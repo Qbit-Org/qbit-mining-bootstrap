@@ -1299,24 +1299,19 @@ async fn ctv_artifacts_wait_for_maturity_and_claims_are_fenced() -> Result<()> {
     );
     a.save_cpfp_package(&first, "aabb", &"66".repeat(32))
         .await?;
-    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&first.fanout_txid).execute(&a.pool).await?;
+    // #654: only a takeover ends a claim. The revocation hook stands in for
+    // a lease b watched go unrenewed; until b takes the fanout, its owner is
+    // still the holder.
+    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&first.fanout_txid)).await?;
+    let recovered = b
+        .claim_fanout(60)
+        .await?
+        .context("a revoked fanout claim was not taken over")?;
+    assert_eq!(first.fanout_txid, recovered.fanout_txid);
     assert!(
         a.renew_fanout_claim(&first, 60).await.is_err(),
-        "expired owner revived its lease"
+        "a taken-over owner revived its lease"
     );
-    // SQLx queues rollback when the rejected renewal drops its transaction.
-    // SKIP LOCKED may briefly skip that row until the rollback releases it.
-    let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(claim) = b.claim_fanout(60).await? {
-                return Ok::<_, anyhow::Error>(claim);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("expired fanout was not reclaimed after renewal rollback")??;
-    assert_eq!(first.fanout_txid, recovered.fanout_txid);
     assert_eq!(recovered.progress["scan_next_height"], json!(1103));
     assert_eq!(
         recovered.progress["scan_anchor_hash"],
@@ -1534,23 +1529,20 @@ async fn cpfp_retirement_requires_current_claim_and_preserves_signed_packages() 
         b.cpfp_package(&old.fanout_txid).await?.unwrap(),
         unsigned_before
     );
-    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&old.fanout_txid).execute(&a.pool).await?;
+    // #654: only a takeover ends b's claim; the revocation hook stands in for
+    // a lease a watched go unrenewed.
+    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&old.fanout_txid)).await?;
+    let current = a
+        .claim_fanout(60)
+        .await?
+        .context("a revoked fanout claim was not taken over")?;
+    assert_eq!(current.fanout_txid, old.fanout_txid);
     assert!(
         b.retire_unsigned_cpfp_funding(&old, &unsigned_funding, 2, "spent")
             .await
             .is_err(),
-        "expired claim retired funding"
+        "a taken-over claim retired funding"
     );
-    let current = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(claim) = a.claim_fanout(60).await? {
-                break Ok::<_, anyhow::Error>(claim);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    assert_eq!(current.fanout_txid, old.fanout_txid);
     a.retire_unsigned_cpfp_funding(
         &current,
         &unsigned_funding,

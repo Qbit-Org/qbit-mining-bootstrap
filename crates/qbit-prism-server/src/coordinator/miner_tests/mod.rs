@@ -446,6 +446,23 @@ impl Fixture {
         tune: impl FnOnce(&mut Config),
         statement_timeout: Option<Duration>,
     ) -> Self {
+        Self::build_with_ledger(
+            max_age,
+            tune,
+            statement_timeout,
+            "postgresql://unused@127.0.0.1:1/unused",
+        )
+        .await
+    }
+
+    /// [`Fixture::build`], with the coordinator's own `Ledger` (session
+    /// allocation) connecting to `ledger_url` instead of a refused port.
+    pub async fn build_with_ledger(
+        max_age: Duration,
+        tune: impl FnOnce(&mut Config),
+        statement_timeout: Option<Duration>,
+        ledger_url: &str,
+    ) -> Self {
         let node = Arc::new(StdMutex::new(Node {
             tip: hash(1),
             mempool: None,
@@ -468,7 +485,7 @@ impl Fixture {
         tune(&mut config);
         let ledger = Arc::new(Ledger::offline_for_tests(
             sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
+                .connect_lazy(ledger_url)
                 .unwrap(),
             "offline-decisions".into(),
         ));
@@ -497,6 +514,7 @@ impl Fixture {
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
             refresh_lock: Mutex::new(RefreshState::default()),
+            refresh_in_flight: std::sync::Mutex::new(None),
             clocked_flights: clocked_flight::ClockedFlights::default(),
             resume_flights: compact_resume::ResumeFlights::new(1),
             identities: Mutex::new(HashMap::new()),

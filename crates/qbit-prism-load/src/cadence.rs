@@ -1436,8 +1436,9 @@ pub const COUNTED_CLASSES: &str =
      It does not own backend refusals, whatever their message (backend-rpc-unavailable: \
      `current chain state is unavailable`, `current payout state is unavailable`, `current tip \
      parent is unavailable`, `job resume unavailable`, `job resume timed out`; \
-     backend-database-unavailable: `current payout state is unavailable`, `job resume \
-     unavailable`; ledger-confirmation-failed: `share was not committed because its commit gate closed`, \
+     backend-database-unavailable: `current chain state is unavailable`, `current payout state \
+     is unavailable`, `job resume unavailable`, `job resume timed out`; \
+     ledger-confirmation-failed: `share was not committed because its commit gate closed`, \
      `share was not confirmed by the database`; ledger-outcome-unknown; internal-error), which \
      say the backend could not classify or record the share rather than that the work was \
      retired, nor stale-job with `job CTV fee is below the current relay floor`, pool-closed, the \

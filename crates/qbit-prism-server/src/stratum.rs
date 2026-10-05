@@ -3,6 +3,7 @@ use crate::{
     codec::{self, Job, Submission},
     ledger::SessionId,
     vardiff::{password_difficulties, Vardiff, VardiffConfig},
+    waiting::Dependency,
 };
 use anyhow::{ensure, Context, Result};
 use futures_util::future::{Fuse, FusedFuture, FutureExt};
@@ -76,6 +77,21 @@ impl StratumError {
     }
     pub fn backend(message: impl Into<String>) -> Self {
         Self::new(20, message, "backend-rpc-unavailable")
+    }
+    /// A refusal whose cause lies with the ledger database, not the node
+    /// (#581).
+    pub fn database(message: impl Into<String>) -> Self {
+        Self::new(20, message, "backend-database-unavailable")
+    }
+    /// One of the session's own deadlines passed while a backend call was
+    /// still waiting (#655): the database's when the call was waiting on the
+    /// ledger database then, otherwise the node's, as every such timeout was
+    /// before.
+    pub fn timed_out(message: impl Into<String>, waiting_on: Dependency) -> Self {
+        match waiting_on {
+            Dependency::Database => Self::database(message),
+            Dependency::Unattributed => Self::backend(message),
+        }
     }
     pub fn malformed(message: impl Into<String>) -> Self {
         Self::new(20, message, "malformed-submit")
@@ -1213,6 +1229,18 @@ async fn alongside<T, D: FusedFuture>(
     }
 }
 
+/// Await a backend call under one of the session's own deadlines (#655): its
+/// output, or, once `seconds` have passed, what the call was waiting on then,
+/// which names the refusal ([`StratumError::timed_out`]). The backend marks
+/// the steps it waits on the ledger database (`crate::waiting`); a call that
+/// marks none keeps the node's label.
+async fn within_session_deadline<F: Future>(
+    seconds: f64,
+    call: F,
+) -> std::result::Result<F::Output, Dependency> {
+    crate::waiting::timeout(Duration::from_secs_f64(seconds), call).await
+}
+
 /// Admit, build and persist one job. The session loop polls this while it
 /// keeps answering submits (#621) and announces the job with
 /// [`announce_job`] once it is durable. `refresh` is this delivery's own
@@ -1281,24 +1309,23 @@ async fn prepare_job<B: MiningBackend>(
             .map(|job| (job, lane))
     };
     let revision_build = metrics.revision_work_build();
-    let (job, lane) = match timeout(
-        Duration::from_secs_f64(config.initial_job_timeout_seconds),
-        build,
-    )
-    .await
+    let (job, lane) = match within_session_deadline(config.initial_job_timeout_seconds, build).await
     {
         Ok(Ok(built)) => built,
         Ok(Err(error)) => return Err(observation.failed(error)),
-        Err(_) => {
+        Err(waiting_on) => {
             revision_build.deadline_hit();
-            return Err(observation.failed(StratumError::backend("initial job delivery timed out")));
+            return Err(observation.failed(StratumError::timed_out(
+                "initial job delivery timed out",
+                waiting_on,
+            )));
         }
     };
     let mask = miner_version_mask.map_or(0, |miner| {
         miner & config.version_rolling_mask & job.wire.version_mask
     });
-    match timeout(
-        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+    match within_session_deadline(
+        config.initial_job_timeout_seconds,
         backend.persist_issued_job(
             &worker,
             &job,
@@ -1310,8 +1337,11 @@ async fn prepare_job<B: MiningBackend>(
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(observation.failed(error)),
-        Err(_) => {
-            return Err(observation.failed(StratumError::backend("job persistence timed out")))
+        Err(waiting_on) => {
+            return Err(observation.failed(StratumError::timed_out(
+                "job persistence timed out",
+                waiting_on,
+            )))
         }
     }
     // The job is durable. Neither a slow miner's socket nor a submit the
@@ -1489,12 +1519,14 @@ async fn request<B: MiningBackend>(
             }
             "mining.subscribe" => {
                 if session.extranonce1.is_none() {
-                    let id = timeout(
-                        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                    let id = within_session_deadline(
+                        config.initial_job_timeout_seconds,
                         backend.new_session_id(),
                     )
                     .await
-                    .map_err(|_| StratumError::backend("session allocation timed out"))??;
+                    .map_err(|waiting_on| {
+                        StratumError::timed_out("session allocation timed out", waiting_on)
+                    })??;
                     // Requests are serial within a session. Publish only a
                     // successful allocation; later subscribes reuse this ID.
                     session.extranonce1 = Some(format!("{id:08x}"));
@@ -1525,12 +1557,14 @@ async fn request<B: MiningBackend>(
                     }
                     .into());
                 }
-                let worker = timeout(
-                    Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                let worker = within_session_deadline(
+                    config.initial_job_timeout_seconds,
                     backend.authorize(username),
                 )
                 .await
-                .map_err(|_| StratumError::backend("payout address validation timed out"))??;
+                .map_err(|waiting_on| {
+                    StratumError::timed_out("payout address validation timed out", waiting_on)
+                })??;
                 let same_username = session
                     .worker
                     .as_ref()
@@ -1757,13 +1791,14 @@ async fn request<B: MiningBackend>(
                 if !session.jobs.iter().any(|j| j.job.wire.job_id == fields[1])
                     && session.retained.get(fields[1]).is_none()
                 {
-                    if let Some(job) = timeout(
-                        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                    if let Some(job) = within_session_deadline(
+                        config.initial_job_timeout_seconds,
                         backend.resume_job(&worker, fields[1]),
                     )
                     .await
-                    .map_err(|_| StratumError::backend("job resume timed out"))??
-                    {
+                    .map_err(|waiting_on| {
+                        StratumError::timed_out("job resume timed out", waiting_on)
+                    })?? {
                         if job.wire.job_id != fields[1] {
                             return Err(StratumError::internal("restored job ID mismatch").into());
                         }

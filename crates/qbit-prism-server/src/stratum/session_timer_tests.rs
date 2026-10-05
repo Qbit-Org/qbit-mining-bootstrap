@@ -247,3 +247,133 @@ async fn initial_job_timer_still_closes_unauthenticated_and_never_usable_session
         tokio::time::resume();
     }
 }
+
+/// The `backend-database-unavailable` refusal a session timeout must give.
+fn assert_database_timeout(error: &Value, message: &str) {
+    assert_eq!(error[1], message, "{error}");
+    assert_eq!(
+        error[2]["reason_id"], "backend-database-unavailable",
+        "a session timeout blamed the node while the coordinator waited on the database: {error}"
+    );
+}
+
+/// #655: one of the session's own deadlines that passes while the
+/// coordinator waits on the ledger database is the database's, not the
+/// node's. Here a submit resumes a durable-only job through the real
+/// coordinator, whose resume waits on the database clock past the session's
+/// 0.5 s deadline. Before #655 it was refused `backend-rpc-unavailable`.
+#[tokio::test]
+async fn a_resume_stalled_on_the_database_times_out_as_the_databases() {
+    let mut live = LiveSession::new(false).await;
+    live.login().await;
+    let original = live.delivered().await;
+    // N=1: two retargets leave the original durable-only, so a submit for
+    // it resumes it.
+    for (id, difficulty) in [(3, 1e-10), (4, 2e-10)] {
+        assert_eq!(
+            live.request(id, "mining.suggest_difficulty", json!([difficulty]))
+                .await["result"],
+            true
+        );
+        live.delivered().await;
+    }
+    let gate = Arc::new(Gate::default());
+    *live
+        .backend
+        .fixture
+        .store
+        .compact
+        .clock_gate
+        .lock()
+        .unwrap() = Some(gate.clone());
+    let refused = live.submit(5, &original).await;
+    assert!(refused["result"].is_null(), "{refused}");
+    assert_database_timeout(&refused["error"], "job resume timed out");
+    gate.release.notify_one();
+}
+
+/// #655: the same for issued-job persistence. The live session retries a
+/// failed delivery without answering it, so this drives one delivery as the
+/// session does and reads the refusal it retries: the coordinator's real
+/// persistence waits on its save past the session's deadline.
+#[tokio::test]
+async fn a_persistence_stalled_on_the_database_times_out_as_the_databases() {
+    let live = LiveSession::new(false).await;
+    let gate = Arc::new(Gate::default());
+    *live.backend.fixture.store.save_gate.lock().unwrap() = Some(gate.clone());
+    let worker = live.backend.next.lock().unwrap().context.worker.clone();
+    let (_publications, refresh) = watch::channel(0);
+    let delivery = prepare_job(
+        live.backend.as_ref(),
+        DeliveryInputs {
+            worker,
+            extranonce1: "00000002".into(),
+            difficulty: 1e-12,
+            miner_version_mask: None,
+            prior: None,
+        },
+        &live.config,
+        &crate::metrics::Metrics::default(),
+        refresh,
+    )
+    .await;
+    let Err(error) = delivery else {
+        panic!("a persistence held past the session deadline was delivered");
+    };
+    assert_database_timeout(
+        &error.response(json!(1))["error"],
+        "job persistence timed out",
+    );
+    gate.release.notify_one();
+}
+
+/// #655: and for session allocation, through the real coordinator as the
+/// session's backend. Its ledger connects to a server that accepts and never
+/// answers, as a PostgreSQL that has stopped answering holds a connection.
+#[tokio::test]
+async fn an_allocation_stalled_on_the_database_times_out_as_the_databases() {
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = silent.local_addr().unwrap();
+    let held = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        while let Ok((connection, _)) = silent.accept().await {
+            connections.push(connection);
+        }
+    });
+    let fixture = Fixture::build_with_ledger(
+        Duration::from_secs(600),
+        |_| {},
+        None,
+        &format!("postgresql://unused@{address}/unused"),
+    )
+    .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (reader, mut writer) = client.into_split();
+    let (_shutdown, receiver) = watch::channel(false);
+    let task = tokio::spawn(session(
+        server,
+        fixture.coordinator.clone(),
+        StratumConfig {
+            initial_job_timeout_seconds: 0.5,
+            ..Default::default()
+        },
+        fixture.coordinator.refresh.subscribe(),
+        receiver,
+        Arc::new(crate::metrics::Metrics::default()),
+    ));
+    writer
+        .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
+        .await
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(reader).read_line(&mut line).await.unwrap();
+    let refused: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(refused["id"], 1, "{refused}");
+    assert_database_timeout(&refused["error"], "session allocation timed out");
+    task.abort();
+    held.abort();
+}

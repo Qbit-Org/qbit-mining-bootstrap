@@ -10,9 +10,12 @@ The backend allocator and wire width are unchanged.
 A failed allocation returns `backend-database-unavailable` (`database
 unavailable`, #581) and leaves the connection unsubscribed. An immediate
 failure can be retried on that connection. A timeout returns
-`backend-rpc-unavailable` with `session allocation timed out`, because the
-session cannot tell which dependency stalled; a sequence value already
-consumed before the timeout is not published or reused.
+`session allocation timed out`, labelled by what the allocation was waiting
+on when the session's deadline passed (#655): `backend-database-unavailable`
+while it waited on the ledger database, which the native coordinator's
+allocation always does, and `backend-rpc-unavailable` for a backend that
+names no database step. A sequence value already consumed before the timeout
+is not published or reused.
 
 The initial-job lifetime now begins during connection setup, before the later
 subscription allocation. The base runtime began that lifetime after eager

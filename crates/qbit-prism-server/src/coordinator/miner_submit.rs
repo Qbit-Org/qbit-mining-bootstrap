@@ -342,7 +342,7 @@ impl Coordinator {
         // the coordinator, before any await. Recorded on the candidate row
         // at enqueue; a clock before the epoch leaves it unknown.
         let proof_observed_at_ms = submission.block_pass.then(|| unix_ms_now().ok()).flatten();
-        let (last_poll, readiness_generation, stale_readiness_reason) = {
+        let (last_poll, readiness_generation, refresh_failed_on_database) = {
             let readiness = self.readiness.read().await;
             let last_poll = readiness.last_poll.ok_or_else(|| {
                 protocol_error(
@@ -350,15 +350,11 @@ impl Coordinator {
                     "current chain state is unavailable",
                 )
             })?;
-            // #581: readiness ages out when neither a refresh nor a guarded
-            // tip poll (#622) renews it; the reason names the dependency the
-            // latest refresh failed on.
-            let reason = if readiness.refresh_failed_on_database {
-                DATABASE_UNAVAILABLE
-            } else {
-                "backend-rpc-unavailable"
-            };
-            (last_poll, readiness.generation, reason)
+            (
+                last_poll,
+                readiness.generation,
+                readiness.refresh_failed_on_database,
+            )
         };
         let context = &job.context;
         self.ensure_job_fee_current(context.prepared.fee)
@@ -377,8 +373,12 @@ impl Coordinator {
             && last_poll.elapsed() >= self.config.health_timeout
             && !selected.share_lease
         {
+            // #581: readiness ages out when neither a refresh nor a guarded
+            // tip poll (#622) renews it; the reason names the dependency the
+            // latest refresh failed on, or (#655) the one the refresh in
+            // flight is still blocked on past its deadline.
             return Err(protocol_error(
-                stale_readiness_reason,
+                self.stale_readiness_reason(refresh_failed_on_database),
                 "current chain state is unavailable",
             ));
         }

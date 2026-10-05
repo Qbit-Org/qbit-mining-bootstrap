@@ -85,7 +85,7 @@
       "labels": {
         "reason_id": "RejectReason"
       },
-      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. backend-rpc-unavailable names the node, backend-database-unavailable the ledger database (#581): a refusal on a path that reads both names whichever failed. Incremented per refusal and overlaid on cached metric bodies at scrape time (#581), so refusals during a database outage are counted while the cached body is stale."
+      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. backend-rpc-unavailable names the node, backend-database-unavailable the ledger database (#581): a refusal on a path that reads both names whichever failed, and a timeout or aged-out readiness names the ledger database while the work it waited for was still waiting on it (#655). Incremented per refusal and overlaid on cached metric bodies at scrape time (#581), so refusals during a database outage are counted while the cached body is stale."
     },
     "stale_shares_total": {
       "replaces": [
