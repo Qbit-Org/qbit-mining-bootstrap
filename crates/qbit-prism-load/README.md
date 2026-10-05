@@ -11,6 +11,10 @@ behaviour, time to usable work after a new tip, and rejections by reason.
 Nothing in the harness changes production code, adds a metric, or bypasses a
 validation. The server verifies every share for real.
 
+In [external-target mode](#external-target-mode-291) the same client drives
+frontends it did not launch, a deployed pair behind its load balancer, and
+writes stats several client machines merge.
+
 ## What it measures, and why
 
 Decision D1 (#260) sets the targets: 2,000 shares/s for a minute, 500 shares/s
@@ -1050,6 +1054,205 @@ soak gates beside its usual ones, and `qbit-prism-soak-report` holds a live
 deployment's hourly samples to the same gates. [docs/prism-soak.md](../../docs/prism-soak.md)
 has the gates, the presets, the weekly job and the testnet4 procedure.
 
+## External-target mode (#291)
+
+`qbit-prism-load external` drives the same Stratum sessions at frontends it
+did not launch: one frontend's listener, or the operator's TCP load balancer
+in front of the deployed pair, which is where #291's failover drill,
+load-balancer exercise and soak have to put their load. It is this harness's
+client, not a second load generator (#474): the session task connects,
+subscribes, authorizes, mines real proof of work on the jobs the target
+sends and reconnects when its connection goes, and the open-loop token
+bucket the phases use places the offers. Nothing is launched, seeded or read
+from a database, so there is no artifact and no reconciliation of its own:
+the stats are what the client saw, and `--share-log` keeps every share id for
+reconciling against the target's ledger.
+
+```sh
+target/release/qbit-prism-load external \
+  --target lb.rehearsal.example:3333 \
+  --i-understand-external-target \
+  --address <a payout address valid on the target's chain> \
+  --label vm1 --worker-prefix vm1 \
+  --sessions 500 --rate 250 --duration-seconds 7200 \
+  --out vm1.json --share-log vm1-shares.jsonl
+```
+
+### The guard
+
+Without `--i-understand-external-target` the mode refuses before it
+resolves the target or opens a connection, and says why: every session
+authorizes as `<address>.<worker>` and submits real proof-of-work shares that
+the target credits to `<address>`. Point it only at a rehearsal or test
+deployment configured for low-difficulty load, never at a pool serving
+miners.
+
+The client's difficulty ceiling is a second guard. It never mines a job
+advertised above `--max-difficulty` (default 2^-16, about 65,536 hashes a
+share; at most 2^-14, the most a share search of 2^22 nonces reliably
+covers): each offer on such a job is counted under
+`offers.above_difficulty_ceiling` and nothing is sent. A mainnet frontend's
+share difficulty and vardiff floor are at least 1,024
+(`tests/fixtures/mainnet-compose.env`), so pointed at mainnet, flag or no
+flag, it would send no share at all.
+
+### What the target needs
+
+A share at difficulty `d` costs about `2^32 x d` hashes; a release build does
+a few million a second on one core. The target's frontends have to serve a
+difficulty the clients can afford, and admit the sessions:
+
+| Setting | For low-difficulty load |
+|---|---|
+| `PRISM_STRATUM_SHARE_DIFF` | The share difficulty: at most the clients' `--max-difficulty`. 2^-20 (`0.00000095367431640625`) is about 4,096 hashes a share |
+| `PRISM_STRATUM_VARDIFF_MIN_DIFF` | The vardiff floor. It is also the floor of a difficulty a client asks for with `--difficulty` (`d=` in the Stratum password), vardiff on or off: a request below it is raised to it. At or below the share difficulty |
+| `PRISM_STRATUM_VARDIFF` | `0` for a constant difficulty: the frontend serves `PRISM_STRATUM_SHARE_DIFF`, or what a client asks for within the floor and `PRISM_STRATUM_VARDIFF_MAX_DIFF`. With vardiff on, a session that offers more than one share per `PRISM_STRATUM_VARDIFF_TARGET_SECONDS` (15 s) is raised up to 4x every `PRISM_STRATUM_VARDIFF_RETARGET_SECONDS` (90 s, and up to 64x once at the start) until `PRISM_STRATUM_VARDIFF_MAX_DIFF`; a load at a fixed rate outruns any target, so set `PRISM_STRATUM_VARDIFF_MAX_DIFF` at or below the clients' `--max-difficulty` and the sessions settle there. Every retarget is a new job, which is production's rebuild traffic too |
+| `PRISM_STRATUM_VARDIFF_START_DIFF` | With vardiff on, where a session starts: between the floor and the maximum |
+| `PRISM_STRATUM_MAX_CONNECTIONS` | Per frontend, 384 by default. When a frontend fails, its sessions land on the others, so size each for every client session at once, with room for reconnects |
+| `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP` | 0 (off), or at least the sessions of one client machine. Behind a balancer that does not pass the client's address the frontends see the balancer's |
+| `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME` | Every session has its own worker name, so a per-username limit sees one connection each |
+| `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` | How many sessions build their first job at once (128). A failover moves sessions in a burst, and their first jobs queue behind this, inside the 30 s initial-job timeout |
+
+The `--address` has to be a payout address the target's node validates
+(a P2MR address on its chain).
+
+### What a run does
+
+1. Connects `--sessions` sessions to `--target`, which every connection
+   resolves again, so a name the operator moves is followed. Session `i`
+   authorizes as `<address>.<prefix>-s<i>`, with `--worker-prefix` (default
+   `pload-<run tag>`); give each client machine its own.
+2. Waits up to `--work-timeout-seconds` for them all to hold work, and starts
+   with those that do. If none does, the run is blocked (exit 3).
+3. Offers `--rate` shares a second for `--duration-seconds`: the open-loop
+   token bucket, round-robin over the sessions that hold work and have
+   nothing outstanding, and an offer no such session can take is shortfall,
+   never a backlog. A session without a connection is offered nothing, so an
+   outage reads as shortfall rather than as offers held until it reconnects
+   and then sent in a burst; an offer that reaches a session in the instant
+   its connection goes is dropped when it reconnects, and counted as
+   discarded. A session has one submit outstanding at a time, as the server
+   answers it. The bucket ticks every millisecond and offers each session at
+   most once a tick, so a late tick (a process suspended and resumed, say)
+   counts what it owes as shortfall rather than sending it as a burst. A
+   process's ceiling is therefore 1,000 offers a second per session.
+4. Mines each job at the difficulty the last `mining.set_difficulty` before
+   its `mining.notify` advertised, as the server binds them (Stratum's 1
+   before any), with `--difficulty` asked for in the password when given. The
+   search runs off the async runtime, so a slow search cannot delay another
+   session's reads, and it stops as soon as its own connection has something
+   waiting (a new job, a new difficulty, the socket ending). The session
+   reads that at once and mines the same offer again on the newest job, so a
+   share is not sent on work a job already waiting has retired, and a job's
+   arrival or an outage is timed when it happened. A job that arrives in the
+   moment between the search's last look and the submit's write still finds
+   a share sent on the old one: the race every miner's share in flight runs
+   with the server's next job, which the network widens to a round trip
+   anyway. A share that also meets
+   the network target is stepped over and counted
+   (`jobs.discarded_block_solutions`): the mode lands no blocks.
+5. Reconnects a session whose connection goes, at once and then every
+   250 ms until it holds work again.
+6. Waits up to `--drain-seconds` for answers still outstanding on sessions
+   that hold work, records what is still unanswered as no-response
+   `run ended`, and stops the sessions. A session that has not stopped 10 s
+   later (one in the middle of a handshake) is aborted, and what it held is
+   counted as `offers.unknown_at_abort`: sent or not, it has no share-log
+   line.
+
+SIGINT or SIGTERM ends the load early, drains and writes the stats (exit 6);
+a second one skips the rest of the drain. A stop also ends any search in
+progress at once. A progress line goes to stderr every `--progress-seconds`.
+`--rate` is at most 100,000 a process: a share costs thousands of hashes, so a
+faster load needs more client machines.
+
+### The stats
+
+`--out` (default `external-load.json`) is a `qbit.prism.external-load.v1`
+document with four parts. Its directory is checked at entry with a probe
+file beside it, so a path that cannot be written refuses the run before any
+load; a file already there is replaced only when the new document is
+written, and a `--share-log` that reaches the same file, through any path or
+symlink, is refused.
+
+- `processes`: per client process, its configuration, its load window, how
+  it `ended`, its exit code, its own counts, what was still outstanding when
+  the drain ended, its CPU seconds and cores (so a busy client can be told
+  from a slow target), its share log, and `events_cut_off`, set only if the
+  stats had to stop taking events before the last one arrived.
+- `totals`: the additive record. Counts, latency histograms and a timeline
+  with one entry per wall-clock second (offered, dispatched, shortfall,
+  accepted, rejected, no-response, disconnects, reconnects, and the sessions
+  holding work).
+- `summary`, derived from those two: `shares` (accepted, rejected and
+  no-response, split into the connections that went mid-run and the
+  submits the drain gave up on), `rates` (offered and accepted per second
+  over the load window, an answer read in the drain counting for the window
+  its offer was made in, as a phase's submits count for the phase; and
+  accepted per wall-clock second inside every window), `ack_latency`
+  (p50, p90, p99, p99.9, max, from the submit's write to the read of its
+  answer), `rejections` by class and by `(code, reason_id, message)`,
+  `reconnects` (disconnects and their causes, completed reconnects, failed
+  attempts, and the outage from losing a connection to holding work again),
+  `connections` (time to first job), `difficulty` (what the target
+  advertised, and the offers above the ceiling), `tips` (per tip, from the
+  first session to the last to hold work on it, each session counted once;
+  a process keeps its newest 1,024 tips, and past that the distinct count is
+  `null` with the reason), `client_failures`, and `offers`, whose
+  `unaccounted` is 0 for a complete run.
+- `definitions`: what each figure means and which clock it is on.
+
+The latency percentiles come from log-linear histograms with buckets 0.2%
+wide, reported as the bucket's upper bound, so never below the sample; min
+and max are exact. Nothing absent is reported as zero: an empty histogram's
+percentiles are `null` with a reason.
+
+### Several client machines
+
+One process per machine, each with its own `--label` and `--worker-prefix`,
+then:
+
+```sh
+qbit-prism-load external-merge vm1.json vm2.json vm3.json --out merged.json
+```
+
+The merge adds every count and histogram exactly, adds the timelines second
+by second, and recomputes the summary: the rates are the per-process rates
+added, and the per-wall-clock-second figures need the machines' clocks to
+agree (NTP). A process that appears twice is refused rather than counted
+twice. The merged document has the same schema (`kind: merged`) and merges
+again.
+
+### Reconciling against the ledger
+
+`--share-log` writes one JSON line per submit: `share_id`, `outcome`
+(`accepted`, `rejected` or `no-response`), `session`, `job_id`,
+`sent_unix_ms`, `answered_unix_ms`, `latency_ms`, the rejection's `code`,
+`reason_id` and `message`, and the `no_response_reason`. A thread of its own
+writes the file, so a slow disk never stalls a session. If it falls 65,536
+lines behind, later lines are dropped rather than held, and
+`processes[].share_log.dropped` says how many. A `share_id` is the
+ledger's own `qbit_share_ledger.share_id`, so the failover drill can hold the
+clients to the promoted primary: every accepted id must be there, or it is an
+acknowledged-share loss to count under D3, and every committed id under the
+run's worker names must be accepted or a no-response whose answer went with
+the frontend.
+
+```sql
+SELECT share_id FROM qbit_share_ledger WHERE accepted AND share_id LIKE '<address>.vm1-%';
+```
+
+`tests/external_frontend.rs` does exactly that against the in-repo frontends.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | The load window ran its length; the stats say what happened |
+| 2 | An error, or a refusal at entry, the guard included; no stats are written |
+| 3 | No session held work within `--work-timeout-seconds`; the stats are written, with no window |
+| 6 | Interrupted: by SIGINT or SIGTERM, or by the run itself when its stats fell 250,000 events behind its sessions (a machine driving more than it can count). The stats are written up to that point, and `ended` says which |
+
 ## Exit codes
 
 | Code | Meaning |
@@ -1697,7 +1900,13 @@ unmeasured, failed and zero cases. `tests/realism.rs` covers the realism
 flags' parsing and refusals, the default population's byte-for-byte legacy
 shape, the generated skew, windows and bursts, every checked-in preset's
 completeness and validity, #473's cells and rule, and the gate and its
-#473-format table.
+#473-format table. `tests/external_target.rs` covers external-target mode
+against a Stratum target of its own that checks every share against the
+difficulty it advertised for the share's job: the guard, the entry checks,
+mining at the advertised difficulty through a mid-run raise, a dropped
+connection counted and reconnected, the ceiling, the stop on a signal, the
+blocked run, and that the histograms and two processes' documents merge into
+their sums.
 
 The gated tests start the managed cluster against real PostgreSQL 16 server
 binaries through the shared integration gate (`PRISM_TEST_PG_BIN_DIR`), and
@@ -1705,7 +1914,9 @@ skip without them: the quorum-standby detection in `tests/quorum_replication.rs`
 in `tests/harness.rs` a cluster that fails to start, whose error has to
 carry PostgreSQL's own reason, the per-PR smoke run in
 `tests/load_smoke.rs`, the CTV settlement run in `tests/ctv_settlement.rs`
-(#548), and, also needing `QBITD_BIN`, the per-PR real-node
+(#548), external-target mode against two in-repo frontends behind a balancer,
+one killed and relaunched mid-run, reconciled against the ledger, in
+`tests/external_frontend.rs` (#291), and, also needing `QBITD_BIN`, the per-PR real-node
 smoke run in `tests/real_node.rs`, and the per-PR fault smoke run in
 `tests/faults.rs`. `tests/real_node.rs` also holds
 `fake_node_mode_is_unchanged`, which needs nothing: the fake node's answers to

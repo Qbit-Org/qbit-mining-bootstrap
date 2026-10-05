@@ -124,6 +124,29 @@ pub fn le_at_most(a: &[u8; 32], b: &[u8; 32]) -> bool {
     true
 }
 
+/// The difficulty Stratum assigns a job when the server advertised none.
+pub const STRATUM_DEFAULT_DIFFICULTY: f64 = 1.0;
+
+/// Where a session takes the difficulty it mines each job at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DifficultySource {
+    /// The difficulty the harness launched its own frontends with. A
+    /// `mining.set_difficulty` that disagrees is a contradicted premise,
+    /// reported as [`Event::DifficultyMismatch`].
+    Configured(f64),
+    /// The target's (external-target mode, [`crate::external`]): each job is
+    /// mined at the difficulty the last `mining.set_difficulty` before its
+    /// `mining.notify` advertised, which is how Stratum binds the two and how
+    /// the server sends them (`stratum.rs`: difficulty precedes the work it
+    /// applies to, and older jobs keep their own target), or at
+    /// [`STRATUM_DEFAULT_DIFFICULTY`] before any. A job advertised above
+    /// `ceiling` is not mined: each offer on it fails, so a target whose
+    /// difficulty a CPU cannot meet costs the client nothing and shows in its
+    /// stats. The search runs off the async runtime, so a slow search cannot
+    /// delay another session's reads.
+    Advertised { ceiling: f64 },
+}
+
 /// One job as the client holds it.
 #[derive(Clone, Debug)]
 pub struct JobState {
@@ -138,6 +161,8 @@ pub struct JobState {
     pub ntime: u32,
     pub clean_jobs: bool,
     pub received: Instant,
+    /// The difficulty [`Self::share_target`] was derived from.
+    pub share_difficulty: f64,
     pub share_target: [u8; 32],
     pub network_target: [u8; 32],
 }
@@ -160,6 +185,12 @@ pub const RUN_ENDED: &str = "run ended";
 /// server committed anyway is reported as such, never as an ACK/commit
 /// divergence.
 pub const CHURN_CLOSED: &str = "churn close";
+
+/// How the failure of an offer on a job above the
+/// [`DifficultySource::Advertised`] ceiling begins, so external-target stats
+/// can count those offers apart from the session failures that are faults.
+pub const DIFFICULTY_ABOVE_CEILING: &str =
+    "not mined: the target's share difficulty is above the client's ceiling";
 
 #[derive(Clone, Debug)]
 pub enum Outcome {
@@ -309,6 +340,13 @@ pub enum Event {
         session: usize,
         phase: String,
     },
+    /// A usable `set_difficulty` a [`DifficultySource::Advertised`] session
+    /// will mine its next job at. Never sent under
+    /// [`DifficultySource::Configured`].
+    DifficultyAdvertised {
+        session: usize,
+        difficulty: f64,
+    },
     /// A `set_difficulty` whose value disagrees with the difficulty the
     /// harness configured.
     DifficultyMismatch {
@@ -372,6 +410,9 @@ pub struct ClientFailure {
 pub struct OfferFailure {
     pub error: anyhow::Error,
     pub recorded: bool,
+    /// The search stopped because the connection had something to say
+    /// first: the offer is still good and is mined again once that is read.
+    pub interrupted: bool,
 }
 
 impl OfferFailure {
@@ -379,6 +420,15 @@ impl OfferFailure {
         Self {
             error,
             recorded: false,
+            interrupted: false,
+        }
+    }
+
+    fn interrupted() -> Self {
+        Self {
+            error: anyhow::anyhow!("the search stopped for traffic on the connection"),
+            recorded: false,
+            interrupted: true,
         }
     }
 }
@@ -444,7 +494,7 @@ pub struct SessionConfig {
     pub index: usize,
     pub username: String,
     pub password: String,
-    pub share_difficulty: f64,
+    pub difficulty: DifficultySource,
     pub version_rolling_mask: u32,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
@@ -457,6 +507,13 @@ pub struct SessionConfig {
     /// be working on is never turned into a `NoResponse` by the harness's
     /// own close (EP-ERRORS).
     pub quiesce_limit: Duration,
+    /// Drop, as [`Event::DiscardedOffer`], every offer the session took
+    /// while it had no connection, the moment it holds work again, instead
+    /// of sending them then. External-target mode measures an outage as
+    /// shortfall: an offer that reached a session in the instant its socket
+    /// closed would otherwise go out with the reconnect, as a burst the
+    /// outage never offered. The harness's sessions keep theirs, as before.
+    pub drop_offers_held_while_disconnected: bool,
 }
 
 /// Shared, live run state a session reads.
@@ -472,6 +529,11 @@ pub struct SessionShared {
     /// shared by the run, every session and the driver, so "before the kill"
     /// and "after the kill" are the same fact for all of them.
     pub kill_fence: Arc<AtomicU64>,
+    /// Set by a run that is stopping its sessions. A search off the runtime
+    /// looks at it with the connection's queue and stops, so a stop is not
+    /// held behind a search, nor a search queued for the blocking pool run
+    /// for nothing. Nothing in the harness's own run sets it.
+    pub stopping: Arc<AtomicBool>,
 }
 
 impl SessionShared {
@@ -570,7 +632,8 @@ struct Pending {
 }
 
 enum Incoming {
-    Line(String),
+    /// A line, with the instant the reader took it off the socket.
+    Line(String, Instant),
     /// The socket ended. `fence` is [`SessionShared::kill_fence`] as the
     /// reader read it at the instant the end was observed, and it travels
     /// with the reason all the way to the records the closure fails.
@@ -593,12 +656,48 @@ enum Incoming {
     Closed {
         reason: String,
         fence: u64,
+        /// When the reader saw the socket end.
+        at: Instant,
     },
+}
+
+/// The instant an inbound line or closure is taken to have happened at. An
+/// external-target session uses the instant its reader took it off the
+/// socket: the session may be waiting on a search off the runtime, or for a
+/// worker to run one, while the line waits, and that wait is the client's,
+/// not the target's. The harness's sessions stamp a line as they process it,
+/// as their evidence has always been taken (README, "Which rejections a
+/// landing owns": stamped when the client read the response line).
+fn observed(config: &SessionConfig, received: Instant) -> Instant {
+    match config.difficulty {
+        DifficultySource::Advertised { .. } => received,
+        DifficultySource::Configured(_) => Instant::now(),
+    }
+}
+
+/// A connection's inbound queue, with a count of what its reader has queued
+/// and the session has not taken yet, so a search running off the runtime
+/// can stop as soon as the connection has something to say.
+struct Lines {
+    queue: mpsc::Receiver<Incoming>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Lines {
+    /// As `mpsc::Receiver::recv`, and as cancel-safe: the count drops in the
+    /// same poll the message is taken in.
+    async fn recv(&mut self) -> Option<Incoming> {
+        let incoming = self.queue.recv().await;
+        if incoming.is_some() {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+        incoming
+    }
 }
 
 struct Connection {
     writer: tokio::net::tcp::OwnedWriteHalf,
-    lines: mpsc::Receiver<Incoming>,
+    lines: Lines,
     reader_task: tokio::task::JoinHandle<()>,
     extranonce1: Vec<u8>,
     extranonce2_size: usize,
@@ -607,6 +706,10 @@ struct Connection {
     pending: HashMap<u64, Pending>,
     last_tip: Option<String>,
     extranonce2_counter: u64,
+    /// The last usable `mining.set_difficulty` on this connection, which the
+    /// next `mining.notify` is mined at under
+    /// [`DifficultySource::Advertised`].
+    advertised_difficulty: Option<f64>,
 }
 
 impl Connection {
@@ -635,6 +738,7 @@ pub fn spawn_session(
         frontend_slot.clone(),
         shared.clone(),
         work_rx,
+        work_tx.downgrade(),
         control_rx,
         outstanding.clone(),
         paused.clone(),
@@ -658,6 +762,9 @@ async fn run_session(
     frontend: Arc<AtomicUsize>,
     shared: Arc<SessionShared>,
     mut work: mpsc::Receiver<Work>,
+    // Puts an interrupted offer back, behind the lines that interrupted it.
+    // Weak, so the queue still closes when the handle goes.
+    requeue: mpsc::WeakSender<Work>,
     mut control: mpsc::UnboundedReceiver<Control>,
     outstanding: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
@@ -693,6 +800,9 @@ async fn run_session(
             };
             match attempt {
                 Some(Ok(fresh)) => {
+                    if config.drop_offers_held_while_disconnected {
+                        drain_work(&mut work, &outstanding, &shared, config.index);
+                    }
                     let _ = shared.events.send(Event::Opened(ConnectionOpened {
                         session: config.index,
                         frontend: frontend.load(Ordering::Relaxed),
@@ -947,8 +1057,8 @@ async fn run_session(
             }
             incoming = active.lines.recv() => {
                 match incoming {
-                    Some(Incoming::Line(line)) => {
-                        if let Err(error) = handle_line(active, &line, &config, &shared, &frontend, &outstanding) {
+                    Some(Incoming::Line(line, received)) => {
+                        if let Err(error) = handle_line(active, &line, received, &config, &shared, &frontend, &outstanding) {
                             let _ = shared.events.send(Event::Failure(ClientFailure {
                                 session: config.index,
                                 phase: shared.phase(),
@@ -963,11 +1073,11 @@ async fn run_session(
                         // The closure carries the fence it was observed
                         // under; a reader that simply stopped has no earlier
                         // observation to carry, so this is its moment.
-                        let (reason, fence) = match other {
-                            Some(Incoming::Closed { reason, fence }) => {
-                                (reason_or_default(reason), fence)
+                        let (reason, fence, ended) = match other {
+                            Some(Incoming::Closed { reason, fence, at }) => {
+                                (reason_or_default(reason), fence, observed(&config, at))
                             }
-                            _ => ("reader stopped".to_owned(), shared.fence()),
+                            _ => ("reader stopped".to_owned(), shared.fence(), Instant::now()),
                         };
                         reconnect_phase = shared.phase();
                         fail_pending(active, &reason, fence, &shared, &config, &outstanding);
@@ -978,12 +1088,12 @@ async fn run_session(
                         });
                         let _ = shared.events.send(Event::Closed(ConnectionClosed {
                             session: config.index,
-                            at: Instant::now(),
+                            at: ended,
                             cause: format!("socket closed: {reason}"),
                         }));
                         active.drop_reader();
                         connection = None;
-                        reconnect_started = Instant::now();
+                        reconnect_started = ended;
                         reconnect_reason = format!("socket closed: {reason}");
                     }
                 }
@@ -991,18 +1101,41 @@ async fn run_session(
             offered = work.recv(), if can_submit => {
                 match offered {
                     None => { stopping = true; }
-                    Some(Work::Submit { phase }) => {
-                        let phase = phase.to_string();
-                        if let Err(failure) = offer(active, &config, &shared, &frontend, false, phase.clone()).await {
-                            outstanding.fetch_sub(1, Ordering::Relaxed);
-                            let _ = shared.events.send(Event::Failure(ClientFailure {
-                                session: config.index,
-                                phase,
-                                kind: FailureKind::Offer,
-                                recorded: failure.recorded,
-                                error: format!("{:#}", failure.error),
-                                at: Instant::now(),
-                            }));
+                    Some(Work::Submit { phase: stamp }) => {
+                        let phase = stamp.to_string();
+                        match offer(active, &config, &shared, &frontend, false, phase.clone()).await {
+                            Ok(()) => {}
+                            // The offer keeps its slot and goes back in the
+                            // queue, which has room for it: its slot is still
+                            // counted, so the scheduler adds nothing. The
+                            // biased select reads the waiting lines first,
+                            // then mines it on the newest job.
+                            Err(failure)
+                                if failure.interrupted
+                                    && !shared.stopping.load(Ordering::SeqCst)
+                                    && requeue.upgrade().is_some_and(|queue| {
+                                        queue.try_send(Work::Submit { phase: stamp.clone() }).is_ok()
+                                    }) => {}
+                            // Stopped for the run's stop: never sent, as the
+                            // stop would discard it anyway.
+                            Err(failure) if failure.interrupted && shared.stopping.load(Ordering::SeqCst) => {
+                                outstanding.fetch_sub(1, Ordering::Relaxed);
+                                let _ = shared.events.send(Event::DiscardedOffer {
+                                    session: config.index,
+                                    phase,
+                                });
+                            }
+                            Err(failure) => {
+                                outstanding.fetch_sub(1, Ordering::Relaxed);
+                                let _ = shared.events.send(Event::Failure(ClientFailure {
+                                    session: config.index,
+                                    phase,
+                                    kind: FailureKind::Offer,
+                                    recorded: failure.recorded,
+                                    error: format!("{:#}", failure.error),
+                                    at: Instant::now(),
+                                }));
+                            }
                         }
                     }
                 }
@@ -1068,12 +1201,22 @@ async fn quiesce(
     let deadline = Instant::now() + config.quiesce_limit;
     while !connection.pending.is_empty() && Instant::now() < deadline {
         match tokio::time::timeout(QUIESCE_POLL, connection.lines.recv()).await {
-            Ok(Some(Incoming::Line(line))) => {
-                let _ = handle_line(connection, &line, config, shared, frontend, outstanding);
+            Ok(Some(Incoming::Line(line, received))) => {
+                let _ = handle_line(
+                    connection,
+                    &line,
+                    received,
+                    config,
+                    shared,
+                    frontend,
+                    outstanding,
+                );
             }
             Ok(other) => {
                 let (reason, fence) = match other {
-                    Some(Incoming::Closed { reason, fence }) => (reason_or_default(reason), fence),
+                    Some(Incoming::Closed { reason, fence, .. }) => {
+                        (reason_or_default(reason), fence)
+                    }
                     _ => ("reader stopped".to_owned(), shared.fence()),
                 };
                 fail_pending(connection, &reason, fence, shared, config, outstanding);
@@ -1162,6 +1305,10 @@ async fn connect(
     stream.set_nodelay(true)?;
     let (read_half, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel(256);
+    // Counted before each send, so a search can see a line that is on its
+    // way into the queue.
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let queued = waiting.clone();
     // The reader's own handle on the run's fence, so the moment the socket
     // ends is the moment the fence is read. See `Incoming::Closed`.
     let kill_fence = shared.kill_fence.clone();
@@ -1174,17 +1321,20 @@ async fn connect(
                 Ok(0) => {
                     // Read before the send, not after: the send can await.
                     let fence = kill_fence.load(Ordering::SeqCst);
+                    queued.fetch_add(1, Ordering::SeqCst);
                     let _ = tx
                         .send(Incoming::Closed {
                             reason: "end of stream".into(),
                             fence,
+                            at: Instant::now(),
                         })
                         .await;
                     break;
                 }
                 Ok(_) => {
+                    queued.fetch_add(1, Ordering::SeqCst);
                     if tx
-                        .send(Incoming::Line(line.trim().to_owned()))
+                        .send(Incoming::Line(line.trim().to_owned(), Instant::now()))
                         .await
                         .is_err()
                     {
@@ -1193,10 +1343,12 @@ async fn connect(
                 }
                 Err(error) => {
                     let fence = kill_fence.load(Ordering::SeqCst);
+                    queued.fetch_add(1, Ordering::SeqCst);
                     let _ = tx
                         .send(Incoming::Closed {
                             reason: error.to_string(),
                             fence,
+                            at: Instant::now(),
                         })
                         .await;
                     break;
@@ -1206,7 +1358,7 @@ async fn connect(
     });
     let mut connection = Connection {
         writer,
-        lines: rx,
+        lines: Lines { queue: rx, waiting },
         reader_task,
         extranonce1: Vec::new(),
         extranonce2_size: 8,
@@ -1215,6 +1367,7 @@ async fn connect(
         pending: HashMap::new(),
         last_tip: None,
         extranonce2_counter: u64::from(config.index as u32) << 32,
+        advertised_difficulty: None,
     };
     let subscribe = connection.next_id;
     connection.next_id += 1;
@@ -1276,10 +1429,11 @@ async fn connect(
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "no job arrived after authorize");
         match tokio::time::timeout(remaining, connection.lines.recv()).await {
-            Ok(Some(Incoming::Line(line))) => {
+            Ok(Some(Incoming::Line(line, received))) => {
                 consume(
                     &mut connection,
                     &line,
+                    received,
                     config,
                     shared,
                     &Arc::new(AtomicUsize::new(0)),
@@ -1308,7 +1462,7 @@ async fn await_response(
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "no response to request {id}");
         match tokio::time::timeout(remaining, connection.lines.recv()).await {
-            Ok(Some(Incoming::Line(line))) => {
+            Ok(Some(Incoming::Line(line, received))) => {
                 let value: Value = serde_json::from_str(&line)
                     .with_context(|| format!("unparsable Stratum line {line:?}"))?;
                 if value.get("id").and_then(Value::as_u64) == Some(id) {
@@ -1320,6 +1474,7 @@ async fn await_response(
                 consume(
                     connection,
                     &line,
+                    received,
                     config,
                     shared,
                     &Arc::new(AtomicUsize::new(0)),
@@ -1336,18 +1491,28 @@ async fn await_response(
 fn handle_line(
     connection: &mut Connection,
     line: &str,
+    received: Instant,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     frontend: &Arc<AtomicUsize>,
     outstanding: &Arc<AtomicUsize>,
 ) -> Result<()> {
-    consume(connection, line, config, shared, outstanding, frontend)
+    consume(
+        connection,
+        line,
+        received,
+        config,
+        shared,
+        outstanding,
+        frontend,
+    )
 }
 
 /// Dispatch one inbound line: a response to a submit, or a server push.
 fn consume(
     connection: &mut Connection,
     line: &str,
+    received: Instant,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     outstanding: &Arc<AtomicUsize>,
@@ -1360,7 +1525,7 @@ fn consume(
         serde_json::from_str(line).with_context(|| format!("unparsable Stratum line {line:?}"))?;
     if let Some(id) = value.get("id").and_then(Value::as_u64) {
         if let Some(pending) = connection.pending.remove(&id) {
-            let responded = Instant::now();
+            let responded = observed(config, received);
             let outcome = if value.get("result") == Some(&Value::Bool(true)) {
                 Outcome::Accepted
             } else {
@@ -1394,22 +1559,67 @@ fn consume(
         }
     }
     match value.get("method").and_then(Value::as_str) {
-        Some("mining.notify") => note_job(connection, &value, config, shared, frontend)?,
-        Some("mining.set_difficulty") => {
-            if let Some(advertised) = value["params"][0].as_f64() {
-                // The harness pins the difficulty, so a disagreement here means
-                // the frontend is not running the configuration the artifact
-                // will claim (EP-CONFIG).
-                let configured = config.share_difficulty;
-                if (advertised - configured).abs() > configured.abs() * 1e-9 {
-                    let _ = shared.events.send(Event::DifficultyMismatch {
-                        session: config.index,
-                        advertised,
-                        configured,
-                    });
+        Some("mining.notify") => note_job(
+            connection,
+            &value,
+            observed(config, received),
+            config,
+            shared,
+            frontend,
+        )?,
+        Some("mining.set_difficulty") => match config.difficulty {
+            DifficultySource::Configured(configured) => {
+                if let Some(advertised) = value["params"][0].as_f64() {
+                    // The harness pins the difficulty, so a disagreement here means
+                    // the frontend is not running the configuration the artifact
+                    // will claim (EP-CONFIG).
+                    if (advertised - configured).abs() > configured.abs() * 1e-9 {
+                        let _ = shared.events.send(Event::DifficultyMismatch {
+                            session: config.index,
+                            advertised,
+                            configured,
+                        });
+                    }
                 }
             }
-        }
+            DifficultySource::Advertised { .. } => {
+                match value["params"][0]
+                    .as_f64()
+                    .filter(|difficulty| difficulty.is_finite() && *difficulty > 0.0)
+                {
+                    // It applies to the next job; the jobs already held keep
+                    // the target they were issued at.
+                    Some(advertised) => {
+                        connection.advertised_difficulty = Some(advertised);
+                        let _ = shared.events.send(Event::DifficultyAdvertised {
+                            session: config.index,
+                            difficulty: advertised,
+                        });
+                    }
+                    // Reported rather than returned: an error here would end a
+                    // handshake the target may yet complete, and the jobs that
+                    // follow are mined at the last usable value, which their
+                    // own records show (EP-OBSERVABILITY).
+                    None => {
+                        let _ = shared.events.send(Event::Failure(ClientFailure {
+                            session: config.index,
+                            phase: shared.phase(),
+                            kind: FailureKind::Line,
+                            recorded: false,
+                            error: format!(
+                                "mining.set_difficulty advertised {}, which is not a positive \
+                                 finite difficulty; the next job is mined at {}",
+                                value["params"][0],
+                                connection
+                                    .advertised_difficulty
+                                    .unwrap_or(STRATUM_DEFAULT_DIFFICULTY)
+                            ),
+                            at: Instant::now(),
+                        }));
+                    }
+                }
+            }
+        },
         _ => {}
     }
     Ok(())
@@ -1427,6 +1637,7 @@ fn parse_rejection(value: &Value) -> Rejection {
 fn note_job(
     connection: &mut Connection,
     value: &Value,
+    received: Instant,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     frontend: &Arc<AtomicUsize>,
@@ -1462,10 +1673,16 @@ fn note_job(
     let clean_jobs = params[8].as_bool().unwrap_or(false);
     let network_target = codec::target_from_compact(nbits)?;
     // The share target is derived from the difficulty the harness configured,
-    // through the server's own `difficulty_target`, so the client's acceptance
-    // test is bit-for-bit the server's.
-    let share_target =
-        codec::difficulty_target(config.share_difficulty)?.max(network_target.clone());
+    // or the one the target advertised for this job, through the server's own
+    // `difficulty_target`, so the client's acceptance test is bit-for-bit the
+    // server's.
+    let share_difficulty = match config.difficulty {
+        DifficultySource::Configured(configured) => configured,
+        DifficultySource::Advertised { .. } => connection
+            .advertised_difficulty
+            .unwrap_or(STRATUM_DEFAULT_DIFFICULTY),
+    };
+    let share_target = codec::difficulty_target(share_difficulty)?.max(network_target.clone());
     let job = JobState {
         job_id,
         tip: tip.clone(),
@@ -1477,7 +1694,8 @@ fn note_job(
         nbits,
         ntime,
         clean_jobs,
-        received: Instant::now(),
+        received,
+        share_difficulty,
         share_target: target_bytes_le(&share_target),
         network_target: target_bytes_le(&network_target),
     };
@@ -1529,6 +1747,20 @@ async fn offer(
         .cloned()
         .context("no current job to mine")
         .map_err(OfferFailure::unrecorded)?;
+    let off_runtime = match config.difficulty {
+        DifficultySource::Configured(_) => false,
+        DifficultySource::Advertised { ceiling } => {
+            if job.share_difficulty > ceiling {
+                return Err(OfferFailure::unrecorded(anyhow::anyhow!(
+                    "{DIFFICULTY_ABOVE_CEILING}: job {} is at share difficulty {}, above the \
+                     ceiling {ceiling}",
+                    job.job_id,
+                    job.share_difficulty
+                )));
+            }
+            true
+        }
+    };
     connection.extranonce2_counter = connection.extranonce2_counter.wrapping_add(1);
     let mut extranonce2 = vec![0u8; connection.extranonce2_size];
     let counter = connection.extranonce2_counter.to_be_bytes();
@@ -1538,12 +1770,48 @@ async fn offer(
     let extranonce1 = connection.extranonce1.clone();
     let session = config.index;
     let events = shared.events.clone();
-    let found = if scheduled_block {
+    let found = if scheduled_block || off_runtime {
+        // A block search is a full network-target search, and a share at an
+        // external target's difficulty can take thousands of hashes where the
+        // harness's own take dozens. Searched inline either would hold a
+        // runtime worker, and every session on that worker would read its
+        // answers late and report the delay as acknowledgement latency.
+        //
+        // A share search off the runtime also stops as soon as the
+        // connection has something waiting -- a new job, a new difficulty,
+        // the socket ending -- so the session reads it at once instead of
+        // after the search: a share is not sent on work a job already waiting
+        // has retired, and a job's arrival or an outage is timed when it
+        // happened. One arriving after the last look below and before the
+        // write is the race any share in flight runs with the next job.
         let job = job.clone();
         let extranonce2 = extranonce2.clone();
-        tokio::task::spawn_blocking(move || search(&job, &extranonce1, &extranonce2, true, None))
-            .await
-            .map_err(|error| OfferFailure::unrecorded(error.into()))?
+        let discards = (!scheduled_block).then_some((session, events));
+        let interrupt = (!scheduled_block).then(|| Interrupt {
+            waiting: connection.lines.waiting.clone(),
+            stopping: shared.stopping.clone(),
+        });
+        let searching = interrupt.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            search(
+                &job,
+                &extranonce1,
+                &extranonce2,
+                scheduled_block,
+                discards,
+                searching.as_ref(),
+            )
+        })
+        .await
+        .map_err(|error| OfferFailure::unrecorded(error.into()))?;
+        // Looked at again once a share is found: what arrived since the
+        // search last looked may have retired the job it is on.
+        match found {
+            Searched::Found(..) if interrupt.as_ref().is_some_and(Interrupt::now) => {
+                Searched::Interrupted
+            }
+            found => found,
+        }
     } else {
         search(
             &job,
@@ -1551,14 +1819,19 @@ async fn offer(
             &extranonce2,
             false,
             Some((session, events)),
+            None,
         )
     };
-    let Some((nonce, header)) = found else {
-        return Err(OfferFailure::unrecorded(anyhow::anyhow!(
-            "no {} solution found under job {}",
-            if scheduled_block { "block" } else { "share" },
-            job.job_id
-        )));
+    let (nonce, header) = match found {
+        Searched::Found(nonce, header) => (nonce, header),
+        Searched::Interrupted => return Err(OfferFailure::interrupted()),
+        Searched::Exhausted => {
+            return Err(OfferFailure::unrecorded(anyhow::anyhow!(
+                "no {} solution found under job {}",
+                if scheduled_block { "block" } else { "share" },
+                job.job_id
+            )))
+        }
     };
     let extranonce2_hex = hex::encode(&extranonce2);
     let ntime_hex = format!("{:08x}", job.ntime);
@@ -1623,6 +1896,7 @@ async fn offer(
         return Err(OfferFailure {
             error,
             recorded: true,
+            interrupted: false,
         });
     }
     Ok(())
@@ -1630,13 +1904,41 @@ async fn offer(
 
 /// Find a nonce. Share searches step over any solution that also meets the
 /// network target: an unscheduled block is never submitted, only counted.
+/// How many nonces an interruptible search tries between looks at its
+/// connection.
+const INTERRUPT_CHECK: u32 = 1 << 10;
+
+/// What stops a search off the runtime early: something waiting on the
+/// session's connection, or the run stopping its sessions.
+#[derive(Clone)]
+struct Interrupt {
+    waiting: Arc<AtomicUsize>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl Interrupt {
+    fn now(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst) > 0 || self.stopping.load(Ordering::SeqCst)
+    }
+}
+
+/// What a search came to.
+enum Searched {
+    Found(u32, Vec<u8>),
+    /// Every nonce of its span was tried.
+    Exhausted,
+    /// The connection had something waiting before a solution turned up.
+    Interrupted,
+}
+
 fn search(
     job: &JobState,
     extranonce1: &[u8],
     extranonce2: &[u8],
     want_block: bool,
     discards: Option<(usize, tokio::sync::mpsc::UnboundedSender<Event>)>,
-) -> Option<(u32, Vec<u8>)> {
+    interrupt: Option<&Interrupt>,
+) -> Searched {
     let merkle = merkle_root(
         &job.coinb1,
         extranonce1,
@@ -1654,11 +1956,14 @@ fn search(
     );
     let span = if want_block { u32::MAX } else { NONCE_SPAN };
     for nonce in 0..span {
+        if nonce % INTERRUPT_CHECK == 0 && interrupt.is_some_and(Interrupt::now) {
+            return Searched::Interrupted;
+        }
         header[76..80].copy_from_slice(&nonce.to_le_bytes());
         let hash = codec::double_sha256(&header);
         if want_block {
             if le_at_most(&hash, &job.network_target) {
-                return Some((nonce, header));
+                return Searched::Found(nonce, header);
             }
             continue;
         }
@@ -1671,9 +1976,9 @@ fn search(
             }
             continue;
         }
-        return Some((nonce, header));
+        return Searched::Found(nonce, header);
     }
-    None
+    Searched::Exhausted
 }
 
 async fn write_line(writer: &mut tokio::net::tcp::OwnedWriteHalf, value: &Value) -> Result<()> {

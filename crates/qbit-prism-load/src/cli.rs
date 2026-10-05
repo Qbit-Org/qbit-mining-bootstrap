@@ -103,7 +103,9 @@ impl StratumLimits {
 #[command(
     name = "qbit-prism-load",
     about = "Stratum-to-PostgreSQL load harness and capacity-evidence producer",
-    version
+    version,
+    after_help = "External-target mode, for frontends the harness did not launch: \
+                  `qbit-prism-load external --help` and `qbit-prism-load external-merge --help`."
 )]
 pub struct Args {
     /// `qbit-prism-server` executable. Defaults to the one beside this binary.

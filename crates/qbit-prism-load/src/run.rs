@@ -560,6 +560,9 @@ impl Collected {
             } => self
                 .difficulty_mismatches
                 .push((session, advertised, configured)),
+            // Only an external-target session mines what it is advertised;
+            // the harness's sessions report a disagreement above instead.
+            Event::DifficultyAdvertised { .. } => {}
             Event::Connected { session, .. } => {
                 self.connects += 1;
                 self.holding_work.insert(session);
@@ -669,11 +672,12 @@ fn churn_driver(
             index: 0,
             username: String::new(),
             password: String::new(),
-            share_difficulty,
+            difficulty: client::DifficultySource::Configured(share_difficulty),
             version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
             quiesce_limit,
+            drop_offers_held_while_disconnected: false,
         },
     };
     Ok(crate::churn::ChurnDriver::new(
@@ -1539,6 +1543,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         events: events_tx,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: kill_fence.clone(),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let mut sessions: Vec<SessionHandle> = Vec::with_capacity(args.sessions);
     // One deadline for everything that waits on the server to answer a
@@ -1554,11 +1559,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             index,
             username: profile.username.clone(),
             password,
-            share_difficulty,
+            difficulty: client::DifficultySource::Configured(share_difficulty),
             version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
             quiesce_limit,
+            drop_offers_held_while_disconnected: false,
         };
         sessions.push(client::spawn_session(
             config,

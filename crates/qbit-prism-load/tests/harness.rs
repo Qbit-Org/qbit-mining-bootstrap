@@ -1189,19 +1189,22 @@ async fn serve_stratum(
     }
 }
 
+/// Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share search
+/// costs microseconds even in a debug build.
+const SESSION_DIFFICULTY: f64 = 1.0 / 67_108_864.0;
+
 fn session_config(index: usize) -> client::SessionConfig {
     client::SessionConfig {
         index,
         username: format!("pload1test.s{index:05}"),
         password: "x".into(),
-        // Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share
-        // search costs microseconds even in a debug build.
-        share_difficulty: 1.0 / 67_108_864.0,
+        difficulty: client::DifficultySource::Configured(SESSION_DIFFICULTY),
         version_rolling_mask: codec::VERSION_ROLLING_MASK,
         connect_timeout: std::time::Duration::from_secs(5),
         handshake_timeout: std::time::Duration::from_secs(20),
         // What the run derives from the default 15 s commit timeout.
         quiesce_limit: run::drain_limit(15.0),
+        drop_offers_held_while_disconnected: false,
     }
 }
 
@@ -1237,6 +1240,7 @@ async fn quiesced_submit(
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let config = client::SessionConfig {
         quiesce_limit,
@@ -1302,6 +1306,7 @@ async fn a_reconnect_across_several_failed_attempts_reports_the_whole_outage() -
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(session_config(0), 0, server.address.clone(), shared, 1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1390,6 +1395,7 @@ async fn a_disconnected_session_flushes_its_census_through_the_collector() -> Re
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(session_config(0), 0, "127.0.0.1:1".into(), shared, 1);
     assert!(handle.try_offer(1, &Arc::from("mid_flight_kill")));
@@ -1436,6 +1442,7 @@ async fn work_that_reaches_a_disconnected_session_is_reported_not_dropped() -> R
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     // Nothing listens on port 1, so the session never holds a connection.
     let handle = client::spawn_session(session_config(3), 1, "127.0.0.1:1".into(), shared, 1);
@@ -1562,6 +1569,7 @@ async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1639,6 +1647,7 @@ async fn a_reconnect_is_attributed_to_the_phase_that_asked_for_it() -> Result<()
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1711,7 +1720,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
 
     // The observation: a session reports the disagreement with the values
     // on both sides, and still connects and holds work.
-    let configured = session_config(0).share_difficulty;
+    let configured = SESSION_DIFFICULTY;
     let server = fake_stratum_with(StratumOptions {
         advertised_difficulty: Some(configured / 2.0),
         ..Default::default()
@@ -1723,6 +1732,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -6180,6 +6190,7 @@ async fn a_socket_closed_before_the_kill_is_not_stamped_as_kill_induced() -> Res
         events,
         record_notifies: AtomicBool::new(false),
         kill_fence: kill_fence.clone(),
+        stopping: Arc::new(AtomicBool::new(false)),
     });
     // The session gets its own single-threaded runtime on its own thread. The
     // gate below parks the session task on a `std` lock, and a parked thread

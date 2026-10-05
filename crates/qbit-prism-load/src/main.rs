@@ -2,7 +2,7 @@
 //! and produce a capacity-evidence artifact plus a side report.
 
 use clap::Parser;
-use qbit_prism_load::{cli::Args, frontend, preset, run};
+use qbit_prism_load::{cli::Args, external, frontend, preset, run};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -12,21 +12,28 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // External-target mode has a command line of its own, read before the
+    // preset expansion below: its flags are not the harness's, so no preset
+    // pins them and none can be added to them.
+    if let Some(command) = external::Command::of(&argv) {
+        // Kept until the process exits: dropping a runtime waits for its
+        // blocking tasks, and the stats are already written by then.
+        let runtime = runtime();
+        let code = runtime.block_on(external::main(command, argv));
+        match code {
+            Ok(code) => std::process::exit(code),
+            Err(error) => fail(error),
+        }
+    }
     // A `--preset` file's flags join the command line before clap reads it,
     // so a flag the preset pins cannot be given twice (#521).
-    let (argv, preset) = match preset::expand_command_line(std::env::args_os().collect()) {
+    let (argv, preset) = match preset::expand_command_line(argv) {
         Ok(expanded) => expanded,
         Err(error) => fail(error),
     };
     let args = Args::parse_from(argv);
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("prism-load")
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => fail(error.into()),
-    };
+    let runtime = runtime();
     // The harness owns child processes and two PostgreSQL clusters. A signal
     // must unwind through the same teardown as a normal exit, so it cancels
     // the run rather than killing the process where it stands.
@@ -42,6 +49,17 @@ fn main() {
     match code {
         Ok(code) => std::process::exit(code),
         Err(error) => fail(error),
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("prism-load")
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => fail(error.into()),
     }
 }
 

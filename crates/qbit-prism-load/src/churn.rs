@@ -542,7 +542,7 @@ impl ChurnDriver {
                 index,
                 username: format!("{}.rent{rental:05}", self.template.address),
                 password: self.template.password.clone(),
-                share_difficulty: self.template.share_difficulty,
+                difficulty: client::DifficultySource::Configured(self.template.share_difficulty),
                 ..self.template.config.clone()
             };
             self.rentals[rental] = Some(client::spawn_session(
