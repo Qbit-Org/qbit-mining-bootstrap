@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicUsize},
     Mutex as StdMutex,
 };
-use submit_ledger::CommitGate;
+use submit_ledger::{Appended, CommitGate};
 
 mod admission_races;
 mod authority_lease;
@@ -20,6 +20,7 @@ mod compact_authority;
 mod compact_prepared;
 mod config;
 mod credit;
+mod fence_capture;
 mod interleavings;
 mod observations;
 mod prepared_expiry;
@@ -67,6 +68,10 @@ pub(crate) struct MemoryLedger {
     pub fail_commit: StdMutex<Option<FailCommit>>,
     /// Appends dropped before they returned, as an aborted task is.
     pub cancelled: AtomicUsize,
+    /// #657: block-bearing appends the revision fence captured instead:
+    /// the deferred share, the credited candidate it carried, and the
+    /// revision the fence read.
+    pub captures: StdMutex<Vec<(AcceptedShare, Candidate, i64)>>,
 }
 
 /// An indeterminate COMMIT failure: the reply was lost, before or after the
@@ -94,18 +99,45 @@ impl MemoryLedger {
         mut share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
+        moved: crate::ledger::MovedRevision,
         commit: &CommitGate,
-    ) -> Result<bool> {
+    ) -> Result<Appended> {
         let gate = self.append_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        // Model the production atomic append fence, not share decisions.
-        ensure!(
-            revision == self.revision.load(Ordering::SeqCst),
-            "payout revision changed"
-        );
+        // Model the production atomic append fence, not share decisions: a
+        // moved revision refuses a plain share before any write, and a
+        // block-bearing share captures its block instead when capture is on
+        // (#657).
+        let current = self.revision.load(Ordering::SeqCst);
+        if revision != current {
+            let Some(candidate) =
+                candidate.filter(|_| moved == crate::ledger::MovedRevision::Capture)
+            else {
+                return Err(crate::ledger::PayoutRevisionChanged {
+                    expected: revision,
+                    observed: current,
+                }
+                .into());
+            };
+            if !commit.begin_commit() {
+                return Err(crate::ledger::CommitGateClosed.into());
+            }
+            let (failure, lost) = self.commit_in_flight().await;
+            if matches!(failure, Some(FailCommit::NotRecorded)) {
+                return Err(lost.into());
+            }
+            self.captures
+                .lock()
+                .unwrap()
+                .push((share, candidate, current));
+            if matches!(failure, Some(FailCommit::Recorded)) {
+                return Err(lost.into());
+            }
+            return Ok(Appended::Captured);
+        }
         let existing = self
             .records
             .lock()
@@ -121,32 +153,41 @@ impl MemoryLedger {
         // Model the production pre-commit hook: every statement has run.
         if !commit.begin_commit() {
             if existing.is_some() && candidate.is_none() {
-                return Ok(false);
+                return Ok(Appended::Recorded);
             }
             return Err(crate::ledger::CommitGateClosed.into());
         }
-        let gate = self.commit_gate.lock().unwrap().take();
-        if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
-        }
-        let failure = self.fail_commit.lock().unwrap().take();
-        let lost = || sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into());
+        let (failure, lost) = self.commit_in_flight().await;
         if matches!(failure, Some(FailCommit::NotRecorded)) {
-            return Err(lost().into());
+            return Err(lost.into());
         }
         let mut records = self.records.lock().unwrap();
         if records
             .iter()
             .any(|(old, _, _)| old.share_id == share.share_id)
         {
-            return Ok(false);
+            return Ok(Appended::Recorded);
         }
         records.push((share, candidate, revision));
         if matches!(failure, Some(FailCommit::Recorded)) {
-            return Err(lost().into());
+            return Err(lost.into());
         }
-        Ok(true)
+        Ok(Appended::Inserted)
+    }
+
+    /// COMMIT in flight: hold at `commit_gate` if one is set, then take the
+    /// planned failure of this COMMIT and the error a lost reply surfaces as.
+    async fn commit_in_flight(&self) -> (Option<FailCommit>, sqlx::Error) {
+        let gate = self.commit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let failure = self.fail_commit.lock().unwrap().take();
+        (
+            failure,
+            sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+        )
     }
 }
 
@@ -172,10 +213,30 @@ impl submit_ledger::SubmitLedger for MemoryLedger {
         candidate: Option<Candidate>,
         revision: i64,
         gate: Arc<CommitGate>,
-    ) -> BoxFuture<'_, Result<bool>> {
+    ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            crate::ledger::MovedRevision::Refuse,
+            gate,
+        )
+    }
+    fn append_at_revision_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        _proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        moved: crate::ledger::MovedRevision,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
         Box::pin(async move {
             let mut probe = CancelProbe(&self.cancelled, false);
-            let result = self.append_gated(share, candidate, revision, &gate).await;
+            let result = self
+                .append_gated(share, candidate, revision, moved, &gate)
+                .await;
             probe.1 = true;
             result
         })

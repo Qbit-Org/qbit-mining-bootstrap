@@ -30,7 +30,6 @@ mod candidates;
 #[cfg(test)]
 pub(crate) use candidates::faults as candidate_faults;
 mod claim_observer;
-use candidates::prepare_candidate_observed;
 pub use candidates::revoke_candidate_claims;
 pub use candidates::{
     adoption_evidence, authenticate_landed_audit, build_claim_parts,
@@ -40,6 +39,7 @@ pub use candidates::{
     ADOPTED_OFFER_REPLY_PREFIX, LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX,
     ORPHANED_STATE, SIDE_CHAIN_REPLIES,
 };
+use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
 mod connect;
 pub(crate) use connect::shielded_begin;
 use connect::{require_revision, writable};
@@ -76,7 +76,6 @@ pub use migration::{
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
-pub use window::CommitGateClosed;
 pub use window::{
     probe_share_rows, probe_window_holding, put_balance_snapshot, read_range_paged, AppendResult,
     BalanceSource, ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot,
@@ -87,6 +86,7 @@ pub(crate) use window::{
     AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
     RetainedShares, SnapshotCapture, WRITER_TIMELINE_SQL,
 };
+pub use window::{CommitGateClosed, MovedRevision, PayoutRevisionChanged};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;

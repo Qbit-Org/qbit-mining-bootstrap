@@ -17,6 +17,11 @@ const ACCEPTED_CUTOFF_SQL: &str =
 pub struct AppendResult {
     pub share: AcceptedShare,
     pub inserted: bool,
+    /// #657: the fenced append found the payout revision moved past
+    /// `expected_revision` and captured its candidate instead. The block is
+    /// enqueued as a #478 capture with `share` deferred, credited only if the
+    /// block confirms. No share was appended, so `inserted` is false.
+    pub captured: bool,
 }
 
 /// The pre-commit hook of [`Ledger::append_at_revision_gated`] refused COMMIT.
@@ -31,6 +36,43 @@ impl std::fmt::Display for CommitGateClosed {
 }
 
 impl std::error::Error for CommitGateClosed {}
+
+/// The share append's payout-revision fence refused a share without a
+/// candidate: the revision moved between the submit check that admitted it
+/// at `expected` and the append's read under `ORDER_LOCK`. It is raised
+/// before any write, and the transaction is rolled back. An append that
+/// carries a block is never refused this way; its block is captured instead
+/// (#657, [`AppendResult::captured`]).
+#[derive(Debug)]
+pub struct PayoutRevisionChanged {
+    pub expected: i64,
+    pub observed: i64,
+}
+
+impl std::fmt::Display for PayoutRevisionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "payout revision changed before share commit: admitted at {}, now {}",
+            self.expected, self.observed
+        )
+    }
+}
+
+impl std::error::Error for PayoutRevisionChanged {}
+
+/// What a fenced append that carries a block does when the payout revision
+/// moved after the share's submit check (#657).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MovedRevision {
+    /// Refuse before any write, with [`PayoutRevisionChanged`], as an append
+    /// without a block always is.
+    Refuse,
+    /// Capture the block, its share deferred: the #478 capture the submit
+    /// check itself makes when capture is on
+    /// (`PRISM_CAPTURE_OVERPAY_CEILING_BPS` > 0).
+    Capture,
+}
 
 /// A transition was refused before any write, with its original chain epoch
 /// unchanged and its predecessor still accepted. Only a new coherent proof
@@ -522,7 +564,7 @@ impl Ledger {
         share: AcceptedShare,
         candidate: Option<Candidate>,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, None, None, None)
+        self.append_checked(share, candidate, None, None, None, MovedRevision::Refuse)
             .await
     }
 
@@ -532,8 +574,15 @@ impl Ledger {
         candidate: Option<Candidate>,
         expected_revision: i64,
     ) -> Result<AppendResult> {
-        self.append_checked(share, candidate, None, Some(expected_revision), None)
-            .await
+        self.append_checked(
+            share,
+            candidate,
+            None,
+            Some(expected_revision),
+            None,
+            MovedRevision::Refuse,
+        )
+        .await
     }
 
     /// [`Ledger::append_at_revision`] with a last-moment veto over COMMIT.
@@ -557,13 +606,15 @@ impl Ledger {
             None,
             Some(expected_revision),
             Some(pre_commit),
+            MovedRevision::Refuse,
         )
         .await
     }
 
     /// [`Ledger::append_at_revision_gated`], recording when the candidate's
     /// locally validated proof was observed (a wall clock, UNIX ms); see
-    /// `ClaimLifecycle::proof_observed_at_ms`.
+    /// `ClaimLifecycle::proof_observed_at_ms`. `moved` decides what a
+    /// candidate-bearing append does when the revision moved (#657).
     pub async fn append_at_revision_gated_observed(
         &self,
         share: AcceptedShare,
@@ -571,6 +622,7 @@ impl Ledger {
         proof_observed_at_ms: Option<i64>,
         expected_revision: i64,
         pre_commit: &(dyn Fn() -> bool + Send + Sync),
+        moved: MovedRevision,
     ) -> Result<AppendResult> {
         self.append_checked(
             share,
@@ -578,6 +630,7 @@ impl Ledger {
             proof_observed_at_ms,
             Some(expected_revision),
             Some(pre_commit),
+            moved,
         )
         .await
     }
@@ -589,6 +642,7 @@ impl Ledger {
         proof_observed_at_ms: Option<i64>,
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
+        moved: MovedRevision,
     ) -> Result<AppendResult> {
         // The ACK path is the incident path. A block-solving share's candidate
         // is serialized, digested and checked here, before the transaction
@@ -602,7 +656,17 @@ impl Ledger {
                 "credited candidates cannot also contain a deferred share"
             );
         }
+        // A fenced append that may capture prepares its candidate's capture
+        // form too (#657): if the payout revision moved after the share's
+        // submit check, the append writes the capture instead of losing the
+        // block to the fence.
         let prepared = match candidate {
+            Some(candidate) if expected_revision.is_some() && moved == MovedRevision::Capture => {
+                Some(
+                    prepare_fenced_candidate(candidate, proof_observed_at_ms, share.clone())
+                        .await?,
+                )
+            }
             Some(candidate) => {
                 Some(prepare_candidate_observed(candidate, proof_observed_at_ms).await?)
             }
@@ -697,18 +761,78 @@ impl Ledger {
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Append)
             .await?;
         writable(&mut tx).await?;
+        // The payout-revision fence: `Some((expected, observed))` when a
+        // settlement moved the revision between the share's submit check and
+        // this read, and the append captures its block (#657).
+        let mut moved = None;
         if let Some(expected) = expected_revision {
             let revision:i64=sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL FOR SHARE").fetch_one(&mut *tx).await?;
-            ensure!(
-                revision == expected,
-                "payout revision changed before share commit"
-            );
+            if revision != expected {
+                // A plain share, or a block-bearing one when capture is off,
+                // is refused here, before any write. A block-bearing share
+                // with capture on is not: this transaction enqueues its block
+                // as the #478 capture its submit check makes when it sees a
+                // superseded revision, the share deferred until the block
+                // confirms. Whether the block's parent is still the tip is the
+                // offer's to decide, as for any capture: it probes the chain
+                // and abandons a superseded parent. The capture-or-credit
+                // decision is taken under this ORDER_LOCK and this FOR SHARE
+                // read, so the attempt commits the credited share with its
+                // candidate or the capture, never both.
+                if !prepared.is_some_and(|prepared| prepared.has_capture()) {
+                    return Err(PayoutRevisionChanged {
+                        expected,
+                        observed: revision,
+                    }
+                    .into());
+                }
+                moved = Some((expected, revision));
+            }
         }
-        let result = self.append_in(&mut tx, share).await?;
-        if let Some(prepared) = prepared {
-            self.persist_prepared_candidate(&mut tx, prepared, Some(&result.share.share_id))
+        let result = match (moved, prepared) {
+            (Some(_), Some(prepared)) => {
+                // A resubmitted proof whose share is already recorded is a
+                // duplicate, and enqueues nothing: the probe and answer of a
+                // capture at the submit check (`persist_block_only`).
+                let recorded: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
+                )
+                .bind(&share.share_id)
+                .fetch_one(&mut *tx)
                 .await?;
-        }
+                if recorded {
+                    if let Err(error) = tx.rollback().await {
+                        tracing::debug!(%error, "rollback after a recorded share failed");
+                    }
+                    return Ok(AppendResult {
+                        share,
+                        inserted: false,
+                        captured: false,
+                    });
+                }
+                // An identical capture already enqueued writes nothing and
+                // reports `captured: false`: a duplicate, as the block-only
+                // path answers an existing outbox row.
+                let captured = self.persist_prepared_capture(&mut tx, prepared).await?;
+                AppendResult {
+                    share,
+                    inserted: false,
+                    captured,
+                }
+            }
+            _ => {
+                let result = self.append_in(&mut tx, share).await?;
+                if let Some(prepared) = prepared {
+                    self.persist_prepared_candidate(
+                        &mut tx,
+                        prepared,
+                        Some(&result.share.share_id),
+                    )
+                    .await?;
+                }
+                result
+            }
+        };
         if pre_commit.is_some_and(|allow| !allow()) {
             // Release ORDER_LOCK before the refusal is observed.
             if let Err(error) = tx.rollback().await {
@@ -723,6 +847,15 @@ impl Ledger {
             return Err(CommitGateClosed.into());
         }
         tx.commit().await?;
+        if let (Some((admitted, observed)), true) = (moved, result.captured) {
+            tracing::warn!(
+                block = %prepared.map(|prepared| prepared.block_hash()).unwrap_or_default(),
+                share_id = %result.share.share_id,
+                admitted_revision = admitted,
+                payout_revision = observed,
+                "payout revision moved before a block-bearing share's commit; captured the block, its share deferred until the block confirms (#657)"
+            );
+        }
         Ok(result)
     }
 
@@ -834,6 +967,7 @@ impl Ledger {
             return Ok(AppendResult {
                 share: previous,
                 inserted: false,
+                captured: false,
             });
         }
         ensure!(
@@ -867,6 +1001,7 @@ impl Ledger {
         Ok(AppendResult {
             share,
             inserted: true,
+            captured: false,
         })
     }
 
