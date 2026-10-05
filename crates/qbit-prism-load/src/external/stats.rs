@@ -116,8 +116,11 @@ impl Tally {
         Ok(())
     }
 
-    pub fn total(&self) -> u64 {
-        self.counts.values().sum::<u64>() + self.other
+    /// Every occurrence counted, or `None` past `u64::MAX`.
+    pub fn total(&self) -> Option<u64> {
+        self.counts
+            .values()
+            .try_fold(self.other, |total, count| total.checked_add(*count))
     }
 }
 
@@ -151,18 +154,31 @@ struct RejectionEntry {
 
 impl Rejections {
     pub fn add(&mut self, rejection: &Rejection, count: u64) {
+        // The collector adds one at a time: no run reaches u64::MAX.
+        let _ = self.add_checked(rejection, count);
+    }
+
+    fn add_checked(&mut self, rejection: &Rejection, count: u64) -> Result<()> {
         let key = (
             rejection.code,
             rejection.reason_id.clone(),
             rejection.message.clone(),
         );
         if let Some(held) = self.counts.get_mut(&key) {
-            *held += count;
+            *held = sum(*held, count, "a rejection count")?;
         } else if self.counts.len() < REJECTION_KEYS {
             self.counts.insert(key, count);
         } else {
-            self.other += count;
+            self.other = sum(self.other, count, "a rejection count")?;
         }
+        Ok(())
+    }
+
+    /// Every rejection counted, or `None` past `u64::MAX`.
+    pub fn total(&self) -> Option<u64> {
+        self.counts
+            .values()
+            .try_fold(self.other, |total, count| total.checked_add(*count))
     }
 
     pub fn merge(&mut self, other: &Self) -> Result<()> {
@@ -201,9 +217,10 @@ impl Rejections {
     pub fn by_class(&self) -> BTreeMap<String, u64> {
         let mut classes = BTreeMap::new();
         for ((code, reason_id, message), count) in &self.counts {
-            *classes
+            let held = classes
                 .entry(class_of(*code, reason_id, message).to_owned())
-                .or_insert(0) += count;
+                .or_insert(0u64);
+            *held = held.saturating_add(*count);
         }
         if self.other > 0 {
             classes.insert("unclassified".into(), self.other);
@@ -250,14 +267,14 @@ impl TryFrom<RejectionsWire> for Rejections {
             ..Self::default()
         };
         for entry in wire.by_reason {
-            rejections.add(
+            rejections.add_checked(
                 &Rejection {
                     code: entry.code,
                     reason_id: entry.reason_id,
                     message: entry.message,
                 },
                 entry.count,
-            );
+            )?;
         }
         Ok(rejections)
     }
@@ -614,6 +631,96 @@ impl Totals {
                 second.dispatched.checked_add(second.shortfall) == Some(second.offered),
                 "second {}: offers dispatched and shortfall do not add up to the offers made",
                 second.unix_second
+            );
+        }
+        // Each of these is counted twice by the one event that makes it, so
+        // the two always agree: a document where they do not was damaged.
+        // Agreeing with a counter that fits also bounds every sum the
+        // summary takes over them.
+        let column = |pick: fn(&Second) -> u64| {
+            self.timeline
+                .seconds()
+                .try_fold(0u64, |total, second| total.checked_add(pick(second)))
+        };
+        let identities = [
+            (
+                "timeline offered",
+                column(|s| s.offered),
+                self.offers_minted,
+            ),
+            (
+                "timeline dispatched",
+                column(|s| s.dispatched),
+                self.offers_dispatched,
+            ),
+            (
+                "timeline shortfall",
+                column(|s| s.shortfall),
+                self.offers_shortfall,
+            ),
+            ("timeline accepted", column(|s| s.accepted), self.accepted),
+            ("timeline rejected", column(|s| s.rejected), self.rejected),
+            (
+                "timeline no_response",
+                column(|s| s.no_response),
+                self.no_response(),
+            ),
+            (
+                "timeline disconnects",
+                column(|s| s.disconnects),
+                self.disconnects,
+            ),
+            (
+                "rejections by reason",
+                self.rejections.total(),
+                self.rejected,
+            ),
+            (
+                "no-response reasons",
+                self.no_response_reasons.total(),
+                self.no_response(),
+            ),
+            (
+                "disconnect causes",
+                self.disconnect_causes.total(),
+                self.disconnects,
+            ),
+            (
+                "initial connect errors",
+                self.initial_connect_errors.total(),
+                self.initial_connect_failures,
+            ),
+            (
+                "reconnect errors",
+                self.reconnect_errors.total(),
+                self.reconnect_failed_attempts,
+            ),
+            (
+                "ack_latency samples",
+                Some(self.ack_latency.count()),
+                self.accepted,
+            ),
+            (
+                "rejection_latency samples",
+                Some(self.rejection_latency.count()),
+                self.rejected,
+            ),
+            (
+                "reconnect_outage samples",
+                Some(self.reconnect_outage.count()),
+                self.reconnects_completed,
+            ),
+            (
+                "time_to_first_job samples",
+                Some(self.time_to_first_job.count()),
+                self.initial_connections,
+            ),
+        ];
+        for (what, counted, total) in identities {
+            ensure!(
+                counted == Some(total),
+                "{what} add up to {}, not the {total} the totals count",
+                counted.map_or_else(|| "more than u64::MAX".to_owned(), |c| c.to_string())
             );
         }
         Ok(())
@@ -1149,33 +1256,31 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
             .with_context(|| format!("{} holds inconsistent totals", path.display()))?;
         // Each process's own counts are the totals' share of it: the
         // summary reads rates from the one and counts from the other.
+        let own = |pick: fn(&Process) -> u64| {
+            these
+                .iter()
+                .try_fold(0u64, |total, process| total.checked_add(pick(process)))
+        };
         for (name, own, total) in [
-            (
-                "accepted",
-                these.iter().map(|p| p.accepted).sum::<u64>(),
-                these_totals.accepted,
-            ),
-            (
-                "rejected",
-                these.iter().map(|p| p.rejected).sum(),
-                these_totals.rejected,
-            ),
+            ("accepted", own(|p| p.accepted), these_totals.accepted),
+            ("rejected", own(|p| p.rejected), these_totals.rejected),
             (
                 "no_response",
-                these.iter().map(|p| p.no_response).sum(),
+                own(|p| p.no_response),
                 these_totals.no_response(),
             ),
             (
                 "offers_minted",
-                these.iter().map(|p| p.offers_minted).sum(),
+                own(|p| p.offers_minted),
                 these_totals.offers_minted,
             ),
         ] {
             ensure!(
-                own == total,
-                "{} holds inconsistent totals: its processes' {name} add up to {own}, its totals \
+                own == Some(total),
+                "{} holds inconsistent totals: its processes' {name} add up to {}, its totals \
                  say {total}",
-                path.display()
+                path.display(),
+                own.map_or_else(|| "more than u64::MAX".to_owned(), |own| own.to_string())
             );
         }
         processes.extend(these);

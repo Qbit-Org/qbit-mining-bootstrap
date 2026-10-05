@@ -197,14 +197,20 @@ impl TryFrom<Wire> for LogHistogram {
             SIGNIFICANT_BITS
         );
         let mut buckets = BTreeMap::new();
+        let mut counted = 0u64;
         for (lower, count) in wire.buckets {
             ensure!(
                 bucket_lower_bound(lower) == lower,
                 "{lower} is not a bucket lower bound at {SIGNIFICANT_BITS} significant bits"
             );
-            *buckets.entry(lower).or_insert(0) += count;
+            let held: &mut u64 = buckets.entry(lower).or_insert(0);
+            *held = held
+                .checked_add(count)
+                .context("a histogram bucket's count overflows")?;
+            counted = counted
+                .checked_add(count)
+                .context("a histogram's bucket counts overflow")?;
         }
-        let counted: u64 = buckets.values().sum();
         ensure!(
             counted == wire.count,
             "the histogram's buckets hold {counted} samples, but it says {}",

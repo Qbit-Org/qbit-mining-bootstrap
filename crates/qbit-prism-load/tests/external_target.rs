@@ -453,6 +453,11 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
     let mut broken = wire.clone();
     broken["sum"] = json!(0);
     assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
+    // And buckets whose counts overflow as they are added up.
+    let mut broken = wire.clone();
+    broken["buckets"] = json!([[100, u64::MAX], [100, 1]]);
+    broken["count"] = json!(0);
+    assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
     let empty = LogHistogram::default().summary("test");
     assert_eq!(empty["samples"], json!(0));
     assert!(empty["p99"].is_null());
@@ -736,10 +741,7 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         .enumerate()
         .map(|(index, path)| {
             let mut huge = read(path);
-            huge["totals"]["offers_minted"] = json!(u64::MAX);
-            huge["totals"]["offers_dispatched"] = json!(u64::MAX);
-            huge["totals"]["offers_shortfall"] = json!(0);
-            huge["processes"][0]["offers_minted"] = json!(u64::MAX);
+            huge["totals"]["notifies"] = json!(u64::MAX);
             let out = scratch.path(&format!("huge-{index}.json"));
             external::write_document(&out, &huge).unwrap();
             out
@@ -747,7 +749,8 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         .collect();
     let error = format!("{:#}", external::merge_files(&huge).unwrap_err());
     assert!(error.contains("overflows"), "{error}");
-    // And one whose counters fit apart but not in the sums it reports.
+    // And one whose counters fit apart but not in the sums it reports, or
+    // with the timeline and histograms that count the same events.
     let mut sums = read(&a);
     let rejected = sums["totals"]["rejected"].as_u64().unwrap() + 1;
     sums["totals"]["accepted"] = json!(u64::MAX);
@@ -760,7 +763,31 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         "{:#}",
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
-    assert!(error.contains("add up past"), "{error}");
+    assert!(error.contains("inconsistent totals"), "{error}");
+    // A count the timeline does not hold, and a rejection tally rebuilt past
+    // u64::MAX from repeated triples.
+    let mut timeline = read(&a);
+    let accepted = timeline["totals"]["accepted"].as_u64().unwrap();
+    timeline["totals"]["accepted"] = json!(accepted + 1);
+    timeline["processes"][0]["accepted"] = json!(accepted + 1);
+    let path = scratch.path("timeline.json");
+    external::write_document(&path, &timeline)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("timeline accepted"), "{error}");
+    let mut triples = read(&a);
+    let triple = json!({"code": 21, "reason_id": "stale-job", "message": "stale job",
+                        "count": u64::MAX});
+    triples["totals"]["rejections"]["by_reason"] = json!([triple.clone(), triple]);
+    let path = scratch.path("triples.json");
+    external::write_document(&path, &triples)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("overflows"), "{error}");
     let mut damaged = read(&a);
     damaged["processes"][0]["accepted"] = json!(123_456_789u64);
     let path = scratch.path("damaged-process.json");
