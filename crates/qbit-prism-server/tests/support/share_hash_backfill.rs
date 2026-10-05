@@ -451,7 +451,7 @@ async fn migration_002_fences_earlier_builds_until_its_backfill_is_recorded() ->
         .await?;
     // A resume maps under the fence: seen while a batch waits on an open
     // insert.
-    let mut blocker = block_late_header(&pool).await?;
+    let blocker = block_late_header(&pool).await?;
     sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
         .bind(RUNNER_LOCK_CLASS)
         .execute(&mut runners)
