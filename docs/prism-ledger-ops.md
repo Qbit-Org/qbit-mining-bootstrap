@@ -1552,8 +1552,8 @@ A held block looks like any other pending candidate:
 `qbit_prism_block_candidates_pending` and
 `qbit_prism_block_candidate_oldest_pending_seconds` count and age it,
 `candidates list` shows it `pending`, and the pending-candidate alerts fire as
-they would for a stuck outbox. Before any block is found, `PrismBlockSubmissionHeld`
-pages a minute after each held frontend starts, because
+they would for a stuck outbox. `PrismBlockSubmissionHeld` pages a minute after
+each held frontend starts, independently of any found block, because
 `qbit_prism_block_submission_enabled` is not 1 (#666). All of that is expected
 during a rehearsal. Scrape the rehearsal's frontends under another job or
 network, or silence `PrismBlockSubmissionHeld` and the pending-candidate alerts
