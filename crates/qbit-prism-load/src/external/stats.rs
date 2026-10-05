@@ -1086,6 +1086,37 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
         these_totals
             .check()
             .with_context(|| format!("{} holds inconsistent totals", path.display()))?;
+        // Each process's own counts are the totals' share of it: the
+        // summary reads rates from the one and counts from the other.
+        for (name, own, total) in [
+            (
+                "accepted",
+                these.iter().map(|p| p.accepted).sum::<u64>(),
+                these_totals.accepted,
+            ),
+            (
+                "rejected",
+                these.iter().map(|p| p.rejected).sum(),
+                these_totals.rejected,
+            ),
+            (
+                "no_response",
+                these.iter().map(|p| p.no_response).sum(),
+                these_totals.no_response(),
+            ),
+            (
+                "offers_minted",
+                these.iter().map(|p| p.offers_minted).sum(),
+                these_totals.offers_minted,
+            ),
+        ] {
+            ensure!(
+                own == total,
+                "{} holds inconsistent totals: its processes' {name} add up to {own}, its totals \
+                 say {total}",
+                path.display()
+            );
+        }
         processes.extend(these);
         totals.merge(&these_totals);
     }

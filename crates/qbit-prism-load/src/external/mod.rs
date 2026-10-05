@@ -1026,7 +1026,12 @@ async fn drive(
             offers.minted += 1;
             let placed = !saturated && place(sessions, holding, &mut cursor, &phase);
             saturated = !placed;
-            let tally = offers.per_second.entry(second).or_insert((0, 0));
+            // Each offer in the wall-clock second it was placed in, which a
+            // large catch-up batch can carry past the tick's own.
+            let tally = offers
+                .per_second
+                .entry(anchor.unix_second(Instant::now()))
+                .or_insert((0, 0));
             tally.0 += 1;
             if placed {
                 offers.dispatched += 1;

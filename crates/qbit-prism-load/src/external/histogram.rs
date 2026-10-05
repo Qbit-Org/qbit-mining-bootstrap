@@ -214,6 +214,15 @@ impl TryFrom<Wire> for LogHistogram {
                 "a histogram's min {min} and max {max} are not its lowest and highest buckets' \
                  samples"
             );
+            // And the sum lies between count x min and count x max; both
+            // bounds saturate as the sum does.
+            ensure!(
+                wire.sum >= min.saturating_mul(wire.count)
+                    && wire.sum <= max.saturating_mul(wire.count),
+                "a histogram's sum {} is not one of {} samples between {min} and {max}",
+                wire.sum,
+                wire.count
+            );
         }
         Ok(Self {
             buckets,

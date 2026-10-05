@@ -449,6 +449,10 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
         broken["max"] = max;
         assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
     }
+    // So is a sum no set of its samples could have.
+    let mut broken = wire.clone();
+    broken["sum"] = json!(0);
+    assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
     let empty = LogHistogram::default().summary("test");
     assert_eq!(empty["samples"], json!(0));
     assert!(empty["p99"].is_null());
@@ -726,6 +730,15 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
     assert!(error.contains("count it twice"), "{error}");
     // A damaged document is refused with the reason, not merged into
     // figures it would corrupt.
+    let mut damaged = read(&a);
+    damaged["processes"][0]["accepted"] = json!(123_456_789u64);
+    let path = scratch.path("damaged-process.json");
+    external::write_document(&path, &damaged)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("processes' accepted"), "{error}");
     for (field, value, needle) in [
         ("offers_shortfall", json!(1_000_000_000u64), "do not add up"),
         (
