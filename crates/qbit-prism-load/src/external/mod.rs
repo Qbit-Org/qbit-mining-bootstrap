@@ -654,7 +654,7 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     };
     let mut window = None;
     let mut minted = Offers::default();
-    let ended = if let Some(reason) = shutdown.requested() {
+    let mut ended = if let Some(reason) = shutdown.requested() {
         format!("interrupted: {reason} before the load started")
     } else if holding_at_start == 0 {
         format!(
@@ -784,6 +784,13 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         second.shortfall += offered - dispatched;
     }
 
+    // A stop asked for after the window ran its length -- a signal, or the
+    // stats falling behind -- still cut the drain short: the run says so.
+    if ended == "completed" {
+        if let Some(reason) = shutdown.requested() {
+            ended = format!("interrupted during the drain: {reason}");
+        }
+    }
     let exit_code = if ended.starts_with("interrupted") {
         EXIT_ABORTED
     } else if ended.starts_with("blocked") {
@@ -1037,24 +1044,30 @@ async fn drive(
         // Once a scan finds no session free, the rest of this tick's offers
         // are shortfall without scanning again, so an outage costs one pass
         // over the sessions a tick rather than one per offer.
-        let mut saturated = false;
         let minting = offers.minted < want;
         while offers.minted < want {
-            offers.minted += 1;
-            let placed = !saturated && place(sessions, holding, &mut cursor, &phase);
-            saturated = !placed;
+            let placed = place(sessions, holding, &mut cursor, &phase);
             // Each offer in the wall-clock second it was placed in, which a
             // large catch-up batch can carry past the tick's own.
             let tally = offers
                 .per_second
                 .entry(anchor.unix_second(Instant::now()))
                 .or_insert((0, 0));
-            tally.0 += 1;
             if placed {
+                offers.minted += 1;
                 offers.dispatched += 1;
+                tally.0 += 1;
                 tally.1 += 1;
             } else {
-                offers.shortfall += 1;
+                // No session is free: every offer still due this tick is
+                // shortfall, counted at once rather than one at a time, so
+                // even a tick hours late -- a suspended process -- costs one
+                // pass over the sessions.
+                let rest = want - offers.minted;
+                offers.minted = want;
+                offers.shortfall += rest;
+                tally.0 += rest;
+                break;
             }
         }
         // After the loop, which a large catch-up can make take a while.

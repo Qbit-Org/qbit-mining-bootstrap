@@ -1244,6 +1244,16 @@ impl Process {
             "a difficulty ceiling of {}",
             self.max_difficulty
         );
+        // Load is only offered inside a window, so counts need one to be
+        // rated over.
+        let loaded = self.offers_minted > 0
+            || self.accepted > 0
+            || self.rejected > 0
+            || self.no_response > 0;
+        ensure!(
+            !loaded || self.window.as_ref().is_some_and(|w| w.seconds > 0.0),
+            "load counts with no window of positive length to rate them over"
+        );
         if let Some(window) = &self.window {
             // A window runs its length, or past it by a late last tick; its
             // seconds are its ends' difference, taken without overflow.
