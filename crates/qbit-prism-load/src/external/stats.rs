@@ -1280,15 +1280,6 @@ impl Process {
             "a difficulty ceiling of {}",
             self.max_difficulty
         );
-        // The token bucket mints at most rate x length; one more covers the
-        // floating point it is computed in.
-        ensure!(
-            (self.offers_minted as f64) <= (self.rate * self.duration_seconds as f64).floor() + 1.0,
-            "{} offers minted, more than {} offers a second for {} s make",
-            self.offers_minted,
-            self.rate,
-            self.duration_seconds
-        );
         // Load is only offered inside a window, so counts need one to be
         // rated over.
         let loaded = self.offers_minted > 0
@@ -1318,6 +1309,19 @@ impl Process {
                 self.duration_seconds
             );
         }
+        // Once the window is known to be one a run makes: the token bucket
+        // mints at most rate x the window it ran, which a stop can cut short
+        // of the configured length; one more covers the floating point it is
+        // computed in.
+        let minted_for = self.window.as_ref().map_or(0.0, |window| {
+            window.seconds.min(self.duration_seconds as f64)
+        });
+        ensure!(
+            (self.offers_minted as f64) <= (self.rate * minted_for).floor() + 1.0,
+            "{} offers minted, more than {} offers a second for {minted_for} s make",
+            self.offers_minted,
+            self.rate
+        );
         Ok(())
     }
 }

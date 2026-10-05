@@ -906,6 +906,20 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("offers minted, more than"), "{error}");
+    // A window cut to one second, with the offers of the full length.
+    let mut short = read(&a);
+    let started = short["processes"][0]["window"]["started_unix_ms"]
+        .as_i64()
+        .unwrap();
+    short["processes"][0]["window"]["ended_unix_ms"] = json!(started + 1000);
+    short["processes"][0]["window"]["seconds"] = json!(1.0);
+    let path = scratch.path("short.json");
+    external::write_document(&path, &short)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("offers minted, more than"), "{error}");
     let mut initial = read(&a);
     initial["processes"][0]["sessions"] = json!(1);
     let path = scratch.path("initial.json");
