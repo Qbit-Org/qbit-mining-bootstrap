@@ -19,6 +19,47 @@ pub(crate) use policy_transition::transition_configs;
 pub const DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX: &str =
     "dfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfee";
 
+/// What `PRISM_BLOCK_SUBMIT_ENABLED=0` holds back, in the words the startup
+/// warning, `check-config` and `self-check` all use.
+pub const BLOCK_SUBMIT_DISABLED: &str = "block submission is disabled \
+    (PRISM_BLOCK_SUBMIT_ENABLED=0): found blocks stay pending in the candidate outbox \
+    and are never sent to the node's submitblock, and no CTV fanout is broadcast";
+
+/// What `PRISM_BLOCK_SUBMIT_ENABLED=0` does to a configured CTV broadcaster.
+pub const CTV_BROADCASTER_HELD: &str = "PRISM_CTV_BROADCASTER_ENABLED=1 is held by \
+    PRISM_BLOCK_SUBMIT_ENABLED=0: the CTV fanout broadcaster does not start";
+
+/// The CTV fanout broadcaster a frontend with this configuration runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CtvBroadcaster {
+    /// `PRISM_CTV_BROADCASTER_ENABLED` is off.
+    Off,
+    On,
+    /// Configured on, and held back by `PRISM_BLOCK_SUBMIT_ENABLED=0`.
+    Held,
+}
+
+impl CtvBroadcaster {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Held => "held",
+        }
+    }
+}
+
+/// What a frontend with this configuration may send to its node: the lines
+/// `check-config` prints and the `block_submission` section of `self-check`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BlockSubmission {
+    pub enabled: bool,
+    pub ctv_broadcaster: CtvBroadcaster,
+    /// [`BLOCK_SUBMIT_DISABLED`] while the kill switch is on.
+    pub warning: Option<&'static str>,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -36,6 +77,14 @@ pub struct Config {
     pub rpc_password: String,
     pub rpc_timeout: Duration,
     pub block_submit_timeout: Duration,
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` (default on): the kill switch a rehearsal
+    /// against a real node runs with (#291). Off, this frontend sends its node
+    /// no block and no transaction: the submit loop claims no candidate, so
+    /// every found block stays `pending` and `submitblock` is never called,
+    /// and the CTV fanout broadcaster does not start, whatever
+    /// `PRISM_CTV_BROADCASTER_ENABLED` says. Per frontend, not in the cluster
+    /// fingerprint.
+    pub block_submit_enabled: bool,
     pub poll_interval: Duration,
     pub blockwait: bool,
     pub build_workers: usize,
@@ -592,6 +641,7 @@ impl Config {
             rpc_password,
             rpc_timeout: seconds("PRISM_RPC_TIMEOUT_SECONDS", 15.0)?,
             block_submit_timeout: seconds("PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS", 1.0)?,
+            block_submit_enabled: flag("PRISM_BLOCK_SUBMIT_ENABLED", true)?,
             poll_interval: seconds("PRISM_BLOCKPOLL_SECONDS", 2.0)?,
             blockwait: flag("PRISM_BLOCKWAIT_ENABLED", true)?,
             runtime_workers,
@@ -665,6 +715,19 @@ impl Config {
         Ok(())
     }
 
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` and what it holds back (#291).
+    pub fn block_submission(&self) -> BlockSubmission {
+        BlockSubmission {
+            enabled: self.block_submit_enabled,
+            ctv_broadcaster: match (self.ctv_broadcast, self.block_submit_enabled) {
+                (false, _) => CtvBroadcaster::Off,
+                (true, true) => CtvBroadcaster::On,
+                (true, false) => CtvBroadcaster::Held,
+            },
+            warning: (!self.block_submit_enabled).then_some(BLOCK_SUBMIT_DISABLED),
+        }
+    }
+
     pub(crate) fn verify_genesis(&self, actual: &str) -> Result<()> {
         if let Some(expected) = genesis_pin(&self.chain, self.expected_genesis_hash.clone())? {
             ensure!(
@@ -723,6 +786,7 @@ mod tests {
             rpc_password: "test-only".into(),
             rpc_timeout: Duration::from_secs(15),
             block_submit_timeout: Duration::from_secs(1),
+            block_submit_enabled: true,
             poll_interval: Duration::from_secs(2),
             blockwait: true,
             build_workers: 2,
@@ -884,6 +948,43 @@ mod tests {
             first.fingerprint("genesis").unwrap(),
             second.fingerprint("genesis").unwrap(),
             "automatic fee premiums change immutable payouts"
+        );
+    }
+
+    /// #291: the kill switch reports itself, holds a configured CTV
+    /// broadcaster, and stays out of the cluster fingerprint, so one frontend
+    /// of a cluster can run a rehearsal with it while another does not.
+    #[test]
+    fn the_block_submit_kill_switch_holds_the_broadcaster_and_is_per_frontend() {
+        for (enabled, broadcast, broadcaster) in [
+            (true, false, CtvBroadcaster::Off),
+            (true, true, CtvBroadcaster::On),
+            (false, false, CtvBroadcaster::Off),
+            (false, true, CtvBroadcaster::Held),
+        ] {
+            let mut config = automatic_ctv_config();
+            config.block_submit_enabled = enabled;
+            config.ctv_broadcast = broadcast;
+            assert_eq!(
+                config.block_submission(),
+                BlockSubmission {
+                    enabled,
+                    ctv_broadcaster: broadcaster,
+                    warning: (!enabled).then_some(BLOCK_SUBMIT_DISABLED),
+                }
+            );
+        }
+        let report = serde_json::to_value(automatic_ctv_config().block_submission()).unwrap();
+        assert_eq!(
+            report,
+            json!({"enabled":true,"ctv_broadcaster":"off","warning":null})
+        );
+        let mut held = automatic_ctv_config();
+        held.block_submit_enabled = false;
+        assert_eq!(
+            held.fingerprint("genesis").unwrap(),
+            automatic_ctv_config().fingerprint("genesis").unwrap(),
+            "the kill switch is local: it must not split the pool"
         );
     }
 

@@ -1504,6 +1504,56 @@ Automatic replacement fee bumps and abandoned-reservation release are not
 implemented; retain and reconcile the durable reservation when handling those
 cases manually.
 
+## Block submission kill switch for rehearsals
+
+A rehearsal (#291) runs production frontends against a restored copy of the
+mainnet ledger and a real mainnet node. Start every frontend of the rehearsal
+with `PRISM_BLOCK_SUBMIT_ENABLED=0`, so that no found block and no
+transaction it handles can reach the network:
+
+| Path | With `PRISM_BLOCK_SUBMIT_ENABLED=0` |
+| --- | --- |
+| Found blocks | Validated, credited and enqueued as usual, and the outbox row stays `pending`. The submit loop claims no row at all, so `submitblock` is never called, and no row, restored ones included, is reserved, offered, settled or abandoned. A block proof below the miner's share target is credited only once its block confirms, so it is answered `ledger-outcome-unknown` after `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`, as with a stuck outbox. |
+| CTV fanouts | The periodic broadcaster does not start, even with `PRISM_CTV_BROADCASTER_ENABLED=1`, and `broadcast-ctv` exits non-zero before it connects. No `sendrawtransaction`, `submitpackage` or CPFP wallet call is made. |
+| Everything else | Unchanged: templates, tip polling, readiness, Stratum, share acknowledgement, rollups and every write to the rehearsal database. `candidates recover` still lands blocks the node has already accepted; it never offers one. |
+
+Inside the process, the offer and the broadcaster pass also refuse under the
+switch, so no other caller reaches the node. The switch is per frontend and is
+read at startup. A frontend started without it offers every `pending` row it
+can claim, held ones included, so set it on every frontend that shares the
+rehearsal database, and restart a frontend to change it. As an independent
+second layer, give the rehearsal frontends a node RPC user that cannot call
+`submitblock`, `sendrawtransaction` or `submitpackage`, for example with
+Bitcoin Core's `-rpcwhitelist` where the qbitd build supports it.
+
+Verify the mode before admitting miners:
+
+- `check-config` prints `WARNING: block submission is disabled
+  (PRISM_BLOCK_SUBMIT_ENABLED=0): ...` as its first line, followed by a second
+  warning when a configured CTV broadcaster is held.
+- `self-check` reports `"block_submission": {"enabled": false, ...}` for its
+  own environment and repeats the warning on stderr. Its
+  `live_instances.instances[].status.block_submission_enabled` is each running
+  frontend's own value, read from its heartbeat; every one must be `false`.
+- `/healthz` carries `block_submission_enabled`, and `/metrics` reads
+  `qbit_prism_block_submission_enabled 0`.
+- Each frontend logs a warning at startup that ends `the submit loop claims no
+  candidate`, and, when a broadcaster was configured, one that it is held.
+
+A held block looks like any other pending candidate:
+`qbit_prism_block_candidates_pending` and
+`qbit_prism_block_candidate_oldest_pending_seconds` count and age it,
+`candidates list` shows it `pending`, and the pending-candidate alerts fire as
+they would for a stuck outbox. That is expected during a rehearsal, so route
+those alerts to the rehearsal rather than to production paging.
+
+After the rehearsal, do not start a frontend with submission enabled against
+the rehearsal database while held rows remain. That frontend would offer each
+one to its node, and a leased candidate skips the pre-offer staleness screen.
+Discard the database, or first abandon each held row with `candidates
+abandon`. Production frontends run with the setting unset or `1`; the
+[go-live checks](mainnet-deployment.md#go-live-checks) confirm it.
+
 ## Retry, replay and deadline contract
 
 The ledger never replays SQL automatically. After a `statement_timeout`

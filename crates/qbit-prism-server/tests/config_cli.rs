@@ -113,6 +113,88 @@ async fn valid_regtest_and_production_configuration_are_checked_without_services
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+/// #291: `check-config` states the block submission mode, and leads with the
+/// kill switch when it is on, in production too: a rehearsal runs on mainnet.
+#[tokio::test]
+async fn check_config_reports_the_block_submission_kill_switch_first() {
+    let output = check(false, &[]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains(
+            "found blocks are offered to the node's submitblock \
+             (PRISM_BLOCK_SUBMIT_ENABLED=1); the CTV fanout broadcaster is off"
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("WARNING"), "{report}");
+    for production in [false, true] {
+        let output = check(
+            production,
+            &[
+                ("PRISM_BLOCK_SUBMIT_ENABLED", "0"),
+                ("PRISM_CTV_BROADCASTER_ENABLED", "1"),
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<_> = report.lines().take(3).collect();
+        assert_eq!(
+            lines,
+            [
+                "WARNING: block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0): found \
+                 blocks stay pending in the candidate outbox and are never sent to the node's \
+                 submitblock, and no CTV fanout is broadcast",
+                "WARNING: PRISM_CTV_BROADCASTER_ENABLED=1 is held by \
+                 PRISM_BLOCK_SUBMIT_ENABLED=0: the CTV fanout broadcaster does not start",
+                "PRISM configuration valid; 2 runtime workers",
+            ],
+            "production={production}: {report}"
+        );
+        assert!(!report.contains("found blocks are offered"), "{report}");
+    }
+    rejects(
+        false,
+        &[("PRISM_BLOCK_SUBMIT_ENABLED", "maybe")],
+        "PRISM_BLOCK_SUBMIT_ENABLED must be a boolean",
+    )
+    .await;
+}
+
+/// #291: the one-shot broadcaster refuses under the kill switch before it
+/// reaches the node or the database. Both are unreachable here, so any later
+/// refusal would name a connection instead.
+#[tokio::test]
+async fn broadcast_ctv_refuses_before_reaching_services_when_block_submission_is_disabled() {
+    let output = configured_command(
+        "broadcast-ctv",
+        false,
+        &[("PRISM_BLOCK_SUBMIT_ENABLED", "0")],
+    )
+    .await;
+    assert!(
+        !output.status.success(),
+        "broadcast-ctv ran under the kill switch: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(
+            "broadcast-ctv refused: block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0)"
+        ),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn large_resource_budgets_fail_instead_of_truncating_or_panicking() {
     for (name, value) in [

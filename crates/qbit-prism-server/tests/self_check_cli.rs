@@ -66,6 +66,12 @@ fn unavailable_report(instance_id: Option<&str>, status: &str, warning: &str) ->
         "schema": "qbit.prism.self-check.v2",
         "ok": false,
         "instance_id": instance_id,
+        // The default mode, whenever the configuration could be read.
+        "block_submission": instance_id.map(|_| json!({
+            "enabled": true,
+            "ctv_broadcaster": "off",
+            "warning": null
+        })),
         "health": null,
         "carry_forward_integrity": null,
         "durability": null,
@@ -121,6 +127,36 @@ async fn unreachable_database_emits_complete_failed_report_without_zero_count() 
         error.contains("qbit RPC getblockhash transport failed"),
         "expected the local RPC check to run after heartbeat failure, got: {error}"
     );
+}
+
+/// #291: the kill switch is in the report, and warned about, before the
+/// database or the node is reached, so it shows even when neither answers.
+#[tokio::test]
+async fn disabled_block_submission_is_reported_when_the_services_are_unavailable() {
+    let output = self_check(
+        &[
+            ("PRISM_BLOCK_SUBMIT_ENABLED", "0"),
+            ("PRISM_CTV_BROADCASTER_ENABLED", "1"),
+        ],
+        Duration::from_secs(8),
+    )
+    .await;
+    let disabled = "block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0): found blocks \
+                    stay pending in the candidate outbox and are never sent to the node's \
+                    submitblock, and no CTV fanout is broadcast";
+    let mut expected = unavailable_report(
+        Some("self-check-cli"),
+        "failed",
+        "Heartbeat read failed or exceeded 5 seconds; HA is unknown",
+    );
+    expected["block_submission"] = json!({
+        "enabled": false,
+        "ctv_broadcaster": "held",
+        "warning": disabled
+    });
+    assert_eq!(failed_report(&output), expected);
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains(&format!("WARNING: {disabled}")), "{error}");
 }
 
 #[tokio::test]

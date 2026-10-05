@@ -2601,6 +2601,15 @@ impl Coordinator {
     /// confirmation all follow in the post-offer phase.
     async fn offer_candidate(&self, claim: &CandidateClaim, lease: CandidateLease) -> Result<()> {
         let candidate = &claim.candidate;
+        // #291: the submit loop of a frontend with PRISM_BLOCK_SUBMIT_ENABLED=0
+        // claims nothing. Any other caller is refused here, before the probe
+        // and the reservation, so the row stays `pending` and unoffered.
+        ensure!(
+            self.config.block_submit_enabled,
+            "{}; block {} was not offered",
+            crate::config::BLOCK_SUBMIT_DISABLED,
+            candidate.block_hash
+        );
         let parent = header_parent(&candidate.block_bytes)?;
         if !candidate.leased
             && (self.observed_tip.read().await.as_deref() != Some(parent.as_str())
@@ -3050,7 +3059,23 @@ impl Coordinator {
     }
 
     pub async fn submit_loop(self: Arc<Self>, shutdown: watch::Receiver<bool>) {
+        if !self.config.block_submit_enabled {
+            return Self::hold_candidates(shutdown).await;
+        }
         self.submit_loop_with(CANDIDATE_LEASE, shutdown).await
+    }
+
+    /// `PRISM_BLOCK_SUBMIT_ENABLED=0` (#291): claim nothing until shutdown.
+    /// Every unfinished row stays as it is, a found block `pending`, counted
+    /// by the candidate gauges and left for a frontend with submission
+    /// enabled; nothing reaches the node's `submitblock`.
+    async fn hold_candidates(mut shutdown: watch::Receiver<bool>) {
+        tracing::warn!(
+            "{}; the submit loop claims no candidate",
+            crate::config::BLOCK_SUBMIT_DISABLED
+        );
+        // As in the drain, any change or a closed channel ends the hold.
+        let _ = shutdown.changed().await;
     }
 
     async fn submit_loop_with(
@@ -3147,7 +3172,7 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
         else {
             unreachable!("coordinator health fields are an object");
         };

@@ -145,6 +145,9 @@ impl Metrics {
         ] {
             registry.register(family, vec![], -1.);
         }
+        // The default configuration; `run` sets the configured value before
+        // its first publication.
+        registry.register(Family::BlockSubmission, vec![], 1.);
         for value in AckResult::ALL {
             registry.register(Family::ShareAck, label("result", value.as_str()), 0.);
         }

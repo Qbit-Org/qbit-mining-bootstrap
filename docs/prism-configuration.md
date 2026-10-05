@@ -167,6 +167,29 @@ See [prism-b4-stratum-admission.md](prism-b4-stratum-admission.md) for the
 runbook, the recommended starting values and the topologies that make a cap
 unsafe.
 
+## Block submission kill switch
+
+`PRISM_BLOCK_SUBMIT_ENABLED` (boolean, default `1`) exists for rehearsals
+against a real node and a restored ledger (#291). Set to `0`, a frontend sends
+its node no found block and no transaction:
+
+- the submit loop claims no candidate. A found block is still validated,
+  credited and enqueued, but its outbox row stays `pending` and `submitblock`
+  is never called;
+- the CTV fanout broadcaster does not start, whatever
+  `PRISM_CTV_BROADCASTER_ENABLED` says, and `broadcast-ctv` refuses before it
+  connects. That broadcaster is PRISM's only sender of `sendrawtransaction`
+  and `submitpackage`, and its only user of the CPFP wallet.
+
+Templates, readiness, share acceptance and the database writes continue as
+usual. The setting is read at startup and applies per frontend; it is not part
+of the cluster fingerprint. While it is `0`, `check-config` and `self-check`
+lead with a warning. See
+[the rehearsal procedure](prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals)
+for checking it on running frontends and for what to do with held blocks
+afterwards. Never leave it at `0` on a production frontend: a block that
+frontend finds is never offered.
+
 ## Preventing stale guidance
 
 CI runs `python3 scripts/check_prism_settings.py`. It checks the native name

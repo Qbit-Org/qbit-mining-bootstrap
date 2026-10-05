@@ -140,6 +140,7 @@ pub fn expected(populated: bool) -> Census {
         "block_candidate_oldest_pending_seconds",
         "block_candidate_oldest_unacknowledged_seconds",
         "block_candidate_oldest_landing_failed_seconds",
+        "block_submission_enabled",
         "share_ledger_partition_lead_rows",
         "process_resident_memory_bytes",
         "process_open_fds",

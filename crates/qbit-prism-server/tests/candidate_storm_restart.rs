@@ -2426,3 +2426,136 @@ async fn wait_for_row_state(
         tokio::time::sleep(SUBMIT_LOOP_TICK).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// The block submission kill switch (#291).
+// ---------------------------------------------------------------------------
+
+/// The siblings the kill-switch scenario holds: more than one, so a drain
+/// would have had several rows to claim, and no question of cardinality.
+const HELD_CANDIDATES: usize = 3;
+
+/// A frontend with `PRISM_BLOCK_SUBMIT_ENABLED=0`, the real `run` with a CTV
+/// broadcaster configured on, serves its node over a due outbox for a whole
+/// health cadence and sends it no `submitblock`: every row stays `pending`
+/// and unclaimed, its heartbeat reports the mode and its log says what is
+/// held. Relaunched with submission on, the same frontend offers every block
+/// exactly once, so the node's silence was the switch's doing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frontend_with_block_submission_disabled_sends_its_node_no_block_until_it_is_enabled(
+) -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_submit_held_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "submit-held-fixture".into(),
+        4,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let outcome = held_submission(&database, &ledger).await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+/// The child's latest health heartbeat after `after`, as UNIX seconds, once
+/// it reports block submission disabled. The publisher's first tick is
+/// immediate and its cadence is `PRISM_HEALTH_REFRESH_SECONDS` (2 s), so two
+/// heartbeats bound a window of about twenty submit-loop ticks.
+async fn held_heartbeat(ledger: &Ledger, child: &ServerChild, after: f64) -> Result<f64> {
+    let bound = deadline(HELD_CANDIDATES);
+    let started = Instant::now();
+    loop {
+        let heartbeat: Option<(Option<bool>, f64)> = sqlx::query_as(
+            "SELECT (status->'block_submission_enabled')::text::boolean,extract(epoch FROM heartbeat_at)::float8 FROM qbit_prism_instances WHERE instance_id=$1 AND status ? 'schema'",
+        )
+        .bind(INSTANCE_ID)
+        .fetch_optional(&ledger.pool)
+        .await?;
+        if let Some((enabled, at)) = heartbeat.filter(|(_, at)| *at > after) {
+            ensure!(
+                enabled == Some(false),
+                "the held frontend's heartbeat reports block_submission_enabled {enabled:?}"
+            );
+            return Ok(at);
+        }
+        ensure!(
+            started.elapsed() < bound,
+            "no health heartbeat after {after} within {bound:?}; child stderr:\n{}",
+            child.stderr_tail()
+        );
+        tokio::time::sleep(SUBMIT_LOOP_TICK).await;
+    }
+}
+
+async fn held_submission(database: &FixtureDatabase, ledger: &Ledger) -> Result<()> {
+    let snapshot = seed(ledger).await?;
+    let planned = plan(&snapshot, HELD_CANDIDATES)?;
+    for row in &planned {
+        ledger.enqueue_candidate(row.candidate.clone()).await?;
+    }
+    let node = FakeNode::open(heights(&planned), NodePlan::default()).await?;
+
+    let mut child = ServerChild::spawn_with(
+        &database.url,
+        &node.url,
+        &[
+            ("PRISM_BLOCK_SUBMIT_ENABLED", "0"),
+            ("PRISM_CTV_BROADCASTER_ENABLED", "1"),
+        ],
+    )?;
+    // `run` spawns the submit loop and decides the broadcaster before the
+    // health publisher, so both have run for the whole window.
+    let first = held_heartbeat(ledger, &child, 0.0).await?;
+    held_heartbeat(ledger, &child, first).await?;
+    let signal = node.signals.borrow().clone();
+    ensure!(signal.calls > 0, "the held frontend never reached its node");
+    ensure!(
+        signal.submissions == 0 && node.per_hash().await.is_empty(),
+        "the held frontend sent its node {} submitblock calls",
+        signal.submissions
+    );
+    for planned_row in &planned {
+        let held = row(ledger, &planned_row.block_hash).await?;
+        ensure!(
+            held.state == CandidateState::Pending.as_str()
+                && held.attempt_count == 0
+                && held.claim_token.is_none()
+                && held.offer_reserved_by.is_none()
+                && held.offered_at_ms.is_none()
+                && held.payload_present,
+            "the held frontend touched {}: {held:?}",
+            planned_row.block_hash
+        );
+    }
+    ensure!(
+        dispatch_slots(ledger).await? == 0,
+        "the held frontend's drain claimed a row"
+    );
+    let log = std::fs::read_to_string(child.log.path())?;
+    for held in [
+        "block submission is disabled (PRISM_BLOCK_SUBMIT_ENABLED=0)",
+        "the submit loop claims no candidate",
+        "PRISM_CTV_BROADCASTER_ENABLED=1 is held by PRISM_BLOCK_SUBMIT_ENABLED=0: the CTV fanout broadcaster does not start",
+    ] {
+        ensure!(log.contains(held), "the held frontend never logged {held:?}:\n{log}");
+    }
+    child.kill().await?;
+
+    let mut child = ServerChild::spawn(&database.url, &node.url)?;
+    wait_for_drain(ledger, &child, HELD_CANDIDATES, HELD_CANDIDATES as i64).await?;
+    child.kill().await?;
+    let offers = assert_one_offer_per_hash(&node, &planned).await?;
+    ensure!(
+        offers == HELD_CANDIDATES as u64,
+        "the enabled frontend offered {offers} of {HELD_CANDIDATES} held blocks"
+    );
+    Ok(())
+}
