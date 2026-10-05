@@ -16,6 +16,7 @@ pub mod server;
 pub mod stratum;
 pub mod tools;
 pub mod vardiff;
+pub mod waiting;
 
 pub mod capacity;
 

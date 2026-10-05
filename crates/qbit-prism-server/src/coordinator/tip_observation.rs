@@ -582,11 +582,12 @@ impl Coordinator {
         requested_at: MonotonicInstant,
     ) -> Result<work_ledger::ClockedRevision> {
         let ledger = self.work_ledger.clone();
-        self.clocked_flights
-            .read(requested_at, move || async move {
-                ledger.clocked_payout_revision().await
-            })
-            .await
+        // #655: the waiter's own await of the shared read is marked, never
+        // the shared read itself (see `crate::waiting`).
+        on_database(self.clocked_flights.read(requested_at, move || async move {
+            ledger.clocked_payout_revision().await
+        }))
+        .await
     }
 
     pub(super) async fn begin_issuance_authority(
@@ -744,7 +745,7 @@ impl Coordinator {
         // (#619). Within one timeline rows are immutable and the same read
         // carries the timeline, so fresh work costs no extra round trip.
         if identity.timeline != Some(read.timeline)
-            && !self.work_ledger.window_held(&identity.window).await?
+            && !on_database(self.work_ledger.window_held(&identity.window)).await?
         {
             // Debug here: the caller's deferral WARN names the cause (see
             // `WorkRefusal::context`), and the refresh that replaces the work

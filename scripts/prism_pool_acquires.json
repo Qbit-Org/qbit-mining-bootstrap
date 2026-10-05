@@ -317,6 +317,7 @@
     "stratum.rs::prepare_job#1::match config . rebuild_job_limit .try_acquire()": [1,"non-database"],
     "stratum.rs::request#1::begin(metrics , is_submit , received_at)": [1,"non-database"],
     "stratum.rs::run_listener#1::config . connection_limit .try_acquire()": [1,"non-database"],
+    "stratum.rs::timed_out#1::database(message)": [1,"non-database"],
     "tools.rs::prepare#1::run(command , transition)": [1,"non-database"],
     "tools.rs::run#1::run(Config :: from_env ( ) ?)": [1,"non-database"],
     "tools.rs::run#1::audit_completeness(& ledger . pool)": [1,"operator"],
