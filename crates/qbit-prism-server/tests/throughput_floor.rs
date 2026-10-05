@@ -135,6 +135,11 @@ const ORDER_LOCK_OBJSUBID: i32 = 1;
 /// 30% of the slowest level seen. That leaves enough headroom for a noisy
 /// runner, while a 3-4x collapse of the append path still fails the build.
 ///
+/// Those runs kept the service's data directory on disk; it has been a tmpfs
+/// since #677. In four runs on the tmpfs, the slowest level was 1,084, 1,056
+/// and 1,103 shares/s in the job, and 702 in a probe that also loaded
+/// `auto_explain`. That is the same range as on disk, so 250 stays.
+///
 /// Re-derive it from the same summary lines if the runner, the PostgreSQL
 /// service or the append path changes. On any other host,
 /// `QBIT_PRISM_MIN_SHARES_PER_SEC` overrides it.
