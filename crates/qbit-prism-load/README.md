@@ -1137,9 +1137,13 @@ The `--address` has to be a payout address the target's node validates
    its `mining.notify` advertised, as the server binds them (Stratum's 1
    before any), with `--difficulty` asked for in the password when given. The
    search runs off the async runtime, so a slow search cannot delay another
-   session's reads. A share that also meets the network target is stepped
-   over and counted (`jobs.discarded_block_solutions`): the mode lands no
-   blocks.
+   session's reads, and it stops as soon as its own connection has something
+   waiting (a new job, a new difficulty, the socket ending). The session
+   reads that at once and mines the same offer again on the newest job, so
+   it never sends a share on work it has been told is retired, and a job's
+   arrival or an outage is timed when it happened. A share that also meets
+   the network target is stepped over and counted
+   (`jobs.discarded_block_solutions`): the mode lands no blocks.
 5. Reconnects a session whose connection goes, at once and then every
    250 ms until it holds work again.
 6. Waits up to `--drain-seconds` for answers still outstanding on sessions
@@ -1215,7 +1219,10 @@ again.
 `--share-log` writes one JSON line per submit: `share_id`, `outcome`
 (`accepted`, `rejected` or `no-response`), `session`, `job_id`,
 `sent_unix_ms`, `answered_unix_ms`, `latency_ms`, the rejection's `code`,
-`reason_id` and `message`, and the `no_response_reason`. A `share_id` is the
+`reason_id` and `message`, and the `no_response_reason`. A thread of its own
+writes the file, so a slow disk never stalls a session. If it falls 65,536
+lines behind, later lines are dropped rather than held, and
+`processes[].share_log.dropped` says how many. A `share_id` is the
 ledger's own `qbit_share_ledger.share_id`, so the failover drill can hold the
 clients to the promoted primary: every accepted id must be there, or it is an
 acknowledged-share loss to count under D3, and every committed id under the

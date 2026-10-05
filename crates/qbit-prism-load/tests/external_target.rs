@@ -577,6 +577,7 @@ async fn a_run_mines_the_advertised_difficulty_and_counts_what_the_target_did() 
         summary["shares"]["sent"].as_u64().unwrap()
     );
     assert_eq!(process["share_log"]["lines"], json!(lines.len()));
+    assert_eq!(process["share_log"]["dropped"], json!(0));
     let ids: HashSet<&str> = lines
         .iter()
         .filter(|line| line["outcome"] == json!("accepted"))
@@ -989,6 +990,62 @@ async fn an_offer_taken_while_disconnected_is_dropped_on_reconnect() -> Result<(
         let _ = handle.control.send(client::Control::Stop);
         tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
     }
+    Ok(())
+}
+
+/// A search does not hold the session's reading back: here the first job is
+/// one no search of the nonce span is likely to solve, and a new, easy job
+/// arrives while it runs. The search stops for the new job, the session
+/// reads it, and the same offer is mined on it and sent, rather than ground
+/// out on the retired job for millions of hashes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_stops_for_a_new_job_and_mines_the_offer_on_it() -> Result<()> {
+    let target = fake_target(1.0).await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new(external::PHASE.to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    });
+    let config = client::SessionConfig {
+        index: 0,
+        username: "pload1external.t-s00000".into(),
+        password: "x".into(),
+        // A ceiling of 1 lets the session take on the hopeless job at all.
+        difficulty: client::DifficultySource::Advertised { ceiling: 1.0 },
+        version_rolling_mask: codec::VERSION_ROLLING_MASK,
+        connect_timeout: Duration::from_secs(5),
+        handshake_timeout: Duration::from_secs(5),
+        quiesce_limit: Duration::from_secs(5),
+        drop_offers_held_while_disconnected: true,
+    };
+    let handle = client::spawn_session(config, 0, target.address.clone(), shared, 1);
+    next_event(&mut inbox, "the first connection", |event| {
+        matches!(event, client::Event::Connected { .. })
+    })
+    .await;
+    let phase: Arc<str> = Arc::from(external::PHASE);
+    assert!(handle.try_offer(1, &phase));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    target.difficulty.send_replace(EASY);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let record = loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .expect("the offer is sent on the new job within seconds")
+            .expect("the session is still running");
+        match event {
+            client::Event::Submit(record) => break record,
+            client::Event::Failure(failure) => panic!("the offer failed: {failure:?}"),
+            _ => {}
+        }
+    };
+    assert_eq!(record.job_id, "job-2", "{record:?}");
+    assert_eq!(record.outcome.label(), "accepted");
+    assert_eq!(handle.outstanding.load(Ordering::SeqCst), 0);
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
     Ok(())
 }
 

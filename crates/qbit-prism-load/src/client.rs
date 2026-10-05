@@ -410,6 +410,9 @@ pub struct ClientFailure {
 pub struct OfferFailure {
     pub error: anyhow::Error,
     pub recorded: bool,
+    /// The search stopped because the connection had something to say
+    /// first: the offer is still good and is mined again once that is read.
+    pub interrupted: bool,
 }
 
 impl OfferFailure {
@@ -417,6 +420,15 @@ impl OfferFailure {
         Self {
             error,
             recorded: false,
+            interrupted: false,
+        }
+    }
+
+    fn interrupted() -> Self {
+        Self {
+            error: anyhow::anyhow!("the search stopped for traffic on the connection"),
+            recorded: false,
+            interrupted: true,
         }
     }
 }
@@ -641,9 +653,29 @@ enum Incoming {
     },
 }
 
+/// A connection's inbound queue, with a count of what its reader has queued
+/// and the session has not taken yet, so a search running off the runtime
+/// can stop as soon as the connection has something to say.
+struct Lines {
+    queue: mpsc::Receiver<Incoming>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Lines {
+    /// As `mpsc::Receiver::recv`, and as cancel-safe: the count drops in the
+    /// same poll the message is taken in.
+    async fn recv(&mut self) -> Option<Incoming> {
+        let incoming = self.queue.recv().await;
+        if incoming.is_some() {
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+        incoming
+    }
+}
+
 struct Connection {
     writer: tokio::net::tcp::OwnedWriteHalf,
-    lines: mpsc::Receiver<Incoming>,
+    lines: Lines,
     reader_task: tokio::task::JoinHandle<()>,
     extranonce1: Vec<u8>,
     extranonce2_size: usize,
@@ -684,6 +716,7 @@ pub fn spawn_session(
         frontend_slot.clone(),
         shared.clone(),
         work_rx,
+        work_tx.downgrade(),
         control_rx,
         outstanding.clone(),
         paused.clone(),
@@ -707,6 +740,9 @@ async fn run_session(
     frontend: Arc<AtomicUsize>,
     shared: Arc<SessionShared>,
     mut work: mpsc::Receiver<Work>,
+    // Puts an interrupted offer back, behind the lines that interrupted it.
+    // Weak, so the queue still closes when the handle goes.
+    requeue: mpsc::WeakSender<Work>,
     mut control: mpsc::UnboundedReceiver<Control>,
     outstanding: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
@@ -1043,18 +1079,31 @@ async fn run_session(
             offered = work.recv(), if can_submit => {
                 match offered {
                     None => { stopping = true; }
-                    Some(Work::Submit { phase }) => {
-                        let phase = phase.to_string();
-                        if let Err(failure) = offer(active, &config, &shared, &frontend, false, phase.clone()).await {
-                            outstanding.fetch_sub(1, Ordering::Relaxed);
-                            let _ = shared.events.send(Event::Failure(ClientFailure {
-                                session: config.index,
-                                phase,
-                                kind: FailureKind::Offer,
-                                recorded: failure.recorded,
-                                error: format!("{:#}", failure.error),
-                                at: Instant::now(),
-                            }));
+                    Some(Work::Submit { phase: stamp }) => {
+                        let phase = stamp.to_string();
+                        match offer(active, &config, &shared, &frontend, false, phase.clone()).await {
+                            Ok(()) => {}
+                            // The offer keeps its slot and goes back in the
+                            // queue, which has room for it: its slot is still
+                            // counted, so the scheduler adds nothing. The
+                            // biased select reads the waiting lines first,
+                            // then mines it on the newest job.
+                            Err(failure)
+                                if failure.interrupted
+                                    && requeue
+                                        .upgrade()
+                                        .is_some_and(|queue| queue.try_send(Work::Submit { phase: stamp.clone() }).is_ok()) => {}
+                            Err(failure) => {
+                                outstanding.fetch_sub(1, Ordering::Relaxed);
+                                let _ = shared.events.send(Event::Failure(ClientFailure {
+                                    session: config.index,
+                                    phase,
+                                    kind: FailureKind::Offer,
+                                    recorded: failure.recorded,
+                                    error: format!("{:#}", failure.error),
+                                    at: Instant::now(),
+                                }));
+                            }
                         }
                     }
                 }
@@ -1214,6 +1263,10 @@ async fn connect(
     stream.set_nodelay(true)?;
     let (read_half, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel(256);
+    // Counted before each send, so a search can see a line that is on its
+    // way into the queue.
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let queued = waiting.clone();
     // The reader's own handle on the run's fence, so the moment the socket
     // ends is the moment the fence is read. See `Incoming::Closed`.
     let kill_fence = shared.kill_fence.clone();
@@ -1226,6 +1279,7 @@ async fn connect(
                 Ok(0) => {
                     // Read before the send, not after: the send can await.
                     let fence = kill_fence.load(Ordering::SeqCst);
+                    queued.fetch_add(1, Ordering::SeqCst);
                     let _ = tx
                         .send(Incoming::Closed {
                             reason: "end of stream".into(),
@@ -1235,6 +1289,7 @@ async fn connect(
                     break;
                 }
                 Ok(_) => {
+                    queued.fetch_add(1, Ordering::SeqCst);
                     if tx
                         .send(Incoming::Line(line.trim().to_owned()))
                         .await
@@ -1245,6 +1300,7 @@ async fn connect(
                 }
                 Err(error) => {
                     let fence = kill_fence.load(Ordering::SeqCst);
+                    queued.fetch_add(1, Ordering::SeqCst);
                     let _ = tx
                         .send(Incoming::Closed {
                             reason: error.to_string(),
@@ -1258,7 +1314,7 @@ async fn connect(
     });
     let mut connection = Connection {
         writer,
-        lines: rx,
+        lines: Lines { queue: rx, waiting },
         reader_task,
         extranonce1: Vec::new(),
         extranonce2_size: 8,
@@ -1656,11 +1712,25 @@ async fn offer(
         // harness's own take dozens. Searched inline either would hold a
         // runtime worker, and every session on that worker would read its
         // answers late and report the delay as acknowledgement latency.
+        //
+        // A share search off the runtime also stops as soon as the
+        // connection has something waiting -- a new job, a new difficulty,
+        // the socket ending -- so the session reads it at once instead of
+        // after the search: a share on retired work is not sent, and a job's
+        // arrival or an outage is timed when it happened.
         let job = job.clone();
         let extranonce2 = extranonce2.clone();
         let discards = (!scheduled_block).then_some((session, events));
+        let interrupt = (!scheduled_block).then(|| connection.lines.waiting.clone());
         tokio::task::spawn_blocking(move || {
-            search(&job, &extranonce1, &extranonce2, scheduled_block, discards)
+            search(
+                &job,
+                &extranonce1,
+                &extranonce2,
+                scheduled_block,
+                discards,
+                interrupt.as_deref(),
+            )
         })
         .await
         .map_err(|error| OfferFailure::unrecorded(error.into()))?
@@ -1671,14 +1741,19 @@ async fn offer(
             &extranonce2,
             false,
             Some((session, events)),
+            None,
         )
     };
-    let Some((nonce, header)) = found else {
-        return Err(OfferFailure::unrecorded(anyhow::anyhow!(
-            "no {} solution found under job {}",
-            if scheduled_block { "block" } else { "share" },
-            job.job_id
-        )));
+    let (nonce, header) = match found {
+        Searched::Found(nonce, header) => (nonce, header),
+        Searched::Interrupted => return Err(OfferFailure::interrupted()),
+        Searched::Exhausted => {
+            return Err(OfferFailure::unrecorded(anyhow::anyhow!(
+                "no {} solution found under job {}",
+                if scheduled_block { "block" } else { "share" },
+                job.job_id
+            )))
+        }
     };
     let extranonce2_hex = hex::encode(&extranonce2);
     let ntime_hex = format!("{:08x}", job.ntime);
@@ -1743,6 +1818,7 @@ async fn offer(
         return Err(OfferFailure {
             error,
             recorded: true,
+            interrupted: false,
         });
     }
     Ok(())
@@ -1750,13 +1826,27 @@ async fn offer(
 
 /// Find a nonce. Share searches step over any solution that also meets the
 /// network target: an unscheduled block is never submitted, only counted.
+/// How many nonces an interruptible search tries between looks at its
+/// connection.
+const INTERRUPT_CHECK: u32 = 1 << 10;
+
+/// What a search came to.
+enum Searched {
+    Found(u32, Vec<u8>),
+    /// Every nonce of its span was tried.
+    Exhausted,
+    /// The connection had something waiting before a solution turned up.
+    Interrupted,
+}
+
 fn search(
     job: &JobState,
     extranonce1: &[u8],
     extranonce2: &[u8],
     want_block: bool,
     discards: Option<(usize, tokio::sync::mpsc::UnboundedSender<Event>)>,
-) -> Option<(u32, Vec<u8>)> {
+    interrupt: Option<&AtomicUsize>,
+) -> Searched {
     let merkle = merkle_root(
         &job.coinb1,
         extranonce1,
@@ -1774,11 +1864,16 @@ fn search(
     );
     let span = if want_block { u32::MAX } else { NONCE_SPAN };
     for nonce in 0..span {
+        if nonce % INTERRUPT_CHECK == 0
+            && interrupt.is_some_and(|waiting| waiting.load(Ordering::SeqCst) > 0)
+        {
+            return Searched::Interrupted;
+        }
         header[76..80].copy_from_slice(&nonce.to_le_bytes());
         let hash = codec::double_sha256(&header);
         if want_block {
             if le_at_most(&hash, &job.network_target) {
-                return Some((nonce, header));
+                return Searched::Found(nonce, header);
             }
             continue;
         }
@@ -1791,9 +1886,9 @@ fn search(
             }
             continue;
         }
-        return Some((nonce, header));
+        return Searched::Found(nonce, header);
     }
-    None
+    Searched::Exhausted
 }
 
 async fn write_line(writer: &mut tokio::net::tcp::OwnedWriteHalf, value: &Value) -> Result<()> {

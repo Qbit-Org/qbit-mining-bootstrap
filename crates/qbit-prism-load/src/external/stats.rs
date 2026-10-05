@@ -39,6 +39,11 @@ pub const TIP_KEYS: usize = 1024;
 /// Sample messages kept per client-failure kind.
 pub const FAILURE_SAMPLES: usize = 8;
 
+/// Share-log lines that may wait for the writer: tens of megabytes at most.
+/// Past it a line is dropped and counted, rather than held without bound or
+/// waited for on the async runtime.
+pub const SHARE_LOG_BACKLOG: usize = 65_536;
+
 /// One instant on both clocks, so an event's monotonic `Instant` can be
 /// placed on the wall clock without reading the wall clock again: a wall
 /// clock stepped mid-run moves nothing.
@@ -553,7 +558,9 @@ pub struct ShareLog {
     /// Lines for the writer thread. The collector runs on the async runtime
     /// and must never wait on the disk: a slow filesystem would stall that
     /// worker's sessions and read as acknowledgement latency.
-    lines: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    lines: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// Lines dropped because the writer was `SHARE_LOG_BACKLOG` behind.
+    dropped: u64,
     /// Writes every line it is sent, then flushes, and returns how many it
     /// wrote and the first write that failed.
     writer: Option<std::thread::JoinHandle<(u64, Option<String>)>>,
@@ -565,6 +572,9 @@ pub struct ShareLog {
 pub struct ShareLogInfo {
     pub path: String,
     pub lines: u64,
+    /// Lines dropped because the disk fell too far behind; the log is then
+    /// missing that many submits.
+    pub dropped: u64,
     /// The first write that failed; the log stops there and says so.
     pub error: Option<String>,
 }
@@ -575,7 +585,7 @@ impl ShareLog {
     pub fn create(path: &Path) -> Result<Self> {
         let file = std::fs::File::create(path)
             .with_context(|| format!("creating the share log {}", path.display()))?;
-        let (lines, received) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (lines, received) = std::sync::mpsc::sync_channel::<Vec<u8>>(SHARE_LOG_BACKLOG);
         let writer = std::thread::Builder::new()
             .name("share-log".into())
             .spawn(move || {
@@ -602,6 +612,7 @@ impl ShareLog {
         Ok(Self {
             path: path.to_owned(),
             lines: Some(lines),
+            dropped: 0,
             writer: Some(writer),
         })
     }
@@ -610,7 +621,9 @@ impl ShareLog {
         let mut bytes = serde_json::to_vec(line).expect("a JSON value serializes");
         bytes.push(b'\n');
         if let Some(lines) = &self.lines {
-            let _ = lines.send(bytes);
+            if let Err(std::sync::mpsc::TrySendError::Full(_)) = lines.try_send(bytes) {
+                self.dropped += 1;
+            }
         }
     }
 
@@ -626,6 +639,7 @@ impl ShareLog {
         ShareLogInfo {
             path: self.path.display().to_string(),
             lines,
+            dropped: self.dropped,
             error,
         }
     }
