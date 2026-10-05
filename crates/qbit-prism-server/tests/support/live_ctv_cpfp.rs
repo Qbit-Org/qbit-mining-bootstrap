@@ -60,7 +60,9 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
         }
         // The owner dies before signing. Two successors must recover either
         // the still-protected reservation or replacement spendable funding.
-        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&fanout_txid).execute(&fixture.pool).await?;
+        // #654: a successor takes the claim over only once it has watched it
+        // go unrenewed for its lease; revoking it stands in for that wait.
+        qbit_prism_server::ledger::revoke_fanout_claims(&fixture.pool,Some(&fanout_txid),false).await?;
         for index in 0..2 {fixture.servers[index]=fixture.start_server_with_sponsorship(index,Some(100_000))?;}
         until("recovered CPFP package in mempool",40,||async {
             let package=ledger.cpfp_package(&fanout_txid).await?;
@@ -75,8 +77,8 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
             let archived:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_prism_cpfp_retired_funding WHERE fanout_txid=$1 AND funding_txid=$2 AND funding_vout=$3)")
                 .bind(&fanout_txid).bind(funding_txid).bind(i64::from(funding_vout)).fetch_one(&fixture.pool).await?;
             ensure!(archived,"invalid reservation lost cleanup history");
-            ensure!(ledger.reserve_cpfp_funding(&abandoned,"prism",funding_txid,funding_vout,amount).await.is_err(),"expired owner replaced successor funding");
-            ensure!(ledger.save_cpfp_package(&abandoned,"00",&"ff".repeat(32)).await.is_err(),"expired owner overwrote signed package");
+            ensure!(ledger.reserve_cpfp_funding(&abandoned,"prism",funding_txid,funding_vout,amount).await.is_err(),"taken-over owner replaced successor funding");
+            ensure!(ledger.save_cpfp_package(&abandoned,"00",&"ff".repeat(32)).await.is_err(),"taken-over owner overwrote signed package");
             let replacement_txid=package["funding_txid"].as_str().context("replacement txid missing")?;
             let replacement_vout:u32=package["funding_vout"].as_u64().context("replacement vout missing")?.try_into()?;
             ensure_funding_excluded(&fixture,replacement_txid,replacement_vout).await?;
@@ -90,7 +92,7 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
             }).await?;
             ensure!(ledger.cpfp_package(&fanout_txid).await?.context("signed package disappeared")?["signed_child_hex"]==package["signed_child_hex"],"confirmation rewrote signed replacement bytes");
             fixture.integrity().await?;
-            eprintln!("live CPFP regtest: database-only unsigned reservation became confirmed-spent; two broadcasters archived it, fenced the expired owner, funded one immutable replacement package and confirmed the payout");
+            eprintln!("live CPFP regtest: database-only unsigned reservation became confirmed-spent; two broadcasters archived it, fenced the taken-over owner, funded one immutable replacement package and confirmed the payout");
             ledger.pool.close().await;
             return Ok(());
         }

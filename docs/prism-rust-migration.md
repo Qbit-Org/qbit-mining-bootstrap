@@ -573,6 +573,12 @@ pre-021 binary takes claims over by the database clock, so 021 is applied
 offline exactly as 018 is, and the capability refuses older binaries at
 later connects. See
 [candidate claim leases and database clock steps](prism-ledger-ops.md#candidate-claim-leases-and-database-clock-steps-021-581).
+Migration 022 does the same for CTV fanout claims (#654): it adds
+`claim_renewals` and `claim_lease_seconds` to `qbit_ctv_fanout_artifacts`, a
+partial index over its claimed rows, and declares
+`fanout_claim_observed_lease = 1`. A pre-022 binary takes fanout claims over
+by the database clock, so 022 is applied offline as 021 is. See
+[CTV fanout claim leases and database clock steps](prism-ledger-ops.md#ctv-fanout-claim-leases-and-database-clock-steps-022-654).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
@@ -1490,7 +1496,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `021`), 013's concurrent index builds, and 017's
+(`001` and native `002` to `022`), 013's concurrent index builds, and 017's
 prepare, validate and swap. The transaction holds the cutover locks, ACCESS
 EXCLUSIVE on `qbit_share_ledger` among them, for its whole length; the report
 also lists the statements `migrate` spent the most sampled time in.

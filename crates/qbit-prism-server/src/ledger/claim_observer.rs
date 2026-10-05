@@ -1,20 +1,22 @@
 //! #581: a candidate claim is taken over only once the taker has itself
 //! watched it go unrenewed for its whole lease, on this process's monotonic
-//! clock.
+//! clock. #654: so is a CTV fanout claim.
 //!
-//! The database clock decides nothing here. Before 021 a claim was taken
-//! over once `claim_expires_at` was in the past by `clock_timestamp()`, so a
-//! database clock step moved every lease by the step: forward, a live
-//! holder's row was taken while it was still offering the block; backward, a
-//! dead holder's row waited lease + step.
+//! The database clock decides nothing here. Before 021 (candidates) and 022
+//! (fanouts) a claim was taken over once `claim_expires_at` was in the past
+//! by `clock_timestamp()`, so a database clock step moved every lease by the
+//! step: forward, a live holder's row was taken while it was still offering
+//! the block or broadcasting the fanout; backward, a dead holder's row waited
+//! lease + step.
 //!
-//! Every claim poll reads the claimed unfinished rows and gives each one's
-//! version, its (`claim_token`, `claim_renewals`), to [`ClaimObserver`]. A
-//! version first seen in a reply starts its clock when that reply arrived,
-//! which is after the commit that wrote the version, and that commit is after
-//! the instant the holder started the renewal its own lease is measured from
-//! (`Coordinator::with_tracked_heartbeat`). So the holder's lease always ends
-//! first, whatever either clock reads. A renewal is a new version, and a
+//! Every claim poll reads the claimed rows and gives each one's version, its
+//! (`claim_token`, `claim_renewals`), to a [`ClaimObserver`], one per kind of
+//! claim. A version first seen in a reply starts its clock when that reply
+//! arrived, which is after the commit that wrote the version, and that commit
+//! is after the instant the holder started the renewal its own lease is
+//! measured from (`Coordinator::with_tracked_heartbeat` for a candidate, the
+//! broadcaster's attempt deadline for a fanout). So the holder's lease always
+//! ends first, whatever either clock reads. A renewal is a new version, and a
 //! version that is no longer claimed is forgotten. The takeover itself is a
 //! compare and set on the version the observer timed.
 //!
@@ -27,23 +29,25 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// How long a claim taken before migration 021, which recorded no lease, is
-/// timed: the most any writer can take (every claim and renewal accepts 1 to
-/// 600 seconds).
+/// How long a claim taken before migration 021 (a candidate) or 022 (a
+/// fanout), which recorded no lease, is timed: the most any writer can take
+/// (every claim and renewal accepts 1 to 600 seconds).
 pub const UNRECORDED_LEASE: Duration = Duration::from_secs(600);
 
-/// One claimed unfinished row as a survey read it.
+/// One claimed row as a survey read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimVersion {
-    pub block_hash: String,
+    /// The claimed row: a candidate's block hash, or a fanout's txid.
+    pub key: String,
     pub token: String,
     pub renewals: i64,
-    /// `claim_lease_seconds`: `None` for a claim taken before 021, `Some(0)`
-    /// for a revoked one.
+    /// `claim_lease_seconds`: `None` for a claim taken before 021 (022 for a
+    /// fanout), `Some(0)` for a revoked one.
     pub lease_seconds: Option<i32>,
     pub instance_id: Option<String>,
     /// Whether the row may be taken over once its lease is over: it is not
-    /// parked (see `TAKEOVER_SQL`).
+    /// parked (see `TAKEOVER_SQL` in `candidates.rs` and
+    /// `FANOUT_TAKEOVER_SQL` in `fanout.rs`).
     pub due: bool,
 }
 
@@ -62,20 +66,22 @@ struct Watched {
     since: Instant,
 }
 
-/// The claims this process has watched, by block hash. Shared by every clone
-/// of one [`super::Ledger`], so one frontend keeps one clock per claim.
+/// The claims of one kind this process has watched, by the claimed row's
+/// key. Shared by every clone of one [`super::Ledger`], so one frontend keeps
+/// one clock per claim. Candidates and fanouts each have their own: a survey
+/// forgets every row it does not show.
 #[derive(Debug, Default)]
 pub struct ClaimObserver {
     watched: Mutex<HashMap<String, Watched>>,
 }
 
 impl ClaimObserver {
-    /// Record one complete read of the claimed unfinished rows, whose reply
-    /// arrived at `replied`. A version not watched before starts its clock
-    /// there; a row the read no longer shows claimed is forgotten.
+    /// Record one complete read of the claimed rows, whose reply arrived at
+    /// `replied`. A version not watched before starts its clock there; a row
+    /// the read no longer shows claimed is forgotten.
     pub fn survey(&self, claims: &[ClaimVersion], replied: Instant) {
         let mut watched = self.watched.lock().unwrap_or_else(|e| e.into_inner());
-        watched.retain(|hash, _| claims.iter().any(|claim| &claim.block_hash == hash));
+        watched.retain(|key, _| claims.iter().any(|claim| &claim.key == key));
         for claim in claims {
             Self::record(&mut watched, claim, replied);
         }
@@ -91,11 +97,11 @@ impl ClaimObserver {
 
     fn record(watched: &mut HashMap<String, Watched>, claim: &ClaimVersion, replied: Instant) {
         let same = watched
-            .get(&claim.block_hash)
+            .get(&claim.key)
             .is_some_and(|seen| seen.token == claim.token && seen.renewals == claim.renewals);
         if !same {
             watched.insert(
-                claim.block_hash.clone(),
+                claim.key.clone(),
                 Watched {
                     token: claim.token.clone(),
                     renewals: claim.renewals,
@@ -112,7 +118,7 @@ impl ClaimObserver {
     pub fn remaining(&self, claim: &ClaimVersion, now: Instant) -> Option<Duration> {
         let watched = self.watched.lock().unwrap_or_else(|e| e.into_inner());
         let seen = watched
-            .get(&claim.block_hash)
+            .get(&claim.key)
             .filter(|seen| seen.token == claim.token && seen.renewals == claim.renewals)?;
         Some(
             claim
@@ -134,7 +140,7 @@ mod tests {
 
     fn claim(token: &str, renewals: i64, lease: Option<i32>) -> ClaimVersion {
         ClaimVersion {
-            block_hash: "b".into(),
+            key: "b".into(),
             token: token.into(),
             renewals,
             lease_seconds: lease,

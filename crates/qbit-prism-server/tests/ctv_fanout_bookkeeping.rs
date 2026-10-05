@@ -189,14 +189,16 @@ async fn a_failed_attempt_whose_failure_is_lost_keeps_its_backoff() -> Result<()
             ensure!(rows.len() == count, "{} rows", rows.len());
             ensure!(unfinished == 1, "{unfinished} rows kept their status");
             // Both hand-backs are fenced by the holder's token: a late one
-            // from an expired claim neither releases nor records anything on
+            // from a taken-over claim neither releases nor records anything on
             // the row another frontend took over.
             sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at=NULL")
                 .execute(f.pool())
                 .await?;
             let stale = f.a.ledger.claim_fanout(120).await?.context("claim")?;
-            sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp() WHERE fanout_txid=$1")
-                .bind(&stale.fanout_txid).execute(f.pool()).await?;
+            // #654: only a takeover ends a claim; revoking it stands in
+            // for a lease the other frontend watched go unrenewed.
+            qbit_prism_server::ledger::revoke_fanout_claims(f.pool(), Some(&stale.fanout_txid), false)
+                .await?;
             let taken = f.b.ledger.claim_fanout(120).await?.context("takeover")?;
             ensure!(taken.fanout_txid == stale.fanout_txid, "fixture took over another row");
             ensure!(
@@ -333,6 +335,65 @@ async fn a_send_whose_completion_is_refused_is_recorded_as_an_attempt() -> Resul
                     && history[0].try_get::<Option<String>, _>("error")?.is_some(),
                 "the attempt history has {} rows for the refused send",
                 history.len()
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #654: a forward database clock step in the middle of an attempt makes the
+/// holder's claim look expired at once. Another frontend does not take the
+/// fanout over, and the holder's settlement after its send is recorded, one
+/// attempt, its claim released by the holder itself. Before #654 the other
+/// frontend's claim took the fanout and the holder's settlement was refused.
+/// The step is made as `ledger_postgres`'s clock-step tests make it: every
+/// stored fanout timestamp moves back by the step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_database_clock_step_mid_attempt_keeps_the_holders_claim_and_settlement(
+) -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f, false).await?;
+            sendable(f).await?;
+            let mut held = f.node.pause_next("sendrawtransaction")?;
+            let a = f.a.clone();
+            let pass = tokio::spawn(async move { broadcaster::run_once(&a).await });
+            timeout(BOUND, held.entered()).await??;
+            let sending = claimed_fanout(f).await?;
+            sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET updated_at=updated_at-interval '2 hours',claim_expires_at=claim_expires_at-interval '2 hours',first_broadcast_attempt_at=first_broadcast_attempt_at-interval '2 hours',last_broadcast_attempt_at=last_broadcast_attempt_at-interval '2 hours',next_broadcast_attempt_at=next_broadcast_attempt_at-interval '2 hours'")
+                .execute(f.pool())
+                .await?;
+            let expired: bool = sqlx::query_scalar(
+                "SELECT claim_expires_at<=clock_timestamp() FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1",
+            )
+            .bind(&sending)
+            .fetch_one(f.pool())
+            .await?;
+            ensure!(expired, "the step did not expire the claim by the database clock");
+            // The other frontend may take another fanout, never the one in
+            // flight; it hands any it took straight back.
+            if let Some(other) = f.b.ledger.claim_fanout(120).await? {
+                ensure!(
+                    other.fanout_txid != sending,
+                    "a forward step handed a live fanout claim to another frontend"
+                );
+                ensure!(f.b.ledger.release_fanout_claim(&other).await?);
+            }
+            held.release();
+            let attempted = timeout(BOUND, pass)
+                .await??
+                .context("the pass failed after the step")?;
+            ensure!(attempted == count, "the pass attempted {attempted} of {count} fanouts");
+            let row = sqlx::query("SELECT claim_token IS NULL AS released,settlement_status,broadcast_attempt_count,last_broadcast_attempt_status FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
+                .bind(&sending).fetch_one(f.pool()).await?;
+            ensure!(
+                row.try_get::<bool, _>("released")?
+                    && row.try_get::<String, _>("settlement_status")? == "broadcast_submitted"
+                    && row.try_get::<i64, _>("broadcast_attempt_count")? == 1
+                    && row.try_get::<Option<String>, _>("last_broadcast_attempt_status")?.as_deref() == Some("submitted"),
+                "a forward step refused the holder's settlement"
             );
             Ok(())
         })

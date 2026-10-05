@@ -585,14 +585,16 @@ async fn ctv_releases_the_claim_when_a_revision_bump_refuses_a_successful_attemp
                 settled == count as i64,
                 "{settled} of {count} fanouts ended confirmed and unclaimed"
             );
-            // The release is fenced by the holder's token: a late release of an
-            // expired claim leaves the frontend that took it over alone.
+            // The release is fenced by the holder's token: a late release of a
+            // taken-over claim leaves the frontend that took it over alone.
             sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET next_broadcast_attempt_at=NULL")
                 .execute(f.pool())
                 .await?;
             let stale = f.a.ledger.claim_fanout(120).await?.context("claim")?;
-            sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp() WHERE fanout_txid=$1")
-                .bind(&stale.fanout_txid).execute(f.pool()).await?;
+            // #654: only a takeover ends a claim; revoking it stands in
+            // for a lease the other frontend watched go unrenewed.
+            qbit_prism_server::ledger::revoke_fanout_claims(f.pool(), Some(&stale.fanout_txid), false)
+                .await?;
             let taken = f.b.ledger.claim_fanout(120).await?.context("takeover")?;
             ensure!(
                 taken.fanout_txid == stale.fanout_txid,
