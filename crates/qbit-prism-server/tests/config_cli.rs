@@ -75,6 +75,26 @@ async fn configured_command(
         .unwrap()
 }
 
+/// A command line with several arguments, isolated like `configured_command`
+/// and with the database unreachable.
+async fn configured_command_args(args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    command.args(args).kill_on_drop(true);
+    for (name, _) in std::env::vars().filter(|(name, _)| {
+        name.starts_with("PRISM_") || name.starts_with("QBIT_") || name == "RUST_LOG"
+    }) {
+        command.env_remove(name);
+    }
+    command.env("PRISM_RUNTIME_WORKERS", "2").env(
+        "PRISM_DATABASE_URL",
+        "postgresql://operator:test-only-password@127.0.0.1:1/offline",
+    );
+    timeout(Duration::from_secs(3), command.output())
+        .await
+        .expect("the command attempted network access or stalled")
+        .unwrap()
+}
+
 async fn rejects(production: bool, settings: &[(&str, &str)], message: &str) {
     let output = check(production, settings).await;
     assert!(
@@ -113,6 +133,11 @@ async fn valid_regtest_and_production_configuration_are_checked_without_services
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
+/// #664: check-config never reads the database, so it says where the
+/// cluster-wide hold that overrides the switch is reported instead.
+const CLUSTER_HOLD: &str = "a cluster-wide block submission hold in the database overrides \
+    PRISM_BLOCK_SUBMIT_ENABLED; `qbit-prism-server submission-hold show` and self-check report it";
+
 /// #291: `check-config` states the block submission mode, and leads with the
 /// kill switch when it is on, in production too: a rehearsal runs on mainnet.
 #[tokio::test]
@@ -127,6 +152,7 @@ async fn check_config_reports_the_block_submission_kill_switch_first() {
     for line in [
         "PRISM_BLOCK_SUBMIT_ENABLED is on: found blocks are offered to the node's submitblock",
         "found-block offers do not wait for a failover standby",
+        CLUSTER_HOLD,
     ] {
         assert!(report.contains(line), "{line:?} missing from {report}");
     }
@@ -163,6 +189,7 @@ async fn check_config_reports_the_block_submission_kill_switch_first() {
         );
         // A held frontend makes no offer, so it reports none.
         assert!(!report.contains("found blocks are offered"), "{report}");
+        assert!(report.contains(CLUSTER_HOLD), "{report}");
         assert!(!report.contains("found-block offers"), "{report}");
     }
     rejects(
@@ -978,4 +1005,30 @@ async fn retired_inventory_covers_the_final_python_runtime_name() {
     let mut sorted = retired.clone();
     sorted.sort_unstable();
     assert_eq!(retired, sorted, "retired inventory is not sorted");
+}
+
+/// #664: `submission-hold set` and `clear` check their reason before they
+/// open a connection, so a blank one is refused even with the database
+/// unreachable, and both require one: each is journaled.
+#[tokio::test]
+async fn submission_hold_set_and_clear_refuse_a_blank_reason_before_reaching_the_database() {
+    for command in ["set", "clear"] {
+        let blank = configured_command_args(&["submission-hold", command, "--reason", "  "]).await;
+        assert!(!blank.status.success(), "{command}");
+        let error = String::from_utf8_lossy(&blank.stderr);
+        assert!(
+            error.contains("--reason must contain 1 to 4096 bytes of nonblank text"),
+            "{command}: {error}"
+        );
+        let missing = configured_command_args(&["submission-hold", command]).await;
+        assert_eq!(
+            missing.status.code(),
+            Some(2),
+            "{command}: clap's usage exit code"
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).contains("--reason"),
+            "{command}"
+        );
+    }
 }

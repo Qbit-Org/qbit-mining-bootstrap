@@ -42,7 +42,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
     applied integer[];
     missing integer[];
     metadata text;
@@ -57,6 +57,7 @@ DECLARE
     epoch_declared boolean := false;
     lease_declared boolean := false;
     fanout_lease_declared boolean := false;
+    hold_declared boolean := false;
     backfill_fence_declared boolean := false;
     epoch_state record;
     source record;
@@ -168,15 +169,16 @@ BEGIN
     -- Startup decodes capability as text and capability_value as int4, and
     -- understands storage version 1, offer lifecycle 1, startup fence 1 and
     -- orphan disposition 1 (015), chain observation epoch 1 (018),
-    -- candidate claim observed lease 1 (021), fanout claim observed
-    -- lease 1 (022), and the share-hash backfill fence 1 (#669), which a
-    -- database declares only while 2's backfill is pending.
+    -- candidate claim observed lease 1 (021), fanout claim observed lease 1
+    -- (022), block submission hold 1 (023), and the share-hash backfill
+    -- fence 1 (#669), which a database declares only while 2's backfill is
+    -- pending.
     -- Every format declaration is required on this native schema; a missing row is never repaired.
     FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s ORDER BY capability DESC', capability_table) LOOP
         IF capability.name_type <> 'text' OR capability.value_type <> 'integer'
            OR capability.capability IS NULL OR capability.capability_value IS NULL THEN
             RAISE EXCEPTION 'qbit_prism_schema_capabilities has an unreadable row: capability % (%), capability_value % (%)', capability.capability, capability.name_type, capability.capability_value, capability.value_type USING HINT = hint;
-        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup', 'candidate_orphan_disposition', 'chain_observation_epoch', 'candidate_claim_observed_lease', 'fanout_claim_observed_lease', 'share_hash_backfill_pending') THEN
+        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup', 'candidate_orphan_disposition', 'chain_observation_epoch', 'candidate_claim_observed_lease', 'fanout_claim_observed_lease', 'block_submission_hold', 'share_hash_backfill_pending') THEN
             RAISE EXCEPTION 'database declares capability % = %, which this server does not understand', capability.capability, capability.capability_value USING HINT = hint;
         ELSIF capability.capability_value <> 1 THEN
             RAISE EXCEPTION 'database declares % = %, but this server understands % 1 to 1 only', capability.capability, capability.capability_value, capability.capability USING HINT = hint;
@@ -188,6 +190,7 @@ BEGIN
         epoch_declared := epoch_declared OR capability.capability = 'chain_observation_epoch';
         lease_declared := lease_declared OR capability.capability = 'candidate_claim_observed_lease';
         fanout_lease_declared := fanout_lease_declared OR capability.capability = 'fanout_claim_observed_lease';
+        hold_declared := hold_declared OR capability.capability = 'block_submission_hold';
         backfill_fence_declared := backfill_fence_declared OR capability.capability = 'share_hash_backfill_pending';
     END LOOP;
     -- A pending share-hash backfill declares share_hash_backfill_pending = 1
@@ -217,6 +220,9 @@ BEGIN
     END IF;
     IF NOT fanout_lease_declared THEN
         RAISE EXCEPTION 'database is at schema migration 22 but does not declare fanout_claim_observed_lease = 1' USING HINT = hint;
+    END IF;
+    IF NOT hold_declared THEN
+        RAISE EXCEPTION 'database is at schema migration 23 but does not declare block_submission_hold = 1' USING HINT = hint;
     END IF;
     -- The singleton row startup decodes into MigrationSource.
     EXECUTE format('SELECT concat_ws('','', pg_typeof(source_state), pg_typeof(source_release), pg_typeof(source_commit), pg_typeof(candidate_storage_version), pg_typeof(prior_schema_version), pg_typeof(migrated_by), pg_typeof(migrated_at)) AS types, source_state IS NULL OR prior_schema_version IS NULL OR migrated_by IS NULL OR migrated_at IS NULL AS incomplete FROM %s WHERE singleton LIMIT 1', source_table) INTO source;

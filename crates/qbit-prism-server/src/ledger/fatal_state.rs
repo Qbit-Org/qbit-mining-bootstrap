@@ -4,6 +4,18 @@ use crate::{config::Config, rpc::Rpc};
 use serde_json::json;
 use std::time::Duration;
 
+/// The rule every operator's `--reason` follows before it is journaled or
+/// written to a row: `fatal-state clear`, `candidates abandon` and
+/// `submission-hold set` and `clear` (#664). The journals' CHECKs (010, 023)
+/// hold the database to the same bound.
+pub fn require_operator_reason(reason: &str) -> Result<()> {
+    ensure!(
+        !reason.trim().is_empty() && reason.len() <= 4096,
+        "--reason must contain 1 to 4096 bytes of nonblank text"
+    );
+    Ok(())
+}
+
 impl Ledger {
     /// Read-only diagnostics remain available before the current migrations.
     /// Recovery writes use connect_operator and its full startup gates.
@@ -52,10 +64,7 @@ impl Ledger {
     }
 
     pub async fn clear_fatal_state(&self, config: &Config, reason: &str) -> Result<Value> {
-        ensure!(
-            !reason.trim().is_empty() && reason.len() <= 4096,
-            "--reason must contain 1 to 4096 bytes of nonblank text"
-        );
+        require_operator_reason(reason)?;
         // Bound the whole operation, including cumulative RPC time while locks
         // are held. Cancellation before COMMIT rolls back. Once COMMIT has
         // been sent, a lost response must be resolved from the durable event.

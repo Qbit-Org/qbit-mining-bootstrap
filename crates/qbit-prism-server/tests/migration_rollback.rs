@@ -1517,7 +1517,7 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1),('chain_observation_epoch',1),('candidate_claim_observed_lease',1),('fanout_claim_observed_lease',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1),('chain_observation_epoch',1),('candidate_claim_observed_lease',1),('fanout_claim_observed_lease',1),('block_submission_hold',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
@@ -1589,6 +1589,16 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='fanout_claim_observed_lease'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='fanout_claim_observed_lease'".into(),
             "fanout_claim_observed_lease",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='block_submission_hold'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('block_submission_hold',1)".into(),
+            "block_submission_hold",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='block_submission_hold'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='block_submission_hold'".into(),
+            "block_submission_hold",
         ),
         (
             "ALTER TABLE qbit_prism_cluster RENAME COLUMN chain_epoch TO saved_chain_epoch".into(),

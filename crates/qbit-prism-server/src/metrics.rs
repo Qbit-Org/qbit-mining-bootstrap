@@ -142,7 +142,7 @@ impl Metrics {
             Family::NodeIbd,
             Family::NodeObservationAge,
             Family::LandingTrimResident,
-            // Unknown, never "on", until `run` publishes the setting (#291).
+            // Unknown, never "on", until the switch and hold are read (#291, #664).
             Family::BlockSubmission,
         ] {
             registry.register(family, vec![], -1.);

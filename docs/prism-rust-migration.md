@@ -584,6 +584,14 @@ partial index over its claimed rows, and declares
 `fanout_claim_observed_lease = 1`. A pre-022 binary takes fanout claims over
 by the database clock, so 022 is applied offline as 021 is. See
 [CTV fanout claim leases and database clock steps](prism-ledger-ops.md#ctv-fanout-claim-leases-and-database-clock-steps-022-654).
+Migration 023 adds the cluster-wide block submission hold (#664): the
+one-row table `qbit_prism_submission_hold`, its append-only journal
+`qbit_prism_submission_hold_events`, and the capability
+`block_submission_hold = 1`. A pre-023 binary would claim and offer
+candidates under a hold, so 023 is applied offline as 021 is, in the
+cutover's stopped window, and the capability refuses older binaries at later
+connects. See
+[holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664).
 While migration 2's share-hash backfill is pending on a populated `2.x.x`
 source, the database declares `share_hash_backfill_pending = 1` (#669). It is
 declared with the backfill's cursor and removed with it when 2 is recorded.
@@ -1722,7 +1730,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `022`), 002's share-hash backfill, 013's concurrent
+(`001` and native `002` to `023`), 002's share-hash backfill, 013's concurrent
 index builds, and 017's prepare, validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
 whole length; the backfill's batches hold only ACCESS SHARE on it. The report

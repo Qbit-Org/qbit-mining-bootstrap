@@ -868,7 +868,12 @@ impl Ledger {
         );
         let token = Uuid::new_v4().to_string();
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        // #664: nothing is claimed, by any frontend, while the cluster holds
+        // block submission.
+        if writable_unless_held(&mut tx, false).await?.is_some() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         // #581: time every claim on this process's clock, and take over the
         // first one it has watched unrenewed for its whole lease, before
         // any new work. A takeover consumes no scheduling slot.

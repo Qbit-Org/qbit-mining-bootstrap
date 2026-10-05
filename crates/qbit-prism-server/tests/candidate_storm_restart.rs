@@ -2466,23 +2466,29 @@ async fn a_frontend_with_block_submission_disabled_sends_its_node_no_block_until
 }
 
 /// The child's latest health heartbeat after `after`, as UNIX seconds, once
-/// it reports block submission disabled. The publisher's first tick is
-/// immediate and its cadence is `PRISM_HEALTH_REFRESH_SECONDS` (2 s), so two
-/// heartbeats bound a window of about twenty submit-loop ticks.
-async fn held_heartbeat(ledger: &Ledger, child: &ServerChild, after: f64) -> Result<f64> {
+/// it reports the `held` mode: its switch off (#291), or its switch on and
+/// the cluster's hold set (#664). The publisher's first tick is immediate and
+/// its cadence is `PRISM_HEALTH_REFRESH_SECONDS` (2 s), so two heartbeats
+/// bound a window of about twenty submit-loop ticks.
+async fn held_heartbeat(
+    ledger: &Ledger,
+    child: &ServerChild,
+    after: f64,
+    held: &Value,
+) -> Result<f64> {
     let bound = deadline(HELD_CANDIDATES);
     let started = Instant::now();
     loop {
-        let heartbeat: Option<(Option<bool>, f64)> = sqlx::query_as(
-            "SELECT (status->'block_submission_enabled')::text::boolean,extract(epoch FROM heartbeat_at)::float8 FROM qbit_prism_instances WHERE instance_id=$1 AND status ? 'schema'",
+        let heartbeat: Option<(Value, f64)> = sqlx::query_as(
+            "SELECT jsonb_build_object('block_submission_enabled',status->'block_submission_enabled','held',status->'block_submission_hold'->'held'),extract(epoch FROM heartbeat_at)::float8 FROM qbit_prism_instances WHERE instance_id=$1 AND status ? 'schema'",
         )
         .bind(INSTANCE_ID)
         .fetch_optional(&ledger.pool)
         .await?;
-        if let Some((enabled, at)) = heartbeat.filter(|(_, at)| *at > after) {
+        if let Some((mode, at)) = heartbeat.filter(|(_, at)| *at > after) {
             ensure!(
-                enabled == Some(false),
-                "the held frontend's heartbeat reports block_submission_enabled {enabled:?}"
+                &mode == held,
+                "the held frontend's heartbeat reports {mode}, not {held}"
             );
             return Ok(at);
         }
@@ -2513,8 +2519,9 @@ async fn held_submission(database: &FixtureDatabase, ledger: &Ledger) -> Result<
     )?;
     // `run` spawns the submit loop and decides the broadcaster before the
     // health publisher, so both have run for the whole window.
-    let first = held_heartbeat(ledger, &child, 0.0).await?;
-    held_heartbeat(ledger, &child, first).await?;
+    let switched_off = json!({"block_submission_enabled": false, "held": false});
+    let first = held_heartbeat(ledger, &child, 0.0, &switched_off).await?;
+    held_heartbeat(ledger, &child, first, &switched_off).await?;
     let signal = node.signals.borrow().clone();
     ensure!(signal.calls > 0, "the held frontend never reached its node");
     ensure!(
@@ -2556,6 +2563,169 @@ async fn held_submission(database: &FixtureDatabase, ledger: &Ledger) -> Result<
     ensure!(
         offers == HELD_CANDIDATES as u64,
         "the enabled frontend offered {offers} of {HELD_CANDIDATES} held blocks"
+    );
+    Ok(())
+}
+
+/// `qbit-prism-server submission-hold <args>` against the fixture's database,
+/// with nothing inherited from the test's own environment. The frontend-only
+/// settings it passes are invalid on purpose: the hold commands read only
+/// `PRISM_DATABASE_URL`, so a stale frontend setting cannot stop an operator.
+async fn submission_hold(database_url: &str, args: &[&str]) -> Result<std::process::Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    for (key, _) in
+        std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
+    {
+        command.env_remove(key);
+    }
+    command
+        .arg("submission-hold")
+        .args(args)
+        .kill_on_drop(true)
+        .env("PRISM_DATABASE_URL", database_url)
+        .env("PRISM_INSTANCE_ID", "prepared:reserved-for-the-ledger")
+        .env("PRISM_DATABASE_MAX_CONNECTIONS", "1")
+        .env("PRISM_RUNTIME_WORKERS", "2");
+    Ok(tokio::time::timeout(Duration::from_secs(30), command.output()).await??)
+}
+
+/// #664: a ledger held with `submission-hold set` holds a frontend that is
+/// started without `PRISM_BLOCK_SUBMIT_ENABLED=0`, with a CTV broadcaster
+/// configured on: over a due outbox, for a whole health cadence, its node
+/// sees no `submitblock`, every row stays `pending` and unclaimed, and its
+/// heartbeat reports the hold. `submission-hold clear` is refused while the
+/// rows are pending; with `--offer-pending-candidates` the same frontend,
+/// still running, offers each block exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_ledger_holds_a_frontend_started_without_the_switch_until_it_is_cleared(
+) -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_submission_hold_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "submission-hold-fixture".into(),
+        4,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let outcome = held_ledger(&database, &ledger).await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+async fn held_ledger(database: &FixtureDatabase, ledger: &Ledger) -> Result<()> {
+    let snapshot = seed(ledger).await?;
+    let planned = plan(&snapshot, HELD_CANDIDATES)?;
+    for row in &planned {
+        ledger.enqueue_candidate(row.candidate.clone()).await?;
+    }
+    let node = FakeNode::open(heights(&planned), NodePlan::default()).await?;
+    let reason = "rehearsal on a restored ledger";
+    let set = submission_hold(&database.url, &["set", "--reason", reason]).await?;
+    ensure!(
+        set.status.success(),
+        "submission-hold set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let report: Value = serde_json::from_slice(&set.stdout)?;
+    ensure!(
+        report["held"] == true && report["newly_set"] == true && report["reason"] == reason,
+        "{report}"
+    );
+
+    let mut child = ServerChild::spawn_with(
+        &database.url,
+        &node.url,
+        &[("PRISM_CTV_BROADCASTER_ENABLED", "1")],
+    )?;
+    let cluster_held = json!({"block_submission_enabled": true, "held": true});
+    let first = held_heartbeat(ledger, &child, 0.0, &cluster_held).await?;
+    held_heartbeat(ledger, &child, first, &cluster_held).await?;
+    let reported: Option<String> = sqlx::query_scalar(
+        "SELECT status->'block_submission_hold'->>'reason' FROM qbit_prism_instances WHERE instance_id=$1",
+    )
+    .bind(INSTANCE_ID)
+    .fetch_one(&ledger.pool)
+    .await?;
+    ensure!(
+        reported.as_deref() == Some(reason),
+        "the frontend's heartbeat reports the hold as {reported:?}"
+    );
+    let signal = node.signals.borrow().clone();
+    ensure!(signal.calls > 0, "the held frontend never reached its node");
+    ensure!(
+        signal.submissions == 0 && node.per_hash().await.is_empty(),
+        "a frontend on the held ledger sent its node {} submitblock calls",
+        signal.submissions
+    );
+    for planned_row in &planned {
+        let held = row(ledger, &planned_row.block_hash).await?;
+        ensure!(
+            held.state == CandidateState::Pending.as_str()
+                && held.attempt_count == 0
+                && held.claim_token.is_none()
+                && held.offer_reserved_by.is_none()
+                && held.payload_present,
+            "a frontend on the held ledger touched {}: {held:?}",
+            planned_row.block_hash
+        );
+    }
+    ensure!(
+        dispatch_slots(ledger).await? == 0,
+        "a frontend on the held ledger claimed a row"
+    );
+    let log = std::fs::read_to_string(child.log.path())?;
+    ensure!(
+        log.contains("the cluster holds block submission"),
+        "the frontend never logged the hold:\n{log}"
+    );
+
+    let refused = submission_hold(&database.url, &["clear", "--reason", "rehearsal over"]).await?;
+    let error = String::from_utf8_lossy(&refused.stderr);
+    ensure!(
+        !refused.status.success()
+            && error.contains(&format!("while candidates are pending ({HELD_CANDIDATES})")),
+        "submission-hold clear did not refuse over pending candidates: {error}"
+    );
+    let cleared = submission_hold(
+        &database.url,
+        &[
+            "clear",
+            "--reason",
+            "offer the held blocks",
+            "--offer-pending-candidates",
+        ],
+    )
+    .await?;
+    ensure!(
+        cleared.status.success(),
+        "submission-hold clear --offer-pending-candidates failed: {}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    // The journal keeps who released the held blocks, and why.
+    let shown = submission_hold(&database.url, &["show"]).await?;
+    ensure!(shown.status.success(), "submission-hold show failed");
+    let shown: Value = serde_json::from_slice(&shown.stdout)?;
+    ensure!(
+        shown["held"] == false
+            && shown["last_event"]["action"] == "clear"
+            && shown["last_event"]["reason"] == "offer the held blocks"
+            && shown["last_event"]["pending_candidates"] == HELD_CANDIDATES,
+        "{shown}"
+    );
+    wait_for_drain(ledger, &child, HELD_CANDIDATES, HELD_CANDIDATES as i64).await?;
+    child.kill().await?;
+    let offers = assert_one_offer_per_hash(&node, &planned).await?;
+    ensure!(
+        offers == HELD_CANDIDATES as u64,
+        "the frontend offered {offers} of {HELD_CANDIDATES} blocks once the hold cleared"
     );
     Ok(())
 }
