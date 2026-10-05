@@ -1125,9 +1125,12 @@ The `--address` has to be a payout address the target's node validates
 2. Waits up to `--work-timeout-seconds` for them all to hold work, and starts
    with those that do. If none does, the run is blocked (exit 3).
 3. Offers `--rate` shares a second for `--duration-seconds`: the open-loop
-   token bucket, round-robin over the sessions with nothing outstanding, and
-   an offer no session can take is shortfall, never a backlog. A session has
-   one submit outstanding at a time, as the server answers it.
+   token bucket, round-robin over the sessions that hold work and have
+   nothing outstanding, and an offer no such session can take is shortfall,
+   never a backlog. A session without a connection is offered nothing, so an
+   outage reads as shortfall rather than as offers held until it reconnects
+   and then sent in a burst. A session has one submit outstanding at a time,
+   as the server answers it.
 4. Mines each job at the difficulty the last `mining.set_difficulty` before
    its `mining.notify` advertised, as the server binds them (Stratum's 1
    before any), with `--difficulty` asked for in the password when given. The
@@ -1137,8 +1140,12 @@ The `--address` has to be a payout address the target's node validates
    blocks.
 5. Reconnects a session whose connection goes, at once and then every
    250 ms until it holds work again.
-6. Waits up to `--drain-seconds` for answers still outstanding, records what
-   is still unanswered as no-response `run ended`, and stops the sessions.
+6. Waits up to `--drain-seconds` for answers still outstanding on sessions
+   that hold work, records what is still unanswered as no-response
+   `run ended`, and stops the sessions. A session that has not stopped 10 s
+   later (one in the middle of a handshake) is aborted, and what it held is
+   counted as `offers.unknown_at_abort`: sent or not, it has no share-log
+   line.
 
 SIGINT or SIGTERM ends the load early, drains and writes the stats (exit 6);
 a second one skips the rest of the drain. A progress line goes to stderr every
@@ -1147,27 +1154,36 @@ a second one skips the rest of the drain. A progress line goes to stderr every
 ### The stats
 
 `--out` (default `external-load.json`) is a `qbit.prism.external-load.v1`
-document with four parts:
+document with four parts. Its directory is checked at entry with a probe
+file beside it, so a path that cannot be written refuses the run before any
+load; a file already there is replaced only when the new document is
+written, and a `--share-log` naming the same file is refused.
 
 - `processes`: per client process, its configuration, its load window, how
-  it `ended`, its exit code, its own counts, its CPU seconds and cores (so a
-  busy client can be told from a slow target), and its share log.
+  it `ended`, its exit code, its own counts, what was still outstanding when
+  the drain ended, its CPU seconds and cores (so a busy client can be told
+  from a slow target), its share log, and `events_cut_off`, set only if the
+  stats had to stop taking events before the last one arrived.
 - `totals`: the additive record. Counts, latency histograms and a timeline
   with one entry per wall-clock second (offered, dispatched, shortfall,
   accepted, rejected, no-response, disconnects, reconnects, and the sessions
   holding work).
 - `summary`, derived from those two: `shares` (accepted, rejected and
   no-response, split into the connections that went mid-run and the
-  submits the drain gave up on), `rates` (offered and accepted per second,
-  and accepted per wall-clock second inside every window), `ack_latency`
+  submits the drain gave up on), `rates` (offered and accepted per second
+  over the load window, an answer read in the drain counting for the window
+  its offer was made in, as a phase's submits count for the phase; and
+  accepted per wall-clock second inside every window), `ack_latency`
   (p50, p90, p99, p99.9, max, from the submit's write to the read of its
   answer), `rejections` by class and by `(code, reason_id, message)`,
   `reconnects` (disconnects and their causes, completed reconnects, failed
   attempts, and the outage from losing a connection to holding work again),
   `connections` (time to first job), `difficulty` (what the target
   advertised, and the offers above the ceiling), `tips` (per tip, from the
-  first session to the last to hold work on it), `client_failures`, and
-  `offers`, whose `unaccounted` is 0 for a complete run.
+  first session to the last to hold work on it, each session counted once;
+  a process keeps its newest 1,024 tips, and past that the distinct count is
+  `null` with the reason), `client_failures`, and `offers`, whose
+  `unaccounted` is 0 for a complete run.
 - `definitions`: what each figure means and which clock it is on.
 
 The latency percentiles come from log-linear histograms with buckets 0.2%

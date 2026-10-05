@@ -24,7 +24,7 @@ pub mod stats;
 
 use crate::client::{self, Control, DifficultySource, SessionConfig, SessionHandle, SessionShared};
 use crate::run::{EXIT_ABORTED, EXIT_BLOCKED, EXIT_OK};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use serde_json::Value;
 use std::ffi::OsString;
@@ -55,6 +55,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a stopped session may take to finish its last search and exit.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the stats may take to take in the last events once every session
+/// has stopped. A search an aborted session left running still holds a
+/// sender until it ends.
+pub const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Which subcommand a command line names, if any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,18 +291,19 @@ impl Shutdown {
         Self::default()
     }
 
-    /// One that SIGINT and SIGTERM ask of.
-    pub fn on_signals() -> Self {
+    /// One that SIGINT and SIGTERM ask of. Both handlers are installed
+    /// before this returns, so from then on neither signal can end the
+    /// process without its stats; one that cannot be installed is an error,
+    /// not a silent default.
+    pub fn on_signals() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt =
+            signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+        let mut terminate =
+            signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
         let shutdown = Self::default();
         let asked = shutdown.clone();
         tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let (Ok(mut interrupt), Ok(mut terminate)) = (
-                signal(SignalKind::interrupt()),
-                signal(SignalKind::terminate()),
-            ) else {
-                return;
-            };
             loop {
                 let name = tokio::select! {
                     _ = interrupt.recv() => "interrupted",
@@ -307,7 +312,7 @@ impl Shutdown {
                 asked.request(name);
             }
         });
-        shutdown
+        Ok(shutdown)
     }
 
     pub fn request(&self, reason: &str) {
@@ -362,7 +367,7 @@ pub async fn main(command: Command, argv: Vec<OsString>) -> Result<i32> {
     match command {
         Command::Run => {
             let args = ExternalArgs::parse_from(rest);
-            let outcome = run(&args, &Shutdown::on_signals()).await?;
+            let outcome = run(&args, &Shutdown::on_signals()?).await?;
             Ok(outcome.exit_code)
         }
         Command::Merge => {
@@ -482,17 +487,9 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         args.sessions,
         args.sessions + 64
     );
-    // The document is written after the load; a path it cannot be written
-    // to is refused before the load, not discovered after it.
-    ensure!(
-        !args.out.is_dir(),
-        "--out {} is a directory; name the file to write",
-        args.out.display()
-    );
-    write_document(&args.out, &Value::Null)
-        .with_context(|| format!("--out {} cannot be written", args.out.display()))?;
-    std::fs::remove_file(&args.out)
-        .with_context(|| format!("removing the probe at {}", args.out.display()))?;
+    let run_id = uuid::Uuid::new_v4();
+    let run_tag = run_id.simple().to_string()[..8].to_owned();
+    check_outputs(args, &run_tag)?;
     // Created before any load, so a log that cannot be written refuses the
     // run instead of losing the ids.
     let share_log = args
@@ -501,8 +498,6 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         .map(stats::ShareLog::create)
         .transpose()?;
 
-    let run_id = uuid::Uuid::new_v4();
-    let run_tag = run_id.simple().to_string()[..8].to_owned();
     let worker_prefix = args
         .worker_prefix
         .clone()
@@ -527,8 +522,15 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     );
 
     let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
-    let collector = Arc::new(Mutex::new(stats::Collector::new(anchor, share_log)));
-    let collector_task = {
+    let collector = Arc::new(Mutex::new(stats::Collector::new(
+        anchor,
+        share_log,
+        args.sessions,
+    )));
+    // Which sessions hold work, kept by the collector from the sessions' own
+    // events: the scheduler offers only to these.
+    let holding = collector.lock().expect("collector lock").holding();
+    let mut collector_task = {
         let collector = collector.clone();
         tokio::spawn(async move {
             while let Some(event) = inbox.recv().await {
@@ -552,9 +554,6 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
                     index,
                     username: format!("{}.{worker_prefix}-s{index:05}", args.address),
                     password: args.password(),
-                    share_difficulty: args
-                        .difficulty
-                        .unwrap_or(client::STRATUM_DEFAULT_DIFFICULTY),
                     difficulty: DifficultySource::Advertised {
                         ceiling: args.max_difficulty,
                     },
@@ -578,7 +577,7 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
 
     // --- the sessions take work ------------------------------------------
     let ready_deadline = Instant::now() + work_timeout;
-    let holding = loop {
+    let holding_at_start = loop {
         let holding = collector
             .lock()
             .expect("collector lock")
@@ -598,21 +597,23 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     let mut minted = Offers::default();
     let ended = if let Some(reason) = shutdown.requested() {
         format!("interrupted: {reason} before the load started")
-    } else if holding == 0 {
+    } else if holding_at_start == 0 {
         format!(
             "blocked: no session held work within --work-timeout-seconds ({})",
             args.work_timeout_seconds
         )
     } else {
-        if holding < args.sessions {
+        if holding_at_start < args.sessions {
             eprintln!(
-                "qbit-prism-load external: {label}: {holding} of {} sessions hold work after \
-                 {} s; starting the load with them, the rest keep trying",
+                "qbit-prism-load external: {label}: {holding_at_start} of {} sessions hold work \
+                 after {} s; starting the load with them, the rest keep trying",
                 args.sessions, args.work_timeout_seconds
             );
         }
-        let (driven, interrupted) =
-            drive(args, &label, &sessions, &collector, anchor, shutdown).await;
+        let (driven, interrupted) = drive(
+            args, &label, &sessions, &holding, &collector, anchor, shutdown,
+        )
+        .await;
         window = Some(driven.window);
         minted = driven.offers;
         match interrupted {
@@ -622,20 +623,25 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     };
 
     // --- drain, then stop ------------------------------------------------
-    let outstanding = || -> usize {
+    // Only a session with a connection can still be answered; an offer held
+    // by one without is waited for by nothing.
+    let outstanding = |connected: bool| -> usize {
         sessions
             .iter()
-            .map(|session| session.outstanding.load(Ordering::Relaxed))
+            .zip(holding.iter())
+            .filter(|(_, holds)| holds.load(Ordering::Relaxed) == connected)
+            .map(|(session, _)| session.outstanding.load(Ordering::Relaxed))
             .sum()
     };
     let drain_deadline = Instant::now() + drain;
-    while outstanding() > 0 && Instant::now() < drain_deadline && !shutdown.forced() {
+    while outstanding(true) > 0 && Instant::now() < drain_deadline && !shutdown.forced() {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             _ = shutdown.after(2) => {}
         }
     }
-    let outstanding_at_drain_end = outstanding();
+    let outstanding_at_drain_end = outstanding(true);
+    let held_without_a_connection_at_drain_end = outstanding(false);
     for session in &sessions {
         let _ = session.control.send(Control::Stop);
     }
@@ -643,35 +649,49 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     // reads its stop only once the handshake ends, and is aborted instead.
     let stop_deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
     let mut sessions_aborted_at_stop = 0usize;
-    let mut abandoned = 0u64;
+    let (mut discarded_at_stop, mut unknown_at_abort) = (0u64, 0u64);
     for session in sessions {
         let mut task = session.task;
-        if tokio::time::timeout_at(stop_deadline, &mut task)
+        let stopped = tokio::time::timeout_at(stop_deadline, &mut task)
             .await
-            .is_err()
-        {
+            .is_ok();
+        // What a session still counts once it is gone is what it took and
+        // never reported. One that stopped had no connection when its stop
+        // came, so its offer was never sent. One that had to be aborted may
+        // have been sending it.
+        let left = session.outstanding.load(Ordering::Relaxed) as u64;
+        if stopped {
+            discarded_at_stop += left;
+        } else {
             task.abort();
             sessions_aborted_at_stop += 1;
+            unknown_at_abort += left;
         }
-        // What a stopped session still counts is what it took and never
-        // reported: an aborted session's, or the offer a session without a
-        // connection held when its stop came, which it leaves unreported.
-        abandoned += session.outstanding.load(Ordering::Relaxed) as u64;
     }
-    // Every sender has gone with its session, so the queue drains and ends.
-    if tokio::time::timeout(STOP_TIMEOUT, collector_task)
-        .await
-        .is_err()
-    {
-        bail!("the stats collector did not finish within {STOP_TIMEOUT:?} of the sessions");
-    }
-    let mut collector = Arc::try_unwrap(collector)
-        .map_err(|_| anyhow::anyhow!("the stats collector is still shared"))?
-        .into_inner()
-        .map_err(|_| anyhow::anyhow!("the stats collector lock was poisoned"))?;
-    let share_log = collector.finish_share_log();
-    let mut totals = collector.totals;
-    totals.offers_discarded += abandoned;
+    // Every sender goes with its session, so the queue drains and ends. If it
+    // has not within the limit, the stats are written with what arrived and
+    // say so, rather than lost.
+    let events_cut_off = match tokio::time::timeout(COLLECTOR_TIMEOUT, &mut collector_task).await {
+        Ok(_) => None,
+        Err(_) => {
+            collector_task.abort();
+            Some(format!(
+                "events were still arriving {COLLECTOR_TIMEOUT:?} after the sessions stopped; \
+                 the stats hold what had arrived by then"
+            ))
+        }
+    };
+    let (mut totals, share_log) = {
+        let mut collector = collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            std::mem::take(&mut collector.totals),
+            collector.finish_share_log(),
+        )
+    };
+    totals.offers_discarded += discarded_at_stop;
+    totals.offers_unknown_at_abort += unknown_at_abort;
     totals.offers_minted = minted.minted;
     totals.offers_dispatched = minted.dispatched;
     totals.offers_shortfall = minted.shortfall;
@@ -708,7 +728,7 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         started_at: started_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         ended_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         window,
-        sessions_holding_work_at_start: holding,
+        sessions_holding_work_at_start: holding_at_start,
         ended: ended.clone(),
         exit_code,
         offers_minted: totals.offers_minted,
@@ -716,7 +736,9 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         rejected: totals.rejected,
         no_response: totals.no_response(),
         outstanding_at_drain_end,
+        held_without_a_connection_at_drain_end,
         sessions_aborted_at_stop,
+        events_cut_off,
         client_cpu_seconds: crate::measure::process_cpu_seconds(std::process::id()),
         available_parallelism: std::thread::available_parallelism().ok().map(usize::from),
         file_descriptor_limit: Some(descriptors),
@@ -735,6 +757,50 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     })
 }
 
+/// The output paths, checked before the load: `--out` is written only after
+/// it, so a path it cannot be written to is refused now rather than found
+/// after hours. The check writes a probe beside it and never touches the
+/// file itself, which may hold an earlier run's stats. `--share-log` must be
+/// another file, or the document would replace the ids it reports.
+fn check_outputs(args: &ExternalArgs, run_tag: &str) -> Result<()> {
+    ensure!(
+        !args.out.is_dir(),
+        "--out {} is a directory; name the file to write",
+        args.out.display()
+    );
+    if let Some(log) = &args.share_log {
+        let same = std::path::absolute(log)? == std::path::absolute(&args.out)?
+            || std::fs::canonicalize(log)
+                .ok()
+                .zip(std::fs::canonicalize(&args.out).ok())
+                .is_some_and(|(log, out)| log == out);
+        ensure!(
+            !same,
+            "--share-log and --out name the same file, {}; the stats would replace the share ids",
+            args.out.display()
+        );
+    }
+    let directory = args
+        .out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = args
+        .out
+        .file_name()
+        .with_context(|| format!("--out {} names no file", args.out.display()))?;
+    let probe = directory.join(format!(".{}.{run_tag}.probe", name.to_string_lossy()));
+    std::fs::write(&probe, b"").with_context(|| {
+        format!(
+            "--out {}: cannot write in {}",
+            args.out.display(),
+            directory.display()
+        )
+    })?;
+    std::fs::remove_file(&probe).with_context(|| format!("removing {}", probe.display()))?;
+    Ok(())
+}
+
 /// What the token bucket minted, by wall-clock second: (offered,
 /// dispatched).
 #[derive(Default)]
@@ -750,22 +816,44 @@ struct Driven {
     offers: Offers,
 }
 
+/// Give one offer to the next session, in turn from `cursor`, that holds
+/// work and has nothing outstanding. A session without a connection is not
+/// offered anything: it would hold the offer until it reconnected, so an
+/// outage would read as dispatched load rather than shortfall, and the held
+/// offers would go out as a burst on recovery.
+fn place(
+    sessions: &[SessionHandle],
+    holding: &[AtomicBool],
+    cursor: &mut usize,
+    phase: &Arc<str>,
+) -> bool {
+    for _ in 0..sessions.len() {
+        let index = *cursor % sessions.len();
+        *cursor = cursor.wrapping_add(1);
+        if holding[index].load(Ordering::Relaxed) && sessions[index].try_offer(1, phase) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The load window: the harness's open-loop token bucket, round-robin over
-/// the sessions with nothing outstanding. Returns the window and, when a
-/// shutdown cut it short, why.
+/// the sessions that hold work and have nothing outstanding. Returns the
+/// window and, when a shutdown cut it short, why.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     args: &ExternalArgs,
     label: &str,
     sessions: &[SessionHandle],
+    holding: &[AtomicBool],
     collector: &Arc<Mutex<stats::Collector>>,
     anchor: stats::Anchor,
     shutdown: &Shutdown,
 ) -> (Driven, Option<String>) {
     let started = Instant::now();
     let duration = Duration::from_secs(args.duration_seconds);
-    let cursor = AtomicUsize::new(0);
+    let mut cursor = 0usize;
     let phase: Arc<str> = Arc::from(PHASE);
-    let mut picker = crate::run::OfferPicker::new(None, sessions.len(), PHASE);
     let mut offers = Offers::default();
     let mut interrupted = None;
     let mut next_sample = started;
@@ -792,9 +880,14 @@ async fn drive(
         // take is shortfall, never a backlog.
         let want = (elapsed.as_secs_f64() * args.rate).floor() as u64;
         let second = anchor.unix_second(now);
+        // Once a scan finds no session free, the rest of this tick's offers
+        // are shortfall without scanning again, so an outage costs one pass
+        // over the sessions a tick rather than one per offer.
+        let mut saturated = false;
         while offers.minted < want {
             offers.minted += 1;
-            let placed = picker.offer(sessions, &cursor, 1, &phase);
+            let placed = !saturated && place(sessions, holding, &mut cursor, &phase);
+            saturated = !placed;
             let tally = offers.per_second.entry(second).or_insert((0, 0));
             tally.0 += 1;
             if placed {

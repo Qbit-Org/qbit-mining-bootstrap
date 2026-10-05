@@ -56,6 +56,12 @@ struct FakeTarget {
 }
 
 async fn fake_target(difficulty: f64) -> FakeTarget {
+    fake_target_admitting(difficulty, usize::MAX).await
+}
+
+/// A target that serves its first `admitted` connections and closes every
+/// later one at once, as a frontend at its connection cap does.
+async fn fake_target_admitting(difficulty: f64, admitted: usize) -> FakeTarget {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let seen = Arc::new(Seen::default());
@@ -71,7 +77,10 @@ async fn fake_target(difficulty: f64) -> FakeTarget {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                seen.connections.fetch_add(1, Ordering::SeqCst);
+                if seen.connections.fetch_add(1, Ordering::SeqCst) >= admitted {
+                    drop(socket);
+                    continue;
+                }
                 let extranonce1 = (extranonce.fetch_add(1, Ordering::SeqCst) as u32).to_be_bytes();
                 let generation = *drops.borrow();
                 tokio::spawn(serve(
@@ -743,10 +752,12 @@ async fn a_shutdown_ends_the_load_early_and_keeps_the_stats() -> Result<()> {
 }
 
 /// A target that goes down for good mid-run: every session loses its
-/// connection and keeps failing to reconnect until the run stops it, and the
-/// offers they had taken are still accounted for, not lost.
+/// connection and keeps failing to reconnect. From then on no offer goes to
+/// a session without a connection, so the outage reads as shortfall rather
+/// than as offers held for sessions that cannot send them, and every offer
+/// is still accounted for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_run_that_ends_with_the_target_down_still_accounts_for_every_offer() -> Result<()> {
+async fn an_outage_is_shortfall_and_every_offer_is_accounted_for() -> Result<()> {
     let target = fake_target(EASY).await;
     let scratch = Scratch::new("down");
     let out = scratch.path("stats.json");
@@ -760,7 +771,7 @@ async fn a_run_that_ends_with_the_target_down_still_accounts_for_every_offer() -
             "--rate",
             "30",
             "--duration-seconds",
-            "3",
+            "4",
         ],
     );
     let run = tokio::spawn(async move { external::run(&args, &Shutdown::never()).await });
@@ -771,9 +782,11 @@ async fn a_run_that_ends_with_the_target_down_still_accounts_for_every_offer() -
     .await;
     target.listener.abort();
     target.drops.send_modify(|generation| *generation += 1);
+    let down_at = chrono::Utc::now().timestamp();
     let outcome = run.await??;
     assert_eq!(outcome.exit_code, run::EXIT_OK);
-    let summary = &outcome.document["summary"];
+    let document = &outcome.document;
+    let summary = &document["summary"];
     assert_eq!(
         summary["reconnects"]["disconnects"],
         json!(3),
@@ -781,15 +794,151 @@ async fn a_run_that_ends_with_the_target_down_still_accounts_for_every_offer() -
     );
     assert_eq!(summary["reconnects"]["completed"], json!(0), "{summary:#}");
     assert!(summary["reconnects"]["failed_attempts"].as_u64().unwrap() >= 3);
+    // A whole second after the outage, nothing is dispatched: every offer is
+    // shortfall. An offer can only reach a session in the instant between
+    // its socket closing and its disconnect being counted.
+    let window_end = document["processes"][0]["window"]["ended_unix_ms"]
+        .as_i64()
+        .unwrap()
+        / 1000;
+    let after: Vec<&Value> = document["totals"]["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            let second = s["unix_second"].as_i64().unwrap();
+            second > down_at + 1 && second < window_end
+        })
+        .collect();
+    assert!(!after.is_empty(), "{document:#}");
+    for second in after {
+        assert_eq!(second["dispatched"], json!(0), "{second}");
+        assert_eq!(second["shortfall"], second["offered"], "{second}");
+    }
     assert!(
-        summary["offers"]["discarded"].as_u64().unwrap() >= 1,
+        summary["offers"]["discarded"].as_u64().unwrap() <= 3,
         "{summary:#}"
     );
     assert_eq!(summary["offers"]["unaccounted"], json!(0), "{summary:#}");
-    assert_eq!(
-        outcome.document["processes"][0]["sessions_aborted_at_stop"],
-        json!(0)
+    let process = &document["processes"][0];
+    assert_eq!(process["sessions_aborted_at_stop"], json!(0));
+    assert_eq!(process["events_cut_off"], Value::Null);
+    Ok(())
+}
+
+/// A session that has no connection is never offered anything: here two of
+/// four sessions are never admitted, and the load runs on the other two
+/// without a single offer parked on the two that cannot send it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_without_a_connection_are_never_offered_work() -> Result<()> {
+    let target = fake_target_admitting(EASY, 2).await;
+    let scratch = Scratch::new("admitted");
+    let out = scratch.path("stats.json");
+    let mut args = args(
+        &target.address,
+        &out,
+        &[
+            external::GUARD_FLAG,
+            "--sessions",
+            "4",
+            "--rate",
+            "20",
+            "--duration-seconds",
+            "2",
+        ],
     );
+    args.work_timeout_seconds = 1;
+    let outcome = external::run(&args, &Shutdown::never()).await?;
+    assert_eq!(outcome.exit_code, run::EXIT_OK);
+    let summary = &outcome.document["summary"];
+    let process = &outcome.document["processes"][0];
+    assert_eq!(process["sessions_holding_work_at_start"], json!(2));
+    assert!(
+        summary["shares"]["accepted"].as_u64().unwrap() >= 10,
+        "{summary:#}"
+    );
+    assert_eq!(process["held_without_a_connection_at_drain_end"], json!(0));
+    assert_eq!(summary["offers"]["discarded"], json!(0), "{summary:#}");
+    assert_eq!(summary["offers"]["unaccounted"], json!(0), "{summary:#}");
+    assert!(
+        summary["connections"]["initial_connect_failures"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    Ok(())
+}
+
+/// A session that comes back to a tip, as one can while the frontends
+/// behind a balancer disagree, is counted on it once, at its first
+/// sighting.
+#[test]
+fn a_session_is_counted_once_per_tip_however_often_it_comes_back() {
+    let anchor = stats::Anchor::now();
+    let mut collector = stats::Collector::new(anchor, None, 2);
+    let start = std::time::Instant::now();
+    let sight = |session: usize, tip: &str, millis: u64| {
+        client::Event::Tip(client::TipSighting {
+            session,
+            frontend: 0,
+            tip: tip.into(),
+            at: start + Duration::from_millis(millis),
+        })
+    };
+    for event in [
+        sight(0, "a", 0),
+        sight(1, "a", 10),
+        sight(0, "b", 20),
+        sight(0, "a", 900),
+        sight(1, "a", 950),
+    ] {
+        collector.apply(event);
+    }
+    let tips = &collector.totals.tips;
+    assert_eq!(tips.tips["a"].sessions, 2);
+    assert_eq!(
+        tips.tips["a"].last_seen_unix_ms - tips.tips["a"].first_seen_unix_ms,
+        10
+    );
+    assert_eq!(tips.tips["b"].sessions, 1);
+}
+
+/// The output checks never touch an earlier run's stats, and refuse a share
+/// log that would be overwritten by the document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()> {
+    let target = fake_target(EASY).await;
+    let scratch = Scratch::new("outputs");
+    let out = scratch.path("stats.json");
+    std::fs::write(&out, "an earlier run's stats")?;
+    let out_arg = out.display().to_string();
+    let missing = scratch.path("no-such-directory/shares.jsonl");
+    let missing = missing.display().to_string();
+    for (extra, needle) in [
+        (vec!["--share-log", &out_arg], "same file"),
+        (vec!["--share-log", &missing], "share log"),
+    ] {
+        let mut flags = vec![external::GUARD_FLAG];
+        flags.extend(extra.iter().copied());
+        let args = args(&target.address, &out, &flags);
+        let error = match external::run(&args, &Shutdown::never()).await {
+            Ok(_) => panic!("{extra:?} ran"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains(needle), "{extra:?}: {error}");
+        assert_eq!(
+            std::fs::read_to_string(&out)?,
+            "an earlier run's stats",
+            "{extra:?}"
+        );
+    }
+    assert_eq!(target.seen.connections.load(Ordering::SeqCst), 0);
+    // Nothing is left behind by the check either.
+    let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(leftovers, vec![std::ffi::OsString::from("stats.json")]);
     Ok(())
 }
 

@@ -1189,15 +1189,16 @@ async fn serve_stratum(
     }
 }
 
+/// Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share search
+/// costs microseconds even in a debug build.
+const SESSION_DIFFICULTY: f64 = 1.0 / 67_108_864.0;
+
 fn session_config(index: usize) -> client::SessionConfig {
     client::SessionConfig {
         index,
         username: format!("pload1test.s{index:05}"),
         password: "x".into(),
-        // Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share
-        // search costs microseconds even in a debug build.
-        share_difficulty: 1.0 / 67_108_864.0,
-        difficulty: client::DifficultySource::Configured,
+        difficulty: client::DifficultySource::Configured(SESSION_DIFFICULTY),
         version_rolling_mask: codec::VERSION_ROLLING_MASK,
         connect_timeout: std::time::Duration::from_secs(5),
         handshake_timeout: std::time::Duration::from_secs(20),
@@ -1712,7 +1713,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
 
     // The observation: a session reports the disagreement with the values
     // on both sides, and still connects and holds work.
-    let configured = session_config(0).share_difficulty;
+    let configured = SESSION_DIFFICULTY;
     let server = fake_stratum_with(StratumOptions {
         advertised_difficulty: Some(configured / 2.0),
         ..Default::default()

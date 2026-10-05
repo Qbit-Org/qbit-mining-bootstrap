@@ -130,11 +130,10 @@ pub const STRATUM_DEFAULT_DIFFICULTY: f64 = 1.0;
 /// Where a session takes the difficulty it mines each job at.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DifficultySource {
-    /// [`SessionConfig::share_difficulty`], the difficulty the harness
-    /// launched its own frontends with. A `mining.set_difficulty` that
-    /// disagrees is a contradicted premise, reported as
-    /// [`Event::DifficultyMismatch`].
-    Configured,
+    /// The difficulty the harness launched its own frontends with. A
+    /// `mining.set_difficulty` that disagrees is a contradicted premise,
+    /// reported as [`Event::DifficultyMismatch`].
+    Configured(f64),
     /// The target's (external-target mode, [`crate::external`]): each job is
     /// mined at the difficulty the last `mining.set_difficulty` before its
     /// `mining.notify` advertised, which is how Stratum binds the two and how
@@ -483,9 +482,6 @@ pub struct SessionConfig {
     pub index: usize,
     pub username: String,
     pub password: String,
-    /// The difficulty a [`DifficultySource::Configured`] session mines at;
-    /// unread under [`DifficultySource::Advertised`].
-    pub share_difficulty: f64,
     pub difficulty: DifficultySource,
     pub version_rolling_mask: u32,
     pub connect_timeout: Duration,
@@ -1443,12 +1439,11 @@ fn consume(
     match value.get("method").and_then(Value::as_str) {
         Some("mining.notify") => note_job(connection, &value, config, shared, frontend)?,
         Some("mining.set_difficulty") => match config.difficulty {
-            DifficultySource::Configured => {
+            DifficultySource::Configured(configured) => {
                 if let Some(advertised) = value["params"][0].as_f64() {
                     // The harness pins the difficulty, so a disagreement here means
                     // the frontend is not running the configuration the artifact
                     // will claim (EP-CONFIG).
-                    let configured = config.share_difficulty;
                     if (advertised - configured).abs() > configured.abs() * 1e-9 {
                         let _ = shared.events.send(Event::DifficultyMismatch {
                             session: config.index,
@@ -1552,7 +1547,7 @@ fn note_job(
     // `difficulty_target`, so the client's acceptance test is bit-for-bit the
     // server's.
     let share_difficulty = match config.difficulty {
-        DifficultySource::Configured => config.share_difficulty,
+        DifficultySource::Configured(configured) => configured,
         DifficultySource::Advertised { .. } => connection
             .advertised_difficulty
             .unwrap_or(STRATUM_DEFAULT_DIFFICULTY),
@@ -1623,7 +1618,7 @@ async fn offer(
         .context("no current job to mine")
         .map_err(OfferFailure::unrecorded)?;
     let off_runtime = match config.difficulty {
-        DifficultySource::Configured => false,
+        DifficultySource::Configured(_) => false,
         DifficultySource::Advertised { ceiling } => {
             if job.share_difficulty > ceiling {
                 return Err(OfferFailure::unrecorded(anyhow::anyhow!(
@@ -1645,27 +1640,17 @@ async fn offer(
     let extranonce1 = connection.extranonce1.clone();
     let session = config.index;
     let events = shared.events.clone();
-    let found = if scheduled_block {
-        let job = job.clone();
-        let extranonce2 = extranonce2.clone();
-        tokio::task::spawn_blocking(move || search(&job, &extranonce1, &extranonce2, true, None))
-            .await
-            .map_err(|error| OfferFailure::unrecorded(error.into()))?
-    } else if off_runtime {
-        // A share at the target's difficulty can take thousands of hashes,
-        // where the harness's own take dozens: searched inline it would hold
-        // a runtime worker, and every session on that worker would read its
+    let found = if scheduled_block || off_runtime {
+        // A block search is a full network-target search, and a share at an
+        // external target's difficulty can take thousands of hashes where the
+        // harness's own take dozens. Searched inline either would hold a
+        // runtime worker, and every session on that worker would read its
         // answers late and report the delay as acknowledgement latency.
         let job = job.clone();
         let extranonce2 = extranonce2.clone();
+        let discards = (!scheduled_block).then_some((session, events));
         tokio::task::spawn_blocking(move || {
-            search(
-                &job,
-                &extranonce1,
-                &extranonce2,
-                false,
-                Some((session, events)),
-            )
+            search(&job, &extranonce1, &extranonce2, scheduled_block, discards)
         })
         .await
         .map_err(|error| OfferFailure::unrecorded(error.into()))?

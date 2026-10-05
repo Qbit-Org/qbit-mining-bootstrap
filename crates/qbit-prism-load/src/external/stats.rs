@@ -15,9 +15,11 @@ use crate::external::histogram::LogHistogram;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const SCHEMA: &str = "qbit.prism.external-load.v1";
@@ -417,6 +419,10 @@ pub struct Totals {
     /// without a connection at the time included), or it did not stop in
     /// time and was aborted (`Process::sessions_aborted_at_stop`).
     pub offers_discarded: u64,
+    /// Offers held by a session that did not stop within 10 s and was
+    /// aborted. Whether each was sent is unknown, and none has a share-log
+    /// line: a share among them may be in the target's ledger unexplained.
+    pub offers_unknown_at_abort: u64,
     /// Offers whose job the target advertised above the client's ceiling:
     /// not mined, and also counted under `client_failures.offer`.
     pub offers_above_difficulty_ceiling: u64,
@@ -470,6 +476,7 @@ impl Totals {
         self.offers_dispatched += other.offers_dispatched;
         self.offers_shortfall += other.offers_shortfall;
         self.offers_discarded += other.offers_discarded;
+        self.offers_unknown_at_abort += other.offers_unknown_at_abort;
         self.offers_above_difficulty_ceiling += other.offers_above_difficulty_ceiling;
         self.accepted += other.accepted;
         self.rejected += other.rejected;
@@ -604,30 +611,43 @@ impl ShareLog {
 pub struct Collector {
     pub totals: Totals,
     anchor: Anchor,
-    holding_work: HashSet<usize>,
-    /// The tip each session last held work on.
-    last_tip: HashMap<usize, String>,
+    /// Whether each session holds work: set on its `Connected`, cleared on
+    /// its `Disconnected`. Shared with the scheduler, which offers only to a
+    /// session that holds work.
+    holding: Arc<[AtomicBool]>,
+    holding_count: usize,
+    /// Per tip, the sessions that have held work on it, one bit each: a
+    /// session sights a tip again on every connection, and may come back to
+    /// one after holding another, but only its first sighting says when the
+    /// tip's work reached it. Kept for the tips `totals.tips` keeps.
+    tip_sessions: HashMap<String, Vec<u64>>,
     share_log: Option<ShareLog>,
 }
 
 impl Collector {
-    pub fn new(anchor: Anchor, share_log: Option<ShareLog>) -> Self {
+    pub fn new(anchor: Anchor, share_log: Option<ShareLog>, sessions: usize) -> Self {
         Self {
             totals: Totals::default(),
             anchor,
-            holding_work: HashSet::new(),
-            last_tip: HashMap::new(),
+            holding: (0..sessions).map(|_| AtomicBool::new(false)).collect(),
+            holding_count: 0,
+            tip_sessions: HashMap::new(),
             share_log,
         }
     }
 
+    /// The per-session flags the scheduler reads.
+    pub fn holding(&self) -> Arc<[AtomicBool]> {
+        self.holding.clone()
+    }
+
     pub fn sessions_holding_work(&self) -> usize {
-        self.holding_work.len()
+        self.holding_count
     }
 
     /// Record how many sessions hold work now, as the given second's sample.
     pub fn sample_holding_work(&mut self, unix_second: i64) {
-        let holding = self.holding_work.len() as u64;
+        let holding = self.holding_count as u64;
         let second = self.totals.timeline.second(unix_second);
         if second.sampled_by == 0 {
             second.sampled_by = 1;
@@ -688,10 +708,18 @@ impl Collector {
                 }
             }
             Event::Connected { session, .. } => {
-                self.holding_work.insert(session);
+                if let Some(flag) = self.holding.get(session) {
+                    if !flag.swap(true, Ordering::Relaxed) {
+                        self.holding_count += 1;
+                    }
+                }
             }
             Event::Disconnected { session, .. } => {
-                self.holding_work.remove(&session);
+                if let Some(flag) = self.holding.get(session) {
+                    if flag.swap(false, Ordering::Relaxed) {
+                        self.holding_count -= 1;
+                    }
+                }
             }
             Event::Tip(sighting) => self.tip(&sighting),
             Event::Notify(sighting) => {
@@ -808,14 +836,15 @@ impl Collector {
     }
 
     fn tip(&mut self, sighting: &client::TipSighting) {
-        // A session sights the tip again on every new connection; only the
-        // first sighting says when the tip's work reached it. Keeping each
-        // session's last tip, rather than each tip's sessions, bounds this
-        // by the sessions.
-        if self.last_tip.get(&sighting.session) == Some(&sighting.tip) {
+        let seen = self.tip_sessions.entry(sighting.tip.clone()).or_default();
+        let (word, bit) = (sighting.session / 64, 1u64 << (sighting.session % 64));
+        if seen.len() <= word {
+            seen.resize(word + 1, 0);
+        }
+        if seen[word] & bit != 0 {
             return;
         }
-        self.last_tip.insert(sighting.session, sighting.tip.clone());
+        seen[word] |= bit;
         let at = self.anchor.unix_ms(sighting.at);
         self.totals.tips.add(
             &sighting.tip,
@@ -825,6 +854,11 @@ impl Collector {
                 sessions: 1,
             },
         );
+        // A tip the bound dropped takes its sessions with it.
+        if self.tip_sessions.len() > self.totals.tips.tips.len() {
+            let kept = &self.totals.tips.tips;
+            self.tip_sessions.retain(|tip, _| kept.contains_key(tip));
+        }
     }
 }
 
@@ -872,13 +906,21 @@ pub struct Process {
     pub accepted: u64,
     pub rejected: u64,
     pub no_response: u64,
-    /// Submits still unanswered when the drain ended, recorded as
-    /// no-response `run ended`.
+    /// What sessions holding work still had outstanding when the drain
+    /// ended: a submit not yet answered (then recorded as no-response
+    /// `run ended`) or an offer still being mined (then discarded).
     pub outstanding_at_drain_end: usize,
+    /// Offers held by sessions without a connection when the drain ended,
+    /// which the drain does not wait for: they were never sent, and are
+    /// counted under `totals.offers_discarded`.
+    pub held_without_a_connection_at_drain_end: usize,
     /// Sessions that had not stopped within 10 s of being told to (one in
     /// the middle of a handshake), aborted. What they had taken is counted
     /// under `totals.offers_discarded`.
     pub sessions_aborted_at_stop: usize,
+    /// Set when the stats stopped taking events before the last one arrived,
+    /// with why; `null` when every event was counted.
+    pub events_cut_off: Option<String>,
     /// This process's CPU over its whole life, and the cores it had, so a
     /// shortfall can be told from a busy client.
     pub client_cpu_seconds: Option<f64>,
@@ -1011,13 +1053,20 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         .filter(|(kind, _)| kind.as_str() == "offer")
         .map(|(_, stat)| stat.count - stat.recorded)
         .sum();
-    let accounted = totals.sent() + failures_unrecorded + totals.offers_discarded;
-    let spreads: Vec<i64> = totals
+    let accounted = totals.sent()
+        + failures_unrecorded
+        + totals.offers_discarded
+        + totals.offers_unknown_at_abort;
+    let spreads: Vec<f64> = totals
         .tips
         .tips
         .values()
-        .map(|tip| tip.last_seen_unix_ms - tip.first_seen_unix_ms)
+        .map(|tip| (tip.last_seen_unix_ms - tip.first_seen_unix_ms) as f64)
         .collect();
+    // A process that dropped its oldest tips leaves the tips it kept short of
+    // its sightings of the ones it dropped, and a merge cannot tell which
+    // they were, so the distinct count is unknown rather than estimated.
+    let tips_partial = totals.tips.dropped > 0;
     json!({
         "processes": processes.len(),
         "labels": processes.iter().map(|p| p.label.clone()).collect::<Vec<_>>(),
@@ -1039,6 +1088,7 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
             "dispatched": totals.offers_dispatched,
             "shortfall": totals.offers_shortfall,
             "discarded": totals.offers_discarded,
+            "unknown_at_abort": totals.offers_unknown_at_abort,
             "above_difficulty_ceiling": totals.offers_above_difficulty_ceiling,
             "failed_before_sending": failures_unrecorded,
             "unaccounted": totals.offers_dispatched as i64 - accounted as i64,
@@ -1092,22 +1142,17 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
             "discarded_block_solutions": totals.discarded_block_solutions,
         },
         "tips": {
-            "distinct": totals.tips.tips.len() as u64 + totals.tips.dropped,
-            "fan_out_max_milliseconds": spreads.iter().max(),
-            "fan_out_p50_milliseconds": nearest_rank(&spreads, 0.5),
+            "kept": totals.tips.tips.len(),
+            "dropped_by_processes": totals.tips.dropped,
+            "distinct": (!tips_partial).then_some(totals.tips.tips.len()),
+            "distinct_unavailable_reason": tips_partial.then_some(
+                "a process saw more tips than it keeps and dropped its oldest"
+            ),
+            "fan_out_max_milliseconds": spreads.iter().copied().reduce(f64::max),
+            "fan_out_p50_milliseconds": crate::gate::nearest_rank(&spreads, 0.5),
         },
         "client_failures": totals.client_failures,
     })
-}
-
-fn nearest_rank(values: &[i64], q: f64) -> Option<i64> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
-    Some(sorted[rank - 1])
 }
 
 fn rfc3339(unix_ms: i64) -> String {
@@ -1123,18 +1168,24 @@ pub fn definitions() -> Value {
                   accepted share is one the target acknowledged, and nothing here shows it is \
                   durable. Reconcile the --share-log ids against the target's database for that.",
         "offers": "An open-loop token bucket mints --rate offers a second over the load window and \
-                   gives each to the next session with nothing outstanding; one no session can \
-                   take is shortfall, never queued. A dispatched offer is mined and sent, fails \
-                   before sending (failed_before_sending, including above_difficulty_ceiling), or \
-                   is discarded unsent when the run stops its session; unaccounted is what none \
-                   of those covers, and is 0 for a complete run.",
+                   gives each to the next session that holds work and has nothing outstanding; \
+                   one no such session can take is shortfall, never queued, so an outage shows \
+                   as shortfall rather than as offers held for sessions without a connection. \
+                   A dispatched offer is mined and sent, fails before sending \
+                   (failed_before_sending, including above_difficulty_ceiling), is discarded \
+                   unsent when the run stops its session, or is unknown_at_abort: held by a \
+                   session that did not stop in time, sent or not. unaccounted is what none of \
+                   those covers, and is 0 for a complete run.",
         "shares": "Every submit sent is accepted, rejected or no_response. no_response_mid_run \
                    lost its connection before the answer came (the target or the path went \
                    away); no_response_run_ended was still unanswered when the drain ended.",
         "rates": "offered_per_second and accepted_per_second add each process's count over its \
-                  own load window. accepted_per_second_by_wall_second takes the accepted answers \
-                  read in each whole wall-clock second inside every process's window, summed \
-                  over the processes, so it depends on the machines' clocks agreeing.",
+                  own load window. Every offer is made inside the window, and accepted counts \
+                  the answers to them, including the few read in the drain after it, as the \
+                  harness counts a phase's submits. accepted_per_second_by_wall_second takes \
+                  the accepted answers read in each whole wall-clock second inside every \
+                  process's window, summed over the processes, so it depends on the machines' \
+                  clocks agreeing.",
         "ack_latency": "From the submit's write to the session reading its answer, on the client's \
                         monotonic clock: the network, any load balancer and the target's \
                         acknowledgement path. Percentiles come from a histogram that adds \
@@ -1148,7 +1199,9 @@ pub fn definitions() -> Value {
         "difficulty": "Each job is mined at the difficulty the target advertised before it. An \
                        offer whose job is above the process's ceiling is not mined.",
         "tips": "Per tip, from the first session to the last to hold work on it, each session \
-                 counted once; across processes this depends on their clocks agreeing.",
+                 counted once however often it comes back to the tip; across processes this \
+                 depends on their clocks agreeing. A process keeps its newest 1,024 tips: past \
+                 that the distinct count is unknown and the fan-out covers the tips kept.",
         "timeline": "totals.timeline: one entry per wall-clock second in which something \
                      happened, placed on the wall clock through one anchor taken at process start, \
                      so a clock step mid-run moves nothing; sessions_holding_work is sampled once \

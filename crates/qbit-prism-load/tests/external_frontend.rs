@@ -330,8 +330,10 @@ async fn external_load_through_a_balancer_reaches_the_in_repo_frontends_and_reco
         let process = &outcome.document["processes"][0];
         assert_eq!(process["ended"], json!("completed"), "{summary:#}");
         assert_eq!(process["sessions_holding_work_at_start"], json!(8));
+        // Real load reached the frontends. Each process offers 400; a loaded
+        // 2 vCPU runner, with two debug frontends, takes well under that.
         assert!(
-            summary["shares"]["accepted"].as_u64().unwrap() >= 100,
+            summary["shares"]["accepted"].as_u64().unwrap() >= 50,
             "{summary:#}"
         );
         // The frontend's verdict on every share: none mined wrong.
