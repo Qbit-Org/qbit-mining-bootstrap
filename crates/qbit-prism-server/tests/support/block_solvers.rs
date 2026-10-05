@@ -115,3 +115,31 @@ async fn migration_016_attributes_a_2x_sources_blocks_as_its_single_statement_di
     assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
     db.close(vec![ledger]).await
 }
+
+/// A native ledger an earlier build migrated before 016 existed applies 016
+/// on the native path, with the same attribution: the ledger is put back to
+/// before 017 and 016, given the same blocks and shares, and migrated again.
+#[tokio::test]
+async fn migration_016_attributes_a_native_ledgers_blocks_when_016_is_missing() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let earlier = db.ledger("earlier-build").await?;
+    super::share_partitions::undo_017(&pool).await?;
+    super::share_partitions::undo_016(&pool).await?;
+    seed(&pool).await?;
+    let expected = expected(&pool).await?;
+    assert_eq!(
+        expected.iter().filter(|block| block.2.is_some()).count(),
+        BLOCKS as usize / 2
+    );
+    let migrated = db.ledger("this-build").await?;
+    assert_eq!(attributed(&pool).await?, expected);
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
+    db.close(vec![earlier, migrated]).await
+}

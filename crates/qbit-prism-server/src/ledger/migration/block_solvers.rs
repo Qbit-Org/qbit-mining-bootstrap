@@ -52,8 +52,8 @@ pub(super) async fn attribute(tx: &mut Transaction<'_, Postgres>) -> Result<()> 
                 format!("migration 16: attributing block solvers after block_hash {after:?}")
             })?;
         slowest = slowest.max(statement.elapsed());
-        let Some(last) = last else { break };
         statements += 1;
+        let Some(last) = last else { break };
         attributed += solved;
         after = last;
     }
@@ -72,13 +72,24 @@ pub(super) async fn attribute(tx: &mut Transaction<'_, Postgres>) -> Result<()> 
 mod tests {
     use super::*;
 
+    /// The landing trigger in 016's file attributes every block landed
+    /// after 016; a batch attributes the ones before it. Both must pick the
+    /// same share: the trigger's lookup, read from the file, is the batch's
+    /// probe with `NEW` for the batch's row.
     #[test]
-    fn a_batch_makes_the_probe_016s_single_statement_made() {
-        // The lookup 016's file ran for every block before #672, and the
-        // dashboard queries before 016: the latest accepted share whose ID
-        // ends in the block's hash.
-        let probe = "SELECT share.miner_id,share.share_id,share.share_difficulty,share.network_difficulty FROM qbit_share_ledger share WHERE share.accepted AND length(share.share_id)>=65 AND lower(right(share.share_id,64))=batch.block_hash ORDER BY share.accepted_at DESC,share.share_seq DESC LIMIT 1";
-        assert!(BATCH.contains(probe), "{BATCH}");
+    fn a_batch_makes_the_lookup_016s_landing_trigger_makes() {
+        let file = super::super::native_migration(16);
+        let trigger = file
+            .find("FROM qbit_share_ledger share")
+            .map(|start| &file[start..])
+            .and_then(|from| {
+                from.find("LIMIT 1;")
+                    .map(|end| &from[..end + "LIMIT 1".len()])
+            })
+            .expect("016's landing trigger looks its solver up with LIMIT 1");
+        let squeeze = |sql: &str| sql.split_whitespace().collect::<String>();
+        let probe = squeeze(trigger).replace("NEW.block_hash", "batch.block_hash");
+        assert!(squeeze(BATCH).contains(&probe), "{probe}\n{BATCH}");
         assert!(BATCH.contains(
             "WHERE solver_share_id IS NULL AND block_hash>$1 ORDER BY block_hash LIMIT $2"
         ));

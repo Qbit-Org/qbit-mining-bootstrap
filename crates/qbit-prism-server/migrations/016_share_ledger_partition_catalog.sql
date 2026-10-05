@@ -39,7 +39,7 @@
 --    silently blank a historical block's solver. The columns are written at
 --    landing from now on, and the queries read them. The existing blocks'
 --    columns are filled by the migrator right after this file, in the same
---    transaction (see the end of this file).
+--    transaction (see the note after the landing trigger below).
 
 ALTER TABLE qbit_block_candidate_outbox
     DROP CONSTRAINT IF EXISTS qbit_block_candidate_outbox_share_id_fkey;
