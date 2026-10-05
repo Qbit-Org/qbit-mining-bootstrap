@@ -667,8 +667,8 @@ async fn a_resume_leaves_no_fence_when_an_earlier_runner_finishes_the_backfill()
 /// A fence whose cursor is gone, which only a hand-dropped cursor leaves,
 /// is refused by migrate before any DDL and, once 2 is recorded by hand
 /// too, by every start: recording 2 by hand unlocks nothing (#669). At
-/// another value the name is a newer release's declaration, refused as
-/// that release's rather than as an orphan or as 3 without 2.
+/// another value the name is a newer release's declaration, refused as any
+/// newer capability is and never offered for deletion as an orphan.
 #[tokio::test]
 async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -699,9 +699,10 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
     )?;
     assert_eq!(schema_versions(&pool).await?, pending);
     assert!(fence_declared(&pool).await?);
-    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='share_hash_backfill_pending'")
-        .execute(&pool)
-        .await?;
+    // At another value the name is a newer release's: never an orphan to
+    // delete, and refused in the order any newer capability is, after the
+    // record.
+    set_fence(&pool, 2).await?;
     let error = db
         .ledger("migrate-newer")
         .await
@@ -709,16 +710,13 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
         .context("migrate accepted a newer release's share_hash_backfill_pending = 2")?
         .to_string();
     ensure!(
-        error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
-            && error.contains("upgrade the server")
+        error.contains("migration 3 is recorded and 2 is not")
             && !error.contains("is gone")
-            && !error.contains("migration 3 is recorded and 2 is not"),
+            && !error.contains("DELETE FROM qbit_prism_schema_capabilities"),
         "{error}"
     );
     assert_eq!(schema_versions(&pool).await?, pending);
-    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='share_hash_backfill_pending'")
-        .execute(&pool)
-        .await?;
+    set_fence(&pool, 1).await?;
     // Recording 2 by hand as well lets nothing start: 013 and 017 never ran
     // behind the pending backfill, and migrate still names the fence.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
@@ -738,7 +736,31 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
             .to_string(),
     )?;
     assert!(fence_declared(&pool).await?);
+    // With the record past 3 without 2, a newer release's value is refused
+    // as newer.
+    set_fence(&pool, 2).await?;
+    let error = db
+        .ledger("migrate-newer-again")
+        .await
+        .err()
+        .context("migrate accepted a newer release's share_hash_backfill_pending = 2 and a hand-recorded 2")?
+        .to_string();
+    ensure!(
+        error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+            && error.contains("upgrade the server")
+            && !error.contains("is gone"),
+        "{error}"
+    );
     db.close(Vec::new()).await
+}
+
+/// Declare the fence at `value`, as a newer release might.
+async fn set_fence(pool: &PgPool, value: i32) -> Result<()> {
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=$1 WHERE capability='share_hash_backfill_pending'")
+        .bind(value)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// A fence declared on a database with every migration recorded and no
@@ -774,9 +796,7 @@ async fn every_start_refuses_a_backfill_fence_on_a_migrated_database() -> Result
             "{what}: {error}"
         );
     }
-    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='share_hash_backfill_pending'")
-        .execute(&pool)
-        .await?;
+    set_fence(&pool, 2).await?;
     for (what, error) in [
         (
             "a start",
