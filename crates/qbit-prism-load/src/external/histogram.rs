@@ -204,6 +204,17 @@ impl TryFrom<Wire> for LogHistogram {
             (wire.count == 0) == (wire.min.is_none() && wire.max.is_none()),
             "a histogram's extremes are present exactly when it has samples"
         );
+        if let (Some(min), Some(max)) = (wire.min, wire.max) {
+            // The extremes are samples: each in a bucket the histogram holds,
+            // the lowest and the highest.
+            ensure!(
+                min <= max
+                    && buckets.keys().next() == Some(&bucket_lower_bound(min))
+                    && buckets.keys().next_back() == Some(&bucket_lower_bound(max)),
+                "a histogram's min {min} and max {max} are not its lowest and highest buckets' \
+                 samples"
+            );
+        }
         Ok(Self {
             buckets,
             count: wire.count,

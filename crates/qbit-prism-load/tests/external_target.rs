@@ -438,9 +438,17 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
         serde_json::from_value::<LogHistogram>(wire.clone()).unwrap(),
         both
     );
-    let mut other = wire;
+    let mut other = wire.clone();
     other["significant_bits"] = json!(7);
     assert!(serde_json::from_value::<LogHistogram>(other).is_err());
+    // Extremes that cannot be its samples are refused, not merged into a
+    // summary that would panic on them.
+    for (min, max) in [(json!(4_000_000), json!(1)), (json!(0), json!(9_000_000))] {
+        let mut broken = wire.clone();
+        broken["min"] = min;
+        broken["max"] = max;
+        assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
+    }
     let empty = LogHistogram::default().summary("test");
     assert_eq!(empty["samples"], json!(0));
     assert!(empty["p99"].is_null());
@@ -902,8 +910,12 @@ async fn a_window_makes_every_offer_its_rate_and_length_promise() -> Result<()> 
         let summary = &outcome.document["summary"];
         assert_eq!(summary["offers"]["minted"], json!(offers), "{summary:#}");
         assert_eq!(summary["shares"]["accepted"], json!(offers), "{summary:#}");
-        let window = &outcome.document["processes"][0]["window"];
-        assert_eq!(window["seconds"].as_f64(), Some(seconds.parse::<f64>()?));
+        // At least its length; past it only by the last tick's lateness.
+        let window = outcome.document["processes"][0]["window"]["seconds"]
+            .as_f64()
+            .unwrap();
+        let length = seconds.parse::<f64>()?;
+        assert!(window >= length && window < length + 1.0, "{window}");
     }
     Ok(())
 }

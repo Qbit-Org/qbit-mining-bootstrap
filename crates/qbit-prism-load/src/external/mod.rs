@@ -977,6 +977,10 @@ async fn drive(
     let mut cursor = 0usize;
     let phase: Arc<str> = Arc::from(PHASE);
     let mut offers = Offers::default();
+    // When the last offer was placed or fell short: the window runs at least
+    // to there, so no offer lies outside it, however late a starved tick
+    // made them.
+    let mut last_minted = started;
     let mut interrupted = None;
     let mut next_sample = started;
     let progress = Duration::from_secs(args.progress_seconds);
@@ -1007,6 +1011,9 @@ async fn drive(
         // are shortfall without scanning again, so an outage costs one pass
         // over the sessions a tick rather than one per offer.
         let mut saturated = false;
+        if offers.minted < want {
+            last_minted = now;
+        }
         while offers.minted < want {
             offers.minted += 1;
             let placed = !saturated && place(sessions, holding, &mut cursor, &phase);
@@ -1057,10 +1064,12 @@ async fn drive(
             next_progress += progress;
         }
     }
-    // A window that ran its length ends where its offers were minted to,
-    // not where a late last tick noticed; one a shutdown cut short ends now.
+    // A window that ran its length ends at its length, or where its last
+    // offers went out if a late tick sent them after it: the rate is then
+    // taken over the span the offers really took. One a shutdown cut short
+    // ends now.
     let ended = match interrupted {
-        None => started + duration,
+        None => (started + duration).max(last_minted),
         Some(_) => Instant::now(),
     };
     let window = stats::Window {
