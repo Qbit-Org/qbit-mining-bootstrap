@@ -759,6 +759,50 @@ impl Fixture {
         .await
     }
 
+    /// Wait until server `index` serves work on the node's tip at the
+    /// cluster's payout revision, with no block candidate still on its way to
+    /// the node. A block lands after its submit is answered, and its landing
+    /// and each server's observation of it move the payout revision. A share
+    /// on work from before a move passes its submit check and is then refused
+    /// at the append's revision fence as `ledger-confirmation-failed`
+    /// ("payout revision changed before share commit", #632). A case that
+    /// needs every share accepted mines only on settled work, waiting at
+    /// most `seconds` for it.
+    async fn settled(&self, index: usize, seconds: u64) -> Result<()> {
+        until(
+            &format!("server {index} on the node's tip and payout revision"),
+            seconds,
+            || async {
+                let landing: i64 = sqlx::query_scalar(&format!(
+                    "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",
+                    qbit_prism_server::ledger::CandidateState::UNFINISHED_SQL
+                ))
+                .fetch_one(&self.pool)
+                .await?;
+                if landing > 0 {
+                    return Ok(false);
+                }
+                let tip = self.rpc("getbestblockhash", json!([])).await?;
+                let health: Value = self
+                    .client
+                    .get(format!("http://127.0.0.1:{}/healthz", self.api[index]))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                let revision: i64 = sqlx::query_scalar(
+                    "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
+                )
+                .fetch_one(&self.pool)
+                .await?;
+                Ok(health["ok"] == true
+                    && health["observed_tip"] == tip
+                    && health["payout_state_generation"] == revision)
+            },
+        )
+        .await
+    }
+
     async fn integrity(&self) -> Result<()> {
         let report: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
             .fetch_one(&self.pool)
