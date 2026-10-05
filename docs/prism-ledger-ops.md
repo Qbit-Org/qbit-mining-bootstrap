@@ -1109,12 +1109,20 @@ runs.
 
 **Upgrade.** 023 is additive, as 019 and 020 are: no capability and no
 shutdown proof, and it is not applied offline. A binary that does not know
-the index never reads it. Building it reads the table once, about 0.2 s for
-1,000,000 settled fanouts on a warm cache, and holds a SHARE lock on
-`qbit_ctv_fanout_artifacts` until the migration commits, right after the
-build. That delays a broadcaster write that arrives meanwhile and nothing
-else. Applied together with 021 and 022, it runs inside their offline
-upgrade.
+the index never reads it. It is applied online, as 013 is: on an existing
+ledger `migrate` (or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds the
+index with `CREATE INDEX CONCURRENTLY` after the migration transaction
+commits, on its
+own connection without statement or lock timeouts, and records 23 once the
+index is valid. No write to `qbit_ctv_fanout_artifacts` waits for the build,
+a found block's landing and the broadcasters of frontends still running
+included. The build reads the table twice and waits for the transactions
+already open to finish: about 0.6 s for 1,000,000 settled fanouts on a warm
+cache, against 0.2 s for a plain `CREATE INDEX`. Until 23 is recorded every start
+of a 023 binary refuses the database, as for any missing migration. An
+interrupted build leaves an invalid index that the next run drops and
+builds again. A fresh or empty source applies 023 inside the migration
+transaction.
 
 ## Chain observation epoch upgrade (018)
 

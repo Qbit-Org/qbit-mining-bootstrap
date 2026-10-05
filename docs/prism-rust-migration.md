@@ -99,13 +99,14 @@ hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
 transaction, including carry-forward summary repair, except 002's share-hash
-backfill and migrations 013 and 017. On a ledger with rows, 002 maps the
+backfill and migrations 013, 017 and 023. On a ledger with rows, 002 maps the
 legacy shares' headers after the commit, in bounded batches, and records 2
 once every one is mapped
 ([below](#migration-002s-share-hash-backfill-applied-online)).
 Migration 013, the share ledger index trim, builds its indexes after the
 commit with `CREATE INDEX CONCURRENTLY`
-([below](#migration-013-the-share-ledger-index-trim-applied-online)).
+([below](#migration-013-the-share-ledger-index-trim-applied-online)), and
+migration 023 builds the CTV fanout claim lane's index the same way (#668).
 Migration 017, the share ledger partition conversion, validates its bound and
 swaps the table after the commit on a dedicated connection
 ([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
@@ -589,9 +590,10 @@ the fanouts the CTV claim lane may still claim, keyed by their schedule, so a
 claim reads only the fanouts due now and no longer the settled fanout history
 (#668). It is additive, as 019 and 020 are: no capability and no shutdown
 proof, and it is not applied offline. A binary that does not know the index
-never reads it. Building it reads the table once and holds a SHARE lock on
-`qbit_ctv_fanout_artifacts` until the migration commits, right after the
-build. See
+never reads it. It is applied online, as 013 is: on an existing ledger
+`migrate` builds it with `CREATE INDEX CONCURRENTLY` after the migration
+transaction commits, so no write to `qbit_ctv_fanout_artifacts` waits for the
+build, a found block's landing included, and records 23 once it is valid. See
 [the claim lane](prism-ledger-ops.md#the-claim-lane-and-settled-history-023-668).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
@@ -680,7 +682,7 @@ holds:
 | `end_seq` | the ledger held no row at or above it when the transaction committed |
 | `started_at`, `updated_at` | when the cursor was created and last advanced |
 
-After the commit, and before 013 and 017, `migrate` maps the legacy shares in
+After the commit, and before 013, 017 and 023, `migrate` maps the legacy shares in
 batches of consecutive `share_seq`. Each batch is 002's statement restricted to
 its range: one statement, in a transaction that also advances the cursor. The
 first batch covers 10,000 `share_seq`; later ones double or halve toward half a
@@ -745,7 +747,7 @@ interrupted `migrate` loses only the batch in flight. That holds for a killed
 process, a lost connection, and a cancelled or timed-out statement. Run
 `migrate` again. The migration transaction finds 3 recorded without 2 and the
 cursor table present, so it applies nothing, and the backfill resumes at
-`next_seq`; 013 and 017 follow. A record with 3 and not 2 but no cursor table
+`next_seq`; 013, 017 and 023 follow. A record with 3 and not 2 but no cursor table
 is still refused as an edited record.
 
 Resuming only goes forward. The migration transaction has committed, so the

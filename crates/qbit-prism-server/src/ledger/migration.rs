@@ -24,9 +24,9 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect. Existing native
-/// ledgers apply 013 and 017 online (`ONLINE_MIGRATIONS`) and record each
-/// after its last change, so a start refuses the database until that has
-/// completed. A populated 2.x.x source records 2 the same way, after its
+/// ledgers apply 013, 017 and 023 online (`ONLINE_MIGRATIONS`) and record
+/// each after its last change, so a start refuses the database until that
+/// has completed. A populated 2.x.x source records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
@@ -2206,7 +2206,11 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// ledger into a partitioned table (see `partition.rs`): its validation
 /// scan runs for hours on a large ledger and its swap must take the table
 /// lock with a short timeout and retries, neither of which the migration
-/// transaction can do. Each is recorded last, so the startup gate refuses
+/// transaction can do. 023 creates the CTV fanout claim lane's index
+/// (#668) the way 013 does: a plain `CREATE INDEX` would hold every write
+/// to `qbit_ctv_fanout_artifacts` for the build, a found block's landing
+/// included, on a ledger whose other frontends keep running, since 023
+/// needs no shutdown proof. Each is recorded last, so the startup gate refuses
 /// the database until it has completed. Fresh and empty 2.x.x sources apply
 /// these inside the transaction while holding the cutover locks that
 /// exclude writers. A later transactional migration must not depend on an
@@ -2215,7 +2219,7 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// version order, and 016 is transactional. 002 is not listed: its file is
 /// always transactional, and only its share-hash backfill on a populated
 /// 2.x.x source runs after the commit, ahead of these (`share_hashes.rs`).
-pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17];
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 23];
 
 /// The online migration a version declares, from the scratch apply's
 /// before and after readings.
@@ -2225,7 +2229,7 @@ fn derive_online(
     after: &SchemaFingerprint,
 ) -> Result<OnlineMigration> {
     match version {
-        13 => Ok(OnlineMigration::Indexes(online::derive(
+        13 | 23 => Ok(OnlineMigration::Indexes(online::derive(
             version, before, after,
         )?)),
         17 => Ok(OnlineMigration::Partitions(partition::derive(
@@ -2948,7 +2952,7 @@ pub(super) async fn migrate_schema(
                     .await?;
             } else {
                 // The legacy shares are mapped after the commit, in batches,
-                // before 013 and 017, and that run records 2 (#582).
+                // before 013, 017 and 023, and that run records 2 (#582).
                 share_hashes::create_cursor(tx).await?;
                 online.insert(0, OnlineMigration::ShareHashes);
             }
@@ -3247,17 +3251,6 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(22)")
-            .execute(&mut **tx)
-            .await?;
-    }
-    if !versions.contains(&23) {
-        // #668: the CTV fanout claim lane's partial index. Additive only: no
-        // capability and no shutdown proof. A binary that does not know the
-        // index never reads it.
-        sqlx::raw_sql(native_migration(23))
-            .execute(&mut **tx)
-            .await?;
-        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(23)")
             .execute(&mut **tx)
             .await?;
     }

@@ -20,11 +20,12 @@
 -- the index.
 --
 -- Additive: no capability and no shutdown proof, as 019 and 020. A binary
--- that does not know the index never reads it. Building it reads the table
--- once, about 0.2 s for 1,000,000 settled fanouts on a warm cache, and holds
--- a SHARE lock on qbit_ctv_fanout_artifacts until the migration commits,
--- right after the build, which only delays a broadcaster write that arrives
--- meanwhile.
+-- that does not know the index never reads it. Applied online, as 013 is
+-- (`ONLINE_MIGRATIONS`): on an existing ledger the runner builds it with
+-- CREATE INDEX CONCURRENTLY after the migration transaction commits, so no
+-- write to qbit_ctv_fanout_artifacts waits for the build, a found block's
+-- landing included, and records 23 once it is valid. A fresh or empty
+-- source applies this file inside the transaction.
 CREATE INDEX qbit_ctv_fanout_artifacts_lane_idx
     ON qbit_ctv_fanout_artifacts (next_broadcast_attempt_at, fanout_txid)
     WHERE settlement_status IN ('broadcastable', 'broadcast_submitted', 'failed')

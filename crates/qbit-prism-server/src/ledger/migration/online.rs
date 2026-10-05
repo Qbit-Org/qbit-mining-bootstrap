@@ -3,7 +3,8 @@
 //! `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` cannot run in a
 //! transaction block, and a plain `CREATE INDEX` on the share ledger holds a
 //! SHARE lock on the table for the whole build, so every append would queue
-//! behind it. A migration listed in `ONLINE_MIGRATIONS` is therefore applied
+//! behind it, as every write to the CTV fanout table would, a found block's
+//! landing included, behind 023's. A migration listed in `ONLINE_MIGRATIONS` is therefore applied
 //! in two parts. Its file is applied transactionally to the scratch schema
 //! with every other native migration, so the migrator learns the index
 //! definitions it declares as this server's PostgreSQL renders them; nothing
@@ -47,8 +48,8 @@
 //! source (`share_hashes.rs`, #582). 002's file is applied in the migration
 //! transaction like any other; only the mapping of the legacy shares is
 //! left for after the commit, in batches, and that run records 2. It runs
-//! before 013 and 017, so every version is still recorded after the ones
-//! below it.
+//! before 013, 017 and 023, so every version is still recorded after the
+//! ones below it.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
@@ -56,7 +57,7 @@ use std::time::{Duration, Instant};
 /// One migration applied after the commit, by the runner its kind names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OnlineMigration {
-    /// Index creates and drops, applied with `CONCURRENTLY` (013).
+    /// Index creates and drops, applied with `CONCURRENTLY` (013, 023).
     Indexes(IndexMigration),
     /// The share ledger partition conversion (017, `partition.rs`).
     Partitions(super::partition::PartitionMigration),
