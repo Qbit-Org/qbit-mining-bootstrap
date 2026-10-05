@@ -1322,6 +1322,19 @@ impl Process {
             self.offers_minted,
             self.rate
         );
+        // Each share it sent was one of its own offers.
+        let outcomes = self
+            .accepted
+            .checked_add(self.rejected)
+            .and_then(|total| total.checked_add(self.no_response));
+        ensure!(
+            outcomes.is_some_and(|outcomes| outcomes <= self.offers_minted),
+            "{} accepted, {} rejected and {} unanswered, more than its {} offers",
+            self.accepted,
+            self.rejected,
+            self.no_response,
+            self.offers_minted
+        );
         Ok(())
     }
 }

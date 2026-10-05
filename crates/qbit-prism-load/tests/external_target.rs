@@ -778,14 +778,13 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         .collect();
     let error = format!("{:#}", external::merge_files(&huge).unwrap_err());
     assert!(error.contains("overflows"), "{error}");
-    // And one whose counters fit apart but not in the sums it reports, or
-    // with the timeline and histograms that count the same events.
+    // And totals whose counters fit apart but not in the sums it reports, or
+    // with the timeline and histograms that count the same events. (Its
+    // process cannot carry them: it never sends more shares than it offers.)
     let mut sums = read(&a);
     let rejected = sums["totals"]["rejected"].as_u64().unwrap() + 1;
     sums["totals"]["accepted"] = json!(u64::MAX);
     sums["totals"]["rejected"] = json!(rejected);
-    sums["processes"][0]["accepted"] = json!(u64::MAX);
-    sums["processes"][0]["rejected"] = json!(rejected);
     let path = scratch.path("sums.json");
     external::write_document(&path, &sums)?;
     let error = format!(
@@ -798,7 +797,6 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
     let mut timeline = read(&a);
     let accepted = timeline["totals"]["accepted"].as_u64().unwrap();
     timeline["totals"]["accepted"] = json!(accepted + 1);
-    timeline["processes"][0]["accepted"] = json!(accepted + 1);
     let path = scratch.path("timeline.json");
     external::write_document(&path, &timeline)?;
     let error = format!(
@@ -920,6 +918,22 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("offers minted, more than"), "{error}");
+    // Offers moved from one process to another: the sums still match, but
+    // a process cannot have sent more shares than it was offered.
+    let mut moved = merged.clone();
+    let sent: u64 = ["accepted", "rejected", "no_response"]
+        .iter()
+        .map(|key| moved["processes"][0][key].as_u64().unwrap())
+        .sum();
+    assert!(sent > 0, "vm-a sent no shares");
+    let minted = moved["processes"][0]["offers_minted"].as_u64().unwrap();
+    let other = moved["processes"][1]["offers_minted"].as_u64().unwrap();
+    moved["processes"][0]["offers_minted"] = json!(sent - 1);
+    moved["processes"][1]["offers_minted"] = json!(other + minted - (sent - 1));
+    let path = scratch.path("moved.json");
+    external::write_document(&path, &moved)?;
+    let error = format!("{:#}", external::merge_files(&[path]).unwrap_err());
+    assert!(error.contains("more than its"), "{error}");
     let mut initial = read(&a);
     initial["processes"][0]["sessions"] = json!(1);
     let path = scratch.path("initial.json");
@@ -941,8 +955,11 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("no window"), "{error}");
+    // A process that sent fewer shares than its totals count.
     let mut damaged = read(&a);
-    damaged["processes"][0]["accepted"] = json!(123_456_789u64);
+    let accepted = damaged["processes"][0]["accepted"].as_u64().unwrap();
+    damaged["processes"][0]["accepted"] =
+        json!(accepted.checked_sub(1).expect("vm-a accepted shares"));
     let path = scratch.path("damaged-process.json");
     external::write_document(&path, &damaged)?;
     let error = format!(
