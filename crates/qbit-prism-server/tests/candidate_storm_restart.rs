@@ -2568,7 +2568,9 @@ async fn held_submission(database: &FixtureDatabase, ledger: &Ledger) -> Result<
 }
 
 /// `qbit-prism-server submission-hold <args>` against the fixture's database,
-/// with nothing inherited from the test's own environment.
+/// with nothing inherited from the test's own environment. The frontend-only
+/// settings it passes are invalid on purpose: the hold commands read only
+/// `PRISM_DATABASE_URL`, so a stale frontend setting cannot stop an operator.
 async fn submission_hold(database_url: &str, args: &[&str]) -> Result<std::process::Output> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     for (key, _) in
@@ -2581,7 +2583,8 @@ async fn submission_hold(database_url: &str, args: &[&str]) -> Result<std::proce
         .args(args)
         .kill_on_drop(true)
         .env("PRISM_DATABASE_URL", database_url)
-        .env("PRISM_INSTANCE_ID", "submission-hold-operator")
+        .env("PRISM_INSTANCE_ID", "prepared:reserved-for-the-ledger")
+        .env("PRISM_DATABASE_MAX_CONNECTIONS", "1")
         .env("PRISM_RUNTIME_WORKERS", "2");
     Ok(tokio::time::timeout(Duration::from_secs(30), command.output()).await??)
 }

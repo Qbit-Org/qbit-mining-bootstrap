@@ -569,11 +569,13 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
     }
 }
 
-/// #664: `show` reads only the database URL, read-only, and also reads a
-/// ledger from before migration 023. `set` and `clear` check their reason
-/// before any connection is opened, as `fatal-state clear` does, then take
-/// the operator connection, which works on a halted cluster and writes no
-/// heartbeat; both print the hold that results as JSON.
+/// #664: every subcommand reads only the database URL, so a frontend-only
+/// setting left invalid cannot stop an operator holding or releasing the
+/// cluster. `show` opens it read-only and also reads a ledger from before
+/// migration 023. `set` and `clear` check their reason before any connection
+/// is opened, as `fatal-state clear` does, then take the operator connection,
+/// which works on a halted cluster and writes no heartbeat; both print the
+/// hold that results as JSON.
 async fn submission_hold(command: SubmissionHoldCommand) -> Result<()> {
     let printed = |held: bool, fields: Value| -> Result<()> {
         let mut document = json!({"schema": "qbit.prism.submission-hold.v1", "held": held});
@@ -593,9 +595,8 @@ async fn submission_hold(command: SubmissionHoldCommand) -> Result<()> {
         }
         SubmissionHoldCommand::Set { reason } => {
             crate::ledger::require_operator_reason(&reason)?;
-            let config = config::DatabaseConfig::from_env()?;
-            let ledger =
-                crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+            let url = config::DatabaseConfig::url_from_env()?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
             let result = ledger.set_submission_hold(&reason).await;
             ledger.pool.close().await;
             let (hold, newly_set) = result?;
@@ -612,9 +613,8 @@ async fn submission_hold(command: SubmissionHoldCommand) -> Result<()> {
             offer_pending_candidates,
         } => {
             crate::ledger::require_operator_reason(&reason)?;
-            let config = config::DatabaseConfig::from_env()?;
-            let ledger =
-                crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+            let url = config::DatabaseConfig::url_from_env()?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
             let result = ledger
                 .clear_submission_hold(&reason, offer_pending_candidates)
                 .await;
