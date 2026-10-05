@@ -214,7 +214,9 @@ block's landing) wait for their candidate's disposition up to
 before, and a captured proof's miner could submit nothing else while its
 landing ran). A share-pass block whose payout revision moved between its
 submit check and its commit is captured by its append instead of refused, and
-waits for its block the same way (#657). A block-bearing submission still
+waits for its block the same way (#657); with capture off
+(`PRISM_CAPTURE_OVERPAY_CEILING_BPS=0`) it is refused as before. A
+block-bearing submission still
 pending at its bound (a block-only proof at the share deadline, a
 block-carrying append at the share deadline, or after its grace when COMMIT
 was in flight) is

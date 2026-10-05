@@ -99,6 +99,7 @@ impl MemoryLedger {
         mut share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
+        moved: crate::ledger::MovedRevision,
         commit: &CommitGate,
     ) -> Result<Appended> {
         let gate = self.append_gate.lock().unwrap().take();
@@ -108,10 +109,13 @@ impl MemoryLedger {
         }
         // Model the production atomic append fence, not share decisions: a
         // moved revision refuses a plain share before any write, and a
-        // block-bearing share captures its block instead (#657).
+        // block-bearing share captures its block instead when capture is on
+        // (#657).
         let current = self.revision.load(Ordering::SeqCst);
         if revision != current {
-            let Some(candidate) = candidate else {
+            let Some(candidate) =
+                candidate.filter(|_| moved == crate::ledger::MovedRevision::Capture)
+            else {
                 return Err(crate::ledger::PayoutRevisionChanged {
                     expected: revision,
                     observed: current,
@@ -210,9 +214,29 @@ impl submit_ledger::SubmitLedger for MemoryLedger {
         revision: i64,
         gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            crate::ledger::MovedRevision::Refuse,
+            gate,
+        )
+    }
+    fn append_at_revision_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        _proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        moved: crate::ledger::MovedRevision,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
         Box::pin(async move {
             let mut probe = CancelProbe(&self.cancelled, false);
-            let result = self.append_gated(share, candidate, revision, &gate).await;
+            let result = self
+                .append_gated(share, candidate, revision, moved, &gate)
+                .await;
             probe.1 = true;
             result
         })

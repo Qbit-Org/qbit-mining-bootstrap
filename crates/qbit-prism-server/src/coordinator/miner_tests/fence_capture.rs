@@ -11,13 +11,18 @@ use tracing::instrument::WithSubscriber;
 const MS: fn(u64) -> Duration = Duration::from_millis;
 
 /// Tip 1 at revision 0, with share answers bounded at 300 ms plus 300 ms of
-/// grace for a COMMIT in flight.
+/// grace for a COMMIT in flight, capture on (100 bps, the default).
 async fn fixture() -> Fixture {
+    fixture_with(|_| {}).await
+}
+
+async fn fixture_with(tune: impl FnOnce(&mut Config)) -> Fixture {
     let fixture = Fixture::build(
         Duration::from_secs(10),
         |config| {
             config.share_commit_timeout = MS(300);
             config.share_commit_grace = MS(300);
+            tune(config);
         },
         None,
     )
@@ -102,6 +107,30 @@ async fn a_block_whose_revision_moves_before_its_append_is_captured_not_dropped(
     let text = log.text();
     assert!(
         text.contains("share outcome unknown") && text.contains(&block_hash),
+        "{text}"
+    );
+}
+
+/// With capture off (`PRISM_CAPTURE_OVERPAY_CEILING_BPS=0`) the fence refuses
+/// a block-bearing share as it always did, just as the submit check refuses
+/// one whose revision had already moved: nothing is captured.
+#[tokio::test]
+async fn a_block_whose_revision_moves_with_capture_off_is_refused() {
+    let fixture = fixture_with(|config| config.capture_overpay_ceiling_bps = 0).await;
+    let gate = Arc::new(Gate::default());
+    *fixture.store.append_gate.lock().unwrap() = Some(gate.clone());
+    let (submitted, log, _) = submit(&fixture, true);
+    move_revision_at_the_fence(&fixture, &gate).await;
+    assert_error(
+        submitted.await.unwrap().unwrap_err(),
+        "ledger-confirmation-failed",
+        "share was not confirmed by the database",
+    );
+    assert!(fixture.store.records.lock().unwrap().is_empty());
+    assert!(fixture.store.captures.lock().unwrap().is_empty());
+    let text = log.text();
+    assert!(
+        text.contains("payout revision changed before share commit: admitted at 0, now 1"),
         "{text}"
     );
 }

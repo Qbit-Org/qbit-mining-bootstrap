@@ -84,7 +84,7 @@ pub(crate) use window::{
     AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
     RetainedShares, SnapshotCapture, WRITER_TIMELINE_SQL,
 };
-pub use window::{CommitGateClosed, PayoutRevisionChanged};
+pub use window::{CommitGateClosed, MovedRevision, PayoutRevisionChanged};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;

@@ -553,6 +553,7 @@ impl Coordinator {
                     candidate,
                     proof_observed_at_ms,
                     revision,
+                    &block_hash,
                     start,
                     fence,
                 )
@@ -651,19 +652,26 @@ impl Coordinator {
     /// If the payout revision moved before its commit, such an append
     /// captures its block instead (#657), and the answer follows the block's
     /// disposition, as a block-only proof's does.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_share_pass(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
         proof_observed_at_ms: Option<i64>,
         revision: i64,
+        block_hash: &str,
         start: tokio::time::Instant,
         lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
-        let block_hash = candidate
-            .as_ref()
-            .map(|candidate| candidate.block_hash.clone());
+        // #657: with capture on, a block whose revision moved before its
+        // commit is captured, as the submit check captures one whose revision
+        // already moved; with it off, the fence refuses it as before.
+        let moved = if self.config.capture_overpay_ceiling_bps > 0 {
+            crate::ledger::MovedRevision::Capture
+        } else {
+            crate::ledger::MovedRevision::Refuse
+        };
         let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
         // path to submitblock, so a candidate-bearing append is never refused.
@@ -678,6 +686,7 @@ impl Coordinator {
                         candidate,
                         proof_observed_at_ms,
                         revision,
+                        moved,
                         task_gate.clone(),
                     )
                     .await;
@@ -726,22 +735,16 @@ impl Coordinator {
         // append committed the block as a capture and deferred the share. As
         // for a block-only proof, the answer is the block's disposition: the
         // share is credited if the block confirms within the bound.
+        // A capture commits only after `begin_commit`, so its COMMIT time is
+        // known and the sync-rep guard applies to it as to any commit.
         if matches!(joined, Ok(Ok(Appended::Captured))) {
-            if gate.state() == GateState::Committing {
-                if let Some(unknown) = sync_rep_unknown(commit_elapsed, self.statement_timeout) {
-                    return unknown;
-                }
+            if let Some(unknown) = sync_rep_unknown(commit_elapsed, self.statement_timeout) {
+                return unknown;
             }
-            let Some(block_hash) = block_hash else {
-                return SaveOutcome::Unknown {
-                    phase: "captured",
-                    detail: "the ledger reported a capture for an append without a block".into(),
-                };
-            };
             return self
                 .deferred_share_disposition(
                     &share_id,
-                    &block_hash,
+                    block_hash,
                     start + self.config.share_commit_timeout,
                     "candidate-pending",
                     (BlockAckPath::Share, "share"),
@@ -983,7 +986,7 @@ impl Coordinator {
                         block_hash,
                         path = log_path,
                         %error,
-                        "block-only disposition poll failed; retrying"
+                        "{log_path} disposition poll failed; retrying"
                     );
                     phase = "poll-error";
                 }

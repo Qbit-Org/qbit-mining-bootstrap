@@ -4,6 +4,7 @@
 //! Production appends retain the transaction-scoped payout revision check.
 use super::publication_authority::{LeaseCommitFence, LeaseCommitRefusal};
 use super::*;
+use crate::ledger::MovedRevision;
 use futures_util::future::BoxFuture;
 use std::sync::{atomic::AtomicU8, OnceLock};
 
@@ -139,15 +140,17 @@ pub(super) trait SubmitLedger: Send + Sync {
         gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<Appended>>;
     /// [`SubmitLedger::append_at_revision`], recording when the candidate's
-    /// locally validated block proof was observed (a wall clock, UNIX ms).
-    /// A store without a durable candidate row has nowhere to keep it and
-    /// keeps the plain append.
+    /// locally validated block proof was observed (a wall clock, UNIX ms),
+    /// and capturing a candidate-bearing append's block if the revision
+    /// moved when `moved` allows it (#657). A store without a durable
+    /// candidate row has nowhere to keep either and keeps the plain append.
     fn append_at_revision_observed(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
         _proof_observed_at_ms: Option<i64>,
         revision: i64,
+        _moved: MovedRevision,
         gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<Appended>> {
         self.append_at_revision(share, candidate, revision, gate)
@@ -166,7 +169,14 @@ impl SubmitLedger for Ledger {
         revision: i64,
         gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<Appended>> {
-        self.append_at_revision_observed(share, candidate, None, revision, gate)
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            MovedRevision::Refuse,
+            gate,
+        )
     }
 
     fn append_at_revision_observed(
@@ -175,6 +185,7 @@ impl SubmitLedger for Ledger {
         candidate: Option<Candidate>,
         proof_observed_at_ms: Option<i64>,
         revision: i64,
+        moved: MovedRevision,
         gate: Arc<CommitGate>,
     ) -> BoxFuture<'_, Result<Appended>> {
         Box::pin(async move {
@@ -186,6 +197,7 @@ impl SubmitLedger for Ledger {
                 proof_observed_at_ms,
                 revision,
                 &pre_commit,
+                moved,
             )
             .await?;
             Ok(if appended.captured {
