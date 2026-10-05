@@ -4,6 +4,7 @@
 //! Production appends retain the transaction-scoped payout revision check.
 use super::publication_authority::{LeaseCommitFence, LeaseCommitRefusal};
 use super::*;
+use crate::ledger::MovedRevision;
 use futures_util::future::BoxFuture;
 use std::sync::{atomic::AtomicU8, OnceLock};
 
@@ -114,6 +115,19 @@ impl CommitGate {
     }
 }
 
+/// What a committed share append wrote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Appended {
+    /// The share, and its candidate if it carried one.
+    Inserted,
+    /// Nothing: the immutable row was already durable (a duplicate).
+    Recorded,
+    /// #657: the payout revision moved after the submit check, so the
+    /// append captured its block instead of crediting the share. The block
+    /// is enqueued as a #478 capture, the share deferred until it confirms.
+    Captured,
+}
+
 pub(super) trait SubmitLedger: Send + Sync {
     fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
     /// Append at `revision`, sending COMMIT only if `gate.begin_commit()`
@@ -124,19 +138,21 @@ pub(super) trait SubmitLedger: Send + Sync {
         candidate: Option<Candidate>,
         revision: i64,
         gate: Arc<CommitGate>,
-    ) -> BoxFuture<'_, Result<bool>>;
+    ) -> BoxFuture<'_, Result<Appended>>;
     /// [`SubmitLedger::append_at_revision`], recording when the candidate's
-    /// locally validated block proof was observed (a wall clock, UNIX ms).
-    /// A store without a durable candidate row has nowhere to keep it and
-    /// keeps the plain append.
+    /// locally validated block proof was observed (a wall clock, UNIX ms),
+    /// and capturing a candidate-bearing append's block if the revision
+    /// moved when `moved` allows it (#657). A store without a durable
+    /// candidate row has nowhere to keep either and keeps the plain append.
     fn append_at_revision_observed(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
         _proof_observed_at_ms: Option<i64>,
         revision: i64,
+        _moved: MovedRevision,
         gate: Arc<CommitGate>,
-    ) -> BoxFuture<'_, Result<bool>> {
+    ) -> BoxFuture<'_, Result<Appended>> {
         self.append_at_revision(share, candidate, revision, gate)
     }
 }
@@ -152,8 +168,15 @@ impl SubmitLedger for Ledger {
         candidate: Option<Candidate>,
         revision: i64,
         gate: Arc<CommitGate>,
-    ) -> BoxFuture<'_, Result<bool>> {
-        self.append_at_revision_observed(share, candidate, None, revision, gate)
+    ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            MovedRevision::Refuse,
+            gate,
+        )
     }
 
     fn append_at_revision_observed(
@@ -162,20 +185,28 @@ impl SubmitLedger for Ledger {
         candidate: Option<Candidate>,
         proof_observed_at_ms: Option<i64>,
         revision: i64,
+        moved: MovedRevision,
         gate: Arc<CommitGate>,
-    ) -> BoxFuture<'_, Result<bool>> {
+    ) -> BoxFuture<'_, Result<Appended>> {
         Box::pin(async move {
             let pre_commit = || gate.begin_commit();
-            Ok(Ledger::append_at_revision_gated_observed(
+            let appended = Ledger::append_at_revision_gated_observed(
                 self,
                 share,
                 candidate,
                 proof_observed_at_ms,
                 revision,
                 &pre_commit,
+                moved,
             )
-            .await?
-            .inserted)
+            .await?;
+            Ok(if appended.captured {
+                Appended::Captured
+            } else if appended.inserted {
+                Appended::Inserted
+            } else {
+                Appended::Recorded
+            })
         })
     }
 }

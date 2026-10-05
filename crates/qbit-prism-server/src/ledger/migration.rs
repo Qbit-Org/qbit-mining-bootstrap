@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod block_solvers;
 mod online;
 mod partition;
 mod share_hashes;
@@ -3192,6 +3193,9 @@ pub(super) async fn migrate_schema(
         sqlx::raw_sql(native_migration(16))
             .execute(&mut **tx)
             .await?;
+        // The existing blocks' solvers, in this transaction but in short
+        // statements, not one long one (#672).
+        block_solvers::attribute(tx).await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(16)")
             .execute(&mut **tx)
             .await?;

@@ -12,7 +12,7 @@
 //! A block-bearing submission still pending at its bound is answered
 //! `ledger-outcome-unknown` and counted in `block_proof_ack_capped_total`; the
 //! bound only ends the wait, never the probe, enqueue, append or landing.
-use super::submit_ledger::{CommitGate, GateClosure, GateState};
+use super::submit_ledger::{Appended, CommitGate, GateClosure, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
 use crate::metrics::{BlockAckPath, StaleJobCause};
@@ -104,17 +104,9 @@ pub(super) fn classify_share_append(
         };
     }
     match joined {
-        Ok(Ok(true)) => match statement_timeout {
-            Some(limit) if commit_elapsed.is_none_or(|elapsed| elapsed >= limit) => {
-                SaveOutcome::Unknown {
-                    phase: "sync-rep-guard",
-                    detail: format!(
-                        "possible sync-rep cancellation: COMMIT took {commit_elapsed:?}, at least statement_timeout {limit:?}"
-                    ),
-                }
-            }
-            _ => SaveOutcome::Accepted,
-        },
+        Ok(Ok(true)) => {
+            sync_rep_unknown(commit_elapsed, statement_timeout).unwrap_or(SaveOutcome::Accepted)
+        }
         Ok(Ok(false)) => SaveOutcome::Duplicate,
         Ok(Err(error)) if database_error_severity(&error) == Some(PgSeverity::Error) => {
             SaveOutcome::Failed(error)
@@ -127,6 +119,26 @@ pub(super) fn classify_share_append(
             phase: "commit-error",
             detail: error.to_string(),
         },
+    }
+}
+
+/// A successful COMMIT that took the whole `statement_timeout` may be a
+/// cancelled synchronous-replication wait that committed only locally, so it
+/// is answered unknown rather than as a confirmation.
+fn sync_rep_unknown(
+    commit_elapsed: Option<Duration>,
+    statement_timeout: Option<Duration>,
+) -> Option<SaveOutcome> {
+    match statement_timeout {
+        Some(limit) if commit_elapsed.is_none_or(|elapsed| elapsed >= limit) => {
+            Some(SaveOutcome::Unknown {
+                phase: "sync-rep-guard",
+                detail: format!(
+                    "possible sync-rep cancellation: COMMIT took {commit_elapsed:?}, at least statement_timeout {limit:?}"
+                ),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -162,7 +174,7 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
 /// Both times are taken inside the task, so a late poll of this handle can
 /// neither count scheduler delay as database time nor make an on-time
 /// confirmation look late.
-type AppendJoin = (Result<bool>, Option<Duration>, tokio::time::Instant);
+type AppendJoin = (Result<Appended>, Option<Duration>, tokio::time::Instant);
 
 struct AppendTask {
     handle: Option<JoinHandle<AppendJoin>>,
@@ -201,7 +213,7 @@ impl AppendTask {
         };
         tokio::spawn(async move {
             match handle.await {
-                Ok((Ok(true), _, _)) => {
+                Ok((Ok(Appended::Inserted), _, _)) => {
                     tracing::warn!(
                         share_id,
                         path,
@@ -210,12 +222,23 @@ impl AppendTask {
                         "unknown share outcome resolved"
                     )
                 }
-                Ok((Ok(false), _, _)) => {
+                Ok((Ok(Appended::Recorded), _, _)) => {
                     tracing::warn!(
                         share_id,
                         path,
                         phase,
                         outcome = "already-recorded",
+                        "unknown share outcome resolved"
+                    )
+                }
+                // #657: the block was captured, its share deferred; the
+                // candidate loop offers it and confirmation credits the share.
+                Ok((Ok(Appended::Captured), _, _)) => {
+                    tracing::warn!(
+                        share_id,
+                        path,
+                        phase,
+                        outcome = "captured",
                         "unknown share outcome resolved"
                     )
                 }
@@ -530,6 +553,7 @@ impl Coordinator {
                     candidate,
                     proof_observed_at_ms,
                     revision,
+                    &block_hash,
                     start,
                     fence,
                 )
@@ -625,16 +649,29 @@ impl Coordinator {
     /// `share_commit_grace` once COMMIT is in flight. An append that carries a
     /// block candidate gets the same deadline and grace (#574: never less than
     /// a plain share) but is never refused, so it runs on past the answer.
+    /// If the payout revision moved before its commit, such an append
+    /// captures its block instead (#657), and the answer follows the block's
+    /// disposition, as a block-only proof's does.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_share_pass(
         &self,
         share: AcceptedShare,
         candidate: Option<Candidate>,
         proof_observed_at_ms: Option<i64>,
         revision: i64,
+        block_hash: &str,
         start: tokio::time::Instant,
         lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
+        // #657: with capture on, a block whose revision moved before its
+        // commit is captured, as the submit check captures one whose revision
+        // already moved; with it off, the fence refuses it as before.
+        let moved = if self.config.capture_overpay_ceiling_bps > 0 {
+            crate::ledger::MovedRevision::Capture
+        } else {
+            crate::ledger::MovedRevision::Refuse
+        };
         let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
         // path to submitblock, so a candidate-bearing append is never refused.
@@ -649,6 +686,7 @@ impl Coordinator {
                         candidate,
                         proof_observed_at_ms,
                         revision,
+                        moved,
                         task_gate.clone(),
                     )
                     .await;
@@ -693,6 +731,27 @@ impl Coordinator {
             }
             Err(error) => (Err(error), None, None),
         };
+        // #657: the payout revision moved after the submit check, so the
+        // append committed the block as a capture and deferred the share. As
+        // for a block-only proof, the answer is the block's disposition: the
+        // share is credited if the block confirms within the bound.
+        // A capture commits only after `begin_commit`, so its COMMIT time is
+        // known and the sync-rep guard applies to it as to any commit.
+        if matches!(joined, Ok(Ok(Appended::Captured))) {
+            if let Some(unknown) = sync_rep_unknown(commit_elapsed, self.statement_timeout) {
+                return unknown;
+            }
+            return self
+                .deferred_share_disposition(
+                    &share_id,
+                    block_hash,
+                    start + self.config.share_commit_timeout,
+                    "candidate-pending",
+                    (BlockAckPath::Share, "share"),
+                )
+                .await;
+        }
+        let joined = joined.map(|appended| appended.map(|appended| appended == Appended::Inserted));
         let outcome =
             classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout);
         let outcome = match outcome {
@@ -838,6 +897,32 @@ impl Coordinator {
         }
         // A block below the advertised share target earns only proven network
         // work, and only after active-chain confirmation.
+        self.deferred_share_disposition(
+            &share.share_id,
+            block_hash,
+            bound,
+            phase,
+            (BlockAckPath::BlockOnly, "block-only"),
+        )
+        .await
+    }
+
+    /// Follow a captured block until its confirmation credits the proof's
+    /// deferred solver share, or its candidate settles otherwise, waiting at
+    /// most until `bound` (#574). Used by a block-only proof after its
+    /// enqueue, and by a share-pass proof whose append captured its block when
+    /// the payout revision moved before its commit (#657). Past the bound the
+    /// answer is `ledger-outcome-unknown`; the landing runs on and credits the
+    /// share once, whenever it commits. `path` labels the logs and
+    /// `block_proof_ack_capped_total`.
+    async fn deferred_share_disposition(
+        &self,
+        share_id: &str,
+        block_hash: &str,
+        bound: tokio::time::Instant,
+        mut phase: &'static str,
+        (capped, log_path): (BlockAckPath, &'static str),
+    ) -> SaveOutcome {
         loop {
             // Observe credit and disposition in one MVCC snapshot so
             // finalization cannot fall between two separate reads. The credit
@@ -850,7 +935,7 @@ impl Coordinator {
                 sqlx::query_as::<_, (bool, Option<String>, Option<String>, Option<String>)>(
                     "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
                 )
-                .bind(&share.share_id)
+                .bind(share_id)
                 .bind(block_hash)
                 .fetch_one(&mut *self.ledger.acquire().await?)
                 .await
@@ -897,11 +982,11 @@ impl Coordinator {
                 // nothing about its credit.
                 Ok(Err(error)) => {
                     tracing::warn!(
-                        share_id = %share.share_id,
+                        share_id,
                         block_hash,
-                        path = "block-only",
+                        path = log_path,
                         %error,
-                        "block-only disposition poll failed; retrying"
+                        "{log_path} disposition poll failed; retrying"
                     );
                     phase = "poll-error";
                 }
@@ -915,8 +1000,7 @@ impl Coordinator {
         }
         // The landing runs on without this wait: its confirmation credits the
         // deferred share once, whenever it commits.
-        self.metrics
-            .record_block_ack_capped(BlockAckPath::BlockOnly);
+        self.metrics.record_block_ack_capped(capped);
         SaveOutcome::Unknown {
             phase,
             detail: "the block candidate had no disposition by share_commit_timeout".into(),

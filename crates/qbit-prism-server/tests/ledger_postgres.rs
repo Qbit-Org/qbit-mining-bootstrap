@@ -52,6 +52,9 @@ mod share_partitions;
 #[path = "support/share_hash_backfill.rs"]
 mod share_hash_backfill;
 
+#[path = "support/block_solvers.rs"]
+mod block_solvers;
+
 #[path = "support/policy_transition.rs"]
 mod policy_transition;
 

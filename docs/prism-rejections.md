@@ -24,7 +24,7 @@ share-rejection label set.
 | `internal-error` | An internal coordinator failure prevented normal classification. |
 | `pool-closed` | The coordinator was no longer accepting shares. |
 | `block-stale` | Legacy taxonomy; no native share producer. The block candidate height was stale against the active qbit tip. |
-| `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back. For block-only proofs, the block was not on the active chain when its candidate was abandoned, refused by the node after the offer, or settled as a proven orphan (#415); a later reorg or late landing can still credit it. |
+| `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back, including a share whose payout revision moved between its submit check and its commit; while capture is on (`PRISM_CAPTURE_OVERPAY_CEILING_BPS` > 0), a share-pass submission that carries a found block is not refused for that: its block is captured and its answer follows the block's, as for a block-only proof (#657). For block-only proofs, the block was not on the active chain when its candidate was abandoned, refused by the node after the offer, or settled as a proven orphan (#415); a later reorg or late landing can still credit it. |
 | `ledger-outcome-unknown` | The ledger outcome was not known by the acknowledgement deadline; the share may still be credited (logged with `share_id`). |
 
 The native coordinator exposes its produced reason IDs in:

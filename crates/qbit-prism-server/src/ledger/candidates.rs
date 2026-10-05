@@ -437,12 +437,51 @@ pub(super) struct PreparedCandidate {
     /// The proof-observation wall clock the row records, see
     /// [`ClaimLifecycle::proof_observed_at_ms`].
     proof_observed_at_ms: Option<i64>,
+    /// The same candidate as a #478 capture, prepared beside the credited
+    /// form for a fenced share append (#657). The append writes it instead
+    /// when the payout revision moved after the share's submit check.
+    capture: Option<PreparedCapture>,
+}
+
+/// What a capture's outbox row writes differently from the credited form:
+/// the document and digest with the solver share set as `deferred_share`, and
+/// that share's deferred row. They are exactly what an enqueue of the
+/// candidate with `deferred_share` set writes, which is what a capture at
+/// the submit check (`capture_stale`) enqueues. The block, the window
+/// reference and the as-issued snapshot are shared with the credited form.
+struct PreparedCapture {
+    document: Value,
+    sha256: String,
+    deferred: (Value, String),
+}
+
+/// The outbox row one enqueue of a prepared candidate writes: its credited
+/// or block-only form, or its capture form (#657).
+struct CandidateRow<'a> {
+    document: &'a Value,
+    sha256: &'a str,
+    deferred: Option<&'a (Value, String)>,
+    share_id: Option<&'a str>,
 }
 
 impl PreparedCandidate {
     pub(super) fn block_hash(&self) -> &str {
         &self.candidate.block_hash
     }
+
+    /// Whether this candidate was prepared with a capture form.
+    pub(super) fn has_capture(&self) -> bool {
+        self.capture.is_some()
+    }
+}
+
+/// The stored payload and digest of a deferred solver share: the digest
+/// `credit_deferred_share` checks at confirmation.
+fn deferred_share_row(share: &AcceptedShare) -> Result<(Value, String)> {
+    Ok((
+        serde_json::to_value(share)?,
+        hex::encode(Sha256::digest(serde_json::to_vec(share)?)),
+    ))
 }
 
 /// Serialize, digest and validate a candidate on the blocking pool,
@@ -459,16 +498,35 @@ pub(super) async fn prepare_candidate_observed(
     candidate: Candidate,
     proof_observed_at_ms: Option<i64>,
 ) -> Result<PreparedCandidate> {
-    tokio::task::spawn_blocking(move || prepare_candidate_blocking(candidate, proof_observed_at_ms))
-        .await
-        .context("candidate preparation task failed")?
+    tokio::task::spawn_blocking(move || {
+        prepare_candidate_blocking(candidate, proof_observed_at_ms, None)
+    })
+    .await
+    .context("candidate preparation task failed")?
+}
+
+/// [`prepare_candidate_observed`] for the candidate of a fenced share
+/// append, with its capture form for `share` (#657, see
+/// [`PreparedCandidate::capture`]): one more O(1) document, so the append's
+/// transaction still only inserts prepared bytes, whichever form it writes.
+pub(super) async fn prepare_fenced_candidate(
+    candidate: Candidate,
+    proof_observed_at_ms: Option<i64>,
+    share: AcceptedShare,
+) -> Result<PreparedCandidate> {
+    tokio::task::spawn_blocking(move || {
+        prepare_candidate_blocking(candidate, proof_observed_at_ms, Some(share))
+    })
+    .await
+    .context("candidate preparation task failed")?
 }
 
 /// [`prepare_candidate_observed`]'s work: synchronous, whole-set, and never
-/// on a runtime thread.
+/// on a runtime thread. With `capture_share`, also the capture form.
 fn prepare_candidate_blocking(
     mut candidate: Candidate,
     proof_observed_at_ms: Option<i64>,
+    capture_share: Option<AcceptedShare>,
 ) -> Result<PreparedCandidate> {
     let block = &candidate.block_bytes;
     ensure!(block.len() > 80, "candidate block is truncated");
@@ -514,13 +572,31 @@ fn prepare_candidate_blocking(
     let deferred = candidate
         .deferred_share
         .as_ref()
-        .map(|share| {
-            Ok::<_, anyhow::Error>((
-                serde_json::to_value(share)?,
-                hex::encode(Sha256::digest(serde_json::to_vec(share)?)),
-            ))
-        })
+        .map(deferred_share_row)
         .transpose()?;
+    // The capture form differs only by `deferred_share`, which the document
+    // serializes; the block and the balance set are skipped fields. So it is
+    // the same candidate serialized once more with the share set, then unset.
+    let capture = match capture_share {
+        Some(share) => {
+            ensure!(
+                candidate.deferred_share.is_none(),
+                "a fenced append's candidate already carries a deferred share"
+            );
+            let deferred = deferred_share_row(&share)?;
+            candidate.deferred_share = Some(share);
+            let encoded = serde_json::to_value(&candidate)
+                .and_then(|document| Ok((document, serde_json::to_vec(&candidate)?)));
+            candidate.deferred_share = None;
+            let (document, bytes) = encoded?;
+            Some(PreparedCapture {
+                document,
+                sha256: hex::encode(Sha256::digest(bytes)),
+                deferred,
+            })
+        }
+        None => None,
+    };
     Ok(PreparedCandidate {
         candidate,
         document,
@@ -528,6 +604,7 @@ fn prepare_candidate_blocking(
         deferred,
         snapshot,
         proof_observed_at_ms,
+        capture,
     })
 }
 
@@ -607,6 +684,50 @@ impl Ledger {
         prepared: &PreparedCandidate,
         share_id: Option<&str>,
     ) -> Result<bool> {
+        let row = CandidateRow {
+            document: &prepared.document,
+            sha256: &prepared.sha256,
+            deferred: prepared.deferred.as_ref(),
+            share_id,
+        };
+        self.persist_candidate_row(tx, prepared, row).await
+    }
+
+    /// [`Ledger::persist_prepared_candidate`] with the candidate's capture
+    /// form (#657): no crediting share, the solver share deferred. The same
+    /// fence, snapshot and window probe guard it, and it writes the rows a
+    /// capture at the submit check would. Fails if the candidate was not
+    /// prepared with a capture form.
+    pub(super) async fn persist_prepared_capture(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        prepared: &PreparedCandidate,
+    ) -> Result<bool> {
+        let capture = prepared
+            .capture
+            .as_ref()
+            .context("candidate was prepared without a capture form")?;
+        let row = CandidateRow {
+            document: &capture.document,
+            sha256: &capture.sha256,
+            deferred: Some(&capture.deferred),
+            share_id: None,
+        };
+        self.persist_candidate_row(tx, prepared, row).await
+    }
+
+    async fn persist_candidate_row(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        prepared: &PreparedCandidate,
+        row: CandidateRow<'_>,
+    ) -> Result<bool> {
+        let CandidateRow {
+            document,
+            sha256,
+            deferred,
+            share_id,
+        } = row;
         let candidate = &prepared.candidate;
         // The writer fence. `FOR SHARE` conflicts with `configure`'s `FOR
         // UPDATE`, so a fingerprint reset and this write cannot interleave:
@@ -722,15 +843,15 @@ impl Ledger {
             None => (None, None, None, None),
         };
         let inserted = sqlx::query("INSERT INTO qbit_block_candidate_outbox(block_hash,share_id,candidate,candidate_sha256,block_bytes,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,proof_observed_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(block_hash) DO NOTHING")
-            .bind(&candidate.block_hash).bind(share_id).bind(&prepared.document).bind(&prepared.sha256).bind(&candidate.block_bytes)
+            .bind(&candidate.block_hash).bind(share_id).bind(document).bind(sha256).bind(&candidate.block_bytes)
             .bind(candidate.window.anchor_ms).bind(hex::encode(candidate.window.prior_balances_digest)).bind(first).bind(last).bind(count).bind(snapshot)
             .bind(prepared.proof_observed_at_ms)
             .execute(&mut **tx).await?.rows_affected();
         if inserted == 0 {
-            let same: bool = sqlx::query_scalar("SELECT candidate_sha256=$2 AND share_id IS NOT DISTINCT FROM $3 FROM qbit_block_candidate_outbox WHERE block_hash=$1").bind(&candidate.block_hash).bind(&prepared.sha256).bind(share_id).fetch_one(&mut **tx).await?;
+            let same: bool = sqlx::query_scalar("SELECT candidate_sha256=$2 AND share_id IS NOT DISTINCT FROM $3 FROM qbit_block_candidate_outbox WHERE block_hash=$1").bind(&candidate.block_hash).bind(sha256).bind(share_id).fetch_one(&mut **tx).await?;
             ensure!(same, "candidate identity conflict");
         }
-        if let Some((payload, digest)) = &prepared.deferred {
+        if let Some((payload, digest)) = deferred {
             sqlx::query("INSERT INTO qbit_prism_deferred_shares(block_hash,share,share_sha256) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
                 .bind(&candidate.block_hash).bind(payload).bind(digest).execute(&mut **tx).await?;
             let same:bool = sqlx::query_scalar("SELECT share=$2 AND share_sha256=$3 FROM qbit_prism_deferred_shares WHERE block_hash=$1")
@@ -2550,6 +2671,10 @@ pub(crate) mod faults {
 
 #[cfg(test)]
 use faults::Fault;
+
+#[cfg(test)]
+#[path = "candidates/capture_form_tests.rs"]
+mod capture_form_tests;
 
 #[cfg(test)]
 #[path = "candidates/park_tests.rs"]

@@ -38,6 +38,8 @@ type Answer = std::result::Result<(), StratumError>;
 struct NodeState {
     chain: BTreeMap<u64, String>,
     chainwork: u128,
+    /// `submitblock` calls answered: offers that reached the node.
+    submitted: usize,
 }
 
 async fn node_reply(
@@ -94,6 +96,7 @@ async fn node_reply(
                 codec::hash_display(&codec::double_sha256(&block[..80])),
             );
             node.chainwork += 1;
+            node.submitted += 1;
             Value::Null
         }
         method => panic!("unexpected commit-reconcile RPC {method}"),
@@ -108,12 +111,14 @@ async fn node_reply(
 struct Fixture {
     schema: TestSchema,
     coordinator: Arc<Coordinator>,
+    node: Arc<Mutex<NodeState>>,
     /// A second pool on the test schema, without the ledger's session
     /// timeouts, for holding locks and inspecting the server.
     side: PgPool,
     _server: AbortOnDropHandle<()>,
 }
 
+#[derive(Clone)]
 struct Proof {
     job: MiningJob<JobContext>,
     submission: codec::Submission,
@@ -130,6 +135,7 @@ impl Fixture {
             let node = Arc::new(Mutex::new(NodeState {
                 chain: BTreeMap::from([(0, "00".repeat(32)), (100, "aa".repeat(32))]),
                 chainwork: 1,
+                submitted: 0,
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let rpc_url = format!("http://{}/", listener.local_addr()?);
@@ -140,7 +146,9 @@ impl Fixture {
                 Duration::from_secs(1),
             )?;
             tune(&mut config);
-            let app = Router::new().route("/", post(node_reply)).with_state(node);
+            let app = Router::new()
+                .route("/", post(node_reply))
+                .with_state(node.clone());
             // Dropping the handle on any later failure aborts the server.
             let server = AbortOnDropHandle::new(tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
@@ -149,13 +157,14 @@ impl Fixture {
                 Coordinator::new(config, Arc::new(crate::metrics::Metrics::default())).await?;
             let side = PgPool::connect(schema.url()).await?;
             coordinator.refresh_once().await?;
-            Ok::<_, anyhow::Error>((coordinator, side, server))
+            Ok::<_, anyhow::Error>((coordinator, node, side, server))
         }
         .await;
         match opened {
-            Ok((coordinator, side, server)) => Ok(Self {
+            Ok((coordinator, node, side, server)) => Ok(Self {
                 schema,
                 coordinator,
+                node,
                 side,
                 _server: server,
             }),
@@ -173,6 +182,18 @@ impl Fixture {
     /// ordinary share-pass append, or a block-only proof below its share
     /// target.
     async fn proof(&self, block_only: bool) -> Result<Proof> {
+        let mut proof = self.block_bearing_proof().await?;
+        if block_only {
+            proof.submission.share_pass = false;
+        } else {
+            proof.submission.block_pass = false;
+        }
+        Ok(proof)
+    }
+
+    /// A current-work proof that passes both the share and the network
+    /// target: a share-pass append that carries its found block.
+    async fn block_bearing_proof(&self) -> Result<Proof> {
         let worker = Worker {
             username: "miner.rig".into(),
             payout_address: "miner".into(),
@@ -182,7 +203,7 @@ impl Fixture {
         let job = MiningBackend::build_job(&*self.coordinator, &worker, EXTRANONCE1, 1e-12, 0.0)
             .await
             .map_err(|error| anyhow::anyhow!("job build failed: {}", error.message))?;
-        let mut submission = (0..200_000u32)
+        let submission = (0..200_000u32)
             .find_map(|nonce| {
                 let submission = job
                     .wire
@@ -197,11 +218,6 @@ impl Fixture {
                 (submission.share_pass && submission.block_pass).then_some(submission)
             })
             .context("no proof in the nonce budget")?;
-        if block_only {
-            submission.share_pass = false;
-        } else {
-            submission.block_pass = false;
-        }
         Ok(Proof {
             share_id: format!("{}:{}", worker.username, submission.block_hash_hex),
             block_hash: submission.block_hash_hex.clone(),
@@ -303,6 +319,63 @@ impl Fixture {
         .bind(pid)
         .fetch_one(&self.side)
         .await?)
+    }
+
+    /// On the session holding `ORDER_LOCK`, move the payout revision, then
+    /// release the lock: a settlement that bumps the revision while it holds
+    /// the lock, committing behind a share already past its submit check.
+    /// Returns the new revision.
+    async fn bump_revision_and_release(
+        &self,
+        holder: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    ) -> Result<i64> {
+        let revision = sqlx::query_scalar(
+            "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision",
+        )
+        .fetch_one(&mut **holder)
+        .await?;
+        sqlx::query(&format!("SELECT pg_advisory_unlock({ORDER_LOCK_KEY})"))
+            .execute(&mut **holder)
+            .await?;
+        Ok(revision)
+    }
+
+    /// The outbox row of a pending candidate: the share that credits it, if
+    /// any, and its document.
+    async fn pending_row(&self, block_hash: &str) -> Result<(Option<String>, Value)> {
+        Ok(sqlx::query_as(
+            "SELECT share_id,candidate FROM qbit_block_candidate_outbox WHERE block_hash=$1 AND state='pending'",
+        )
+        .bind(block_hash)
+        .fetch_one(&self.side)
+        .await?)
+    }
+
+    /// The #478 offer decision recorded for a block whose payout revision was
+    /// superseded: the decision, the revision the block was issued at and the
+    /// one the offer observed.
+    async fn offer_decision(&self, block_hash: &str) -> Result<Option<(String, i64, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT offer_decision,candidate_payout_revision,offer_observed_payout_revision FROM qbit_prism_payout_divergences WHERE block_hash=$1",
+        )
+        .bind(block_hash)
+        .fetch_optional(&self.side)
+        .await?)
+    }
+
+    async fn submitblock_calls(&self) -> usize {
+        self.node.lock().await.submitted
+    }
+
+    async fn integrity_is_clean(&self) -> Result<()> {
+        let report: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
+            .fetch_one(&self.side)
+            .await?;
+        ensure!(
+            report["mismatch_count"] == 0 && report["current_drift_count"] == 0,
+            "carry-forward integrity failed: {report}"
+        );
+        Ok(())
     }
 
     /// Hold `ORDER_LOCK` on a dedicated session and wait until an append
@@ -786,7 +859,10 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
                 gate,
             )
             .await?;
-            ensure!(!duplicate, "closed gate changed a confirmed duplicate");
+            ensure!(
+                duplicate == submit_ledger::Appended::Recorded,
+                "closed gate changed a confirmed duplicate"
+            );
             drop(contended);
             // Rollback also released ORDER_LOCK for a subsequent valid append.
             ensure!(
@@ -1073,6 +1149,375 @@ async fn commit_reconcile_block_only_enqueue_past_the_bound_is_unknown() -> Resu
             fixture.rows(&share_id).await? == 0,
             "a block-only proof must not be credited before confirmation"
         );
+        drop(holder);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    settle(outcome, fixture.close().await)
+}
+
+// ---------------------------------------------------------------------------
+// The payout-revision fence (#657): a settlement holding `ORDER_LOCK` bumps
+// the revision while an append admitted at the old one queues behind it.
+// ---------------------------------------------------------------------------
+
+/// A block-bearing share whose revision moves before its commit loses its
+/// block on the base: the fence rolls the candidate back with the share. It
+/// is now captured as the submit check would have, offered once, landed, and
+/// its share credited once on confirmation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_reconcile_block_whose_revision_moves_before_its_commit_is_captured_and_lands_once(
+) -> Result<()> {
+    let Some(raw) = database_url()? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::open(&raw, |config| {
+        config.share_commit_timeout = Duration::from_secs(10)
+    })
+    .await?;
+    let outcome = async {
+        let proof = fixture.block_bearing_proof().await?;
+        let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
+        let issued = proof.job.wire.payout_revision;
+        let resubmitted = proof.clone();
+        let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
+        let (submitted, _log) = fixture.submit(proof);
+        wait_until_blocked(&fixture, holder_pid).await?;
+        let moved = fixture.bump_revision_and_release(&mut holder).await?;
+        ensure!(moved > issued, "the revision did not move past {issued}");
+        until("the captured candidate", || async {
+            Ok(fixture.outbox_state(&block_hash).await?.as_deref() == Some("pending"))
+        })
+        .await?;
+        // The capture a submit check at the moved revision would have made:
+        // no crediting share, the share deferred, the block as issued.
+        let (credited_by, document) = fixture.pending_row(&block_hash).await?;
+        ensure!(
+            credited_by.is_none(),
+            "the candidate is credited by {credited_by:?}, not captured"
+        );
+        ensure!(
+            document["deferred_share"]["share_id"] == json!(share_id)
+                && document["payout_revision"] == json!(issued),
+            "the capture does not defer the share at the issued revision: {document}"
+        );
+        ensure!(
+            fixture.rows(&share_id).await? == 0,
+            "the share was credited at the superseded revision"
+        );
+        ensure!(
+            !submitted.is_finished(),
+            "the share was answered before its captured block's disposition"
+        );
+        fixture.drive_candidate().await?;
+        let answered = answer(submitted).await?;
+        ensure!(
+            answered.is_ok(),
+            "a captured block that confirmed was answered {:?}",
+            reason(&answered)
+        );
+        ensure!(fixture.outbox_state(&block_hash).await?.as_deref() == Some("submitted"));
+        ensure!(
+            fixture.offer_decision(&block_hash).await?
+                == Some(("offered".into(), issued, moved)),
+            "the capture was not held to the overpay ceiling: {:?}",
+            fixture.offer_decision(&block_hash).await?
+        );
+        // One offer, one credit, one confirmed pool block with its audit.
+        ensure!(fixture.submitblock_calls().await == 1, "offered other than once");
+        ensure!(
+            fixture.rows(&share_id).await? == 1,
+            "the deferred share was not credited exactly once"
+        );
+        let (chain_state, bundles): (String, i64) = sqlx::query_as(
+            "SELECT chain_state,(SELECT count(*) FROM qbit_pool_audit_bundles WHERE block_hash=$1) FROM qbit_pool_blocks WHERE block_hash=$1",
+        )
+        .bind(&block_hash)
+        .fetch_one(&fixture.side)
+        .await?;
+        ensure!(
+            chain_state == "confirmed" && bundles == 1,
+            "pool block {chain_state} with {bundles} audit bundle(s)"
+        );
+        fixture.integrity_is_clean().await?;
+        let (accepted, headers): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM qbit_share_ledger WHERE accepted),(SELECT count(*) FROM qbit_prism_share_hashes)",
+        )
+        .fetch_one(&fixture.side)
+        .await?;
+        ensure!(
+            accepted == headers,
+            "{accepted} accepted shares but {headers} credited headers"
+        );
+        ensure!(
+            fixture
+                .coordinator
+                .ledger
+                .claim_candidate(10)
+                .await?
+                .is_none(),
+            "a second candidate is waiting"
+        );
+        // The same proof again credits and offers nothing more.
+        let (again, _) = fixture.submit(resubmitted);
+        let again = answer(again).await?;
+        ensure!(
+            matches!(
+                reason(&again).as_deref(),
+                Some("duplicate-share" | "stale-job")
+            ),
+            "the resubmitted proof was answered {:?}",
+            reason(&again)
+        );
+        ensure!(fixture.rows(&share_id).await? == 1, "credited twice");
+        ensure!(fixture.submitblock_calls().await == 1, "offered twice");
+        drop(holder);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    settle(outcome, fixture.close().await)
+}
+
+/// A share without a block keeps the fence's refusal: nothing written, the
+/// typed reason logged, `ledger-confirmation-failed` answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_reconcile_plain_share_whose_revision_moves_before_its_commit_writes_nothing(
+) -> Result<()> {
+    let Some(raw) = database_url()? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::open(&raw, |config| {
+        config.share_commit_timeout = Duration::from_secs(10)
+    })
+    .await?;
+    let outcome = async {
+        let proof = fixture.proof(false).await?;
+        let share_id = proof.share_id.clone();
+        let sequence = fixture.share_sequence().await?;
+        let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
+        let (submitted, log) = fixture.submit(proof);
+        wait_until_blocked(&fixture, holder_pid).await?;
+        fixture.bump_revision_and_release(&mut holder).await?;
+        let answer = answer(submitted).await?;
+        ensure!(
+            reason(&answer).as_deref() == Some("ledger-confirmation-failed"),
+            "a share past its revision was answered {:?}",
+            reason(&answer)
+        );
+        ensure!(
+            log.text()
+                .contains("payout revision changed before share commit: admitted at"),
+            "the refusal was not the fence's:\n{}",
+            log.text()
+        );
+        ensure!(
+            fixture.rows(&share_id).await? == 0,
+            "the refused share left a row"
+        );
+        ensure!(
+            fixture.share_sequence().await? == sequence,
+            "the refused append reached its INSERT"
+        );
+        drop(holder);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    settle(outcome, fixture.close().await)
+}
+
+/// The capture is the append's own work, not the answer's: an append still
+/// queued behind `ORDER_LOCK` at its deadline is answered unknown and
+/// followed, and when the settlement frees the lock it captures the block,
+/// which then lands and credits the share once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_reconcile_block_append_queued_past_its_deadline_still_captures_its_block(
+) -> Result<()> {
+    let Some(raw) = database_url()? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::open(&raw, |_| {}).await?;
+    let outcome = async {
+        let proof = fixture.block_bearing_proof().await?;
+        let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
+        let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
+        let (submitted, log) = fixture.submit(proof);
+        wait_until_blocked(&fixture, holder_pid).await?;
+        let answer = answer(submitted).await?;
+        ensure!(
+            reason(&answer).as_deref() == Some("ledger-outcome-unknown"),
+            "a block-bearing append queued at its deadline was answered {:?}",
+            reason(&answer)
+        );
+        let text = log.text();
+        ensure!(
+            text.contains("candidate-pending") && text.contains(&block_hash),
+            "the unknown outcome was not logged with its block:\n{text}"
+        );
+        ensure!(fixture.outbox_state(&block_hash).await?.is_none());
+        fixture.bump_revision_and_release(&mut holder).await?;
+        until("the followed append to capture its block", || async {
+            Ok(fixture.outbox_state(&block_hash).await?.as_deref() == Some("pending"))
+        })
+        .await?;
+        ensure!(
+            fixture.pending_row(&block_hash).await?.0.is_none(),
+            "the late append credited its share instead of capturing its block"
+        );
+        fixture.drive_candidate().await?;
+        ensure!(fixture.outbox_state(&block_hash).await?.as_deref() == Some("submitted"));
+        ensure!(
+            fixture.submitblock_calls().await == 1,
+            "offered other than once"
+        );
+        ensure!(
+            fixture.rows(&share_id).await? == 1,
+            "the deferred share was not credited exactly once"
+        );
+        drop(holder);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    settle(outcome, fixture.close().await)
+}
+
+/// With capture off (`PRISM_CAPTURE_OVERPAY_CEILING_BPS=0`) the fence refuses
+/// a block-bearing share whose revision moved, exactly as before #657 and as
+/// the submit check refuses one whose revision had already moved: nothing
+/// written, nothing enqueued or offered, nothing credited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_reconcile_block_whose_revision_moves_with_capture_off_is_refused_as_before(
+) -> Result<()> {
+    let Some(raw) = database_url()? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::open(&raw, |config| {
+        config.share_commit_timeout = Duration::from_secs(10);
+        config.capture_overpay_ceiling_bps = 0;
+    })
+    .await?;
+    let outcome = async {
+        let proof = fixture.block_bearing_proof().await?;
+        let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
+        let sequence = fixture.share_sequence().await?;
+        let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
+        let (submitted, log) = fixture.submit(proof);
+        wait_until_blocked(&fixture, holder_pid).await?;
+        fixture.bump_revision_and_release(&mut holder).await?;
+        let answer = answer(submitted).await?;
+        ensure!(
+            reason(&answer).as_deref() == Some("ledger-confirmation-failed"),
+            "a block past its revision with capture off was answered {:?}",
+            reason(&answer)
+        );
+        ensure!(
+            log.text()
+                .contains("payout revision changed before share commit: admitted at"),
+            "the refusal was not the fence's:\n{}",
+            log.text()
+        );
+        ensure!(
+            fixture.outbox_state(&block_hash).await?.is_none(),
+            "capture is off, yet the fence enqueued the block"
+        );
+        ensure!(fixture.offer_decision(&block_hash).await?.is_none());
+        ensure!(
+            fixture
+                .coordinator
+                .ledger
+                .claim_candidate(10)
+                .await?
+                .is_none(),
+            "a candidate is waiting"
+        );
+        ensure!(
+            fixture.submitblock_calls().await == 0,
+            "a refused block was offered"
+        );
+        ensure!(
+            fixture.rows(&share_id).await? == 0,
+            "the refused share left a row"
+        );
+        ensure!(
+            fixture.share_sequence().await? == sequence,
+            "the refused append reached its INSERT"
+        );
+        drop(holder);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    settle(outcome, fixture.close().await)
+}
+
+/// A block-bearing proof already credited with its candidate, submitted again
+/// into a revision that moves before the append's commit, is the duplicate it
+/// is: the fence finds its share recorded and writes nothing, so the credited
+/// candidate keeps its row, is not turned into a conflicting capture, and
+/// lands once with its share credited once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_reconcile_credited_block_resubmitted_as_its_revision_moves_is_a_duplicate(
+) -> Result<()> {
+    let Some(raw) = database_url()? else {
+        return Ok(());
+    };
+    let _serial = TEST_LOCK.lock().await;
+    let fixture = Fixture::open(&raw, |config| {
+        config.share_commit_timeout = Duration::from_secs(10)
+    })
+    .await?;
+    let outcome = async {
+        let proof = fixture.block_bearing_proof().await?;
+        let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
+        let resubmitted = proof.clone();
+        let (first, _) = fixture.submit(proof);
+        let first = answer(first).await?;
+        ensure!(
+            first.is_ok(),
+            "the first submission was answered {:?}",
+            reason(&first)
+        );
+        let credited = fixture.pending_row(&block_hash).await?;
+        ensure!(
+            credited.0.as_deref() == Some(share_id.as_str()),
+            "the first submission did not credit its candidate: {:?}",
+            credited.0
+        );
+        let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
+        let (again, log) = fixture.submit(resubmitted);
+        wait_until_blocked(&fixture, holder_pid).await?;
+        fixture.bump_revision_and_release(&mut holder).await?;
+        let again = answer(again).await?;
+        ensure!(
+            reason(&again).as_deref() == Some("duplicate-share"),
+            "the resubmitted proof was answered {:?}:\n{}",
+            reason(&again),
+            log.text()
+        );
+        ensure!(
+            fixture.pending_row(&block_hash).await? == credited,
+            "the duplicate rewrote the credited candidate"
+        );
+        let deferred: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_prism_deferred_shares WHERE block_hash=$1",
+        )
+        .bind(&block_hash)
+        .fetch_one(&fixture.side)
+        .await?;
+        ensure!(deferred == 0, "the duplicate deferred its share");
+        fixture.drive_candidate().await?;
+        ensure!(fixture.outbox_state(&block_hash).await?.as_deref() == Some("submitted"));
+        ensure!(
+            fixture.submitblock_calls().await == 1,
+            "offered other than once"
+        );
+        ensure!(
+            fixture.rows(&share_id).await? == 1,
+            "the share was not credited exactly once"
+        );
+        fixture.integrity_is_clean().await?;
         drop(holder);
         Ok::<_, anyhow::Error>(())
     }
