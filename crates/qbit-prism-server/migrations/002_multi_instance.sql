@@ -30,13 +30,16 @@ CREATE TABLE IF NOT EXISTS qbit_prism_share_hashes (
     share_id text NOT NULL UNIQUE REFERENCES qbit_share_ledger(share_id)
 );
 -- Legacy worker-scoped identifiers could contain the same header twice.
--- Preserve that history while prohibiting any new replay across identities.
-INSERT INTO qbit_prism_share_hashes(header_hash,share_id)
-SELECT DISTINCT ON (lower(right(share_id,64))) lower(right(share_id,64)),share_id
-FROM qbit_share_ledger
-WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$'
-ORDER BY lower(right(share_id,64)),share_seq
-ON CONFLICT DO NOTHING;
+-- Preserve that history while prohibiting any new replay across identities:
+-- every accepted legacy share whose ID ends in 64 hex digits maps its
+-- header, the earliest share_seq winning. That backfill is not in this
+-- file (#582). As one INSERT ... SELECT DISTINCT ON over the whole ledger,
+-- inside the migration transaction, it outlasted the statement timeout on
+-- a production-sized ledger. On a ledger with rows the migrator maps the
+-- legacy shares after the commit instead, in batches of consecutive
+-- share_seq, and records migration 2 only once every one is mapped
+-- (ledger/migration/share_hashes.rs); until then every start refuses the
+-- database. A fresh or empty ledger has nothing to map.
 
 CREATE SEQUENCE IF NOT EXISTS qbit_prism_session_sequence AS bigint MINVALUE 1 MAXVALUE 4294967295 NO CYCLE;
 CREATE TABLE IF NOT EXISTS qbit_prism_instances (

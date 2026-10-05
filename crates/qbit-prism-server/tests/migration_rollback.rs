@@ -1390,6 +1390,24 @@ async fn assert_native_metadata_required(
             .contains("missing required native migrations"));
         ensure!(recovery::evidence(source, pg_bin).await? == *native);
     }
+    // A share-hash backfill still pending (#582) is refused as startup
+    // refuses it, even with 2 recorded: the mapping would be exported partial.
+    sqlx::raw_sql("CREATE TABLE qbit_prism_share_hash_backfill(singleton boolean PRIMARY KEY DEFAULT true, start_seq bigint NOT NULL, next_seq bigint NOT NULL, end_seq bigint NOT NULL); INSERT INTO qbit_prism_share_hash_backfill(start_seq,next_seq,end_seq) VALUES(1,1,2)")
+        .execute(&source.pool)
+        .await?;
+    let pending = recovery::evidence(source, pg_bin).await;
+    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
+        .execute(&source.pool)
+        .await?;
+    ensure!(
+        pending.is_err(),
+        "a pending share-hash backfill was exported"
+    );
+    ensure!(pending
+        .unwrap_err()
+        .to_string()
+        .contains("share-hash backfill has not finished"));
+    ensure!(recovery::evidence(source, pg_bin).await? == *native);
     // Unknown additive migrations do not prevent this release from starting.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(999)")
         .execute(&source.pool)

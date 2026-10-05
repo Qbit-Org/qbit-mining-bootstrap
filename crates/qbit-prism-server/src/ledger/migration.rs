@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 mod online;
 mod partition;
+mod share_hashes;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 
 /// The schema migrations every native start requires, each checked on its
@@ -25,7 +26,8 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// `require_known_capabilities` refuses again at connect. Existing native
 /// ledgers apply 013 and 017 online (`ONLINE_MIGRATIONS`) and record each
 /// after its last change, so a start refuses the database until that has
-/// completed.
+/// completed. A populated 2.x.x source records 2 the same way, after its
+/// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
 ];
@@ -710,18 +712,22 @@ fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -
     Ok(())
 }
 
-/// A native database whose record has 3 and not 2. Every native build
-/// records both in the one transaction that applies them, so such a record
-/// was edited or restored selectively. Only 2 can be hidden that way: 3
-/// applies it, and every later migration is checked on its own.
+/// A native database whose record has 3 and not 2, and no share-hash
+/// backfill pending. Every native build records 2 in the transaction that
+/// records 3, or, on a populated 2.x.x source, after the backfill that
+/// `qbit_prism_share_hash_backfill` tracks until then (`share_hashes.rs`,
+/// #582), which the caller resumes rather than refuses. Without that table
+/// such a record was edited or restored selectively. Only 2 can be hidden
+/// that way: 3 applies it, and every later migration is checked on its own.
 /// `require_schema_version` refuses the gap at every start, and
 /// `migrate_schema` neither re-runs 002 on a database at 3 nor records it
-/// unseen, which would vouch for objects this run never checked, so nothing
-/// would repair it. Refused before any DDL, naming the remedy.
+/// unseen, which would vouch for objects and a share-hash mapping this run
+/// never checked, so nothing would repair it. Refused before any DDL,
+/// naming the remedy.
 fn refuse_inconsistent_native_record(versions: &[i32]) -> Result<()> {
     ensure!(
         !versions.contains(&3) || versions.contains(&2),
-        "refusing to migrate a native database at schema migrations {} before any DDL: migration 3 is recorded and 2 is not, and every native build records both in one transaction, so the migration record was edited or restored selectively; every start refuses the gap, and no migrate repairs it, because 002_multi_instance.sql is not re-run on a database at 3 and recording it unseen would vouch for objects this run never checked. Nothing was changed. Restore the full pre-migration backup, or, once every object 002_multi_instance.sql creates is verified present, record it with INSERT INTO qbit_prism_schema_migrations(version) VALUES(2) and migrate again",
+        "refusing to migrate a native database at schema migrations {} before any DDL: migration 3 is recorded and 2 is not, and no share-hash backfill is pending (there is no qbit_prism_share_hash_backfill). Every native build records 2 in the transaction that records 3, or, on a populated 2.x.x source, after the backfill that table tracks, so the migration record was edited or restored selectively; every start refuses the gap, and no migrate repairs it, because 002_multi_instance.sql is not re-run on a database at 3 and recording it unseen would vouch for objects and a share-hash mapping this run never checked. Nothing was changed. Restore the full pre-migration backup, or, once every object 002_multi_instance.sql creates is verified present and qbit_prism_share_hashes maps every accepted share whose ID ends in 64 hex digits, record it with INSERT INTO qbit_prism_schema_migrations(version) VALUES(2) and migrate again",
         schema_version_list(versions)
     );
     Ok(())
@@ -2182,7 +2188,9 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// exclude writers. A later transactional migration must not depend on an
 /// online one's objects: within one run it is applied first. 017 depends on
 /// 013's indexes and on 016's functions; 013 is applied before it by
-/// version order, and 016 is transactional.
+/// version order, and 016 is transactional. 002 is not listed: its file is
+/// always transactional, and only its share-hash backfill on a populated
+/// 2.x.x source runs after the commit, ahead of these (`share_hashes.rs`).
 pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17];
 
 /// The online migration a version declares, from the scratch apply's
@@ -2895,6 +2903,9 @@ pub(super) async fn migrate_schema(
         // Nothing a native migration creates may be there yet, or its IF
         // NOT EXISTS would keep it as it is.
         require_no_native_collision(state, &reserved, &found)?;
+        // The share-hash backfill's progress table is no migration file's
+        // object, so its name is checked on its own.
+        share_hashes::refuse_held_name(tx).await?;
         refuse_undrained_outbox(tx, &inventory, None).await?;
         sqlx::raw_sql(&base_schema).execute(&mut **tx).await?;
         // 001 repaired what it re-asserts; what it skipped must already be
@@ -2906,9 +2917,17 @@ pub(super) async fn migrate_schema(
             sqlx::raw_sql(native_migration(2))
                 .execute(&mut **tx)
                 .await?;
-            sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
-                .execute(&mut **tx)
-                .await?;
+            if ledger_empty {
+                // Nothing to map, so nothing to leave for after the commit.
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+                    .execute(&mut **tx)
+                    .await?;
+            } else {
+                // The legacy shares are mapped after the commit, in batches,
+                // before 013 and 017, and that run records 2 (#582).
+                share_hashes::create_cursor(tx).await?;
+                online.insert(0, OnlineMigration::ShareHashes);
+            }
         }
         sqlx::raw_sql(native_migration(3))
             .execute(&mut **tx)
@@ -2927,10 +2946,14 @@ pub(super) async fn migrate_schema(
         // 005 and 006, or 008 and 009, would alter a database a newer
         // release wrote and record their versions, and only the connect-time
         // gate, after the commit, would refuse it. A record with 3 and not
-        // 2, which no native build writes, is refused first: 004 to 009
-        // must not run above a record every start refuses and no migrate
-        // repairs.
-        refuse_inconsistent_native_record(&versions)?;
+        // 2 is refused first: 004 to 009 must not run above a record every
+        // start refuses and no migrate repairs. The one exception is a
+        // populated 2.x.x source whose share-hash backfill has not finished,
+        // which records 2 last (#582): this run resumes it.
+        let backfill = share_hashes::progress(tx).await?;
+        if backfill.is_none() {
+            refuse_inconsistent_native_record(&versions)?;
+        }
         let inventory = inspect_source_schema(tx).await?;
         // A database at 6 that no longer declares its capabilities is
         // refused before 008 or 009 run above it, as connect refuses it.
@@ -2966,7 +2989,24 @@ pub(super) async fn migrate_schema(
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
             source = (None, inventory.capability("candidate_storage_version"));
         }
-        online.extend(require_no_native_gap_collisions(tx, &versions).await?);
+        // A pending backfill's database has 002's objects: the transaction
+        // that created its progress table applied 002 too. The gap check
+        // would find them and refuse 2 as a gap to repair.
+        let applied: Vec<i32> = match backfill {
+            Some(_) if !versions.contains(&2) => {
+                std::iter::once(2).chain(versions.iter().copied()).collect()
+            }
+            _ => versions.clone(),
+        };
+        online.extend(require_no_native_gap_collisions(tx, &applied).await?);
+        if let Some(progress) = backfill {
+            tracing::info!(
+                next_seq = progress.next_seq,
+                end_seq = progress.end_seq,
+                "resuming migration 2's share-hash backfill after the commit"
+            );
+            online.insert(0, OnlineMigration::ShareHashes);
+        }
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(native_migration(4))
@@ -3288,6 +3328,11 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     );
     let mut connection = pool.acquire().await?;
     require_migration_history(&mut connection).await?;
+    // Named before the missing 2 it explains, and refused even with 2
+    // recorded: while the table is there, legacy shares may be unmapped.
+    if let Some(progress) = share_hashes::progress(&mut connection).await? {
+        bail!("{}", progress.refusal());
+    }
     let applied: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&mut *connection)
