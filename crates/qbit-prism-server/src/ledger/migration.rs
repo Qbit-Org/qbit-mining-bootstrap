@@ -2860,6 +2860,9 @@ pub(super) async fn migrate_schema(
     // The online migrations this run must apply after the commit, from the
     // definitions the scratch apply rendered.
     let mut online = Vec::new();
+    // Whether this transaction created a share-hash backfill cursor, which
+    // it fences at once once 006 has created the capability table (#669).
+    let mut cursor_created = false;
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
         // schema repair and cutover atomic with their accounting. Its hold
@@ -2954,6 +2957,7 @@ pub(super) async fn migrate_schema(
                 // The legacy shares are mapped after the commit, in batches,
                 // before 013 and 017, and that run records 2 (#582).
                 share_hashes::create_cursor(tx).await?;
+                cursor_created = true;
                 online.insert(0, OnlineMigration::ShareHashes);
             }
         }
@@ -2979,10 +2983,14 @@ pub(super) async fn migrate_schema(
         // populated 2.x.x source whose share-hash backfill has not finished,
         // which records 2 last (#582): this run resumes it.
         let backfill = share_hashes::progress(tx).await?;
+        let inventory = inspect_source_schema(tx).await?;
         if backfill.is_none() {
             // A fence without its cursor: the cursor was dropped by hand, and
             // "3 without 2" would only suggest recording 2 by hand (#669).
-            if share_hashes::pending_declared(tx).await? {
+            if inventory
+                .capability(share_hashes::PENDING_CAPABILITY)
+                .is_some()
+            {
                 bail!(
                     "refusing to migrate a native database at schema migrations {} before any DDL: {}",
                     schema_version_list(&versions),
@@ -2991,7 +2999,6 @@ pub(super) async fn migrate_schema(
             }
             refuse_inconsistent_native_record(&versions)?;
         }
-        let inventory = inspect_source_schema(tx).await?;
         // A database at 6 that no longer declares its capabilities is
         // refused before 008 or 009 run above it, as connect refuses it.
         refuse_undeclared_native_database(&versions, &inventory)?;
@@ -3080,10 +3087,13 @@ pub(super) async fn migrate_schema(
             tracing::info!(source=state.rule().name, release=?release, "migrated PRISM database source");
         }
     }
-    // A pending share-hash backfill fences every earlier build (#669): the
-    // cursor this transaction created on a populated 2.x.x source, or the
-    // one a resume found. 006 has created the capability table by here.
-    if share_hashes::progress(tx).await?.is_some() {
+    // A cursor this transaction created fences every earlier build at once
+    // (#669); 006 has created the capability table by here. A resumed
+    // backfill is fenced again by its runner, under the runners' lock
+    // (`share_hashes::apply`): a runner of an earlier build that is still
+    // mapping holds that lock, records 2 without knowing the fence, and must
+    // not leave one behind.
+    if cursor_created {
         share_hashes::declare_pending(tx).await?;
     }
     if !versions.contains(&7) {

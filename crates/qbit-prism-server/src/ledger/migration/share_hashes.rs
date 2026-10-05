@@ -38,12 +38,17 @@
 //! would serve with legacy headers unmapped. So while the backfill is
 //! pending the database also declares the capability
 //! `share_hash_backfill_pending = 1` (#669). The transaction that creates
-//! the cursor declares it, every resume declares it again, and the
-//! transaction that records 2 removes it with the cursor. Every build
-//! before #669 refuses it at connect and at migrate, whatever the record
-//! says, and this release refuses the cursor itself; a declaration whose
-//! cursor is gone, which only a hand-dropped cursor leaves, is refused by
-//! every start and migrate of this release.
+//! the cursor declares it, every runner that resumes the backfill declares
+//! it again before its first batch, and the transaction that records 2
+//! removes it with the cursor. A resume declares it from the runner, under
+//! the runners' lock, not in its migration transaction: a runner of an
+//! earlier build that is still mapping holds that lock and records 2
+//! without knowing the fence, and must not find one to leave behind. Every
+//! earlier build that checks capabilities refuses the declaration at
+//! connect and at migrate, whatever the record says, and this release
+//! refuses the cursor itself. A declaration whose cursor is gone, which
+//! only a hand-dropped cursor leaves, is refused by every start and migrate
+//! of this release.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
 use sqlx::{Connection, PgConnection};
@@ -103,39 +108,23 @@ impl Progress {
 /// #669 off the database (see the module doc).
 pub(super) const PENDING_CAPABILITY: &str = "share_hash_backfill_pending";
 
-/// Declare the fence of a pending backfill, in the migration transaction
-/// that creates its cursor or resumes it. Idempotent, so a backfill an
-/// earlier build started, or whose declaration was deleted by hand, is
-/// fenced again by the next `migrate`.
-pub(super) async fn declare_pending(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+/// Declare the fence of a pending backfill: in the migration transaction
+/// that creates its cursor, and by every runner that resumes it, under the
+/// runners' lock. Idempotent, so a backfill an earlier build started, or
+/// whose declaration was deleted by hand, is fenced again before its next
+/// batch.
+pub(super) async fn declare_pending(connection: &mut PgConnection) -> Result<()> {
     sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES($1,1) ON CONFLICT (capability) DO NOTHING")
         .bind(PENDING_CAPABILITY)
-        .execute(&mut **tx)
+        .execute(&mut *connection)
         .await?;
     Ok(())
-}
-
-/// Whether the current schema's capability table declares the fence. A
-/// native database from before 006 has no capability table, and no fence.
-pub(super) async fn pending_declared(connection: &mut PgConnection) -> Result<bool> {
-    let table: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname='qbit_prism_schema_capabilities' AND relkind='r')")
-        .fetch_one(&mut *connection)
-        .await?;
-    if !table {
-        return Ok(false);
-    }
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM qbit_prism_schema_capabilities WHERE capability=$1)",
-    )
-    .bind(PENDING_CAPABILITY)
-    .fetch_one(&mut *connection)
-    .await?)
 }
 
 /// Why a database that declares the fence without its cursor is refused.
 pub(super) fn orphaned_fence_refusal() -> String {
     format!(
-        "database declares {PENDING_CAPABILITY} = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again"
+        "database declares {PENDING_CAPABILITY} = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again, or, once qbit_prism_share_hashes is verified to map every accepted share whose ID ends in 64 hex digits (docs/prism-rust-migration.md has the query), remove the declaration with DELETE FROM qbit_prism_schema_capabilities WHERE capability='{PENDING_CAPABILITY}' and migrate again"
     )
 }
 
@@ -247,6 +236,12 @@ pub(super) async fn apply(
         tracing::info!(version = VERSION, "share-hash backfill already complete");
         return Ok(());
     };
+    // Fence earlier builds for the rest of the backfill (#669), here under
+    // the runners' lock rather than in the migration transaction: a runner
+    // of an earlier build that was still mapping held this lock and has
+    // finished, so no fence is declared that an earlier build will not
+    // remove.
+    declare_pending(connection).await?;
     let started = Instant::now();
     let first_seq = progress.next_seq;
     tracing::info!(

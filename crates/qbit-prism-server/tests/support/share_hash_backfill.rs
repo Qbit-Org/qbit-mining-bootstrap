@@ -422,9 +422,10 @@ async fn pending_backfill(db: &Database, pool: &PgPool) -> Result<PgConnection> 
 
 /// The fence keeps every build before #669 off the database until 2 is
 /// recorded, whatever the record says: declared with the cursor, still
-/// declared when 2 is recorded by hand, declared again by a resume if it
-/// was deleted (as on a backfill an earlier build started), and removed
-/// only with the cursor. That an earlier build refuses the declaration is
+/// declared when 2 is recorded by hand, declared again by a resume's runner
+/// before its first batch if it was deleted (as on a backfill an earlier
+/// build started), and removed only with the cursor. That an earlier build
+/// refuses the declaration is
 /// `a_pending_share_hash_backfill_fences_every_earlier_build`.
 #[tokio::test]
 async fn migration_002_fences_earlier_builds_until_its_backfill_is_recorded() -> Result<()> {
@@ -450,28 +451,46 @@ async fn migration_002_fences_earlier_builds_until_its_backfill_is_recorded() ->
     sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=2")
         .execute(&pool)
         .await?;
-    // A backfill whose fence is missing is fenced again by the next run's
-    // transaction, before its batches start.
+    // A backfill whose fence is missing is fenced again by the next runner
+    // before its batches: seen while a batch waits on an open insert.
     sqlx::query(
         "DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'",
     )
     .execute(&pool)
     .await?;
-    let mut resume = Box::pin(Ledger::connect(&db.url, "resumed".into(), 8, true));
-    let fenced = timeout(Duration::from_secs(60), async {
-        while !fence_declared(&pool).await? {
-            sleep(Duration::from_millis(10)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    });
-    tokio::select! {
-        result = &mut resume => bail!("the resume ended while the runners' lock was held: {:?}", result.err()),
-        result = fenced => result.context("the resume did not declare the fence again")??,
-    }
+    let late = format!("{LATE:064x}");
+    let mut blocker = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,'blocker:'||$1)",
+    )
+    .bind(&late)
+    .execute(&mut *blocker)
+    .await?;
     sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
         .bind(RUNNER_LOCK_CLASS)
         .execute(&mut runners)
         .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "resumed".into(), 8, true));
+    let waiting = timeout(Duration::from_secs(60), async {
+        loop {
+            let waits: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND query LIKE 'INSERT INTO qbit_prism_share_hashes%' AND wait_event_type='Lock')")
+                .fetch_one(&pool)
+                .await?;
+            if waits {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+    tokio::select! {
+        result = &mut resume => bail!("the resume ended before its batch reached the late header: {:?}", result.err()),
+        result = waiting => result.context("no batch of the resume waited on the late header")??,
+    }
+    assert!(
+        fence_declared(&pool).await?,
+        "the resume batched without fencing earlier builds"
+    );
+    blocker.rollback().await?;
     let resumed = timeout(Duration::from_secs(120), resume).await??;
     // Recorded: the fence went with the cursor.
     assert!(
@@ -483,6 +502,82 @@ async fn migration_002_fences_earlier_builds_until_its_backfill_is_recorded() ->
     assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
     runners.close().await?;
     db.close(vec![resumed]).await
+}
+
+/// A runner of an earlier build that is still mapping when this release
+/// resumes the backfill holds the runners' lock, finishes, drops the cursor
+/// and records 2 without knowing the fence. This release must not have
+/// declared one meanwhile, which nothing would remove (#669): its resume
+/// declares the fence only from its runner, after that lock. The test plays
+/// the earlier runner, holding the lock while the resume's transaction
+/// commits, then finishing the backfill the way #663's runner does.
+#[tokio::test]
+async fn a_resume_leaves_no_fence_when_an_earlier_runner_finishes_the_backfill() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let expected = expected_mapping(&pool, i64::MAX).await?;
+    let mut runners = pending_backfill(&db, &pool).await?;
+    // A backfill an earlier build started declares no fence.
+    sqlx::query(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'",
+    )
+    .execute(&pool)
+    .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "this-build".into(), 8, true));
+    // The resume's transaction has committed once its runner polls for the
+    // lock the earlier runner holds.
+    let queued = timeout(Duration::from_secs(60), async {
+        loop {
+            let polling: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND query LIKE 'SELECT pg_try_advisory_lock%')")
+                .fetch_one(&pool)
+                .await?;
+            if polling {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+    tokio::select! {
+        result = &mut resume => bail!("the resume ended while the runners' lock was held: {:?}", result.err()),
+        result = queued => result.context("the resume's runner never queued for the runners' lock")??,
+    }
+    assert!(
+        !fence_declared(&pool).await?,
+        "the resume's transaction declared a fence an earlier runner would leave behind"
+    );
+    // The earlier runner finishes: maps the rest, drops the cursor and
+    // records 2, in its last transaction, knowing nothing of the fence.
+    let (next, end) = cursor(&pool).await?.context("the progress table is gone")?;
+    let mut tx = runners.begin().await?;
+    sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT DISTINCT ON (lower(right(share_id,64))) lower(right(share_id,64)),share_id FROM qbit_share_ledger WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$' AND share_seq>=$1 AND share_seq<$2 ORDER BY lower(right(share_id,64)),share_seq ON CONFLICT DO NOTHING")
+        .bind(next)
+        .bind(end)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill; INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    // This release's runner finds the backfill complete, and the database
+    // starts: no fence was left behind.
+    let resumed = timeout(Duration::from_secs(120), resume).await??;
+    assert!(
+        !fence_declared(&pool).await?,
+        "a fence outlived the backfill"
+    );
+    assert_eq!(mapping(&pool).await?, expected);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    let started = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+    runners.close().await?;
+    db.close(vec![resumed, started]).await
 }
 
 /// A fence whose cursor is gone, which only a hand-dropped cursor leaves,

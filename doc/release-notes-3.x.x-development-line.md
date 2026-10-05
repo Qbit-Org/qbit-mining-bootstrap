@@ -86,9 +86,10 @@ carries a banner with the same statement.
   `migrate` resumes at the cursor. 2 is recorded last, so every start, of
   any native build, refuses the database until the backfill has finished.
   While it is pending, the database also declares the capability
-  `share_hash_backfill_pending = 1`, which every build before #669 refuses
-  at connect and at migrate. So recording 2 by hand does not let an earlier
-  build serve, and a declaration left without its cursor is refused (#669).
+  `share_hash_backfill_pending = 1`. Every earlier build refuses it at
+  connect, so recording 2 by hand does not let one serve. The runner of a
+  resumed backfill declares it again under the runners' lock, and a
+  declaration left without its cursor is refused (#669).
   `migrate` needs no statement timeout above the default 15 s. See
   `docs/prism-rust-migration.md`.
 
