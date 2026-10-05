@@ -29,7 +29,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// completed. A populated 2.x.x source records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -2190,6 +2190,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         22,
         include_str!("../../migrations/022_fanout_claim_observed_lease.sql"),
     ),
+    (
+        23,
+        include_str!("../../migrations/023_fanout_lane_index.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3243,6 +3247,17 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(22)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&23) {
+        // #668: the CTV fanout claim lane's partial index. Additive only: no
+        // capability and no shutdown proof. A binary that does not know the
+        // index never reads it.
+        sqlx::raw_sql(native_migration(23))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(23)")
             .execute(&mut **tx)
             .await?;
     }

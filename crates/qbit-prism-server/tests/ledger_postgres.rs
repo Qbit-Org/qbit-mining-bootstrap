@@ -40,6 +40,8 @@ mod candidates_cli;
 mod candidates_recover;
 #[path = "support/clock_steps.rs"]
 mod clock_steps;
+#[path = "support/fanout_lane_plan.rs"]
+mod fanout_lane_plan;
 
 #[path = "support/index_trim.rs"]
 mod index_trim;

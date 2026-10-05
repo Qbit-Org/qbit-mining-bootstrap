@@ -336,6 +336,7 @@ qbit-prism-server::ledger_postgres::cpfp_retirement_requires_current_claim_and_p
 qbit-prism-server::ledger_postgres::ctv_artifacts_wait_for_maturity_and_claims_are_fenced
 qbit-prism-server::ledger_postgres::deferred_share_survives_confirmation_crash_and_is_credited_once
 qbit-prism-server::ledger_postgres::durable_sessions_upgrade_async_commit_and_keep_remote_apply
+qbit-prism-server::ledger_postgres::fanout_lane_plan::a_fanout_claim_poll_never_reads_the_settled_history
 qbit-prism-server::ledger_postgres::fatal_state::chain_change_rpc_timeout_and_cancellation_keep_the_halt
 qbit-prism-server::ledger_postgres::fatal_state::clear_preserves_halt_on_integrity_failure_and_audit_insert_failure
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_live_starting_stale_and_unknown_instances

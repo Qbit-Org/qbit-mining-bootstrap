@@ -643,7 +643,8 @@ impl Ledger {
     /// `claim_expires_at` decides nothing. Every poll first surveys the
     /// claims (and makes due every attempt a backward clock step stretched),
     /// then takes over such a claim before any new one. The lane itself takes
-    /// only an unclaimed, due fanout.
+    /// only an unclaimed, due fanout, reading only the fanouts it may claim
+    /// ([`Ledger::fanout_lane_sql`], #668).
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
         ensure!(
             (1..=600).contains(&lease_seconds),
@@ -657,8 +658,12 @@ impl Ledger {
             .take_over_fanout(&mut tx, &claims, &token, lease_seconds)
             .await?;
         if row.is_none() {
-            row = sqlx::query(&format!("WITH next AS (SELECT a.fanout_txid FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE {} AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<=clock_timestamp()) AND a.claim_token IS NULL ORDER BY (a.settlement_status='confirmed'),a.next_broadcast_attempt_at NULLS FIRST,b.block_height,a.chunk_index FOR UPDATE OF a SKIP LOCKED LIMIT 1) UPDATE qbit_ctv_fanout_artifacts a SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',claim_lease_seconds=$3::integer,claim_renewals=0 FROM next WHERE a.fanout_txid=next.fanout_txid RETURNING {}", super::fanout::FANOUT_CLAIMABLE_SQL, super::fanout::FANOUT_CLAIMED_COLUMNS))
-                .bind(&token).bind(&self.instance_id).bind(lease_seconds).fetch_optional(&mut *tx).await?;
+            row = sqlx::query(&Self::fanout_lane_sql())
+                .bind(&token)
+                .bind(&self.instance_id)
+                .bind(lease_seconds)
+                .fetch_optional(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         row.map(|row| {
