@@ -660,7 +660,8 @@ holds:
 
 | Column | Meaning |
 | --- | --- |
-| `next_seq` | every legacy share below it is mapped |
+| `start_seq` | the ledger's first `share_seq` when the transaction committed |
+| `next_seq` | the legacy shares from `start_seq` up to it are mapped |
 | `end_seq` | the ledger held no row at or above it when the transaction committed |
 | `started_at`, `updated_at` | when the cursor was created and last advanced |
 
@@ -668,11 +669,14 @@ After the commit, and before 013 and 017, `migrate` maps the legacy shares in
 batches of consecutive `share_seq`. Each batch is 002's statement restricted to
 its range: one statement, in a transaction that also advances the cursor. The
 first batch covers 10,000 `share_seq`; later ones double or halve toward half a
-second each, between 1,000 and 200,000. So every statement stays far inside the
+second each, between 1,000 and 50,000. So every statement stays far inside the
 server's statement timeout whatever the ledger's size, and no setting has to be
-raised for `migrate`. The last transaction takes the migration lock and checks
-that the cursor has passed every row the ledger holds. It then drops the cursor
-table and records 2.
+raised for `migrate`. The cap matters after a gap in `share_seq` or a run of
+rejected shares, where batches are cheap and grow. A batch that outlasts the
+timeout all the same, on a much slower disk, is rolled back and retried at
+half its size; only an operator's cancel stops the run. The last transaction
+waits for the migration lock and checks that the cursor has passed every row
+the ledger holds. It then drops the cursor table and records 2.
 
 The mapping is the single statement's, row for row. Batches run in ascending
 `share_seq`, so the earliest share of a repeated header is mapped by the batch
@@ -691,14 +695,22 @@ with:
 
 ```
 database is not ready: migration 2's share-hash backfill has not finished (#582).
-qbit_prism_share_hashes maps the legacy shares below share_seq 30001 of the 4129153
-the ledger held at migration, and until every one is mapped a share could be
-credited twice. Run `qbit-prism-server migrate` to resume it from there; every
-start refuses the database until it has finished and recorded migration 2
+The legacy shares from share_seq 1 up to 30001 are mapped in
+qbit_prism_share_hashes and those from 30001 up to 4129153 are not, and until
+every one is mapped a share could be credited twice. Run `qbit-prism-server
+migrate` to resume it from there; every start refuses the database until it has
+finished and recorded migration 2
 ```
 
 They refuse the same way while the cursor table exists, even if 2 has been
-recorded by hand.
+recorded by hand, and so does the recovery evidence export
+(`scripts/prism-recovery-evidence.sql`).
+
+**Never run an earlier 3.x.x build against the database while the backfill is
+pending, and never record 2 by hand.** An earlier build knows nothing of the
+cursor. Its `migrate` refuses 3 without 2 as an edited record, and its remedy,
+recording 2 once 002's objects are present, would let it serve with legacy
+headers unmapped. Resume with this release's `migrate` instead.
 
 **Progress.** No frontend runs while the backfill does, so there is no
 Prometheus series for it. `migrate` logs the backfill's start, a progress line
@@ -707,8 +719,8 @@ and the estimated seconds left) and its completion. Any session can read the
 cursor:
 
 ```sql
-SELECT next_seq, end_seq,
-       round(100.0 * next_seq / greatest(end_seq, 1), 1) AS percent,
+SELECT start_seq, next_seq, end_seq,
+       round(100.0 * (next_seq - start_seq) / greatest(end_seq - start_seq, 1), 1) AS percent,
        started_at, updated_at
 FROM qbit_prism_share_hash_backfill;
 ```
@@ -734,7 +746,8 @@ boundary.
 | --- | --- |
 | `refusing to migrate before any DDL: a table named qbit_prism_share_hash_backfill already exists, and migration 2 creates its share-hash backfill's progress table under that name. Nothing was changed. Check what it holds, then rename or move it aside and migrate again` | a `2.x.x` source holds a relation under the cursor's name; check what it holds, rename or move it aside, and migrate again |
 | `migration 2: backfilling qbit_prism_share_hashes for share_seq <a> to <b>; every earlier batch committed, so migrate again to resume from share_seq <a>` | the context on a failed batch statement: cancelled, timed out, or a lost connection. Migrate again |
-| `refusing to continue migration 2: its share-hash backfill's cursor moved from <a> to <b> under this run, which holds the runner lock; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
+| `refusing to continue migration 2: its share-hash backfill's cursor is no longer at share_seq <a>, where this run, which holds the runner lock, left it; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
+| `a <kind> named qbit_prism_share_hash_backfill holds the name of migration 2's share-hash backfill progress table; check what it holds, then rename or move it aside` | on a native database, a relation that is not the cursor table holds its name; move it aside, then start or migrate again |
 | `qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup` | the cursor table was edited; restore the full backup |
 | `refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup` | the cursor table was dropped by hand during a run; restore the full backup |
 

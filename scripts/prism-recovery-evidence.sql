@@ -130,6 +130,17 @@ BEGIN
     IF missing IS NOT NULL THEN
         RAISE EXCEPTION 'missing required native migrations % (found %)', missing, applied USING HINT = hint;
     END IF;
+    -- Migration 2's share-hash backfill (#582) has not finished while its
+    -- cursor table exists, even with 2 recorded by hand, and startup refuses
+    -- the database: qbit_prism_share_hashes would be exported partial.
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c
+        WHERE c.relnamespace = current_schema()::regnamespace
+          AND c.relname = 'qbit_prism_share_hash_backfill'
+    ) THEN
+        RAISE EXCEPTION 'migration 2''s share-hash backfill has not finished: qbit_prism_share_hash_backfill exists in the current schema %', current_schema()
+            USING HINT = 'Startup refuses this database. Run qbit-prism-server migrate to finish the backfill, then export again.';
+    END IF;
     FOREACH metadata IN ARRAY ARRAY['qbit_prism_schema_capabilities', 'qbit_prism_migration_source'] LOOP
         SELECT n.nspname IS NOT DISTINCT FROM current_schema() AS in_current_schema,
                format('%I.%I', n.nspname, c.relname) AS qualified, c.relkind::text AS kind,

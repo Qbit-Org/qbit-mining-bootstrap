@@ -48,9 +48,17 @@ const BATCH: &str = "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) S
 
 /// The `share_seq` values the first batch of a run covers. Later batches
 /// double or halve toward `BATCH_TARGET`, within `BATCH_MIN..=BATCH_MAX`.
+/// A batch's cost follows the rows it holds, not the values it covers: a
+/// gap or a run of rejected shares makes batches cheap, and the next dense
+/// range starts at whatever size they grew to. `BATCH_MAX` keeps that
+/// first dense batch inside the statement timeout: 50,000 `share_seq` took
+/// under 4 s at the slowest rate measured on a mainnet-shaped ledger (about
+/// 13,000 a second, PostgreSQL's default memory settings, the mapping's
+/// indexes past the cache). A batch that outlasts the timeout all the same
+/// is retried at half its size.
 const BATCH_START: i64 = 10_000;
 const BATCH_MIN: i64 = 1_000;
-const BATCH_MAX: i64 = 200_000;
+const BATCH_MAX: i64 = 50_000;
 /// What one batch statement should take: far inside the statement timeout
 /// (15 s by default), and long enough that each transaction's commit is a
 /// small part of it.
@@ -58,11 +66,13 @@ const BATCH_TARGET: Duration = Duration::from_millis(500);
 /// How often a run logs its progress.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 
-/// Where a pending backfill stands: every legacy share below `next_seq` is
-/// mapped, and the ledger held no row at or above `end_seq` when the
-/// migration transaction committed.
+/// Where a pending backfill stands. The legacy shares from `start_seq` up
+/// to `next_seq` are mapped and those from `next_seq` up to `end_seq` are
+/// not; the ledger held no row at or above `end_seq` when the migration
+/// transaction committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Progress {
+    pub(super) start_seq: i64,
     pub(super) next_seq: i64,
     pub(super) end_seq: i64,
 }
@@ -71,10 +81,18 @@ impl Progress {
     /// Why a start refuses the database while the backfill is pending.
     pub(super) fn refusal(&self) -> String {
         format!(
-            "database is not ready: migration 2's share-hash backfill has not finished (#582). qbit_prism_share_hashes maps the legacy shares below share_seq {} of the {} the ledger held at migration, and until every one is mapped a share could be credited twice. Run `qbit-prism-server migrate` to resume it from there; every start refuses the database until it has finished and recorded migration 2",
-            self.next_seq, self.end_seq
+            "database is not ready: migration 2's share-hash backfill has not finished (#582). The legacy shares from share_seq {} up to {} are mapped in qbit_prism_share_hashes and those from {} up to {} are not, and until every one is mapped a share could be credited twice. Run `qbit-prism-server migrate` to resume it from there; every start refuses the database until it has finished and recorded migration 2",
+            self.start_seq, self.next_seq, self.next_seq, self.end_seq
         )
     }
+}
+
+/// The kind of the relation under the progress table's name in the
+/// current schema, if any.
+async fn cursor_relation(connection: &mut PgConnection) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar("SELECT relkind::text FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname='qbit_prism_share_hash_backfill'")
+        .fetch_optional(&mut *connection)
+        .await?)
 }
 
 /// Refuse, before any DDL, a source that already has a relation under the
@@ -82,10 +100,7 @@ impl Progress {
 /// creates it, and only with 002 and 003, so on a source without 3 it is
 /// someone else's.
 pub(super) async fn refuse_held_name(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    let held: Option<String> = sqlx::query_scalar("SELECT relkind::text FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname='qbit_prism_share_hash_backfill'")
-        .fetch_optional(&mut **tx)
-        .await?;
-    if let Some(kind) = held {
+    if let Some(kind) = cursor_relation(tx).await? {
         bail!(
             "refusing to migrate before any DDL: a {} named qbit_prism_share_hash_backfill already exists, and migration 2 creates its share-hash backfill's progress table under that name. Nothing was changed. Check what it holds, then rename or move it aside and migrate again",
             super::online::relation_kind(&kind)
@@ -99,10 +114,10 @@ pub(super) async fn refuse_held_name(tx: &mut Transaction<'_, Postgres>) -> Resu
 /// exclude writers here, and after the commit nothing appends until 2 is
 /// recorded.
 pub(super) async fn create_cursor(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    sqlx::raw_sql("CREATE TABLE qbit_prism_share_hash_backfill (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), next_seq bigint NOT NULL, end_seq bigint NOT NULL, started_at timestamptz NOT NULL DEFAULT clock_timestamp(), updated_at timestamptz NOT NULL DEFAULT clock_timestamp())")
+    sqlx::raw_sql("CREATE TABLE qbit_prism_share_hash_backfill (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), start_seq bigint NOT NULL, next_seq bigint NOT NULL, end_seq bigint NOT NULL, started_at timestamptz NOT NULL DEFAULT clock_timestamp(), updated_at timestamptz NOT NULL DEFAULT clock_timestamp())")
         .execute(&mut **tx)
         .await?;
-    sqlx::query("INSERT INTO qbit_prism_share_hash_backfill(next_seq,end_seq) SELECT COALESCE(min(share_seq),0),COALESCE(max(share_seq),-1)+1 FROM qbit_share_ledger")
+    sqlx::query("INSERT INTO qbit_prism_share_hash_backfill(start_seq,next_seq,end_seq) SELECT first_seq,first_seq,end_seq FROM (SELECT COALESCE(min(share_seq),0) AS first_seq,COALESCE(max(share_seq),-1)+1 AS end_seq FROM qbit_share_ledger) bounds")
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -112,19 +127,36 @@ pub(super) async fn create_cursor(tx: &mut Transaction<'_, Postgres>) -> Result<
 /// progress table exists only from the transaction that applied 002 to a
 /// populated ledger to the one that records 2.
 pub(super) async fn progress(connection: &mut PgConnection) -> Result<Option<Progress>> {
-    let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname='qbit_prism_share_hash_backfill')")
-        .fetch_one(&mut *connection)
-        .await?;
-    if !pending {
-        return Ok(None);
+    match cursor_relation(connection).await?.as_deref() {
+        None => return Ok(None),
+        Some("r") => {}
+        Some(kind) => bail!(
+            "a {} named qbit_prism_share_hash_backfill holds the name of migration 2's share-hash backfill progress table; check what it holds, then rename or move it aside",
+            super::online::relation_kind(kind)
+        ),
     }
-    let (next_seq, end_seq): (i64, i64) = sqlx::query_as(
-        "SELECT next_seq,end_seq FROM qbit_prism_share_hash_backfill WHERE singleton",
+    let row = match sqlx::query_as(
+        "SELECT start_seq,next_seq,end_seq FROM qbit_prism_share_hash_backfill WHERE singleton",
     )
     .fetch_optional(&mut *connection)
-    .await?
-    .context("qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup")?;
-    Ok(Some(Progress { next_seq, end_seq }))
+    .await
+    {
+        Ok(row) => row,
+        // Dropped since the look-up by the transaction that records 2, as a
+        // start that takes no migration lock can see. Every other caller
+        // holds a lock that transaction needs, so this is outside any
+        // transaction it could leave aborted.
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (start_seq, next_seq, end_seq): (i64, i64, i64) = row.context("qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup")?;
+    Ok(Some(Progress {
+        start_seq,
+        next_seq,
+        end_seq,
+    }))
 }
 
 /// The size of the next batch, from how long the last one took.
@@ -138,6 +170,13 @@ fn next_batch(rows: i64, took: Duration) -> i64 {
     }
 }
 
+/// Whether a statement was cancelled by the statement timeout. An
+/// operator's cancel request carries the same SQLSTATE and another message,
+/// and still stops the run.
+fn statement_timed_out(error: &dyn sqlx::error::DatabaseError) -> bool {
+    error.code().as_deref() == Some("57014") && error.message().contains("statement timeout")
+}
+
 /// Map the legacy shares the cursor has not passed, then drop the cursor
 /// and record 2. Idempotent: a run finding no progress table finds 2
 /// recorded by the run that dropped it.
@@ -145,8 +184,8 @@ pub(super) async fn apply(
     connection: &mut PgConnection,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
-    // The pool's statement and lock timeouts stay in force: every statement
-    // here is one bounded batch or a catalog step.
+    // The pool's statement and lock timeouts stay in force for the batches:
+    // each is one bounded statement.
     acquire_runner_lock(connection).await?;
     let Some(mut progress) = progress(connection).await? else {
         ensure!(
@@ -160,6 +199,7 @@ pub(super) async fn apply(
     let first_seq = progress.next_seq;
     tracing::info!(
         version = VERSION,
+        start_seq = progress.start_seq,
         next_seq = progress.next_seq,
         end_seq = progress.end_seq,
         "backfilling qbit_prism_share_hashes for the legacy shares in batches; every start refuses the database until migration 2 is recorded"
@@ -169,34 +209,51 @@ pub(super) async fn apply(
     let mut reported = Instant::now();
     loop {
         while progress.next_seq < progress.end_seq {
-            let upper = progress.next_seq.saturating_add(rows).min(progress.end_seq);
+            let next = progress.next_seq;
+            let upper = next.saturating_add(rows).min(progress.end_seq);
             let batch = Instant::now();
             let mut tx = connection.begin().await?;
-            // The range starts where the last committed batch ended. Only
-            // the runner lock's holder moves the cursor, so it is where
-            // this run left it.
-            let next: i64 = sqlx::query_scalar(
-                "SELECT next_seq FROM qbit_prism_share_hash_backfill WHERE singleton FOR UPDATE",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            ensure!(
-                next == progress.next_seq,
-                "refusing to continue migration 2: its share-hash backfill's cursor moved from {} to {next} under this run, which holds the runner lock; migrate again",
-                progress.next_seq
-            );
-            mapped += sqlx::query(BATCH)
+            let inserted = match sqlx::query(BATCH)
                 .bind(next)
                 .bind(upper)
                 .execute(&mut *tx)
                 .await
-                .with_context(|| format!("migration 2: backfilling qbit_prism_share_hashes for share_seq {next} to {upper}; every earlier batch committed, so migrate again to resume from share_seq {next}"))?
-                .rows_affected();
-            sqlx::query("UPDATE qbit_prism_share_hash_backfill SET next_seq=$1,updated_at=clock_timestamp() WHERE singleton")
+            {
+                Ok(done) => done.rows_affected(),
+                // Only this batch is lost; the same range is tried again at
+                // half the size.
+                Err(sqlx::Error::Database(error))
+                    if rows > BATCH_MIN && statement_timed_out(&*error) =>
+                {
+                    tx.rollback().await?;
+                    rows = (rows / 2).max(BATCH_MIN);
+                    tracing::warn!(
+                        version = VERSION,
+                        next_seq = next,
+                        upper,
+                        retry_seqs = rows,
+                        "a share-hash backfill batch outlasted the statement timeout; retrying it at half the size"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::from(error).context(format!("migration 2: backfilling qbit_prism_share_hashes for share_seq {next} to {upper}; every earlier batch committed, so migrate again to resume from share_seq {next}")));
+                }
+            };
+            // Only the runner lock's holder moves the cursor, so it is where
+            // this run left it; the condition checks that it still is.
+            let advanced = sqlx::query("UPDATE qbit_prism_share_hash_backfill SET next_seq=$2,updated_at=clock_timestamp() WHERE singleton AND next_seq=$1")
+                .bind(next)
                 .bind(upper)
                 .execute(&mut *tx)
-                .await?;
+                .await?
+                .rows_affected();
+            ensure!(
+                advanced == 1,
+                "refusing to continue migration 2: its share-hash backfill's cursor is no longer at share_seq {next}, where this run, which holds the runner lock, left it; migrate again"
+            );
             tx.commit().await?;
+            mapped += inserted;
             progress.next_seq = upper;
             rows = next_batch(rows, batch.elapsed());
             if reported.elapsed() >= REPORT_EVERY {
@@ -219,7 +276,15 @@ pub(super) async fn apply(
         // read again under the migration lock. Nothing can append before 2
         // is recorded, so the end found at migration is still the end; a
         // row past it would be mapped by another pass, not left unmapped.
+        // Like 013's and 017's records, this waits for the migration lock
+        // and for any reader of the cursor table rather than failing on the
+        // pool's timeouts once all the mapping is done.
         let mut tx = connection.begin().await?;
+        sqlx::query(
+            "SELECT set_config('statement_timeout','0',true),set_config('lock_timeout','0',true)",
+        )
+        .execute(&mut *tx)
+        .await?;
         lock(&mut tx, MIGRATION_LOCK, metrics).await?;
         let (next_seq, end_seq): (i64, i64) = sqlx::query_as("SELECT next_seq,(SELECT COALESCE(max(share_seq),-1)+1 FROM qbit_share_ledger) FROM qbit_prism_share_hash_backfill WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
@@ -236,7 +301,8 @@ pub(super) async fn apply(
                 end_seq,
                 "the share ledger holds rows past the end the backfill was planned to; mapping them too"
             );
-            progress = Progress { next_seq, end_seq };
+            progress.next_seq = next_seq;
+            progress.end_seq = end_seq;
             continue;
         }
         sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
@@ -288,12 +354,15 @@ mod tests {
     #[test]
     fn the_refusal_names_the_cursor_and_the_remedy() {
         let refusal = Progress {
+            start_seq: 1,
             next_seq: 40,
             end_seq: 100,
         }
         .refusal();
         assert!(
-            refusal.contains("below share_seq 40 of the 100"),
+            refusal.contains(
+                "from share_seq 1 up to 40 are mapped in qbit_prism_share_hashes and those from 40 up to 100 are not"
+            ),
             "{refusal}"
         );
         assert!(refusal.contains("`qbit-prism-server migrate`"), "{refusal}");

@@ -121,9 +121,7 @@ async fn assert_refused_at(url: &str, next_seq: i64, end_seq: i64) -> Result<()>
         .to_string();
     ensure!(
         error.contains("migration 2's share-hash backfill has not finished")
-            && error.contains(&format!(
-                "below share_seq {next_seq} of the {end_seq} the ledger held"
-            )),
+            && error.contains(&format!("those from {next_seq} up to {end_seq} are not")),
         "{error}"
     );
     Ok(())
@@ -244,31 +242,27 @@ async fn migration_002_backfill_resumes_from_its_last_committed_batch_after_an_i
         result = &mut migrate => bail!("migrate ended before its batch reached the late header: {:?}", result.err()),
         result = waiting => result.context("no batch waited on the late header")??,
     };
-    // Earlier batches committed and the cursor says where they ended: the
-    // mapping is the single statement's over exactly that prefix.
-    let (next, planned_end) = cursor(&pool).await?.context("the progress table is gone")?;
-    assert_eq!(planned_end, end);
-    assert!(
-        next > first && next <= late_seq,
-        "cursor {next} is not past the first batch and before {late_seq}"
-    );
-    assert_eq!(mapping(&pool).await?, expected_mapping(&pool, next).await?);
-
-    // Interrupt the run mid-batch, as a crash or a killed migrate would.
-    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+    // Interrupt the run mid-batch, as a crash or a killed migrate would, at
+    // once: the waiting batch also runs under the pool's lock timeout.
+    sqlx::query("SELECT pg_terminate_backend($1)")
         .bind(pid)
-        .fetch_one(&pool)
+        .execute(&pool)
         .await?;
-    assert!(terminated);
     let failed = timeout(Duration::from_secs(30), migrate).await?;
     ensure!(
         failed.is_err(),
         "migrate succeeded although its batch was killed"
     );
     blocker.rollback().await?;
-    // The killed batch left nothing: the cursor, the mapping and the record
-    // are those of the last committed batch, and starts still refuse.
-    assert_eq!(cursor(&pool).await?, Some((next, end)));
+    // Earlier batches committed and the cursor says where they ended. The
+    // killed batch left nothing: the mapping is the single statement's over
+    // exactly that prefix, 2 is not recorded, and starts still refuse.
+    let (next, planned_end) = cursor(&pool).await?.context("the progress table is gone")?;
+    assert_eq!(planned_end, end);
+    assert!(
+        next > first && next <= late_seq,
+        "cursor {next} is not past the first batch and before {late_seq}"
+    );
     assert_eq!(mapping(&pool).await?, expected_mapping(&pool, next).await?);
     assert_eq!(schema_versions(&pool).await?, pending);
     assert_refused_at(&db.url, next, end).await?;
