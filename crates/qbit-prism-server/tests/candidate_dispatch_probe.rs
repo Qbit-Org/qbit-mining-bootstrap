@@ -461,11 +461,13 @@ async fn canonical_probe_errors_remain_failures_and_pool_recovers() -> Result<()
         let _spare = db.ledger.pool.acquire().await?;
         let mut blocker = PgConnection::connect(&db.fixture.url).await?;
         sqlx::raw_sql("BEGIN; LOCK qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE").execute(&mut blocker).await?;
+        // Restored below to whatever the ledger configured, which CI raises.
+        let configured: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&db.ledger.pool).await?;
         sqlx::raw_sql("SET statement_timeout='100ms'").execute(&db.ledger.pool).await?;
         let error = db.ledger.claim_candidate(60).await.err().context("timeout became idle")?;
         let code = error.downcast_ref::<sqlx::Error>().and_then(|e| e.as_database_error()).and_then(|e| e.code());
         ensure!(code.as_deref() == Some("57014"), "expected query cancellation: {error:#}");
-        sqlx::raw_sql("SET statement_timeout='15s'").execute(&db.ledger.pool).await?;
+        sqlx::query("SELECT set_config('statement_timeout',$1,false)").bind(&configured).execute(&db.ledger.pool).await?;
         let ledger = db.ledger.clone();
         let cancelled = tokio::spawn(async move { ledger.claim_candidate(60).await });
         wait_for_probe_lock(&mut control).await?;
