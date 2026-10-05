@@ -21,6 +21,7 @@ pub mod cli;
 pub mod client;
 pub mod cluster;
 pub mod digest;
+pub mod external;
 pub mod fault;
 pub mod frontend;
 pub mod gate;

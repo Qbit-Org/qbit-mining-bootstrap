@@ -1197,6 +1197,7 @@ fn session_config(index: usize) -> client::SessionConfig {
         // Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share
         // search costs microseconds even in a debug build.
         share_difficulty: 1.0 / 67_108_864.0,
+        difficulty: client::DifficultySource::Configured,
         version_rolling_mask: codec::VERSION_ROLLING_MASK,
         connect_timeout: std::time::Duration::from_secs(5),
         handshake_timeout: std::time::Duration::from_secs(20),

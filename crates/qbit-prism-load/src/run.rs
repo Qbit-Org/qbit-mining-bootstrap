@@ -560,6 +560,9 @@ impl Collected {
             } => self
                 .difficulty_mismatches
                 .push((session, advertised, configured)),
+            // Only an external-target session mines what it is advertised;
+            // the harness's sessions report a disagreement above instead.
+            Event::DifficultyAdvertised { .. } => {}
             Event::Connected { session, .. } => {
                 self.connects += 1;
                 self.holding_work.insert(session);
@@ -670,6 +673,7 @@ fn churn_driver(
             username: String::new(),
             password: String::new(),
             share_difficulty,
+            difficulty: client::DifficultySource::Configured,
             version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
@@ -1555,6 +1559,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             username: profile.username.clone(),
             password,
             share_difficulty,
+            difficulty: client::DifficultySource::Configured,
             version_rolling_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),

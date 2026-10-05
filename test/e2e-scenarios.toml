@@ -869,6 +869,21 @@ tests = [
 notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/32 of the rows (1/16 once #582 is fixed) on a real regtest chain, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
 
 [[scenario]]
+id = "external-target-load-through-a-balancer"
+title = "#291: the load harness's client driving frontends it did not launch, through a TCP balancer"
+owner = "#291"
+lanes = ["pr"]
+criteria = "Two external-target client processes drive two in-repo frontends through a round-robin TCP balancer, one asking for its own share difficulty with d=, and each mines at the difficulty the frontend advertised. A frontend SIGKILLed and relaunched mid-run costs reconnects, not acknowledgements: every disconnected session reconnects, no share is refused as mined wrong, every acknowledged share id is committed, every committed id was acknowledged or went unanswered, and the two processes' stats merge into their sums."
+runs = true
+tests = ["qbit-prism-load::external_frontend::external_load_through_a_balancer_reaches_the_in_repo_frontends_and_reconciles"]
+unit_tests = [
+  "crates/qbit-prism-load/tests/external_target.rs::a_run_mines_the_advertised_difficulty_and_counts_what_the_target_did",
+  "crates/qbit-prism-load/tests/external_target.rs::documents_from_two_processes_merge_into_their_sum",
+  "crates/qbit-prism-load/tests/external_target.rs::without_the_guard_flag_nothing_is_sent",
+]
+notes = "The fixture for #291's failover drill, load-balancer exercise and soak, which run `qbit-prism-load external` against the deployed pair behind the operator's balancer; those runs, and their reconciliation against the promoted primary, stay #291's."
+
+[[scenario]]
 id = "shipped-image-lane"
 title = "The Compose prism profile with the HA overlay under modest real-miner load"
 owner = "#544"

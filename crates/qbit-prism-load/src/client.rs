@@ -124,6 +124,30 @@ pub fn le_at_most(a: &[u8; 32], b: &[u8; 32]) -> bool {
     true
 }
 
+/// The difficulty Stratum assigns a job when the server advertised none.
+pub const STRATUM_DEFAULT_DIFFICULTY: f64 = 1.0;
+
+/// Where a session takes the difficulty it mines each job at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DifficultySource {
+    /// [`SessionConfig::share_difficulty`], the difficulty the harness
+    /// launched its own frontends with. A `mining.set_difficulty` that
+    /// disagrees is a contradicted premise, reported as
+    /// [`Event::DifficultyMismatch`].
+    Configured,
+    /// The target's (external-target mode, [`crate::external`]): each job is
+    /// mined at the difficulty the last `mining.set_difficulty` before its
+    /// `mining.notify` advertised, which is how Stratum binds the two and how
+    /// the server sends them (`stratum.rs`: difficulty precedes the work it
+    /// applies to, and older jobs keep their own target), or at
+    /// [`STRATUM_DEFAULT_DIFFICULTY`] before any. A job advertised above
+    /// `ceiling` is not mined: each offer on it fails, so a target whose
+    /// difficulty a CPU cannot meet costs the client nothing and shows in its
+    /// stats. The search runs off the async runtime, so a slow search cannot
+    /// delay another session's reads.
+    Advertised { ceiling: f64 },
+}
+
 /// One job as the client holds it.
 #[derive(Clone, Debug)]
 pub struct JobState {
@@ -138,6 +162,8 @@ pub struct JobState {
     pub ntime: u32,
     pub clean_jobs: bool,
     pub received: Instant,
+    /// The difficulty [`Self::share_target`] was derived from.
+    pub share_difficulty: f64,
     pub share_target: [u8; 32],
     pub network_target: [u8; 32],
 }
@@ -160,6 +186,12 @@ pub const RUN_ENDED: &str = "run ended";
 /// server committed anyway is reported as such, never as an ACK/commit
 /// divergence.
 pub const CHURN_CLOSED: &str = "churn close";
+
+/// How the failure of an offer on a job above the
+/// [`DifficultySource::Advertised`] ceiling begins, so external-target stats
+/// can count those offers apart from the session failures that are faults.
+pub const DIFFICULTY_ABOVE_CEILING: &str =
+    "not mined: the target's share difficulty is above the client's ceiling";
 
 #[derive(Clone, Debug)]
 pub enum Outcome {
@@ -309,6 +341,13 @@ pub enum Event {
         session: usize,
         phase: String,
     },
+    /// A usable `set_difficulty` a [`DifficultySource::Advertised`] session
+    /// will mine its next job at. Never sent under
+    /// [`DifficultySource::Configured`].
+    DifficultyAdvertised {
+        session: usize,
+        difficulty: f64,
+    },
     /// A `set_difficulty` whose value disagrees with the difficulty the
     /// harness configured.
     DifficultyMismatch {
@@ -444,7 +483,10 @@ pub struct SessionConfig {
     pub index: usize,
     pub username: String,
     pub password: String,
+    /// The difficulty a [`DifficultySource::Configured`] session mines at;
+    /// unread under [`DifficultySource::Advertised`].
     pub share_difficulty: f64,
+    pub difficulty: DifficultySource,
     pub version_rolling_mask: u32,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
@@ -607,6 +649,10 @@ struct Connection {
     pending: HashMap<u64, Pending>,
     last_tip: Option<String>,
     extranonce2_counter: u64,
+    /// The last usable `mining.set_difficulty` on this connection, which the
+    /// next `mining.notify` is mined at under
+    /// [`DifficultySource::Advertised`].
+    advertised_difficulty: Option<f64>,
 }
 
 impl Connection {
@@ -1215,6 +1261,7 @@ async fn connect(
         pending: HashMap::new(),
         last_tip: None,
         extranonce2_counter: u64::from(config.index as u32) << 32,
+        advertised_difficulty: None,
     };
     let subscribe = connection.next_id;
     connection.next_id += 1;
@@ -1395,21 +1442,60 @@ fn consume(
     }
     match value.get("method").and_then(Value::as_str) {
         Some("mining.notify") => note_job(connection, &value, config, shared, frontend)?,
-        Some("mining.set_difficulty") => {
-            if let Some(advertised) = value["params"][0].as_f64() {
-                // The harness pins the difficulty, so a disagreement here means
-                // the frontend is not running the configuration the artifact
-                // will claim (EP-CONFIG).
-                let configured = config.share_difficulty;
-                if (advertised - configured).abs() > configured.abs() * 1e-9 {
-                    let _ = shared.events.send(Event::DifficultyMismatch {
-                        session: config.index,
-                        advertised,
-                        configured,
-                    });
+        Some("mining.set_difficulty") => match config.difficulty {
+            DifficultySource::Configured => {
+                if let Some(advertised) = value["params"][0].as_f64() {
+                    // The harness pins the difficulty, so a disagreement here means
+                    // the frontend is not running the configuration the artifact
+                    // will claim (EP-CONFIG).
+                    let configured = config.share_difficulty;
+                    if (advertised - configured).abs() > configured.abs() * 1e-9 {
+                        let _ = shared.events.send(Event::DifficultyMismatch {
+                            session: config.index,
+                            advertised,
+                            configured,
+                        });
+                    }
                 }
             }
-        }
+            DifficultySource::Advertised { .. } => {
+                match value["params"][0]
+                    .as_f64()
+                    .filter(|difficulty| difficulty.is_finite() && *difficulty > 0.0)
+                {
+                    // It applies to the next job; the jobs already held keep
+                    // the target they were issued at.
+                    Some(advertised) => {
+                        connection.advertised_difficulty = Some(advertised);
+                        let _ = shared.events.send(Event::DifficultyAdvertised {
+                            session: config.index,
+                            difficulty: advertised,
+                        });
+                    }
+                    // Reported rather than returned: an error here would end a
+                    // handshake the target may yet complete, and the jobs that
+                    // follow are mined at the last usable value, which their
+                    // own records show (EP-OBSERVABILITY).
+                    None => {
+                        let _ = shared.events.send(Event::Failure(ClientFailure {
+                            session: config.index,
+                            phase: shared.phase(),
+                            kind: FailureKind::Line,
+                            recorded: false,
+                            error: format!(
+                                "mining.set_difficulty advertised {}, which is not a positive \
+                                 finite difficulty; the next job is mined at {}",
+                                value["params"][0],
+                                connection
+                                    .advertised_difficulty
+                                    .unwrap_or(STRATUM_DEFAULT_DIFFICULTY)
+                            ),
+                            at: Instant::now(),
+                        }));
+                    }
+                }
+            }
+        },
         _ => {}
     }
     Ok(())
@@ -1462,10 +1548,16 @@ fn note_job(
     let clean_jobs = params[8].as_bool().unwrap_or(false);
     let network_target = codec::target_from_compact(nbits)?;
     // The share target is derived from the difficulty the harness configured,
-    // through the server's own `difficulty_target`, so the client's acceptance
-    // test is bit-for-bit the server's.
-    let share_target =
-        codec::difficulty_target(config.share_difficulty)?.max(network_target.clone());
+    // or the one the target advertised for this job, through the server's own
+    // `difficulty_target`, so the client's acceptance test is bit-for-bit the
+    // server's.
+    let share_difficulty = match config.difficulty {
+        DifficultySource::Configured => config.share_difficulty,
+        DifficultySource::Advertised { .. } => connection
+            .advertised_difficulty
+            .unwrap_or(STRATUM_DEFAULT_DIFFICULTY),
+    };
+    let share_target = codec::difficulty_target(share_difficulty)?.max(network_target.clone());
     let job = JobState {
         job_id,
         tip: tip.clone(),
@@ -1478,6 +1570,7 @@ fn note_job(
         ntime,
         clean_jobs,
         received: Instant::now(),
+        share_difficulty,
         share_target: target_bytes_le(&share_target),
         network_target: target_bytes_le(&network_target),
     };
@@ -1529,6 +1622,20 @@ async fn offer(
         .cloned()
         .context("no current job to mine")
         .map_err(OfferFailure::unrecorded)?;
+    let off_runtime = match config.difficulty {
+        DifficultySource::Configured => false,
+        DifficultySource::Advertised { ceiling } => {
+            if job.share_difficulty > ceiling {
+                return Err(OfferFailure::unrecorded(anyhow::anyhow!(
+                    "{DIFFICULTY_ABOVE_CEILING}: job {} is at share difficulty {}, above the \
+                     ceiling {ceiling}",
+                    job.job_id,
+                    job.share_difficulty
+                )));
+            }
+            true
+        }
+    };
     connection.extranonce2_counter = connection.extranonce2_counter.wrapping_add(1);
     let mut extranonce2 = vec![0u8; connection.extranonce2_size];
     let counter = connection.extranonce2_counter.to_be_bytes();
@@ -1544,6 +1651,24 @@ async fn offer(
         tokio::task::spawn_blocking(move || search(&job, &extranonce1, &extranonce2, true, None))
             .await
             .map_err(|error| OfferFailure::unrecorded(error.into()))?
+    } else if off_runtime {
+        // A share at the target's difficulty can take thousands of hashes,
+        // where the harness's own take dozens: searched inline it would hold
+        // a runtime worker, and every session on that worker would read its
+        // answers late and report the delay as acknowledgement latency.
+        let job = job.clone();
+        let extranonce2 = extranonce2.clone();
+        tokio::task::spawn_blocking(move || {
+            search(
+                &job,
+                &extranonce1,
+                &extranonce2,
+                false,
+                Some((session, events)),
+            )
+        })
+        .await
+        .map_err(|error| OfferFailure::unrecorded(error.into()))?
     } else {
         search(
             &job,
