@@ -586,10 +586,10 @@ by the database clock, so 022 is applied offline as 021 is. See
 [CTV fanout claim leases and database clock steps](prism-ledger-ops.md#ctv-fanout-claim-leases-and-database-clock-steps-022-654).
 While migration 2's share-hash backfill is pending on a populated `2.x.x`
 source, the database declares `share_hash_backfill_pending = 1` (#669). It is
-declared with the backfill's cursor, declared again by each runner that
-resumes it, and removed with the cursor when 2 is recorded. So every earlier
-build that checks capabilities is refused for as long as legacy headers are
-unmapped (see [the backfill](#migration-002s-share-hash-backfill-applied-online)).
+declared with the backfill's cursor and removed with it when 2 is recorded.
+So every earlier build that checks capabilities is refused for as long as
+legacy headers are unmapped (see
+[the backfill](#migration-002s-share-hash-backfill-applied-online)).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
@@ -725,15 +725,21 @@ objects are present. On its own, that would let it serve with legacy headers
 unmapped. So the database also declares the capability
 `share_hash_backfill_pending = 1` while the backfill is pending:
 
-- the migration transaction that creates the cursor declares it;
-- every runner that resumes the backfill declares it again before its first
-  batch. That fences a backfill an earlier 3.x.x build started, or one whose
-  declaration was deleted. The runner does this under the runners' lock, not
-  in the migration transaction: a runner of an earlier build that is still
-  mapping holds that lock and records 2 without knowing the fence, so it
-  must not find one to leave behind;
+- the migration transaction that creates the cursor declares it, and nothing
+  declares it later;
 - the transaction that records 2 removes it with the cursor. It is the one
   capability native code removes, because it describes a state, not a format.
+
+An earlier build cannot remove the fence, so the fence must never coexist
+with an earlier build's runner, and that is why it is declared only with a new
+cursor. Migrations serialize on the migration lock, and no earlier build's
+`migrate` passes its capability check once the fence has committed. So any
+runner an earlier build started belongs to a cursor an earlier build created,
+which carries no fence. Declared later, by a resume, a fence could meet such a
+runner already past its check, still mapping or queued for the runners' lock.
+That runner would record 2 and leave the fence behind. The price: a backfill
+that a #582 build (before #669) started stays unfenced to its end. Resume it
+with this release, and don't record 2 by hand.
 
 How earlier builds react, once each checks declared capabilities at connect
 and at `migrate`:

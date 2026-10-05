@@ -38,17 +38,23 @@
 //! would serve with legacy headers unmapped. So while the backfill is
 //! pending the database also declares the capability
 //! `share_hash_backfill_pending = 1` (#669). The transaction that creates
-//! the cursor declares it, every runner that resumes the backfill declares
-//! it again before its first batch, and the transaction that records 2
-//! removes it with the cursor. A resume declares it from the runner, under
-//! the runners' lock, not in its migration transaction: a runner of an
-//! earlier build that is still mapping holds that lock and records 2
-//! without knowing the fence, and must not find one to leave behind. Every
-//! earlier build that checks capabilities refuses the declaration at
-//! connect and at migrate, whatever the record says, and this release
-//! refuses the cursor itself. A declaration whose cursor is gone, which
-//! only a hand-dropped cursor leaves, is refused by every start and migrate
-//! of this release.
+//! the cursor declares it, and the transaction that records 2 removes it
+//! with the cursor. Every earlier build that checks capabilities refuses
+//! the declaration at connect and at migrate, whatever the record says, and
+//! this release refuses the cursor itself.
+//!
+//! The fence is declared there and nowhere else, never again on a resume.
+//! An earlier build cannot remove it, so it must never coexist with an
+//! earlier build's runner. Migrations serialize on the migration lock, and
+//! no earlier build's migrate passes its capability check once the fence
+//! has committed. So the only runners an earlier build can have started are
+//! for a cursor an earlier build created, which carries no fence. Declared
+//! later, by a resume, a fence could meet such a runner already past its
+//! check: still mapping, or queued for the runners' lock. That runner would
+//! record 2 without removing the fence, and leave it behind. The price is
+//! that a backfill a #582 build started, before #669, stays unfenced to its
+//! end. A declaration whose cursor is gone, which only a hand-dropped
+//! cursor leaves, is refused by every start and migrate of this release.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
 use sqlx::{Connection, PgConnection};
@@ -108,11 +114,8 @@ impl Progress {
 /// #669 off the database (see the module doc).
 pub(super) const PENDING_CAPABILITY: &str = "share_hash_backfill_pending";
 
-/// Declare the fence of a pending backfill: in the migration transaction
-/// that creates its cursor, and by every runner that resumes it, under the
-/// runners' lock. Idempotent, so a backfill an earlier build started, or
-/// whose declaration was deleted by hand, is fenced again before its next
-/// batch.
+/// Declare the fence of a pending backfill, in the migration transaction
+/// that creates its cursor and nowhere else (see the module doc).
 pub(super) async fn declare_pending(connection: &mut PgConnection) -> Result<()> {
     sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES($1,1) ON CONFLICT (capability) DO NOTHING")
         .bind(PENDING_CAPABILITY)
@@ -236,12 +239,7 @@ pub(super) async fn apply(
         tracing::info!(version = VERSION, "share-hash backfill already complete");
         return Ok(());
     };
-    // Fence earlier builds for the rest of the backfill (#669), here under
-    // the runners' lock rather than in the migration transaction: a runner
-    // of an earlier build that was still mapping held this lock and has
-    // finished, so no fence is declared that an earlier build will not
-    // remove.
-    declare_pending(connection).await?;
+
     let started = Instant::now();
     let first_seq = progress.next_seq;
     tracing::info!(

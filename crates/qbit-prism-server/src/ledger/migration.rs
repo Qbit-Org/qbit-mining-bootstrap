@@ -3088,11 +3088,10 @@ pub(super) async fn migrate_schema(
         }
     }
     // A cursor this transaction created fences every earlier build at once
-    // (#669); 006 has created the capability table by here. A resumed
-    // backfill is fenced again by its runner, under the runners' lock
-    // (`share_hashes::apply`): a runner of an earlier build that is still
-    // mapping holds that lock, records 2 without knowing the fence, and must
-    // not leave one behind.
+    // (#669); 006 has created the capability table by here. Only here: a
+    // resumed backfill is never fenced again, since a runner an earlier build
+    // started before the fence existed would finish without removing it
+    // (`share_hashes.rs`).
     if cursor_created {
         share_hashes::declare_pending(tx).await?;
     }
