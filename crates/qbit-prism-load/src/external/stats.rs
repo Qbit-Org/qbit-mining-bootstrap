@@ -559,6 +559,8 @@ pub struct ShareLog {
     /// and must never wait on the disk: a slow filesystem would stall that
     /// worker's sessions and read as acknowledgement latency.
     lines: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// Lines handed to the writer.
+    sent: u64,
     /// Lines dropped because the writer was `SHARE_LOG_BACKLOG` behind.
     dropped: u64,
     /// Writes every line it is sent, then flushes, and returns how many it
@@ -612,6 +614,7 @@ impl ShareLog {
         Ok(Self {
             path: path.to_owned(),
             lines: Some(lines),
+            sent: 0,
             dropped: 0,
             writer: Some(writer),
         })
@@ -621,9 +624,27 @@ impl ShareLog {
         let mut bytes = serde_json::to_vec(line).expect("a JSON value serializes");
         bytes.push(b'\n');
         if let Some(lines) = &self.lines {
-            if let Err(std::sync::mpsc::TrySendError::Full(_)) = lines.try_send(bytes) {
-                self.dropped += 1;
+            match lines.try_send(bytes) {
+                Ok(()) => self.sent += 1,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => self.dropped += 1,
+                // The writer is gone; finish() reports why.
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
             }
+        }
+    }
+
+    /// What to report if the writer cannot be waited for: the lines it was
+    /// sent, which it may not all have written, and why.
+    pub fn unfinished(&self) -> impl Fn(&str) -> ShareLogInfo {
+        let (path, sent, dropped) = (self.path.display().to_string(), self.sent, self.dropped);
+        move |why: &str| ShareLogInfo {
+            path: path.clone(),
+            lines: sent,
+            dropped,
+            error: Some(format!(
+                "{why}: lines counts the {sent} sent to the writer, which may not all be in the \
+                 file"
+            )),
         }
     }
 

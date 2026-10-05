@@ -17,7 +17,10 @@ fn main() {
     // preset expansion below: its flags are not the harness's, so no preset
     // pins them and none can be added to them.
     if let Some(command) = external::Command::of(&argv) {
-        let code = runtime().block_on(external::main(command, argv));
+        // Kept until the process exits: dropping a runtime waits for its
+        // blocking tasks, and the stats are already written by then.
+        let runtime = runtime();
+        let code = runtime.block_on(external::main(command, argv));
         match code {
             Ok(code) => std::process::exit(code),
             Err(error) => fail(error),

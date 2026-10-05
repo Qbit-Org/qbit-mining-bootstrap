@@ -66,6 +66,10 @@ pub const EVENT_BACKLOG_LIMIT: usize = 250_000;
 /// The highest `--rate`: a share costs thousands of hashes, so one client
 /// machine mines far fewer.
 pub const MAX_RATE: f64 = 100_000.0;
+/// How long the share log's writer may take to write what it holds once the
+/// load is over. A stalled disk past this leaves the log marked unfinished,
+/// and the stats are still written.
+pub const SHARE_LOG_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Which subcommand a command line names, if any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -726,13 +730,22 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         )
     };
     // Its writer may still be writing what it was sent: waited for off the
-    // runtime.
+    // runtime, and only so long, since a stalled disk must not cost the
+    // stats. A second signal ends the wait at once.
     let share_log = match share_log {
-        Some(log) => Some(
-            tokio::task::spawn_blocking(move || log.finish())
-                .await
-                .context("finishing the share log")?,
-        ),
+        Some(log) => {
+            let unfinished = log.unfinished();
+            let mut finishing = tokio::task::spawn_blocking(move || log.finish());
+            Some(tokio::select! {
+                finished = &mut finishing => finished.context("finishing the share log")?,
+                _ = tokio::time::sleep(SHARE_LOG_TIMEOUT) => unfinished(&format!(
+                    "the writer had not written every line {SHARE_LOG_TIMEOUT:?} after the load"
+                )),
+                _ = shutdown.after(2) => unfinished(
+                    "a second signal ended the wait for the writer"
+                ),
+            })
+        }
         None => None,
     };
     totals.offers_discarded += discarded_at_stop;
@@ -1011,9 +1024,7 @@ async fn drive(
         // are shortfall without scanning again, so an outage costs one pass
         // over the sessions a tick rather than one per offer.
         let mut saturated = false;
-        if offers.minted < want {
-            last_minted = now;
-        }
+        let minting = offers.minted < want;
         while offers.minted < want {
             offers.minted += 1;
             let placed = !saturated && place(sessions, holding, &mut cursor, &phase);
@@ -1026,6 +1037,10 @@ async fn drive(
             } else {
                 offers.shortfall += 1;
             }
+        }
+        // After the loop, which a large catch-up can make take a while.
+        if minting {
+            last_minted = Instant::now();
         }
         if last {
             break;
