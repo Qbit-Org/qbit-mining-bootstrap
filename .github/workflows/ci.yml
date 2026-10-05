@@ -375,7 +375,8 @@ jobs:
       # The statement_timeout of the ledger pools the tests open in process
       # (Ledger::connect reads it). Production keeps its 15 s default, and so
       # do the servers and operator tools the tests spawn, which drop
-      # inherited PRISM_ settings. These 2 vCPU runners run the heaviest
+      # inherited PRISM_ settings (authorization_rpc forwards this one to the
+      # re-run of its own test binary). These 2 vCPU runners run the heaviest
       # statements (a migration's catalog fingerprint, a 300,000-recipient
       # balance snapshot) in 1 to 4 s, and in a slow spell on a busy host past
       # 15 s, failing tests that changed nothing near them. Tests of timeout

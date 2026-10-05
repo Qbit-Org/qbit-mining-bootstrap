@@ -147,7 +147,9 @@ the runner prints that log when the job ends. The job sets
 process: production keeps its 15 s default, but these 2 vCPU runners take 1 to
 4 s for the heaviest statements and, in a slow spell, more than 15 s. The
 servers and operator tools the tests spawn drop inherited `PRISM_` settings and
-keep the production default. Tests of timeout behaviour set their own values.
+keep the production default. `authorization_rpc` re-runs its own test binary in
+a cleared environment and forwards the setting to it. Tests of timeout
+behaviour set their own values.
 
 Each shard uploads its manifest and test log as `prism-gate-shard-<index>`.
 The `prism-integration-proof` job requires every shard to succeed, downloads
