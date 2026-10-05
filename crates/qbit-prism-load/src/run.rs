@@ -1543,6 +1543,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         events: events_tx,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: kill_fence.clone(),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let mut sessions: Vec<SessionHandle> = Vec::with_capacity(args.sessions);
     // One deadline for everything that waits on the server to answer a

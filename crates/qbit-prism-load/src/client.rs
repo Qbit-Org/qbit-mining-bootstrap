@@ -529,6 +529,11 @@ pub struct SessionShared {
     /// shared by the run, every session and the driver, so "before the kill"
     /// and "after the kill" are the same fact for all of them.
     pub kill_fence: Arc<AtomicU64>,
+    /// Set by a run that is stopping its sessions. A search off the runtime
+    /// looks at it with the connection's queue and stops, so a stop is not
+    /// held behind a search, nor a search queued for the blocking pool run
+    /// for nothing. Nothing in the harness's own run sets it.
+    pub stopping: Arc<AtomicBool>,
 }
 
 impl SessionShared {
@@ -1090,9 +1095,19 @@ async fn run_session(
                             // then mines it on the newest job.
                             Err(failure)
                                 if failure.interrupted
-                                    && requeue
-                                        .upgrade()
-                                        .is_some_and(|queue| queue.try_send(Work::Submit { phase: stamp.clone() }).is_ok()) => {}
+                                    && !shared.stopping.load(Ordering::SeqCst)
+                                    && requeue.upgrade().is_some_and(|queue| {
+                                        queue.try_send(Work::Submit { phase: stamp.clone() }).is_ok()
+                                    }) => {}
+                            // Stopped for the run's stop: never sent, as the
+                            // stop would discard it anyway.
+                            Err(failure) if failure.interrupted && shared.stopping.load(Ordering::SeqCst) => {
+                                outstanding.fetch_sub(1, Ordering::Relaxed);
+                                let _ = shared.events.send(Event::DiscardedOffer {
+                                    session: config.index,
+                                    phase,
+                                });
+                            }
                             Err(failure) => {
                                 outstanding.fetch_sub(1, Ordering::Relaxed);
                                 let _ = shared.events.send(Event::Failure(ClientFailure {
@@ -1721,7 +1736,10 @@ async fn offer(
         let job = job.clone();
         let extranonce2 = extranonce2.clone();
         let discards = (!scheduled_block).then_some((session, events));
-        let interrupt = (!scheduled_block).then(|| connection.lines.waiting.clone());
+        let interrupt = (!scheduled_block).then(|| Interrupt {
+            waiting: connection.lines.waiting.clone(),
+            stopping: shared.stopping.clone(),
+        });
         tokio::task::spawn_blocking(move || {
             search(
                 &job,
@@ -1729,7 +1747,7 @@ async fn offer(
                 &extranonce2,
                 scheduled_block,
                 discards,
-                interrupt.as_deref(),
+                interrupt.as_ref(),
             )
         })
         .await
@@ -1830,6 +1848,19 @@ async fn offer(
 /// connection.
 const INTERRUPT_CHECK: u32 = 1 << 10;
 
+/// What stops a search off the runtime early: something waiting on the
+/// session's connection, or the run stopping its sessions.
+struct Interrupt {
+    waiting: Arc<AtomicUsize>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl Interrupt {
+    fn now(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst) > 0 || self.stopping.load(Ordering::SeqCst)
+    }
+}
+
 /// What a search came to.
 enum Searched {
     Found(u32, Vec<u8>),
@@ -1845,7 +1876,7 @@ fn search(
     extranonce2: &[u8],
     want_block: bool,
     discards: Option<(usize, tokio::sync::mpsc::UnboundedSender<Event>)>,
-    interrupt: Option<&AtomicUsize>,
+    interrupt: Option<&Interrupt>,
 ) -> Searched {
     let merkle = merkle_root(
         &job.coinb1,
@@ -1864,9 +1895,7 @@ fn search(
     );
     let span = if want_block { u32::MAX } else { NONCE_SPAN };
     for nonce in 0..span {
-        if nonce % INTERRUPT_CHECK == 0
-            && interrupt.is_some_and(|waiting| waiting.load(Ordering::SeqCst) > 0)
-        {
+        if nonce % INTERRUPT_CHECK == 0 && interrupt.is_some_and(Interrupt::now) {
             return Searched::Interrupted;
         }
         header[76..80].copy_from_slice(&nonce.to_le_bytes());

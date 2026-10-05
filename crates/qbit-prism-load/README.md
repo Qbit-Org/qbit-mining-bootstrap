@@ -1154,8 +1154,10 @@ The `--address` has to be a payout address the target's node validates
    line.
 
 SIGINT or SIGTERM ends the load early, drains and writes the stats (exit 6);
-a second one skips the rest of the drain. A progress line goes to stderr every
-`--progress-seconds`.
+a second one skips the rest of the drain. A stop also ends any search in
+progress at once. A progress line goes to stderr every `--progress-seconds`.
+`--rate` is at most 100,000 a process: a share costs thousands of hashes, so a
+faster load needs more client machines.
 
 ### The stats
 
@@ -1242,7 +1244,7 @@ SELECT share_id FROM qbit_share_ledger WHERE accepted AND share_id LIKE '<addres
 | 0 | The load window ran its length; the stats say what happened |
 | 2 | An error, or a refusal at entry, the guard included; no stats are written |
 | 3 | No session held work within `--work-timeout-seconds`; the stats are written, with no window |
-| 6 | Interrupted by SIGINT or SIGTERM; the stats are written up to that point |
+| 6 | Interrupted: by SIGINT or SIGTERM, or by the run itself when its stats fell 250,000 events behind its sessions (a machine driving more than it can count). The stats are written up to that point, and `ended` says which |
 
 ## Exit codes
 

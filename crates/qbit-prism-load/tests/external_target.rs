@@ -331,6 +331,7 @@ fn the_command_line_is_checked_at_entry() {
     refused(&["--sessions", "0"], "--sessions");
     refused(&["--rate", "0"], "--rate");
     refused(&["--rate", "NaN"], "--rate");
+    refused(&["--rate", "200000"], "--rate");
     refused(&["--duration-seconds", "0"], "--duration-seconds");
     refused(&["--worker-prefix", "a.b"], "--worker-prefix");
     refused(&["--work-timeout-seconds", "0"], "--work-timeout-seconds");
@@ -776,7 +777,9 @@ async fn an_outage_is_shortfall_and_every_offer_is_accounted_for() -> Result<()>
             "--rate",
             "30",
             "--duration-seconds",
-            "4",
+            // Long enough that whole seconds after the outage remain inside
+            // the window however late a slow runner gets to it.
+            "8",
         ],
     );
     let run = tokio::spawn(async move { external::run(&args, &Shutdown::never()).await });
@@ -936,6 +939,7 @@ async fn an_offer_taken_while_disconnected_is_dropped_on_reconnect() -> Result<(
             events,
             record_notifies: std::sync::atomic::AtomicBool::new(false),
             kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let config = client::SessionConfig {
             index: 0,
@@ -1007,6 +1011,7 @@ async fn a_search_stops_for_a_new_job_and_mines_the_offer_on_it() -> Result<()> 
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let config = client::SessionConfig {
         index: 0,
@@ -1043,9 +1048,60 @@ async fn a_search_stops_for_a_new_job_and_mines_the_offer_on_it() -> Result<()> 
     };
     assert_eq!(record.job_id, "job-2", "{record:?}");
     assert_eq!(record.outcome.label(), "accepted");
-    assert_eq!(handle.outstanding.load(Ordering::SeqCst), 0);
+    // The answer's record goes out just before its slot is released.
+    let outstanding = handle.outstanding.clone();
+    wait_until(
+        "the offer's slot is released",
+        Duration::from_secs(5),
+        || outstanding.load(Ordering::SeqCst) == 0,
+    )
+    .await;
     let _ = handle.control.send(client::Control::Stop);
     tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
+    Ok(())
+}
+
+/// A run's stop is not held behind a search: here the session is grinding
+/// a job no search of the span is likely to solve when the run stops, and it
+/// stops at once rather than after millions of hashes, its offer discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_ends_a_search_at_once() -> Result<()> {
+    let target = fake_target(1.0).await;
+    let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shared = Arc::new(client::SessionShared {
+        phase: std::sync::RwLock::new(external::PHASE.to_owned()),
+        events,
+        record_notifies: std::sync::atomic::AtomicBool::new(false),
+        kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: stopping.clone(),
+    });
+    let config = client::SessionConfig {
+        index: 0,
+        username: "pload1external.t-s00000".into(),
+        password: "x".into(),
+        difficulty: client::DifficultySource::Advertised { ceiling: 1.0 },
+        version_rolling_mask: codec::VERSION_ROLLING_MASK,
+        connect_timeout: Duration::from_secs(5),
+        handshake_timeout: Duration::from_secs(5),
+        quiesce_limit: Duration::from_secs(5),
+        drop_offers_held_while_disconnected: true,
+    };
+    let handle = client::spawn_session(config, 0, target.address.clone(), shared, 1);
+    next_event(&mut inbox, "the first connection", |event| {
+        matches!(event, client::Event::Connected { .. })
+    })
+    .await;
+    let phase: Arc<str> = Arc::from(external::PHASE);
+    assert!(handle.try_offer(1, &phase));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stopping.store(true, Ordering::SeqCst);
+    let _ = handle.control.send(client::Control::Stop);
+    tokio::time::timeout(Duration::from_secs(3), handle.task)
+        .await
+        .expect("the session stops within seconds, not after the search")?;
+    assert_eq!(handle.outstanding.load(Ordering::SeqCst), 0);
+    assert_eq!(target.seen.submits.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
@@ -1130,6 +1186,23 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
     };
     assert!(error.contains("same file"), "{error}");
     assert!(!fresh.exists());
+    // A share log that is the document's partial file under another name.
+    let shares = scratch.path("shares.jsonl");
+    std::fs::write(&shares, "")?;
+    std::fs::hard_link(&shares, scratch.path(".fresh.json.partial"))?;
+    let hard = shares.display().to_string();
+    let linked_hard = args(
+        &target.address,
+        &fresh,
+        &[external::GUARD_FLAG, "--share-log", &hard],
+    );
+    let error = match external::run(&linked_hard, &Shutdown::never()).await {
+        Ok(_) => panic!("a share log hard-linked to the partial file ran"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("same file"), "{error}");
+    std::fs::remove_file(scratch.path(".fresh.json.partial"))?;
+    std::fs::remove_file(&shares)?;
     // A dangling symlink to the document's path: the log would be created
     // through it, at the document's path.
     std::os::unix::fs::symlink(&fresh, scratch.path("link.jsonl"))?;

@@ -59,6 +59,13 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// has stopped. A search an aborted session left running still holds a
 /// sender until it ends.
 pub const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
+/// Session events that may wait for the stats. A collector this far behind
+/// is losing ground, and the queue would grow without bound: the run stops
+/// itself, as a signal would stop it, and says why.
+pub const EVENT_BACKLOG_LIMIT: usize = 250_000;
+/// The highest `--rate`: a share costs thousands of hashes, so one client
+/// machine mines far fewer.
+pub const MAX_RATE: f64 = 100_000.0;
 
 /// Which subcommand a command line names, if any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,8 +204,9 @@ impl ExternalArgs {
             "--sessions must be 1..100000"
         );
         ensure!(
-            self.rate.is_finite() && self.rate > 0.0 && self.rate <= 1_000_000.0,
-            "--rate must be finite and in (0, 1000000]"
+            self.rate.is_finite() && self.rate > 0.0 && self.rate <= MAX_RATE,
+            "--rate must be finite and in (0, {MAX_RATE}]: a share costs thousands of hashes, and \
+             a faster load needs more client machines, one process each"
         );
         ensure!(
             (1..=604_800).contains(&self.duration_seconds),
@@ -537,9 +545,22 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     let holding = collector.lock().expect("collector lock").holding();
     let mut collector_task = {
         let collector = collector.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
+            let mut behind = false;
             while let Some(event) = inbox.recv().await {
-                collector.lock().expect("collector lock").apply(event);
+                let waiting = inbox.len();
+                let mut collector = collector.lock().expect("collector lock");
+                collector.apply(event);
+                collector.event_backlog_max = collector.event_backlog_max.max(waiting);
+                if waiting >= EVENT_BACKLOG_LIMIT && !behind {
+                    behind = true;
+                    shutdown.request(&format!(
+                        "the stats fell {waiting} events behind the sessions, so this machine \
+                         drives more than it can count; run fewer sessions or a lower rate per \
+                         process"
+                    ));
+                }
             }
         })
     };
@@ -549,7 +570,10 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         // Every job is counted.
         record_notifies: AtomicBool::new(true),
         kill_fence: Arc::new(AtomicU64::new(0)),
+        stopping: Arc::new(AtomicBool::new(false)),
     });
+    // Kept apart from `shared`, which goes with the sessions.
+    let stopping = shared.stopping.clone();
     let work_timeout = Duration::from_secs(args.work_timeout_seconds);
     let drain = Duration::from_secs(args.drain_seconds);
     let sessions: Vec<SessionHandle> = (0..args.sessions)
@@ -649,6 +673,9 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     }
     let outstanding_at_drain_end = outstanding(true);
     let held_without_a_connection_at_drain_end = outstanding(false);
+    // First the flag, which a search running or queued for the blocking pool
+    // reads, then the stop each session reads between searches.
+    stopping.store(true, Ordering::SeqCst);
     for session in &sessions {
         let _ = session.control.send(Control::Stop);
     }
@@ -688,13 +715,14 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
             ))
         }
     };
-    let (mut totals, share_log) = {
+    let (mut totals, share_log, event_backlog_max) = {
         let mut collector = collector
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             std::mem::take(&mut collector.totals),
             collector.take_share_log(),
+            collector.event_backlog_max,
         )
     };
     // Its writer may still be writing what it was sent: waited for off the
@@ -756,6 +784,7 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
         held_without_a_connection_at_drain_end,
         sessions_aborted_at_stop,
         events_cut_off,
+        event_backlog_max,
         client_cpu_seconds: crate::measure::process_cpu_seconds(std::process::id()),
         available_parallelism: std::thread::available_parallelism().ok().map(usize::from),
         file_descriptor_limit: Some(descriptors),
@@ -853,7 +882,20 @@ fn check_outputs(args: &ExternalArgs, run_tag: &str) -> Result<()> {
             .unwrap_or(Path::new("."));
         let mut out_names = file_names(&args.out, "--out")?;
         out_names.extend(file_names(&partial_path(out_directory, out_name), "--out")?);
-        let same = out_names.iter().any(|name| log_names.contains(name));
+        // And the same file under another name, a hard link: by device and
+        // inode, for the names that exist.
+        let identity = |name: &PathBuf| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(name)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+        };
+        let out_files: Vec<(u64, u64)> = out_names.iter().filter_map(identity).collect();
+        let same = out_names.iter().any(|name| log_names.contains(name))
+            || log_names
+                .iter()
+                .filter_map(identity)
+                .any(|file| out_files.contains(&file));
         ensure!(
             !same,
             "--share-log and --out name the same file, {}; the stats would replace the share ids",

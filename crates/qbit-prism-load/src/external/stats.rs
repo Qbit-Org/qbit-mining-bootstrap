@@ -661,6 +661,8 @@ pub struct Collector {
     /// tip's work reached it. Kept for the tips `totals.tips` keeps.
     tip_sessions: HashMap<String, Vec<u64>>,
     share_log: Option<ShareLog>,
+    /// The most session events seen waiting behind the one being counted.
+    pub event_backlog_max: usize,
 }
 
 impl Collector {
@@ -672,6 +674,7 @@ impl Collector {
             holding_count: 0,
             tip_sessions: HashMap::new(),
             share_log,
+            event_backlog_max: 0,
         }
     }
 
@@ -961,6 +964,9 @@ pub struct Process {
     /// Set when the stats stopped taking events before the last one arrived,
     /// with why; `null` when every event was counted.
     pub events_cut_off: Option<String>,
+    /// The most session events that waited for the stats at once. Near
+    /// `EVENT_BACKLOG_LIMIT` the run stops itself rather than let it grow.
+    pub event_backlog_max: usize,
     /// This process's CPU over its whole life, and the cores it had, so a
     /// shortfall can be told from a busy client.
     pub client_cpu_seconds: Option<f64>,
