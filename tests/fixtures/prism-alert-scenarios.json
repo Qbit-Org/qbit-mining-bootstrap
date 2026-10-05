@@ -3605,5 +3605,144 @@
         }
       ]
     }
+  },
+  {
+    "name": "#666 a frontend held by PRISM_BLOCK_SUBMIT_ENABLED pages after a minute, before it finds a block",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 1
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#666 a frontend held for less than a minute is still pending",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x320 0x280",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 1
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": []
+    }
+  },
+  {
+    "name": "#666 a frontend that submits blocks does not page",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 0
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": []
+    }
+  },
+  {
+    "name": "#666 an unpublished setting pages, since nothing shows the frontend submits",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": -1.0,
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": 1
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 1
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#666 a failed scrape leaves a held frontend to the endpoint rules",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": null
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": []
+    }
+  },
+  {
+    "name": "#666 an image without the gauge stays quiet",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": null
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": []
+    }
+  },
+  {
+    "name": "#666 only the held frontend of a pair pages",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600",
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 1
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#666 a held frontend keeps paging through a stale metrics snapshot",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 1
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
   }
 ]

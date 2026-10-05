@@ -692,6 +692,34 @@
       ]
     },
     {
+      "uid": "qbit-prism-block-submission-held",
+      "title": "PrismBlockSubmissionHeld",
+      "role": "run",
+      "expr": "(qbit_prism_block_submission_enabled{job=\"qbit-prism\",network=\"__NETWORK__\"} != bool 1) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1)",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "1m",
+      "severity": "critical",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime",
+        "page": "true"
+      },
+      "summary": "PrismBlockSubmissionHeld",
+      "description": "This frontend holds block submission: PRISM_BLOCK_SUBMIT_ENABLED is off (#661, the #291 rehearsal kill switch), so every block it finds stays pending in the candidate outbox and is never sent to the node's submitblock, and its CTV fanout broadcaster does not start. It pages a minute after such a frontend starts, before it has found anything, rather than only once a found block is held, which the pending-candidate rules page 15 seconds after. A frontend that has not published its setting (-1) pages too, since nothing shows that it submits. The gauge is fixed at process start and served from the cached metrics snapshot, so the rule is gated on a successful scrape rather than a fresh snapshot: a held frontend keeps paging while its snapshot is stale. A missing endpoint, no data and evaluation errors are OK, because PrismMetricsEndpointDown and PrismMetricsNoData own them, and an image older than #661 exports no series. A rehearsal against the production network holds every frontend on purpose: scrape its frontends under another job or network, or silence this alert for the rehearsal (docs/prism-ledger-ops.md, block submission kill switch for rehearsals). Remedy: unset PRISM_BLOCK_SUBMIT_ENABLED or set it to 1, restart the frontend, and confirm check-config prints no block submission WARNING. #666.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "qbit_prism_block_submission_enabled is 1 while a frontend offers found blocks, 0 while PRISM_BLOCK_SUBMIT_ENABLED holds them and -1 before the setting is published (#661); a production frontend must never hold (docs/mainnet-deployment.md go-live checks). The setting is fixed at process start, so the one-minute dwell only covers a scrape or two after a restart; #666.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L80",
+        "crates/qbit-prism-server/src/metrics.rs#L146",
+        "crates/qbit-prism-server/src/metrics/snapshots.rs#L121",
+        "crates/qbit-prism-server/src/server.rs#L53",
+        "crates/qbit-prism-server/src/config.rs#L635"
+      ]
+    },
+    {
       "uid": "qbit-prism-database-unavailable",
       "title": "PrismDatabaseUnavailable",
       "role": "run",

@@ -517,8 +517,9 @@ Do not expose a lane until all applicable checks pass:
 - walletless fee-bearing CTV fanout construction and broadcast have passed
 - every PRISM frontend runs with `PRISM_BLOCK_SUBMIT_ENABLED` unset or `1`:
   `check-config` prints no `WARNING: block submission is disabled` line and
-  `qbit_prism_block_submission_enabled` reads 1. Set to `0`, that rehearsal
-  kill switch keeps every found block from the node; see
+  `qbit_prism_block_submission_enabled` reads 1, so `PrismBlockSubmissionHeld`
+  is not paging. Set to `0`, that rehearsal kill switch keeps every found block
+  from the node; see
   [prism-ledger-ops.md](prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals)
 - AuxPoW uses explicit payout addresses and no helper payout wallet
 - backup restore, Postgres failover, disk alerts, and container restart policies
