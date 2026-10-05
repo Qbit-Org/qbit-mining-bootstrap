@@ -87,14 +87,12 @@ impl Coordinator {
     ) -> Result<CapturedWindow> {
         // The interval starts before the read, not after each template build.
         let anchored = Instant::now();
-        let snapshot = self
-            .work_ledger
-            .snapshot_with_admission(
-                network,
-                crate::ledger::ReadAdmission::shared(permit.clone()),
-                prior,
-            )
-            .await?;
+        let snapshot = on_database(self.work_ledger.snapshot_with_admission(
+            network,
+            crate::ledger::ReadAdmission::shared(permit.clone()),
+            prior,
+        ))
+        .await?;
         // The anchor transaction's revision is the one this work will carry;
         // record it before the build so the landing metric sees it as early
         // as the ledger probe it replaces did.

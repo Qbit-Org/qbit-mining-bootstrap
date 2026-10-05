@@ -10,6 +10,7 @@ use crate::{
     metrics::{RefreshAcquisition, RefreshTrigger},
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
+    waiting::{self, on_database, Dependency, Waiting},
 };
 use anyhow::{ensure, Context, Result};
 use num_bigint::BigUint;
@@ -224,6 +225,49 @@ struct RefreshState {
     cached_window: Option<prepared_storage::compact::CompactOwner<refresh_window::CachedWindow>>,
 }
 
+/// A template refresh in flight (#655).
+struct RefreshInFlight {
+    started: Instant,
+    /// Its ledger steps mark this tracker (`crate::waiting`).
+    waiting: Waiting,
+}
+
+/// Registers a refresh in flight on `Coordinator::refresh_in_flight` and
+/// clears it when the refresh ends, cancellation included.
+struct InFlightRefresh<'a> {
+    slot: &'a std::sync::Mutex<Option<RefreshInFlight>>,
+    waiting: Waiting,
+}
+
+impl<'a> InFlightRefresh<'a> {
+    fn register(slot: &'a std::sync::Mutex<Option<RefreshInFlight>>) -> Self {
+        let waiting = Waiting::default();
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RefreshInFlight {
+            started: Instant::now(),
+            waiting: waiting.clone(),
+        });
+        Self { slot, waiting }
+    }
+}
+
+impl Drop for InFlightRefresh<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only its own entry: the refresh lock serializes refreshes, so
+        // another is never registered meanwhile, but a guard never clears
+        // what it did not write.
+        if slot
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.waiting.same_as(&self.waiting))
+        {
+            *slot = None;
+        }
+    }
+}
+
 pub struct Coordinator {
     pub config: Arc<Config>,
     pub ledger: Arc<Ledger>,
@@ -259,6 +303,12 @@ pub struct Coordinator {
     // Both states survive cancelled refreshes under the same serialization:
     // retiring cached inputs must not reset a consumed node transition.
     refresh_lock: Mutex<RefreshState>,
+    /// The template refresh in flight, if any (#655): when it started and
+    /// what it is waiting on, so a submit refused for stale readiness can
+    /// tell a refresh blocked on the database past its deadline from one
+    /// waiting on the node. Written only by the refresh holding
+    /// `refresh_lock`; never held across an await.
+    refresh_in_flight: std::sync::Mutex<Option<RefreshInFlight>>,
     resume_flights: compact_resume::ResumeFlights,
     /// One shared clock+revision read per fan-out burst; see `clocked_flight`.
     clocked_flights: clocked_flight::ClockedFlights,
@@ -950,6 +1000,7 @@ impl Coordinator {
             last_error: RwLock::new(None),
             refreshed_at: std::sync::Mutex::new(Instant::now()),
             refresh_lock: Mutex::new(RefreshState::default()),
+            refresh_in_flight: std::sync::Mutex::new(None),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -1197,7 +1248,7 @@ impl Coordinator {
     /// Reconcile against one coherent tip. Every frontend observes prepared
     /// parents before building a descendant with its carry-forward snapshot.
     pub async fn reconcile(&self, tip: &str, tip_height: u64, revision: i64) -> Result<()> {
-        let blocks = self.work_ledger.pool_blocks().await?;
+        let blocks = on_database(self.work_ledger.pool_blocks()).await?;
         let mut cache = self.chain_cache.lock().await;
         let extends = if let Some(previous) = cache.as_ref() {
             tip_height >= previous.height
@@ -1268,10 +1319,12 @@ impl Coordinator {
         }
         // Reconciliation and settlement both count the block's durable first
         // confirmation, regardless of the outbox state at that moment.
-        let first_confirmations = self
-            .work_ledger
-            .reconcile(&observations, tip_height, revision)
-            .await?;
+        let first_confirmations = on_database(self.work_ledger.reconcile(
+            &observations,
+            tip_height,
+            revision,
+        ))
+        .await?;
         self.metrics.revision_work_matured(mature_height);
         self.blocks
             .fetch_add(first_confirmations, Ordering::Relaxed);
@@ -1323,18 +1376,49 @@ impl Coordinator {
             .map(|since| since.as_millis())
             .unwrap_or_default();
         let mut refresh = self.refresh_lock.lock().await;
-        let result = self
-            .refresh_locked(&mut refresh, refresh_started, refresh_started_unix_ms)
+        // #655: while it runs, its ledger steps mark this tracker, so a
+        // submit refused for stale readiness can see a refresh still blocked
+        // on the database past its deadline (`stale_readiness_reason`).
+        let in_flight = InFlightRefresh::register(&self.refresh_in_flight);
+        let result = in_flight
+            .waiting
+            .track(self.refresh_locked(&mut refresh, refresh_started, refresh_started_unix_ms))
             .await;
         // #581: recorded before the refresh lock is released, so outcomes
         // land in the order the refreshes ran: an older refresh that finishes
         // late can never overwrite a newer one's.
-        let on_database = result
+        let failed_on_database = result
             .as_ref()
             .err()
             .is_some_and(|error| error.chain().any(|cause| cause.is::<sqlx::Error>()));
-        self.readiness.write().await.refresh_failed_on_database = on_database;
+        self.readiness.write().await.refresh_failed_on_database = failed_on_database;
+        // Its outcome is recorded: no longer in flight.
+        drop(in_flight);
         result
+    }
+
+    /// The reason id of a submit refused because readiness aged out (#581,
+    /// #655). The database's when the latest refresh failed on it, or when
+    /// the refresh in flight has outlived its deadline, the health timeout,
+    /// and is waiting on the database now: a refresh slower than that cannot
+    /// have kept readiness fresh, and one still blocked on the database is
+    /// the database's failure although it has not failed yet. Otherwise the
+    /// node's.
+    fn stale_readiness_reason(&self, refresh_failed_on_database: bool) -> &'static str {
+        let blocked_on_database = self
+            .refresh_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|in_flight| {
+                in_flight.started.elapsed() >= self.config.health_timeout
+                    && in_flight.waiting.on() == Dependency::Database
+            });
+        if refresh_failed_on_database || blocked_on_database {
+            DATABASE_UNAVAILABLE
+        } else {
+            "backend-rpc-unavailable"
+        }
     }
 
     /// [`Self::refresh_once_inner`]'s work, under the refresh lock.
@@ -1355,7 +1439,8 @@ impl Coordinator {
         let readiness_generation = proof.readiness_epoch();
         // Capture before node I/O, so a delayed equal-work observation cannot
         // overwrite a replacement accepted while its proof was in flight.
-        let chain_observation = self.work_ledger.chain_observation_state().await?;
+        // #655: every ledger step below is marked; node calls are not.
+        let chain_observation = on_database(self.work_ledger.chain_observation_state()).await?;
         // The refresh's own readiness epoch, read before any of its node I/O.
         let (info, tip_poll) = self
             .poll_chain_info(true, Some(readiness_generation))
@@ -1395,15 +1480,14 @@ impl Coordinator {
             "template tip is stale"
         );
         self.cache_tip_parent(parent).await?;
-        let observed_revision = match observation
-            .observe(
-                &*self.work_ledger,
-                parent,
-                height - 1,
-                chainwork,
-                &chain_observation,
-            )
-            .await
+        let observed_revision = match on_database(observation.observe(
+            &*self.work_ledger,
+            parent,
+            height - 1,
+            chainwork,
+            &chain_observation,
+        ))
+        .await
         {
             Err(error) if error.is::<crate::ledger::ChainObservationBehind>() => {
                 self.readiness.write().await.poll_renews = false;
@@ -1450,10 +1534,11 @@ impl Coordinator {
             .as_ref()
             .is_some_and(|current| current.fingerprint == fingerprint);
         let probe = if same_template {
-            let probe = self
-                .work_ledger
-                .refresh_probe(crate::ledger::ReadAdmission::default())
-                .await?;
+            let probe = on_database(
+                self.work_ledger
+                    .refresh_probe(crate::ledger::ReadAdmission::default()),
+            )
+            .await?;
             self.metrics
                 .revision_work_observed(probe.payout_state.payout_revision);
             Some(probe)
@@ -1525,7 +1610,7 @@ impl Coordinator {
                 self.ready_tip(parent).await?;
                 self.ensure_template_fresh(&template).await?;
                 ensure!(
-                    self.work_ledger.payout_state().await? == state,
+                    on_database(self.work_ledger.payout_state()).await? == state,
                     "payout state changed during work reuse"
                 );
                 let mut readiness = self.readiness.write().await;
@@ -1562,9 +1647,7 @@ impl Coordinator {
             shared_ttl < i64::MAX as f64 / 1000.0,
             "prepared TTL overflow"
         );
-        let original_expires_at_ms = self
-            .work_ledger
-            .now_ms()
+        let original_expires_at_ms = on_database(self.work_ledger.now_ms())
             .await?
             .checked_add(
                 (shared_ttl as i64)
@@ -1584,10 +1667,11 @@ impl Coordinator {
             .as_ref()
             .filter(|window| window.snapshot.payout_revision >= observed_revision)
         {
-            let probe = self
-                .work_ledger
-                .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
-                .await?;
+            let probe = on_database(
+                self.work_ledger
+                    .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone())),
+            )
+            .await?;
             window.reusable(
                 network,
                 probe.accepted_share_seq,
@@ -3286,13 +3370,17 @@ impl MiningBackend for Coordinator {
     }
 
     async fn new_session_id(&self) -> Result<crate::ledger::SessionId, StratumError> {
-        self.ledger.new_session_id().await.map_err(|error| {
-            if error.is::<crate::ledger::SessionAllocationExhausted>() {
-                protocol_error("session-allocation-exhausted", &error.to_string())
-            } else {
-                protocol_error(DATABASE_UNAVAILABLE, "database unavailable")
-            }
-        })
+        // #655: allocation is a ledger statement, so a session timeout that
+        // passes while it waits is the database's.
+        on_database(self.ledger.new_session_id())
+            .await
+            .map_err(|error| {
+                if error.is::<crate::ledger::SessionAllocationExhausted>() {
+                    protocol_error("session-allocation-exhausted", &error.to_string())
+                } else {
+                    protocol_error(DATABASE_UNAVAILABLE, "database unavailable")
+                }
+            })
     }
 
     async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {
@@ -3455,6 +3543,10 @@ impl MiningBackend for Coordinator {
         version_mask: u32,
         ttl: Duration,
     ) -> Result<(), StratumError> {
+        // #655: its ledger steps (the clock and revision reads, the batch
+        // and repair writes) are marked where they run, so a session timeout
+        // that passes during one is the database's, and one that passes while
+        // a compact repair waits for its lock or admission, or encodes, is not.
         let save = self.save_issued_record(worker, job, version_mask, ttl);
         save.await.map_err(|error| {
             tracing::warn!(error = format!("{error:#}"), "job persistence deferred");
@@ -3491,7 +3583,10 @@ impl MiningBackend for Coordinator {
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
             }
-            let Some(payload) = self.work_ledger.job(job_id).await? else {
+            // #655: each ledger step is the database's when the session's
+            // timeout passes during it; the reconstruction below follows its
+            // shared flight's own steps.
+            let Some(payload) = on_database(self.work_ledger.job(job_id)).await? else {
                 return Ok(None);
             };
             let stored: StoredJob = serde_json::from_value(payload)?;
@@ -3508,7 +3603,7 @@ impl MiningBackend for Coordinator {
             prepared_storage::compact::prepared_dependency_key(&stored.prepared_key)?;
             let clock_started = tokio::time::Instant::now();
             let deadline = publication_authority::AbsoluteDeadline::from_database(
-                self.work_ledger.now_ms().await?,
+                on_database(self.work_ledger.now_ms()).await?,
                 clock_started,
                 stored.expires_at_ms,
             )?;
@@ -3523,7 +3618,7 @@ impl MiningBackend for Coordinator {
                     .resume_flights
                     .join(self, &stored.prepared_key, stored.extranonce2_size)
                     .await;
-                let Some(metadata) = flight.metadata.clone().await? else {
+                let Some(metadata) = on_database(flight.metadata.clone()).await? else {
                     return Ok(None);
                 };
                 let (published_parent, published_revision) =
@@ -3557,14 +3652,16 @@ impl MiningBackend for Coordinator {
                     return Ok(None);
                 }
                 self.ensure_job_fee_current(metadata.record.fee).await?;
-                let prepared = flight
-                    .reconstruction(
+                let prepared = waiting::follow(
+                    flight.waiting(),
+                    flight.reconstruction(
                         self,
                         stored.prepared_key.clone(),
                         metadata,
                         stored.extranonce2_size,
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 if !deadline.live()
                     || self
                         .revalidate_issuance_authority(

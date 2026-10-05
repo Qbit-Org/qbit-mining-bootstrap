@@ -957,9 +957,100 @@ capability refuses older binaries at every later connect; it cannot evict one
 that is already running. Start only post-021 binaries after the commit.
 Removing the capability or the columns is not a supported downgrade.
 
-**Not changed.** CTV fanout claims (`qbit_ctv_fanout_artifacts.claim_expires_at`,
-`next_broadcast_attempt_at`) still compare with the database clock, so a
-step stretches or shortens them as it did candidate claims before 021.
+CTV fanout claims follow the same contract since 022; see the next section.
+
+## CTV fanout claim leases and database clock steps (022, #654)
+
+Before 022 a CTV fanout claim was decided as candidate claims were before
+021: the claim lane took a fanout once `claim_expires_at` was before
+`clock_timestamp()` and its `next_broadcast_attempt_at` was due, and every
+write the holder made required `claim_expires_at` in the future. A forward
+database clock step made a live claim look expired: another frontend took the
+fanout over and broadcast the identical transaction (the node deduplicates
+it), and the holder's settlement write was refused and the attempt retried.
+A backward step made a dead holder's claim wait lease + step, and an attempt
+or a confirmation check scheduled before the step wait its delay + step.
+Nothing was broadcast twice in a way the node does not deduplicate; the cost
+was liveness. Since 022 a fanout claim is timed exactly as a candidate claim
+is (previous section):
+
+- **Leases.** A claim's version is (`claim_token`, `claim_renewals`) on
+  `qbit_ctv_fanout_artifacts`, and its lease `claim_lease_seconds` (1 to
+  600; the broadcaster takes 120 at every claim and renewal). Every fanout
+  claim poll (`Ledger::fanout_claim_survey_sql`) reads every claimed fanout's
+  version through the `qbit_ctv_fanout_artifacts_claimed_idx` partial index,
+  and a frontend takes a claimed fanout over only once it has watched the same
+  version for the whole lease on its own monotonic clock, by compare and set
+  on that version (`FOR UPDATE SKIP LOCKED`, so a holder's fenced write that
+  holds the row is never taken over mid-commit). The takeover runs before
+  the lane, which takes only unclaimed, due fanouts. A claimed fanout is taken
+  over whatever its schedule (the one it was due at when claimed, on the
+  clock of that moment), unless it is held at `infinity`.
+- **Holder.** Every write the holder makes (renewal, scan progress, CPFP
+  reservation, package and wallet cleanup, settlement and the hand-backs) is
+  fenced on its token alone. Its lease is its own monotonic deadline: one
+  attempt runs for at most 90 seconds, less than the 120-second lease every
+  renewal takes, and every renewal is sent inside the attempt, so the attempt
+  ends before any observer can end the lease of any version it wrote. Its
+  completion after that deadline is a compare and set on the token, refused
+  once a takeover has replaced it.
+- `claim_expires_at` is still written, as the database clock's estimate of
+  the lease's end, for operators. No decision reads it.
+
+What this costs is what it costs candidates: a frontend that starts while a
+dead holder's claim is in the table times it from its own first poll, so that
+takeover comes up to one lease (120 s) later than the claim's true end, never
+earlier. The one-shot `broadcast-ctv` times claims from its own first poll
+too, so within one pass it takes over only a revoked claim; a running
+frontend's broadcaster takes over a dead one's. To push a dead holder's
+fanout with `broadcast-ctv` while no frontend is running, revoke its claim
+first, as below. A claim taken before 022, which recorded no lease, is timed
+as the 600-second maximum.
+
+**Attempts and checks.** Every statement that schedules
+`next_broadcast_attempt_at` writes `updated_at` from the same database clock.
+Each fanout claim poll makes due, at once, every unclaimed fanout the lane
+could take whose last write is later than the clock now, which proves the
+clock stepped back (it logs `CTV fanout attempts were last scheduled later
+than the database clock reads now, so the clock stepped back`). A claim handed
+back at shutdown (`release_fanout_claim`) keeps its schedule, but never later
+than the clock: the fanout was due when it was claimed, and the release's own
+`updated_at` would otherwise hide a step from every claim poll. A backward
+step therefore delays an attempt or a confirmation check by less than its own
+delay, never by the step; a forward step makes them due early. A fanout held
+at `infinity` is never made due, and a schedule set far ahead without a later
+`updated_at` (a test or operator hold) stays held while the fanout is
+unclaimed. A claimed fanout is held only at `infinity`: its own schedule is no
+hold, because after a backward step it reads ahead although its holder died,
+so the takeover does not wait for it.
+
+**Revoking a claim.** `ledger::revoke_fanout_claims` sets
+`claim_lease_seconds = 0` (and moves `claim_expires_at` into the past), so the
+next frontend to read the claim takes it over at once; the holder's token
+stays until then. The fanout tests use it where waiting out a real lease is
+not deterministic. An operator may run the same statement only once the
+holder is known to be gone:
+
+```sql
+UPDATE qbit_ctv_fanout_artifacts
+SET claim_lease_seconds = 0,
+    claim_expires_at = LEAST(claim_expires_at, clock_timestamp() - interval '1 second')
+WHERE fanout_txid = '<txid>' AND claim_token IS NOT NULL;
+```
+
+**Upgrade (offline, per D5).** 022 adds the two columns, the
+`qbit_ctv_fanout_artifacts_claimed_idx` partial index and the
+`fanout_claim_observed_lease = 1` capability. A pre-022 frontend or
+`broadcast-ctv` takes fanout claims over by the database clock and never
+writes the columns a post-022 one times, so the two must never run together.
+Upgrade exactly as for 021, and together with it when both are pending: stop
+every earlier frontend and one-shot tool, disable automatic restarts, and let
+every `qbit_prism_instances` row report `stopped` or `drained`; the migrator
+refuses any other instance before applying 022 and holds the registration
+lock through the commit. The capability refuses older binaries at every later
+connect; it cannot evict one that is already running. Start only post-022
+binaries after the commit. Removing the capability or the columns is not a
+supported downgrade.
 
 ## Chain observation epoch upgrade (018)
 
@@ -1461,7 +1552,10 @@ qbit-prism-server broadcast-ctv
 
 The integrated periodic worker uses `PRISM_CTV_BROADCASTER_ENABLED=1`. An optional
 CPFP wallet and fee configuration must be consistent with the intended operating
-policy. Durable claims coordinate work across instances; node RPCs may still
+policy. Durable claims coordinate work across instances, timed on each
+frontend's monotonic clock rather than the database clock (see
+[CTV fanout claim leases](#ctv-fanout-claim-leases-and-database-clock-steps-022-654));
+node RPCs may still
 receive an identical transaction more than once after a lost reply. The one-shot
 `broadcast-ctv` verifies the node, the schema and the cluster fingerprint like a
 frontend but registers no heartbeat: its claims are fenced by their own claim

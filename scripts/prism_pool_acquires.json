@@ -82,8 +82,8 @@
     },
     "claim-revocation": {
       "class": "operator",
-      "owner": "candidate claim tests and operators",
-      "reason": "Generic Executor helper that revokes candidate claims (#581): the lease tests and an operator pass a pool or their own transaction; no run frontend call."
+      "owner": "candidate and fanout claim tests and operators",
+      "reason": "Generic Executor helpers that revoke candidate claims (#581) and CTV fanout claims (#654): the lease tests and an operator pass a pool or their own transaction; no run frontend call."
     },
     "shielded-begin": {
       "class": "borrowed",
@@ -202,6 +202,7 @@
     "ledger/candidates.rs::claim_candidate_for_recovery#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::release_recovery_token#1::self .begin()": [1,"ledger"],
     "ledger/candidates.rs::revoke_candidate_claims#1::execute(executor)": [1,"claim-revocation"],
+    "ledger/fanout.rs::revoke_fanout_claims#1::execute(executor)": [1,"claim-revocation"],
     "ledger/connect.rs::release#1::pool .acquire() [timer: self . metrics . as_deref ( )]": [1,"timer"],
     "ledger/connect.rs::drop#2::pool .acquire() [timer: metrics . as_deref ( )]": [1,"timer"],
     "ledger/connect.rs::begin#1::shielded_begin(self . acquire ( ) . await ?)": [1,"shielded-begin"],
@@ -317,6 +318,7 @@
     "stratum.rs::prepare_job#1::match config . rebuild_job_limit .try_acquire()": [1,"non-database"],
     "stratum.rs::request#1::begin(metrics , is_submit , received_at)": [1,"non-database"],
     "stratum.rs::run_listener#1::config . connection_limit .try_acquire()": [1,"non-database"],
+    "stratum.rs::timed_out#1::database(message)": [1,"non-database"],
     "tools.rs::prepare#1::run(command , transition)": [1,"non-database"],
     "tools.rs::run#1::run(Config :: from_env ( ) ?)": [1,"non-database"],
     "tools.rs::run#1::audit_completeness(& ledger . pool)": [1,"operator"],

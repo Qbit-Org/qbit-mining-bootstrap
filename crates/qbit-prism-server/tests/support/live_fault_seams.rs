@@ -429,10 +429,11 @@ pub(crate) fn frontend_index(instance: &str) -> Result<usize> {
 }
 
 /// Mark the dead owner's lease on `table`'s row `key_column = key` as
-/// expired, which is what the lease would be after its 120 s: for a fanout,
-/// the claim query's own `claim_expires_at<=clock_timestamp()` predicate
-/// then hands the row to a survivor; a candidate claim is revoked as well.
-/// Refused unless `owner` still holds it, so a live claim is never cut short.
+/// expired, which is what the lease would be after its 120 s: the database
+/// clock's estimate moves into the past, and the claim, a candidate's or a
+/// fanout's, is revoked, so a survivor takes it over at its next claim poll
+/// (#581, #654). Refused unless `owner` still holds it, so a live claim is
+/// never cut short.
 pub(crate) async fn expire_dead_lease(
     fixture: &Fixture,
     table: &str,
@@ -452,11 +453,18 @@ pub(crate) async fn expire_dead_lease(
         expired == 1,
         "the dead owner {owner} does not hold the claim on {key}"
     );
-    // #581: a candidate claim is taken over once a survivor has watched it go
-    // unrenewed for its lease, never by the database clock; revoking it is
-    // what lets the survivor take it at once.
-    if table == "qbit_block_candidate_outbox" {
-        qbit_prism_server::ledger::revoke_candidate_claims(&fixture.pool, Some(key), false).await?;
+    // #581, #654: a candidate or CTV fanout claim is taken over once a
+    // survivor has watched it go unrenewed for its lease, never by the
+    // database clock; revoking it is what lets the survivor take it at once.
+    match table {
+        "qbit_block_candidate_outbox" => {
+            qbit_prism_server::ledger::revoke_candidate_claims(&fixture.pool, Some(key), false)
+                .await?;
+        }
+        "qbit_ctv_fanout_artifacts" => {
+            qbit_prism_server::ledger::revoke_fanout_claims(&fixture.pool, Some(key)).await?;
+        }
+        _ => {}
     }
     Ok(())
 }

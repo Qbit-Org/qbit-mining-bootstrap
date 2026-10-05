@@ -29,6 +29,7 @@ pub use audit::{
 mod candidates;
 #[cfg(test)]
 pub(crate) use candidates::faults as candidate_faults;
+mod claim_observer;
 use candidates::prepare_candidate_observed;
 pub use candidates::revoke_candidate_claims;
 pub use candidates::{
@@ -50,6 +51,7 @@ pub use divergence::{
     rows_divergence, AccountOverpay, CarryRow, LandingDivergence, OfferReservation, OverpayBound,
 };
 mod fanout;
+pub use fanout::revoke_fanout_claims;
 mod fatal_state;
 mod instances;
 mod policy_transition;
@@ -117,7 +119,10 @@ pub struct Ledger {
     /// The candidate claims this frontend has watched, each timed on its own
     /// monotonic clock (#581). Shared across clones: one process, one clock
     /// per claim.
-    claim_observer: std::sync::Arc<candidates::ClaimObserver>,
+    claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
+    /// The CTV fanout claims this frontend has watched, timed the same way
+    /// (#654).
+    fanout_claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
     #[cfg(test)]
     pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
     #[cfg(test)]

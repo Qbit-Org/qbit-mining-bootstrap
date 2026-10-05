@@ -154,30 +154,33 @@ impl Coordinator {
     ) -> Result<IssuedJobSave> {
         let revision = self.revalidate_issued(issued).await?;
         let prepared = &issued.job.context.prepared;
+        // #655: both writes are database steps for a session's deadline. The
+        // batcher does nothing but write batches, and its slots are held by
+        // entries waiting on those writes, so waiting for one is waiting on
+        // the database as well. The repair's lock, build admission and
+        // encoding in `save_issued` are not marked.
         let saved = if repair.is_none() {
-            self.issued_batcher
-                .save(
-                    &issued.job.wire.job_id,
-                    &issued.payload,
-                    revision,
-                    &issued.job.wire.previousblockhash,
-                    issued.expires_at_ms,
-                    prepared.reservation.dependency(&prepared.storage_key),
-                    issued.deadline.instant().into(),
-                )
-                .await?
+            on_database(self.issued_batcher.save(
+                &issued.job.wire.job_id,
+                &issued.payload,
+                revision,
+                &issued.job.wire.previousblockhash,
+                issued.expires_at_ms,
+                prepared.reservation.dependency(&prepared.storage_key),
+                issued.deadline.instant().into(),
+            ))
+            .await?
         } else {
-            self.work_ledger
-                .save_issued_job_compact(
-                    &issued.job.wire.job_id,
-                    &issued.payload,
-                    revision,
-                    &issued.job.wire.previousblockhash,
-                    issued.expires_at_ms,
-                    prepared.reservation.dependency(&prepared.storage_key),
-                    repair,
-                )
-                .await?
+            on_database(self.work_ledger.save_issued_job_compact(
+                &issued.job.wire.job_id,
+                &issued.payload,
+                revision,
+                &issued.job.wire.previousblockhash,
+                issued.expires_at_ms,
+                prepared.reservation.dependency(&prepared.storage_key),
+                repair,
+            ))
+            .await?
         };
         if saved == IssuedJobSave::Saved {
             // A transaction may leave an immutable row after revocation, but

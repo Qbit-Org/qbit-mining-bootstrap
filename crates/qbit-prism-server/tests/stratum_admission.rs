@@ -122,6 +122,37 @@ async fn timed_out_consumed_allocation_returns_error_then_reconnect_uses_fresh_i
     server.stop().await;
 }
 
+/// #655: a session timeout is labelled by the step the backend was waiting
+/// on. A backend that names it as the ledger database's gets
+/// `backend-database-unavailable`; the unmarked stall above keeps the node's
+/// `backend-rpc-unavailable`.
+#[tokio::test]
+async fn an_allocation_timeout_in_a_database_step_is_the_databases() {
+    let backend = Arc::new(Backend::default());
+    backend.stall_on_database_once.store(true, Ordering::SeqCst);
+    let server = Server::start(
+        StratumConfig {
+            initial_job_timeout_seconds: 0.1,
+            ..Default::default()
+        },
+        backend,
+    )
+    .await;
+    let mut client = Client::connect(&server).await;
+    client.send(subscribe(1)).await;
+    server.backend.allocation_started.notified().await;
+    let failed = client.read().await;
+    assert!(failed["result"].is_null(), "{failed}");
+    assert_eq!(failed["error"][1], "session allocation timed out");
+    assert_eq!(
+        failed["error"][2]["reason_id"],
+        "backend-database-unavailable"
+    );
+    server.backend.allocation_release.notify_one();
+    drop(client);
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn reset_connection_errors_are_structured_tracing_events() {
     use std::{io::Write, sync::Mutex};
