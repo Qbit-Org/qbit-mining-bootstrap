@@ -570,6 +570,9 @@ services:
       PRISM_BLOCKWAIT_ENABLED: ${PRISM_BLOCKWAIT_ENABLED:-1}
       PRISM_RPC_TIMEOUT_SECONDS: ${PRISM_RPC_TIMEOUT_SECONDS:-15}
       PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS: ${PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS:-1}
+      # #291 rehearsal kill switch: 0 holds every found block pending, never
+      # calls submitblock and keeps the CTV broadcaster stopped; 1 in production.
+      PRISM_BLOCK_SUBMIT_ENABLED: ${PRISM_BLOCK_SUBMIT_ENABLED:-1}
       PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS: ${PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS:-6}
       PRISM_CAPTURE_OVERPAY_CEILING_BPS: ${PRISM_CAPTURE_OVERPAY_CEILING_BPS:-100}
       # #529: set to the dedicated failover standby's application_name (and

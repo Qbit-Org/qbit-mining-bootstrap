@@ -326,10 +326,12 @@ impl Ledger {
             let online =
                 migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
             tx.commit().await?;
-            // Index rebuilds run after the commit, outside any transaction
-            // and with CONCURRENTLY, so appends continue; each is recorded
-            // once it has completed, and the gate below refuses the
-            // database until then.
+            // 002's share-hash backfill on a populated 2.x.x source, then the
+            // index rebuilds and the partition conversion, run after the
+            // commit, outside the migration transaction: the backfill in
+            // bounded batches, the rebuilds with CONCURRENTLY so appends
+            // continue. Each is recorded once it has completed, and the gate
+            // below refuses the database until then.
             for pending in &online {
                 migration::apply_online_migration(&pool, pending, metrics.as_deref()).await?;
             }

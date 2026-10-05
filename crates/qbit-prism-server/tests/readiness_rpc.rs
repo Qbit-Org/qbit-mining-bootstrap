@@ -400,6 +400,7 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(5),
         block_submit_timeout: Duration::from_secs(1),
+        block_submit_enabled: true,
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,

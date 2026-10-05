@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use num_bigint::BigUint;
 use qbit_prism_server::codec::{
-    difficulty_target, double_sha256, parse_u32_hex, target_from_compact,
+    difficulty_target, double_sha256, hash_display, parse_u32_hex, target_from_compact,
 };
 use serde_json::{json, Value};
 use std::{
@@ -137,7 +137,8 @@ struct Solution {
     extranonce2: String,
     ntime: u32,
     nonce: u32,
-    block: bool,
+    /// A block-target solution's hash and its parent's, in display order.
+    block: Option<(String, String)>,
 }
 
 struct MiningBudget {
@@ -186,7 +187,8 @@ fn mine(
                 break;
             }
             header[76..80].copy_from_slice(&nonce.to_le_bytes());
-            let hash = BigUint::from_bytes_le(&double_sha256(&header));
+            let digest = double_sha256(&header);
+            let hash = BigUint::from_bytes_le(&digest);
             let block = hash <= current.network_target;
             if hash <= current.share_target || (below_floor && block) {
                 let _ = solutions.try_send(Solution {
@@ -194,7 +196,7 @@ fn mine(
                     extranonce2: extranonce2.clone(),
                     ntime: current.ntime,
                     nonce,
-                    block,
+                    block: block.then(|| (hash_display(&digest), hash_display(&current.previous))),
                 });
             }
             attempted += 1;
@@ -339,7 +341,9 @@ async fn main() -> Result<()> {
                         format!("{:08x}",solution.ntime),format!("{:08x}",solution.nonce)]});
                     timeout(Duration::from_secs(5),writer.write_all(format!("{request}\n").as_bytes())).await??;
                     pending.insert(next_id);next_id+=1;submitted+=1;last_submit=Some(Instant::now());
-                    println!("{}",json!({"event":"submit","block_target_met":solution.block,"request_id":next_id-1}));
+                    let mut event=json!({"event":"submit","block_target_met":solution.block.is_some(),"request_id":next_id-1});
+                    if let Some((hash,parent))=&solution.block {event["block_hash"]=json!(hash);event["previousblockhash"]=json!(parent);}
+                    println!("{event}");
                 }
             }
         }

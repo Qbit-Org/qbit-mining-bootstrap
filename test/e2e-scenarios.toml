@@ -866,7 +866,7 @@ tests = [
   "qbit-prism-server::migration_rollback::cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance",
   "qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation",
 ]
-notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/32 of the rows (1/16 once #582 is fixed) on a real regtest chain, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
+notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/16 of the rows (about 4.1M) on a real regtest chain, at the server's default statement timeout, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
 
 [[scenario]]
 id = "shipped-image-lane"

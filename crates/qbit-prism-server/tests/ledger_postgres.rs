@@ -47,6 +47,9 @@ mod index_trim;
 #[path = "support/share_partitions.rs"]
 mod share_partitions;
 
+#[path = "support/share_hash_backfill.rs"]
+mod share_hash_backfill;
+
 #[path = "support/policy_transition.rs"]
 mod policy_transition;
 

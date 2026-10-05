@@ -136,13 +136,23 @@ fn median(values: &mut [u64]) -> Option<u64> {
     Some(values[values.len() / 2])
 }
 
-/// The block solutions a miner found and what the pool answered, from its
-/// JSON-lines log: `(found, accepted, refusal messages)`.
-fn miner_blocks(log: &std::path::Path) -> Result<(usize, usize, Vec<String>)> {
+/// The block solutions a miner found and what the pool answered.
+struct MinerBlocks {
+    found: usize,
+    accepted: usize,
+    /// The pool's refusal messages.
+    refused: Vec<String>,
+    /// The parent each block was found on, by block hash (display order).
+    parents: HashMap<String, String>,
+}
+
+/// [`MinerBlocks`] from a miner's JSON-lines log.
+fn miner_blocks(log: &std::path::Path) -> Result<MinerBlocks> {
     let text = std::fs::read_to_string(log)?;
     let mut block_requests = std::collections::HashSet::new();
     let mut accepted = 0;
     let mut refused = Vec::new();
+    let mut parents = HashMap::new();
     for line in text.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -151,6 +161,12 @@ fn miner_blocks(log: &std::path::Path) -> Result<(usize, usize, Vec<String>)> {
             Some("submit") if event["block_target_met"] == true => {
                 if let Some(id) = event["request_id"].as_u64() {
                     block_requests.insert(id);
+                }
+                if let (Some(hash), Some(parent)) = (
+                    event["block_hash"].as_str(),
+                    event["previousblockhash"].as_str(),
+                ) {
+                    parents.insert(hash.to_owned(), parent.to_owned());
                 }
             }
             Some("share")
@@ -167,7 +183,12 @@ fn miner_blocks(log: &std::path::Path) -> Result<(usize, usize, Vec<String>)> {
             _ => {}
         }
     }
-    Ok((block_requests.len(), accepted, refused))
+    Ok(MinerBlocks {
+        found: block_requests.len(),
+        accepted,
+        refused,
+        parents,
+    })
 }
 
 /// `(le, cumulative count)` buckets of one labelled histogram series, summed
@@ -307,13 +328,15 @@ pub(super) async fn soak(fixture: &mut Fixture, seconds: u64, budget: f64) -> Re
     let mut found = 0;
     let mut accepted = 0;
     let mut refused: BTreeMap<String, usize> = BTreeMap::new();
+    let mut parents = HashMap::new();
     for miner in &fixture.miners {
-        let (f, a, r) = miner_blocks(&miner.log)?;
-        found += f;
-        accepted += a;
-        for reason in r {
+        let blocks = miner_blocks(&miner.log)?;
+        found += blocks.found;
+        accepted += blocks.accepted;
+        for reason in blocks.refused {
             *refused.entry(reason).or_default() += 1;
         }
+        parents.extend(blocks.parents);
     }
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT block_hash,state,offer_outcome FROM qbit_block_candidate_outbox ORDER BY created_at",
@@ -411,22 +434,27 @@ pub(super) async fn soak(fixture: &mut Fixture, seconds: u64, budget: f64) -> Re
             reason.as_deref() == Some("parent superseded"),
             "candidate {hash} was abandoned for {reason:?}, not a superseded parent"
         );
-        let height: i64 = sqlx::query_scalar(
-            "SELECT template_height::bigint FROM qbit_share_ledger WHERE share_id LIKE '%:' || $1",
-        )
-        .bind(hash)
-        .fetch_one(&fixture.pool)
-        .await
-        .with_context(|| format!("abandoned candidate {hash} has no share row"))?;
+        // Its height from the parent its miner built it on, not from its
+        // share: a block captured on superseded payout work (#478) has no
+        // credited share, its share deferred until the block confirms (never,
+        // once abandoned) or, from block-only work, never credited.
+        let parent = parents
+            .get(hash)
+            .with_context(|| format!("abandoned candidate {hash} is no block a miner found"))?;
+        let height = fixture.rpc("getblockheader", json!([parent])).await?["height"]
+            .as_i64()
+            .with_context(|| {
+                format!("abandoned candidate {hash}: parent {parent} has no height")
+            })?
+            + 1;
         let winner: String =
-            serde_json::from_value(fixture.rpc("getblockhash", json!([height + 1])).await?)?;
+            serde_json::from_value(fixture.rpc("getblockhash", json!([height])).await?)?;
         ensure!(
             winner != *hash
                 && rows
                     .iter()
                     .any(|(row, state, _)| *row == winner && state == "submitted"),
-            "abandoned candidate {hash}: height {} is held by {winner}, not a landed pool block",
-            height + 1
+            "abandoned candidate {hash}: height {height} is held by {winner}, not a landed pool block"
         );
     }
     ensure!(

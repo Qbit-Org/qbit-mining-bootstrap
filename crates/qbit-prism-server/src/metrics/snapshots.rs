@@ -117,6 +117,11 @@ impl Metrics {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.set(Family::WorkRefreshStalled, vec![], age.as_secs_f64());
     }
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` (#291), a fixed setting of the process.
+    pub fn publish_block_submission(&self, enabled: bool) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(Family::BlockSubmission, vec![], u8::from(enabled).into());
+    }
     /// #622: the age of the readiness proof admission reads, or unknown
     /// (-1) while readiness is revoked or was never established. Distinct
     /// from `publish_work_refresh_stalled`: a frontend whose rebuilds stall
@@ -323,6 +328,19 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+    /// #291: the kill switch is visible to a scrape, so an alert can page on
+    /// a frontend left holding its blocks.
+    #[test]
+    fn block_submission_gauge_follows_the_kill_switch() {
+        let metrics = Metrics::default();
+        let gauge =
+            |metrics: &Metrics| sample(&metrics.render(), "qbit_prism_block_submission_enabled");
+        assert_eq!(gauge(&metrics), -1., "unknown, never on, until published");
+        metrics.publish_block_submission(false);
+        assert_eq!(gauge(&metrics), 0.);
+        metrics.publish_block_submission(true);
+        assert_eq!(gauge(&metrics), 1.);
     }
     #[test]
     fn collector_expiry_and_failure_preserve_last_success_time_without_fabricating_values() {

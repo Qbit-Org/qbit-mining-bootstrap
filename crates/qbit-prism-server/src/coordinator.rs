@@ -363,16 +363,21 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 
 /// Why the one `submitblock` call provably did not run on the node, if it
 /// did not: its connection was never established, so no byte of it left this
-/// process (`rpc::RpcNotSentError`, #522), or the node answered it with
-/// `RPC_IN_WARMUP`, which qbitd returns before it dispatches any call
-/// (`rpc::RpcReplyError::in_warmup`, #526). Only a `submitblock` reply
-/// counts: a warmup answer to another call says nothing about this one.
-/// Every other result, any other error code, a transport failure after the
-/// connection existed or a timeout included, may have run and is `None`.
+/// process (`rpc::RpcNotSentError`, #522), the client refused to send it
+/// under `PRISM_BLOCK_SUBMIT_ENABLED` (`rpc::RpcRelayRefused`, #291), or the
+/// node answered it with `RPC_IN_WARMUP`, which qbitd returns before it
+/// dispatches any call (`rpc::RpcReplyError::in_warmup`, #526). Only a
+/// `submitblock` reply counts: a warmup answer to another call says nothing
+/// about this one. Every other result, any other error code, a transport
+/// failure after the connection existed or a timeout included, may have run
+/// and is `None`.
 fn offer_not_executed(result: &Result<Value>) -> Option<String> {
     let error = result.as_ref().err()?;
     if let Some(not_sent) = error.downcast_ref::<crate::rpc::RpcNotSentError>() {
         return Some(not_sent.to_string());
+    }
+    if let Some(refused) = error.downcast_ref::<crate::rpc::RpcRelayRefused>() {
+        return Some(refused.to_string());
     }
     error
         .downcast_ref::<crate::rpc::RpcReplyError>()
@@ -874,6 +879,13 @@ impl Coordinator {
             config.rpc_password.clone(),
             config.rpc_timeout,
         )?;
+        // #291: whatever calls it, a held frontend's node client and every
+        // wallet client made from it refuse to relay a block or a transaction.
+        let rpc = if config.block_submit_enabled {
+            rpc
+        } else {
+            rpc.without_relay()
+        };
         if let Some(address) = &config.fee_address {
             let validation = rpc.call("validateaddress", json!([address])).await?;
             let script = validation["scriptPubKey"]
@@ -2643,6 +2655,14 @@ impl Coordinator {
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
+        // #291: a frontend with PRISM_BLOCK_SUBMIT_ENABLED off processes no
+        // claim. Its submit loop takes none; any other caller is refused here,
+        // before the probe, the reservation or a settlement, so the row stays
+        // as it is and its block never reaches the node.
+        self.config.require_block_submission(format_args!(
+            "block {} was not processed",
+            claim.candidate.block_hash
+        ))?;
         match claim.lifecycle.state {
             CandidateState::Pending => self.offer_candidate(claim, lease).await,
             // A reservation this or another frontend took and never recorded
@@ -3134,7 +3154,23 @@ impl Coordinator {
     }
 
     pub async fn submit_loop(self: Arc<Self>, shutdown: watch::Receiver<bool>) {
+        if !self.config.block_submit_enabled {
+            return Self::hold_candidates(shutdown).await;
+        }
         self.submit_loop_with(CANDIDATE_LEASE, shutdown).await
+    }
+
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` off (#291): claim nothing until shutdown.
+    /// Every unfinished row stays as it is, a found block `pending`, counted
+    /// by the candidate gauges and left for a frontend with submission
+    /// enabled; nothing reaches the node's `submitblock`.
+    async fn hold_candidates(mut shutdown: watch::Receiver<bool>) {
+        tracing::warn!(
+            "{}; the submit loop claims no candidate",
+            crate::config::BLOCK_SUBMIT_DISABLED
+        );
+        // As in the drain, any change or a closed channel ends the hold.
+        let _ = shutdown.changed().await;
     }
 
     async fn submit_loop_with(
@@ -3231,7 +3267,7 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
         else {
             unreachable!("coordinator health fields are an object");
         };
