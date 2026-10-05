@@ -1084,7 +1084,9 @@ async fn drive(
                 .lock()
                 .expect("collector lock")
                 .sample_holding_work(second);
-            next_sample += Duration::from_secs(1);
+            // The next whole second from now: a suspended process does not
+            // sample once a tick for every second it missed.
+            next_sample = now + Duration::from_secs(1);
         }
         if !progress.is_zero() && now >= next_progress {
             let (accepted, rejected, no_response, holding) = {
@@ -1110,7 +1112,9 @@ async fn drive(
                 sessions.len()
             );
             last_progress = (now, offers.minted, accepted);
-            next_progress += progress;
+            // From now, not from the missed deadline, so a process resumed
+            // after a pause prints one line, not one per interval it slept.
+            next_progress = now + progress;
         }
     }
     // A window that ran its length ends at its length, or where its last

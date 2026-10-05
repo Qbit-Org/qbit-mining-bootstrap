@@ -1408,6 +1408,17 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
                 own.map_or_else(|| "more than u64::MAX".to_owned(), |own| own.to_string())
             );
         }
+        // Each session's first connection is one.
+        let sessions = these.iter().try_fold(0u64, |total, process| {
+            total.checked_add(process.sessions as u64)
+        });
+        ensure!(
+            sessions.is_some_and(|sessions| these_totals.initial_connections <= sessions),
+            "{} holds inconsistent totals: {} initial connections for {} sessions",
+            path.display(),
+            these_totals.initial_connections,
+            sessions.map_or_else(|| "more than u64::MAX".to_owned(), |s| s.to_string())
+        );
         processes.extend(these);
         totals
             .merge(&these_totals)
@@ -1445,8 +1456,7 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
     // part of some process's load and would read as a dip.
     let steady: Vec<&Second> = match overlap {
         Some((start, end)) => {
-            let first = start.div_euclid(1000) + 1;
-            let last = end.div_euclid(1000) - 1;
+            let (first, last) = whole_seconds(start, end);
             totals
                 .timeline
                 .seconds()
@@ -1456,7 +1466,10 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         None => Vec::new(),
     };
     let steady_seconds = match overlap {
-        Some((start, end)) => (end.div_euclid(1000) - start.div_euclid(1000) - 1).max(0),
+        Some((start, end)) => {
+            let (first, last) = whole_seconds(start, end);
+            (last - first + 1).max(0)
+        }
         None => 0,
     };
     let steady_rate = if steady_seconds > 0 {
@@ -1596,6 +1609,14 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         },
         "client_failures": totals.client_failures,
     })
+}
+
+/// The first and last whole wall-clock seconds inside `[start, end)`, in
+/// milliseconds: a second that starts exactly at `start` is whole, and one
+/// that ends exactly at `end` is too.
+fn whole_seconds(start: i64, end: i64) -> (i64, i64) {
+    let first = start.div_euclid(1000) + i64::from(start.rem_euclid(1000) != 0);
+    (first, end.div_euclid(1000) - 1)
 }
 
 fn rfc3339(unix_ms: i64) -> String {

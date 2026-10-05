@@ -906,6 +906,18 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("offers minted, more than"), "{error}");
+    let mut initial = read(&a);
+    initial["processes"][0]["sessions"] = json!(1);
+    let path = scratch.path("initial.json");
+    external::write_document(&path, &initial)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(
+        error.contains("initial connections for 1 sessions"),
+        "{error}"
+    );
     let mut windowless = read(&a);
     windowless["processes"][0]["window"] = Value::Null;
     let path = scratch.path("windowless.json");
