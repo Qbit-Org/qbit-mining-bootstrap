@@ -58,7 +58,8 @@ use std::{collections::BTreeMap, path::Path};
 
 /// Shares each serving server mines per phase.
 const PHASE_SHARES: usize = 5;
-/// How long a server has to serve work on the current tip in a phase.
+/// How long a server has to serve work on the current tip in a phase,
+/// settling included.
 const WORK_SECONDS: u64 = 30;
 /// How long a held landing stays held after its clock jump.
 const HOLD_AFTER_JUMP: Duration = Duration::from_secs(8);
@@ -256,17 +257,17 @@ enum Served {
     NoWork(String),
 }
 
-/// Mine `PHASE_SHARES` shares and one block on `server`, on the current
-/// tip, and wait for the block on the node. Every share and the block must be
-/// accepted.
-async fn mine_on(f: &Fixture, server: usize, label: &str) -> Result<Served> {
+/// Mine `PHASE_SHARES` shares and one block on `server`, on work on the
+/// current tip by `deadline`, and wait for the block on the node. Every share
+/// and the block must be accepted.
+async fn mine_on(f: &Fixture, server: usize, label: &str, deadline: Instant) -> Result<Served> {
     let tip = f.rpc("getbestblockhash", json!([])).await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
     let username = format!("{}.clock-{server}", f.address);
     let current = async {
         let mut client = ShareClient::connect(f.stratum[server], &username).await?;
         client
-            .work_on(&tip, Duration::from_secs(WORK_SECONDS))
+            .work_on(&tip, deadline.saturating_duration_since(Instant::now()))
             .await?;
         Ok::<_, anyhow::Error>(client)
     };
@@ -319,10 +320,11 @@ impl Run {
     /// Mine on `server` in a phase where it must serve work, once its work
     /// is settled, and keep what it did.
     async fn mine(&mut self, f: &Fixture, server: usize, label: &str) -> Result<()> {
-        f.settled(server)
+        let deadline = Instant::now() + Duration::from_secs(WORK_SECONDS);
+        f.settled(server, WORK_SECONDS)
             .await
             .with_context(|| format!("{label}: server {server} before mining"))?;
-        match mine_on(f, server, label).await? {
+        match mine_on(f, server, label, deadline).await? {
             Served::NoWork(why) => bail!("{label}: server {server} served no current work: {why}"),
             Served::Mined { submitted, block } => {
                 self.submitted.extend(
@@ -443,7 +445,8 @@ async fn held_landing(
     offset: i64,
     label: &str,
 ) -> Result<()> {
-    f.settled(holder)
+    let deadline = Instant::now() + Duration::from_secs(WORK_SECONDS);
+    f.settled(holder, WORK_SECONDS)
         .await
         .with_context(|| format!("{label}: server {holder} before its held block"))?;
     let held = proxy.arm();
@@ -452,7 +455,7 @@ async fn held_landing(
     let username = format!("{}.clock-held-{holder}", f.address);
     let mut client = ShareClient::connect(f.stratum[holder], &username).await?;
     client
-        .work_on(&tip, Duration::from_secs(WORK_SECONDS))
+        .work_on(&tip, deadline.saturating_duration_since(Instant::now()))
         .await?;
     // The block's answer waits for its landing, which the proxy holds:
     // submit it concurrently.
@@ -550,7 +553,8 @@ async fn jumps(
         let ahead = format!("server {server} {}", span(seconds));
         move_server(f, clocks, &mut highest, server, seconds).await?;
         run.mine(f, other, &ahead).await?;
-        let Served::NoWork(why) = mine_on(f, server, &ahead).await? else {
+        let deadline = Instant::now() + Duration::from_secs(WORK_SECONDS);
+        let Served::NoWork(why) = mine_on(f, server, &ahead, deadline).await? else {
             bail!("{ahead}: server {server} served work on a template its clock calls stale");
         };
         run.notes.push(format!(

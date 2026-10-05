@@ -766,11 +766,12 @@ impl Fixture {
     /// on work from before a move passes its submit check and is then refused
     /// at the append's revision fence as `ledger-confirmation-failed`
     /// ("payout revision changed before share commit", #632). A case that
-    /// needs every share accepted mines only on settled work.
-    async fn settled(&self, index: usize) -> Result<()> {
+    /// needs every share accepted mines only on settled work, waiting at
+    /// most `seconds` for it.
+    async fn settled(&self, index: usize, seconds: u64) -> Result<()> {
         until(
             &format!("server {index} on the node's tip and payout revision"),
-            30,
+            seconds,
             || async {
                 let landing: i64 = sqlx::query_scalar(&format!(
                     "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",

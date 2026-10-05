@@ -293,7 +293,7 @@ fn superseded(answer: &Value) -> bool {
 /// and has landed, so a recorded accepted submit cannot meet the revision
 /// fence ([`Fixture::settled`]).
 async fn current(fixture: &Fixture) -> Result<()> {
-    fixture.settled(0).await
+    fixture.settled(0, 30).await
 }
 
 async fn replay(fixture: &Fixture, transcript: &Transcript) -> Result<Replayed> {
