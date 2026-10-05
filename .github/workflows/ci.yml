@@ -357,12 +357,31 @@ jobs:
           POSTGRES_PASSWORD: prism_test
         ports:
           - 5432:5432
+        # This service's data directory is a tmpfs. fsync, full_page_writes
+        # and synchronous_commit stay on (the ledger refuses a server without
+        # the first two, and the fixtures check all three), but a flush costs
+        # nothing, so its commits no longer queue behind Cargo's writeback or
+        # a neighbour's disk on the shared host. The disposable clusters some
+        # tests start from PRISM_TEST_PG_BIN_DIR stay on disk. Measured over
+        # all four shards, the container peaked at 0.8 GB of memory, tmpfs
+        # included; the cap is half of the runner's 8 GB.
         options: >-
           --health-cmd "pg_isready -U prism_test -d prism_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
+          --tmpfs /var/lib/postgresql/data:rw,size=4g
     env:
       PRISM_TEST_DATABASE_URL: postgresql://prism_test:prism_test@127.0.0.1:5432/prism_test
       PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      # The statement_timeout of the ledger pools the tests open in process
+      # (Ledger::connect reads it). Production keeps its 15 s default, and so
+      # do the servers and operator tools the tests spawn, which drop
+      # inherited PRISM_ settings (authorization_rpc forwards this one to the
+      # re-run of its own test binary). These 2 vCPU runners run the heaviest
+      # statements (a migration's catalog fingerprint, a 300,000-recipient
+      # balance snapshot) in 1 to 4 s, and in a slow spell on a busy host past
+      # 15 s, failing tests that changed nothing near them. Tests of timeout
+      # behaviour set their own values.
+      PRISM_DATABASE_STATEMENT_TIMEOUT_MS: "60000"
       # Every gated test must execute across these shards: a missing
       # input fails the test instead of skipping it (the shared gate also keys
       # on GITHUB_JOB=prism-native-postgres, so keep this job id). The gate
@@ -378,6 +397,20 @@ jobs:
         run: |
           printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-gate-manifest-%s.txt\n' "${RUNNER_TEMP}" "${SHARD_INDEX}" >> "${GITHUB_ENV}"
           printf 'PRISM_TEST_LOG=%s/prism-native-tests-%s.log\n' "${RUNNER_TEMP}" "${SHARD_INDEX}" >> "${GITHUB_ENV}"
+      # The runner prints the service's log when the job ends; with these
+      # settings a statement that nears the timeout, and the lock it waited
+      # on, name themselves there. Diagnostics only, so it never fails a shard.
+      - name: Log slow statements and lock waits in the PostgreSQL service
+        continue-on-error: true
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "${PG_CONTAINER}" psql -U prism_test -d prism_test -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET log_min_duration_statement = '1s'" \
+            -c "ALTER SYSTEM SET log_parameter_max_length = 64" \
+            -c "ALTER SYSTEM SET log_lock_waits = on" \
+            -c "ALTER SYSTEM SET log_line_prefix = '%m [%p] %a '" \
+            -c "SELECT pg_reload_conf()"
       - name: Set up Rust
         uses: ./.github/actions/rust-toolchain
       - name: Install tools for disposable primary and standby failover test

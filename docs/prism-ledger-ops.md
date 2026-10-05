@@ -1052,6 +1052,78 @@ connect; it cannot evict one that is already running. Start only post-022
 binaries after the commit. Removing the capability or the columns is not a
 supported downgrade.
 
+### The claim lane and settled history (024, #668)
+
+Settled fanouts stay in `qbit_ctv_fanout_artifacts`: a fanout's row remains
+after its 1,000th confirmation, and mainnet adds about 65,000 to 130,000 a
+year at #521's block rate. Before 024 the claim lane's selection matched them
+on its status and schedule predicates and dropped them only after reading
+them, a sequential scan of the whole table on every claim. A broadcaster pass
+claims once per fanout it attempts, up to `PRISM_CTV_BROADCASTER_LIMIT`.
+
+Since 024 the lane (`Ledger::fanout_lane_sql`) gathers its candidates first,
+into one array, and looks only those up by primary key:
+- the due fanouts among those it may still claim, which are every fanout
+  still to broadcast or check (`broadcastable`, `broadcast_submitted`,
+  `failed`) and every confirmed one under 1,000 deep. They are read from the
+  partial index `qbit_ctv_fanout_artifacts_lane_idx`, keyed by
+  `next_broadcast_attempt_at`, as two ranges of it: never attempted (`NULL`)
+  and scheduled at or before `statement_timestamp()`;
+- the newest deep fanout, the checkpoint reconciliation keeps watching,
+  through `qbit_prism_fanout_checkpoint_idx`.
+
+It then applies its full predicate and order to them, as before. Due is read
+at `statement_timestamp()` so the index can serve it as a bound, which only
+means a fanout falling due during the claim statement itself waits for the
+next poll. The candidate query repeats the index's predicate, which must stay
+identical to it, or the planner cannot use the index.
+
+The survey every claim poll opens with (#654) reads the fanouts scheduled
+later than now through the broadcast index (`settlement_status`,
+`next_broadcast_attempt_at`): the watched fanouts waiting for their next
+check, never the settled ones, whose schedules are past.
+`ledger_postgres::fanout_lane_plan` plans and runs both statements, prepared,
+over 20,000 settled and 500 watched fanouts. It fails if either plans a
+sequential scan of the table, if the lane does not read its index or visits
+more rows than the few due, or if the survey visits more than the watched
+fanouts.
+
+Measured on PostgreSQL 16 with a warm cache, the lane statement prepared, per
+claim, with 7,500 watched fanouts: several times the 1,000 to 2,000 that
+today's block rate keeps under 1,000 deep.
+
+| settled fanouts | due now | before 024 | after 024 |
+| ---: | ---: | ---: | ---: |
+| 100,000 | 377 | 63 ms, sequential scan | 1.6 ms |
+| 100,000 | 7,502, all | 67 ms, sequential scan | 28 ms |
+| 1,000,000 | 377 | 357 to 372 ms, sequential scan | 1.8 to 2.0 ms |
+| 1,000,000 | 7,502, all | 412 ms, sequential scan | 38 ms |
+
+After 024 a claim costs what the due fanouts cost: one index entry and one
+primary-key lookup each, then a sort for the first. The settled history only
+deepens the primary key. A confirmed fanout under 1,000 deep is checked again
+5 seconds after each check, so a broadcaster that cannot check every watched
+fanout that often finds most of them due, and each claim then reads them all,
+as in the second and fourth rows. The survey took under 6 ms in the same
+runs.
+
+**Upgrade.** 024 is additive, as 019 and 020 are: no capability and no
+shutdown proof, and it is not applied offline. A binary that does not know
+the index never reads it. It is applied online, as 013 is: on an existing
+ledger `migrate` (or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds the
+index with `CREATE INDEX CONCURRENTLY` after the migration transaction
+commits, on its
+own connection without statement or lock timeouts, and records 24 once the
+index is valid. No write to `qbit_ctv_fanout_artifacts` waits for the build,
+a found block's landing and the broadcasters of frontends still running
+included. The build reads the table twice and waits for the transactions
+already open to finish: about 0.6 s for 1,000,000 settled fanouts on a warm
+cache, against 0.2 s for a plain `CREATE INDEX`. Until 24 is recorded every start
+of a 024 binary refuses the database, as for any missing migration. An
+interrupted build leaves an invalid index that the next run drops and
+builds again. A fresh or empty source applies 024 inside the migration
+transaction.
+
 ## Chain observation epoch upgrade (018)
 
 Migration 018 adds `qbit_prism_cluster.chain_epoch` and declares

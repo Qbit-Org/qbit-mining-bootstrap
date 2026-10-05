@@ -137,6 +137,20 @@ New workspace targets join automatically.
 The three explicit `--ignored` targets run only on the shards owning them.
 Use `--shard-index 0 --shard-count 4 --dry-run` to inspect a shard's commands.
 
+Each shard's PostgreSQL service keeps its data directory on a tmpfs, so a
+busy disk on the shared runner host cannot stall its commits; `fsync`,
+`full_page_writes` and `synchronous_commit` stay on. The disposable clusters
+some tests start from `PRISM_TEST_PG_BIN_DIR` stay on disk. The service logs
+every statement that runs over a second and every lock wait over a second, and
+the runner prints that log when the job ends. The job sets
+`PRISM_DATABASE_STATEMENT_TIMEOUT_MS=60000` for the ledgers the tests open in
+process: production keeps its 15 s default, but these 2 vCPU runners take 1 to
+4 s for the heaviest statements and, in a slow spell, more than 15 s. The
+servers and operator tools the tests spawn drop inherited `PRISM_` settings and
+keep the production default. `authorization_rpc` re-runs its own test binary in
+a cleared environment and forwards the setting to it. Tests of timeout
+behaviour set their own values.
+
 Each shard uploads its manifest and test log as `prism-gate-shard-<index>`.
 The `prism-integration-proof` job requires every shard to succeed, downloads
 and combines their manifests and logs, then runs

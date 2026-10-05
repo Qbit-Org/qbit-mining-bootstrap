@@ -275,6 +275,13 @@ async fn authorization_fallback_requires_a_definitive_address_result() -> Result
                 "--nocapture",
             ])
             .env_clear()
+            // The child migrates a schema, so it keeps the statement timeout
+            // the parent's environment gives its ledger (CI sets one for its
+            // slower runners); unset, the ledger's default applies.
+            .envs(
+                std::env::var_os("PRISM_DATABASE_STATEMENT_TIMEOUT_MS")
+                    .map(|timeout| ("PRISM_DATABASE_STATEMENT_TIMEOUT_MS", timeout)),
+            )
             .env("PRISM_AUTHORIZATION_TEST_CHILD", "1")
             .env("PRISM_DATABASE_URL", database_url)
             .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1")
