@@ -752,12 +752,8 @@ impl Ledger {
         // first one it has watched unrenewed for its whole lease, before
         // any new work. A takeover consumes no scheduling slot.
         let claims = self.survey_claims(&mut tx).await?;
-        let now = tokio::time::Instant::now();
         let mut row = None;
-        for claim in claims
-            .iter()
-            .filter(|claim| claim.due && self.claim_observer.expired(claim, now))
-        {
+        for claim in self.claim_observer.takeable(&claims) {
             row = take_over_claim(&mut tx, claim, &token, &self.instance_id, lease_seconds).await?;
             if row.is_some() {
                 tracing::warn!(
@@ -2399,30 +2395,12 @@ impl Ledger {
             .fetch_all(&mut **tx)
             .await?;
         let replied = tokio::time::Instant::now();
-        let made_due: i64 = rows
-            .first()
-            .map(|row| row.try_get("made_due"))
-            .transpose()?
-            .unwrap_or(0);
+        let (made_due, claims) = super::claim_observer::decode_survey(&rows, "block_hash")?;
         if made_due > 0 {
             tracing::warn!(
                 rows = made_due,
                 "candidate retries were last written later than the database clock reads now, so the clock stepped back; they are due now"
             );
-        }
-        let mut claims = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let Some(block_hash) = row.try_get::<Option<String>, _>("block_hash")? else {
-                continue;
-            };
-            claims.push(ClaimVersion {
-                key: block_hash,
-                token: row.try_get("claim_token")?,
-                renewals: row.try_get("claim_renewals")?,
-                lease_seconds: row.try_get("claim_lease_seconds")?,
-                instance_id: row.try_get("claim_instance_id")?,
-                due: row.try_get("due")?,
-            });
         }
         self.claim_observer.survey(&claims, replied);
         Ok(claims)

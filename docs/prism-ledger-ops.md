@@ -1002,8 +1002,10 @@ dead holder's claim is in the table times it from its own first poll, so that
 takeover comes up to one lease (120 s) later than the claim's true end, never
 earlier. The one-shot `broadcast-ctv` times claims from its own first poll
 too, so within one pass it takes over only a revoked claim; a running
-frontend's broadcaster takes over a dead one's. A claim taken before 022,
-which recorded no lease, is timed as the 600-second maximum.
+frontend's broadcaster takes over a dead one's. To push a dead holder's
+fanout with `broadcast-ctv` while no frontend is running, revoke its claim
+first, as below. A claim taken before 022, which recorded no lease, is timed
+as the 600-second maximum.
 
 **Attempts and checks.** Every statement that schedules
 `next_broadcast_attempt_at` writes `updated_at` from the same database clock.
@@ -1017,7 +1019,10 @@ than the clock: the fanout was due when it was claimed, and the release's own
 step therefore delays an attempt or a confirmation check by less than its own
 delay, never by the step; a forward step makes them due early. A fanout held
 at `infinity` is never made due, and a schedule set far ahead without a later
-`updated_at` (a test or operator hold) stays held.
+`updated_at` (a test or operator hold) stays held while the fanout is
+unclaimed. A claimed fanout is held only at `infinity`: its own schedule is no
+hold, because after a backward step it reads ahead although its holder died,
+so the takeover does not wait for it.
 
 **Revoking a claim.** `ledger::revoke_fanout_claims` sets
 `claim_lease_seconds = 0` (and moves `claim_expires_at` into the past), so the

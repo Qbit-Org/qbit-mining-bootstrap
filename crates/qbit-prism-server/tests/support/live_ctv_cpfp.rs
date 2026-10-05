@@ -62,7 +62,7 @@ async fn cpfp_recovery_case(case: RecoveryCase) -> Result<()> {
         // the still-protected reservation or replacement spendable funding.
         // #654: a successor takes the claim over only once it has watched it
         // go unrenewed for its lease; revoking it stands in for that wait.
-        qbit_prism_server::ledger::revoke_fanout_claims(&fixture.pool,Some(&fanout_txid),false).await?;
+        qbit_prism_server::ledger::revoke_fanout_claims(&fixture.pool,Some(&fanout_txid)).await?;
         for index in 0..2 {fixture.servers[index]=fixture.start_server_with_sponsorship(index,Some(100_000))?;}
         until("recovered CPFP package in mempool",40,||async {
             let package=ledger.cpfp_package(&fanout_txid).await?;

@@ -24,6 +24,8 @@
 //! from its own first reply: a takeover can come up to one lease later than
 //! the claim's true end, never earlier.
 
+use anyhow::Result;
+use sqlx::{postgres::PgRow, Row};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -132,6 +134,46 @@ impl ClaimObserver {
         self.remaining(claim, now)
             .is_some_and(|left| left.is_zero())
     }
+
+    /// The surveyed claims this process may take over now, in survey order:
+    /// those not parked whose whole lease it has watched pass unrenewed.
+    pub fn takeable<'a>(
+        &'a self,
+        claims: &'a [ClaimVersion],
+    ) -> impl Iterator<Item = &'a ClaimVersion> + 'a {
+        let now = Instant::now();
+        claims
+            .iter()
+            .filter(move |claim| claim.due && self.expired(claim, now))
+    }
+}
+
+/// Decode a claim survey's reply (`Ledger::claim_survey_sql` for
+/// candidates, `Ledger::fanout_claim_survey_sql` for fanouts): how many rows
+/// its reschedule made due, and every claimed row's version, keyed by the
+/// `key` column. A survey always returns one row, with a `NULL` key when
+/// nothing is claimed.
+pub fn decode_survey(rows: &[PgRow], key: &str) -> Result<(i64, Vec<ClaimVersion>)> {
+    let made_due = rows
+        .first()
+        .map(|row| row.try_get("made_due"))
+        .transpose()?
+        .unwrap_or(0);
+    let mut claims = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(key) = row.try_get::<Option<String>, _>(key)? else {
+            continue;
+        };
+        claims.push(ClaimVersion {
+            key,
+            token: row.try_get("claim_token")?,
+            renewals: row.try_get("claim_renewals")?,
+            lease_seconds: row.try_get("claim_lease_seconds")?,
+            instance_id: row.try_get("claim_instance_id")?,
+            due: row.try_get("due")?,
+        });
+    }
+    Ok((made_due, claims))
 }
 
 #[cfg(test)]

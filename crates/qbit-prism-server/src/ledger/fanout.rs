@@ -1,4 +1,4 @@
-use super::claim_observer::ClaimVersion;
+use super::claim_observer::{decode_survey, ClaimVersion};
 use super::*;
 
 // Allocation and retirement span two tables; this short lock makes their
@@ -468,30 +468,12 @@ impl Ledger {
             .fetch_all(&mut **tx)
             .await?;
         let replied = tokio::time::Instant::now();
-        let made_due: i64 = rows
-            .first()
-            .map(|row| row.try_get("made_due"))
-            .transpose()?
-            .unwrap_or(0);
+        let (made_due, claims) = decode_survey(&rows, "fanout_txid")?;
         if made_due > 0 {
             tracing::warn!(
                 rows = made_due,
                 "CTV fanout attempts were last scheduled later than the database clock reads now, so the clock stepped back; they are due now"
             );
-        }
-        let mut claims = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let Some(fanout_txid) = row.try_get::<Option<String>, _>("fanout_txid")? else {
-                continue;
-            };
-            claims.push(ClaimVersion {
-                key: fanout_txid,
-                token: row.try_get("claim_token")?,
-                renewals: row.try_get("claim_renewals")?,
-                lease_seconds: row.try_get("claim_lease_seconds")?,
-                instance_id: row.try_get("claim_instance_id")?,
-                due: row.try_get("due")?,
-            });
         }
         self.fanout_claim_observer.survey(&claims, replied);
         Ok(claims)
@@ -511,12 +493,8 @@ impl Ledger {
         token: &str,
         lease_seconds: i64,
     ) -> Result<Option<PgRow>> {
-        let now = tokio::time::Instant::now();
         let query = format!("WITH next AS (SELECT a.fanout_txid FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE a.fanout_txid=$4 AND a.claim_token=$5 AND a.claim_renewals=$6 AND {FANOUT_CLAIMABLE_SQL} AND {FANOUT_TAKEOVER_SQL} FOR UPDATE OF a SKIP LOCKED) UPDATE qbit_ctv_fanout_artifacts a SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',claim_lease_seconds=$3::integer,claim_renewals=0 FROM next WHERE a.fanout_txid=next.fanout_txid RETURNING {FANOUT_CLAIMED_COLUMNS}");
-        for claim in claims
-            .iter()
-            .filter(|claim| claim.due && self.fanout_claim_observer.expired(claim, now))
-        {
+        for claim in self.fanout_claim_observer.takeable(claims) {
             let row = sqlx::query(&query)
                 .bind(token)
                 .bind(&self.instance_id)
@@ -547,8 +525,9 @@ impl Ledger {
 /// the claim takes it over at once, by compare and set on the version it
 /// read, and `claim_expires_at` moves into the past so the database clock's
 /// estimate agrees. The token stays: the holder may still renew or write
-/// until a takeover replaces it. With `due_now` the fanout's schedule is due
-/// at once as well.
+/// until a takeover replaces it. Only claimed fanouts are touched, and no
+/// schedule: a takeover does not wait for one, and an unclaimed or settled
+/// fanout keeps its own, `infinity` holds included.
 ///
 /// The one hook the lease tests use where waiting out a real lease is not
 /// deterministic. An operator may run the same statement only once the
@@ -556,11 +535,9 @@ impl Ledger {
 pub async fn revoke_fanout_claims<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     fanout_txid: Option<&str>,
-    due_now: bool,
 ) -> Result<u64> {
-    Ok(sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_lease_seconds=CASE WHEN claim_token IS NULL THEN NULL ELSE 0 END,claim_expires_at=CASE WHEN claim_expires_at IS NULL THEN NULL ELSE LEAST(claim_expires_at,clock_timestamp()-interval '1 second') END,next_broadcast_attempt_at=CASE WHEN $2 THEN clock_timestamp() ELSE next_broadcast_attempt_at END WHERE $1::text IS NULL OR fanout_txid=$1")
+    Ok(sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_lease_seconds=0,claim_expires_at=LEAST(claim_expires_at,clock_timestamp()-interval '1 second') WHERE claim_token IS NOT NULL AND ($1::text IS NULL OR fanout_txid=$1)")
         .bind(fanout_txid)
-        .bind(due_now)
         .execute(executor)
         .await?
         .rows_affected())

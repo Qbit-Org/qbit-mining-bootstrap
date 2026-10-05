@@ -197,7 +197,7 @@ async fn a_failed_attempt_whose_failure_is_lost_keeps_its_backoff() -> Result<()
             let stale = f.a.ledger.claim_fanout(120).await?.context("claim")?;
             // #654: only a takeover ends a claim; revoking it stands in
             // for a lease the other frontend watched go unrenewed.
-            qbit_prism_server::ledger::revoke_fanout_claims(f.pool(), Some(&stale.fanout_txid), false)
+            qbit_prism_server::ledger::revoke_fanout_claims(f.pool(), Some(&stale.fanout_txid))
                 .await?;
             let taken = f.b.ledger.claim_fanout(120).await?.context("takeover")?;
             ensure!(taken.fanout_txid == stale.fanout_txid, "fixture took over another row");

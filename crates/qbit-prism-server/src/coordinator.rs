@@ -1375,11 +1375,11 @@ impl Coordinator {
         // #581: recorded before the refresh lock is released, so outcomes
         // land in the order the refreshes ran: an older refresh that finishes
         // late can never overwrite a newer one's.
-        let on_database = result
+        let failed_on_database = result
             .as_ref()
             .err()
             .is_some_and(|error| error.chain().any(|cause| cause.is::<sqlx::Error>()));
-        self.readiness.write().await.refresh_failed_on_database = on_database;
+        self.readiness.write().await.refresh_failed_on_database = failed_on_database;
         // Its outcome is recorded: no longer in flight.
         drop(in_flight);
         result

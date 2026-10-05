@@ -1299,8 +1299,7 @@ async fn ctv_artifacts_wait_for_maturity_and_claims_are_fenced() -> Result<()> {
     // #654: only a takeover ends a claim. The revocation hook stands in for
     // a lease b watched go unrenewed; until b takes the fanout, its owner is
     // still the holder.
-    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&first.fanout_txid), false)
-        .await?;
+    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&first.fanout_txid)).await?;
     let recovered = b
         .claim_fanout(60)
         .await?
@@ -1529,7 +1528,7 @@ async fn cpfp_retirement_requires_current_claim_and_preserves_signed_packages() 
     );
     // #654: only a takeover ends b's claim; the revocation hook stands in for
     // a lease a watched go unrenewed.
-    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&old.fanout_txid), false).await?;
+    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&old.fanout_txid)).await?;
     let current = a
         .claim_fanout(60)
         .await?

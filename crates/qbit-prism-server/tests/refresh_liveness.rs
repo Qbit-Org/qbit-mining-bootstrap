@@ -593,7 +593,7 @@ async fn ctv_releases_the_claim_when_a_revision_bump_refuses_a_successful_attemp
             let stale = f.a.ledger.claim_fanout(120).await?.context("claim")?;
             // #654: only a takeover ends a claim; revoking it stands in
             // for a lease the other frontend watched go unrenewed.
-            qbit_prism_server::ledger::revoke_fanout_claims(f.pool(), Some(&stale.fanout_txid), false)
+            qbit_prism_server::ledger::revoke_fanout_claims(f.pool(), Some(&stale.fanout_txid))
                 .await?;
             let taken = f.b.ledger.claim_fanout(120).await?.context("takeover")?;
             ensure!(

@@ -854,7 +854,8 @@ impl Coordinator {
         // admission. Caching just the publication key would miss mid-lease
         // balance changes; revisit only with a transactionally versioned digest
         // producer if recipient-count cost makes this bounded path too costly.
-        let state = self.work_ledger.payout_state().await?;
+        // #655: a ledger step of every issuance under a replacement lease.
+        let state = on_database(self.work_ledger.payout_state()).await?;
         let lease = PublishedLease {
             identity,
             published_tip,
