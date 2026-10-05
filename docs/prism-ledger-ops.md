@@ -1557,7 +1557,10 @@ pages a minute after each held frontend starts, because
 `qbit_prism_block_submission_enabled` is not 1 (#666). All of that is expected
 during a rehearsal. Scrape the rehearsal's frontends under another job or
 network, or silence `PrismBlockSubmissionHeld` and the pending-candidate alerts
-for the rehearsal, so they do not reach production paging.
+for the rehearsal, so they do not reach production paging. Scope such a silence
+with matchers on the rehearsal frontends' `instance` labels, never on the alert
+name alone: that would also hide a production frontend left held, which is what
+`PrismBlockSubmissionHeld` exists to page.
 
 After the rehearsal, do not start a frontend with submission enabled against
 the rehearsal database while held rows remain. That frontend would offer each

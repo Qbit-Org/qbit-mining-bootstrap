@@ -3607,9 +3607,9 @@
     }
   },
   {
-    "name": "#666 a frontend held by PRISM_BLOCK_SUBMIT_ENABLED pages after a minute, before it finds a block",
+    "name": "#666 a frontend held for 70 seconds has paged, before it finds a block",
     "series": {
-      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x600",
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x290 0x310",
       "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
     },
     "eval_time": "6m",
@@ -3627,9 +3627,9 @@
     }
   },
   {
-    "name": "#666 a frontend held for less than a minute is still pending",
+    "name": "#666 a frontend held for 50 seconds is still pending",
     "series": {
-      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x320 0x280",
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x310 0x290",
       "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x600"
     },
     "eval_time": "6m",
@@ -3638,6 +3638,26 @@
     },
     "alerts": {
       "PrismBlockSubmissionHeld": []
+    }
+  },
+  {
+    "name": "#666 a failed scrape every 50 seconds does not restart the dwell",
+    "series": {
+      "qbit_prism_block_submission_enabled{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale 0x48 stale",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0 1x48 0"
+    },
+    "eval_time": "6m",
+    "expect": {
+      "PrismBlockSubmissionHeld": 1
+    },
+    "alerts": {
+      "PrismBlockSubmissionHeld": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
     }
   },
   {

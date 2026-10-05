@@ -133,11 +133,13 @@ def main():
             assert "collector=\\\"database\\\"" in database
             assert "qbit_prism_metrics_snapshot" not in database
             # #666: a frontend held by PRISM_BLOCK_SUBMIT_ENABLED pages a minute
-            # after it starts, on a successful scrape: the gauge is fixed at
-            # start, so a stale snapshot must not hide it.
+            # after it starts, on a successful scrape within two minutes: the
+            # gauge is fixed at start, so neither a stale snapshot nor one
+            # failed scrape may hide it or restart its dwell.
             held = json.dumps(paging["qbit-prism-block-submission-held"])
             assert paging["qbit-prism-block-submission-held"]["for"] == "1m"
-            assert "qbit_prism_block_submission_enabled{" in held and "!= bool 1" in held
+            assert "last_over_time(qbit_prism_block_submission_enabled{" in held and "!= bool 1" in held
+            assert "max_over_time(up{" in held
             assert "qbit_prism_metrics_snapshot" not in held
             # #493: the tracking-unknown and unlanded warnings dwell and never page.
             for uid, dwell in [("qbit-prism-revision-work-unknown", "2m"),
