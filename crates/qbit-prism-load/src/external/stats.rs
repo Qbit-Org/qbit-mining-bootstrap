@@ -1217,6 +1217,56 @@ pub struct Process {
     pub share_log: Option<ShareLogInfo>,
 }
 
+impl Process {
+    /// What `qbit-prism-load external` could have written: the command
+    /// line's own bounds, and a window a run of its length makes. A process
+    /// held to them cannot carry a value whose sums would overflow.
+    pub fn check(&self) -> Result<()> {
+        ensure!(
+            (1..=crate::external::MAX_SESSIONS).contains(&self.sessions),
+            "{} sessions, past what one process drives",
+            self.sessions
+        );
+        ensure!(
+            self.rate.is_finite() && self.rate > 0.0 && self.rate <= crate::external::MAX_RATE,
+            "a rate of {}, past what one process offers",
+            self.rate
+        );
+        ensure!(
+            (1..=crate::external::MAX_DURATION_SECONDS).contains(&self.duration_seconds),
+            "a load of {} s, past what one process runs",
+            self.duration_seconds
+        );
+        ensure!(
+            self.max_difficulty.is_finite()
+                && self.max_difficulty > 0.0
+                && self.max_difficulty <= crate::external::MAX_DIFFICULTY_LIMIT,
+            "a difficulty ceiling of {}",
+            self.max_difficulty
+        );
+        if let Some(window) = &self.window {
+            // A window runs its length, or past it by a late last tick; its
+            // seconds are its ends' difference, taken without overflow.
+            let span = (i128::from(window.ended_unix_ms) - i128::from(window.started_unix_ms))
+                as f64
+                / 1000.0;
+            ensure!(
+                span >= 0.0
+                    && window.seconds.is_finite()
+                    && window.seconds >= 0.0
+                    && (window.seconds - span).abs() < 1.0
+                    && window.seconds <= self.duration_seconds as f64 + 3600.0,
+                "a window of {} s from {} to {}, which no run of {} s makes",
+                window.seconds,
+                window.started_unix_ms,
+                window.ended_unix_ms,
+                self.duration_seconds
+            );
+        }
+        Ok(())
+    }
+}
+
 /// The document one process writes, or a merge of several.
 pub fn document(kind: &str, processes: &[Process], totals: &Totals) -> Result<Value> {
     Ok(json!({
@@ -1251,24 +1301,9 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
         )
         .with_context(|| format!("reading the processes of {}", path.display()))?;
         for process in &these {
-            if let Some(window) = &process.window {
-                // A window runs its length, or past it by a late last tick;
-                // its seconds are its ends' difference.
-                let span = (window.ended_unix_ms - window.started_unix_ms) as f64 / 1000.0;
-                ensure!(
-                    window.ended_unix_ms >= window.started_unix_ms
-                        && window.seconds.is_finite()
-                        && (window.seconds - span).abs() < 1.0
-                        && window.seconds <= process.duration_seconds as f64 + 3600.0,
-                    "{}: process {} has a window of {} s from {} to {}, which no run of {} s makes",
-                    path.display(),
-                    process.label,
-                    window.seconds,
-                    window.started_unix_ms,
-                    window.ended_unix_ms,
-                    process.duration_seconds
-                );
-            }
+            process
+                .check()
+                .with_context(|| format!("{}: process {}", path.display(), process.label))?;
             if let Some(first) = seen.insert(process.run_id.clone(), path.clone()) {
                 anyhow::bail!(
                     "run {} ({}) is in both {} and {}; merging it twice would count it twice",
@@ -1417,7 +1452,9 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         "processes": processes.len(),
         "labels": processes.iter().map(|p| p.label.clone()).collect::<Vec<_>>(),
         "targets": processes.iter().map(|p| p.target.clone()).collect::<std::collections::BTreeSet<_>>(),
-        "sessions": processes.iter().map(|p| p.sessions).sum::<usize>(),
+        "sessions": processes
+            .iter()
+            .fold(0usize, |total, p| total.saturating_add(p.sessions)),
         "offered_rate": processes.iter().map(|p| p.rate).sum::<f64>(),
         "ended": processes
             .iter()

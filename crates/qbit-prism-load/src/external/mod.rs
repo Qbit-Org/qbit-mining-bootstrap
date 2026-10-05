@@ -66,6 +66,10 @@ pub const EVENT_BACKLOG_LIMIT: usize = 250_000;
 /// The highest `--rate`: a share costs thousands of hashes, so one client
 /// machine mines far fewer.
 pub const MAX_RATE: f64 = 100_000.0;
+/// The most `--sessions` one process holds.
+pub const MAX_SESSIONS: usize = 100_000;
+/// The longest `--duration-seconds`: a week.
+pub const MAX_DURATION_SECONDS: u64 = 604_800;
 /// How long the share log's writer may take to write what it holds once the
 /// load is over. A stalled disk past this leaves the log marked unfinished,
 /// and the stats are still written.
@@ -204,8 +208,8 @@ impl ExternalArgs {
             );
         }
         ensure!(
-            (1..=100_000).contains(&self.sessions),
-            "--sessions must be 1..100000"
+            (1..=MAX_SESSIONS).contains(&self.sessions),
+            "--sessions must be 1..{MAX_SESSIONS}"
         );
         ensure!(
             self.rate.is_finite() && self.rate > 0.0 && self.rate <= MAX_RATE,
@@ -213,8 +217,8 @@ impl ExternalArgs {
              a faster load needs more client machines, one process each"
         );
         ensure!(
-            (1..=604_800).contains(&self.duration_seconds),
-            "--duration-seconds must be 1..604800"
+            (1..=MAX_DURATION_SECONDS).contains(&self.duration_seconds),
+            "--duration-seconds must be 1..{MAX_DURATION_SECONDS}"
         );
         ensure!(
             self.max_difficulty.is_finite()

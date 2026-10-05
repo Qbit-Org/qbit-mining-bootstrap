@@ -864,6 +864,28 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("no run of"), "{error}");
+    // Extremes a window's span overflows in, and a session count past what
+    // a process holds.
+    let mut extremes = read(&a);
+    extremes["processes"][0]["window"]["started_unix_ms"] = json!(i64::MIN);
+    extremes["processes"][0]["window"]["ended_unix_ms"] = json!(i64::MAX);
+    extremes["processes"][0]["window"]["seconds"] = json!(-1.0);
+    let path = scratch.path("extremes.json");
+    external::write_document(&path, &extremes)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("no run of"), "{error}");
+    let mut sessions = read(&a);
+    sessions["processes"][0]["sessions"] = json!(usize::MAX);
+    let path = scratch.path("sessions.json");
+    external::write_document(&path, &sessions)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("sessions, past"), "{error}");
     let mut damaged = read(&a);
     damaged["processes"][0]["accepted"] = json!(123_456_789u64);
     let path = scratch.path("damaged-process.json");
