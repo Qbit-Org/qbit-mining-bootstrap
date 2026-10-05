@@ -95,18 +95,18 @@ async fn cursor(pool: &PgPool) -> Result<Option<(i64, i64)>> {
 }
 
 /// 2 is recorded after every migration of the transaction and before the
-/// online 013 and 017, which each check that they come after every lower
-/// version.
+/// online 013, 017 and 024, which each check that they come after every
+/// lower version.
 async fn assert_recorded_in_order(pool: &PgPool) -> Result<()> {
     let (after_transaction, before_online): (bool, bool) = sqlx::query_as(
-        "SELECT (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) >= (SELECT max(applied_at) FROM qbit_prism_schema_migrations WHERE version NOT IN (2,13,17)), \
-                (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) <= (SELECT min(applied_at) FROM qbit_prism_schema_migrations WHERE version IN (13,17))",
+        "SELECT (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) >= (SELECT max(applied_at) FROM qbit_prism_schema_migrations WHERE version NOT IN (2,13,17,24)), \
+                (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) <= (SELECT min(applied_at) FROM qbit_prism_schema_migrations WHERE version IN (13,17,24))",
     )
     .fetch_one(pool)
     .await?;
     ensure!(
         after_transaction && before_online,
-        "2 is not recorded between the transaction's migrations and 013 and 017"
+        "2 is not recorded between the transaction's migrations and 013, 017 and 024"
     );
     Ok(())
 }
@@ -203,12 +203,12 @@ async fn migration_002_backfill_resumes_from_its_last_committed_batch_after_an_i
         result = &mut migrate => bail!("migrate ended before the backfill ran: {:?}", result.err()),
         result = committed => result.context("the migration transaction never committed")??,
     }
-    // Committed: every migration but 2 and the online 013 and 017 recorded,
+    // Committed: every migration but 2 and the online 013, 017 and 024 recorded,
     // nothing mapped yet, and no start serves the database.
     let pending: Vec<i32> = REQUIRED_SCHEMA_VERSIONS
         .iter()
         .copied()
-        .filter(|version| ![2, 13, 17].contains(version))
+        .filter(|version| ![2, 13, 17, 24].contains(version))
         .collect();
     assert_eq!(schema_versions(&pool).await?, pending);
     assert_eq!(cursor(&pool).await?, Some((first, end)));
@@ -277,7 +277,7 @@ async fn migration_002_backfill_resumes_from_its_last_committed_batch_after_an_i
         .await?;
 
     // migrate resumes at the cursor and finishes: the single statement's
-    // mapping, 2 recorded before 013 and 017, the progress table gone.
+    // mapping, 2 recorded before 013, 017 and 024, the progress table gone.
     let resumed = timeout(Duration::from_secs(120), db.ledger("resumed")).await??;
     assert_eq!(mapping(&pool).await?, expected);
     assert_eq!(cursor(&pool).await?, None);

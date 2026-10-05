@@ -43,6 +43,20 @@ const FANOUT_STEPPED_SQL: &str =
 const FANOUT_TAKEOVER_SQL: &str =
     "(a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<>'infinity'::timestamptz)";
 
+/// The predicate of `qbit_ctv_fanout_artifacts_lane_idx` (migration 024,
+/// #668), which a statement must repeat exactly for the planner to read the
+/// index: every fanout still to broadcast or check, and every confirmed one
+/// under 1,000 deep. Apart from the newest deep fanout, the checkpoint
+/// reconciliation keeps watching, these are all the fanouts a claim may
+/// take; the settled history is the rest.
+const FANOUT_LANE_INDEXED_SQL: &str = "(settlement_status IN ('broadcastable','broadcast_submitted','failed') OR (settlement_status='confirmed' AND confirmed_depth<1000))";
+
+/// The newest deep fanout, the checkpoint reconciliation keeps watching,
+/// through `qbit_prism_fanout_checkpoint_idx`: the one fanout a claim may
+/// take outside the lane's index. `FANOUT_CLAIMABLE_SQL` admits the same
+/// one, which a unit test checks.
+const FANOUT_CHECKPOINT_SQL: &str = "SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE settlement_status='confirmed' AND confirmed_depth>=1000 ORDER BY confirmed_block_height DESC,fanout_txid DESC LIMIT 1";
+
 /// What a claim returns, the lane's and a takeover's alike.
 pub(super) const FANOUT_CLAIMED_COLUMNS: &str = "a.fanout_txid,a.block_hash,a.manifest,a.broadcast_attempt_count,jsonb_build_object('status',a.settlement_status,'confirmed_block_hash',a.confirmed_block_hash,'confirmed_block_height',a.confirmed_block_height,'confirmed_depth',a.confirmed_depth,'scan_next_height',a.spend_scan_next_height,'scan_anchor_height',a.spend_scan_anchor_height,'scan_anchor_hash',a.spend_scan_anchor_hash) AS progress";
 
@@ -435,6 +449,42 @@ pub(super) async fn apply_progress(
 }
 
 impl Ledger {
+    /// The fanout claim lane (#654, #668): claim the next unclaimed, due
+    /// fanout `FANOUT_CLAIMABLE_SQL` admits, for `$3` seconds under token
+    /// `$1` and instance `$2`, in the lane's order (every settlement before
+    /// any confirmation check, then the oldest schedule, never-attempted
+    /// first, then block height and chunk), returning
+    /// `FANOUT_CLAIMED_COLUMNS`.
+    ///
+    /// It reads only the fanouts due now, never the settled history or the
+    /// fanouts still waiting for their next check (#668). Its candidates are
+    /// gathered once into an array: from the lane's index, as two ranges of
+    /// it, those never attempted and those scheduled at or before
+    /// `statement_timestamp()`, and the checkpoint (`FANOUT_CHECKPOINT_SQL`).
+    /// The bound must stay `statement_timestamp()`: it is stable, so the
+    /// index serves it as a range, where the volatile `clock_timestamp()`
+    /// would only filter every entry. A fanout falling due later in the same
+    /// statement waits for the next poll. The selection looks the candidates
+    /// up by primary key and applies `FANOUT_CLAIMABLE_SQL` and the lane's
+    /// own `clock_timestamp()` schedule test in full. That test is what
+    /// decides the checkpoint, which no candidate bound covers, and it is
+    /// checked again on a row another transaction changed before this one
+    /// locked it. `FOR UPDATE SKIP LOCKED` leaves a fanout another
+    /// transaction holds to a later poll.
+    pub fn fanout_lane_sql() -> String {
+        format!(
+            "WITH next AS (SELECT a.fanout_txid FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) \
+             WHERE a.fanout_txid=ANY(ARRAY(SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE {FANOUT_LANE_INDEXED_SQL} AND next_broadcast_attempt_at IS NULL \
+             UNION ALL SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE {FANOUT_LANE_INDEXED_SQL} AND next_broadcast_attempt_at<=statement_timestamp() \
+             UNION ALL ({FANOUT_CHECKPOINT_SQL}))) \
+             AND {FANOUT_CLAIMABLE_SQL} \
+             AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<=clock_timestamp()) AND a.claim_token IS NULL \
+             ORDER BY (a.settlement_status='confirmed'),a.next_broadcast_attempt_at NULLS FIRST,b.block_height,a.chunk_index FOR UPDATE OF a SKIP LOCKED LIMIT 1) \
+             UPDATE qbit_ctv_fanout_artifacts a SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second',claim_lease_seconds=$3::integer,claim_renewals=0 \
+             FROM next WHERE a.fanout_txid=next.fanout_txid RETURNING {FANOUT_CLAIMED_COLUMNS}"
+        )
+    }
+
     /// The statement every fanout claim poll opens with (#654), in one round
     /// trip, as [`Ledger::claim_survey_sql`] is for candidates: it reschedules,
     /// as due now, every unclaimed fanout a claim may take whose schedule
@@ -541,4 +591,49 @@ pub async fn revoke_fanout_claims<'e>(
         .execute(executor)
         .await?
         .rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQL without its whitespace, to compare texts written apart.
+    fn compact(sql: &str) -> String {
+        sql.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The lane's candidates repeat the predicate of 024's index, or the
+    /// planner cannot read the index and every claim reads the settled
+    /// history again (#668). `ledger_postgres::fanout_lane_plan` proves the
+    /// plan on PostgreSQL, behind the integration gate; this does not need
+    /// a database.
+    #[test]
+    fn the_lane_repeats_its_index_predicate() {
+        let statement = include_str!("../../migrations/024_fanout_lane_index.sql")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_, predicate) = statement
+            .split_once("WHERE")
+            .expect("024's index is partial");
+        assert_eq!(
+            format!("({})", compact(predicate).trim_end_matches(';')),
+            compact(FANOUT_LANE_INDEXED_SQL)
+        );
+        assert_eq!(
+            Ledger::fanout_lane_sql()
+                .matches(FANOUT_LANE_INDEXED_SQL)
+                .count(),
+            2
+        );
+    }
+
+    /// The checkpoint the lane gathers is the one `FANOUT_CLAIMABLE_SQL`
+    /// admits, or reconciliation would stop watching it.
+    #[test]
+    fn the_lane_gathers_the_checkpoint_a_claim_admits() {
+        assert!(FANOUT_CLAIMABLE_SQL.contains(&format!("a.fanout_txid=({FANOUT_CHECKPOINT_SQL})")));
+        assert!(Ledger::fanout_lane_sql().contains(&format!("UNION ALL ({FANOUT_CHECKPOINT_SQL})")));
+    }
 }
