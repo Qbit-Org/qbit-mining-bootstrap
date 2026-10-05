@@ -302,6 +302,64 @@ async fn migration_002_backfill_resumes_from_its_last_committed_batch_after_an_i
     db.close(vec![resumed]).await
 }
 
+/// Nothing appends before 2 is recorded, so the end the cursor was planned
+/// to is the ledger's end. A row past it, from a writer that went around
+/// every gate, is still mapped before 2 is recorded, not left unmapped.
+#[tokio::test]
+async fn migration_002_maps_a_row_past_its_planned_end_before_recording_2() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let mut runners = PgConnection::connect(&db.url).await?;
+    sqlx::query("SELECT pg_advisory_lock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let mut migrate = Box::pin(Ledger::connect(&db.url, "cutover".into(), 8, true));
+    let committed = timeout(Duration::from_secs(60), async {
+        while cursor(&pool).await?.is_none() {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    tokio::select! {
+        result = &mut migrate => bail!("migrate ended before the backfill ran: {:?}", result.err()),
+        result = committed => result.context("the migration transaction never committed")??,
+    }
+    let (_, end) = cursor(&pool).await?.context("the progress table is gone")?;
+    let straggler = "ee".repeat(32);
+    sqlx::query(
+        "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) \
+         VALUES($1,'straggler:'||$2,'miner-0','miner-0',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(1),1,to_timestamp(2),true,'backfill-test',0)",
+    )
+    .bind(end + 5)
+    .bind(&straggler)
+    .execute(&pool)
+    .await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let ledger = timeout(Duration::from_secs(120), migrate).await??;
+    assert_eq!(
+        mapping(&pool).await?,
+        expected_mapping(&pool, i64::MAX).await?
+    );
+    let mapped: Option<String> =
+        sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1")
+            .bind(&straggler)
+            .fetch_optional(&pool)
+            .await?;
+    assert_eq!(mapped, Some(format!("straggler:{straggler}")));
+    assert_eq!(cursor(&pool).await?, None);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    runners.close().await?;
+    db.close(vec![ledger]).await
+}
+
 #[tokio::test]
 async fn migration_002_refuses_a_2x_source_holding_the_backfill_progress_name_before_any_ddl(
 ) -> Result<()> {
