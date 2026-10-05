@@ -591,10 +591,10 @@ async fn a_crashed_resume_leaves_no_fence_for_an_earlier_runner_to_strand() -> R
 /// A runner of an earlier build that is still mapping when this release
 /// resumes the backfill holds the runners' lock, finishes, drops the cursor
 /// and records 2 without knowing the fence. This release must not have
-/// declared one meanwhile, which nothing would remove (#669): its resume
-/// declares the fence only from its runner, after that lock. The test plays
-/// the earlier runner, holding the lock while the resume's transaction
-/// commits, then finishing the backfill the way #663's runner does.
+/// declared one meanwhile, which nothing would remove (#669), and a resume
+/// declares none. The test plays the earlier runner, holding the lock while
+/// the resume's transaction commits, then finishing the backfill the way
+/// #663's runner does.
 #[tokio::test]
 async fn a_resume_leaves_no_fence_when_an_earlier_runner_finishes_the_backfill() -> Result<()> {
     let Some(db) = Database::open().await? else {

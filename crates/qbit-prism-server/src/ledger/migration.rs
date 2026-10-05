@@ -2862,7 +2862,7 @@ pub(super) async fn migrate_schema(
     // definitions the scratch apply rendered.
     let mut online = Vec::new();
     // Whether this transaction created a share-hash backfill cursor, which
-    // it fences at once once 006 has created the capability table (#669).
+    // it fences as soon as 006 has created the capability table (#669).
     let mut cursor_created = false;
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
@@ -3089,9 +3089,9 @@ pub(super) async fn migrate_schema(
         }
     }
     // A cursor this transaction created fences every earlier build at once
-    // (#669); 006 has created the capability table by here. Only here: a
-    // resumed backfill is never fenced again, since a runner an earlier build
-    // started before the fence existed would finish without removing it
+    // (#669); 006 has created the capability table by here. Only here, never
+    // on a resume: a runner an earlier build started before then could still
+    // finish the backfill, and would leave a later fence behind
     // (`share_hashes.rs`).
     if cursor_created {
         share_hashes::declare_pending(tx).await?;
