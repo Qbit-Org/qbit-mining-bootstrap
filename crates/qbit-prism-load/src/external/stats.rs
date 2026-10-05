@@ -1244,6 +1244,15 @@ impl Process {
             "a difficulty ceiling of {}",
             self.max_difficulty
         );
+        // The token bucket mints at most rate x length; one more covers the
+        // floating point it is computed in.
+        ensure!(
+            (self.offers_minted as f64) <= (self.rate * self.duration_seconds as f64).floor() + 1.0,
+            "{} offers minted, more than {} offers a second for {} s make",
+            self.offers_minted,
+            self.rate,
+            self.duration_seconds
+        );
         // Load is only offered inside a window, so counts need one to be
         // rated over.
         let loaded = self.offers_minted > 0

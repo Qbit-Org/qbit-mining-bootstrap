@@ -469,6 +469,16 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
     let none = json!({"unit": "microseconds", "significant_bits": 10, "count": 0,
                       "sum": 5, "min": null, "max": null, "buckets": []});
     assert!(serde_json::from_value::<LogHistogram>(none).is_err());
+    // A sum no samples in their buckets could have, though the extremes
+    // allow it.
+    let middle = json!({"unit": "microseconds", "significant_bits": 10, "count": 102,
+                        "sum": 200, "min": 0, "max": 200,
+                        "buckets": [[0, 1], [100, 100], [200, 1]]});
+    assert!(serde_json::from_value::<LogHistogram>(middle).is_err());
+    let middle = json!({"unit": "microseconds", "significant_bits": 10, "count": 102,
+                        "sum": 10200, "min": 0, "max": 200,
+                        "buckets": [[0, 1], [100, 100], [200, 1]]});
+    assert!(serde_json::from_value::<LogHistogram>(middle).is_ok());
     // And an empty bucket, which would let an extreme no sample has pass.
     let empty = json!({"unit": "microseconds", "significant_bits": 10, "count": 1,
                        "sum": 100, "min": 0, "max": 100, "buckets": [[0, 0], [100, 1]]});
@@ -886,6 +896,15 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("sessions, past"), "{error}");
+    let mut minted = read(&a);
+    minted["processes"][0]["offers_minted"] = json!(u64::MAX);
+    let path = scratch.path("minted.json");
+    external::write_document(&path, &minted)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("offers minted, more than"), "{error}");
     let mut windowless = read(&a);
     windowless["processes"][0]["window"] = Value::Null;
     let path = scratch.path("windowless.json");

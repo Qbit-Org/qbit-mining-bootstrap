@@ -1021,7 +1021,9 @@ async fn drive(
     let mut next_progress = started + progress;
     let mut last_progress = (started, 0u64, 0u64);
     let mut ticker = tokio::time::interval(Duration::from_millis(1));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    // The offers due are taken from the clock, not counted in ticks, so a
+    // missed tick has nothing to make up: skipped, not replayed.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;

@@ -235,23 +235,38 @@ impl TryFrom<Wire> for LogHistogram {
                 "a histogram's min {min} and max {max} are not its lowest and highest buckets' \
                  samples"
             );
-            // And the sum is one of samples that include both extremes: one
-            // sample is min and one is max (the same one when there is one),
-            // and the rest lie between. The bounds saturate as the sum does.
-            let (low, high) = match wire.count {
-                1 => (min, max),
-                count => {
-                    let rest = count - 2;
-                    let ends = min.saturating_add(max);
-                    (
-                        ends.saturating_add(min.saturating_mul(rest)),
-                        ends.saturating_add(max.saturating_mul(rest)),
-                    )
-                }
+            // And the sum is one its samples could have: each lies in its
+            // bucket, one is exactly min (in the lowest bucket) and one exactly
+            // max (in the highest; the same sample when there is only one).
+            // Taken in u128. The stored sum saturates at u64::MAX, so a range
+            // reaching past it admits that.
+            ensure!(
+                wire.count > 1 || min == max,
+                "a histogram of one sample has min {min} and max {max}"
+            );
+            let (first, last) = (bucket_lower_bound(min), bucket_lower_bound(max));
+            let (mut low, mut high) = (0u128, 0u128);
+            for (lower, count) in &buckets {
+                let count = u128::from(*count);
+                low = low.saturating_add(count.saturating_mul(u128::from(*lower)));
+                high = high
+                    .saturating_add(count.saturating_mul(u128::from(bucket_upper_bound(*lower))));
+            }
+            low = low.saturating_add(u128::from(min - first));
+            high = high.saturating_sub(u128::from(bucket_upper_bound(first) - min));
+            if wire.count > 1 {
+                low = low.saturating_add(u128::from(max - last));
+                high = high.saturating_sub(u128::from(bucket_upper_bound(last) - max));
+            }
+            let sum = u128::from(wire.sum);
+            let fits = if wire.sum == u64::MAX {
+                high >= sum
+            } else {
+                low <= sum && sum <= high
             };
             ensure!(
-                (wire.count > 1 || min == max) && wire.sum >= low && wire.sum <= high,
-                "a histogram's sum {} is not one of {} samples from {min} to {max}",
+                fits,
+                "a histogram's sum {} is not one its {} samples in their buckets could have",
                 wire.sum,
                 wire.count
             );
