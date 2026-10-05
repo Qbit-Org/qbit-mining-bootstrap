@@ -36,8 +36,10 @@
 -- 4. Solver attribution moves onto qbit_pool_blocks. Four dashboard queries
 --    found each block's solving share by suffix-matching every block's hash
 --    against the ledger on every request; after a detach that lookup would
---    silently blank a historical block's solver. The columns are backfilled
---    here, written at landing from now on, and the queries read them.
+--    silently blank a historical block's solver. The columns are written at
+--    landing from now on, and the queries read them. The existing blocks'
+--    columns are filled by the migrator right after this file, in the same
+--    transaction (see the end of this file).
 
 ALTER TABLE qbit_block_candidate_outbox
     DROP CONSTRAINT IF EXISTS qbit_block_candidate_outbox_share_id_fkey;
@@ -135,28 +137,14 @@ CREATE TRIGGER qbit_pool_blocks_capture_solver
 BEFORE INSERT ON qbit_pool_blocks
 FOR EACH ROW EXECUTE FUNCTION qbit_prism_capture_block_solver();
 
--- Backfill from the ledger, one suffix-index probe per block, exactly the
--- lookup the dashboard queries performed on every request.
-UPDATE qbit_pool_blocks block
-SET solver_miner_id = solver.miner_id,
-    solver_share_id = solver.share_id,
-    solver_share_difficulty = solver.share_difficulty,
-    solver_network_difficulty = solver.network_difficulty
-FROM (
-    SELECT found.block_hash, share.miner_id, share.share_id, share.share_difficulty, share.network_difficulty
-    FROM qbit_pool_blocks found
-    CROSS JOIN LATERAL (
-        SELECT share.miner_id, share.share_id, share.share_difficulty, share.network_difficulty
-        FROM qbit_share_ledger share
-        WHERE share.accepted
-          AND length(share.share_id) >= 65
-          AND lower(right(share.share_id, 64)) = found.block_hash
-        ORDER BY share.accepted_at DESC, share.share_seq DESC
-        LIMIT 1
-    ) share
-    WHERE found.solver_share_id IS NULL
-) solver
-WHERE solver.block_hash = block.block_hash;
+-- The existing blocks' solvers are not filled here (#672). The lookup is one
+-- suffix-index probe per block, exactly what the dashboard queries made on
+-- every request. As one UPDATE over every block it was a single statement
+-- of two random reads per block, under the migration's statement timeout,
+-- and on a cold cache over a busy disk mainnet's 13,566 blocks outlasted the
+-- 15 s default. The migrator makes the same probes right after this file,
+-- inside the same transaction, in statements of at most 128 blocks each
+-- (ledger/migration/block_solvers.rs).
 
 -- The next value the share sequence will hand out.
 CREATE FUNCTION qbit_prism_share_next_seq()
