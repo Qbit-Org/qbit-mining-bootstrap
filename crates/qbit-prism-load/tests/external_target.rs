@@ -719,8 +719,32 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path.clone(), a.clone()]).unwrap_err()
     );
     assert!(error.contains("count it twice"), "{error}");
-    let error = format!("{:#}", external::merge_files(&[a.clone(), a]).unwrap_err());
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[a.clone(), a.clone()]).unwrap_err()
+    );
     assert!(error.contains("count it twice"), "{error}");
+    // A damaged document is refused with the reason, not merged into
+    // figures it would corrupt.
+    for (field, value, needle) in [
+        ("offers_shortfall", json!(1_000_000_000u64), "do not add up"),
+        (
+            "client_failures",
+            json!({"offer": {"count": 1, "recorded": 2, "samples": []}}),
+            "recorded",
+        ),
+    ] {
+        let mut damaged = read(&a);
+        damaged["totals"][field] = value;
+        let path = scratch.path("damaged.json");
+        external::write_document(&path, &damaged)?;
+        let error = format!(
+            "{:#}",
+            external::merge_files(&[path.clone(), b.clone()]).unwrap_err()
+        );
+        assert!(error.contains("inconsistent totals"), "{field}: {error}");
+        assert!(error.contains(needle), "{field}: {error}");
+    }
     Ok(())
 }
 

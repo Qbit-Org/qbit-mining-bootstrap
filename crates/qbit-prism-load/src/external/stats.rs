@@ -529,6 +529,42 @@ impl Totals {
         self.no_response_run_ended + self.no_response_mid_run
     }
 
+    /// What every process's totals hold by construction, checked on a
+    /// document read back for a merge: a hand-edited or damaged one is
+    /// refused with the reason rather than added into figures it would
+    /// corrupt, or into arithmetic it would overflow.
+    pub fn check(&self) -> Result<()> {
+        ensure!(
+            self.offers_dispatched.checked_add(self.offers_shortfall) == Some(self.offers_minted),
+            "offers dispatched ({}) and shortfall ({}) do not add up to the offers minted ({})",
+            self.offers_dispatched,
+            self.offers_shortfall,
+            self.offers_minted
+        );
+        for (kind, stat) in &self.client_failures {
+            ensure!(
+                stat.recorded <= stat.count,
+                "client failures of kind {kind}: {} recorded of {}",
+                stat.recorded,
+                stat.count
+            );
+        }
+        for (tip, stat) in &self.tips.tips {
+            ensure!(
+                stat.first_seen_unix_ms <= stat.last_seen_unix_ms && stat.sessions > 0,
+                "tip {tip}: first seen after last seen, or by no session"
+            );
+        }
+        for second in self.timeline.seconds() {
+            ensure!(
+                second.dispatched.checked_add(second.shortfall) == Some(second.offered),
+                "second {}: offers dispatched and shortfall do not add up to the offers made",
+                second.unix_second
+            );
+        }
+        Ok(())
+    }
+
     /// Every submit that went out and was settled one way or the other.
     pub fn sent(&self) -> u64 {
         self.accepted + self.rejected + self.no_response()
@@ -1047,6 +1083,9 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
                 .with_context(|| format!("{} has no totals", path.display()))?,
         )
         .with_context(|| format!("reading the totals of {}", path.display()))?;
+        these_totals
+            .check()
+            .with_context(|| format!("{} holds inconsistent totals", path.display()))?;
         processes.extend(these);
         totals.merge(&these_totals);
     }
@@ -1118,7 +1157,7 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         .client_failures
         .iter()
         .filter(|(kind, _)| kind.as_str() == "offer")
-        .map(|(_, stat)| stat.count - stat.recorded)
+        .map(|(_, stat)| stat.count.saturating_sub(stat.recorded))
         .sum();
     let accounted = totals.sent()
         + failures_unrecorded
@@ -1128,7 +1167,7 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         .tips
         .tips
         .values()
-        .map(|tip| (tip.last_seen_unix_ms - tip.first_seen_unix_ms) as f64)
+        .map(|tip| tip.last_seen_unix_ms.saturating_sub(tip.first_seen_unix_ms) as f64)
         .collect();
     // A process that dropped its oldest tips leaves the tips it kept short of
     // its sightings of the ones it dropped, and a merge cannot tell which
