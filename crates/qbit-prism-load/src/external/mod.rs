@@ -429,9 +429,16 @@ pub fn write_document(path: &Path, document: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Where [`write_document`] writes `name` before renaming it into place.
+/// Where [`write_document`] writes `name` before renaming it into place: a
+/// name of its own each time, so nothing already in the directory -- a file
+/// it may not write, a directory, a link, a share log -- stands in its way
+/// after an hours-long load, and the entry probe's success holds for it.
 fn partial_path(directory: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    directory.join(format!(".{}.partial", name.to_string_lossy()))
+    directory.join(format!(
+        ".{}.{}.partial",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ))
 }
 
 /// The run's result in one line.
@@ -882,19 +889,9 @@ fn check_outputs(args: &ExternalArgs, run_tag: &str) -> Result<()> {
         // renamed over its own name, so any name the two share is a log the
         // document would replace.
         let log_names = file_names(log, "--share-log")?;
-        // The document is written to a partial file first and renamed: a log
-        // there would be overwritten as surely.
-        let out_name = args
-            .out
-            .file_name()
-            .with_context(|| format!("--out {} names no file", args.out.display()))?;
-        let out_directory = args
-            .out
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut out_names = file_names(&args.out, "--out")?;
-        out_names.extend(file_names(&partial_path(out_directory, out_name), "--out")?);
+        // The document's partial file is named afresh when it is written, so
+        // only --out's own names can be the log's.
+        let out_names = file_names(&args.out, "--out")?;
         // And the same file under another name, a hard link: by device and
         // inode, for the names that exist.
         let identity = |name: &PathBuf| {

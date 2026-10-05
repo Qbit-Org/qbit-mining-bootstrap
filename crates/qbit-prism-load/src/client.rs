@@ -1740,18 +1740,27 @@ async fn offer(
             waiting: connection.lines.waiting.clone(),
             stopping: shared.stopping.clone(),
         });
-        tokio::task::spawn_blocking(move || {
+        let searching = interrupt.clone();
+        let found = tokio::task::spawn_blocking(move || {
             search(
                 &job,
                 &extranonce1,
                 &extranonce2,
                 scheduled_block,
                 discards,
-                interrupt.as_ref(),
+                searching.as_ref(),
             )
         })
         .await
-        .map_err(|error| OfferFailure::unrecorded(error.into()))?
+        .map_err(|error| OfferFailure::unrecorded(error.into()))?;
+        // Looked at again once a share is found: what arrived since the
+        // search last looked may have retired the job it is on.
+        match found {
+            Searched::Found(..) if interrupt.as_ref().is_some_and(Interrupt::now) => {
+                Searched::Interrupted
+            }
+            found => found,
+        }
     } else {
         search(
             &job,
@@ -1850,6 +1859,7 @@ const INTERRUPT_CHECK: u32 = 1 << 10;
 
 /// What stops a search off the runtime early: something waiting on the
 /// session's connection, or the run stopping its sessions.
+#[derive(Clone)]
 struct Interrupt {
     waiting: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,

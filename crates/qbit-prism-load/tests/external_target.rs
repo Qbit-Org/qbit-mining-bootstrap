@@ -1117,6 +1117,33 @@ async fn a_stop_ends_a_search_at_once() -> Result<()> {
     Ok(())
 }
 
+/// Nothing already beside --out can stop the document being written after
+/// the load: here a directory sits where a fixed partial name would be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_document_is_written_whatever_lies_beside_it() -> Result<()> {
+    let target = fake_target(EASY).await;
+    let scratch = Scratch::new("beside");
+    let out = scratch.path("stats.json");
+    std::fs::create_dir(scratch.path(".stats.json.partial"))?;
+    let args = args(
+        &target.address,
+        &out,
+        &[
+            external::GUARD_FLAG,
+            "--sessions",
+            "1",
+            "--rate",
+            "5",
+            "--duration-seconds",
+            "1",
+        ],
+    );
+    let outcome = external::run(&args, &Shutdown::never()).await?;
+    assert_eq!(outcome.exit_code, run::EXIT_OK);
+    assert_eq!(read(&out), outcome.document);
+    Ok(())
+}
+
 /// A session that comes back to a tip, as one can while the frontends
 /// behind a balancer disagree, is counted on it once, at its first
 /// sighting.
@@ -1198,22 +1225,22 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
     };
     assert!(error.contains("same file"), "{error}");
     assert!(!fresh.exists());
-    // A share log that is the document's partial file under another name.
+    // A share log that is the document under another name: a hard link to
+    // an --out that exists.
     let shares = scratch.path("shares.jsonl");
-    std::fs::write(&shares, "")?;
-    std::fs::hard_link(&shares, scratch.path(".fresh.json.partial"))?;
+    std::fs::hard_link(&out, &shares)?;
     let hard = shares.display().to_string();
     let linked_hard = args(
         &target.address,
-        &fresh,
+        &out,
         &[external::GUARD_FLAG, "--share-log", &hard],
     );
     let error = match external::run(&linked_hard, &Shutdown::never()).await {
-        Ok(_) => panic!("a share log hard-linked to the partial file ran"),
+        Ok(_) => panic!("a share log hard-linked to --out ran"),
         Err(error) => format!("{error:#}"),
     };
     assert!(error.contains("same file"), "{error}");
-    std::fs::remove_file(scratch.path(".fresh.json.partial"))?;
+    assert_eq!(std::fs::read_to_string(&out)?, "an earlier run's stats");
     std::fs::remove_file(&shares)?;
     // A dangling symlink to the document's path: the log would be created
     // through it, at the document's path.
@@ -1231,18 +1258,6 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
     assert!(error.contains("same file"), "{error}");
     assert!(!fresh.exists());
     std::fs::remove_file(scratch.path("link.jsonl"))?;
-    // The partial file the document is written to before its rename.
-    let partial = scratch.path(".fresh.json.partial").display().to_string();
-    let partial_log = args(
-        &target.address,
-        &fresh,
-        &[external::GUARD_FLAG, "--share-log", &partial],
-    );
-    let error = match external::run(&partial_log, &Shutdown::never()).await {
-        Ok(_) => panic!("a share log at the document's partial file ran"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert!(error.contains("same file"), "{error}");
     assert_eq!(target.seen.connections.load(Ordering::SeqCst), 0);
     // Nothing is left behind by the check either.
     let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)?
