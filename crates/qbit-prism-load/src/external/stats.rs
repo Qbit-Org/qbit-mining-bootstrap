@@ -44,6 +44,14 @@ pub const FAILURE_SAMPLES: usize = 8;
 /// waited for on the async runtime.
 pub const SHARE_LOG_BACKLOG: usize = 65_536;
 
+/// `total + more`, refused rather than wrapped: two documents' counters can
+/// only pass `u64::MAX` together if one of them was damaged.
+fn sum(total: u64, more: u64, what: &str) -> Result<u64> {
+    total
+        .checked_add(more)
+        .with_context(|| format!("{what} overflows when the documents are added"))
+}
+
 /// One instant on both clocks, so an event's monotonic `Instant` can be
 /// placed on the wall clock without reading the wall clock again: a wall
 /// clock stepped mid-run moves nothing.
@@ -94,11 +102,18 @@ impl Tally {
         }
     }
 
-    pub fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
         for (key, count) in &other.counts {
-            self.add(key, *count);
+            if let Some(held) = self.counts.get_mut(key) {
+                *held = sum(*held, *count, "a tally")?;
+            } else if self.counts.len() < TALLY_KEYS {
+                self.counts.insert(key.clone(), *count);
+            } else {
+                self.other = sum(self.other, *count, "a tally")?;
+            }
         }
-        self.other += other.other;
+        self.other = sum(self.other, other.other, "a tally")?;
+        Ok(())
     }
 
     pub fn total(&self) -> u64 {
@@ -150,18 +165,18 @@ impl Rejections {
         }
     }
 
-    pub fn merge(&mut self, other: &Self) {
-        for ((code, reason_id, message), count) in &other.counts {
-            self.add(
-                &Rejection {
-                    code: *code,
-                    reason_id: reason_id.clone(),
-                    message: message.clone(),
-                },
-                *count,
-            );
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
+        for (key, count) in &other.counts {
+            if let Some(held) = self.counts.get_mut(key) {
+                *held = sum(*held, *count, "a rejection count")?;
+            } else if self.counts.len() < REJECTION_KEYS {
+                self.counts.insert(key.clone(), *count);
+            } else {
+                self.other = sum(self.other, *count, "a rejection count")?;
+            }
         }
-        self.other += other.other;
+        self.other = sum(self.other, other.other, "a rejection count")?;
+        Ok(())
     }
 
     /// Every triple with its class and count, most frequent first.
@@ -276,21 +291,23 @@ pub struct Second {
 }
 
 impl Second {
-    fn merge(&mut self, other: &Self) {
-        self.offered += other.offered;
-        self.dispatched += other.dispatched;
-        self.shortfall += other.shortfall;
-        self.accepted += other.accepted;
-        self.rejected += other.rejected;
-        self.no_response += other.no_response;
-        self.disconnects += other.disconnects;
-        self.reconnects += other.reconnects;
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        let what = "a timeline second's count";
+        self.offered = sum(self.offered, other.offered, what)?;
+        self.dispatched = sum(self.dispatched, other.dispatched, what)?;
+        self.shortfall = sum(self.shortfall, other.shortfall, what)?;
+        self.accepted = sum(self.accepted, other.accepted, what)?;
+        self.rejected = sum(self.rejected, other.rejected, what)?;
+        self.no_response = sum(self.no_response, other.no_response, what)?;
+        self.disconnects = sum(self.disconnects, other.disconnects, what)?;
+        self.reconnects = sum(self.reconnects, other.reconnects, what)?;
         self.sessions_holding_work = match (self.sessions_holding_work, other.sessions_holding_work)
         {
-            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), Some(b)) => Some(sum(a, b, what)?),
             (a, b) => a.or(b),
         };
-        self.sampled_by += other.sampled_by;
+        self.sampled_by = sum(self.sampled_by, other.sampled_by, what)?;
+        Ok(())
     }
 }
 
@@ -311,10 +328,11 @@ impl Timeline {
         self.0.values()
     }
 
-    pub fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
         for second in other.0.values() {
-            self.second(second.unix_second).merge(second);
+            self.second(second.unix_second).merge(second)?;
         }
+        Ok(())
     }
 }
 
@@ -330,7 +348,7 @@ impl TryFrom<Vec<Second>> for Timeline {
     fn try_from(seconds: Vec<Second>) -> Result<Self> {
         let mut timeline = Self::default();
         for second in seconds {
-            timeline.second(second.unix_second).merge(&second);
+            timeline.second(second.unix_second).merge(&second)?;
         }
         Ok(timeline)
     }
@@ -358,12 +376,12 @@ pub struct Tips {
 }
 
 impl Tips {
-    fn add(&mut self, tip: &str, stat: &TipStat) {
+    fn add(&mut self, tip: &str, stat: &TipStat) -> Result<()> {
         match self.tips.get_mut(tip) {
             Some(held) => {
                 held.first_seen_unix_ms = held.first_seen_unix_ms.min(stat.first_seen_unix_ms);
                 held.last_seen_unix_ms = held.last_seen_unix_ms.max(stat.last_seen_unix_ms);
-                held.sessions += stat.sessions;
+                held.sessions = sum(held.sessions, stat.sessions, "a tip's sessions")?;
             }
             None => {
                 self.tips.insert(tip.to_owned(), stat.clone());
@@ -379,13 +397,15 @@ impl Tips {
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn merge(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
         for (tip, stat) in &other.tips {
-            self.add(tip, stat);
+            self.add(tip, stat)?;
         }
-        self.dropped += other.dropped;
+        self.dropped = sum(self.dropped, other.dropped, "the dropped tips")?;
+        Ok(())
     }
 }
 
@@ -402,14 +422,15 @@ pub struct FailureStat {
 }
 
 impl FailureStat {
-    fn merge(&mut self, other: &Self) {
-        self.count += other.count;
-        self.recorded += other.recorded;
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        self.count = sum(self.count, other.count, "a client-failure count")?;
+        self.recorded = sum(self.recorded, other.recorded, "a client-failure count")?;
         for sample in &other.samples {
             if self.samples.len() < FAILURE_SAMPLES && !self.samples.contains(sample) {
                 self.samples.push(sample.clone());
             }
         }
+        Ok(())
     }
 }
 
@@ -476,42 +497,52 @@ pub struct Totals {
 }
 
 impl Totals {
-    pub fn merge(&mut self, other: &Self) {
-        self.offers_minted += other.offers_minted;
-        self.offers_dispatched += other.offers_dispatched;
-        self.offers_shortfall += other.offers_shortfall;
-        self.offers_discarded += other.offers_discarded;
-        self.offers_unknown_at_abort += other.offers_unknown_at_abort;
-        self.offers_above_difficulty_ceiling += other.offers_above_difficulty_ceiling;
-        self.accepted += other.accepted;
-        self.rejected += other.rejected;
-        self.no_response_run_ended += other.no_response_run_ended;
-        self.no_response_mid_run += other.no_response_mid_run;
-        self.no_response_reasons.merge(&other.no_response_reasons);
-        self.rejections.merge(&other.rejections);
+    /// Add another process's totals. A counter that would pass `u64::MAX` is
+    /// refused rather than wrapped.
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
+        macro_rules! add {
+            ($($field:ident),* $(,)?) => {
+                $(self.$field = sum(self.$field, other.$field, stringify!($field))?;)*
+            };
+        }
+        add!(
+            offers_minted,
+            offers_dispatched,
+            offers_shortfall,
+            offers_discarded,
+            offers_unknown_at_abort,
+            offers_above_difficulty_ceiling,
+            accepted,
+            rejected,
+            no_response_run_ended,
+            no_response_mid_run,
+            connections_opened,
+            initial_connections,
+            initial_connect_failures,
+            disconnects,
+            reconnects_completed,
+            reconnect_failed_attempts,
+            notifies,
+            clean_jobs,
+            difficulty_advertisements,
+            discarded_block_solutions,
+        );
+        self.no_response_reasons.merge(&other.no_response_reasons)?;
+        self.rejections.merge(&other.rejections)?;
         for (kind, stat) in &other.client_failures {
             self.client_failures
                 .entry(kind.clone())
                 .or_default()
-                .merge(stat);
+                .merge(stat)?;
         }
-        self.ack_latency.merge(&other.ack_latency);
-        self.rejection_latency.merge(&other.rejection_latency);
-        self.connections_opened += other.connections_opened;
-        self.initial_connections += other.initial_connections;
-        self.time_to_first_job.merge(&other.time_to_first_job);
-        self.initial_connect_failures += other.initial_connect_failures;
+        self.ack_latency.merge(&other.ack_latency)?;
+        self.rejection_latency.merge(&other.rejection_latency)?;
+        self.time_to_first_job.merge(&other.time_to_first_job)?;
         self.initial_connect_errors
-            .merge(&other.initial_connect_errors);
-        self.disconnects += other.disconnects;
-        self.disconnect_causes.merge(&other.disconnect_causes);
-        self.reconnects_completed += other.reconnects_completed;
-        self.reconnect_failed_attempts += other.reconnect_failed_attempts;
-        self.reconnect_errors.merge(&other.reconnect_errors);
-        self.reconnect_outage.merge(&other.reconnect_outage);
-        self.notifies += other.notifies;
-        self.clean_jobs += other.clean_jobs;
-        self.difficulty_advertisements += other.difficulty_advertisements;
+            .merge(&other.initial_connect_errors)?;
+        self.disconnect_causes.merge(&other.disconnect_causes)?;
+        self.reconnect_errors.merge(&other.reconnect_errors)?;
+        self.reconnect_outage.merge(&other.reconnect_outage)?;
         self.advertised_difficulty_min = min_f64(
             self.advertised_difficulty_min,
             other.advertised_difficulty_min,
@@ -520,9 +551,9 @@ impl Totals {
             self.advertised_difficulty_max,
             other.advertised_difficulty_max,
         );
-        self.discarded_block_solutions += other.discarded_block_solutions;
-        self.tips.merge(&other.tips);
-        self.timeline.merge(&other.timeline);
+        self.tips.merge(&other.tips)?;
+        self.timeline.merge(&other.timeline)?;
+        Ok(())
     }
 
     pub fn no_response(&self) -> u64 {
@@ -768,11 +799,12 @@ impl Collector {
             Event::Submit(record) => self.submit(&record, now),
             Event::Reconnect(record) => {
                 if record.completed {
+                    // Its second in the timeline comes from its `Opened`,
+                    // which carries when the session held work again.
                     self.totals.reconnects_completed += 1;
                     self.totals
                         .reconnect_outage
                         .record_millis(record.seconds * 1000.0);
-                    self.second(now).reconnects += 1;
                 } else if record.reason == "initial" {
                     self.totals.initial_connect_failures += 1;
                     self.totals
@@ -787,6 +819,9 @@ impl Collector {
             }
             Event::Opened(opened) => {
                 self.totals.connections_opened += 1;
+                if opened.cause != "initial" {
+                    self.second(opened.ready).reconnects += 1;
+                }
                 if opened.cause == "initial" {
                     self.totals.initial_connections += 1;
                     self.totals.time_to_first_job.record_millis(
@@ -946,7 +981,8 @@ impl Collector {
         }
         seen[word] |= bit;
         let at = self.anchor.unix_ms(sighting.at);
-        self.totals.tips.add(
+        // One session more: past u64::MAX only in a run that cannot happen.
+        let _ = self.totals.tips.add(
             &sighting.tip,
             &TipStat {
                 first_seen_unix_ms: at,
@@ -1118,7 +1154,9 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
             );
         }
         processes.extend(these);
-        totals.merge(&these_totals);
+        totals
+            .merge(&these_totals)
+            .with_context(|| format!("adding {}", path.display()))?;
     }
     document("merged", &processes, &totals)
 }

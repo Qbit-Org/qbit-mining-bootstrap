@@ -6,7 +6,7 @@
 //! would have kept for both sample sets, and a merged percentile is as good
 //! as a single process's.
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -72,11 +72,20 @@ impl LogHistogram {
         self.count
     }
 
-    pub fn merge(&mut self, other: &Self) {
-        for (lower, count) in &other.buckets {
-            *self.buckets.entry(*lower).or_insert(0) += count;
+    /// Add `other`'s samples. A count that would pass `u64::MAX` is refused
+    /// rather than wrapped; the sum saturates, as recording does.
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
+        let count = self
+            .count
+            .checked_add(other.count)
+            .context("a histogram's sample count overflows when added")?;
+        for (lower, more) in &other.buckets {
+            let held = self.buckets.entry(*lower).or_insert(0);
+            *held = held
+                .checked_add(*more)
+                .context("a histogram bucket's count overflows when added")?;
         }
-        self.count += other.count;
+        self.count = count;
         self.sum_micros = self.sum_micros.saturating_add(other.sum_micros);
         self.min_micros = match (self.min_micros, other.min_micros) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -86,6 +95,7 @@ impl LogHistogram {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
+        Ok(())
     }
 
     /// The nearest-rank `q` quantile, in microseconds: the upper bound of the

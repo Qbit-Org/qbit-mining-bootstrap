@@ -418,7 +418,7 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
             second.record_micros(value);
         }
     }
-    first.merge(&second);
+    first.merge(&second).unwrap();
     assert_eq!(first, both);
     values.sort_unstable();
     for q in [0.5, 0.9, 0.99, 0.999] {
@@ -695,7 +695,7 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         serde_json::from_value(first.document["totals"]["ack_latency"].clone())?;
     ack.merge(&serde_json::from_value(
         second.document["totals"]["ack_latency"].clone(),
-    )?);
+    )?)?;
     assert_eq!(
         serde_json::from_value::<LogHistogram>(merged["totals"]["ack_latency"].clone())?,
         ack
@@ -730,6 +730,23 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
     assert!(error.contains("count it twice"), "{error}");
     // A damaged document is refused with the reason, not merged into
     // figures it would corrupt.
+    // Two documents each whole in itself, whose counters cannot be added.
+    let huge: Vec<PathBuf> = [&a, &b]
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let mut huge = read(path);
+            huge["totals"]["offers_minted"] = json!(u64::MAX);
+            huge["totals"]["offers_dispatched"] = json!(u64::MAX);
+            huge["totals"]["offers_shortfall"] = json!(0);
+            huge["processes"][0]["offers_minted"] = json!(u64::MAX);
+            let out = scratch.path(&format!("huge-{index}.json"));
+            external::write_document(&out, &huge).unwrap();
+            out
+        })
+        .collect();
+    let error = format!("{:#}", external::merge_files(&huge).unwrap_err());
+    assert!(error.contains("overflows"), "{error}");
     let mut damaged = read(&a);
     damaged["processes"][0]["accepted"] = json!(123_456_789u64);
     let path = scratch.path("damaged-process.json");

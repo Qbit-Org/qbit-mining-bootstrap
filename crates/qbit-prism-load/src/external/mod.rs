@@ -348,6 +348,17 @@ impl Shutdown {
         self.requests.load(Ordering::SeqCst) >= 2
     }
 
+    /// As a first and a second request at once: the load ends and the drain
+    /// is skipped.
+    pub fn force(&self, reason: &str) {
+        {
+            let mut held = self.reason.lock().expect("shutdown reason lock");
+            held.get_or_insert_with(|| reason.to_owned());
+        }
+        self.requests.fetch_max(2, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
     /// Resolve once at least `count` requests have been made.
     async fn after(&self, count: usize) {
         loop {
@@ -564,9 +575,11 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
                 let mut collector = collector.lock().expect("collector lock");
                 collector.apply(event);
                 collector.event_backlog_max = collector.event_backlog_max.max(waiting);
+                // Forced: the drain would let reconnecting sessions keep
+                // adding to the very backlog that ended the load.
                 if waiting >= EVENT_BACKLOG_LIMIT && !behind {
                     behind = true;
-                    shutdown.request(&format!(
+                    shutdown.force(&format!(
                         "the stats fell {waiting} events behind the sessions, so this machine \
                          drives more than it can count; run fewer sessions or a lower rate per \
                          process"
