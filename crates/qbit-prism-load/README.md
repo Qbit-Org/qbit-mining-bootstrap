@@ -1132,7 +1132,10 @@ The `--address` has to be a payout address the target's node validates
    and then sent in a burst; an offer that reaches a session in the instant
    its connection goes is dropped when it reconnects, and counted as
    discarded. A session has one submit outstanding at a time, as the server
-   answers it.
+   answers it. The bucket ticks every millisecond and offers each session at
+   most once a tick, so a late tick (a process suspended and resumed, say)
+   counts what it owes as shortfall rather than sending it as a burst. A
+   process's ceiling is therefore 1,000 offers a second per session.
 4. Mines each job at the difficulty the last `mining.set_difficulty` before
    its `mining.notify` advertised, as the server binds them (Stratum's 1
    before any), with `--difficulty` asked for in the password when given. The

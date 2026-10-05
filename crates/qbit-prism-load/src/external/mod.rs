@@ -977,13 +977,21 @@ struct Driven {
 /// offered anything: it would hold the offer until it reconnected, so an
 /// outage would read as dispatched load rather than shortfall, and the held
 /// offers would go out as a burst on recovery.
+///
+/// Each session looked at spends one of `looks`, a tick's single pass over
+/// the sessions. Sessions on other workers answer and free up while a tick
+/// runs, so without it a tick hours late could keep placing its overdue
+/// offers as fast as a quick target answers them, a burst the token bucket
+/// never meant, instead of counting them short.
 fn place(
     sessions: &[SessionHandle],
     holding: &[AtomicBool],
     cursor: &mut usize,
+    looks: &mut usize,
     phase: &Arc<str>,
 ) -> bool {
-    for _ in 0..sessions.len() {
+    while *looks > 0 {
+        *looks -= 1;
         let index = *cursor % sessions.len();
         *cursor = cursor.wrapping_add(1);
         if holding[index].load(Ordering::Relaxed) && sessions[index].try_offer(1, phase) {
@@ -1043,12 +1051,14 @@ async fn drive(
         // take is shortfall, never a backlog.
         let want = (elapsed.min(duration).as_secs_f64() * args.rate).floor() as u64;
         let second = anchor.unix_second(now);
-        // Once a scan finds no session free, the rest of this tick's offers
-        // are shortfall without scanning again, so an outage costs one pass
-        // over the sessions a tick rather than one per offer.
+        // A tick looks at each session at most once. Once that pass is spent,
+        // or finds no session free, the rest of this tick's offers are
+        // shortfall, so an outage or a tick hours late costs one pass over
+        // the sessions, and no session takes two offers in one tick.
         let minting = offers.minted < want;
+        let mut looks = sessions.len();
         while offers.minted < want {
-            let placed = place(sessions, holding, &mut cursor, &phase);
+            let placed = place(sessions, holding, &mut cursor, &mut looks, &phase);
             // Each offer in the wall-clock second it was placed in, which a
             // large catch-up batch can carry past the tick's own.
             let tally = offers
@@ -1061,10 +1071,9 @@ async fn drive(
                 tally.0 += 1;
                 tally.1 += 1;
             } else {
-                // No session is free: every offer still due this tick is
-                // shortfall, counted at once rather than one at a time, so
-                // even a tick hours late -- a suspended process -- costs one
-                // pass over the sessions.
+                // No session is free, or the tick's pass is spent: every
+                // offer still due this tick is shortfall, counted at once
+                // rather than one at a time.
                 let rest = want - offers.minted;
                 offers.minted = want;
                 offers.shortfall += rest;
@@ -1131,4 +1140,52 @@ async fn drive(
         seconds: ended.duration_since(started).as_secs_f64(),
     };
     (Driven { window, offers }, interrupted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// Sessions free again the moment they take an offer, as ones on other
+    /// workers answering a fast target can be, still take one offer each a
+    /// tick: the tick's pass is spent, not renewed.
+    #[tokio::test]
+    async fn a_tick_offers_each_session_once_however_fast_they_free_up() {
+        let mut receivers = Vec::new();
+        let sessions: Vec<SessionHandle> = (0..3)
+            .map(|index| {
+                let (work, receiver) = mpsc::channel(1024);
+                receivers.push(receiver);
+                SessionHandle {
+                    index,
+                    frontend: Arc::new(AtomicUsize::new(0)),
+                    outstanding: Arc::new(AtomicUsize::new(0)),
+                    paused: Arc::new(AtomicBool::new(false)),
+                    work,
+                    control: mpsc::unbounded_channel().0,
+                    task: tokio::spawn(async {}),
+                }
+            })
+            .collect();
+        let holding: Vec<AtomicBool> = sessions.iter().map(|_| AtomicBool::new(true)).collect();
+        let phase: Arc<str> = Arc::from(PHASE);
+        let (mut cursor, mut looks, mut placed) = (0, sessions.len(), 0);
+        while place(&sessions, &holding, &mut cursor, &mut looks, &phase) {
+            placed += 1;
+            assert!(placed <= sessions.len(), "one tick placed {placed} offers");
+            for session in &sessions {
+                session.outstanding.store(0, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(placed, sessions.len());
+        assert_eq!(looks, 0);
+        // The next tick's pass starts where this one stopped.
+        let mut looks = sessions.len();
+        assert!(place(&sessions, &holding, &mut cursor, &mut looks, &phase));
+        assert_eq!(cursor, sessions.len() + 1);
+        for receiver in &mut receivers {
+            assert!(receiver.try_recv().is_ok());
+        }
+    }
 }

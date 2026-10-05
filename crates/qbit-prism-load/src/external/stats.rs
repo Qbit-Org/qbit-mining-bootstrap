@@ -1658,9 +1658,10 @@ pub fn definitions() -> Value {
                   accepted share is one the target acknowledged, and nothing here shows it is \
                   durable. Reconcile the --share-log ids against the target's database for that.",
         "offers": "An open-loop token bucket mints --rate offers a second over the load window and \
-                   gives each to the next session that holds work and has nothing outstanding; \
-                   one no such session can take is shortfall, never queued, so an outage shows \
-                   as shortfall rather than as offers held for sessions without a connection. \
+                   gives each to the next session that holds work and has nothing outstanding, \
+                   each session at most once a millisecond tick; one no such session can take \
+                   is shortfall, never queued, so an outage or a late tick shows as shortfall \
+                   rather than as offers held for sessions without a connection or a burst. \
                    A dispatched offer is mined and sent, fails before sending \
                    (failed_before_sending, including above_difficulty_ceiling), is discarded \
                    unsent when the run stops its session, or is unknown_at_abort: held by a \
