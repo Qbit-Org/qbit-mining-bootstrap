@@ -63,6 +63,11 @@ enum Command {
         #[command(subcommand)]
         command: FatalStateCommand,
     },
+    /// Hold block submission for every frontend of the cluster, clear the hold, or show it.
+    SubmissionHold {
+        #[command(subcommand)]
+        command: SubmissionHoldCommand,
+    },
     /// Seal, archive, verify, detach, drop and restore share ledger partitions.
     ShareArchive {
         #[command(subcommand)]
@@ -215,6 +220,28 @@ enum FatalStateCommand {
     },
 }
 
+/// #664: the cluster-wide block submission hold, stored in the ledger.
+#[derive(Subcommand)]
+enum SubmissionHoldCommand {
+    /// Print the hold as JSON. Needs only PRISM_DATABASE_URL and opens it read-only.
+    Show,
+    /// Hold submission: no frontend claims a candidate, offers a block or sends a fanout.
+    Set {
+        /// Why submission is held, kept with the hold and journaled (1 to 4096 bytes).
+        #[arg(long)]
+        reason: String,
+    },
+    /// Clear the hold. Refused while a candidate is pending, unless told to offer them.
+    Clear {
+        /// Why the hold is cleared, journaled (1 to 4096 bytes).
+        #[arg(long)]
+        reason: String,
+        /// Let frontends with submission enabled offer the pending candidates the hold kept back.
+        #[arg(long)]
+        offer_pending_candidates: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum CandidatesCommand {
     /// Print unfinished candidates up to --limit, oldest due first; warn if truncated.
@@ -341,6 +368,12 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                     None => println!("found-block offers do not wait for a failover standby"),
                 }
             }
+            // #664: the hold lives in the database, which this check never reads.
+            println!(
+                "a cluster-wide block submission hold in the database overrides \
+                 PRISM_BLOCK_SUBMIT_ENABLED; `qbit-prism-server submission-hold show` and \
+                 self-check report it"
+            );
             Ok(())
         }
         Command::CheckPublicDatabaseConfig => {
@@ -364,6 +397,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         }
         Command::SigningTransition { confirm } => signing_transition(confirm).await,
         Command::FatalState { command } => fatal_state(command).await,
+        Command::SubmissionHold { command } => submission_hold(command).await,
         Command::ShareArchive { command } => share_archive(command).await,
         Command::Candidates { command } => candidates(command).await,
         Command::HeaderDifficulty { bits } => {
@@ -523,10 +557,7 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             Ok(())
         }
         FatalStateCommand::Clear { reason } => {
-            ensure!(
-                !reason.trim().is_empty() && reason.len() <= 4096,
-                "--reason must contain 1 to 4096 bytes of nonblank text"
-            );
+            crate::ledger::require_operator_reason(&reason)?;
             let config = Config::from_env()?;
             let ledger =
                 crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
@@ -534,6 +565,68 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             ledger.pool.close().await;
             println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
+        }
+    }
+}
+
+/// #664: every subcommand reads only the database URL, so a frontend-only
+/// setting left invalid cannot stop an operator holding or releasing the
+/// cluster. `show` opens it read-only and also reads a ledger from before
+/// migration 023. `set` and `clear` check their reason before any connection
+/// is opened, as `fatal-state clear` does, then take the operator connection,
+/// which works on a halted cluster and writes no heartbeat; both print the
+/// hold that results as JSON.
+async fn submission_hold(command: SubmissionHoldCommand) -> Result<()> {
+    let printed = |held: bool, fields: Value| -> Result<()> {
+        let mut document = json!({"schema": "qbit.prism.submission-hold.v1", "held": held});
+        if let (Some(document), Value::Object(fields)) = (document.as_object_mut(), fields) {
+            document.extend(fields);
+        }
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        Ok(())
+    };
+    match command {
+        SubmissionHoldCommand::Show => {
+            let url =
+                config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
+            let state = crate::ledger::Ledger::inspect_submission_hold(&url).await?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+            Ok(())
+        }
+        SubmissionHoldCommand::Set { reason } => {
+            crate::ledger::require_operator_reason(&reason)?;
+            let url = config::DatabaseConfig::url_from_env()?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+            let result = ledger.set_submission_hold(&reason).await;
+            ledger.pool.close().await;
+            let (hold, newly_set) = result?;
+            if !newly_set {
+                eprintln!("the cluster already held block submission; its hold is unchanged");
+            }
+            printed(
+                true,
+                json!({"newly_set": newly_set, "reason": hold.reason, "set_at": hold.set_at, "set_by": hold.set_by}),
+            )
+        }
+        SubmissionHoldCommand::Clear {
+            reason,
+            offer_pending_candidates,
+        } => {
+            crate::ledger::require_operator_reason(&reason)?;
+            let url = config::DatabaseConfig::url_from_env()?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+            let result = ledger
+                .clear_submission_hold(&reason, offer_pending_candidates)
+                .await;
+            ledger.pool.close().await;
+            let cleared = result?;
+            if cleared.cleared.is_none() {
+                eprintln!("the cluster held no block submission; nothing was changed");
+            }
+            printed(
+                false,
+                json!({"cleared": cleared.cleared, "pending_candidates": cleared.pending_candidates}),
+            )
         }
     }
 }
@@ -627,10 +720,7 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
             // '^[0-9a-f]{64}$'` for the hash, and `fatal-state clear`'s rule
             // for the reason, which lands in `last_error`.
             require_block_hash(&block_hash)?;
-            ensure!(
-                !reason.trim().is_empty() && reason.len() <= 4096,
-                "--reason must contain 1 to 4096 bytes of nonblank text"
-            );
+            crate::ledger::require_operator_reason(&reason)?;
             // A one-shot writer of ordinary ledger rows, not a recovery
             // command: `connect_tool` refuses a halted cluster at connect
             // exactly as a frontend would, and writes no heartbeat, so a
@@ -1643,6 +1733,12 @@ struct SelfCheckReport {
     /// `null` when the configuration could not be read. Each live frontend's
     /// own value is `block_submission_enabled` in its heartbeat below.
     block_submission: Option<config::BlockSubmission>,
+    /// #664: the cluster's block submission hold, as `submission-hold show`
+    /// prints it, or `null` when the database could not be read. A set hold
+    /// holds every frontend, whatever its own setting above says; each live
+    /// frontend's heartbeat carries the hold as it last read it in
+    /// `block_submission_hold`.
+    submission_hold: Option<Value>,
     health: Option<Value>,
     carry_forward_integrity: Option<Value>,
     durability: Option<Vec<(String, String)>>,
@@ -1659,6 +1755,7 @@ async fn self_check() -> Result<()> {
         ok: false,
         instance_id: None,
         block_submission: None,
+        submission_hold: None,
         health: None,
         carry_forward_integrity: None,
         durability: None,
@@ -1683,11 +1780,22 @@ async fn self_check() -> Result<()> {
         // Both samples are read-only and independent of the local startup
         // below: a node startup or refresh failure must hide neither the
         // cluster's heartbeats nor an unfinished historical import.
-        let (instances, completeness) = tokio::join!(
+        let (instances, completeness, hold) = tokio::join!(
             live_instances(&config.database_url, freshness),
             sample_audit_completeness(&config.database_url),
+            sample_submission_hold(&config.database_url),
         );
         report.live_instances = instances;
+        if let Some(hold) = hold.as_ref().filter(|hold| hold["held"] == true) {
+            eprintln!(
+                "WARNING: the cluster holds block submission, set by {} at {}: {}; no frontend \
+                 offers a block or sends a fanout until `qbit-prism-server submission-hold clear`",
+                hold["set_by"].as_str().unwrap_or("unknown"),
+                hold["set_at"].as_str().unwrap_or("unknown"),
+                hold["reason"].as_str().unwrap_or("unknown")
+            );
+        }
+        report.submission_hold = hold;
         report.audit_completeness = completeness.as_ref().ok().copied();
         if let Some(completeness) = &report.audit_completeness {
             if config::production_mode()? {
@@ -1712,6 +1820,18 @@ async fn self_check() -> Result<()> {
     report.ok = result.is_ok();
     println!("{}", serde_json::to_string_pretty(&report)?);
     result
+}
+
+/// #664: the cluster's block submission hold, read-only and bounded like the
+/// other samples; `None` when it could not be read.
+async fn sample_submission_hold(database_url: &str) -> Option<Value> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::ledger::Ledger::inspect_submission_hold(database_url),
+    )
+    .await
+    .ok()?
+    .ok()
 }
 
 async fn sample_audit_completeness(database_url: &str) -> Result<AuditCompleteness> {

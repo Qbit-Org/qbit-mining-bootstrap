@@ -337,6 +337,8 @@ pub struct Coordinator {
     /// Returns a landing's freed heap to the kernel once its rebuilt window
     /// is released (#600); on by default, `PRISM_LANDING_MALLOC_TRIM_ENABLED`.
     pub landing_trim: Arc<crate::memory::LandingTrim>,
+    /// The cluster's block submission hold (#664) as `health` last read it.
+    submission_hold: SubmissionHoldView,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -1012,6 +1014,7 @@ impl Coordinator {
             build_job_probe: Default::default(),
             offer_sections: Default::default(),
             landing_trim: Default::default(),
+            submission_hold: Default::default(),
         }))
     }
 
@@ -3256,7 +3259,12 @@ impl Coordinator {
         };
         let prepared = self.prepared.read().await.clone();
         let observed = self.observed_tip.read().await.as_deref().map(str::to_owned);
-        let revision = self.ledger.payout_revision().await.ok();
+        // #664: the cluster's hold in the same statement, as last read.
+        let (revision, hold) = match self.ledger.health_reads().await {
+            Ok((revision, hold)) => (revision, Some(hold)),
+            Err(_) => (None, None),
+        };
+        let hold = self.submission_hold.observe(hold);
         let ready = prepared.as_ref().is_some_and(|work| {
             work.template["previousblockhash"].as_str() == observed.as_deref()
                 && Some(work.snapshot.payout_revision) == revision
@@ -3267,12 +3275,66 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"block_submission_hold":submission_hold_report(hold.as_ref()),"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
         else {
             unreachable!("coordinator health fields are an object");
         };
         HeartbeatHealth::new(ready, fields).into_value()
     }
+}
+
+/// The cluster's block submission hold (#664) as this frontend last read it:
+/// unknown until a read succeeds, then the latest successful read. A failed
+/// read keeps that, so a database outage does not report every frontend as
+/// held; nothing enforces the hold from here, since every claim and
+/// reservation reads it itself.
+#[derive(Default)]
+struct SubmissionHoldView(std::sync::Mutex<Option<Option<crate::ledger::SubmissionHold>>>);
+
+impl SubmissionHoldView {
+    /// Record a read, `None` when it failed, and return the hold as last
+    /// read. A change is logged once, where the operator who set or cleared
+    /// it looks.
+    fn observe(
+        &self,
+        read: Option<Option<crate::ledger::SubmissionHold>>,
+    ) -> Option<Option<crate::ledger::SubmissionHold>> {
+        let mut known = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(current) = read else {
+            return known.clone();
+        };
+        if known.as_ref() != Some(&current) {
+            match &current {
+                Some(hold) => tracing::warn!(
+                    reason = %hold.reason,
+                    set_at = %hold.set_at,
+                    set_by = %hold.set_by,
+                    "the cluster holds block submission: no frontend claims a candidate, offers a block or sends a CTV fanout until `qbit-prism-server submission-hold clear`"
+                ),
+                None if matches!(*known, Some(Some(_))) => tracing::warn!(
+                    "the cluster's block submission hold was cleared: frontends with submission enabled offer pending candidates again"
+                ),
+                None => {}
+            }
+            *known = Some(current);
+        }
+        known.clone()
+    }
+}
+
+/// The cluster's block submission hold as health and the heartbeat report
+/// it (#664): `held` is null until the frontend has read it.
+fn submission_hold_report(read: Option<&Option<crate::ledger::SubmissionHold>>) -> Value {
+    let hold = read.and_then(Option::as_ref);
+    json!({
+        "held": read.map(Option::is_some),
+        "reason": hold.map(|hold| &hold.reason),
+        "set_at": hold.map(|hold| &hold.set_at),
+        "set_by": hold.map(|hold| &hold.set_by),
+    })
 }
 
 /// Job preparation found the authority its work was read with retired: a
@@ -3759,6 +3821,39 @@ impl MiningBackend for Coordinator {
     ) -> Result<(), StratumError> {
         self.submit_share(worker, job, submission, stale_grace)
             .await
+    }
+}
+
+#[cfg(test)]
+mod submission_hold_view_tests {
+    use super::SubmissionHoldView;
+    use crate::ledger::SubmissionHold;
+
+    /// #664: the hold is unknown until a read succeeds. After that a failed
+    /// read keeps the last one, so a database outage does not turn every
+    /// frontend's gauge to -1 and page it as held, and a change is taken at
+    /// the next successful read.
+    #[test]
+    fn a_failed_read_keeps_the_hold_last_read() {
+        let view = SubmissionHoldView::default();
+        let hold = SubmissionHold {
+            reason: "rehearsal".into(),
+            set_at: "2026-10-05T20:00:00+00:00".into(),
+            set_by: "operator".into(),
+        };
+        assert_eq!(view.observe(None), None, "unknown before any read");
+        assert_eq!(view.observe(Some(None)), Some(None));
+        assert_eq!(view.observe(None), Some(None), "a failed read cleared it");
+        assert_eq!(
+            view.observe(Some(Some(hold.clone()))),
+            Some(Some(hold.clone()))
+        );
+        assert_eq!(
+            view.observe(None),
+            Some(Some(hold)),
+            "a failed read released it"
+        );
+        assert_eq!(view.observe(Some(None)), Some(None));
     }
 }
 

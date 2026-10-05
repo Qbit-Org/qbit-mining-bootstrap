@@ -43,7 +43,7 @@ const FANOUT_STEPPED_SQL: &str =
 const FANOUT_TAKEOVER_SQL: &str =
     "(a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<>'infinity'::timestamptz)";
 
-/// The predicate of `qbit_ctv_fanout_artifacts_lane_idx` (migration 023,
+/// The predicate of `qbit_ctv_fanout_artifacts_lane_idx` (migration 024,
 /// #668), which a statement must repeat exactly for the planner to read the
 /// index: every fanout still to broadcast or check, and every confirmed one
 /// under 1,000 deep. Apart from the newest deep fanout, the checkpoint
@@ -602,21 +602,21 @@ mod tests {
         sql.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// The lane's candidates repeat the predicate of 023's index, or the
+    /// The lane's candidates repeat the predicate of 024's index, or the
     /// planner cannot read the index and every claim reads the settled
     /// history again (#668). `ledger_postgres::fanout_lane_plan` proves the
     /// plan on PostgreSQL, behind the integration gate; this does not need
     /// a database.
     #[test]
     fn the_lane_repeats_its_index_predicate() {
-        let statement = include_str!("../../migrations/023_fanout_lane_index.sql")
+        let statement = include_str!("../../migrations/024_fanout_lane_index.sql")
             .lines()
             .filter(|line| !line.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
             .join("\n");
         let (_, predicate) = statement
             .split_once("WHERE")
-            .expect("023's index is partial");
+            .expect("024's index is partial");
         assert_eq!(
             format!("({})", compact(predicate).trim_end_matches(';')),
             compact(FANOUT_LANE_INDEXED_SQL)

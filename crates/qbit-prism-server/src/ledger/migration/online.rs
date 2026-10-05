@@ -4,20 +4,19 @@
 //! transaction block, and a plain `CREATE INDEX` on the share ledger holds a
 //! SHARE lock on the table for the whole build, so every append would queue
 //! behind it, as every write to the CTV fanout table would, a found block's
-//! landing included, behind 023's. A migration listed in `ONLINE_MIGRATIONS` is therefore applied
-//! in two parts. Its file is applied transactionally to the scratch schema
-//! with every other native migration, so the migrator learns the index
-//! definitions it declares as this server's PostgreSQL renders them; nothing
-//! here parses SQL. After the migration transaction has committed, the
-//! runner below builds each new index with `CREATE INDEX CONCURRENTLY`,
-//! drops each replaced one with `DROP INDEX CONCURRENTLY`, and records the
-//! version last, on a dedicated connection with no statement or lock
-//! timeout, under a session-level advisory lock keyed by the ledger's
-//! schema, so two starting frontends never build the same index twice.
-//! Existing native ledgers always use this runner, even without visible
-//! shares: writers do not take the migration lock. Only fresh or empty
-//! 2.x.x sources apply the file inside `migrate_schema`'s transaction,
-//! while its cutover locks exclude writers.
+//! landing included, behind 024's. A migration listed in `ONLINE_MIGRATIONS` is
+//! therefore applied in two parts. Its file is applied transactionally to the
+//! scratch schema with every other native migration, so the migrator learns the
+//! index definitions it declares as this server's PostgreSQL renders them;
+//! nothing here parses SQL. After the migration transaction has committed, the
+//! runner below builds each new index with `CREATE INDEX CONCURRENTLY`, drops
+//! each replaced one with `DROP INDEX CONCURRENTLY`, and records the version
+//! last, on a dedicated connection with no statement or lock timeout, under a
+//! session-level advisory lock keyed by the ledger's schema, so two starting
+//! frontends never build the same index twice. Existing native ledgers always
+//! use this runner, even without visible shares: writers do not take the
+//! migration lock. Only fresh or empty 2.x.x sources apply the file inside
+//! `migrate_schema`'s transaction, while its cutover locks exclude writers.
 //!
 //! The runner is resumable. An interrupted build leaves an invalid index
 //! behind, still maintained by every insert; the next run drops it and
@@ -48,7 +47,7 @@
 //! source (`share_hashes.rs`, #582). 002's file is applied in the migration
 //! transaction like any other; only the mapping of the legacy shares is
 //! left for after the commit, in batches, and that run records 2. It runs
-//! before 013, 017 and 023, so every version is still recorded after the
+//! before 013, 017 and 024, so every version is still recorded after the
 //! ones below it.
 use super::*;
 use sqlx::{Connection, PgConnection};
@@ -57,7 +56,7 @@ use std::time::{Duration, Instant};
 /// One migration applied after the commit, by the runner its kind names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OnlineMigration {
-    /// Index creates and drops, applied with `CONCURRENTLY` (013, 023).
+    /// Index creates and drops, applied with `CONCURRENTLY` (013, 024).
     Indexes(IndexMigration),
     /// The share ledger partition conversion (017, `partition.rs`).
     Partitions(super::partition::PartitionMigration),

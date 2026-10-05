@@ -1,7 +1,7 @@
 //! #668: a CTV fanout claim poll reads the fanouts due now and the ones
 //! still being watched, never the settled history behind them.
 //!
-//! Settled fanouts accumulate with every found block. Before migration 023
+//! Settled fanouts accumulate with every found block. Before migration 024
 //! the lane's selection matched them on its status and schedule predicates
 //! and dropped them only after reading them, a sequential scan of the whole
 //! table on every claim. This plans and executes the two statements every
@@ -17,8 +17,8 @@
 //! lane, through its own index) or by the watched fanouts (the survey, which
 //! reads the scheduled ones), whatever the settled history holds.
 //!
-//! Migration 023 builds the lane's index online, as 013 builds its own:
-//! the last test upgrades a ledger at 22 while a fanout write is open.
+//! Migration 024 builds the lane's index online, as 013 builds its own:
+//! the last test upgrades a ledger at 23 while a fanout write is open.
 use super::*;
 use qbit_prism_server::ledger::REQUIRED_SCHEMA_VERSIONS;
 use serde_json::Value;
@@ -184,7 +184,7 @@ async fn a_fanout_claim_poll_never_reads_the_settled_history() -> Result<()> {
     db.close(vec![a]).await
 }
 
-/// The fanout writes the test makes while 023 builds: one per chunk, each
+/// The fanout writes the test makes while 024 builds: one per chunk, each
 /// a single-row update in its caller's transaction.
 async fn touch_fanout<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -201,21 +201,21 @@ async fn touch_fanout<'e>(
     Ok(())
 }
 
-/// 023 on a ledger at 22 is applied online, after the migration
+/// 024 on a ledger at 23 is applied online, after the migration
 /// transaction, with `CREATE INDEX CONCURRENTLY`: its build waits for a
 /// fanout write already open, and the fanout writes that arrive meanwhile,
 /// a found block's landing among them, land at once. A plain `CREATE INDEX`
 /// would queue behind the open write, and every later fanout write behind
 /// it. Then the index is valid, 23 is recorded and the lane reads it.
 #[tokio::test]
-async fn migration_023_builds_the_lane_index_without_blocking_fanout_writes() -> Result<()> {
+async fn migration_024_builds_the_lane_index_without_blocking_fanout_writes() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
     let a = db.ledger("a").await?;
     prepare_mature_cpfp_fanouts(&a, 2).await?;
     sqlx::raw_sql(
-        "DELETE FROM qbit_prism_schema_migrations WHERE version=23; DROP INDEX qbit_ctv_fanout_artifacts_lane_idx",
+        "DELETE FROM qbit_prism_schema_migrations WHERE version=24; DROP INDEX qbit_ctv_fanout_artifacts_lane_idx",
     )
     .execute(&a.pool)
     .await?;
@@ -236,12 +236,12 @@ async fn migration_023_builds_the_lane_index_without_blocking_fanout_writes() ->
     });
     tokio::select! {
         result = &mut migrate => match result {
-            Ok(_) => bail!("023 was applied while a fanout write was open"),
+            Ok(_) => bail!("024 was applied while a fanout write was open"),
             Err(error) => {
-                return Err(error.context("023 failed before its build waited for the open fanout write"))
+                return Err(error.context("024 failed before its build waited for the open fanout write"))
             }
         },
-        result = waiting => result.context("023's build never waited for the open fanout write")??,
+        result = waiting => result.context("024's build never waited for the open fanout write")??,
     }
     timeout(Duration::from_secs(5), async {
         let mut tx = a.pool.begin().await?;
@@ -250,10 +250,10 @@ async fn migration_023_builds_the_lane_index_without_blocking_fanout_writes() ->
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("a fanout write blocked behind 023's build")??;
+    .context("a fanout write blocked behind 024's build")??;
     ensure!(
         futures_util::poll!(&mut migrate).is_pending(),
-        "023 finished before the open fanout write committed"
+        "024 finished before the open fanout write committed"
     );
     writer.commit().await?;
     let online = timeout(Duration::from_secs(60), migrate).await??;
@@ -262,7 +262,7 @@ async fn migration_023_builds_the_lane_index_without_blocking_fanout_writes() ->
     )
     .fetch_one(&a.pool)
     .await?;
-    ensure!(valid, "023's index is not valid");
+    ensure!(valid, "024's index is not valid");
     let versions: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&a.pool)
@@ -274,7 +274,7 @@ async fn migration_023_builds_the_lane_index_without_blocking_fanout_writes() ->
     let claim = online
         .claim_fanout(60)
         .await?
-        .context("no due fanout was claimed after 023")?;
+        .context("no due fanout was claimed after 024")?;
     ensure!(
         claim.progress["status"] == "broadcastable",
         "{}",

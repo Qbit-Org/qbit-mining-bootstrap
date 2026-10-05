@@ -525,6 +525,7 @@ impl Fixture {
             build_job_probe: Default::default(),
             offer_sections: Default::default(),
             landing_trim: Default::default(),
+            submission_hold: Default::default(),
         });
         let fixture = Self {
             coordinator,

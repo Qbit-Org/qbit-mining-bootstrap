@@ -318,7 +318,7 @@ fn classify(query: &str, previous: &str) -> String {
         ),
         (
             "create index concurrently",
-            "migrate: 013 and 023 concurrent indexes",
+            "migrate: 013 and 024 concurrent indexes",
         ),
         ("drop index concurrently", "migrate: 013 concurrent indexes"),
         // One batch of 002's backfill (#582); the migration transaction no

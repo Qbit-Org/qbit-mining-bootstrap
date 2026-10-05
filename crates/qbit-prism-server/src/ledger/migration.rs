@@ -25,12 +25,12 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect. Existing native
-/// ledgers apply 013, 017 and 023 online (`ONLINE_MIGRATIONS`) and record
+/// ledgers apply 013, 017 and 024 online (`ONLINE_MIGRATIONS`) and record
 /// each after its last change, so a start refuses the database until that
 /// has completed. A populated 2.x.x source records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -79,6 +79,11 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // binary takes fanouts over by the database clock, so it too must be
     // stopped before migration and refused at every connect after it.
     ("fanout_claim_observed_lease", 1),
+    // 023: the cluster-wide block submission hold (#664). An older binary
+    // would claim and offer candidates while the cluster holds submission,
+    // so it must be stopped before migration and refused at every connect
+    // after it.
+    ("block_submission_hold", 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -625,7 +630,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             ""
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}{lease_remedy}{fanout_lease_remedy}, then start or migrate again");
+        let hold_remedy = if versions.contains(&23) {
+            " and restore block_submission_hold = 1 from migrations/023_block_submission_hold.sql after verifying its qbit_prism_submission_hold and qbit_prism_submission_hold_events tables are present"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}{lease_remedy}{fanout_lease_remedy}{hold_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -670,6 +680,12 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
             "database is at schema migration 22 but does not declare fanout_claim_observed_lease = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 022's fanout claim columns and capability; never resume a pre-022 frontend beside a post-022 one; nothing was changed"
         );
     }
+    if versions.contains(&23) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "block_submission_hold" && *value == 1),
+            "database is at schema migration 23 but does not declare block_submission_hold = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 023's hold tables and capability; never resume a pre-023 frontend beside a post-023 one; nothing was changed"
+        );
+    }
     Ok(())
 }
 
@@ -692,6 +708,7 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
         && !versions.contains(&18)
         && !versions.contains(&21)
         && !versions.contains(&22)
+        && !versions.contains(&23)
     {
         return Ok(());
     }
@@ -2193,7 +2210,11 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
     ),
     (
         23,
-        include_str!("../../migrations/023_fanout_lane_index.sql"),
+        include_str!("../../migrations/023_block_submission_hold.sql"),
+    ),
+    (
+        24,
+        include_str!("../../migrations/024_fanout_lane_index.sql"),
     ),
 ];
 
@@ -2207,10 +2228,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// ledger into a partitioned table (see `partition.rs`): its validation
 /// scan runs for hours on a large ledger and its swap must take the table
 /// lock with a short timeout and retries, neither of which the migration
-/// transaction can do. 023 creates the CTV fanout claim lane's index
+/// transaction can do. 024 creates the CTV fanout claim lane's index
 /// (#668) the way 013 does: a plain `CREATE INDEX` would hold every write
 /// to `qbit_ctv_fanout_artifacts` for the build, a found block's landing
-/// included, on a ledger whose other frontends keep running, since 023
+/// included, on a ledger whose other frontends keep running, since 024
 /// needs no shutdown proof. Each is recorded last, so the startup gate refuses
 /// the database until it has completed. Fresh and empty 2.x.x sources apply
 /// these inside the transaction while holding the cutover locks that
@@ -2220,7 +2241,7 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// version order, and 016 is transactional. 002 is not listed: its file is
 /// always transactional, and only its share-hash backfill on a populated
 /// 2.x.x source runs after the commit, ahead of these (`share_hashes.rs`).
-pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 23];
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 24];
 
 /// The online migration a version declares, from the scratch apply's
 /// before and after readings.
@@ -2230,7 +2251,7 @@ fn derive_online(
     after: &SchemaFingerprint,
 ) -> Result<OnlineMigration> {
     match version {
-        13 | 23 => Ok(OnlineMigration::Indexes(online::derive(
+        13 | 24 => Ok(OnlineMigration::Indexes(online::derive(
             version, before, after,
         )?)),
         17 => Ok(OnlineMigration::Partitions(partition::derive(
@@ -2953,7 +2974,7 @@ pub(super) async fn migrate_schema(
                     .await?;
             } else {
                 // The legacy shares are mapped after the commit, in batches,
-                // before 013, 017 and 023, and that run records 2 (#582).
+                // before 013, 017 and 024, and that run records 2 (#582).
                 share_hashes::create_cursor(tx).await?;
                 online.insert(0, OnlineMigration::ShareHashes);
             }
@@ -3255,6 +3276,17 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(22)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&23) {
+        // #664: a pre-023 frontend ignores the cluster's block submission
+        // hold, so it must never run beside a post-023 one, as for 021.
+        refuse_unquiesced_instances(tx, 23).await?;
+        sqlx::raw_sql(native_migration(23))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(23)")
             .execute(&mut **tx)
             .await?;
     }

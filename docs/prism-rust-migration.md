@@ -99,14 +99,14 @@ hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
 transaction, including carry-forward summary repair, except 002's share-hash
-backfill and migrations 013, 017 and 023. On a ledger with rows, 002 maps the
+backfill and migrations 013, 017 and 024. On a ledger with rows, 002 maps the
 legacy shares' headers after the commit, in bounded batches, and records 2
 once every one is mapped
 ([below](#migration-002s-share-hash-backfill-applied-online)).
 Migration 013, the share ledger index trim, builds its indexes after the
 commit with `CREATE INDEX CONCURRENTLY`
 ([below](#migration-013-the-share-ledger-index-trim-applied-online)), and
-migration 023 builds the CTV fanout claim lane's index the same way (#668).
+migration 024 builds the CTV fanout claim lane's index the same way (#668).
 Migration 017, the share ledger partition conversion, validates its bound and
 swaps the table after the commit on a dedicated connection
 ([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
@@ -585,7 +585,15 @@ partial index over its claimed rows, and declares
 `fanout_claim_observed_lease = 1`. A pre-022 binary takes fanout claims over
 by the database clock, so 022 is applied offline as 021 is. See
 [CTV fanout claim leases and database clock steps](prism-ledger-ops.md#ctv-fanout-claim-leases-and-database-clock-steps-022-654).
-Migration 023 adds `qbit_ctv_fanout_artifacts_lane_idx`, a partial index over
+Migration 023 adds the cluster-wide block submission hold (#664): the
+one-row table `qbit_prism_submission_hold`, its append-only journal
+`qbit_prism_submission_hold_events`, and the capability
+`block_submission_hold = 1`. A pre-023 binary would claim and offer
+candidates under a hold, so 023 is applied offline as 021 is, in the
+cutover's stopped window, and the capability refuses older binaries at later
+connects. See
+[holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664).
+Migration 024 adds `qbit_ctv_fanout_artifacts_lane_idx`, a partial index over
 the fanouts the CTV claim lane may still claim, keyed by their schedule, so a
 claim reads only the fanouts due now and no longer the settled fanout history
 (#668). It is additive, as 019 and 020 are: no capability and no shutdown
@@ -593,8 +601,8 @@ proof, and it is not applied offline. A binary that does not know the index
 never reads it. It is applied online, as 013 is: on an existing ledger
 `migrate` builds it with `CREATE INDEX CONCURRENTLY` after the migration
 transaction commits, so no write to `qbit_ctv_fanout_artifacts` waits for the
-build, a found block's landing included, and records 23 once it is valid. See
-[the claim lane](prism-ledger-ops.md#the-claim-lane-and-settled-history-023-668).
+build, a found block's landing included, and records 24 once it is valid. See
+[the claim lane](prism-ledger-ops.md#the-claim-lane-and-settled-history-024-668).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
@@ -682,7 +690,7 @@ holds:
 | `end_seq` | the ledger held no row at or above it when the transaction committed |
 | `started_at`, `updated_at` | when the cursor was created and last advanced |
 
-After the commit, and before 013, 017 and 023, `migrate` maps the legacy shares in
+After the commit, and before 013, 017 and 024, `migrate` maps the legacy shares in
 batches of consecutive `share_seq`. Each batch is 002's statement restricted to
 its range: one statement, in a transaction that also advances the cursor. The
 first batch covers 10,000 `share_seq`; later ones double or halve toward half a
@@ -747,7 +755,7 @@ interrupted `migrate` loses only the batch in flight. That holds for a killed
 process, a lost connection, and a cancelled or timed-out statement. Run
 `migrate` again. The migration transaction finds 3 recorded without 2 and the
 cursor table present, so it applies nothing, and the backfill resumes at
-`next_seq`; 013, 017 and 023 follow. A record with 3 and not 2 but no cursor table
+`next_seq`; 013, 017 and 024 follow. A record with 3 and not 2 but no cursor table
 is still refused as an edited record.
 
 Resuming only goes forward. The migration transaction has committed, so the
@@ -1680,8 +1688,8 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`), 002's share-hash backfill, 013's concurrent
-index builds, and 017's prepare, validate and swap. The transaction holds the
+(`001` and native `002` to `023`), 002's share-hash backfill, 013's and 024's
+concurrent index builds, and 017's prepare, validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
 whole length; the backfill's batches hold only ACCESS SHARE on it. The report
 also lists the statements `migrate` spent the most sampled time in.

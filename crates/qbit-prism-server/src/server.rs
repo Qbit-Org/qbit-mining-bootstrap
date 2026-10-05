@@ -50,7 +50,9 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let registry = Arc::new(metrics::Metrics::default());
-    registry.publish_block_submission(config.block_submit_enabled);
+    // #291: 0 from the start with the switch off. With it on, unknown until
+    // the first health publication has read the cluster's hold (#664).
+    registry.publish_block_submission(config.block_submit_enabled, None);
     // #581: the accepted-share counter is rendered at scrape time, beside the
     // event-driven rejection counter, so the share-refusal rules see an
     // outage that stalls the health publisher.
@@ -386,6 +388,11 @@ async fn publish_health(
                 coordinator.blocks.load(Ordering::Relaxed),
             );
             registry.publish_delivery(stats.delivery_metrics());
+            // #664: the switch, and the cluster hold as this publication read it.
+            registry.publish_block_submission(
+                coordinator.config.block_submit_enabled,
+                health["block_submission_hold"]["held"].as_bool(),
+            );
             registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
             registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
             state.publish_metrics(registry.render())?;

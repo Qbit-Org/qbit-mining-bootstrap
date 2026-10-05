@@ -651,7 +651,12 @@ impl Ledger {
             "invalid fanout lease duration"
         );
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        // #664: no fanout is claimed, by any frontend, while the cluster
+        // holds block submission.
+        if writable_unless_held(&mut tx, false).await?.is_some() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         let token = Uuid::new_v4().to_string();
         let claims = self.survey_fanout_claims(&mut tx).await?;
         let mut row = self

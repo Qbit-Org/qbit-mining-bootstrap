@@ -64,6 +64,10 @@ const PRE_011: [(i32, &str); 10] = [
 /// Migration 022's schema, version and capability, undone together where a
 /// fixture models a writer older than it (#654).
 const UNDO_022: &str = "DELETE FROM qbit_prism_schema_migrations WHERE version=22; DELETE FROM qbit_prism_schema_capabilities WHERE capability='fanout_claim_observed_lease'; DROP INDEX qbit_ctv_fanout_artifacts_claimed_idx; ALTER TABLE qbit_ctv_fanout_artifacts DROP COLUMN claim_renewals, DROP COLUMN claim_lease_seconds";
+/// Migration 023's hold tables, version and capability, undone together
+/// where a fixture models a writer older than it (#664). Dropping a table
+/// drops its trigger, so its function can go after it.
+const UNDO_023: &str = "DELETE FROM qbit_prism_schema_migrations WHERE version=23; DELETE FROM qbit_prism_schema_capabilities WHERE capability='block_submission_hold'; DROP TABLE qbit_prism_submission_hold_events; DROP FUNCTION qbit_prism_preserve_submission_hold_events(); DROP TABLE qbit_prism_submission_hold; DROP FUNCTION qbit_prism_keep_submission_hold()";
 /// Migration 021's schema, version and capability, undone together where a
 /// fixture models a writer older than it.
 const UNDO_021: &str = "DELETE FROM qbit_prism_schema_migrations WHERE version=21; DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_claim_observed_lease'; DROP INDEX qbit_block_candidate_outbox_claimed_idx; ALTER TABLE qbit_block_candidate_outbox DROP COLUMN claim_renewals, DROP COLUMN claim_lease_seconds";
@@ -73,8 +77,8 @@ const CHECKS_021: [&str; 2] = [
     "qbit_block_candidate_outbox_claim_lease_seconds_check",
     "qbit_block_candidate_outbox_claim_renewals_check",
 ];
-const ALL_VERSIONS: [i32; 22] = [
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+const ALL_VERSIONS: [i32; 23] = [
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
 ];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
@@ -486,8 +490,9 @@ impl Database {
                 // this fixture models an old writer, not a mixed-version one.
                 sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=18; DELETE FROM qbit_prism_schema_capabilities WHERE capability='chain_observation_epoch'; ALTER TABLE qbit_prism_cluster DROP COLUMN chain_epoch")
                     .execute(&self.pool).await?;
-                // And 021's and 022's observed claim leases, for the same
-                // reason.
+                // And 021's and 022's observed claim leases and 023's block
+                // submission hold, for the same reason.
+                sqlx::raw_sql(UNDO_023).execute(&self.pool).await?;
                 sqlx::raw_sql(UNDO_022).execute(&self.pool).await?;
                 sqlx::raw_sql(UNDO_021).execute(&self.pool).await?;
                 sqlx::raw_sql(
@@ -2284,7 +2289,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2321,11 +2326,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2362,7 +2367,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );

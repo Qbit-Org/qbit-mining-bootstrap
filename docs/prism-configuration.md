@@ -193,6 +193,12 @@ afterwards. Never leave it at `0` on a production frontend: a block that
 frontend finds is never offered, and `PrismBlockSubmissionHeld` pages a minute
 after the frontend starts.
 
+A ledger can also hold block submission for every frontend that connects to
+it, whatever this setting says: `qbit-prism-server submission-hold set
+--reason ...` (migration 023, #664). `check-config` never reads the database,
+so it only says so; `submission-hold show` and `self-check` report the hold.
+See [holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664).
+
 ## Preventing stale guidance
 
 CI runs `python3 scripts/check_prism_settings.py`. It checks the native name
