@@ -747,6 +747,20 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         .collect();
     let error = format!("{:#}", external::merge_files(&huge).unwrap_err());
     assert!(error.contains("overflows"), "{error}");
+    // And one whose counters fit apart but not in the sums it reports.
+    let mut sums = read(&a);
+    let rejected = sums["totals"]["rejected"].as_u64().unwrap() + 1;
+    sums["totals"]["accepted"] = json!(u64::MAX);
+    sums["totals"]["rejected"] = json!(rejected);
+    sums["processes"][0]["accepted"] = json!(u64::MAX);
+    sums["processes"][0]["rejected"] = json!(rejected);
+    let path = scratch.path("sums.json");
+    external::write_document(&path, &sums)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("add up past"), "{error}");
     let mut damaged = read(&a);
     damaged["processes"][0]["accepted"] = json!(123_456_789u64);
     let path = scratch.path("damaged-process.json");

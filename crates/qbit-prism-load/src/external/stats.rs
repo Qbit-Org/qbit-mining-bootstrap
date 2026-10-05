@@ -556,8 +556,11 @@ impl Totals {
         Ok(())
     }
 
+    /// Saturating, as every sum of counters here: `check` has refused a
+    /// document whose sums do not fit.
     pub fn no_response(&self) -> u64 {
-        self.no_response_run_ended + self.no_response_mid_run
+        self.no_response_run_ended
+            .saturating_add(self.no_response_mid_run)
     }
 
     /// What every process's totals hold by construction, checked on a
@@ -565,6 +568,26 @@ impl Totals {
     /// refused with the reason rather than added into figures it would
     /// corrupt, or into arithmetic it would overflow.
     pub fn check(&self) -> Result<()> {
+        // The sums the summary takes must fit as well as each counter.
+        let sent = [
+            self.rejected,
+            self.no_response_run_ended,
+            self.no_response_mid_run,
+        ]
+        .into_iter()
+        .try_fold(self.accepted, u64::checked_add);
+        let failed = self
+            .client_failures
+            .values()
+            .try_fold(0u64, |total, stat| total.checked_add(stat.count));
+        ensure!(
+            sent.zip(failed)
+                .and_then(|(sent, failed)| sent.checked_add(failed))
+                .and_then(|total| total.checked_add(self.offers_discarded))
+                .and_then(|total| total.checked_add(self.offers_unknown_at_abort))
+                .is_some(),
+            "the submits and offers it accounts for add up past u64::MAX"
+        );
         ensure!(
             self.offers_dispatched.checked_add(self.offers_shortfall) == Some(self.offers_minted),
             "offers dispatched ({}) and shortfall ({}) do not add up to the offers minted ({})",
@@ -598,7 +621,9 @@ impl Totals {
 
     /// Every submit that went out and was settled one way or the other.
     pub fn sent(&self) -> u64 {
-        self.accepted + self.rejected + self.no_response()
+        self.accepted
+            .saturating_add(self.rejected)
+            .saturating_add(self.no_response())
     }
 }
 
@@ -1158,6 +1183,8 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
             .merge(&these_totals)
             .with_context(|| format!("adding {}", path.display()))?;
     }
+    // Sums each document fits can still overflow together.
+    totals.check().context("the merged totals")?;
     document("merged", &processes, &totals)
 }
 
@@ -1228,10 +1255,11 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         .filter(|(kind, _)| kind.as_str() == "offer")
         .map(|(_, stat)| stat.count.saturating_sub(stat.recorded))
         .sum();
-    let accounted = totals.sent()
-        + failures_unrecorded
-        + totals.offers_discarded
-        + totals.offers_unknown_at_abort;
+    let accounted = totals
+        .sent()
+        .saturating_add(failures_unrecorded)
+        .saturating_add(totals.offers_discarded)
+        .saturating_add(totals.offers_unknown_at_abort);
     let spreads: Vec<f64> = totals
         .tips
         .tips
