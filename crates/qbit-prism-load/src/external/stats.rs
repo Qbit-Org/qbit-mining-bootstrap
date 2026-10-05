@@ -410,7 +410,7 @@ impl Tips {
                         .map(|(hash, _)| hash.clone())
                         .expect("a tip to drop");
                     self.tips.remove(&oldest);
-                    self.dropped += 1;
+                    self.dropped = sum(self.dropped, 1, "the dropped tips")?;
                 }
             }
         }
@@ -671,6 +671,11 @@ impl Totals {
                 self.disconnects,
             ),
             (
+                "timeline reconnects",
+                column(|s| s.reconnects),
+                self.reconnects_completed,
+            ),
+            (
                 "rejections by reason",
                 self.rejections.total(),
                 self.rejected,
@@ -880,6 +885,9 @@ pub struct Collector {
     /// one after holding another, but only its first sighting says when the
     /// tip's work reached it. Kept for the tips `totals.tips` keeps.
     tip_sessions: HashMap<String, Vec<u64>>,
+    /// When each session last held work after connecting: the instant a
+    /// completed reconnect, reported just after it, is placed at.
+    opened_at: HashMap<usize, Instant>,
     share_log: Option<ShareLog>,
     /// The most session events seen waiting behind the one being counted.
     pub event_backlog_max: usize,
@@ -893,6 +901,7 @@ impl Collector {
             holding: (0..sessions).map(|_| AtomicBool::new(false)).collect(),
             holding_count: 0,
             tip_sessions: HashMap::new(),
+            opened_at: HashMap::new(),
             share_log,
             event_backlog_max: 0,
         }
@@ -931,12 +940,15 @@ impl Collector {
             Event::Submit(record) => self.submit(&record, now),
             Event::Reconnect(record) => {
                 if record.completed {
-                    // Its second in the timeline comes from its `Opened`,
-                    // which carries when the session held work again.
+                    // Counted, timed and placed in the timeline by this one
+                    // event, at the instant its `Opened`, sent just before
+                    // it, says the session held work again.
                     self.totals.reconnects_completed += 1;
                     self.totals
                         .reconnect_outage
                         .record_millis(record.seconds * 1000.0);
+                    let at = self.opened_at.get(&record.session).copied().unwrap_or(now);
+                    self.second(at).reconnects += 1;
                 } else if record.reason == "initial" {
                     self.totals.initial_connect_failures += 1;
                     self.totals
@@ -951,9 +963,7 @@ impl Collector {
             }
             Event::Opened(opened) => {
                 self.totals.connections_opened += 1;
-                if opened.cause != "initial" {
-                    self.second(opened.ready).reconnects += 1;
-                }
+                self.opened_at.insert(opened.session, opened.ready);
                 if opened.cause == "initial" {
                     self.totals.initial_connections += 1;
                     self.totals.time_to_first_job.record_millis(

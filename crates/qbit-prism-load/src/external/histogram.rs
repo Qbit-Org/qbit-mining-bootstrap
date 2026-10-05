@@ -203,6 +203,11 @@ impl TryFrom<Wire> for LogHistogram {
                 bucket_lower_bound(lower) == lower,
                 "{lower} is not a bucket lower bound at {SIGNIFICANT_BITS} significant bits"
             );
+            // A bucket exists because a sample fell in it.
+            ensure!(
+                count > 0,
+                "the histogram's bucket at {lower} holds no sample"
+            );
             let held: &mut u64 = buckets.entry(lower).or_insert(0);
             *held = held
                 .checked_add(count)

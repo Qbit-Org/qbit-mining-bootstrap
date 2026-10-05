@@ -458,6 +458,10 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
     broken["buckets"] = json!([[100, u64::MAX], [100, 1]]);
     broken["count"] = json!(0);
     assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
+    // And an empty bucket, which would let an extreme no sample has pass.
+    let empty = json!({"unit": "microseconds", "significant_bits": 10, "count": 1,
+                       "sum": 100, "min": 0, "max": 100, "buckets": [[0, 0], [100, 1]]});
+    assert!(serde_json::from_value::<LogHistogram>(empty).is_err());
     let empty = LogHistogram::default().summary("test");
     assert_eq!(empty["samples"], json!(0));
     assert!(empty["p99"].is_null());
@@ -777,6 +781,18 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("timeline accepted"), "{error}");
+    let mut reconnects = read(&a);
+    let completed = reconnects["totals"]["reconnects_completed"]
+        .as_u64()
+        .unwrap();
+    reconnects["totals"]["timeline"][0]["reconnects"] = json!(completed + 7);
+    let path = scratch.path("reconnects.json");
+    external::write_document(&path, &reconnects)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("timeline reconnects"), "{error}");
     let mut triples = read(&a);
     let triple = json!({"code": 21, "reason_id": "stale-job", "message": "stale job",
                         "count": u64::MAX});
@@ -786,6 +802,29 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
     let error = format!(
         "{:#}",
         external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("overflows"), "{error}");
+    // A document already at the tip bound with u64::MAX tips dropped: the
+    // next tip's eviction cannot be counted.
+    let mut full = read(&a);
+    let tips: serde_json::Map<String, Value> = (0..stats::TIP_KEYS)
+        .map(|index| {
+            (
+                format!("{index:064x}"),
+                json!({"first_seen_unix_ms": 1, "last_seen_unix_ms": 2, "sessions": 1}),
+            )
+        })
+        .collect();
+    full["totals"]["tips"] = json!({"tips": tips, "dropped": u64::MAX});
+    let mut newer = read(&b);
+    newer["totals"]["tips"] = json!({"tips": {"f".repeat(64): {
+        "first_seen_unix_ms": 3, "last_seen_unix_ms": 4, "sessions": 1}}, "dropped": 0});
+    let (full_path, newer_path) = (scratch.path("full.json"), scratch.path("newer.json"));
+    external::write_document(&full_path, &full)?;
+    external::write_document(&newer_path, &newer)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[full_path, newer_path]).unwrap_err()
     );
     assert!(error.contains("overflows"), "{error}");
     let mut damaged = read(&a);
