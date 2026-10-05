@@ -17,7 +17,7 @@ mod support;
 use support::{
     ctv_fanout::mature_fanouts,
     execution::{Fault, FaultPhase},
-    run, Fixture,
+    run, run_tuned, Fixture,
 };
 
 const BOUND: Duration = Duration::from_secs(5);
@@ -337,5 +337,62 @@ async fn a_send_whose_completion_is_refused_is_recorded_as_an_attempt() -> Resul
             Ok(())
         })
     })
+    .await
+}
+
+/// Fanouts claimed or attempted so far, and the attempts their history holds.
+async fn touched(f: &Fixture) -> Result<(i64, i64)> {
+    let rows = sqlx::query_scalar("SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE claim_token IS NOT NULL OR broadcast_attempt_count>0")
+        .fetch_one(f.pool())
+        .await?;
+    let attempts = sqlx::query_scalar("SELECT count(*) FROM qbit_ctv_fanout_broadcast_attempts")
+        .fetch_one(f.pool())
+        .await?;
+    Ok((rows, attempts))
+}
+
+/// #291: under `PRISM_BLOCK_SUBMIT_ENABLED=0` a broadcaster pass over due,
+/// sendable fanouts is refused before it reads the node or claims a row, so
+/// nothing is claimed, attempted or sent. The frontend with submission
+/// enabled then sends every one of them: the refusal held back real sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frontend_with_block_submission_disabled_claims_and_sends_no_fanout() -> Result<()> {
+    run_tuned(
+        qbit_prism_test_gate::site!(),
+        // `runtime-a` holds; `runtime-b` is the control.
+        |config| config.block_submit_enabled = config.instance_id != "runtime-a",
+        |f| {
+            Box::pin(async move {
+                f.refresh(true).await?;
+                let count = mature_fanouts(f, false).await?;
+                sendable(f).await?;
+                let refused = timeout(BOUND, broadcaster::run_once(&f.a))
+                    .await?
+                    .err()
+                    .context("the held frontend ran a broadcaster pass")?;
+                ensure!(
+                    refused
+                        .to_string()
+                        .contains("block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED"),
+                    "{refused:#}"
+                );
+                ensure!(
+                    touched(f).await? == (0, 0),
+                    "the held frontend claimed or attempted a fanout"
+                );
+                let settled = timeout(BOUND, broadcaster::run_once(&f.b)).await??;
+                ensure!(
+                    settled == count,
+                    "the enabled frontend settled {settled} of {count} fanouts"
+                );
+                let (rows, attempts) = touched(f).await?;
+                ensure!(
+                    rows == count as i64 && attempts == count as i64,
+                    "the enabled frontend attempted {rows} rows with {attempts} sends of {count}"
+                );
+                Ok(())
+            })
+        },
+    )
     .await
 }

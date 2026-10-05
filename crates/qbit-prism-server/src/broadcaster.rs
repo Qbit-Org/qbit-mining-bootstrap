@@ -39,6 +39,12 @@ pub async fn run_pass(
     coordinator: &Coordinator,
     shutdown: &watch::Receiver<bool>,
 ) -> Result<usize> {
+    // #291: with PRISM_BLOCK_SUBMIT_ENABLED off `run` starts no broadcaster
+    // and `broadcast-ctv` refuses. Any other caller is refused here, before
+    // the node is read or a fanout is claimed.
+    coordinator
+        .config
+        .require_block_submission("the CTV broadcaster claimed no fanout")?;
     // Tip observations recorded from here on can supersede this chain view.
     let pass_started = tokio::time::Instant::now();
     // A node behind its peers must leave their settlement claims available.

@@ -312,18 +312,34 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
             crate::api::ApiConfig::from_env()?;
             crate::api::public_service::ServiceConfig::from_env()?;
+            // #291: the kill switch leads the report, where a rehearsal
+            // cannot miss it.
+            let submission = config.block_submission();
+            if let Some(warning) = submission.warning {
+                println!("WARNING: {warning}");
+            }
+            if submission.ctv_broadcaster == config::CtvBroadcaster::Held {
+                println!("WARNING: {}", config::CTV_BROADCASTER_HELD);
+            }
             println!(
                 "PRISM configuration valid; {} runtime workers",
                 config.runtime_workers
             );
-            match &config.offer_standby {
-                Some(wait) => println!(
-                    "found-block offers wait up to {} ms for standby {}; self-check verifies the \
-                     role can read its position (pg_monitor)",
-                    wait.bound.as_millis(),
-                    wait.application_name
-                ),
-                None => println!("found-block offers do not wait for a failover standby"),
+            // A held frontend makes no found-block offer, so nothing waits.
+            if submission.enabled {
+                println!(
+                    "PRISM_BLOCK_SUBMIT_ENABLED is on: found blocks are offered to the node's \
+                     submitblock"
+                );
+                match &config.offer_standby {
+                    Some(wait) => println!(
+                        "found-block offers wait up to {} ms for standby {}; self-check verifies \
+                         the role can read its position (pg_monitor)",
+                        wait.bound.as_millis(),
+                        wait.application_name
+                    ),
+                    None => println!("found-block offers do not wait for a failover standby"),
+                }
             }
             Ok(())
         }
@@ -422,8 +438,11 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             Ok(())
         }
         Command::BroadcastCtv => {
+            let config = Config::from_env()?;
+            // #291: refused before the node or the database is reached.
+            config.require_block_submission("broadcast-ctv refuses to run")?;
             let coordinator = Coordinator::new_tool(
-                Config::from_env()?,
+                config,
                 std::sync::Arc::new(crate::metrics::Metrics::default()),
             )
             .await?;
@@ -1620,6 +1639,10 @@ struct SelfCheckReport {
     schema: &'static str,
     ok: bool,
     instance_id: Option<String>,
+    /// #291: `PRISM_BLOCK_SUBMIT_ENABLED` as this environment sets it, or
+    /// `null` when the configuration could not be read. Each live frontend's
+    /// own value is `block_submission_enabled` in its heartbeat below.
+    block_submission: Option<config::BlockSubmission>,
     health: Option<Value>,
     carry_forward_integrity: Option<Value>,
     durability: Option<Vec<(String, String)>>,
@@ -1635,6 +1658,7 @@ async fn self_check() -> Result<()> {
         schema: "qbit.prism.self-check.v2",
         ok: false,
         instance_id: None,
+        block_submission: None,
         health: None,
         carry_forward_integrity: None,
         durability: None,
@@ -1651,6 +1675,11 @@ async fn self_check() -> Result<()> {
         let freshness =
             crate::api::health_stale_after(crate::api::health_refresh_interval_from_env()?);
         report.instance_id = Some(config.instance_id.clone());
+        let submission = config.block_submission();
+        if let Some(warning) = submission.warning {
+            eprintln!("WARNING: {warning}");
+        }
+        report.block_submission = Some(submission);
         // Both samples are read-only and independent of the local startup
         // below: a node startup or refresh failure must hide neither the
         // cluster's heartbeats nor an unfinished historical import.

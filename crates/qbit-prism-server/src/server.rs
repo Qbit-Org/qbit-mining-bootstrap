@@ -50,6 +50,7 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let registry = Arc::new(metrics::Metrics::default());
+    registry.publish_block_submission(config.block_submit_enabled);
     // #581: the accepted-share counter is rendered at scrape time, beside the
     // event-driven rejection counter, so the share-refusal rules see an
     // outage that stalls the health publisher.
@@ -139,6 +140,8 @@ pub async fn run(config: Config) -> Result<()> {
             Ok(())
         }
     }));
+    // With PRISM_BLOCK_SUBMIT_ENABLED off (#291) this loop claims nothing and
+    // waits for the shutdown: found blocks stay pending, never offered.
     tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
@@ -157,11 +160,15 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }));
     }
-    if config.ctv_broadcast {
-        tasks.spawn(runtime.track(
-            TaskKind::Broadcast,
-            crate::broadcaster::run(coordinator.clone(), shutdown_rx.clone()),
-        ));
+    match config.block_submission().ctv_broadcaster {
+        config::CtvBroadcaster::On => {
+            tasks.spawn(runtime.track(
+                TaskKind::Broadcast,
+                crate::broadcaster::run(coordinator.clone(), shutdown_rx.clone()),
+            ));
+        }
+        config::CtvBroadcaster::Held => tracing::warn!("{}", config::CTV_BROADCASTER_HELD),
+        config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
         tasks.spawn(runtime.track(

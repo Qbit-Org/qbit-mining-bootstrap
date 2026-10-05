@@ -5,7 +5,7 @@
 //! path records as an unknown outcome. Each case runs the real client against
 //! a real socket on the loopback interface, so a change in reqwest's or
 //! hyper's error kinds fails here rather than in production.
-use qbit_prism_server::rpc::{Rpc, RpcNotSentError, RpcReplyError};
+use qbit_prism_server::rpc::{Rpc, RpcNotSentError, RpcRelayRefused, RpcReplyError, RELAY_METHODS};
 use serde_json::json;
 use std::time::Duration;
 use tokio::{
@@ -211,4 +211,51 @@ async fn http_and_node_errors_after_the_send_are_not_unsent() {
             assert!(error.downcast_ref::<RpcReplyError>().is_some(), "{error:#}");
         }
     }
+}
+
+/// #291: a client built `without_relay`, and every wallet client made from
+/// it, refuses each relaying call before it is sent and still sends every
+/// other call. The node records each method it receives, so "never sent" is
+/// read off the socket; an ordinary client's `submitblock` does reach it.
+#[tokio::test]
+async fn a_client_without_relay_sends_no_relaying_call_and_every_other_call() {
+    use axum::{extract::State, Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    async fn record(
+        State(seen): State<Arc<Mutex<Vec<String>>>>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let method = request["method"].as_str().unwrap_or_default().to_owned();
+        seen.lock().unwrap().push(method);
+        Json(json!({"result": 7, "error": null, "id": request["id"]}))
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(record).with_state(seen.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let held = rpc(port).without_relay();
+    for client in [held.clone(), held.wallet("sponsor").unwrap()] {
+        for method in RELAY_METHODS {
+            let error = client
+                .call(method, json!([]))
+                .await
+                .expect_err("a relaying call was sent");
+            let refused = error
+                .downcast_ref::<RpcRelayRefused>()
+                .unwrap_or_else(|| panic!("{method}: {error:#}"));
+            assert_eq!(refused.method, *method);
+        }
+        assert_eq!(client.call("getblockcount", json!([])).await.unwrap(), 7);
+    }
+    assert_eq!(
+        rpc(port).call("submitblock", json!(["00"])).await.unwrap(),
+        7
+    );
+    server.abort();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["getblockcount", "getblockcount", "submitblock"]
+    );
 }
