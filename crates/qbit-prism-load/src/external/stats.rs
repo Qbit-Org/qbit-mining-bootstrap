@@ -1253,10 +1253,15 @@ pub struct Process {
     pub share_log: Option<ShareLogInfo>,
 }
 
+/// The last millisecond RFC 3339 writes with a four-digit year,
+/// 9999-12-31T23:59:59.999Z. A window's ends lie between the epoch and it,
+/// as a real clock's readings do, so the summary's differences of them fit.
+const LATEST_UNIX_MS: i64 = 253_402_300_799_999;
+
 impl Process {
     /// What `qbit-prism-load external` could have written: the command
-    /// line's own bounds, and a window a run of its length makes. A process
-    /// held to them cannot carry a value whose sums would overflow.
+    /// line's own bounds, and a window a clock measured. A process held to
+    /// them cannot carry a value whose sums would overflow.
     pub fn check(&self) -> Result<()> {
         ensure!(
             (1..=crate::external::MAX_SESSIONS).contains(&self.sessions),
@@ -1291,22 +1296,26 @@ impl Process {
             "load counts with no window of positive length to rate them over"
         );
         if let Some(window) = &self.window {
-            // A window runs its length, or past it by a late last tick; its
-            // seconds are its ends' difference, taken without overflow.
-            let span = (i128::from(window.ended_unix_ms) - i128::from(window.started_unix_ms))
-                as f64
-                / 1000.0;
+            // A window's ends are readings of the machine's clock and its
+            // seconds their difference. Its length has no bound of its own:
+            // a process suspended past its end closes the window when it
+            // resumes, however much later that is.
             ensure!(
-                span >= 0.0
-                    && window.seconds.is_finite()
+                (0..=LATEST_UNIX_MS).contains(&window.started_unix_ms)
+                    && (window.started_unix_ms..=LATEST_UNIX_MS).contains(&window.ended_unix_ms),
+                "a window from {} to {} ms after the epoch, which no clock reads",
+                window.started_unix_ms,
+                window.ended_unix_ms
+            );
+            let span = (window.ended_unix_ms - window.started_unix_ms) as f64 / 1000.0;
+            ensure!(
+                window.seconds.is_finite()
                     && window.seconds >= 0.0
-                    && (window.seconds - span).abs() < 1.0
-                    && window.seconds <= self.duration_seconds as f64 + 3600.0,
-                "a window of {} s from {} to {}, which no run of {} s makes",
+                    && (window.seconds - span).abs() < 1.0,
+                "a window of {} s from {} to {}, whose ends are {span} s apart",
                 window.seconds,
                 window.started_unix_ms,
-                window.ended_unix_ms,
-                self.duration_seconds
+                window.ended_unix_ms
             );
         }
         // Once the window is known to be one a run makes: the token bucket

@@ -861,18 +861,19 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
     assert!(error.contains("offers were dispatched"), "{error}");
-    // A window no run makes, which the summary would otherwise walk second
-    // by second.
+    // A window no clock reads, even with seconds to match: the summary takes
+    // differences of its ends.
     let mut window = read(&a);
     window["processes"][0]["window"]["started_unix_ms"] = json!(0);
     window["processes"][0]["window"]["ended_unix_ms"] = json!(i64::MAX);
+    window["processes"][0]["window"]["seconds"] = json!(i64::MAX as f64 / 1000.0);
     let path = scratch.path("window.json");
     external::write_document(&path, &window)?;
     let error = format!(
         "{:#}",
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
-    assert!(error.contains("no run of"), "{error}");
+    assert!(error.contains("no clock reads"), "{error}");
     // Extremes a window's span overflows in, and a session count past what
     // a process holds.
     let mut extremes = read(&a);
@@ -885,7 +886,37 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         "{:#}",
         external::merge_files(&[path, b.clone()]).unwrap_err()
     );
-    assert!(error.contains("no run of"), "{error}");
+    assert!(error.contains("no clock reads"), "{error}");
+    // Seconds that are not its ends' difference.
+    let mut seconds = read(&a);
+    let held = seconds["processes"][0]["window"]["seconds"]
+        .as_f64()
+        .unwrap();
+    seconds["processes"][0]["window"]["seconds"] = json!(held + 5.0);
+    let path = scratch.path("seconds.json");
+    external::write_document(&path, &seconds)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("s apart"), "{error}");
+    // A process suspended past its end closes its window when it resumes,
+    // hours later: its own document still merges, rated over that window.
+    let mut suspended = read(&a);
+    let started = suspended["processes"][0]["window"]["started_unix_ms"]
+        .as_i64()
+        .unwrap();
+    let stretched = 3.0 + 2.0 * 3600.0;
+    suspended["processes"][0]["window"]["ended_unix_ms"] =
+        json!(started + (stretched * 1000.0) as i64);
+    suspended["processes"][0]["window"]["seconds"] = json!(stretched);
+    let path = scratch.path("suspended.json");
+    external::write_document(&path, &suspended)?;
+    let resumed = external::merge_files(&[path, b.clone()])?;
+    assert_eq!(
+        resumed["processes"][0]["window"]["seconds"],
+        json!(stretched)
+    );
     let mut sessions = read(&a);
     sessions["processes"][0]["sessions"] = json!(usize::MAX);
     let path = scratch.path("sessions.json");
