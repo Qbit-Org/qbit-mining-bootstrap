@@ -584,6 +584,11 @@ partial index over its claimed rows, and declares
 `fanout_claim_observed_lease = 1`. A pre-022 binary takes fanout claims over
 by the database clock, so 022 is applied offline as 021 is. See
 [CTV fanout claim leases and database clock steps](prism-ledger-ops.md#ctv-fanout-claim-leases-and-database-clock-steps-022-654).
+While migration 2's share-hash backfill is pending on a populated `2.x.x`
+source, the database declares `share_hash_backfill_pending = 1` (#669). It is
+declared with the backfill's cursor and removed with it when 2 is recorded, so
+every build before #669 is refused for as long as legacy headers are unmapped
+(see [the backfill](#migration-002s-share-hash-backfill-applied-online)).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
@@ -712,11 +717,26 @@ They refuse the same way while the cursor table exists, even if 2 has been
 recorded by hand, and so does the recovery evidence export
 (`scripts/prism-recovery-evidence.sql`).
 
-**Never run an earlier 3.x.x build against the database while the backfill is
-pending, and never record 2 by hand.** An earlier build knows nothing of the
-cursor. Its `migrate` refuses 3 without 2 as an edited record, and its remedy,
-recording 2 once 002's objects are present, would let it serve with legacy
-headers unmapped. Resume with this release's `migrate` instead.
+**Earlier builds are fenced off while the backfill is pending (#669).** An
+earlier build knows nothing of the cursor. Its `migrate` refuses 3 without 2
+as an edited record, and its remedy is to record 2 once 002's objects are
+present. On its own, that would let it serve with legacy headers unmapped.
+So the database also declares the capability `share_hash_backfill_pending = 1`
+while the backfill is pending:
+
+- the migration transaction that creates the cursor declares it;
+- every resume declares it again, so a backfill an earlier 3.x.x build
+  started, or one whose declaration was deleted, is fenced by the next
+  `migrate`;
+- the transaction that records 2 removes it with the cursor. It is the one
+  capability native code removes, because it describes a state, not a format.
+
+Every build before #669 refuses that capability at connect and at `migrate`.
+So recording 2 by hand lets nothing serve: earlier builds still refuse the
+capability, this release refuses the cursor, and so does the evidence export.
+A declaration whose cursor is gone can only be left by dropping the cursor by
+hand. Every `migrate` of this release refuses it, and so does every start once
+the record is otherwise complete. Restore the full backup.
 
 **Progress.** No frontend runs while the backfill does, so there is no
 Prometheus series for it. `migrate` logs the backfill's start, a progress line
@@ -755,6 +775,7 @@ boundary.
 | `refusing to continue migration 2: its share-hash backfill's cursor is no longer at share_seq <a>, where this run, which holds the runner lock, left it; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
 | `a <kind> named qbit_prism_share_hash_backfill holds the name of migration 2's share-hash backfill progress table; check what it holds, then rename or move it aside` | on a native database, a relation that is not the cursor table holds its name; move it aside, then start or migrate again |
 | `qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup` | the cursor table was edited; restore the full backup |
+| `database declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again` | from `migrate`, and from a start once every migration is recorded: the cursor was dropped by hand while the backfill was pending. Restore the full pre-migration backup |
 | `refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup` | the cursor table was dropped by hand during a run; restore the full backup |
 
 **Plan for the backfill on a large ledger.** The backfill writes every legacy

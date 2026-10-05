@@ -32,6 +32,18 @@
 //! database has the table is therefore a backfill that has not finished,
 //! which `migrate_schema` resumes; without the table it is an edited
 //! record, refused as before.
+//!
+//! The migration record alone is a weak fence: an earlier build that meets
+//! 3 without 2 tells the operator to record 2 by hand, and after that it
+//! would serve with legacy headers unmapped. So while the backfill is
+//! pending the database also declares the capability
+//! `share_hash_backfill_pending = 1` (#669). The transaction that creates
+//! the cursor declares it, every resume declares it again, and the
+//! transaction that records 2 removes it with the cursor. Every build
+//! before #669 refuses it at connect and at migrate, whatever the record
+//! says, and this release refuses the cursor itself; a declaration whose
+//! cursor is gone, which only a hand-dropped cursor leaves, is refused by
+//! every start and migrate of this release.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
 use sqlx::{Connection, PgConnection};
@@ -85,6 +97,46 @@ impl Progress {
             self.start_seq, self.next_seq, self.next_seq, self.end_seq
         )
     }
+}
+
+/// The capability a pending backfill declares, fencing every build before
+/// #669 off the database (see the module doc).
+pub(super) const PENDING_CAPABILITY: &str = "share_hash_backfill_pending";
+
+/// Declare the fence of a pending backfill, in the migration transaction
+/// that creates its cursor or resumes it. Idempotent, so a backfill an
+/// earlier build started, or whose declaration was deleted by hand, is
+/// fenced again by the next `migrate`.
+pub(super) async fn declare_pending(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES($1,1) ON CONFLICT (capability) DO NOTHING")
+        .bind(PENDING_CAPABILITY)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Whether the current schema's capability table declares the fence. A
+/// native database from before 006 has no capability table, and no fence.
+pub(super) async fn pending_declared(connection: &mut PgConnection) -> Result<bool> {
+    let table: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname='qbit_prism_schema_capabilities' AND relkind='r')")
+        .fetch_one(&mut *connection)
+        .await?;
+    if !table {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_prism_schema_capabilities WHERE capability=$1)",
+    )
+    .bind(PENDING_CAPABILITY)
+    .fetch_one(&mut *connection)
+    .await?)
+}
+
+/// Why a database that declares the fence without its cursor is refused.
+pub(super) fn orphaned_fence_refusal() -> String {
+    format!(
+        "database declares {PENDING_CAPABILITY} = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again"
+    )
 }
 
 /// The kind of the relation under the progress table's name in the
@@ -306,6 +358,10 @@ pub(super) async fn apply(
             continue;
         }
         sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability=$1")
+            .bind(PENDING_CAPABILITY)
             .execute(&mut *tx)
             .await?;
         sqlx::query(

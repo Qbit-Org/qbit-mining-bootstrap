@@ -1408,6 +1408,25 @@ async fn assert_native_metadata_required(
         .to_string()
         .contains("share-hash backfill has not finished"));
     ensure!(recovery::evidence(source, pg_bin).await? == *native);
+    // So is its fence without the cursor, which startup refuses (#669).
+    sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('share_hash_backfill_pending',1)")
+        .execute(&source.pool)
+        .await?;
+    let fenced = recovery::evidence(source, pg_bin).await;
+    sqlx::query(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'",
+    )
+    .execute(&source.pool)
+    .await?;
+    ensure!(
+        fenced.is_err(),
+        "a share-hash backfill fence without its cursor was exported"
+    );
+    ensure!(fenced
+        .unwrap_err()
+        .to_string()
+        .contains("declares share_hash_backfill_pending = 1"));
+    ensure!(recovery::evidence(source, pg_bin).await? == *native);
     // Unknown additive migrations do not prevent this release from starting.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(999)")
         .execute(&source.pool)

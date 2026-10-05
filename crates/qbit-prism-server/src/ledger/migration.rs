@@ -78,6 +78,14 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // binary takes fanouts over by the database clock, so it too must be
     // stopped before migration and refused at every connect after it.
     ("fanout_claim_observed_lease", 1),
+    // #669: migration 2's share-hash backfill has not finished (#582). Unlike
+    // the formats above it describes a state: declared with the backfill's
+    // cursor and removed with it when 2 is recorded (`share_hashes.rs`). A
+    // binary without this entry, every build before #669, refuses the
+    // database at connect and at migrate while it is declared, so none can
+    // serve a ledger whose legacy headers are not all mapped, whatever the
+    // migration record says.
+    (share_hashes::PENDING_CAPABILITY, 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -2972,6 +2980,15 @@ pub(super) async fn migrate_schema(
         // which records 2 last (#582): this run resumes it.
         let backfill = share_hashes::progress(tx).await?;
         if backfill.is_none() {
+            // A fence without its cursor: the cursor was dropped by hand, and
+            // "3 without 2" would only suggest recording 2 by hand (#669).
+            if share_hashes::pending_declared(tx).await? {
+                bail!(
+                    "refusing to migrate a native database at schema migrations {} before any DDL: {}",
+                    schema_version_list(&versions),
+                    share_hashes::orphaned_fence_refusal()
+                );
+            }
             refuse_inconsistent_native_record(&versions)?;
         }
         let inventory = inspect_source_schema(tx).await?;
@@ -3062,6 +3079,12 @@ pub(super) async fn migrate_schema(
         if let Some(state) = state {
             tracing::info!(source=state.rule().name, release=?release, "migrated PRISM database source");
         }
+    }
+    // A pending share-hash backfill fences every earlier build (#669): the
+    // cursor this transaction created on a populated 2.x.x source, or the
+    // one a resume found. 006 has created the capability table by here.
+    if share_hashes::progress(tx).await?.is_some() {
+        share_hashes::declare_pending(tx).await?;
     }
     if !versions.contains(&7) {
         // 007's own drain check, which is not the one `refuse_undrained_outbox`
@@ -3420,6 +3443,17 @@ where
     let rows = read_capabilities(&mut *connection).await?;
     require_declared_capabilities(rows.as_deref(), &versions)?;
     refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)?;
+    // A pending backfill's fence is removed only with its cursor, which
+    // `require_schema_version` refuses while it exists (#669).
+    if rows
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|(name, _)| name == share_hashes::PENDING_CAPABILITY)
+        && share_hashes::progress(&mut connection).await?.is_none()
+    {
+        bail!("{}", share_hashes::orphaned_fence_refusal());
+    }
     if versions.contains(&18) {
         let epoch: i64 = sqlx::query_scalar("SELECT chain_epoch FROM qbit_prism_cluster WHERE singleton")
             .fetch_one(&mut *connection).await
@@ -5483,6 +5517,54 @@ mod tests {
             })
             .collect();
         assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
+    }
+
+    /// The export refuses the capabilities startup refuses, so its list of
+    /// understood ones must be startup's, the backfill fence among them.
+    #[test]
+    fn recovery_evidence_understands_the_capabilities_startup_understands() {
+        let script = include_str!("../../../../scripts/prism-recovery-evidence.sql");
+        let lists: Vec<&str> = script
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("ELSIF capability.capability NOT IN (")
+                    .and_then(|rest| rest.strip_suffix(") THEN"))
+            })
+            .collect();
+        let [list] = lists[..] else {
+            panic!("expected one list of understood capabilities, found {lists:?}");
+        };
+        let mut understood: Vec<&str> = list
+            .split(',')
+            .map(|name| name.trim().trim_matches('\''))
+            .collect();
+        let mut native: Vec<&str> = NATIVE_CAPABILITIES.iter().map(|(name, _)| *name).collect();
+        understood.sort_unstable();
+        native.sort_unstable();
+        assert_eq!(understood, native);
+    }
+
+    /// While 2's backfill is pending the database declares a capability no
+    /// build before #669 understands: each refuses it at connect and at
+    /// migrate, even once 2 has been recorded by hand (#669). This build
+    /// understands it, and refuses the pending cursor instead.
+    #[test]
+    fn a_pending_share_hash_backfill_fences_every_earlier_build() {
+        let declared = [(share_hashes::PENDING_CAPABILITY.to_owned(), 1)];
+        let earlier: Vec<(&str, i32)> = NATIVE_CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|(name, _)| *name != share_hashes::PENDING_CAPABILITY)
+            .collect();
+        let error = refuse_unknown_capabilities(&declared, &earlier)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("database declares capability share_hash_backfill_pending = 1, which this server does not understand"),
+            "{error}"
+        );
+        refuse_unknown_capabilities(&declared, NATIVE_CAPABILITIES).unwrap();
     }
 
     #[test]
