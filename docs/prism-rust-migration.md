@@ -741,8 +741,8 @@ That runner would record 2 and leave the fence behind. The price: a backfill
 that a #582 build (before #669) started stays unfenced to its end. Resume it
 with this release, and don't record 2 by hand.
 
-How earlier builds react, once each checks declared capabilities at connect
-and at `migrate`:
+How earlier builds react to a fenced backfill, once each checks declared
+capabilities at connect and at `migrate`:
 - **Every start** of an earlier build refuses the capability, so recording 2
   by hand lets nothing serve. This release refuses the cursor itself, and so
   does the evidence export.
