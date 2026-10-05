@@ -1,8 +1,10 @@
 name: PRISM PostgreSQL CI probe (temporary)
 
 # Temporary diagnostic for the PostgreSQL shard statement timeouts. Runs the
-# prism-native-postgres shards under three set-ups and records slow statements,
-# CPU, I/O and memory. Removed before the branch merges.
+# prism-native-postgres shards while two direct-I/O writers keep the runner's
+# disk busy, with the service's data directory on that disk or on a tmpfs,
+# both at the ledger's default 15 s statement timeout, and records slow
+# statements, CPU, I/O and memory. Removed before the branch merges.
 on:
   push:
     branches:
@@ -20,18 +22,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, tmpfs, cpu4]
+        variant: [disk-busy, tmpfs-busy]
         shard: [0, 1, 2, 3]
         include:
-          - variant: baseline
+          - variant: disk-busy
             runner: blacksmith-2vcpu-ubuntu-2404
             pg_options: ""
-          - variant: tmpfs
+          - variant: tmpfs-busy
             runner: blacksmith-2vcpu-ubuntu-2404
-            pg_options: "--tmpfs /var/lib/postgresql/data:rw --shm-size=1g"
-          - variant: cpu4
-            runner: blacksmith-4vcpu-ubuntu-2404
-            pg_options: ""
+            pg_options: "--tmpfs /var/lib/postgresql/data:rw,size=4g"
     services:
       postgres:
         image: postgres:16
@@ -104,6 +103,11 @@ jobs:
           cat /proc/stat | head -1 > "${PROBE_DIR}/stat.start"
           cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory > "${PROBE_DIR}/pressure.start" 2>/dev/null || true
           nohup vmstat -n -t 5 > "${PROBE_DIR}/vmstat.log" 2>&1 &
+          # Two writers that keep the disk's queue full, as Cargo's writeback
+          # and a neighbour's I/O do on a busy host.
+          for writer in 1 2; do
+            nohup bash -c "while :; do dd if=/dev/zero of='${RUNNER_TEMP}/busy-${writer}' bs=4M count=128 oflag=direct conv=fsync status=none; rm -f '${RUNNER_TEMP}/busy-${writer}'; done" > /dev/null 2>&1 &
+          done
           nohup bash -c 'while sleep 15; do date -u +%T; docker stats --no-stream --format "{{.Name}} {{.CPUPerc}} {{.MemUsage}}" ; free -m | sed -n 2p; df -m / | tail -1; done' > "${PROBE_DIR}/stats.log" 2>&1 &
       - name: Run workspace test shard in required integration mode
         env:
