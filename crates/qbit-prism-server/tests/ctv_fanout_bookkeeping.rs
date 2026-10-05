@@ -457,3 +457,109 @@ async fn a_frontend_with_block_submission_disabled_claims_and_sends_no_fanout() 
     )
     .await
 }
+
+/// #664: while the cluster holds block submission, no frontend's broadcaster
+/// pass runs, whatever its own switch says, so nothing is claimed, attempted
+/// or sent. Once the hold is cleared the same frontend sends every fanout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_hold_claims_and_sends_no_fanout_until_it_is_cleared() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f, false).await?;
+            sendable(f).await?;
+            f.a.ledger
+                .set_submission_hold("rehearsal on a restored ledger")
+                .await?;
+            for frontend in [&f.a, &f.b] {
+                let refused = timeout(BOUND, broadcaster::run_once(frontend))
+                    .await?
+                    .err()
+                    .context("a broadcaster pass ran under the cluster hold")?;
+                ensure!(
+                    refused.is::<qbit_prism_server::ledger::SubmissionHeld>(),
+                    "{refused:#}"
+                );
+            }
+            ensure!(
+                touched(f).await? == (0, 0),
+                "a frontend claimed or attempted a fanout under the cluster hold"
+            );
+            let cleared =
+                f.a.ledger
+                    .clear_submission_hold("rehearsal over", false)
+                    .await?;
+            ensure!(
+                cleared.cleared.is_some() && cleared.pending_candidates == 0,
+                "{cleared:?}"
+            );
+            let settled = timeout(BOUND, broadcaster::run_once(&f.a)).await??;
+            ensure!(
+                settled == count,
+                "the frontend settled {settled} of {count} fanouts once the hold cleared"
+            );
+            let (rows, attempts) = touched(f).await?;
+            ensure!(
+                rows == count as i64 && attempts == count as i64,
+                "the frontend attempted {rows} rows with {attempts} sends of {count}"
+            );
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// #664: a hold set while an attempt is under way refuses its send. The pass
+/// hands the claim back at once, records no attempt and ends, and the next
+/// claim waits for the hold to clear; then a pass sends every fanout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_set_mid_attempt_hands_the_fanout_claim_back_unsent() -> Result<()> {
+    run(qbit_prism_test_gate::site!(), |f| {
+        Box::pin(async move {
+            f.refresh(true).await?;
+            let count = mature_fanouts(f, false).await?;
+            sendable(f).await?;
+            // The attempt's last node read before its claim renewal and the
+            // hold check that precede its send.
+            let mut held = f.node.pause_next("gettxout")?;
+            let a = f.a.clone();
+            let pass = tokio::spawn(async move { broadcaster::run_once(&a).await });
+            timeout(BOUND, held.entered()).await??;
+            let claimed = claimed_fanout(f).await?;
+            f.b.ledger.set_submission_hold("cutover").await?;
+            held.release();
+            let refused = timeout(BOUND, pass)
+                .await??
+                .err()
+                .context("an attempt sent its fanout under a hold set mid-attempt")?;
+            ensure!(
+                refused.is::<qbit_prism_server::ledger::SubmissionHeld>(),
+                "{refused:#}"
+            );
+            let row = sqlx::query("SELECT claim_token IS NULL AND claim_instance_id IS NULL AND claim_expires_at IS NULL AS released,next_broadcast_attempt_at IS NULL AS due FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
+                .bind(&claimed).fetch_one(f.pool()).await?;
+            ensure!(
+                row.try_get::<bool, _>("released")? && row.try_get::<bool, _>("due")?,
+                "the held attempt kept its claim or was rescheduled"
+            );
+            ensure!(
+                touched(f).await? == (0, 0),
+                "a fanout was attempted or sent under the hold"
+            );
+            ensure!(
+                f.b.ledger.claim_fanout(120).await?.is_none(),
+                "a fanout was claimed under the hold"
+            );
+            f.b.ledger
+                .clear_submission_hold("cutover verified", false)
+                .await?;
+            let settled = timeout(BOUND, broadcaster::run_once(&f.a)).await??;
+            ensure!(
+                settled == count,
+                "the frontend settled {settled} of {count} fanouts once the hold cleared"
+            );
+            Ok(())
+        })
+    })
+    .await
+}

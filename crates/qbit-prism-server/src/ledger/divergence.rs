@@ -232,7 +232,12 @@ impl Ledger {
     ) -> Result<OfferReservation> {
         let candidate = &claim.candidate;
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        // #664: no reservation, and no capture decision, while the cluster
+        // holds block submission. The error releases the claim and leaves the
+        // row pending; a refusal here would abandon the block.
+        if let Some(hold) = writable_unless_held(&mut tx, true).await? {
+            return Err(SubmissionHeld(hold).into());
+        }
         let Some(bps) = ceiling_bps.filter(|_| !candidate.leased) else {
             return self.reserve_in(tx, claim, None).await;
         };
@@ -275,7 +280,9 @@ impl Ledger {
         };
         let offered = bound.bound_sats <= bound.ceiling_sats;
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        if let Some(hold) = writable_unless_held(&mut tx, true).await? {
+            return Err(SubmissionHeld(hold).into());
+        }
         record_offer_decision(
             &mut tx,
             candidate,

@@ -72,6 +72,8 @@ fn unavailable_report(instance_id: Option<&str>, status: &str, warning: &str) ->
             "ctv_broadcaster": "off",
             "warning": null
         })),
+        // #664: unreadable here, so unknown rather than "not held".
+        "submission_hold": null,
         "health": null,
         "carry_forward_integrity": null,
         "durability": null,
@@ -358,6 +360,17 @@ async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()
         "expected a fresh heartbeat sampled with the database clock: {live}"
     );
     let mut expected = unavailable_report(Some("self-check-cli"), "observed", "");
+    // #664: the migrated ledger holds nothing.
+    expected["submission_hold"] = json!({
+        "schema": "qbit.prism.submission-hold.v1",
+        "held": false,
+        "reason": null,
+        "set_at": null,
+        "set_by": null,
+        "last_event": null,
+        "schema_supports_hold": true,
+        "pending_candidates": 0,
+    });
     expected["audit_completeness"] = json!({
         "missing_stored_bodies": 0,
         "missing_canonical_bytes": 0,

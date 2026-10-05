@@ -42,7 +42,7 @@ pub use candidates::{
 use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
 mod connect;
 pub(crate) use connect::shielded_begin;
-use connect::{require_revision, writable};
+use connect::{require_revision, writable, writable_unless_held};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod divergence;
@@ -53,15 +53,18 @@ pub use divergence::{
 mod fanout;
 pub use fanout::revoke_fanout_claims;
 mod fatal_state;
+pub use fatal_state::require_operator_reason;
 mod instances;
 mod policy_transition;
 mod signing_transition;
 mod standby_durability;
+mod submission_hold;
 pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 pub use standby_durability::{
     OfferStandbyReport, OfferStandbyWait, StandbyDurability, StandbyWait,
 };
+pub use submission_hold::{SubmissionHeld, SubmissionHold, SubmissionHoldCleared};
 mod jobs;
 pub use jobs::{
     BlobPruneCursor, BlobPruneResult, CompactBatchAttempt, CompactDependency, CompactIssuedJob,

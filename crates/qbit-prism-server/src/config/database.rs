@@ -61,17 +61,7 @@ pub struct DatabaseConfig {
 
 impl DatabaseConfig {
     pub fn from_env() -> Result<Self> {
-        let database_url = optional("PRISM_DATABASE_URL").context(
-            "PRISM_DATABASE_URL is required (Rust PRISM uses PostgreSQL for every instance)",
-        )?;
-        let parsed = url::Url::parse(&database_url).context("invalid PRISM_DATABASE_URL")?;
-        ensure!(
-            matches!(parsed.scheme(), "postgres" | "postgresql"),
-            "PRISM_DATABASE_URL must use postgres or postgresql"
-        );
-        if production_mode()? {
-            non_default_credentials(&database_url)?;
-        }
+        let database_url = Self::url_from_env()?;
         let instance_id =
             optional("PRISM_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         ensure!(
@@ -86,6 +76,24 @@ impl DatabaseConfig {
             database_connections: bounded_usize("PRISM_DATABASE_MAX_CONNECTIONS", 16, 4, 1024)?
                 as u32,
         })
+    }
+
+    /// `PRISM_DATABASE_URL` alone, checked as [`Self::from_env`] checks it,
+    /// for an operator command that reads nothing else: a frontend-only
+    /// setting left invalid must not stop it (#664).
+    pub fn url_from_env() -> Result<String> {
+        let database_url = optional("PRISM_DATABASE_URL").context(
+            "PRISM_DATABASE_URL is required (Rust PRISM uses PostgreSQL for every instance)",
+        )?;
+        let parsed = url::Url::parse(&database_url).context("invalid PRISM_DATABASE_URL")?;
+        ensure!(
+            matches!(parsed.scheme(), "postgres" | "postgresql"),
+            "PRISM_DATABASE_URL must use postgres or postgresql"
+        );
+        if production_mode()? {
+            non_default_credentials(&database_url)?;
+        }
+        Ok(database_url)
     }
 
     /// Verification of imported artifacts needs a public trust pin, never a seed.

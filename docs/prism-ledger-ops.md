@@ -1601,8 +1601,11 @@ cases manually.
 ## Block submission kill switch for rehearsals
 
 A rehearsal (#291) runs production frontends against a restored copy of the
-mainnet ledger and a real mainnet node. Start every frontend of the rehearsal
-with `PRISM_BLOCK_SUBMIT_ENABLED=0`, so that no found block and no
+mainnet ledger and a real mainnet node. Hold the restored ledger itself with
+`submission-hold set` before any frontend starts on it
+([below](#holding-the-whole-cluster-023-664)), so that it holds every frontend
+that connects to it, and start every frontend of the rehearsal with
+`PRISM_BLOCK_SUBMIT_ENABLED=0` as well, so that no found block and no
 transaction it handles can reach the network:
 
 | Path | With `PRISM_BLOCK_SUBMIT_ENABLED=0` |
@@ -1637,8 +1640,10 @@ Verify the mode before admitting miners:
   frontend that is still starting is listed under `inactive_instances` until
   its first health publication, so run `self-check` again once it is up.
 - `/healthz` carries `block_submission_enabled`, and `/metrics` reads
-  `qbit_prism_block_submission_enabled 0`; it reads `-1` only before the
-  frontend has published its setting.
+  `qbit_prism_block_submission_enabled 0` from startup.
+- `qbit-prism-server submission-hold show` reports `"held": true`, and each
+  frontend's heartbeat carries `"held": true` in `block_submission_hold`
+  ([below](#holding-the-whole-cluster-023-664)).
 - Each frontend logs a warning at startup that ends `the submit loop claims no
   candidate`, and, when a broadcaster was configured, one that it is held.
 
@@ -1662,6 +1667,99 @@ one to its node, and a leased candidate skips the pre-offer staleness screen.
 Discard the database, or first abandon each held row with `candidates
 abandon`. Production frontends run with the setting unset or `1`; the
 [go-live checks](mainnet-deployment.md#go-live-checks) confirm it.
+
+### Holding the whole cluster (023, #664)
+
+`PRISM_BLOCK_SUBMIT_ENABLED` holds one frontend, and only one started with it.
+A hold stored in the ledger holds every frontend that connects to that ledger,
+whatever its own setting says, so a frontend started without the variable on
+a rehearsal database still sends its node nothing:
+
+```sh
+qbit-prism-server submission-hold set --reason "#291 rehearsal on a restored ledger"
+qbit-prism-server submission-hold show
+qbit-prism-server submission-hold clear --reason "<why>" [--offer-pending-candidates]
+```
+
+While the hold is set:
+
+- No frontend claims a block candidate, in any state, so `submitblock` is
+  never called and every row stays as it is. That includes `offered` and
+  `reconciliation` rows: the landing, crediting and fanouts of a block already
+  sent wait for the hold to clear. `candidates recover` still lands a block
+  the node has already accepted, and never offers one.
+- An offer's reservation reads the hold in its own transaction, `FOR SHARE`
+  on the hold's own row, which `set` locks `FOR UPDATE`. A hold therefore
+  commits either before a reservation, which is then refused and leaves its
+  row `pending`, or after one that already reserved, whose single offer
+  completes. Nothing else locks that row and the read takes no lock on the
+  cluster row, so it adds no wait behind a landing or blob GC: a leased
+  candidate's reservation still locks nothing there.
+- No frontend's CTV broadcaster claims or sends a fanout, and `broadcast-ctv`
+  refuses; confirmation tracking of fanouts already sent waits too. A hold set
+  during an attempt hands its claim back unattempted before the send; a send
+  already past that check completes.
+- Everything else runs as usual, as under `PRISM_BLOCK_SUBMIT_ENABLED=0`.
+
+Running frontends obey a hold at their next claim, within a submit-loop tick,
+and report it at their next health publication:
+
+- Each logs `the cluster holds block submission` once, and logs again when
+  the hold is cleared.
+- `/healthz` and the heartbeat keep `block_submission_enabled` as the
+  frontend's own setting, so a frontend started without the variable still
+  shows, and carry the hold as `block_submission_hold`: `held`, `reason`,
+  `set_at` and `set_by`, as the frontend last read it. `held` is null until
+  its first read succeeds; a later failed read keeps the last one, so a
+  database outage does not report the frontend as held.
+- `qbit_prism_block_submission_enabled` reads 0 while the setting or the hold
+  holds blocks back, and -1 while the setting is on but the frontend has not
+  yet read the hold. While a cluster is held, `PrismBlockSubmissionHeld` therefore pages for
+  every frontend: scope a rehearsal's or a cutover's alerting as
+  [above](#block-submission-kill-switch-for-rehearsals).
+- `self-check` reports the hold as `submission_hold` and warns on stderr.
+  `check-config` never reads the database and says where the hold is reported.
+
+`set` and `clear` need only `PRISM_DATABASE_URL`, and both require `--reason`.
+They use the operator connection, which works while frontends run and on a
+halted cluster, and print the resulting hold as JSON. `set` keeps a hold
+already in force, with its original reason. `clear` is refused while any
+candidate is `pending`, because every frontend with submission enabled would
+then offer those blocks; pass `--offer-pending-candidates` only when they
+should be offered. `show` opens the database read-only, gives up after 15
+seconds, and also reads a ledger from before 023, which reports
+`"schema_supports_hold": false`.
+
+Each `set` that holds the cluster and each `clear` that releases it is
+journaled in the append-only `qbit_prism_submission_hold_events`, with who ran
+it, why, and how many candidates were pending. A `set` that finds a hold in
+force, a `clear` that finds none and a refused `clear` change nothing and
+record nothing. `show` prints the latest event as `last_event`; the whole
+history is:
+
+```sql
+SELECT event_id, action, recorded_at, operator_identity, database_role,
+       reason, pending_candidates
+FROM qbit_prism_submission_hold_events
+ORDER BY event_id;
+```
+
+Migration 023 adds the hold's row and its journal and declares
+`block_submission_hold = 1`, so a binary older than the hold, which would
+ignore it, refuses the database at connect. 023 is applied offline in the same
+stopped window as the rest of `migrate`, like 021 and 022.
+
+**Rehearsal.** Restore, run `migrate`, then `submission-hold set` before any
+frontend starts, and confirm `"held": true` with `show`. Never clear the hold
+on a rehearsal database: discard the database afterwards.
+
+**Cutover.** The hold can also keep a freshly migrated production ledger from
+the network until the frontends are verified. Run `submission-hold set` after
+`migrate`, in the stopped window. Start and verify the frontends. Then run
+`submission-hold clear --reason ...`, which a drained source allows because it
+has no pending candidates, and confirm `"held": false` with `show` before
+admitting miners. The [go-live checks](mainnet-deployment.md#go-live-checks)
+require it.
 
 ## Retry, replay and deadline contract
 

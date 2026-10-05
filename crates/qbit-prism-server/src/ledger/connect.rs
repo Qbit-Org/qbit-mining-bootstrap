@@ -493,7 +493,11 @@ impl Ledger {
     }
 
     pub async fn payout_revision(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'").fetch_one(&mut *self.acquire().await?).await?)
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND {SERVING}"
+        ))
+        .fetch_one(&mut *self.acquire().await?)
+        .await?)
     }
 }
 
@@ -707,8 +711,18 @@ pub(crate) async fn shielded_begin(
     }
 }
 
-pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    let row = sqlx::query("SELECT fatal_error,EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at>clock_timestamp()) AS legacy_live FROM qbit_prism_cluster WHERE singleton").fetch_one(&mut **tx).await?;
+/// When the cluster row's payout revision is served: the cluster is not
+/// halted and this is a writable primary. [`Ledger::payout_revision`] and
+/// the health read (#664) share it.
+pub(super) const SERVING: &str =
+    "fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'";
+
+/// The write guard's reads, from the cluster row aliased `c`, which
+/// [`check_writable`] refuses on. [`writable`] and [`writable_unless_held`]
+/// share them, so a new halt condition reaches both.
+const WRITABLE_COLUMNS: &str = "c.fatal_error,EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at>clock_timestamp()) AS legacy_live";
+
+fn check_writable(row: &PgRow) -> Result<()> {
     let fatal: Option<String> = row.try_get("fatal_error")?;
     if let Some(error) = fatal {
         bail!("cluster halted: {error}");
@@ -718,6 +732,39 @@ pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         "live legacy Python writer lease"
     );
     Ok(())
+}
+
+pub(super) async fn writable(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let row = sqlx::query(&format!(
+        "SELECT {WRITABLE_COLUMNS} FROM qbit_prism_cluster c WHERE c.singleton"
+    ))
+    .fetch_one(&mut **tx)
+    .await?;
+    check_writable(&row)
+}
+
+/// [`writable`], also reading the cluster's block submission hold (#664), in
+/// the same one statement. Every candidate claim, fanout claim and offer
+/// reservation starts with it in place of `writable`, so none is made while
+/// the hold is set. With `fence` the hold row is read `FOR SHARE`, which
+/// `submission-hold set` waits for under its `FOR UPDATE` lock: a hold
+/// commits either before a reservation, which then sees it, or after the
+/// reservation has committed. Nothing else locks that row, and the fence
+/// takes no lock on the cluster row, so it never waits for a landing or blob
+/// GC holding that.
+pub(super) async fn writable_unless_held(
+    tx: &mut Transaction<'_, Postgres>,
+    fence: bool,
+) -> Result<Option<super::SubmissionHold>> {
+    let row = sqlx::query(&format!(
+        "SELECT {WRITABLE_COLUMNS},{} FROM qbit_prism_cluster c CROSS JOIN qbit_prism_submission_hold h WHERE c.singleton AND h.singleton{}",
+        super::submission_hold::HOLD_COLUMNS,
+        if fence { " FOR SHARE OF h" } else { "" }
+    ))
+    .fetch_one(&mut **tx)
+    .await?;
+    check_writable(&row)?;
+    super::SubmissionHold::from_row(&row)
 }
 
 /// Take the cluster row's exclusive lock before an authority write.
