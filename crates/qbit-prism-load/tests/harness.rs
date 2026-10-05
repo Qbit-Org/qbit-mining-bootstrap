@@ -1204,6 +1204,7 @@ fn session_config(index: usize) -> client::SessionConfig {
         handshake_timeout: std::time::Duration::from_secs(20),
         // What the run derives from the default 15 s commit timeout.
         quiesce_limit: run::drain_limit(15.0),
+        drop_offers_held_while_disconnected: false,
     }
 }
 

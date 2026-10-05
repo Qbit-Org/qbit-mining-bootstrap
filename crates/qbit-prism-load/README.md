@@ -1129,8 +1129,10 @@ The `--address` has to be a payout address the target's node validates
    nothing outstanding, and an offer no such session can take is shortfall,
    never a backlog. A session without a connection is offered nothing, so an
    outage reads as shortfall rather than as offers held until it reconnects
-   and then sent in a burst. A session has one submit outstanding at a time,
-   as the server answers it.
+   and then sent in a burst; an offer that reaches a session in the instant
+   its connection goes is dropped when it reconnects, and counted as
+   discarded. A session has one submit outstanding at a time, as the server
+   answers it.
 4. Mines each job at the difficulty the last `mining.set_difficulty` before
    its `mining.notify` advertised, as the server binds them (Stratum's 1
    before any), with `--difficulty` asked for in the password when given. The
@@ -1157,7 +1159,8 @@ a second one skips the rest of the drain. A progress line goes to stderr every
 document with four parts. Its directory is checked at entry with a probe
 file beside it, so a path that cannot be written refuses the run before any
 load; a file already there is replaced only when the new document is
-written, and a `--share-log` naming the same file is refused.
+written, and a `--share-log` that reaches the same file, through any path or
+symlink, is refused.
 
 - `processes`: per client process, its configuration, its load window, how
   it `ended`, its exit code, its own counts, what was still outstanding when

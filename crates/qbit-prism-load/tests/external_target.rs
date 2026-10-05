@@ -37,6 +37,8 @@ const HARDER: f64 = 1.0 / 1_048_576.0;
 /// What the target saw.
 #[derive(Default)]
 struct Seen {
+    /// While set, every new connection is closed at once.
+    refusing: std::sync::atomic::AtomicBool,
     connections: AtomicUsize,
     submits: AtomicUsize,
     accepted: Mutex<HashSet<[u8; 32]>>,
@@ -77,7 +79,9 @@ async fn fake_target_admitting(difficulty: f64, admitted: usize) -> FakeTarget {
                 let Ok((socket, _)) = listener.accept().await else {
                     return;
                 };
-                if seen.connections.fetch_add(1, Ordering::SeqCst) >= admitted {
+                if seen.connections.fetch_add(1, Ordering::SeqCst) >= admitted
+                    || seen.refusing.load(Ordering::SeqCst)
+                {
                     drop(socket);
                     continue;
                 }
@@ -900,6 +904,94 @@ async fn a_window_makes_every_offer_its_rate_and_length_promise() -> Result<()> 
     Ok(())
 }
 
+async fn next_event(
+    inbox: &mut tokio::sync::mpsc::UnboundedReceiver<client::Event>,
+    what: &str,
+    mut wanted: impl FnMut(&client::Event) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, inbox.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .expect("the session is still running");
+        if wanted(&event) {
+            return;
+        }
+    }
+}
+
+/// An offer that reaches a session in the instant its connection is gone is
+/// dropped, as a discarded offer, when the session reconnects, rather than
+/// sent with the reconnect as a burst the outage never offered. A harness
+/// session, which keeps its offers, still sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_taken_while_disconnected_is_dropped_on_reconnect() -> Result<()> {
+    for drop in [true, false] {
+        let target = fake_target(EASY).await;
+        let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(client::SessionShared {
+            phase: std::sync::RwLock::new(external::PHASE.to_owned()),
+            events,
+            record_notifies: std::sync::atomic::AtomicBool::new(false),
+            kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let config = client::SessionConfig {
+            index: 0,
+            username: "pload1external.t-s00000".into(),
+            password: "x".into(),
+            difficulty: client::DifficultySource::Advertised {
+                ceiling: external::DEFAULT_MAX_DIFFICULTY,
+            },
+            version_rolling_mask: codec::VERSION_ROLLING_MASK,
+            connect_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(5),
+            quiesce_limit: Duration::from_secs(5),
+            drop_offers_held_while_disconnected: drop,
+        };
+        let handle = client::spawn_session(config, 0, target.address.clone(), shared, 1);
+        next_event(&mut inbox, "the first connection", |event| {
+            matches!(event, client::Event::Connected { .. })
+        })
+        .await;
+        target.seen.refusing.store(true, Ordering::SeqCst);
+        target.drops.send_modify(|generation| *generation += 1);
+        next_event(&mut inbox, "the disconnect", |event| {
+            matches!(event, client::Event::Disconnected { .. })
+        })
+        .await;
+        let phase: Arc<str> = Arc::from(external::PHASE);
+        assert!(
+            handle.try_offer(1, &phase),
+            "a session's queue takes one offer"
+        );
+        let sent_before = target.seen.submits.load(Ordering::SeqCst);
+        target.seen.refusing.store(false, Ordering::SeqCst);
+        if drop {
+            next_event(&mut inbox, "the dropped offer", |event| {
+                matches!(event, client::Event::DiscardedOffer { .. })
+            })
+            .await;
+            next_event(&mut inbox, "the reconnect", |event| {
+                matches!(event, client::Event::Connected { .. })
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(handle.outstanding.load(Ordering::SeqCst), 0);
+            assert_eq!(target.seen.submits.load(Ordering::SeqCst), sent_before);
+        } else {
+            next_event(&mut inbox, "the held offer's answer", |event| {
+                matches!(event, client::Event::Submit(record) if record.outcome.label() == "accepted")
+            })
+            .await;
+            assert_eq!(target.seen.submits.load(Ordering::SeqCst), sent_before + 1);
+        }
+        let _ = handle.control.send(client::Control::Stop);
+        tokio::time::timeout(Duration::from_secs(5), handle.task).await??;
+    }
+    Ok(())
+}
+
 /// A session that comes back to a tip, as one can while the frontends
 /// behind a balancer disagree, is counted on it once, at its first
 /// sighting.
@@ -970,17 +1062,33 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
     // through a detour: still the same file, and still refused.
     let fresh = scratch.path("fresh.json");
     let fresh_detour = scratch.path("sub/../fresh.json").display().to_string();
-    let args = args(
+    let detoured = args(
         &target.address,
         &fresh,
         &[external::GUARD_FLAG, "--share-log", &fresh_detour],
     );
-    let error = match external::run(&args, &Shutdown::never()).await {
+    let error = match external::run(&detoured, &Shutdown::never()).await {
         Ok(_) => panic!("a share log aliasing a fresh --out ran"),
         Err(error) => format!("{error:#}"),
     };
     assert!(error.contains("same file"), "{error}");
     assert!(!fresh.exists());
+    // A dangling symlink to the document's path: the log would be created
+    // through it, at the document's path.
+    std::os::unix::fs::symlink(&fresh, scratch.path("link.jsonl"))?;
+    let link = scratch.path("link.jsonl").display().to_string();
+    let linked = args(
+        &target.address,
+        &fresh,
+        &[external::GUARD_FLAG, "--share-log", &link],
+    );
+    let error = match external::run(&linked, &Shutdown::never()).await {
+        Ok(_) => panic!("a share log symlinked to a fresh --out ran"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("same file"), "{error}");
+    assert!(!fresh.exists());
+    std::fs::remove_file(scratch.path("link.jsonl"))?;
     assert_eq!(target.seen.connections.load(Ordering::SeqCst), 0);
     // Nothing is left behind by the check either.
     let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)?

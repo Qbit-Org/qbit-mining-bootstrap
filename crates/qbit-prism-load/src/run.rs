@@ -677,6 +677,7 @@ fn churn_driver(
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
             quiesce_limit,
+            drop_offers_held_while_disconnected: false,
         },
     };
     Ok(crate::churn::ChurnDriver::new(
@@ -1562,6 +1563,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             connect_timeout: Duration::from_secs(20),
             handshake_timeout: Duration::from_secs(args.work_timeout.min(120)),
             quiesce_limit,
+            drop_offers_held_while_disconnected: false,
         };
         sessions.push(client::spawn_session(
             config,

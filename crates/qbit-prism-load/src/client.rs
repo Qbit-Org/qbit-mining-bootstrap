@@ -495,6 +495,13 @@ pub struct SessionConfig {
     /// be working on is never turned into a `NoResponse` by the harness's
     /// own close (EP-ERRORS).
     pub quiesce_limit: Duration,
+    /// Drop, as [`Event::DiscardedOffer`], every offer the session took
+    /// while it had no connection, the moment it holds work again, instead
+    /// of sending them then. External-target mode measures an outage as
+    /// shortfall: an offer that reached a session in the instant its socket
+    /// closed would otherwise go out with the reconnect, as a burst the
+    /// outage never offered. The harness's sessions keep theirs, as before.
+    pub drop_offers_held_while_disconnected: bool,
 }
 
 /// Shared, live run state a session reads.
@@ -735,6 +742,9 @@ async fn run_session(
             };
             match attempt {
                 Some(Ok(fresh)) => {
+                    if config.drop_offers_held_while_disconnected {
+                        drain_work(&mut work, &outstanding, &shared, config.index);
+                    }
                     let _ = shared.events.send(Event::Opened(ConnectionOpened {
                         session: config.index,
                         frontend: frontend.load(Ordering::Relaxed),

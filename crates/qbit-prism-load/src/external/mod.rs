@@ -563,6 +563,8 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
                     // The mode never closes a connection on purpose before
                     // the stop, which comes after the drain.
                     quiesce_limit: drain,
+                    // An outage is shortfall, never a burst on recovery.
+                    drop_offers_held_while_disconnected: true,
                 },
                 0,
                 args.target.clone(),
@@ -757,6 +759,34 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
     })
 }
 
+/// `path` as its file name in its directory's canonical path, then each file
+/// its final component's symlinks lead to, followed whether or not the last
+/// one exists.
+fn file_names(path: &Path, flag: &str) -> Result<Vec<PathBuf>> {
+    let mut names = vec![in_real_directory(path, flag)?];
+    // Linux follows at most 40 links in a path.
+    for _ in 0..40 {
+        let current = names.last().expect("one name").clone();
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return Ok(names);
+        }
+        let target = std::fs::read_link(&current)
+            .with_context(|| format!("{flag} {}: reading {}", path.display(), current.display()))?;
+        let next = match current.parent() {
+            Some(directory) if target.is_relative() => directory.join(target),
+            _ => target,
+        };
+        names.push(in_real_directory(&next, flag)?);
+    }
+    anyhow::bail!(
+        "{flag} {}: too many levels of symbolic links",
+        path.display()
+    )
+}
+
 /// `path`'s file name in its directory's canonical path. The directory has
 /// to exist: the file is created in it.
 fn in_real_directory(path: &Path, flag: &str) -> Result<PathBuf> {
@@ -789,14 +819,15 @@ fn check_outputs(args: &ExternalArgs, run_tag: &str) -> Result<()> {
         args.out.display()
     );
     if let Some(log) = &args.share_log {
-        // Through each one's real directory, so `a/b/../x` and a symlinked
-        // directory are seen for the paths they are, whether or not the
-        // files exist yet; and through the files themselves when they do.
-        let same = in_real_directory(log, "--share-log")? == in_real_directory(&args.out, "--out")?
-            || std::fs::canonicalize(log)
-                .ok()
-                .zip(std::fs::canonicalize(&args.out).ok())
-                .is_some_and(|(log, out)| log == out);
+        // Every name each path can reach a file by: itself in its directory's
+        // real path, and whatever its final symlinks lead to, dangling or
+        // not. The log is created through its symlinks and the document is
+        // renamed over its own name, so any name the two share is a log the
+        // document would replace.
+        let log_names = file_names(log, "--share-log")?;
+        let same = file_names(&args.out, "--out")?
+            .iter()
+            .any(|name| log_names.contains(name));
         ensure!(
             !same,
             "--share-log and --out name the same file, {}; the stats would replace the share ids",
