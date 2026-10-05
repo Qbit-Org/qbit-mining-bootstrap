@@ -138,8 +138,9 @@ const ORDER_LOCK_OBJSUBID: i32 = 1;
 /// Those runs kept the service's data directory on disk; it has been a tmpfs
 /// since #677. On the tmpfs the slowest level was 1,084, 1,056, 1,103 and 670
 /// shares/s in four runs of the job, and 702 in a probe that also loaded
-/// `auto_explain`. 250 stays, at about 37% of the slowest: lowering it to the
-/// rule's 200 would weaken what it catches while no run has come within 2.5x.
+/// `auto_explain`, so 250 is about 37% of the slowest. A fifth run fell to 132
+/// while the runner itself stalled, as disk runs had before (#683). 250 stays:
+/// a floor low enough to pass such a stall would miss the collapse it is for.
 ///
 /// Re-derive it from the same summary lines if the runner, the PostgreSQL
 /// service or the append path changes. On any other host,
