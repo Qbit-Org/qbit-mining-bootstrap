@@ -409,12 +409,17 @@ pub fn write_document(path: &Path, document: &Value) -> Result<()> {
     let name = path
         .file_name()
         .with_context(|| format!("{} names no file", path.display()))?;
-    let temporary = directory.join(format!(".{}.partial", name.to_string_lossy()));
+    let temporary = partial_path(directory, name);
     std::fs::write(&temporary, &bytes)
         .with_context(|| format!("writing {}", temporary.display()))?;
     std::fs::rename(&temporary, path)
         .with_context(|| format!("renaming {} to {}", temporary.display(), path.display()))?;
     Ok(())
+}
+
+/// Where [`write_document`] writes `name` before renaming it into place.
+fn partial_path(directory: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    directory.join(format!(".{}.partial", name.to_string_lossy()))
 }
 
 /// The run's result in one line.
@@ -689,8 +694,18 @@ pub async fn run(args: &ExternalArgs, shutdown: &Shutdown) -> Result<Outcome> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             std::mem::take(&mut collector.totals),
-            collector.finish_share_log(),
+            collector.take_share_log(),
         )
+    };
+    // Its writer may still be writing what it was sent: waited for off the
+    // runtime.
+    let share_log = match share_log {
+        Some(log) => Some(
+            tokio::task::spawn_blocking(move || log.finish())
+                .await
+                .context("finishing the share log")?,
+        ),
+        None => None,
     };
     totals.offers_discarded += discarded_at_stop;
     totals.offers_unknown_at_abort += unknown_at_abort;
@@ -825,9 +840,20 @@ fn check_outputs(args: &ExternalArgs, run_tag: &str) -> Result<()> {
         // renamed over its own name, so any name the two share is a log the
         // document would replace.
         let log_names = file_names(log, "--share-log")?;
-        let same = file_names(&args.out, "--out")?
-            .iter()
-            .any(|name| log_names.contains(name));
+        // The document is written to a partial file first and renamed: a log
+        // there would be overwritten as surely.
+        let out_name = args
+            .out
+            .file_name()
+            .with_context(|| format!("--out {} names no file", args.out.display()))?;
+        let out_directory = args
+            .out
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut out_names = file_names(&args.out, "--out")?;
+        out_names.extend(file_names(&partial_path(out_directory, out_name), "--out")?);
+        let same = out_names.iter().any(|name| log_names.contains(name));
         ensure!(
             !same,
             "--share-log and --out name the same file, {}; the stats would replace the share ids",

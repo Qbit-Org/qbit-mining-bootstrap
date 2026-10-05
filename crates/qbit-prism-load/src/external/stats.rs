@@ -550,9 +550,13 @@ fn max_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 /// (#291's failover drill).
 pub struct ShareLog {
     path: PathBuf,
-    writer: std::io::BufWriter<std::fs::File>,
-    lines: u64,
-    error: Option<String>,
+    /// Lines for the writer thread. The collector runs on the async runtime
+    /// and must never wait on the disk: a slow filesystem would stall that
+    /// worker's sessions and read as acknowledgement latency.
+    lines: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// Writes every line it is sent, then flushes, and returns how many it
+    /// wrote and the first write that failed.
+    writer: Option<std::thread::JoinHandle<(u64, Option<String>)>>,
 }
 
 /// What the share log holds, recorded in the process entry.
@@ -571,37 +575,58 @@ impl ShareLog {
     pub fn create(path: &Path) -> Result<Self> {
         let file = std::fs::File::create(path)
             .with_context(|| format!("creating the share log {}", path.display()))?;
+        let (lines, received) = std::sync::mpsc::channel::<Vec<u8>>();
+        let writer = std::thread::Builder::new()
+            .name("share-log".into())
+            .spawn(move || {
+                let mut writer = std::io::BufWriter::new(file);
+                let (mut written, mut error) = (0u64, None);
+                // Every line is taken off the channel even after a failure,
+                // so nothing waits on a writer that has stopped writing.
+                for line in received {
+                    if error.is_none() {
+                        match writer.write_all(&line) {
+                            Ok(()) => written += 1,
+                            Err(failure) => error = Some(format!("{failure}")),
+                        }
+                    }
+                }
+                if error.is_none() {
+                    if let Err(failure) = writer.flush() {
+                        error = Some(format!("{failure}"));
+                    }
+                }
+                (written, error)
+            })
+            .context("starting the share-log writer")?;
         Ok(Self {
             path: path.to_owned(),
-            writer: std::io::BufWriter::new(file),
-            lines: 0,
-            error: None,
+            lines: Some(lines),
+            writer: Some(writer),
         })
     }
 
     fn write(&mut self, line: &Value) {
-        if self.error.is_some() {
-            return;
-        }
-        let result = serde_json::to_writer(&mut self.writer, line)
-            .map_err(std::io::Error::from)
-            .and_then(|()| self.writer.write_all(b"\n"));
-        match result {
-            Ok(()) => self.lines += 1,
-            Err(error) => self.error = Some(format!("{error}")),
+        let mut bytes = serde_json::to_vec(line).expect("a JSON value serializes");
+        bytes.push(b'\n');
+        if let Some(lines) = &self.lines {
+            let _ = lines.send(bytes);
         }
     }
 
+    /// Close the log once the writer has written every line. This waits on
+    /// the disk, so it is not called on the async runtime.
     pub fn finish(mut self) -> ShareLogInfo {
-        if self.error.is_none() {
-            if let Err(error) = self.writer.flush() {
-                self.error = Some(format!("{error}"));
-            }
-        }
+        drop(self.lines.take());
+        let (lines, error) = match self.writer.take().map(std::thread::JoinHandle::join) {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => (0, Some("the share-log writer panicked".to_owned())),
+            None => (0, None),
+        };
         ShareLogInfo {
             path: self.path.display().to_string(),
-            lines: self.lines,
-            error: self.error,
+            lines,
+            error,
         }
     }
 }
@@ -655,8 +680,9 @@ impl Collector {
         second.sessions_holding_work = Some(holding);
     }
 
-    pub fn finish_share_log(&mut self) -> Option<ShareLogInfo> {
-        self.share_log.take().map(ShareLog::finish)
+    /// The share log, to be finished off the async runtime.
+    pub fn take_share_log(&mut self) -> Option<ShareLog> {
+        self.share_log.take()
     }
 
     pub fn apply(&mut self, event: Event) {

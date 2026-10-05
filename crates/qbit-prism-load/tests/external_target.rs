@@ -1089,6 +1089,18 @@ async fn the_outputs_are_checked_without_touching_an_earlier_run() -> Result<()>
     assert!(error.contains("same file"), "{error}");
     assert!(!fresh.exists());
     std::fs::remove_file(scratch.path("link.jsonl"))?;
+    // The partial file the document is written to before its rename.
+    let partial = scratch.path(".fresh.json.partial").display().to_string();
+    let partial_log = args(
+        &target.address,
+        &fresh,
+        &[external::GUARD_FLAG, "--share-log", &partial],
+    );
+    let error = match external::run(&partial_log, &Shutdown::never()).await {
+        Ok(_) => panic!("a share log at the document's partial file ran"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("same file"), "{error}");
     assert_eq!(target.seen.connections.load(Ordering::SeqCst), 0);
     // Nothing is left behind by the check either.
     let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)?
