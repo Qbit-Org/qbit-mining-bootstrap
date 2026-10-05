@@ -716,7 +716,8 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         "accepted",
         "offers_minted",
         "offers_dispatched",
-        "connections_opened",
+        "initial_connections",
+        "reconnects_completed",
     ] {
         assert_eq!(
             total(&merged, key),

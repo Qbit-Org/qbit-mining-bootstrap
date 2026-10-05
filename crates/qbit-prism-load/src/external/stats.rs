@@ -483,8 +483,8 @@ pub struct Totals {
     pub ack_latency: LogHistogram,
     /// Rejected submits, the same way.
     pub rejection_latency: LogHistogram,
-    /// Connections that reached work, the first and every reconnect.
-    pub connections_opened: u64,
+    /// Sessions' first connections that reached work. With
+    /// `reconnects_completed`, every connection that did.
     pub initial_connections: u64,
     /// A session's first connection: from the start of the attempt that
     /// succeeded to its first job. Failed attempts before it are
@@ -533,7 +533,6 @@ impl Totals {
             rejected,
             no_response_run_ended,
             no_response_mid_run,
-            connections_opened,
             initial_connections,
             initial_connect_failures,
             disconnects,
@@ -598,6 +597,44 @@ impl Totals {
                 "client failures of kind {kind}: {} recorded of {}",
                 stat.recorded,
                 stat.count
+            );
+        }
+        // Counts that are a subset of another, and extremes present exactly
+        // when what they are extremes of is.
+        let offer_failures = self.client_failures.get("offer").map_or(0, |s| s.count);
+        ensure!(
+            self.offers_above_difficulty_ceiling <= offer_failures,
+            "{} offers above the ceiling, but {offer_failures} offer failures, which include them",
+            self.offers_above_difficulty_ceiling
+        );
+        ensure!(
+            self.clean_jobs <= self.notifies,
+            "{} clean jobs of {} notifies",
+            self.clean_jobs,
+            self.notifies
+        );
+        match (
+            self.difficulty_advertisements,
+            self.advertised_difficulty_min,
+            self.advertised_difficulty_max,
+        ) {
+            (0, None, None) => {}
+            (advertised, Some(min), Some(max)) if advertised > 0 => ensure!(
+                min.is_finite() && min > 0.0 && min <= max && max.is_finite(),
+                "advertised difficulties from {min} to {max}"
+            ),
+            (advertised, min, max) => anyhow::bail!(
+                "{advertised} difficulty advertisements with a minimum of {min:?} and a maximum \
+                 of {max:?}"
+            ),
+        }
+        for second in self.timeline.seconds() {
+            ensure!(
+                (second.sampled_by == 0) == second.sessions_holding_work.is_none(),
+                "second {}: sessions holding work sampled by {} processes, but {:?}",
+                second.unix_second,
+                second.sampled_by,
+                second.sessions_holding_work
             );
         }
         for (tip, stat) in &self.tips.tips {
@@ -969,7 +1006,6 @@ impl Collector {
                 }
             }
             Event::Opened(opened) => {
-                self.totals.connections_opened += 1;
                 self.opened_at.insert(opened.session, opened.ready);
                 if opened.cause == "initial" {
                     self.totals.initial_connections += 1;
@@ -1517,7 +1553,12 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
         },
         "connections": {
             "initial": totals.initial_connections,
-            "opened": totals.connections_opened,
+            // Every connection that reached work: each session's first, and
+            // every reconnect. Derived rather than stored, so it cannot
+            // disagree with the two it is made of.
+            "opened": totals
+                .initial_connections
+                .saturating_add(totals.reconnects_completed),
             "time_to_first_job": totals.time_to_first_job.summary(LATENCY_CLOCK),
             "initial_connect_failures": totals.initial_connect_failures,
             "initial_connect_errors": totals.initial_connect_errors,
