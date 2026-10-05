@@ -585,26 +585,6 @@ impl Totals {
     /// refused with the reason rather than added into figures it would
     /// corrupt, or into arithmetic it would overflow.
     pub fn check(&self) -> Result<()> {
-        // The sums the summary takes must fit as well as each counter.
-        let sent = [
-            self.rejected,
-            self.no_response_run_ended,
-            self.no_response_mid_run,
-        ]
-        .into_iter()
-        .try_fold(self.accepted, u64::checked_add);
-        let failed = self
-            .client_failures
-            .values()
-            .try_fold(0u64, |total, stat| total.checked_add(stat.count));
-        ensure!(
-            sent.zip(failed)
-                .and_then(|(sent, failed)| sent.checked_add(failed))
-                .and_then(|total| total.checked_add(self.offers_discarded))
-                .and_then(|total| total.checked_add(self.offers_unknown_at_abort))
-                .is_some(),
-            "the submits and offers it accounts for add up past u64::MAX"
-        );
         ensure!(
             self.offers_dispatched.checked_add(self.offers_shortfall) == Some(self.offers_minted),
             "offers dispatched ({}) and shortfall ({}) do not add up to the offers minted ({})",
@@ -728,6 +708,33 @@ impl Totals {
                 counted.map_or_else(|| "more than u64::MAX".to_owned(), |c| c.to_string())
             );
         }
+        // Last, so a count that disagrees with the events that make it is
+        // reported as that first: the offer accounting the summary reports,
+        // summed with checks. Every submit sent, every offer that failed
+        // before a submit (a failed write is a submit already) and every
+        // discard is the end of one dispatched offer, so they never
+        // outnumber the offers dispatched.
+        let sent = [
+            self.rejected,
+            self.no_response_run_ended,
+            self.no_response_mid_run,
+        ]
+        .into_iter()
+        .try_fold(self.accepted, u64::checked_add);
+        let failed_before_sending = self
+            .client_failures
+            .get("offer")
+            .map_or(0, |stat| stat.count - stat.recorded);
+        let accounted = sent
+            .and_then(|sent| sent.checked_add(failed_before_sending))
+            .and_then(|total| total.checked_add(self.offers_discarded))
+            .and_then(|total| total.checked_add(self.offers_unknown_at_abort))
+            .context("the submits and offers it accounts for add up past u64::MAX")?;
+        ensure!(
+            accounted <= self.offers_dispatched,
+            "it accounts for {accounted} offers' ends, but only {} offers were dispatched",
+            self.offers_dispatched
+        );
         Ok(())
     }
 
@@ -1244,6 +1251,24 @@ pub fn merge(inputs: &[(PathBuf, Value)]) -> Result<Value> {
         )
         .with_context(|| format!("reading the processes of {}", path.display()))?;
         for process in &these {
+            if let Some(window) = &process.window {
+                // A window runs its length, or past it by a late last tick;
+                // its seconds are its ends' difference.
+                let span = (window.ended_unix_ms - window.started_unix_ms) as f64 / 1000.0;
+                ensure!(
+                    window.ended_unix_ms >= window.started_unix_ms
+                        && window.seconds.is_finite()
+                        && (window.seconds - span).abs() < 1.0
+                        && window.seconds <= process.duration_seconds as f64 + 3600.0,
+                    "{}: process {} has a window of {} s from {} to {}, which no run of {} s makes",
+                    path.display(),
+                    process.label,
+                    window.seconds,
+                    window.started_unix_ms,
+                    window.ended_unix_ms,
+                    process.duration_seconds
+                );
+            }
             if let Some(first) = seen.insert(process.run_id.clone(), path.clone()) {
                 anyhow::bail!(
                     "run {} ({}) is in both {} and {}; merging it twice would count it twice",
@@ -1346,15 +1371,18 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
     };
     let steady_rate = if steady_seconds > 0 {
         // A covered second with nothing accepted has no timeline entry of its
-        // own when nothing else happened in it; it still counts as 0.
-        let mut accepted: Vec<u64> = steady.iter().map(|s| s.accepted).collect();
-        accepted.resize(steady_seconds as usize, 0);
-        let sum: u64 = accepted.iter().sum();
+        // own when nothing else happened in it; it still counts as 0. Taken
+        // from the entries that exist, so nothing is held per second.
+        let held = steady.len() as i64;
+        let sum = steady
+            .iter()
+            .fold(0u64, |total, second| total.saturating_add(second.accepted));
+        let empty = steady_seconds > held;
         json!({
             "seconds": steady_seconds,
-            "min": accepted.iter().min(),
+            "min": if empty { Some(0) } else { steady.iter().map(|s| s.accepted).min() },
             "mean": sum as f64 / steady_seconds as f64,
-            "max": accepted.iter().max(),
+            "max": steady.iter().map(|s| s.accepted).max().unwrap_or(0),
             "unavailable_reason": null,
         })
     } else {
@@ -1409,7 +1437,7 @@ pub fn summary(processes: &[Process], totals: &Totals) -> Value {
             "unknown_at_abort": totals.offers_unknown_at_abort,
             "above_difficulty_ceiling": totals.offers_above_difficulty_ceiling,
             "failed_before_sending": failures_unrecorded,
-            "unaccounted": totals.offers_dispatched as i64 - accounted as i64,
+            "unaccounted": i128::from(totals.offers_dispatched) - i128::from(accounted),
         },
         "shares": {
             "sent": totals.sent(),

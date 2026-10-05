@@ -662,6 +662,9 @@ async fn a_job_above_the_ceiling_is_counted_and_not_mined() -> Result<()> {
         sample.starts_with(client::DIFFICULTY_ABOVE_CEILING),
         "{sample}"
     );
+    // A document full of offer failures is whole, and merges.
+    let merged = external::merge_files(&[out])?;
+    assert_eq!(merged["summary"]["offers"]["unaccounted"], json!(0));
     Ok(())
 }
 
@@ -838,6 +841,29 @@ async fn documents_from_two_processes_merge_into_their_sum() -> Result<()> {
         external::merge_files(&[full_path, newer_path]).unwrap_err()
     );
     assert!(error.contains("overflows"), "{error}");
+    // More offers' ends than offers dispatched.
+    let mut ends = read(&a);
+    ends["totals"]["offers_discarded"] =
+        json!(ends["totals"]["offers_dispatched"].as_u64().unwrap() + 1);
+    let path = scratch.path("ends.json");
+    external::write_document(&path, &ends)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("offers were dispatched"), "{error}");
+    // A window no run makes, which the summary would otherwise walk second
+    // by second.
+    let mut window = read(&a);
+    window["processes"][0]["window"]["started_unix_ms"] = json!(0);
+    window["processes"][0]["window"]["ended_unix_ms"] = json!(i64::MAX);
+    let path = scratch.path("window.json");
+    external::write_document(&path, &window)?;
+    let error = format!(
+        "{:#}",
+        external::merge_files(&[path, b.clone()]).unwrap_err()
+    );
+    assert!(error.contains("no run of"), "{error}");
     let mut damaged = read(&a);
     damaged["processes"][0]["accepted"] = json!(123_456_789u64);
     let path = scratch.path("damaged-process.json");
