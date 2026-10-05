@@ -592,11 +592,12 @@ candidates under a hold, so 023 is applied offline as 021 is, in the
 cutover's stopped window, and the capability refuses older binaries at later
 connects. See
 [holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664).
-While migration 2's share-hash backfill is pending on a populated `2.x.x`
-source, the database declares `share_hash_backfill_pending = 1` (#669). It is
-declared with the backfill's cursor and removed with it when 2 is recorded.
-So every earlier build that checks capabilities is refused for as long as
-legacy headers are unmapped (see
+While a share-hash backfill that this release started is pending on a
+populated `2.x.x` source, the database declares
+`share_hash_backfill_pending = 1` (#669). It is declared with the backfill's
+cursor and removed with it when 2 is recorded, so every earlier build that
+checks capabilities is refused until then. A backfill that a #582 build
+started carries no declaration (see
 [the backfill](#migration-002s-share-hash-backfill-applied-online)).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
