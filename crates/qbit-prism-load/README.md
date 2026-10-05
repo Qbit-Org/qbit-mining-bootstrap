@@ -1142,9 +1142,13 @@ The `--address` has to be a payout address the target's node validates
    search runs off the async runtime, so a slow search cannot delay another
    session's reads, and it stops as soon as its own connection has something
    waiting (a new job, a new difficulty, the socket ending). The session
-   reads that at once and mines the same offer again on the newest job, so
-   it never sends a share on work it has been told is retired, and a job's
-   arrival or an outage is timed when it happened. A share that also meets
+   reads that at once and mines the same offer again on the newest job, so a
+   share is not sent on work a job already waiting has retired, and a job's
+   arrival or an outage is timed when it happened. A job that arrives in the
+   moment between the search's last look and the submit's write still finds
+   a share sent on the old one: the race every miner's share in flight runs
+   with the server's next job, which the network widens to a round trip
+   anyway. A share that also meets
    the network target is stepped over and counted
    (`jobs.discarded_block_solutions`): the mode lands no blocks.
 5. Reconnects a session whose connection goes, at once and then every

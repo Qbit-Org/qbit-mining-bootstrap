@@ -1780,8 +1780,10 @@ async fn offer(
         // A share search off the runtime also stops as soon as the
         // connection has something waiting -- a new job, a new difficulty,
         // the socket ending -- so the session reads it at once instead of
-        // after the search: a share on retired work is not sent, and a job's
-        // arrival or an outage is timed when it happened.
+        // after the search: a share is not sent on work a job already waiting
+        // has retired, and a job's arrival or an outage is timed when it
+        // happened. One arriving after the last look below and before the
+        // write is the race any share in flight runs with the next job.
         let job = job.clone();
         let extranonce2 = extranonce2.clone();
         let discards = (!scheduled_block).then_some((session, events));
