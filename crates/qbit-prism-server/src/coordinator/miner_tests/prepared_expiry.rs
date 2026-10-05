@@ -239,6 +239,22 @@ fn spawn_save(
     })
 }
 
+/// #655: only a persistence's ledger steps are the database's. A session
+/// deadline that passes while its compact repair is encoding, CPU work with
+/// no statement pending, keeps the node's label (Codex on #667), as a stall
+/// in its batch write is the database's (`stratum::session_timer_tests`).
+#[tokio::test]
+async fn a_persistence_encoding_its_repair_at_a_session_deadline_is_not_the_databases() {
+    let (f, probe) = probe_fixture().await;
+    let job = job(&f).await;
+    let (timed, ()) = tokio::join!(
+        crate::waiting::timeout(Duration::from_secs(2), persist(&f, &job)),
+        probe.0.entered.notified(),
+    );
+    assert_eq!(timed.err(), Some(crate::waiting::Dependency::Unattributed));
+    assert_eq!(probe.0.calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn concurrent_missing_dependency_serializes_once_for_shared_prepared_work() {
     let (f, probe) = probe_fixture().await;

@@ -3507,12 +3507,11 @@ impl MiningBackend for Coordinator {
         version_mask: u32,
         ttl: Duration,
     ) -> Result<(), StratumError> {
-        // #655: persistence waits on the ledger alone (its clock and revision
-        // reads, the batch transaction and its row locks, the compact repair
-        // it writes), so a session timeout that passes meanwhile is the
-        // database's, exactly as `IssuedPersistenceExpired` is: the label
-        // never depends on which of the two deadlines passes first.
-        let save = on_database(self.save_issued_record(worker, job, version_mask, ttl));
+        // #655: its ledger steps (the clock and revision reads, the batch
+        // and repair writes) are marked where they run, so a session timeout
+        // that passes during one is the database's, and one that passes while
+        // a compact repair waits for its lock or admission, or encodes, is not.
+        let save = self.save_issued_record(worker, job, version_mask, ttl);
         save.await.map_err(|error| {
             tracing::warn!(error = format!("{error:#}"), "job persistence deferred");
             // #581: an expiry is the database's, whichever of the deadline
