@@ -55,6 +55,10 @@
 //! that a backfill a #582 build started, before #669, stays unfenced to its
 //! end. A declaration whose cursor is gone, which only a hand-dropped
 //! cursor leaves, is refused by every start and migrate of this release.
+//! Before it records 2, the runner reads the declaration again under the
+//! migration lock and stops at any value but 1: a newer release declared
+//! it meanwhile, and the cursor, the declaration and the record are that
+//! release's to finish.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
 use sqlx::{Connection, PgConnection};
@@ -331,6 +335,20 @@ pub(super) async fn apply(
         .execute(&mut *tx)
         .await?;
         lock(&mut tx, MIGRATION_LOCK, metrics).await?;
+        // The fence is this release's at 1, or absent on a cursor an
+        // earlier build created. Any other value was declared by a newer
+        // release while this runner mapped without the migration lock. That
+        // declaration is the newer release's to remove, with the cursor and
+        // the record, so this runner leaves all three to it (#669).
+        let fence: Option<i32> = sqlx::query_scalar(
+            "SELECT capability_value FROM qbit_prism_schema_capabilities WHERE capability=$1",
+        )
+        .bind(PENDING_CAPABILITY)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(value) = fence.filter(|value| *value != 1) {
+            bail!("refusing to record migration 2: while its share-hash backfill ran, a newer PRISM release declared {PENDING_CAPABILITY} = {value}, but this server understands {PENDING_CAPABILITY} 1 to 1 only. That release finishes the backfill; upgrade the server before starting or migrating here");
+        }
         let (next_seq, end_seq): (i64, i64) = sqlx::query_as("SELECT next_seq,(SELECT COALESCE(max(share_seq),-1)+1 FROM qbit_share_ledger) FROM qbit_prism_share_hash_backfill WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await?;

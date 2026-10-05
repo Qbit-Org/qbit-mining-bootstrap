@@ -588,6 +588,79 @@ async fn a_crashed_resume_leaves_no_fence_for_an_earlier_runner_to_strand() -> R
     db.close(vec![migrated, started]).await
 }
 
+/// A newer release may declare the fence at its own value while this
+/// release's runner maps between holds of the migration lock (#669). That
+/// declaration is the newer release's to remove, with the cursor and the
+/// record: the runner reads the fence again under the migration lock
+/// before it records 2, and leaves all three. This release's next migrate
+/// refuses the newer value, and every start still refuses the pending
+/// backfill.
+#[tokio::test]
+async fn a_runner_leaves_a_newer_releases_fence_with_its_cursor_and_record() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let mut runners = pending_backfill(&db, &pool).await?;
+    let blocker = block_late_header(&pool).await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "this-build".into(), 8, true));
+    tokio::select! {
+        result = &mut resume => bail!("the resume ended before its batch reached the late header: {:?}", result.err()),
+        result = batch_waiting(&pool) => { result?; }
+    }
+    // A newer release declares the fence at its own value meanwhile.
+    set_fence(&pool, 2).await?;
+    blocker.rollback().await?;
+    let error = timeout(Duration::from_secs(120), resume)
+        .await?
+        .err()
+        .context("the runner recorded 2 over a newer release's fence")?;
+    let text = format!("{error:#}");
+    ensure!(
+        text.contains("refusing to record migration 2")
+            && text.contains("share_hash_backfill_pending = 2")
+            && text.contains("upgrade the server"),
+        "{text}"
+    );
+    let fence: Option<i32> = sqlx::query_scalar("SELECT capability_value FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'")
+        .fetch_optional(&pool)
+        .await?;
+    assert_eq!(fence, Some(2), "the runner removed a newer release's fence");
+    assert!(
+        cursor(&pool).await?.is_some(),
+        "the runner dropped the cursor"
+    );
+    assert!(!schema_versions(&pool).await?.contains(&2));
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a start accepted a pending backfill")?
+        .to_string();
+    ensure!(
+        error.contains("share-hash backfill has not finished"),
+        "{error}"
+    );
+    let error = db
+        .ledger("migrate")
+        .await
+        .err()
+        .context("migrate accepted share_hash_backfill_pending = 2")?
+        .to_string();
+    ensure!(
+        error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+            && error.contains("upgrade the server"),
+        "{error}"
+    );
+    runners.close().await?;
+    db.close(Vec::new()).await
+}
+
 /// A runner of an earlier build that is still mapping when this release
 /// resumes the backfill holds the runners' lock, finishes, drops the cursor
 /// and records 2 without knowing the fence. This release must not have
