@@ -190,7 +190,8 @@ lead with a warning. See
 [the rehearsal procedure](prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals)
 for checking it on running frontends and for what to do with held blocks
 afterwards. Never leave it at `0` on a production frontend: a block that
-frontend finds is never offered.
+frontend finds is never offered, and `PrismBlockSubmissionHeld` pages a minute
+after the frontend starts.
 
 ## Preventing stale guidance
 

@@ -97,7 +97,7 @@ def main():
         assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
-            assert len(before) == 78 and len(after) == 78
+            assert len(before) == 78 and len(after) == 79
             assert len(deletions) == 26
             assert after["qbit-prism-candidate-oldest-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
@@ -112,7 +112,8 @@ def main():
                     "qbit-prism-revision-work-pending-critical",
                     "qbit-prism-candidate-landing-failed-critical",
                     "qbit-prism-work-refresh-stalled-critical",
-                    "qbit-prism-database-unavailable"} <= set(paging), sorted(paging)
+                    "qbit-prism-database-unavailable",
+                    "qbit-prism-block-submission-held"} <= set(paging), sorted(paging)
             for uid, rule in paging.items():
                 assert rule["for"] != "0s", uid
                 assert rule["noDataState"] == "OK", uid
@@ -131,6 +132,15 @@ def main():
             assert paging["qbit-prism-database-unavailable"]["for"] == "2m"
             assert "collector=\\\"database\\\"" in database
             assert "qbit_prism_metrics_snapshot" not in database
+            # #666: a frontend held by PRISM_BLOCK_SUBMIT_ENABLED pages a minute
+            # after it starts, on a successful scrape within two minutes: the
+            # gauge is fixed at start, so neither a stale snapshot nor one
+            # failed scrape may hide it or restart its dwell.
+            held = json.dumps(paging["qbit-prism-block-submission-held"])
+            assert paging["qbit-prism-block-submission-held"]["for"] == "1m"
+            assert "last_over_time(qbit_prism_block_submission_enabled{" in held and "!= bool 1" in held
+            assert "max_over_time(up{" in held
+            assert "qbit_prism_metrics_snapshot" not in held
             # #493: the tracking-unknown and unlanded warnings dwell and never page.
             for uid, dwell in [("qbit-prism-revision-work-unknown", "2m"),
                                ("qbit-prism-accepted-block-unlanded", "3m"),
@@ -177,7 +187,7 @@ def main():
     assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 78 proposed rules; 34 external definitions preserved; "
+          "78 original / 79 proposed rules; 34 external definitions preserved; "
           "26 baseline deletions plus every native UID disabled by its gate")
 
 
