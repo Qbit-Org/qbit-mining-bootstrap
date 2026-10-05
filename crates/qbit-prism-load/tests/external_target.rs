@@ -458,6 +458,17 @@ fn histograms_merge_exactly_and_bound_their_percentiles() {
     broken["buckets"] = json!([[100, u64::MAX], [100, 1]]);
     broken["count"] = json!(0);
     assert!(serde_json::from_value::<LogHistogram>(broken).is_err());
+    // A sum that leaves no room for both extremes, and an empty histogram
+    // with a sum.
+    let both = json!({"unit": "microseconds", "significant_bits": 10, "count": 2,
+                      "sum": 200, "min": 100, "max": 101, "buckets": [[100, 1], [101, 1]]});
+    assert!(serde_json::from_value::<LogHistogram>(both).is_err());
+    let fits = json!({"unit": "microseconds", "significant_bits": 10, "count": 2,
+                      "sum": 201, "min": 100, "max": 101, "buckets": [[100, 1], [101, 1]]});
+    assert!(serde_json::from_value::<LogHistogram>(fits).is_ok());
+    let none = json!({"unit": "microseconds", "significant_bits": 10, "count": 0,
+                      "sum": 5, "min": null, "max": null, "buckets": []});
+    assert!(serde_json::from_value::<LogHistogram>(none).is_err());
     // And an empty bucket, which would let an extreme no sample has pass.
     let empty = json!({"unit": "microseconds", "significant_bits": 10, "count": 1,
                        "sum": 100, "min": 0, "max": 100, "buckets": [[0, 0], [100, 1]]});
@@ -1276,6 +1287,77 @@ async fn the_document_is_written_whatever_lies_beside_it() -> Result<()> {
     assert_eq!(outcome.exit_code, run::EXIT_OK);
     assert_eq!(read(&out), outcome.document);
     Ok(())
+}
+
+/// A session waiting for a worker to run its search does not time what
+/// happens on its connection late: here the only blocking worker is busy for
+/// 3 s, the session's search waits behind it, and its connection closes
+/// meanwhile. The close is timed when the reader saw it, not when the
+/// session got round to it.
+#[test]
+fn a_close_is_timed_when_it_happened_even_while_the_search_waits_for_a_worker() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let target = fake_target(EASY).await;
+        let (events, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(client::SessionShared {
+            phase: std::sync::RwLock::new(external::PHASE.to_owned()),
+            events,
+            record_notifies: std::sync::atomic::AtomicBool::new(false),
+            kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let config = client::SessionConfig {
+            index: 0,
+            username: "pload1external.t-s00000".into(),
+            password: "x".into(),
+            difficulty: client::DifficultySource::Advertised {
+                ceiling: external::DEFAULT_MAX_DIFFICULTY,
+            },
+            version_rolling_mask: codec::VERSION_ROLLING_MASK,
+            connect_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_secs(5),
+            quiesce_limit: Duration::from_secs(5),
+            drop_offers_held_while_disconnected: true,
+        };
+        let handle = client::spawn_session(config, 0, target.address.clone(), shared, 1);
+        next_event(&mut inbox, "the first connection", |event| {
+            matches!(event, client::Event::Connected { .. })
+        })
+        .await;
+        // The only blocking worker, busy.
+        let busy = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(3)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let phase: Arc<str> = Arc::from(external::PHASE);
+        assert!(handle.try_offer(1, &phase));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        target.seen.refusing.store(true, Ordering::SeqCst);
+        let closed_at = std::time::Instant::now();
+        target.drops.send_modify(|generation| *generation += 1);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let closed = loop {
+            let event = tokio::time::timeout_at(deadline, inbox.recv())
+                .await
+                .expect("the close is reported")
+                .expect("the session is still running");
+            if let client::Event::Closed(closed) = event {
+                break closed;
+            }
+        };
+        busy.await?;
+        let late = closed.at.saturating_duration_since(closed_at);
+        assert!(
+            late < Duration::from_secs(1),
+            "the close was timed {late:?} late"
+        );
+        let _ = handle.control.send(client::Control::Stop);
+        tokio::time::timeout(Duration::from_secs(10), handle.task).await??;
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 /// A session that comes back to a tip, as one can while the frontends

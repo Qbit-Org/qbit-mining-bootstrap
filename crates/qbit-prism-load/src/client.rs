@@ -632,7 +632,8 @@ struct Pending {
 }
 
 enum Incoming {
-    Line(String),
+    /// A line, with the instant the reader took it off the socket.
+    Line(String, Instant),
     /// The socket ended. `fence` is [`SessionShared::kill_fence`] as the
     /// reader read it at the instant the end was observed, and it travels
     /// with the reason all the way to the records the closure fails.
@@ -655,7 +656,23 @@ enum Incoming {
     Closed {
         reason: String,
         fence: u64,
+        /// When the reader saw the socket end.
+        at: Instant,
     },
+}
+
+/// The instant an inbound line or closure is taken to have happened at. An
+/// external-target session uses the instant its reader took it off the
+/// socket: the session may be waiting on a search off the runtime, or for a
+/// worker to run one, while the line waits, and that wait is the client's,
+/// not the target's. The harness's sessions stamp a line as they process it,
+/// as their evidence has always been taken (README, "Which rejections a
+/// landing owns": stamped when the client read the response line).
+fn observed(config: &SessionConfig, received: Instant) -> Instant {
+    match config.difficulty {
+        DifficultySource::Advertised { .. } => received,
+        DifficultySource::Configured(_) => Instant::now(),
+    }
 }
 
 /// A connection's inbound queue, with a count of what its reader has queued
@@ -1040,8 +1057,8 @@ async fn run_session(
             }
             incoming = active.lines.recv() => {
                 match incoming {
-                    Some(Incoming::Line(line)) => {
-                        if let Err(error) = handle_line(active, &line, &config, &shared, &frontend, &outstanding) {
+                    Some(Incoming::Line(line, received)) => {
+                        if let Err(error) = handle_line(active, &line, received, &config, &shared, &frontend, &outstanding) {
                             let _ = shared.events.send(Event::Failure(ClientFailure {
                                 session: config.index,
                                 phase: shared.phase(),
@@ -1056,11 +1073,11 @@ async fn run_session(
                         // The closure carries the fence it was observed
                         // under; a reader that simply stopped has no earlier
                         // observation to carry, so this is its moment.
-                        let (reason, fence) = match other {
-                            Some(Incoming::Closed { reason, fence }) => {
-                                (reason_or_default(reason), fence)
+                        let (reason, fence, ended) = match other {
+                            Some(Incoming::Closed { reason, fence, at }) => {
+                                (reason_or_default(reason), fence, observed(&config, at))
                             }
-                            _ => ("reader stopped".to_owned(), shared.fence()),
+                            _ => ("reader stopped".to_owned(), shared.fence(), Instant::now()),
                         };
                         reconnect_phase = shared.phase();
                         fail_pending(active, &reason, fence, &shared, &config, &outstanding);
@@ -1071,12 +1088,12 @@ async fn run_session(
                         });
                         let _ = shared.events.send(Event::Closed(ConnectionClosed {
                             session: config.index,
-                            at: Instant::now(),
+                            at: ended,
                             cause: format!("socket closed: {reason}"),
                         }));
                         active.drop_reader();
                         connection = None;
-                        reconnect_started = Instant::now();
+                        reconnect_started = ended;
                         reconnect_reason = format!("socket closed: {reason}");
                     }
                 }
@@ -1184,12 +1201,22 @@ async fn quiesce(
     let deadline = Instant::now() + config.quiesce_limit;
     while !connection.pending.is_empty() && Instant::now() < deadline {
         match tokio::time::timeout(QUIESCE_POLL, connection.lines.recv()).await {
-            Ok(Some(Incoming::Line(line))) => {
-                let _ = handle_line(connection, &line, config, shared, frontend, outstanding);
+            Ok(Some(Incoming::Line(line, received))) => {
+                let _ = handle_line(
+                    connection,
+                    &line,
+                    received,
+                    config,
+                    shared,
+                    frontend,
+                    outstanding,
+                );
             }
             Ok(other) => {
                 let (reason, fence) = match other {
-                    Some(Incoming::Closed { reason, fence }) => (reason_or_default(reason), fence),
+                    Some(Incoming::Closed { reason, fence, .. }) => {
+                        (reason_or_default(reason), fence)
+                    }
                     _ => ("reader stopped".to_owned(), shared.fence()),
                 };
                 fail_pending(connection, &reason, fence, shared, config, outstanding);
@@ -1299,6 +1326,7 @@ async fn connect(
                         .send(Incoming::Closed {
                             reason: "end of stream".into(),
                             fence,
+                            at: Instant::now(),
                         })
                         .await;
                     break;
@@ -1306,7 +1334,7 @@ async fn connect(
                 Ok(_) => {
                     queued.fetch_add(1, Ordering::SeqCst);
                     if tx
-                        .send(Incoming::Line(line.trim().to_owned()))
+                        .send(Incoming::Line(line.trim().to_owned(), Instant::now()))
                         .await
                         .is_err()
                     {
@@ -1320,6 +1348,7 @@ async fn connect(
                         .send(Incoming::Closed {
                             reason: error.to_string(),
                             fence,
+                            at: Instant::now(),
                         })
                         .await;
                     break;
@@ -1400,10 +1429,11 @@ async fn connect(
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "no job arrived after authorize");
         match tokio::time::timeout(remaining, connection.lines.recv()).await {
-            Ok(Some(Incoming::Line(line))) => {
+            Ok(Some(Incoming::Line(line, received))) => {
                 consume(
                     &mut connection,
                     &line,
+                    received,
                     config,
                     shared,
                     &Arc::new(AtomicUsize::new(0)),
@@ -1432,7 +1462,7 @@ async fn await_response(
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "no response to request {id}");
         match tokio::time::timeout(remaining, connection.lines.recv()).await {
-            Ok(Some(Incoming::Line(line))) => {
+            Ok(Some(Incoming::Line(line, received))) => {
                 let value: Value = serde_json::from_str(&line)
                     .with_context(|| format!("unparsable Stratum line {line:?}"))?;
                 if value.get("id").and_then(Value::as_u64) == Some(id) {
@@ -1444,6 +1474,7 @@ async fn await_response(
                 consume(
                     connection,
                     &line,
+                    received,
                     config,
                     shared,
                     &Arc::new(AtomicUsize::new(0)),
@@ -1460,18 +1491,28 @@ async fn await_response(
 fn handle_line(
     connection: &mut Connection,
     line: &str,
+    received: Instant,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     frontend: &Arc<AtomicUsize>,
     outstanding: &Arc<AtomicUsize>,
 ) -> Result<()> {
-    consume(connection, line, config, shared, outstanding, frontend)
+    consume(
+        connection,
+        line,
+        received,
+        config,
+        shared,
+        outstanding,
+        frontend,
+    )
 }
 
 /// Dispatch one inbound line: a response to a submit, or a server push.
 fn consume(
     connection: &mut Connection,
     line: &str,
+    received: Instant,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     outstanding: &Arc<AtomicUsize>,
@@ -1484,7 +1525,7 @@ fn consume(
         serde_json::from_str(line).with_context(|| format!("unparsable Stratum line {line:?}"))?;
     if let Some(id) = value.get("id").and_then(Value::as_u64) {
         if let Some(pending) = connection.pending.remove(&id) {
-            let responded = Instant::now();
+            let responded = observed(config, received);
             let outcome = if value.get("result") == Some(&Value::Bool(true)) {
                 Outcome::Accepted
             } else {
@@ -1518,7 +1559,14 @@ fn consume(
         }
     }
     match value.get("method").and_then(Value::as_str) {
-        Some("mining.notify") => note_job(connection, &value, config, shared, frontend)?,
+        Some("mining.notify") => note_job(
+            connection,
+            &value,
+            observed(config, received),
+            config,
+            shared,
+            frontend,
+        )?,
         Some("mining.set_difficulty") => match config.difficulty {
             DifficultySource::Configured(configured) => {
                 if let Some(advertised) = value["params"][0].as_f64() {
@@ -1589,6 +1637,7 @@ fn parse_rejection(value: &Value) -> Rejection {
 fn note_job(
     connection: &mut Connection,
     value: &Value,
+    received: Instant,
     config: &SessionConfig,
     shared: &Arc<SessionShared>,
     frontend: &Arc<AtomicUsize>,
@@ -1645,7 +1694,7 @@ fn note_job(
         nbits,
         ntime,
         clean_jobs,
-        received: Instant::now(),
+        received,
         share_difficulty,
         share_target: target_bytes_le(&share_target),
         network_target: target_bytes_le(&network_target),

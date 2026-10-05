@@ -235,14 +235,31 @@ impl TryFrom<Wire> for LogHistogram {
                 "a histogram's min {min} and max {max} are not its lowest and highest buckets' \
                  samples"
             );
-            // And the sum lies between count x min and count x max; both
-            // bounds saturate as the sum does.
+            // And the sum is one of samples that include both extremes: one
+            // sample is min and one is max (the same one when there is one),
+            // and the rest lie between. The bounds saturate as the sum does.
+            let (low, high) = match wire.count {
+                1 => (min, max),
+                count => {
+                    let rest = count - 2;
+                    let ends = min.saturating_add(max);
+                    (
+                        ends.saturating_add(min.saturating_mul(rest)),
+                        ends.saturating_add(max.saturating_mul(rest)),
+                    )
+                }
+            };
             ensure!(
-                wire.sum >= min.saturating_mul(wire.count)
-                    && wire.sum <= max.saturating_mul(wire.count),
-                "a histogram's sum {} is not one of {} samples between {min} and {max}",
+                (wire.count > 1 || min == max) && wire.sum >= low && wire.sum <= high,
+                "a histogram's sum {} is not one of {} samples from {min} to {max}",
                 wire.sum,
                 wire.count
+            );
+        } else {
+            ensure!(
+                wire.sum == 0,
+                "an empty histogram's sum is {}, not 0",
+                wire.sum
             );
         }
         Ok(Self {
