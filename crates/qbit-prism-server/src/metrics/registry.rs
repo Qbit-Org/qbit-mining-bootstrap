@@ -77,7 +77,7 @@ families! {
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
     CandidateUnacknowledgedAge: Gauge, "block_candidate_oldest_unacknowledged_seconds", "Oldest cluster-wide candidate age the node has not accepted: pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (not a row adopted on the node's active-chain evidence), and rows the node rejected unless the reply names a side-chain block; zero when every unfinished row was accepted, or -1 when unknown.";
     CandidateLandingFailedAge: Gauge, "block_candidate_oldest_landing_failed_seconds", "Oldest cluster-wide time since the offer reservation of an offered or reconciliation row whose audit landing has not committed (no pool-block row) or whose last error names a landing refusal; zero when none, or -1 when unknown.";
-    BlockSubmission: Gauge, "block_submission_enabled", "Whether this frontend offers found blocks to its node and may run the CTV fanout broadcaster: 1 normally, 0 while PRISM_BLOCK_SUBMIT_ENABLED is off and holds every block candidate pending with the broadcaster stopped (#291), -1 before the frontend publishes its setting.";
+    BlockSubmission: Gauge, "block_submission_enabled", "Whether this frontend offers found blocks to its node and lets its CTV fanout broadcaster send: 1 normally, 0 while PRISM_BLOCK_SUBMIT_ENABLED is off (#291) or the cluster holds block submission (#664), so block candidates stay pending and no fanout is sent, -1 while the switch is on but the frontend has not yet read the cluster's hold; a later failed read keeps the last one.";
     PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";
     PoolAcquire: Histogram, "database_pool_acquire_seconds", "Actual database pool acquisition wait by outcome.";
     LockWait: Histogram, "database_advisory_lock_wait_seconds", "Database advisory transaction lock wait by lock and outcome.";
@@ -180,6 +180,10 @@ impl Family {
                     | Self::NodeIbd
                     | Self::NodeObservationAge
                     | Self::RollupLag
+                    // #664: a cluster hold set or cleared while the frontend
+                    // runs moves it, and PrismBlockSubmissionHeld reads it on
+                    // a successful scrape rather than a fresh snapshot.
+                    | Self::BlockSubmission
             )
     }
 
