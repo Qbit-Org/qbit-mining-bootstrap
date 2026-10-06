@@ -269,6 +269,10 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             recovery::evidence_with_bytea(&source, pg_bin, "escape").await? == source_evidence,
             "connection bytea defaults changed the recovery fingerprints"
         );
+        ensure!(
+            recovery::evidence_with_fetch_count(&source, pg_bin, 1).await? == source_evidence,
+            "fetching the export one row at a time changed the recovery evidence"
+        );
         ensure!(source_evidence["accepted_shares"] == 3);
         ensure!(source_evidence["last_share_seq"] == 8);
         ensure!(source_evidence["records"]["audits"]["count"] == 3);
