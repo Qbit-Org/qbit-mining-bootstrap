@@ -671,10 +671,16 @@ notes = "l3-full runs every #473 cell three times: the eight rate cells (load-d1
 id = "session-points"
 title = "2,000, 5,000 and 10,000 sessions at 500 shares/s, plus the 10,000-session burst"
 owner = "#555"
-lanes = ["L3"]
+lanes = ["dispatch", "L3"]
 criteria = "Per-session cost and ACK path under connection count, weekly (decision 7)."
-runs = false
-reason = "No presets yet; #555."
+runs = true
+suites = ["l3-reduced"]
+presets = [
+  "throughput-400k-window-2fe-async",
+  "session-point-5000-sessions-400k-2fe-async",
+  "session-point-10000-sessions-400k-2fe-async",
+]
+notes = "Capacity-envelope points, not D1 verdicts (decision 5): the 5,000 and 10,000 points gate reconciliation and a steady_state that places every offer, and report refused and unanswered shares. All three are the 400k window on 2 async frontends in the D1 plan; the 10,000 point's burst phase (2,000 shares/s for 60 s) is the burst variant. Admission is sessions per frontend + 16, as the 2,000-session cell ran it."
 
 [[scenario]]
 id = "recipient-point-10000"
@@ -683,16 +689,24 @@ owner = "#555"
 lanes = ["L3"]
 criteria = "Window-rebuild and payout-revision cost stays linear; seeded and submitted counts reported separately."
 runs = false
-reason = "No preset yet; needs recipient cardinality at that scale (#548)."
+reason = "No preset yet (#555): ten fanout chunks per block need CTV fanout settlement, which qbit-prism-load has had since #548 (--ctv-settlement, #644), so the preset can now be written with it on."
+notes = "The 50,000-recipient run's trigger (#555): this point costs more than 25% more per recipient than the same preset at 1,000 recipients (one fanout chunk), run on the same runner class the same week, in window rebuild (the tip-to-last-notify p99 over its tips) or in payout revision (from a landing to every session holding the new revision's work, the median over landings). A fixed cost only lowers the per-recipient figure at the larger size, so a linear cost never fires it. Evaluated once this point's preset exists and both presets run weekly (crates/qbit-prism-load/README.md, L3)."
 
 [[scenario]]
 id = "mainnet-shapes-reduced-l3"
 title = "The mainnet-shape presets (130, 650 and 2,600 addresses) and rental churn in the reduced weekly L3"
 owner = "#555"
-lanes = ["L3"]
+lanes = ["nightly", "dispatch", "L3"]
 criteria = "Each preset's gates on the L3 runner class (decision 11)."
-runs = false
-reason = "The presets run nightly or on dispatch; the reduced weekly L3 does not exist yet."
+runs = true
+suites = ["l3-reduced"]
+presets = [
+  "mainnet-shape-130-addresses",
+  "mainnet-shape-650-addresses",
+  "mainnet-shape-2600-addresses",
+  "rental-churn-bursts-and-storms",
+]
+notes = "l3-reduced runs each once a week on the 32 vCPU class, beside their nightly (8 vCPU) or dispatch (16 vCPU) runs; rates compare only within one class. Not D1 verdicts."
 
 # ---------------------------------------------------------------------------
 # Faults under load (#554, #487 S16). The load harness's `faults` phase

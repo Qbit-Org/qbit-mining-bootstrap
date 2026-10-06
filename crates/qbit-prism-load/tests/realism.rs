@@ -500,6 +500,8 @@ fn every_checked_in_preset_pins_every_result_flag_and_validates() -> Result<()> 
         "throughput-400k-window-2fe-async-3-blocks",
         "dense-cadence-400k-window-1fe-async",
         "dense-cadence-400k-window-2fe-async",
+        "session-point-5000-sessions-400k-2fe-async",
+        "session-point-10000-sessions-400k-2fe-async",
     ] {
         assert!(
             names.contains(&required),

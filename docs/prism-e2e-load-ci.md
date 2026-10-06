@@ -278,7 +278,7 @@ run-to-run and VM-to-VM spread, and the runner class chosen for each lane.
 | Suite | Presets | Repeats | Runner | When |
 |---|---|---|---|---|
 | `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, `throughput-400k-window-2fe-async-3-blocks`, `dense-cadence-400k-window-{1,2}fe-async`, 500k fe1/2/4 | 3 (33 jobs) | 32 vCPU | the version-bump PR, `release-candidate`, a `v*` tag, dispatch |
-| `l3-reduced` | 400k at 1, 2 and 4 frontends, async | 1 | 32 vCPU | Monday 06:13 UTC on `3.x.x`, dispatch |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; `session-point-{5000,10000}-sessions-400k-2fe-async` (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521) | 1 (9 jobs) | 32 vCPU | Monday 06:13 UTC on `3.x.x`, dispatch |
 
 The runner is the 32 vCPU class until #542 picks one per lane. The triggers:
 
@@ -322,7 +322,8 @@ the suite. It is never dropped. A failed build lists every run as never run
 and writes no verdict. Concurrency is per PR and label (a new push cancels
 the older push's run), per tag, and one group for the weekly run. The
 workflow is never a required check. Cost: `l3-full` is about 660 runner-minutes
-(about $42) a release candidate, and `l3-reduced` about 60 runner-minutes a week.
+(about $42) a release candidate, and `l3-reduced` about 200 runner-minutes
+(about $13) a week.
 
 **Proves:** on one commit and one runner class, #447's production-window
 cells, including the found-block path at 400k and dense cadence, complete,
@@ -339,6 +340,24 @@ has L3 evidence for exactly its tree.
   and #551's trend do that.
 - **#473's flush and build controls** and the 20k dense attempt (exit 6):
   they are not presets.
+
+**Capacity-envelope points (#555).** `l3-reduced` also runs the 5,000 and
+10,000 session points. They are `throughput-400k-window-2fe-async` (400k
+window, 2 async frontends, the D1 plan) at 5,000 and 10,000 sessions, with
+admission sessions per frontend + 16 as the 2,000-session cell ran it. The
+10,000 point's D1 `burst` phase, 2,000 shares/s for 60 s, is the burst
+variant. #521's mainnet shapes and rental churn run beside them (decision
+11). These are capacity-envelope evidence, never D1 verdicts (decision 5):
+their rows carry no D1 verdict, and they gate reconciliation and a
+`steady_state` that places every offer. The 10,000-recipient point has no
+preset yet; the harness has had CTV fanout settlement since #548
+(`--ctv-settlement`, #644), so it can now be written. The 50,000-recipient
+follow-up runs only if the 10,000-recipient point costs more than 25% more
+per recipient than the same preset at 1,000 recipients (one fanout chunk),
+on the same runner class in the same week. The cost is measured as window
+rebuild (the tip-to-last-notify p99) or payout revision (a landing to every
+session holding the new revision's work, median over landings). The trigger
+is evaluated once that point runs.
 
 ## L4: real-node scenarios
 
