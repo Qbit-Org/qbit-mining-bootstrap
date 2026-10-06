@@ -28,12 +28,15 @@ name: PRISM load harness (nightly)
 # The bridging pair (short-plan-real-node and short-plan-fake-node, #547,
 # #552) runs the same short plan on a managed regtest qbitd and on the fake
 # node, on the same runner class, so their difference is what the real node
-# costs.
+# costs. The matrix runs each half on its own VM; the `bridging` job (#552)
+# also runs both on one VM and writes the difference as a row, so the cost is
+# not blurred by the spread between two VMs.
 #
 # Once a week the `live-weekly` job runs the longer live regtest scenarios
 # listed in test/prism-weekly-gated-tests.txt instead (#487's L4 weekly set):
-# today #545's 2.x.x migration lifecycle and #575's measured cutover of a
-# mainnet-shaped 2.x.x ledger. The weekly schedule runs only that job; the
+# today #545's 2.x.x migration lifecycle, #575's measured cutover of a
+# mainnet-shaped 2.x.x ledger and #553's long set of chain events under
+# 2,000 sessions. The weekly schedule runs only that job (and L6); the
 # nightly jobs keep their own schedule.
 #
 # #575 item 2: the long soak has a third schedule, Saturday 05:41 UTC, whose
@@ -53,6 +56,13 @@ name: PRISM load harness (nightly)
 # one 8 vCPU runner for about 5 h 40 min plus the shared release build, about
 # 350 runner-minutes a week, about $5.60 at $0.016 per 8 vCPU minute.
 # `preset: soak-weekly` (or `weekly`) dispatches it by hand.
+#
+# #554: the same Saturday selection runs faults-long-real-node on its own
+# 16 vCPU runner beside the soak: every fault under load with 2,000 sessions
+# on the real node, the primary's WAL on a fuse2fs volume the `wal-disk-full`
+# fault fills, about 60 minutes with the ramp (timeout 100). Cost: about
+# $2 a week at $0.032 per 16 vCPU minute. The run job installs fuse2fs
+# and fuse3 only for a preset whose --faults lists wal-disk-full.
 #
 # The `shipped-images` job is #487's lane L6 (#544): the images and the
 # Compose wiring operators run, under the `prism` profile with the HA overlay
@@ -76,15 +86,37 @@ name: PRISM load harness (nightly)
 #   - The guard job ends the nightly schedule early when 3.x.x's head is the
 #     commit the last scheduled nightly tested, and cancels the run so the
 #     skip shows as cancelled, never as passed. A nightly records the commit
-#     it tested in its `prism-load-tested-commit` artifact once every preset
-#     reached its gate, pass or fail. Neither weekly schedule (the Sunday
+#     it tested in its `prism-load-tested-commit` artifact once every preset,
+#     and both halves of the bridging job (#552), reached its gate, pass or
+#     fail. Neither weekly schedule (the Sunday
 #     live scenarios, the Saturday soak) nor a dispatch is ever skipped.
 #   - Each preset's artifact carries host.json (runner label, filesystem mount
 #     options, block device write cache and FUA) and is kept for 90 days
 #     (#487 decision 3).
 #   - A failed scheduled run opens, or comments on, the one open issue
-#     labelled `prism-load-nightly-failure`, until S6 (#551) has its own
-#     tracking issue. GitHub itself only emails whoever last edited the cron.
+#     labelled `prism-load-nightly-failure`. GitHub itself only emails
+#     whoever last edited the cron.
+#
+# #551 (S6 of #487, decision 3):
+#   - Every preset job builds its trend row (scripts/prism_load_trend.py
+#     row: commit, lane, preset, runner class, fsync cost and band, the
+#     headline numbers, the artifact URL) and uploads it as an artifact, on
+#     every event.
+#   - Only a scheduled run records anything: the `evidence` job, the one job
+#     here with `contents: write`, adds a row per preset, per non-preset job
+#     and per planned preset that left none to the orphan `ci-evidence`
+#     branch (trend/<lane>/YYYY-MM.jsonl, append-only; it creates the branch
+#     on its first write), applies the report-only regression rule
+#     (scripts/prism_load_regress.py, test/prism-load-regression.toml,
+#     provisional until #542), promotes the weekly soak's and every flagged
+#     L2 run's bundle to the rolling `ci-evidence/YYYY-MM` pre-release, and
+#     opens or updates the one `prism-load-regression` issue with the commit
+#     range and both runs' numbers. That issue never pages and never blocks
+#     a merge. All of it is .github/actions/prism-load-evidence, which the
+#     L3 tag job (#550) calls too.
+#   - A `run-load` pull request or a dispatch gets `evidence-preview`
+#     instead: the same rule against the recorded trend, read-only, in the
+#     job summary. PR and dispatch runs write nothing.
 
 on:
   schedule:
@@ -108,7 +140,8 @@ on:
           Preset name(s), comma separated, from crates/qbit-prism-load/presets;
           `nightly` for the nightly set, `all` for nightly plus manual
           (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async),
-          `weekly` for the 5.5 h soak (soak-weekly).
+          `weekly` for the 5.5 h soak (soak-weekly) and the long fault set
+          (faults-long-real-node).
         required: true
         default: nightly
       ref:
@@ -154,6 +187,14 @@ on:
         description: >-
           Also run L6, the shipped images under the Compose prism profile
           with the HA overlay (#544; the weekly schedule always does).
+        type: boolean
+        required: false
+        default: false
+      bridging:
+        description: >-
+          Also run the bridging lane, the short plan on the fake and the real
+          node on one runner (#552; the nightly schedule and the run-load
+          label always do).
         type: boolean
         required: false
         default: false
@@ -330,6 +371,24 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # #554: a preset whose faults fill the primary's WAL volume mounts a
+      # small ext4 image with fuse2fs, without root, as #575's disk-full
+      # scenario does.
+      - name: Check whether the preset fills a WAL volume
+        id: wal_volume
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          set -euo pipefail
+          faults="$(jq -r '.args["--faults"] // ""' "crates/qbit-prism-load/presets/${PRESET}.json")"
+          if [[ "${faults}" == *wal-disk-full* ]]; then
+            printf 'needed=true\n' >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Install the disk-full tools
+        if: ${{ steps.wal_volume.outputs.needed == 'true' }}
+        uses: ./.github/actions/apt-install
+        with:
+          packages: fuse2fs fuse3
       # A `--node qbitd` preset (#547) drives the pinned qbit release; the
       # install script exports QBITD_BIN, which the harness reads when the
       # command line gives no --qbitd-bin. A fake-node preset ignores it.
@@ -403,6 +462,7 @@ jobs:
           path: ${{ runner.temp }}/gated
           if-no-files-found: ignore
       - name: Upload the harness reports
+        id: reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
@@ -412,20 +472,204 @@ jobs:
           retention-days: 90
           path: ${{ runner.temp }}/prism-load-out
           if-no-files-found: error
+      # #551: the preset's trend row, on every event; only the scheduled
+      # `evidence` job records it. What the run did not measure is null.
+      - name: Build the trend row
+        if: ${{ !cancelled() }}
+        env:
+          PRESET: ${{ matrix.preset }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+          COMMIT: ${{ needs.plan.outputs.sha }}
+          REF: ${{ github.event_name == 'pull_request' && github.ref || inputs.ref || '3.x.x' }}
+          ARTIFACT_URL: ${{ steps.reports.outputs.artifact-url }}
+          ARTIFACT_ID: ${{ steps.reports.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/prism_load_trend.py row --dir "${RUNNER_TEMP}/prism-load-out" \
+            --preset "${PRESET}" --lane auto --runner-class "${RUNNER_LABEL}" \
+            --commit "${COMMIT}" --ref "${REF}" \
+            --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --event "${GITHUB_EVENT_NAME}" --repository "${GITHUB_REPOSITORY}" \
+            --server-url "${GITHUB_SERVER_URL}" \
+            --artifact-name "prism-load-${PRESET}" --artifact-url "${ARTIFACT_URL}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --out "${RUNNER_TEMP}/prism-load-trend/${PRESET}.json"
+      - name: Upload the trend row
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-trend-${{ matrix.preset }}
+          overwrite: true
+          retention-days: 7
+          path: ${{ runner.temp }}/prism-load-trend
+          if-no-files-found: error
+
+  # #552 (S12 of #487): the bridging lane. The same short plan on the fake
+  # node and on the real node, one after the other on one runner, so the
+  # difference is what the real node costs and not the spread between two
+  # VMs. It runs in addition to the matrix's short-plan-fake-node and
+  # short-plan-real-node jobs, which gate each half on its own runner. The
+  # order alternates with the run number, so whatever going first or second
+  # costs (a cold page cache, say) does not always land on one side; the row
+  # records it. scripts/prism_load_bridge.py writes the row and the summary
+  # table: the real node's cost on this runner, not a D1 verdict (#487
+  # decisions 1 and 5), with anything a side could not measure left unknown.
+  # Both halves always run and the row is always written; the job then fails
+  # if either half failed its gate.
+  bridging:
+    name: Bridging (short plan, fake and real node on one runner)
+    needs: [guard, plan, build]
+    if: >-
+      ${{ needs.guard.outputs.skip != 'true' && (github.event.schedule == '17 2 * * *'
+      || github.event_name == 'pull_request' || inputs.bridging) }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Each half runs under its preset's timeout_minutes (30), so this is
+    # both of them plus the setup, the row and the upload.
+    timeout-minutes: 75
+    # #551: the commit and the attempt the job's trend row names (it checks
+    # out this commit; a re-run of another job leaves these as they were).
+    outputs:
+      commit: ${{ needs.plan.outputs.sha }}
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Download the binaries built once
+        uses: actions/download-artifact@v8
+        with:
+          name: prism-load-binaries
+          path: ${{ runner.temp }}
+      - name: Unpack the binaries into target/release
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          tar -C target/release -xf "${RUNNER_TEMP}/prism-load-binaries.tar"
+          touch target/release/qbit-prism-server target/release/qbit-prism-load \
+            target/release/qbit-prism-load-gate
+      - name: Run both halves on this runner
+        id: sides
+        env:
+          PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS: ${{ inputs.tip_last_notify_p99_budget_ms }}
+          PRISM_LOAD_MAX_SHORTFALL: ${{ inputs.max_shortfall }}
+          RUNNER_LABEL: blacksmith-8vcpu-ubuntu-2404
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          declare -A preset=([fake]=short-plan-fake-node [real]=short-plan-real-node)
+          if (( RUN_NUMBER % 2 )); then order=(real fake); else order=(fake real); fi
+          printf 'order=%s,%s\n' "${order[@]}" >> "${GITHUB_OUTPUT}"
+          for side in "${order[@]}"; do
+            {
+              echo "### ${preset[${side}]} on ${RUNNER_LABEL} (bridging, ${side} side)"
+              echo
+              echo "Commit \`$(git rev-parse HEAD)\`; order ${order[*]}."
+              echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+            # Each half gets its preset's own timeout_minutes (the matrix
+            # enforces it as the job's), so a hung half cannot use up the
+            # job's and leave the other half and the row unrun. timeout
+            # signals the half's whole process group. A failing or timed-out
+            # half is its gate's verdict (or its missing gate-exit-code),
+            # read in the last step; the other half still runs.
+            minutes="$(jq -er .timeout_minutes "crates/qbit-prism-load/presets/${preset[${side}]}.json")"
+            timeout --kill-after=60 "${minutes}m" \
+              bash .github/scripts/prism-load-run.sh "${preset[${side}]}" \
+              "${RUNNER_TEMP}/prism-load-bridging/${side}" || true
+          done
+      - name: Write the comparison row
+        if: ${{ !cancelled() && steps.sides.outputs.order != '' }}
+        env:
+          ORDER: ${{ steps.sides.outputs.order }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/prism-load-bridging"
+          python3 scripts/prism_load_bridge.py --fake "${out}/fake" --real "${out}/real" \
+            --order "${ORDER}" --out "${out}/bridge-row.json" --summary "${GITHUB_STEP_SUMMARY}" \
+            --commit "${SHA}" --run-url "${RUN_URL}"
+      # As the matrix's presets do: the report job records a nightly's commit
+      # as tested only if this marker says both halves reached a verdict
+      # (gate exit 0 or 1), so a bridge that failed before that, or timed
+      # out, is retried the next night rather than skipped as unchanged.
+      - name: Mark the bridge as gated
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gated"
+          for side in fake real; do
+            code="$(cat "${RUNNER_TEMP}/prism-load-bridging/${side}/gate-exit-code" 2>/dev/null || true)"
+            [[ "${code}" == 0 || "${code}" == 1 ]] || exit 0
+          done
+          touch "${RUNNER_TEMP}/gated/bridging"
+      - name: Upload the gated marker
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-gated-bridging
+          overwrite: true
+          retention-days: 3
+          path: ${{ runner.temp }}/gated
+          if-no-files-found: ignore
+      - name: Upload both runs and the row
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-bridging
+          overwrite: true
+          # #487 decision 3: the load evidence is kept 90 days.
+          retention-days: 90
+          path: ${{ runner.temp }}/prism-load-bridging
+          if-no-files-found: error
+      - name: Fail if either half failed its gate
+        run: |
+          set -euo pipefail
+          failed=0
+          for side in fake real; do
+            code="$(cat "${RUNNER_TEMP}/prism-load-bridging/${side}/gate-exit-code" 2>/dev/null || echo missing)"
+            if [[ "${code}" != 0 ]]; then
+              echo "the ${side} half's gate exit code is ${code}; see its gate.md in the summary" >&2
+              failed=1
+            fi
+          done
+          exit "${failed}"
 
   # The opt-in #[ignore] live_regtest variants (#521): each id in
   # test/prism-nightly-gated-tests.txt, run explicitly with --ignored --exact
   # in required integration mode against a real qbitd and PostgreSQL 16, and
   # proven executed with the same gate manifest check the PR suite uses.
   # That is #523's qbitd -reindex crash variant, #524's 130-payee
-  # weighted-recipients variant, scenario 5's dense-cadence soak, and #575's
-  # PostgreSQL disk-exhaustion and wall-clock-jump variants.
+  # weighted-recipients variant, scenario 5's dense-cadence soak, #575's
+  # PostgreSQL disk-exhaustion and wall-clock-jump variants and soak smoke,
+  # and #553's short set of chain events under 2,000 sessions, #598's guard
+  # included (about 13 minutes on a 22-core host in debug).
   live-nightly:
     name: Live regtest nightly variants
     needs: guard
     if: ${{ needs.guard.outputs.skip != 'true' && (github.event.schedule == '17 2 * * *' || inputs.live) }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
+    # #551: the commit and the attempt a trend row names for this job.
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      # Job-level, so it is set even when a step before `head` failed.
+      attempt: ${{ github.run_attempt }}
     services:
       postgres:
         image: postgres:16
@@ -447,6 +691,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Record the commit under test
+        id: head
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
       - name: Name the gate manifest and the test log
         run: |
           printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-nightly-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
@@ -515,19 +762,28 @@ jobs:
   # PostgreSQL's client tools for the scenarios' pg_dump and psql. Today that
   # is #545's migration lifecycle: a scaled 2.x.x ledger through migrate,
   # import-audits, native mining on the real node, exact reconciliation and
-  # the isolated-restore rollback of docs/prism-rust-migration.md.
+  # the isolated-restore rollback of docs/prism-rust-migration.md. And #553's
+  # long set of chain events under 2,000 sessions: #521 scenario 4's other
+  # four cases, scenario 5's 20-minute soak and 45 minutes of external tips
+  # at 400 shares/s.
   live-weekly:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    # #575's scenario writes mainnet's 13,566 blocks and about 2M of its 65.5M
-    # share rows (1x at 1/32 until #582 lands, then 1/16 at 4.1M rows), keeps
-    # two copies of that ledger (about 8 GB at 1/32, 15 GB at 1/16)
-    # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
+    # #575's scenario writes mainnet's 13,566 blocks and about 4.1M of its
+    # 65.5M share rows (1x at 1/16), keeps two copies of that ledger (about
+    # 15 GB) in the service database, and cuts it over at the server's
+    # default statement timeout (#582). It takes 7.6 minutes at 1/64
     # of the rows on a 22-core host in release, and its row-proportional
     # phases put 1/16 near 20 minutes there, so the job builds in release and
-    # allows two hours.
-    timeout-minutes: 120
+    # allowed two hours; #553's long set adds about 75 minutes (45 of
+    # external tips, a 20-minute soak and four shorter cases, measured in
+    # debug), so it allows three.
+    timeout-minutes: 180
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      # Job-level, so it is set even when a step before `head` failed.
+      attempt: ${{ github.run_attempt }}
     services:
       postgres:
         image: postgres:16
@@ -549,6 +805,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Record the commit under test
+        id: head
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
       - name: Name the gate manifest and the test log
         run: |
           printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-weekly-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
@@ -607,11 +866,18 @@ jobs:
     if: ${{ needs.guard.outputs.skip != 'true' && (github.event.schedule == '17 2 * * *' || inputs.fuzz) }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      # Job-level, so it is set even when a step before `head` failed.
+      attempt: ${{ github.run_attempt }}
     steps:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || '3.x.x' }}
+      - name: Record the commit under test
+        id: head
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
       - name: Restore the kept corpus
         uses: actions/cache/restore@v6
         with:
@@ -645,7 +911,8 @@ jobs:
   # (a skipped night) does neither. The soak never records a tested commit.
   report:
     name: Record the tested commit and report a failure
-    needs: [guard, plan, build, run, live-nightly, live-weekly, stratum-fuzz, shipped-images]
+    # `evidence` (#551) is here so its failure is reported like any job's.
+    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images, evidence]
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
@@ -673,7 +940,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/gated" "${RUNNER_TEMP}/tested"
-          missing="$(jq -r '.include[].preset' <<<"${MATRIX}" | while read -r preset; do
+          # `bridging` is #552's job, which runs on every nightly.
+          missing="$( { jq -r '.include[].preset' <<<"${MATRIX}"; echo bridging; } | while read -r preset; do
             [[ -f "${RUNNER_TEMP}/gated/${preset}" ]] || echo "${preset}"
           done)"
           if [[ -n "${missing}" ]]; then
@@ -724,6 +992,116 @@ jobs:
 
           Opened by the report job of .github/workflows/prism-load-nightly.yml (#549). Later failures comment here while it is open; close it once the cause is fixed."
           fi
+
+  # #551 (S6 of #487): what a scheduled run records, and the one job in this
+  # workflow with `contents: write`. It adds this run's rows to ci-evidence:
+  # one per preset (built by the preset job), one per non-preset job that ran
+  # (the bridging pair as L2, the live scenarios as L4, the fuzzing, the
+  # shipped images as L6) and a
+  # `kind: missing` row for each planned preset whose job left none, so every
+  # scheduled run has rows. The prism-load-evidence action applies the
+  # report-only regression rule, promotes the soak's and every flagged L2
+  # run's bundle, appends the rows (retrying a rejected push from a fresh
+  # fetch, never forcing) and keeps the `prism-load-regression` issue.
+  evidence:
+    name: Record the trend rows and apply the regression rule
+    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images]
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Promotion downloads and uploads the soak's bundle; the append and the
+    # promotion each stop at their own deadline inside this.
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+    steps:
+      # The scripts, the action and the rule's config are the tested
+      # commit's; a Sunday run has no plan and reads 3.x.x's.
+      - name: Check out the tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha || '3.x.x' }}
+      - name: Download the preset rows
+        # A run with no plan (the Sunday schedule) has none; when presets
+        # were planned a failed download fails the job, to be re-run, rather
+        # than recording the night without them.
+        continue-on-error: ${{ needs.plan.outputs.matrix == '' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-load-trend-*
+          path: ${{ runner.temp }}/prism-load-trend
+          merge-multiple: true
+      - name: Add the job rows and the missing preset rows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          # Each job's latest attempt, so a re-run preset job that left no
+          # row is missing at that attempt, not stood in for by its earlier
+          # row (the matrix jobs are named after their preset).
+          jobs="${RUNNER_TEMP}/prism-load-jobs.jsonl"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | {name, run_attempt} | tojson' > "${jobs}"
+          python3 scripts/prism_load_trend.py job-rows --needs "${NEEDS}" --matrix "${MATRIX}" \
+            --rows "${RUNNER_TEMP}/prism-load-trend" --jobs "${jobs}" \
+            --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --event "${GITHUB_EVENT_NAME}" --repository "${GITHUB_REPOSITORY}" \
+            --server-url "${GITHUB_SERVER_URL}" --ref 3.x.x
+      - name: Record the evidence
+        uses: ./.github/actions/prism-load-evidence
+        with:
+          rows-dir: ${{ runner.temp }}/prism-load-trend
+          write: "true"
+          github-token: ${{ github.token }}
+
+  # #551: a `run-load` pull request or a dispatch compares its rows with the
+  # recorded trend and says so in the summary, with a read-only token.
+  evidence-preview:
+    name: Compare with the recorded trend (read-only)
+    needs: [plan, run]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.plan.result == 'success' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Download the preset rows
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-load-trend-*
+          path: ${{ runner.temp }}/prism-load-trend
+          merge-multiple: true
+      # As the scheduled job does: a planned preset that left no row (at its
+      # latest attempt) is shown as missing, not silently absent.
+      - name: Add the missing preset rows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          jobs="${RUNNER_TEMP}/prism-load-jobs.jsonl"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | {name, run_attempt} | tojson' > "${jobs}"
+          python3 scripts/prism_load_trend.py job-rows --needs '{}' --matrix "${MATRIX}" \
+            --rows "${RUNNER_TEMP}/prism-load-trend" --jobs "${jobs}" \
+            --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --event "${GITHUB_EVENT_NAME}" --repository "${GITHUB_REPOSITORY}" \
+            --server-url "${GITHUB_SERVER_URL}"
+      - name: Compare
+        uses: ./.github/actions/prism-load-evidence
+        with:
+          rows-dir: ${{ runner.temp }}/prism-load-trend
+          write: "false"
+          github-token: ${{ github.token }}
 
   # L6's path filter (see the header). A PR's other events and a 3.x.x push
   # land here; only a change to a watched path runs `shipped-images`. PRs into
@@ -797,11 +1175,18 @@ jobs:
       || github.event.schedule == '43 3 * * 0' || inputs.images) }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      # Job-level, so it is set even when a step before `head` failed.
+      attempt: ${{ github.run_attempt }}
     steps:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
           ref: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (inputs.ref || '3.x.x') || '' }}
+      - name: Record the commit under test
+        id: head
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
       # The runner context is not available to a job's env, so name the
       # directories here.
       - name: Name the work and output directories
