@@ -14,7 +14,9 @@ use super::{
 };
 use crate::{client, kill::KillDriver, restart::ReadyWait};
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
@@ -42,6 +44,13 @@ pub const SHUTDOWN_WAITS_LINE: &str = "shutdown waits for a found block's offer 
 /// The ALERT it writes when the shutdown budget ran out first.
 pub const SHUTDOWN_GAVE_UP_LINE: &str =
     "shutdown stopped waiting for a found block's offer in flight";
+/// How long, once the drained frontend serves again, its block has to land
+/// and every frontend to serve work at the payout revision the landing
+/// committed (#686). It normally takes a few seconds.
+pub const DRAIN_SETTLE_WAIT: Duration = Duration::from_secs(60);
+/// How often the drain's settle reads the row, or the revision and every
+/// `/healthz`.
+const SETTLE_READ_INTERVAL: Duration = Duration::from_millis(250);
 
 /// SIGTERM, the signal a service manager sends to stop a process.
 pub fn terminate(pid: u32) {
@@ -161,6 +170,18 @@ pub struct SigtermDrain {
     pub row_error: Option<String>,
     pub moved: Vec<usize>,
     pub ready_at: Option<Instant>,
+    /// The settle (#686), from the frontend serving again: the block's row
+    /// until it is `submitted`, then the payout revision and every
+    /// frontend's `/healthz` until each serves work at it.
+    settle_deadline: Option<Instant>,
+    landing: Option<Spawned<Result<Option<CandidateRow>>>>,
+    work: Option<Spawned<Result<WorkReading>>>,
+    next_settle_read: Instant,
+    pub landed_at: Option<Instant>,
+    pub current_at: Option<Instant>,
+    pub last_row: Option<CandidateRow>,
+    pub last_work: Option<WorkReading>,
+    pub settle_error: Option<String>,
     pub problems: Vec<String>,
     log_before: (usize, usize),
 }
@@ -188,6 +209,15 @@ impl SigtermDrain {
             row_error: None,
             moved: Vec::new(),
             ready_at: None,
+            settle_deadline: None,
+            landing: None,
+            work: None,
+            next_settle_read: Instant::now(),
+            landed_at: None,
+            current_at: None,
+            last_row: None,
+            last_work: None,
+            settle_error: None,
             problems: Vec::new(),
             log_before: (0, 0),
         }
@@ -322,6 +352,119 @@ impl SigtermDrain {
         }
     }
 
+    /// Wait, once the drained frontend serves again, for its block to land
+    /// and for every frontend to serve work at the payout revision the
+    /// landing committed (#686). The relaunched process lands the block it
+    /// offered; the confirmation bumps the revision, and until work at the
+    /// new revision is published every share on the old work is refused
+    /// `stale-job`. A fault started before then measures the drain rather
+    /// than itself: a settlement-lock holder even blocks that publication, so
+    /// all the shares in the first half of its hold were refused. `true` once
+    /// settled, or once [`DRAIN_SETTLE_WAIT`] has passed, which the verdict
+    /// fails.
+    pub fn poll_settle(&mut self, env: &FaultEnv<'_>, tools: &FaultTools) -> bool {
+        let Some(seen) = &self.seen else {
+            // Nothing was offered, so nothing lands; the verdict fails that.
+            return true;
+        };
+        if self.current_at.is_some() {
+            return true;
+        }
+        let deadline = *self
+            .settle_deadline
+            .get_or_insert_with(|| Instant::now() + DRAIN_SETTLE_WAIT);
+        // A read still in flight at the bound is abandoned with the wait.
+        if let Some(read) = self.landing.as_mut() {
+            let Some(result) = read.poll() else {
+                return Instant::now() >= deadline;
+            };
+            match result {
+                Ok(row) => {
+                    if row.as_ref().is_some_and(CandidateRow::landed) {
+                        self.landed_at = Some(Instant::now());
+                    }
+                    self.last_row = row.clone();
+                }
+                Err(error) => {
+                    self.settle_error = Some(format!("reading the candidate: {error:#}"));
+                }
+            }
+            self.landing = None;
+        }
+        if let Some(read) = self.work.as_mut() {
+            let Some(result) = read.poll() else {
+                return Instant::now() >= deadline;
+            };
+            match result {
+                Ok(reading) => {
+                    if reading.current() {
+                        self.current_at = Some(Instant::now());
+                    }
+                    self.last_work = Some(reading.clone());
+                }
+                Err(error) => {
+                    self.settle_error = Some(format!("reading the frontends' work: {error:#}"));
+                }
+            }
+            self.work = None;
+            if self.current_at.is_some() {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        if Instant::now() >= self.next_settle_read {
+            self.next_settle_read = Instant::now() + SETTLE_READ_INTERVAL;
+            if self.landed_at.is_none() {
+                self.landing = Some(Spawned::spawn(CandidateRow::read(
+                    tools.side.clone(),
+                    seen.block_hash.clone(),
+                )));
+            } else {
+                self.work = Some(Spawned::spawn(WorkReading::read(
+                    tools.side.clone(),
+                    env.frontends
+                        .iter()
+                        .map(|frontend| frontend.health_url())
+                        .collect(),
+                )));
+            }
+        }
+        false
+    }
+
+    /// The settle's line in the verdict: when the block landed and every
+    /// frontend's work was current, counted from the frontend serving again,
+    /// or what was still missing at the bound.
+    pub fn settle_detail(&self) -> String {
+        if self.seen.is_none() {
+            return "no offer was seen, so no landing to wait for".into();
+        }
+        let after_ready = |at: Option<Instant>| {
+            self.ready_at
+                .zip(at)
+                .map(|(ready, at)| at.saturating_duration_since(ready).as_secs_f64())
+        };
+        let bound = DRAIN_SETTLE_WAIT.as_secs();
+        match (after_ready(self.landed_at), after_ready(self.current_at)) {
+            (Some(landed), Some(current)) => format!(
+                "landed {landed:.1} s and every frontend's work at its revision {current:.1} s \
+                 after the frontend served again (bound {bound} s)"
+            ),
+            (landed, _) => format!(
+                "not within {bound} s of the frontend serving again: landed after {landed:?} s, \
+                 candidate {:?}, last reading {:?}{}",
+                self.last_row,
+                self.last_work,
+                self.settle_error
+                    .as_deref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
     pub fn evidence(&self, origin: Instant) -> Value {
         let at = |instant: Option<Instant>| {
             instant.map(|at| at.saturating_duration_since(origin).as_secs_f64())
@@ -345,8 +488,76 @@ impl SigtermDrain {
             "candidate_read_error": self.row_error,
             "sessions_paused": self.moved.len(),
             "serving_again_after_seconds": at(self.ready_at),
+            "block_landed_after_seconds": at(self.landed_at),
+            "work_current_after_seconds": at(self.current_at),
+            "settle_wait_seconds": DRAIN_SETTLE_WAIT.as_secs(),
+            "candidate_at_settle": self.last_row,
+            "work_at_settle": self.last_work,
+            "settle_error": self.settle_error,
             "problems": self.problems,
         })
+    }
+}
+
+/// One reading of the work every frontend serves, as #640's gate takes it:
+/// the cluster's payout revision, then each frontend's published `/healthz`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct WorkReading {
+    pub payout_revision: i64,
+    /// One per frontend, in order; `None` where `/healthz` gave no JSON.
+    pub frontends: Vec<Option<FrontendWork>>,
+}
+
+/// What one frontend's `/healthz` says about its work.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FrontendWork {
+    /// The server's readiness: its work is on the tip it observed and at
+    /// the payout revision it last read.
+    pub ok: bool,
+    pub payout_state_generation: Option<i64>,
+    pub authorized_missing_current_work: Option<u64>,
+}
+
+impl WorkReading {
+    async fn read(pool: PgPool, health_urls: Vec<String>) -> Result<Self> {
+        let payout_revision: i64 =
+            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
+                .fetch_one(&pool)
+                .await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let mut frontends = Vec::with_capacity(health_urls.len());
+        for url in health_urls {
+            // A frontend that is not ready answers 503 with the same body.
+            let health: Option<Value> = match client.get(&url).send().await {
+                Ok(response) => response.json().await.ok(),
+                Err(_) => None,
+            };
+            frontends.push(health.map(|health| FrontendWork {
+                ok: health["ok"] == true,
+                payout_state_generation: health["payout_state_generation"].as_i64(),
+                authorized_missing_current_work:
+                    health["stratum"]["authorized_missing_current_work"].as_u64(),
+            }));
+        }
+        Ok(Self {
+            payout_revision,
+            frontends,
+        })
+    }
+
+    /// Every frontend is ready, serves work at the revision read before its
+    /// `/healthz`, and has delivered that work to every authorized session.
+    pub fn current(&self) -> bool {
+        !self.frontends.is_empty()
+            && self.frontends.iter().all(|work| {
+                work.as_ref().is_some_and(|work| {
+                    work.ok
+                        && work.payout_state_generation == Some(self.payout_revision)
+                        && work.authorized_missing_current_work == Some(0)
+                })
+            })
     }
 }
 
@@ -844,5 +1055,47 @@ impl ReconnectStorm {
                 .iter()
                 .any(|opened| opened.session == *session && opened.ready > departed)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work(ok: bool, generation: Option<i64>, missing: Option<u64>) -> Option<FrontendWork> {
+        Some(FrontendWork {
+            ok,
+            payout_state_generation: generation,
+            authorized_missing_current_work: missing,
+        })
+    }
+
+    #[test]
+    fn work_is_current_once_every_frontend_serves_the_revision_to_every_session() {
+        let reading = |frontends| WorkReading {
+            payout_revision: 7,
+            frontends,
+        };
+        assert!(reading(vec![
+            work(true, Some(7), Some(0)),
+            work(true, Some(7), Some(0))
+        ])
+        .current());
+        // The landing's bump is committed, but one frontend still serves the
+        // work it published before it.
+        assert!(!reading(vec![
+            work(true, Some(7), Some(0)),
+            work(true, Some(6), Some(0))
+        ])
+        .current());
+        // Published, but not yet delivered to every authorized session.
+        assert!(!reading(vec![work(true, Some(7), Some(3))]).current());
+        // Not ready: work on another tip, or a stale snapshot.
+        assert!(!reading(vec![work(false, Some(7), Some(0))]).current());
+        // A `/healthz` without JSON, or without the fields, proves nothing.
+        assert!(!reading(vec![None]).current());
+        assert!(!reading(vec![work(true, None, Some(0))]).current());
+        assert!(!reading(vec![work(true, Some(7), None)]).current());
+        assert!(!reading(Vec::new()).current());
     }
 }

@@ -801,11 +801,14 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
 }
 
 /// Anything a fault still waits for once its recovery window has passed:
-/// the SIGKILL's landing through the candidate lease, a failover's census of
-/// the new primary and its block's landing, the backlog's settling.
+/// the SIGKILL's landing through the candidate lease, the drained block's
+/// landing and every frontend's work at the revision it committed (#686), a
+/// failover's census of the new primary and its block's landing, the
+/// backlog's settling. The next fault's gap starts only after it.
 fn settle(run: &mut FaultRun, env: &FaultEnv<'_>, tools: &FaultTools) -> Result<bool> {
     match &mut run.action {
         Action::FrontendSigkill(kill) => kill.poll_landing(tools),
+        Action::SigtermDrain(drain) => Ok(drain.poll_settle(env, tools)),
         Action::Failover(failover) => failover.poll_settle(env, tools),
         Action::CandidateBacklog(backlog) => Ok(backlog.poll_settle(env, tools)),
         _ => Ok(true),
