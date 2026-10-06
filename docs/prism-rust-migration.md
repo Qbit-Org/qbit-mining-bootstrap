@@ -90,6 +90,16 @@ qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
    public edge, including the oldest history, a sidecar-only import and a
    reconstructed body. Require the exact SHA and matching ETag, as below.
 
+Nothing on the serving path reads a legacy row's canonical bytes. So
+frontends can admit traffic before `import-audits` finishes. Until it does,
+production `self-check` fails at audit completeness and skips its other checks
+(#734). `scripts/prism_legacy_import_admission_gate.sh` checks every other fact
+`self-check` checks, against the frontend's own environment on each host. It
+reports legacy completeness as pending, and fails on any incomplete native
+audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
+for an audit whose 2.x body can't be read on that host (#735), and the block's
+audit view answers 404.
+
 `migrate` applies the existing schema and additive native migration under a
 transaction lock. It preserves share sequence/history, balances, audit metadata,
 and settlement rows. New tables hold shared configuration/revision, instance
