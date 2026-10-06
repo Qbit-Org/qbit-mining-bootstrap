@@ -205,6 +205,11 @@ pub struct StratumConfig {
     pub stale_grace_seconds: f64,
     pub initial_job_timeout_seconds: f64,
     pub write_timeout_seconds: f64,
+    /// Connections the kernel queues for each Stratum listener before the
+    /// accept loop takes them (`PRISM_STRATUM_LISTEN_BACKLOG`); a burst
+    /// beyond it has its SYNs dropped. The kernel caps it at
+    /// `net.core.somaxconn`.
+    pub listen_backlog: u32,
     pub connection_limit: ConnectionLimit,
     pub initial_job_limit: Arc<Semaphore>,
     /// The rebuild lane (#604): a session that already holds current work
@@ -246,6 +251,7 @@ impl Default for StratumConfig {
             stale_grace_seconds: 3.0,
             initial_job_timeout_seconds: 30.0,
             write_timeout_seconds: 20.0,
+            listen_backlog: 4096,
             connection_limit: ConnectionLimit::new(384),
             initial_job_limit: Arc::new(Semaphore::new(128)),
             rebuild_job_limit: Arc::new(Semaphore::new(rebuild_lane_permits(128))),
@@ -671,6 +677,7 @@ impl StratumConfig {
             "PRISM_STRATUM_SEND_TIMEOUT_SECONDS",
             config.write_timeout_seconds,
         )?;
+        config.listen_backlog = value("PRISM_STRATUM_LISTEN_BACKLOG", config.listen_backlog)?;
         let connections = value("PRISM_STRATUM_MAX_CONNECTIONS", 384usize)?;
         let initial = value("PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS", 128usize)?;
         ensure!(connections > 0 && connections <= Semaphore::MAX_PERMITS && initial > 0 && initial <= connections,
@@ -752,6 +759,11 @@ impl StratumConfig {
         ensure!(
             self.resume_max_start_factor.is_finite() && self.resume_max_start_factor >= 1.0,
             "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR must be finite and at least 1"
+        );
+        ensure!(
+            (1..=crate::listen::MAX_LISTEN_BACKLOG).contains(&self.listen_backlog),
+            "PRISM_STRATUM_LISTEN_BACKLOG must be between 1 and {}",
+            crate::listen::MAX_LISTEN_BACKLOG
         );
         ensure!(
             self.max_connections_per_username <= Semaphore::MAX_PERMITS,

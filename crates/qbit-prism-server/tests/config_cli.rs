@@ -657,6 +657,30 @@ async fn run_rejects_invalid_highdiff_settings_before_connecting() {
     }
 }
 
+/// The Stratum listen backlog takes the `listen(2)` range, 1 through
+/// `i32::MAX`; the kernel, not this check, caps it at somaxconn.
+#[tokio::test]
+async fn stratum_listen_backlog_is_checked_against_the_listen_range() {
+    const RANGE: &str = "PRISM_STRATUM_LISTEN_BACKLOG must be between 1 and 2147483647";
+    const PARSE: &str = "invalid PRISM_STRATUM_LISTEN_BACKLOG";
+    for (value, message) in [
+        ("0", RANGE),
+        ("2147483648", RANGE),
+        ("-1", PARSE),
+        ("4k", PARSE),
+    ] {
+        rejects(false, &[("PRISM_STRATUM_LISTEN_BACKLOG", value)], message).await;
+    }
+    for value in ["", "1", "4096", "65536", "2147483647"] {
+        let output = check(false, &[("PRISM_STRATUM_LISTEN_BACKLOG", value)]).await;
+        assert!(
+            output.status.success(),
+            "{value:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[tokio::test]
 async fn unread_environment_reports_every_name_without_values() {
     let names: Vec<_> = include_str!("../src/config/retired-settings.txt")
