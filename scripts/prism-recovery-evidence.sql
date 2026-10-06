@@ -3,6 +3,10 @@
 -- scripts/prism-recovery-evidence.py. Works on frozen 2.x and native schemas.
 -- Writers must be stopped: the transaction gives this export one snapshot,
 -- but cannot make separately taken backups or exports contemporaneous.
+-- Stream every result through a cursor. Without FETCH_COUNT psql buffers a
+-- whole result before printing it, and the share history alone took 63 GB
+-- at 65.9M shares (#705).
+\set FETCH_COUNT 10000
 BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL TIME ZONE 'UTC';
 SET LOCAL bytea_output = 'hex';

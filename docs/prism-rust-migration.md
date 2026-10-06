@@ -1558,10 +1558,14 @@ backup, as for any other pre-ACK failure.
    ```sh
    umask 077
    PGSERVICE=prism-source pg_dump --format=custom --file=pre-native.dump
-   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 \
+   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
      -f scripts/prism-recovery-evidence.sql > source.rows.jsonl
    python3 scripts/prism-recovery-evidence.py source.rows.jsonl > source.summary.json
    ```
+
+   `FETCH_COUNT` makes psql stream the rows through a cursor; the script also
+   sets it. Without it psql buffers each whole result before printing, which
+   took 63 GB and was OOM-killed at 65.9M shares (#705).
 
    Keep the filesystem backup from the same drained boundary. Require
    `unfinished_candidates` zero and both integrity mismatch counts zero. The
@@ -1579,7 +1583,7 @@ backup, as for any other pre-ACK failure.
    ```sh
    pg_restore --exit-on-error --single-transaction \
      --dbname='service=prism-restore' pre-native.dump
-   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 \
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
      -f scripts/prism-recovery-evidence.sql > restored.rows.jsonl
    python3 scripts/prism-recovery-evidence.py restored.rows.jsonl > restored.summary.json
    cmp source.summary.json restored.summary.json
@@ -1597,7 +1601,7 @@ backup, as for any other pre-ACK failure.
    ```sh
    time qbit-prism-server migrate
    time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
-   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 \
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
      -f scripts/prism-recovery-evidence.sql > migrated.rows.jsonl
    python3 scripts/prism-recovery-evidence.py migrated.rows.jsonl > migrated.summary.json
    cmp source.summary.json migrated.summary.json

@@ -444,19 +444,23 @@ pub async fn evidence_with_bytea(db: &Database, pg_bin: &Path, format: &str) -> 
         "../../../../scripts/prism-recovery-evidence.sql"
     ))?;
     input.seek(SeekFrom::Start(0))?;
+    // The export goes straight to a file: at production size it is tens of
+    // gigabytes, and FETCH_COUNT keeps psql from buffering it too (#705).
+    // tokio's `output()` would pipe stdout whatever it was set to, so spawn.
+    let records = tempfile::NamedTempFile::new()?;
     let output = postgres_command(db, pg_bin, "psql")?
-        .args(["-XqAt", "-v", "ON_ERROR_STOP=1"])
+        .args(["-XqAt", "-v", "ON_ERROR_STOP=1", "-v", "FETCH_COUNT=10000"])
         .stdin(Stdio::from(input))
-        .output()
+        .stdout(Stdio::from(records.reopen()?))
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()
         .await?;
     ensure!(
         output.status.success(),
         "recovery evidence SQL failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let mut records = tempfile::NamedTempFile::new()?;
-    records.write_all(&output.stdout)?;
-    records.flush()?;
     let output = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),

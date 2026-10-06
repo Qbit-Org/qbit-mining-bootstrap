@@ -2334,7 +2334,7 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    ```sh
    umask 077
    PGSERVICE=prism-source pg_dump --format=custom --file=pre-native.dump
-   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 \
+   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
      -f scripts/prism-recovery-evidence.sql > source.rows.jsonl
    python3 scripts/prism-recovery-evidence.py source.rows.jsonl > source.summary.json
    ```
@@ -2346,6 +2346,9 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    compare that head to the mirrored pre-cutover report. It refuses incomplete
    exports and carry mismatches/drift. Require `unfinished_candidates` zero. Protect
    the evidence as accounting data and budget disk for the share export.
+   `FETCH_COUNT` makes psql stream the rows through a cursor; the script also sets
+   it. Without it psql buffers each whole result before printing, which took 63 GB
+   and was OOM-killed at 65.9M shares (#705).
 4. **Exercise the isolated pre-ACK restore.** Provision a separate empty
    database with compatible PostgreSQL, roles and extensions. Restore the full
    database and artifact backup, never over the current database:
@@ -2353,7 +2356,7 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    ```sh
    pg_restore --exit-on-error --single-transaction \
      --dbname='service=prism-restore' pre-native.dump
-   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 \
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
      -f scripts/prism-recovery-evidence.sql > restored.rows.jsonl
    python3 scripts/prism-recovery-evidence.py restored.rows.jsonl > restored.summary.json
    cmp source.summary.json restored.summary.json
