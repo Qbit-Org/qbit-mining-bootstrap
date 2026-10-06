@@ -254,10 +254,10 @@ async fn one(
                     Some(status),
                     Some(String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned()),
                 ),
-                Err(error) => (None, Some(format!("reading the body: {error}"))),
+                Err(error) => (None, Some(format!("reading the body: {}", describe(error)))),
             }
         }
-        Err(error) => (None, Some(error.to_string())),
+        Err(error) => (None, Some(describe(error))),
     };
     samples
         .lock()
@@ -270,6 +270,14 @@ async fn one(
             status,
             error,
         });
+}
+
+/// A transport error with its causes, such as "error sending request for url
+/// (...): client error (SendRequest): connection closed before message
+/// completed". reqwest's own text names only the URL, so a reset, a refused
+/// connection and a timeout would all read alike (#701).
+fn describe(error: reqwest::Error) -> String {
+    format!("{:#}", anyhow::Error::new(error))
 }
 
 /// The read tier's figures over `[from, to)`, excluding frontends that were
@@ -432,6 +440,34 @@ mod tests {
         samples.push(sample("load-fe-0", "/metrics", at(7), 1_500.0, Some(200)));
         let verdict = summarize(&samples, origin, at(10), &outages, &[(at(5), at(6))]);
         assert_eq!(verdict["frontend_metrics"]["pass"], false, "{verdict}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_records_why_it_failed() {
+        // A port nothing listens on: the connection is refused.
+        let port = free_port().expect("a free port");
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        one(
+            client().expect("the read tier's client"),
+            "public-api".into(),
+            format!("http://127.0.0.1:{port}/public/v1/pool-summary"),
+            PUBLIC_PATHS[0].into(),
+            samples.clone(),
+        )
+        .await;
+        let samples = samples.lock().expect("samples");
+        let error = samples[0]
+            .error
+            .as_deref()
+            .expect("a failed request has an error");
+        assert!(samples[0].status.is_none());
+        // The URL-only top line, then the cause that tells a refusal from a
+        // reset or a timeout.
+        assert!(
+            error.starts_with("error sending request for url"),
+            "{error}"
+        );
+        assert!(error.to_lowercase().contains("connect"), "{error}");
     }
 
     #[test]
