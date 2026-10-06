@@ -603,6 +603,16 @@ never reads it. It is applied online, as 013 is: on an existing ledger
 transaction commits, so no write to `qbit_ctv_fanout_artifacts` waits for the
 build, a found block's landing included, and records 24 once it is valid. See
 [the claim lane](prism-ledger-ops.md#the-claim-lane-and-settled-history-024-668).
+Migration 025 replaces `qbit_carry_forward_integrity_mismatches()` (#708):
+rows landed before 011 are checked per payout program, as 2.x keeps their
+balances, instead of per case-sensitive label, so one program paid under two
+spellings of its bech32 address is one chain. On union's ledger the label
+rule found 5,506 false mismatches in such a program, which `self-check` and
+`fatal-state clear` refuse; the program rule finds none over all 2,753,849
+active rows. It changes no stored row and is applied in the migration
+transaction, with no capability and no shutdown proof: an earlier binary
+accepts the unknown migration with a warning and reads the corrected report.
+See [blocks, balances, and reorgs](prism-ledger-ops.md#blocks-balances-and-reorgs).
 While a share-hash backfill that this release started is pending on a
 populated `2.x.x` source, the database declares
 `share_hash_backfill_pending = 1` (#669). It is declared with the backfill's
@@ -1575,7 +1585,11 @@ backup, as for any other pre-ACK failure.
    state. `audit_head_sha256` is the exact `2.x.x` active carry hash chain. The
    SQL integrity function alone does **not** calculate that head; the companion
    Python summarizer does. Compare it with the previously mirrored legacy head.
-   The checked-in SQL contains the exact reconciliation queries.
+   The checked-in SQL contains the exact reconciliation queries. The summarizer
+   checks legacy carry rows per payout program, as 025's validator does
+   (#708): a finding of `2.x.x`'s per-label rule that the program's chain
+   clears is named in a `note:` on stderr and left out of the summary, so the
+   source summarizes as its migrated copy will.
 3. **Restore and verify the pre-ACK recovery path.** Provision a new empty
    database behind `prism-restore` on an isolated host with the matching
    PostgreSQL version, roles and extensions. Restore the full backup (not a
@@ -1752,7 +1766,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`), 002's share-hash backfill, 013's and 024's
+(`001` and native `002` to `023` and `025`), 002's share-hash backfill, 013's and 024's
 concurrent index builds, and 017's prepare, validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
 whole length; the backfill's batches hold only ACCESS SHARE on it. The report

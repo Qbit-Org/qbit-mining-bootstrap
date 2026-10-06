@@ -29,6 +29,10 @@ use tracing::instrument::WithSubscriber;
 #[path = "support/cohort_fence.rs"]
 mod cohort_fence;
 
+#[path = "support/case_labels.rs"]
+#[allow(dead_code)]
+mod case_labels;
+
 #[path = "support/ledger_database.rs"]
 #[allow(dead_code)]
 mod ledger_database;
@@ -77,8 +81,8 @@ const CHECKS_021: [&str; 2] = [
     "qbit_block_candidate_outbox_claim_lease_seconds_check",
     "qbit_block_candidate_outbox_claim_renewals_check",
 ];
-const ALL_VERSIONS: [i32; 23] = [
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+const ALL_VERSIONS: [i32; 24] = [
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
 ];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
@@ -1993,6 +1997,121 @@ async fn integrity_validator_checks_the_issued_arithmetic_of_every_manifest_acco
     .await
 }
 
+/// 011's carry-forward validator, cut from the migration file: the rule
+/// every native build before 025 ran, which sums a legacy chain per
+/// case-sensitive label.
+fn validator_011() -> &'static str {
+    let start = MIGRATION_011
+        .find("CREATE OR REPLACE FUNCTION qbit_carry_forward_integrity_mismatches()")
+        .expect("011 defines the validator");
+    let end = MIGRATION_011[start..]
+        .find("\n$$;")
+        .expect("the validator body is dollar-quoted")
+        + start
+        + "\n$$;".len();
+    &MIGRATION_011[start..end]
+}
+
+/// #708: legacy rows of one payout program, paid under two labels that
+/// differ only in case, are one chain, as 2.x writes them. A ledger at 24
+/// runs 011's rule, which sums each label apart and reports every row after
+/// the second; `migrate` applies 025 and the same rows are clean, with every
+/// balance and per-label summary row as it was. A real break under either
+/// label is still a finding, on that row alone, and a changed amount under
+/// one label moves the chain of every later row, under both.
+#[tokio::test]
+async fn integrity_validator_follows_a_legacy_chain_per_payout_program_across_case_labels(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let _ledger = db.ledger("validator-708").await?;
+            let pool = &db.pool;
+            case_labels::seed(pool).await?;
+            let clean = |label: &'static str| async move {
+                let (mismatches, drift, reasons) = db.integrity().await?;
+                ensure!(mismatches == 0 && drift == 0, "{label}: {reasons:?} drift {drift}");
+                Ok::<_, anyhow::Error>(())
+            };
+            clean("seeded").await?;
+            let balances = case_labels::balances(pool).await?;
+            ensure!(
+                balances.0 == [(case_labels::program(), case_labels::BALANCE.to_string())],
+                "{balances:?}"
+            );
+
+            // The ledger an earlier build left: 011's rule, and 25 not recorded.
+            sqlx::raw_sql(validator_011()).execute(pool).await?;
+            sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=25")
+                .execute(pool)
+                .await?;
+            let found = case_labels::findings(pool).await?;
+            ensure!(found == case_labels::label_rule_findings(), "011's rule: {found:?}");
+
+            let _upgraded = db.ledger("validator-708-upgrade").await?;
+            ensure!(db.versions().await? == ALL_VERSIONS, "025 was not recorded");
+            clean("migrated").await?;
+            ensure!(case_labels::balances(pool).await? == balances, "025 moved a balance");
+
+            // A break under either label is a finding on its row alone.
+            for height in [case_labels::LAST_LOWER, case_labels::LAST_UPPER] {
+                case_labels::shift(pool, height, 1).await?;
+                let found = case_labels::findings(pool).await?;
+                ensure!(
+                    found == [(height, case_labels::label(height).to_owned(), case_labels::ALL_FIELDS.to_owned())],
+                    "a break at {height}: {found:?}"
+                );
+                case_labels::shift(pool, height, -1).await?;
+                clean("restored").await?;
+            }
+
+            // One more sat of gross under the lowercase label at 43: its own
+            // candidate and carry, and every later row's prior, uppercase
+            // ones included.
+            let gross = |by: i64| async move {
+                sqlx::query("UPDATE qbit_payout_carry_forward SET gross_amount_sats=gross_amount_sats+$2 WHERE block_hash=$1")
+                    .bind(case_labels::block_hash(43)).bind(by).execute(pool).await
+            };
+            gross(1).await?;
+            let mut expected = vec![(43, case_labels::LOWER.to_owned(), "candidate_balance,carry_forward_balance".to_owned())];
+            for height in [44, 45, 46, 47] {
+                expected.push((height, case_labels::label(height).to_owned(), case_labels::ALL_FIELDS.to_owned()));
+            }
+            let found = case_labels::findings(pool).await?;
+            ensure!(found == expected, "a changed amount at 43: {found:?}");
+            let (_, drift, _) = db.integrity().await?;
+            ensure!(drift == 0, "the summary did not follow the changed amount: drift {drift}");
+            gross(-1).await?;
+            clean("restored amount").await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// 025 replaces the validator 011 defines (#708). A record that lacks 11
+/// but has 25, as the #258 fixture leaves it, runs 011 again on migrate,
+/// and 025 after it: the legacy rule stays per program.
+#[tokio::test]
+async fn migration_025_runs_again_after_011_runs() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            db.apply_pre_011_from(Source::Applied258).await?;
+            let versions = db.versions().await?;
+            ensure!(
+                !versions.contains(&11) && versions.contains(&25),
+                "{versions:?}"
+            );
+            let _ledger = db.ledger("rerun-011").await?;
+            ensure!(db.versions().await? == ALL_VERSIONS, "011 was not recorded");
+            case_labels::seed(&db.pool).await?;
+            let found = case_labels::findings(&db.pool).await?;
+            ensure!(found.is_empty(), "011's rule outlived 025: {found:?}");
+            Ok(())
+        })
+    })
+    .await
+}
+
 /// The fence is decided by the row's state as the database holds it under
 /// the claim lock, never by the claim's memory of it: the claim that was
 /// taken pending lands after its own reservation on moved balances.
@@ -2289,7 +2408,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2326,11 +2445,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2367,7 +2486,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );

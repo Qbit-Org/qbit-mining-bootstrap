@@ -141,8 +141,11 @@ pub async fn seed_legacy(pool: &PgPool, root: &Path) -> Result<Vec<Artifact>> {
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,body_uri) VALUES($1,$2,$3,$4,$5)")
             .bind(&hash).bind(inline).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
             .bind((index != 2).then(|| body_path.to_string_lossy().into_owned())).execute(pool).await?;
-        sqlx::query("INSERT INTO qbit_payout_carry_forward(block_height,block_hash,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action) VALUES($1,$2,$3,$3,decode(repeat('11',32),'hex'),1000,0,1000,0,1000,'accrued')")
+        // Each miner its own program, so each row starts its chain: 2.x keeps
+        // one chain per program, whatever label a block pays it under (#708).
+        sqlx::query("INSERT INTO qbit_payout_carry_forward(block_height,block_hash,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action) VALUES($1,$2,$3,$3,decode(repeat($4,32),'hex'),1000,0,1000,0,1000,'accrued')")
             .bind((101 + index) as i64).bind(&hash).bind(format!("miner-{index}"))
+            .bind(format!("{:02x}", 0x11 + index))
             .execute(pool).await?;
         artifacts.push(Artifact {
             block_hash: hash,
