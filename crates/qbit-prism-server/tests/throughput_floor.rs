@@ -141,6 +141,8 @@ const ORDER_LOCK_OBJSUBID: i32 = 1;
 /// `auto_explain`, so 250 is about 37% of the slowest. A fifth run fell to 132
 /// while the runner itself stalled, as disk runs had before (#683). 250 stays:
 /// a floor low enough to pass such a stall would miss the collapse it is for.
+/// Instead a level below the floor is measured a second time, and only that
+/// pass decides: a stall of a few seconds misses once, a collapse twice.
 ///
 /// Re-derive it from the same summary lines if the runner, the PostgreSQL
 /// service or the append path changes. On any other host,
@@ -1028,6 +1030,10 @@ struct LevelResult {
     append_seconds: f64,
     shares_per_second: f64,
     passed_minimum: bool,
+    /// The rate of a first pass that fell below the floor, when the level
+    /// was measured a second time; the fields around it are that second
+    /// pass's (#683).
+    first_pass_shares_per_second: Option<f64>,
     /// `Some(true)` when a backend outside this run held or waited on
     /// `ORDER_LOCK` while this level was being timed, `Some(false)` when the
     /// sampler looked and found none, `None` when it could not look.
@@ -1176,37 +1182,58 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
     let mut passed_all = true;
 
     for &appenders in &config.appenders {
-        let mut ledgers = Vec::new();
-        for index in 0..appenders {
-            let ledger = Ledger::connect(
-                &db.url,
-                format!("throughput-appender-{appenders}-{index}"),
-                APPENDER_POOL_CONNECTIONS,
-                false,
-            )
-            .await
-            .with_context(|| format!("connecting appender {index} of level {appenders}"))?;
-            if durability.is_none() {
-                durability = Some(read_durability(&ledger.pool).await?);
+        // A level below the floor is measured once more, with fresh writers,
+        // and only that second pass decides (#683): a runner that stalls for a
+        // few seconds drops one pass below the floor, while a collapse of the
+        // append path misses on both. The first pass's rate stays in the report.
+        let mut first_pass = None;
+        let result = loop {
+            let suffix = if first_pass.is_some() { "-retry" } else { "" };
+            let mut ledgers = Vec::new();
+            for index in 0..appenders {
+                let ledger = Ledger::connect(
+                    &db.url,
+                    format!("throughput-appender-{appenders}-{index}{suffix}"),
+                    APPENDER_POOL_CONNECTIONS,
+                    false,
+                )
+                .await
+                .with_context(|| format!("connecting appender {index} of level {appenders}"))?;
+                if durability.is_none() {
+                    durability = Some(read_durability(&ledger.pool).await?);
+                }
+                ledgers.push(ledger);
             }
-            ledgers.push(ledger);
-        }
-        let result = run_level(db, config, &plan, &ledgers, appenders, &mut next_index).await;
-        for ledger in &ledgers {
-            ledger.pool.close().await;
-        }
-        let result = result?;
-        total_shares += result.share_count;
+            let result = run_level(db, config, &plan, &ledgers, appenders, &mut next_index).await;
+            for ledger in &ledgers {
+                ledger.pool.close().await;
+            }
+            let mut result = result?;
+            total_shares += result.share_count;
+            if result.passed_minimum || first_pass.is_some() {
+                result.first_pass_shares_per_second = first_pass;
+                break result;
+            }
+            println!(
+                "throughput_floor: {appenders} appender(s): {:.1} shares/s is below the floor \
+                 {:.1}; measuring the level once more",
+                result.shares_per_second, config.minimum,
+            );
+            first_pass = Some(result.shares_per_second);
+        };
         slowest = slowest.min(result.shares_per_second);
         passed_all &= result.passed_minimum;
         println!(
-            "throughput_floor: {} appender(s): {} shares in {:.3}s = {:.1} shares/s (floor {:.1}, {})",
+            "throughput_floor: {} appender(s): {} shares in {:.3}s = {:.1} shares/s (floor {:.1}, {}){}",
             result.appenders,
             result.share_count,
             result.append_seconds,
             result.shares_per_second,
             config.minimum,
             if result.passed_minimum { "pass" } else { "FAIL" },
+            first_pass
+                .map(|rate| format!(", after a first pass at {rate:.1} shares/s"))
+                .unwrap_or_default(),
         );
         match result.contaminated {
             Some(true) => println!(
@@ -1360,6 +1387,7 @@ async fn run_level(
         append_seconds,
         shares_per_second,
         passed_minimum: shares_per_second >= config.minimum,
+        first_pass_shares_per_second: None,
         contaminated,
         per_appender,
         order_lock,
@@ -1613,6 +1641,12 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
                 Value::from(level.passed_minimum),
             );
             entry.insert(
+                "first_pass_shares_per_second".to_owned(),
+                level
+                    .first_pass_shares_per_second
+                    .map_or(Value::Null, json_f64),
+            );
+            entry.insert(
                 "contaminated".to_owned(),
                 level.contaminated.map_or(Value::Null, Value::from),
             );
@@ -1672,6 +1706,20 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
         .map(|level| format!("{}:{:.1}", level.appenders, level.shares_per_second))
         .collect::<Vec<_>>()
         .join(",");
+    let first_passes = measurement
+        .levels
+        .iter()
+        .filter_map(|level| {
+            level
+                .first_pass_shares_per_second
+                .map(|rate| format!("{}:{rate:.1}", level.appenders))
+        })
+        .collect::<Vec<_>>();
+    let first_passes = if first_passes.is_empty() {
+        "none".to_owned()
+    } else {
+        first_passes.join(",")
+    };
     let contaminated = match measurement.contaminated {
         Some(true) => "true",
         Some(false) => "false",
@@ -1679,7 +1727,8 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
     };
     let line = format!(
         "throughput_floor summary: test={} build={} window={} shares_per_level={} \
-         shares_per_second_by_appenders={} floor={:.1} passed={} contaminated={}\n",
+         shares_per_second_by_appenders={} first_passes_below_floor={} floor={:.1} passed={} \
+         contaminated={}\n",
         config.test_name,
         if cfg!(debug_assertions) {
             "debug"
@@ -1689,6 +1738,7 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
         config.window_shares,
         config.shares_per_level,
         levels,
+        first_passes,
         config.minimum,
         measurement.passed_minimum,
         contaminated,
@@ -1752,9 +1802,13 @@ async fn run_floor(test_name: &str, defaults: Defaults, selection: Selection) ->
         ensure!(
             level.passed_minimum,
             "share-append throughput floor: the level of {} appender(s) sustained {:.2} \
-             shares/s, below the floor of {:.2} shares/s ({}).{} The report is at {}.",
+             shares/s{}, below the floor of {:.2} shares/s ({}).{} The report is at {}.",
             level.appenders,
             level.shares_per_second,
+            level
+                .first_pass_shares_per_second
+                .map(|rate| format!(" on a second pass, after {rate:.2} on the first"))
+                .unwrap_or_default(),
             config.minimum,
             config.minimum_source,
             match level.contaminated {
