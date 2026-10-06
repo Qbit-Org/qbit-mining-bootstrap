@@ -141,9 +141,13 @@ const ORDER_LOCK_OBJSUBID: i32 = 1;
 /// `auto_explain`, so 250 is about 37% of the slowest. A fifth run fell to 132
 /// while the runner itself stalled, as disk runs had before (#683). 250 stays:
 /// a floor low enough to pass such a stall would miss the collapse it is for.
+/// Instead the CI-sized test measures a level below the floor a second time,
+/// and only that pass decides: a stall of a few seconds misses once, a
+/// collapse twice.
 ///
-/// Re-derive it from the same summary lines if the runner, the PostgreSQL
-/// service or the append path changes. On any other host,
+/// Re-derive it from the same summary lines, counting their
+/// `first_passes_below_floor` too, if the runner, the PostgreSQL service or
+/// the append path changes. On any other host,
 /// `QBIT_PRISM_MIN_SHARES_PER_SEC` overrides it.
 const CI_MIN_SHARES_PER_SEC: f64 = 250.0;
 
@@ -406,6 +410,9 @@ struct Config {
     minimum: f64,
     minimum_source: String,
     report_path: PathBuf,
+    /// Measure a level below the floor once more (#683): the CI-sized test
+    /// only, so the explicit full-size characterisation stays single-pass.
+    retry_below_floor: bool,
 }
 
 /// How the test was selected, which decides what a missing database means.
@@ -427,7 +434,7 @@ struct Defaults {
 }
 
 impl Config {
-    fn from_env(test_name: &str, defaults: Defaults) -> Result<Self> {
+    fn from_env(test_name: &str, defaults: Defaults, selection: Selection) -> Result<Self> {
         let window_shares = parse_window_shares(
             env_raw(WINDOW_SHARES_VAR)?.as_deref(),
             defaults.window_shares,
@@ -473,6 +480,7 @@ impl Config {
             minimum,
             minimum_source,
             report_path,
+            retry_below_floor: selection == Selection::Ci,
         })
     }
 }
@@ -1028,6 +1036,10 @@ struct LevelResult {
     append_seconds: f64,
     shares_per_second: f64,
     passed_minimum: bool,
+    /// The whole first pass, when it fell below the floor and the level was
+    /// measured a second time; the fields around it are that second pass's
+    /// (#683).
+    first_pass: Option<Box<LevelResult>>,
     /// `Some(true)` when a backend outside this run held or waited on
     /// `ORDER_LOCK` while this level was being timed, `Some(false)` when the
     /// sampler looked and found none, `None` when it could not look.
@@ -1176,37 +1188,58 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
     let mut passed_all = true;
 
     for &appenders in &config.appenders {
-        let mut ledgers = Vec::new();
-        for index in 0..appenders {
-            let ledger = Ledger::connect(
-                &db.url,
-                format!("throughput-appender-{appenders}-{index}"),
-                APPENDER_POOL_CONNECTIONS,
-                false,
-            )
-            .await
-            .with_context(|| format!("connecting appender {index} of level {appenders}"))?;
-            if durability.is_none() {
-                durability = Some(read_durability(&ledger.pool).await?);
+        let result = measure_level(config.retry_below_floor, async |suffix| {
+            if !suffix.is_empty() {
+                println!(
+                    "throughput_floor: {appenders} appender(s): the first pass fell below the \
+                     floor; measuring the level once more"
+                );
             }
-            ledgers.push(ledger);
-        }
-        let result = run_level(db, config, &plan, &ledgers, appenders, &mut next_index).await;
-        for ledger in &ledgers {
-            ledger.pool.close().await;
-        }
-        let result = result?;
-        total_shares += result.share_count;
+            let mut ledgers = Vec::new();
+            for index in 0..appenders {
+                let ledger = Ledger::connect(
+                    &db.url,
+                    format!("throughput-appender-{appenders}-{index}{suffix}"),
+                    APPENDER_POOL_CONNECTIONS,
+                    false,
+                )
+                .await
+                .with_context(|| format!("connecting appender {index} of level {appenders}"))?;
+                if durability.is_none() {
+                    durability = Some(read_durability(&ledger.pool).await?);
+                }
+                ledgers.push(ledger);
+            }
+            let result = run_level(db, config, &plan, &ledgers, appenders, &mut next_index).await;
+            for ledger in &ledgers {
+                ledger.pool.close().await;
+            }
+            result
+        })
+        .await?;
+        total_shares += result.share_count
+            + result
+                .first_pass
+                .as_ref()
+                .map_or(0, |first| first.share_count);
         slowest = slowest.min(result.shares_per_second);
         passed_all &= result.passed_minimum;
         println!(
-            "throughput_floor: {} appender(s): {} shares in {:.3}s = {:.1} shares/s (floor {:.1}, {})",
+            "throughput_floor: {} appender(s): {} shares in {:.3}s = {:.1} shares/s (floor {:.1}, {}){}",
             result.appenders,
             result.share_count,
             result.append_seconds,
             result.shares_per_second,
             config.minimum,
             if result.passed_minimum { "pass" } else { "FAIL" },
+            result
+                .first_pass
+                .as_ref()
+                .map(|first| format!(
+                    ", after a first pass at {:.1} shares/s",
+                    first.shares_per_second
+                ))
+                .unwrap_or_default(),
         );
         match result.contaminated {
             Some(true) => println!(
@@ -1219,6 +1252,23 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
             ),
             Some(false) => {}
         }
+        match result
+            .first_pass
+            .as_ref()
+            .and_then(|first| first.contaminated)
+        {
+            Some(true) => println!(
+                "throughput_floor: WARNING, the first pass of the level of {} appender(s) is \
+                 CONTAMINATED: {}",
+                result.appenders, CONTAMINATION_NOTE
+            ),
+            Some(false) => {}
+            None if result.first_pass.is_some() => println!(
+                "throughput_floor: WARNING, the first pass of the level of {} appender(s): {}",
+                result.appenders, CONTAMINATION_UNKNOWN_NOTE
+            ),
+            None => {}
+        }
         levels.push(result);
     }
 
@@ -1226,7 +1276,7 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
         Some(durability) => durability,
         None => bail!("no appender level ran, so no durability settings were read"),
     };
-    let contaminated = fold_contamination(levels.iter().map(|level| level.contaminated));
+    let contaminated = levels_contamination(&levels);
     Ok(Measurement {
         postgres_version,
         postgres_server_version,
@@ -1238,6 +1288,61 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
         passed_minimum: passed_all,
         contaminated,
     })
+}
+
+/// One level, measured once more when its first pass falls below the floor
+/// and `retry` allows it (#683). Only the second pass decides: a runner that
+/// stalls for a few seconds drops one pass below the floor, while a collapse
+/// of the append path misses on both. The first pass is kept on the result.
+/// `pass` runs one pass, with a suffix for its writer ids, so the second
+/// pass's committed shares are counted apart from the first's.
+async fn measure_level(
+    retry: bool,
+    mut pass: impl std::ops::AsyncFnMut(&'static str) -> Result<LevelResult>,
+) -> Result<LevelResult> {
+    let first = pass("").await?;
+    if first.passed_minimum || !retry {
+        return Ok(first);
+    }
+    let mut second = pass("-retry").await.map_err(|error| {
+        error.context(SecondPassFailed {
+            appenders: first.appenders,
+            first_pass_shares_per_second: first.shares_per_second,
+            first_pass: level_entry(&first),
+        })
+    })?;
+    second.first_pass = Some(Box::new(first));
+    Ok(second)
+}
+
+/// The context on a second pass's error (#683). The error below it says what
+/// went wrong; the first pass it followed rides along, so the error report
+/// still carries that pass's entry.
+#[derive(Debug)]
+struct SecondPassFailed {
+    appenders: u32,
+    first_pass_shares_per_second: f64,
+    first_pass: Value,
+}
+
+impl std::fmt::Display for SecondPassFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measuring the level of {} appender(s) a second time, after a first pass at {:.1} \
+             shares/s below the floor",
+            self.appenders, self.first_pass_shares_per_second
+        )
+    }
+}
+
+/// The run's contamination verdict, over every pass it timed: a foreign
+/// backend during a first pass that was then measured again still counts.
+fn levels_contamination(levels: &[LevelResult]) -> Option<bool> {
+    fold_contamination(levels.iter().flat_map(|level| {
+        std::iter::once(level.contaminated)
+            .chain(level.first_pass.as_ref().map(|first| first.contaminated))
+    }))
 }
 
 async fn run_level(
@@ -1360,6 +1465,7 @@ async fn run_level(
         append_seconds,
         shares_per_second,
         passed_minimum: shares_per_second >= config.minimum,
+        first_pass: None,
         contaminated,
         per_appender,
         order_lock,
@@ -1540,6 +1646,13 @@ fn build_error_report(config: &Config, error: &anyhow::Error) -> Value {
     root.insert("error".to_owned(), Value::from(format!("{error:#}")));
     root.insert("passed_minimum".to_owned(), Value::from(false));
     root.insert("results".to_owned(), Value::Array(Vec::new()));
+    // A second pass that failed leaves the first pass's entry behind (#683).
+    if let Some(failed) = error.downcast_ref::<SecondPassFailed>() {
+        root.insert(
+            "first_pass_before_the_error".to_owned(),
+            failed.first_pass.clone(),
+        );
+    }
     Value::Object(root)
 }
 
@@ -1599,41 +1712,49 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
     let results = measurement
         .levels
         .iter()
-        .map(|level| {
-            let mut entry = Map::new();
-            entry.insert("appenders".to_owned(), Value::from(level.appenders));
-            entry.insert("share_count".to_owned(), Value::from(level.share_count));
-            entry.insert("append_seconds".to_owned(), json_f64(level.append_seconds));
-            entry.insert(
-                "shares_per_second".to_owned(),
-                json_f64(level.shares_per_second),
-            );
-            entry.insert(
-                "passed_minimum".to_owned(),
-                Value::from(level.passed_minimum),
-            );
-            entry.insert(
-                "contaminated".to_owned(),
-                level.contaminated.map_or(Value::Null, Value::from),
-            );
-            let per_appender = level
-                .per_appender
-                .iter()
-                .map(|(writer_id, count)| {
-                    let mut one = Map::new();
-                    one.insert("writer_id".to_owned(), Value::from(writer_id.clone()));
-                    one.insert("share_count".to_owned(), Value::from(*count));
-                    Value::Object(one)
-                })
-                .collect::<Vec<_>>();
-            entry.insert("per_appender".to_owned(), Value::Array(per_appender));
-            entry.insert("order_lock".to_owned(), level.order_lock.clone());
-            Value::Object(entry)
-        })
+        .map(level_entry)
         .collect::<Vec<_>>();
     root.insert("results".to_owned(), Value::Array(results));
     root.insert("notes".to_owned(), Value::from(NOTES));
     Value::Object(root)
+}
+
+/// One level's report entry. A first pass below the floor sits under
+/// `first_pass` in the same shape, its lock evidence included (#683).
+fn level_entry(level: &LevelResult) -> Value {
+    let mut entry = Map::new();
+    entry.insert("appenders".to_owned(), Value::from(level.appenders));
+    entry.insert("share_count".to_owned(), Value::from(level.share_count));
+    entry.insert("append_seconds".to_owned(), json_f64(level.append_seconds));
+    entry.insert(
+        "shares_per_second".to_owned(),
+        json_f64(level.shares_per_second),
+    );
+    entry.insert(
+        "passed_minimum".to_owned(),
+        Value::from(level.passed_minimum),
+    );
+    entry.insert(
+        "first_pass".to_owned(),
+        level.first_pass.as_deref().map_or(Value::Null, level_entry),
+    );
+    entry.insert(
+        "contaminated".to_owned(),
+        level.contaminated.map_or(Value::Null, Value::from),
+    );
+    let per_appender = level
+        .per_appender
+        .iter()
+        .map(|(writer_id, count)| {
+            let mut one = Map::new();
+            one.insert("writer_id".to_owned(), Value::from(writer_id.clone()));
+            one.insert("share_count".to_owned(), Value::from(*count));
+            Value::Object(one)
+        })
+        .collect::<Vec<_>>();
+    entry.insert("per_appender".to_owned(), Value::Array(per_appender));
+    entry.insert("order_lock".to_owned(), level.order_lock.clone());
+    Value::Object(entry)
 }
 
 /// Writes the report and returns its path. Called before the floor assertion so
@@ -1672,6 +1793,21 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
         .map(|level| format!("{}:{:.1}", level.appenders, level.shares_per_second))
         .collect::<Vec<_>>()
         .join(",");
+    let first_passes = measurement
+        .levels
+        .iter()
+        .filter_map(|level| {
+            level
+                .first_pass
+                .as_ref()
+                .map(|first| format!("{}:{:.1}", level.appenders, first.shares_per_second))
+        })
+        .collect::<Vec<_>>();
+    let first_passes = if first_passes.is_empty() {
+        "none".to_owned()
+    } else {
+        first_passes.join(",")
+    };
     let contaminated = match measurement.contaminated {
         Some(true) => "true",
         Some(false) => "false",
@@ -1679,7 +1815,8 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
     };
     let line = format!(
         "throughput_floor summary: test={} build={} window={} shares_per_level={} \
-         shares_per_second_by_appenders={} floor={:.1} passed={} contaminated={}\n",
+         shares_per_second_by_appenders={} first_passes_below_floor={} floor={:.1} passed={} \
+         contaminated={}\n",
         config.test_name,
         if cfg!(debug_assertions) {
             "debug"
@@ -1689,6 +1826,7 @@ fn emit_summary(config: &Config, measurement: &Measurement) {
         config.window_shares,
         config.shares_per_level,
         levels,
+        first_passes,
         config.minimum,
         measurement.passed_minimum,
         contaminated,
@@ -1707,7 +1845,7 @@ async fn run_floor(test_name: &str, defaults: Defaults, selection: Selection) ->
     // no connection, no schema, no seeding. Nothing below this line can run
     // with an out-of-range sampling interval or an uncomparable floor
     // (EP-VALIDATION).
-    let config = Config::from_env(test_name, defaults)?;
+    let config = Config::from_env(test_name, defaults, selection)?;
     // An explicitly selected `#[ignore]`d run must never skip: the gate crate
     // provides `required_database_url` for exactly that, and a silent success
     // here would look like a measurement that simply found nothing to say.
@@ -1752,9 +1890,17 @@ async fn run_floor(test_name: &str, defaults: Defaults, selection: Selection) ->
         ensure!(
             level.passed_minimum,
             "share-append throughput floor: the level of {} appender(s) sustained {:.2} \
-             shares/s, below the floor of {:.2} shares/s ({}).{} The report is at {}.",
+             shares/s{}, below the floor of {:.2} shares/s ({}).{} The report is at {}.",
             level.appenders,
             level.shares_per_second,
+            level
+                .first_pass
+                .as_ref()
+                .map(|first| format!(
+                    " on a second pass, after {:.2} on the first",
+                    first.shares_per_second
+                ))
+                .unwrap_or_default(),
             config.minimum,
             config.minimum_source,
             match level.contaminated {
@@ -2011,6 +2157,105 @@ fn contamination_folds_true_over_unknown_over_false() {
         Some(true),
         "one shared level makes the whole run's numbers shared"
     );
+}
+
+/// A pass as `run_level` returns one, for the database-free retry tests.
+fn timed_pass(shares_per_second: f64, contaminated: Option<bool>) -> LevelResult {
+    LevelResult {
+        appenders: 1,
+        share_count: 2_000,
+        append_seconds: 2_000.0 / shares_per_second,
+        shares_per_second,
+        passed_minimum: shares_per_second >= CI_MIN_SHARES_PER_SEC,
+        first_pass: None,
+        contaminated,
+        per_appender: Vec::new(),
+        order_lock: Value::Null,
+    }
+}
+
+/// Runs `measure_level` over scripted passes and returns the level with the
+/// writer-id suffixes it asked for, in order.
+async fn scripted_level(retry: bool, passes: Vec<LevelResult>) -> (LevelResult, Vec<&'static str>) {
+    let mut passes = passes.into_iter();
+    let mut suffixes = Vec::new();
+    let level = measure_level(retry, async |suffix| {
+        suffixes.push(suffix);
+        Ok(passes.next().expect("no further pass was scripted"))
+    })
+    .await
+    .expect("the scripted passes succeed");
+    (level, suffixes)
+}
+
+#[tokio::test]
+async fn a_level_below_the_floor_is_measured_once_more_and_only_that_pass_decides() {
+    // Met the floor: one pass, nothing kept beside it.
+    let (level, suffixes) = scripted_level(true, vec![timed_pass(500.0, Some(false))]).await;
+    assert_eq!(suffixes, [""]);
+    assert!(level.passed_minimum && level.first_pass.is_none());
+
+    // A stall: the first pass misses, the second decides and keeps the first
+    // pass's rate and contamination beside its own.
+    let (level, suffixes) = scripted_level(
+        true,
+        vec![
+            timed_pass(130.0, Some(true)),
+            timed_pass(480.0, Some(false)),
+        ],
+    )
+    .await;
+    assert_eq!(suffixes, ["", "-retry"]);
+    assert!(level.passed_minimum);
+    assert_eq!(level.shares_per_second, 480.0);
+    let first = level.first_pass.as_ref().expect("the first pass is kept");
+    assert_eq!((first.shares_per_second, first.share_count), (130.0, 2_000));
+    // Its foreign backend still marks the run, though the second pass was clean.
+    assert_eq!(levels_contamination(&[level]), Some(true));
+
+    // A collapse misses on both passes and still fails, with both rates.
+    let (level, _) = scripted_level(
+        true,
+        vec![
+            timed_pass(130.0, Some(false)),
+            timed_pass(120.0, Some(false)),
+        ],
+    )
+    .await;
+    assert!(!level.passed_minimum);
+    assert_eq!(level.shares_per_second, 120.0);
+    assert_eq!(
+        level
+            .first_pass
+            .as_ref()
+            .map(|first| first.shares_per_second),
+        Some(130.0)
+    );
+
+    // Without the retry (the explicit full-size run) one pass decides.
+    let (level, suffixes) = scripted_level(false, vec![timed_pass(130.0, Some(false))]).await;
+    assert_eq!(suffixes, [""]);
+    assert!(!level.passed_minimum && level.first_pass.is_none());
+
+    // A second pass that errors keeps the first pass for the error report,
+    // under whatever context the run adds on its way out.
+    let mut passes = vec![
+        Ok(timed_pass(130.0, Some(false))),
+        Err(anyhow::anyhow!("pool timed out")),
+    ]
+    .into_iter();
+    let error = measure_level(true, async |_| {
+        passes.next().expect("no further pass was scripted")
+    })
+    .await
+    .err()
+    .expect("the second pass errors")
+    .context("measuring the run");
+    let failed = error
+        .downcast_ref::<SecondPassFailed>()
+        .expect("the first pass rides on the error");
+    assert_eq!(failed.first_pass["shares_per_second"], 130.0);
+    assert!(format!("{error:#}").contains("pool timed out"));
 }
 
 #[test]
