@@ -5,24 +5,65 @@
 # In production, `self-check` stops at legacy audit completeness and skips its local checks until
 # the import has finished (#734). This script checks every fact `self-check` checks
 # (`self_check()` and `self_check_local()` in crates/qbit-prism-server/src/tools.rs), with one
-# exception: legacy completeness, which it reports as "N legacy rows pending, import running".
-# It still fails on any native audit row that self-check would count as incomplete.
+# exception: legacy completeness, which it reports as pending, together with whether an
+# import-audits session can be seen. It still fails on any native audit row that self-check would
+# count as incomplete.
 #
 # Run it on each frontend host, as the frontend's service user, with that frontend's operator
 # environment exported (the environment `self-check` would read):
 #   set -a; . <the frontend's environment file>; set +a
 #   bash prism_legacy_import_admission_gate.sh
-# It needs `qbit-prism-server` and `psql` on PATH. Every query runs in a read-only transaction.
-# Nothing prints a DSN or a token. Exit 0 only when every check passes.
+# It needs `qbit-prism-server`, `psql` and `python3` on PATH. Every query runs in a read-only
+# transaction. psql is given the database URL without its password, which it reads from
+# PGPASSWORD, so no credential appears in a command line or in the output. Exit 0 only when
+# every check passes.
 set -uo pipefail
 : "${PRISM_DATABASE_URL:?export the frontend environment first}"
 fail=0
 pass() { printf 'PASS  %s\n' "$1"; }
 bad() { printf 'FAIL  %s\n' "$1"; fail=1; }
 info() { printf 'INFO  %s\n' "$1"; }
-psqlq() {
-  psql "$PRISM_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 \
-    -c "SET default_transaction_read_only = on" -c "$1" 2>/dev/null
+warn() { printf 'WARN  %s\n' "$1"; }
+trim() {
+  local value=$1
+  value=${value#"${value%%[![:space:]]*}"}
+  printf '%s' "${value%"${value##*[![:space:]]}"}"
+}
+
+# The URL without its password, and the password: from the user info or a `password` query
+# parameter, percent-decoded as libpq decodes them.
+if ! { IFS= read -r -d '' database && IFS= read -r -d '' password; } < <(python3 - <<'PY'
+import os, sys, urllib.parse
+parts = urllib.parse.urlsplit(os.environ["PRISM_DATABASE_URL"].strip())
+if parts.scheme not in ("postgres", "postgresql"):
+    sys.exit(1)
+userinfo, at, hosts = parts.netloc.rpartition("@")
+user, _, password = userinfo.partition(":")
+password = urllib.parse.unquote(password)
+kept = []
+for item in parts.query.split("&") if parts.query else []:
+    key, _, value = item.partition("=")
+    if urllib.parse.unquote(key) == "password":
+        password = urllib.parse.unquote(value)
+    else:
+        kept.append(item)
+if "\0" in password:
+    sys.exit(1)
+netloc = f"{user}@{hosts}" if at else hosts
+url = urllib.parse.urlunsplit(parts._replace(netloc=netloc, query="&".join(kept)))
+sys.stdout.write(url + "\0" + password + "\0")
+PY
+); then
+  echo "PRISM_DATABASE_URL must be a postgres:// or postgresql:// URL" >&2
+  exit 2
+fi
+if [ -n "$password" ]; then export PGPASSWORD=$password; fi
+unset password
+psqlq() { # psqlq SQL [psql -v name=value ...]
+  local sql=$1
+  shift
+  printf 'SET default_transaction_read_only = on;\n%s;\n' "$sql" |
+    psql "$database" -XAtq -v ON_ERROR_STOP=1 "$@" 2>/dev/null
 }
 
 # 1. Configuration under production rules, the pool fee settling dust (#525) and the block
@@ -34,10 +75,39 @@ else
 fi
 grep -E '^WARNING' <<<"$out" | sed 's/^/INFO  check-config /'
 
-# 2. The live-instance census. self-check fails only when the heartbeat read fails, and warns
-#    below two live frontends.
-if rows=$(psqlq "SELECT jsonb_agg(jsonb_build_object('id', instance_id, 'age_s', round(extract(epoch FROM clock_timestamp() - heartbeat_at)::numeric, 1), 'status', left(status::text, 80)) ORDER BY instance_id) FROM qbit_prism_instances"); then
-  pass "heartbeat census read: ${rows:-[]}"
+# 2. The live-instance census, classified as `live_instances()` classifies it. self-check fails
+#    only when the heartbeat read fails, and warns when HA is unknown or fewer than two
+#    frontends are live. Freshness is 3 health refreshes, at least 15 s.
+refresh=$(trim "${PRISM_HEALTH_REFRESH_SECONDS:-}")
+if [[ ${refresh:-2} =~ ^[0-9]+$ ]] && [ "${refresh:-2}" -ge 1 ]; then
+  fresh=$(( ${refresh:-2} * 3 > 15 ? ${refresh:-2} * 3 : 15 ))
+else
+  fresh=15
+fi
+if census=$(psqlq "WITH sample AS (SELECT clock_timestamp() AS observed_at),
+heartbeats AS (
+  SELECT instance_id, extract(epoch FROM (observed_at - heartbeat_at)) AS age, status,
+    coalesce(jsonb_typeof(status) = 'object'
+      AND status->>'schema' = 'qbit.prism.audit-health.v1'
+      AND jsonb_typeof(status->'ready') = 'boolean', false) AS health
+  FROM qbit_prism_instances, sample)
+SELECT count(*) FILTER (WHERE age BETWEEN 0 AND :fresh AND health) || '|'
+  || count(*) FILTER (WHERE age > :fresh) || '|'
+  || count(*) FILTER (WHERE age BETWEEN 0 AND :fresh AND NOT health
+       AND coalesce(status->>'state', '') IN ('starting', 'stopped')) || '|'
+  || count(*) FILTER (WHERE age < 0 OR (age <= :fresh AND NOT health
+       AND coalesce(status->>'state', '') NOT IN ('starting', 'stopped'))) || '|'
+  || coalesce(jsonb_agg(jsonb_build_object('id', instance_id, 'age_s', round(age::numeric, 1),
+       'status', left(status::text, 80)) ORDER BY instance_id)::text, '[]')
+FROM heartbeats" -v fresh="$fresh"); then
+  IFS='|' read -r live stale inactive unknown rows <<<"$census"
+  pass "heartbeat census read: $rows"
+  info "HA: $live live, $stale stale, $inactive inactive, $unknown unknown (freshness ${fresh}s)"
+  if [ "$unknown" != 0 ]; then
+    warn "Unrecognized or future-dated heartbeats; HA is unknown"
+  elif [ "$live" -lt 2 ]; then
+    warn "Fewer than two live frontends observed; do not present this deployment as HA"
+  fi
 else
   bad "heartbeat census read failed"
 fi
@@ -49,13 +119,29 @@ info "submission hold: $(qbit-prism-server submission-hold show 2>&1 | tr '\n' '
 #    snapshot) are what import-audits is storing. A native row (with a snapshot) that has no
 #    bytes and either no object body or no snapshot row is incomplete, and fails here as it
 #    would fail self-check.
-if c=$(psqlq "SELECT count(*) FILTER (WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL), count(*) FILTER (WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NOT NULL AND (jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object' OR NOT EXISTS (SELECT 1 FROM qbit_prism_audit_snapshots s WHERE s.snapshot_sha256 = a.share_snapshot_sha256))) FROM qbit_pool_audit_bundles a"); then
+if c=$(psqlq "SELECT count(*) FILTER (WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL) || '|' || count(*) FILTER (WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NOT NULL AND (jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object' OR NOT EXISTS (SELECT 1 FROM qbit_prism_audit_snapshots s WHERE s.snapshot_sha256 = a.share_snapshot_sha256))) FROM qbit_pool_audit_bundles a"); then
   IFS='|' read -r legacy native <<<"$c"
-  info "audit completeness: ${legacy} legacy rows pending, import running"
+  info "audit completeness: ${legacy} legacy rows pending"
   if [ "$native" = 0 ]; then
     pass "native audit rows complete"
   else
     bad "${native} native audit rows are incomplete"
+  fi
+  # Whether import-audits is running: a session whose last statement is the import's row read
+  # or write. Other sessions' statements need pg_read_all_stats to be seen.
+  if [ "${legacy:-0}" != 0 ]; then
+    if s=$(psqlq "SELECT count(*) FILTER (WHERE importing) || '|' || coalesce(round(extract(epoch FROM clock_timestamp() - max(query_start) FILTER (WHERE importing)))::text, '-') || '|' || count(*) FILTER (WHERE query = '<insufficient privilege>') FROM (SELECT query, query_start, (query LIKE 'UPDATE qbit_pool_audit_bundles SET schema_version=%' OR query LIKE 'SELECT block_hash,body_uri,audit_bundle,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles%') AS importing FROM pg_stat_activity WHERE pid <> pg_backend_pid()) t"); then
+      IFS='|' read -r sessions age hidden <<<"$s"
+      if [ "$sessions" != 0 ]; then
+        info "import-audits: $sessions session(s), last statement ${age}s ago"
+      elif [ "$hidden" != 0 ]; then
+        info "import-audits progress not visible to this role (pg_read_all_stats shows it)"
+      else
+        warn "no import-audits session found: legacy completeness will not progress until it runs"
+      fi
+    else
+      warn "could not read pg_stat_activity for import-audits progress"
+    fi
   fi
 else
   bad "audit completeness read failed"
@@ -80,18 +166,14 @@ else
   bad "durability read failed"
 fi
 
-# 7. The found-block offer's standby (#529), when PRISM_OFFER_STANDBY_APPLICATION_NAME is set: the
-#    role can read replication positions, and exactly one streaming or catching-up standby by that
-#    name reports a flush position.
-if [ -n "${PRISM_OFFER_STANDBY_APPLICATION_NAME:-}" ]; then
-  s=$(psql "$PRISM_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 \
-    -v app="$PRISM_OFFER_STANDBY_APPLICATION_NAME" <<'SQL' 2>/dev/null
-SET default_transaction_read_only = on;
-SELECT pg_has_role(current_user, 'pg_read_all_stats', 'USAGE')::text || '|' || count(*) || '|' || count(flush_lsn)
-FROM pg_catalog.pg_stat_replication
-WHERE application_name = :'app' AND state IN ('streaming', 'catchup');
-SQL
-  )
+# 7. The found-block offer's standby (#529), on when PRISM_OFFER_STANDBY_APPLICATION_NAME is set
+#    and PRISM_OFFER_STANDBY_FLUSH_WAIT_MS is not 0 (default 250): the role can read replication
+#    positions, and exactly one streaming or catching-up standby by that name reports a flush
+#    position.
+standby=$(trim "${PRISM_OFFER_STANDBY_APPLICATION_NAME:-}")
+wait_ms=$(trim "${PRISM_OFFER_STANDBY_FLUSH_WAIT_MS:-}")
+if [ -n "$standby" ] && ! [[ $wait_ms =~ ^\+?0+$ ]]; then
+  s=$(psqlq "SELECT pg_has_role(current_user, 'pg_read_all_stats', 'USAGE')::text || '|' || count(*) || '|' || count(flush_lsn) FROM pg_catalog.pg_stat_replication WHERE application_name = :'app' AND state IN ('streaming', 'catchup')" -v app="$standby")
   if [ "$s" = "true|1|1" ]; then
     pass "offer standby usable"
   else
@@ -110,36 +192,77 @@ else
   bad "healthcheck: $(tail -1 <<<"$out")"
 fi
 
-# 9. The highdiff listener's floor, when highdiff is configured: the first difficulty it
-#    advertises is at least PRISM_STRATUM_HIGHDIFF_MIN_DIFF (default 500000).
-if [ -n "${PRISM_STRATUM_HIGHDIFF_PORT:-}${PRISM_STRATUM_HIGHDIFF_BIND:-}" ]; then
-  user=${PRISM_SELF_CHECK_ADDRESS:-${PRISM_USERNAME_FALLBACK:-${PRISM_FEE_ADDRESS:-}}}
+# 9. The highdiff listener's floor, when PRISM_STRATUM_HIGHDIFF_PORT is set: within 15 s, the
+#    first difficulty it advertises is at least PRISM_STRATUM_HIGHDIFF_MIN_DIFF (default 500000).
+#    The probe authorizes as self-check does: PRISM_SELF_CHECK_ADDRESS, the username fallback
+#    (PRISM_USERNAME_FALLBACK_ADDRESS, or the built-in test-network address), the pool fee
+#    address, then the most recent miner.
+highdiff_port=$(trim "${PRISM_STRATUM_HIGHDIFF_PORT:-}")
+if [ -n "$highdiff_port" ]; then
+  user=$(trim "${PRISM_SELF_CHECK_ADDRESS:-}")
+  [ -n "$user" ] || user=$(trim "${PRISM_USERNAME_FALLBACK_ADDRESS:-}")
+  if [ -z "$user" ]; then
+    case "$(trim "${QBIT_CHAIN:-regtest}" | tr '[:upper:]' '[:lower:]')" in
+      test | testnet | testnet3 | testnet4 | signet)
+        user=tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3 ;;
+    esac
+  fi
+  [ -n "$user" ] || user=$(trim "${PRISM_POOL_FEE_ADDRESS:-}")
   [ -n "$user" ] || user=$(psqlq "SELECT miner_id FROM qbit_share_ledger ORDER BY share_seq DESC LIMIT 1")
-  if res=$(python3 - "${PRISM_STRATUM_HIGHDIFF_BIND:-${PRISM_STRATUM_BIND:-127.0.0.1}}" \
-    "${PRISM_STRATUM_HIGHDIFF_PORT:-4334}" "$user" "${PRISM_STRATUM_HIGHDIFF_MIN_DIFF:-500000}" <<'PY' 2>&1
-import json, socket, sys
+  bind=$(trim "${PRISM_STRATUM_HIGHDIFF_BIND:-}")
+  [ -n "$bind" ] || bind=${PRISM_STRATUM_BIND:-127.0.0.1}
+  floor=$(trim "${PRISM_STRATUM_HIGHDIFF_MIN_DIFF:-}")
+  if [ -z "$user" ]; then
+    bad "highdiff probe: set PRISM_SELF_CHECK_ADDRESS to a valid P2MR address to probe highdiff on an empty pool"
+  elif res=$(python3 - "$bind" "$highdiff_port" "$user" "${floor:-500000}" <<'PY' 2>&1
+import json, math, socket, sys, time
 host, port, user, floor = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
-host = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}.get(host, host)
-conn = socket.create_connection((host, port), timeout=15)
-conn.settimeout(15)
-for message in ({"id": 1, "method": "mining.subscribe", "params": ["prism-admission-gate"]},
-                {"id": 2, "method": "mining.authorize", "params": [user, "x"]}):
-    conn.sendall((json.dumps(message) + "\n").encode())
-pending = b""
-while True:
-    chunk = conn.recv(65536)
-    if not chunk:
-        sys.exit("disconnected before a difficulty")
-    pending += chunk
-    while b"\n" in pending:
-        line, pending = pending.split(b"\n", 1)
-        value = json.loads(line)
-        if value.get("error"):
-            sys.exit(f"rejected: {value['error']}")
-        if value.get("method") == "mining.set_difficulty":
-            difficulty = float(value["params"][0])
-            print(f"{difficulty} {'>=' if difficulty >= floor else '<'} {floor}")
-            sys.exit(0 if difficulty >= floor else 1)
+host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host).strip("[]")
+deadline = time.monotonic() + 15
+
+def remaining():
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise socket.timeout()
+    return left
+
+try:
+    conn = socket.create_connection((host, port), timeout=remaining())
+    for message in ({"id": 1, "method": "mining.subscribe", "params": ["prism-admission-gate"]},
+                    {"id": 2, "method": "mining.authorize", "params": [user, "x"]}):
+        conn.settimeout(remaining())
+        conn.sendall((json.dumps(message) + "\n").encode())
+    pending = b""
+    while True:
+        conn.settimeout(remaining())
+        chunk = conn.recv(65536)
+        if not chunk:
+            sys.exit("Stratum probe disconnected before difficulty")
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if len(line) > 1024 * 1024:
+                sys.exit("oversized Stratum probe response")
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                continue
+            if value.get("error") is not None:
+                sys.exit(f"Stratum probe rejected: {value['error']}")
+            if value.get("method") == "mining.set_difficulty":
+                params = value.get("params")
+                difficulty = params[0] if isinstance(params, list) and params else None
+                if (isinstance(difficulty, bool) or not isinstance(difficulty, (int, float))
+                        or not math.isfinite(difficulty) or difficulty <= 0):
+                    sys.exit("invalid advertised difficulty")
+                difficulty = float(difficulty)
+                print(f"{difficulty} {'>=' if difficulty >= floor else '<'} {floor}")
+                sys.exit(0 if difficulty >= floor else 1)
+        if len(pending) > 1024 * 1024:
+            sys.exit("oversized Stratum probe response")
+except socket.timeout:
+    sys.exit("Stratum difficulty probe timed out")
+except OSError as error:
+    sys.exit(f"Stratum probe failed: {error}")
 PY
   ); then
     pass "highdiff first difficulty $res"
