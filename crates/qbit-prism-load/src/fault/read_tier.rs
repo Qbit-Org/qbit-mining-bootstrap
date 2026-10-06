@@ -133,6 +133,7 @@ impl ReadTier {
             task: None,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last_failure: String;
         loop {
             if let Some(status) = tier
                 .child
@@ -144,17 +145,14 @@ impl ReadTier {
                     tier.log.display()
                 );
             }
-            let healthy = client
-                .get(format!("{url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success());
-            if healthy {
-                break;
+            match client.get(format!("{url}/healthz")).send().await {
+                Ok(response) if response.status().is_success() => break,
+                Ok(response) => last_failure = format!("answered {}", response.status()),
+                Err(error) => last_failure = transport_failure(error),
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "public-api was not healthy within 60 s; see {}",
+                    "public-api was not healthy within 60 s (last attempt: {last_failure}); see {}",
                     tier.log.display()
                 );
             }
@@ -254,10 +252,16 @@ async fn one(
                     Some(status),
                     Some(String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned()),
                 ),
-                Err(error) => (None, Some(format!("reading the body: {}", describe(error)))),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "reading the body of a {status} answer: {}",
+                        transport_failure(error)
+                    )),
+                ),
             }
         }
-        Err(error) => (None, Some(describe(error))),
+        Err(error) => (None, Some(transport_failure(error))),
     };
     samples
         .lock()
@@ -272,12 +276,20 @@ async fn one(
         });
 }
 
+/// The most a recorded transport failure keeps, as a refusal body keeps 200.
+const FAILURE_TEXT_LIMIT: usize = 400;
+
 /// A transport error with its causes, such as "error sending request for url
 /// (...): client error (SendRequest): connection closed before message
 /// completed". reqwest's own text names only the URL, so a reset, a refused
-/// connection and a timeout would all read alike (#701).
-fn describe(error: reqwest::Error) -> String {
-    format!("{:#}", anyhow::Error::new(error))
+/// connection and a timeout would all read alike (#701). Redacted like every
+/// other error chain the harness writes out, and capped.
+fn transport_failure(error: reqwest::Error) -> String {
+    let text = crate::frontend::redact_secrets_in_text(&format!("{:#}", anyhow::Error::new(error)));
+    match text.char_indices().nth(FAILURE_TEXT_LIMIT) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
 }
 
 /// The read tier's figures over `[from, to)`, excluding frontends that were
@@ -444,30 +456,50 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_request_records_why_it_failed() {
-        // A port nothing listens on: the connection is refused.
-        let port = free_port().expect("a free port");
+        // A listener that accepts every connection and drops it before
+        // answering, held for the whole test, so no other test can take the
+        // port: the request fails after it connected, as #701's did.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let url = format!(
+            "http://{}/public/v1/pool-summary",
+            listener.local_addr().expect("its address")
+        );
+        let dropper = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        // No proxy from the environment between the scrape and 127.0.0.1.
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .no_proxy()
+            .build()
+            .expect("a client");
         let samples = Arc::new(Mutex::new(Vec::new()));
         one(
-            client().expect("the read tier's client"),
+            client,
             "public-api".into(),
-            format!("http://127.0.0.1:{port}/public/v1/pool-summary"),
+            url.clone(),
             PUBLIC_PATHS[0].into(),
             samples.clone(),
         )
         .await;
+        dropper.abort();
         let samples = samples.lock().expect("samples");
+        assert!(samples[0].status.is_none());
         let error = samples[0]
             .error
             .as_deref()
             .expect("a failed request has an error");
-        assert!(samples[0].status.is_none());
-        // The URL-only top line, then the cause that tells a refusal from a
-        // reset or a timeout.
-        assert!(
-            error.starts_with("error sending request for url"),
-            "{error}"
-        );
-        assert!(error.to_lowercase().contains("connect"), "{error}");
+        // reqwest's own line, which names only the URL, and then the cause
+        // that tells a dropped connection from a refusal or a timeout.
+        let top = format!("error sending request for url ({url})");
+        let cause = error
+            .strip_prefix(&top)
+            .unwrap_or_else(|| panic!("{error:?} does not start with {top:?}"));
+        assert!(cause.starts_with(": ") && cause.len() > 2, "{error}");
     }
 
     #[test]
