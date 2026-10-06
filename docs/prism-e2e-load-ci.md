@@ -491,7 +491,7 @@ file is on `main`:
 gh workflow run prism-load-l3.yml -f suite=l3-full -f ref=my-branch
 
 # What a v* tag on this ref would do: promote a matching PR run, or run l3-full.
-gh workflow run prism-load-l3.yml -f ref=v3.0.0-rc1 -f tag_dry_run=true
+gh workflow run prism-load-l3.yml -f ref=v3.0.0-rc.1 -f tag_dry_run=true
 ```
 
 To run `l3-full` on a PR, apply `release-candidate`. A PR that changes
