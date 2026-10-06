@@ -24,8 +24,9 @@ below.
     A down for about 4 s, and 158 of the 400 sessions spilled to the backup
     frontend and stayed there.
   - **The kernel caps the backlog at `net.core.somaxconn`** in the frontend's
-    network namespace. The `PRISM listening` log line now records both
-    values, and a warning names the cap when somaxconn is the lower.
+    network namespace. The primary Stratum listener's `PRISM listening` log
+    line records the backlog and the namespace's somaxconn, and a warning
+    names the cap when somaxconn is the lower.
   - **The audit and operator HTTP listener and the public read service** now
     listen with a fixed 1024.
   - **`PRISM_STRATUM_LISTEN_BACKLOG` is a supported setting again.** It was
@@ -34,12 +35,19 @@ below.
 
 ## Upgrading
 
-- **From 2.0.x:** as in the rc.3 notes. A 2.x.x `PRISM_STRATUM_LISTEN_BACKLOG`
-  is honored again, where rc.1 to rc.3 refused it as retired. Unset, it is
-  4096.
+- **From 2.0.x:** as in the rc.3 notes, and `PRISM_STRATUM_LISTEN_BACKLOG` is
+  read again. rc.1 to rc.3 did not read it. In production mode they refused it
+  as set but unread; elsewhere they warned, ignored it and listened with
+  mio's 128. Unset, it is 4096. A value carried over from 2.x.x overrides that
+  default (2.x.x's own default was 1024), and a value above 2147483647 now
+  fails `check-config`.
 - **From 3.0.0-rc.3:** no migration; replace the binary on every frontend.
   Keep `net.core.somaxconn` in each frontend's network namespace at least as
   high as the backlog.
+- **Rolling a frontend back to rc.3 or earlier:** first remove
+  `PRISM_STRATUM_LISTEN_BACKLOG` from its environment. This candidate's
+  `compose.yaml` always passes it (default 4096). Earlier native builds in
+  production mode refuse to start with a set-but-unread `PRISM_*` setting.
 
 ## Verification
 
@@ -50,9 +58,17 @@ binding and its setting:
 - the setting's move from `config/retired-settings.txt` to
   `config/native-settings.txt`.
 
-It doesn't touch the order lock, the append, refresh or settlement, so rc.3's
-pair evidence (D1, C4 and C10) applies to this candidate. Its own evidence is
-the same set as rc.3's (#557):
+#723 also passes the setting through `compose.yaml` (default 4096) and
+`.env.example`. It doesn't touch the order lock, the append, refresh or
+settlement. So the pair evidence rc.3's notes cite still applies: the D1
+peak-second gate, the 750/s ceiling and the failover drill under load, run 1,
+all measured on #719's build.
+
+#723's own proof in CI is its unit test: 300 concurrent connects against a
+512 backlog with nothing accepting. None of this candidate's suites bursts
+more than 128 connects through a load balancer, so the pair's C5 re-run is
+the proof on the pair. Otherwise the evidence is the same set as rc.3's
+(#557):
 - CI on the version-bump pull request, and dispatched on the tag;
 - the L3 production-window matrix on the version-bump pull request, which
   the tag promotes on a tree match (#608);
@@ -65,7 +81,7 @@ rc.1's full nightly set and 5.5 h soak carry over. The evidence bundle on the
 
 ## Known issues
 
-As in the rc.3 notes:
+As in the rc.3 notes, with one addition (#724, the last item):
 - **#716 (open part):** at a tip change under load, a share admitted under a
   tip-change lease can be refused when its commit gate finds the publication
   authority busy. It is never credited, nothing is written and no ACKed
