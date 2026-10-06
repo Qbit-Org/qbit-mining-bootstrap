@@ -385,3 +385,511 @@ async fn migration_002_refuses_a_2x_source_holding_the_backfill_progress_name_be
     assert!(untouched, "the refused migrate changed the source");
     db.close(Vec::new()).await
 }
+
+/// Whether the database declares the pending backfill's fence (#669).
+async fn fence_declared(pool: &PgPool) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending' AND capability_value=1)",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Commit the migration transaction of a populated 2.x.x source and leave
+/// its backfill pending: the runners' lock is held while it commits, and the
+/// waiting `migrate` is then dropped. Returns the connection holding the
+/// lock.
+async fn pending_backfill(db: &Database, pool: &PgPool) -> Result<PgConnection> {
+    let mut runners = PgConnection::connect(&db.url).await?;
+    sqlx::query("SELECT pg_advisory_lock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let mut migrate = Box::pin(Ledger::connect(&db.url, "pending".into(), 8, true));
+    let committed = timeout(Duration::from_secs(60), async {
+        while cursor(pool).await?.is_none() {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    tokio::select! {
+        result = &mut migrate => bail!("migrate ended before the backfill ran: {:?}", result.err()),
+        result = committed => result.context("the migration transaction never committed")??,
+    }
+    drop(migrate);
+    Ok(runners)
+}
+
+/// The fence keeps every build before #669 off the database until 2 is
+/// recorded, whatever the record says: declared with the cursor, still
+/// declared when 2 is recorded by hand and while a resume maps, and removed
+/// only with the cursor. That an earlier build refuses the declaration is
+/// `a_pending_share_hash_backfill_fences_every_earlier_build`.
+#[tokio::test]
+async fn migration_002_fences_earlier_builds_until_its_backfill_is_recorded() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let expected = expected_mapping(&pool, i64::MAX).await?;
+    let mut runners = pending_backfill(&db, &pool).await?;
+    assert!(
+        fence_declared(&pool).await?,
+        "a pending backfill is not fenced"
+    );
+    // Recorded by hand, 2 neither lifts the fence nor lets this build start.
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+        .execute(&pool)
+        .await?;
+    assert!(fence_declared(&pool).await?);
+    let (next, end) = cursor(&pool).await?.context("the progress table is gone")?;
+    assert_refused_at(&db.url, next, end).await?;
+    sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=2")
+        .execute(&pool)
+        .await?;
+    // A resume maps under the fence: seen while a batch waits on an open
+    // insert.
+    let blocker = block_late_header(&pool).await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "resumed".into(), 8, true));
+    tokio::select! {
+        result = &mut resume => bail!("the resume ended before its batch reached the late header: {:?}", result.err()),
+        result = batch_waiting(&pool) => { result?; }
+    }
+    assert!(fence_declared(&pool).await?, "a resume mapped unfenced");
+    blocker.rollback().await?;
+    let resumed = timeout(Duration::from_secs(120), resume).await??;
+    // Recorded: the fence went with the cursor.
+    assert!(
+        !fence_declared(&pool).await?,
+        "the fence outlived the backfill"
+    );
+    assert_eq!(cursor(&pool).await?, None);
+    assert_eq!(mapping(&pool).await?, expected);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    runners.close().await?;
+    db.close(vec![resumed]).await
+}
+
+/// An open insert of the late header, which stops the batch that reaches
+/// it until the transaction ends.
+async fn block_late_header(pool: &PgPool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut blocker = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,'blocker:'||$1)",
+    )
+    .bind(format!("{LATE:064x}"))
+    .execute(&mut *blocker)
+    .await?;
+    Ok(blocker)
+}
+
+/// The backend of a batch waiting on `block_late_header`.
+async fn batch_waiting(pool: &PgPool) -> Result<i32> {
+    timeout(Duration::from_secs(60), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND query LIKE 'INSERT INTO qbit_prism_share_hashes%' AND wait_event_type='Lock'")
+                .fetch_optional(pool)
+                .await?;
+            if let Some(pid) = pid {
+                return Ok::<_, anyhow::Error>(pid);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("no batch waited on the late header")?
+}
+
+/// A backfill an earlier build started carries no fence, and this release
+/// does not declare one when it resumes it: an earlier build's runner that
+/// passed its capability check before then could finish the backfill after
+/// this release's runner stopped, and would leave the fence behind (#669).
+/// The test crashes this release's runner mid-batch, then plays the
+/// earlier runner, which finishes the backfill knowing nothing of the
+/// fence. Nothing is left that refuses the database.
+#[tokio::test]
+async fn a_crashed_resume_leaves_no_fence_for_an_earlier_runner_to_strand() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let expected = expected_mapping(&pool, i64::MAX).await?;
+    let mut runners = pending_backfill(&db, &pool).await?;
+    // A backfill an earlier build started declares no fence.
+    sqlx::query(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'",
+    )
+    .execute(&pool)
+    .await?;
+    let blocker = block_late_header(&pool).await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "this-build".into(), 8, true));
+    let pid = tokio::select! {
+        result = &mut resume => bail!("the resume ended before its batch reached the late header: {:?}", result.err()),
+        result = batch_waiting(&pool) => result?,
+    };
+    assert!(
+        !fence_declared(&pool).await?,
+        "a resume declared a fence an earlier runner could leave behind"
+    );
+    // This release's runner crashes mid-batch.
+    sqlx::query("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .execute(&pool)
+        .await?;
+    ensure!(
+        timeout(Duration::from_secs(30), resume).await?.is_err(),
+        "the resume succeeded although its batch was killed"
+    );
+    blocker.rollback().await?;
+    // The earlier runner, queued for the lock, finishes the backfill the way
+    // #663's runner does: maps the rest, drops the cursor and records 2.
+    sqlx::query("SELECT pg_advisory_lock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let (next, end) = cursor(&pool).await?.context("the progress table is gone")?;
+    let mut tx = runners.begin().await?;
+    sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT DISTINCT ON (lower(right(share_id,64))) lower(right(share_id,64)),share_id FROM qbit_share_ledger WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$' AND share_seq>=$1 AND share_seq<$2 ORDER BY lower(right(share_id,64)),share_seq ON CONFLICT DO NOTHING")
+        .bind(next)
+        .bind(end)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill; INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    // No fence was left: migrate finishes 013, 017 and 024, and the database
+    // starts.
+    assert!(
+        !fence_declared(&pool).await?,
+        "a fence outlived the backfill"
+    );
+    let migrated = db.ledger("after").await?;
+    assert_eq!(mapping(&pool).await?, expected);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    let started = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+    runners.close().await?;
+    db.close(vec![migrated, started]).await
+}
+
+/// A newer release may declare the fence at its own value while this
+/// release's runner maps between holds of the migration lock (#669). That
+/// declaration is the newer release's to remove, with the cursor and the
+/// record: the runner reads the fence again under the migration lock
+/// before it records 2, and leaves all three. This release's next migrate
+/// refuses the newer value, and every start still refuses the pending
+/// backfill.
+#[tokio::test]
+async fn a_runner_leaves_a_newer_releases_fence_with_its_cursor_and_record() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let mut runners = pending_backfill(&db, &pool).await?;
+    let blocker = block_late_header(&pool).await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "this-build".into(), 8, true));
+    tokio::select! {
+        result = &mut resume => bail!("the resume ended before its batch reached the late header: {:?}", result.err()),
+        result = batch_waiting(&pool) => { result?; }
+    }
+    // A newer release declares the fence at its own value meanwhile.
+    set_fence(&pool, 2).await?;
+    blocker.rollback().await?;
+    let error = timeout(Duration::from_secs(120), resume)
+        .await?
+        .err()
+        .context("the runner recorded 2 over a newer release's fence")?;
+    let text = format!("{error:#}");
+    ensure!(
+        text.contains("refusing to record migration 2")
+            && text.contains("share_hash_backfill_pending = 2")
+            && text.contains("upgrade the server"),
+        "{text}"
+    );
+    let fence: Option<i32> = sqlx::query_scalar("SELECT capability_value FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'")
+        .fetch_optional(&pool)
+        .await?;
+    assert_eq!(fence, Some(2), "the runner removed a newer release's fence");
+    assert!(
+        cursor(&pool).await?.is_some(),
+        "the runner dropped the cursor"
+    );
+    assert!(!schema_versions(&pool).await?.contains(&2));
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a start accepted a pending backfill")?
+        .to_string();
+    ensure!(
+        error.contains("share-hash backfill has not finished"),
+        "{error}"
+    );
+    let error = db
+        .ledger("migrate")
+        .await
+        .err()
+        .context("migrate accepted share_hash_backfill_pending = 2")?
+        .to_string();
+    ensure!(
+        error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+            && error.contains("upgrade the server"),
+        "{error}"
+    );
+    runners.close().await?;
+    db.close(Vec::new()).await
+}
+
+/// A runner of an earlier build that is still mapping when this release
+/// resumes the backfill holds the runners' lock, finishes, drops the cursor
+/// and records 2 without knowing the fence. This release must not have
+/// declared one meanwhile, which nothing would remove (#669), and a resume
+/// declares none. The test plays the earlier runner, holding the lock while
+/// the resume's transaction commits, then finishing the backfill the way
+/// #663's runner does.
+#[tokio::test]
+async fn a_resume_leaves_no_fence_when_an_earlier_runner_finishes_the_backfill() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let expected = expected_mapping(&pool, i64::MAX).await?;
+    let mut runners = pending_backfill(&db, &pool).await?;
+    // A backfill an earlier build started declares no fence.
+    sqlx::query(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'",
+    )
+    .execute(&pool)
+    .await?;
+    let mut resume = Box::pin(Ledger::connect(&db.url, "this-build".into(), 8, true));
+    // The resume's transaction has committed once its runner polls for the
+    // lock the earlier runner holds.
+    let queued = timeout(Duration::from_secs(60), async {
+        loop {
+            let polling: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND query LIKE 'SELECT pg_try_advisory_lock%')")
+                .fetch_one(&pool)
+                .await?;
+            if polling {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+    tokio::select! {
+        result = &mut resume => bail!("the resume ended while the runners' lock was held: {:?}", result.err()),
+        result = queued => result.context("the resume's runner never queued for the runners' lock")??,
+    }
+    assert!(
+        !fence_declared(&pool).await?,
+        "the resume's transaction declared a fence an earlier runner would leave behind"
+    );
+    // The earlier runner finishes: maps the rest, drops the cursor and
+    // records 2, in its last transaction, knowing nothing of the fence.
+    let (next, end) = cursor(&pool).await?.context("the progress table is gone")?;
+    let mut tx = runners.begin().await?;
+    sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT DISTINCT ON (lower(right(share_id,64))) lower(right(share_id,64)),share_id FROM qbit_share_ledger WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$' AND share_seq>=$1 AND share_seq<$2 ORDER BY lower(right(share_id,64)),share_seq ON CONFLICT DO NOTHING")
+        .bind(next)
+        .bind(end)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill; INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    sqlx::query("SELECT pg_advisory_unlock($1,hashtext(current_schema()))")
+        .bind(RUNNER_LOCK_CLASS)
+        .execute(&mut runners)
+        .await?;
+    // This release's runner finds the backfill complete, and the database
+    // starts: no fence was left behind.
+    let resumed = timeout(Duration::from_secs(120), resume).await??;
+    assert!(
+        !fence_declared(&pool).await?,
+        "a fence outlived the backfill"
+    );
+    assert_eq!(mapping(&pool).await?, expected);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    let started = Ledger::connect(&db.url, "cold".into(), 8, false).await?;
+    runners.close().await?;
+    db.close(vec![resumed, started]).await
+}
+
+/// A fence whose cursor is gone, which only a hand-dropped cursor leaves,
+/// is refused by migrate before any DDL and, once 2 is recorded by hand
+/// too, by every start: recording 2 by hand unlocks nothing (#669). At
+/// another value the name is a newer release's declaration, refused as any
+/// newer capability is and never offered for deletion as an orphan.
+#[tokio::test]
+async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed(&pool).await?;
+    let runners = pending_backfill(&db, &pool).await?;
+    runners.close().await?;
+    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
+        .execute(&pool)
+        .await?;
+    let pending: Vec<i32> = schema_versions(&pool).await?;
+    let refused = |error: String| -> Result<()> {
+        ensure!(
+            error.contains("declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone"),
+            "{error}"
+        );
+        Ok(())
+    };
+    refused(
+        db.ledger("migrate")
+            .await
+            .err()
+            .context("migrate accepted a fence without its cursor")?
+            .to_string(),
+    )?;
+    assert_eq!(schema_versions(&pool).await?, pending);
+    assert!(fence_declared(&pool).await?);
+    // At another value the name is a newer release's: never an orphan to
+    // delete, and refused in the order any newer capability is, after the
+    // record.
+    set_fence(&pool, 2).await?;
+    let error = db
+        .ledger("migrate-newer")
+        .await
+        .err()
+        .context("migrate accepted a newer release's share_hash_backfill_pending = 2")?
+        .to_string();
+    ensure!(
+        error.contains("migration 3 is recorded and 2 is not")
+            && !error.contains("is gone")
+            && !error.contains("DELETE FROM qbit_prism_schema_capabilities"),
+        "{error}"
+    );
+    assert_eq!(schema_versions(&pool).await?, pending);
+    set_fence(&pool, 1).await?;
+    // Recording 2 by hand as well lets nothing start: 013, 017 and 024
+    // never ran behind the pending backfill, and migrate still names the
+    // fence.
+    sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+        .execute(&pool)
+        .await?;
+    let error = Ledger::connect(&db.url, "cold".into(), 8, false)
+        .await
+        .err()
+        .context("a start accepted a fence without its cursor")?
+        .to_string();
+    ensure!(error.contains("missing migration(s) 13, 17, 24"), "{error}");
+    refused(
+        db.ledger("migrate-again")
+            .await
+            .err()
+            .context("migrate accepted a fence without its cursor and a hand-recorded 2")?
+            .to_string(),
+    )?;
+    assert!(fence_declared(&pool).await?);
+    // With the record past 3 without 2, a newer release's value is refused
+    // as newer.
+    set_fence(&pool, 2).await?;
+    let error = db
+        .ledger("migrate-newer-again")
+        .await
+        .err()
+        .context("migrate accepted a newer release's share_hash_backfill_pending = 2 and a hand-recorded 2")?
+        .to_string();
+    ensure!(
+        error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+            && error.contains("upgrade the server")
+            && !error.contains("is gone"),
+        "{error}"
+    );
+    db.close(Vec::new()).await
+}
+
+/// Declare the fence at `value`, as a newer release might.
+async fn set_fence(pool: &PgPool, value: i32) -> Result<()> {
+    sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=$1 WHERE capability='share_hash_backfill_pending'")
+        .bind(value)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A fence declared on a database with every migration recorded and no
+/// cursor is refused at every start and every migrate: only the
+/// transaction that records 2 removes it, with the cursor, so it can only
+/// be left by hand, and legacy shares may be unmapped (#669). At another
+/// value the name is a newer release's declaration: refused as that
+/// release's, without the remedy that would delete it.
+#[tokio::test]
+async fn every_start_refuses_a_backfill_fence_on_a_migrated_database() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('share_hash_backfill_pending',1)")
+        .execute(&pool)
+        .await?;
+    for (what, error) in [
+        (
+            "a start",
+            Ledger::connect(&db.url, "cold".into(), 8, false)
+                .await
+                .err(),
+        ),
+        ("migrate", db.ledger("migrate").await.err()),
+    ] {
+        let error = error
+            .with_context(|| format!("{what} accepted a fence without its cursor"))?
+            .to_string();
+        ensure!(
+            error.contains("declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone"),
+            "{what}: {error}"
+        );
+    }
+    set_fence(&pool, 2).await?;
+    for (what, error) in [
+        (
+            "a start",
+            Ledger::connect(&db.url, "cold".into(), 8, false)
+                .await
+                .err(),
+        ),
+        ("migrate", db.ledger("migrate").await.err()),
+    ] {
+        let error = error
+            .with_context(|| format!("{what} accepted share_hash_backfill_pending = 2"))?
+            .to_string();
+        ensure!(
+            error.contains("share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only")
+                && error.contains("upgrade the server")
+                && !error.contains("is gone"),
+            "{what}: {error}"
+        );
+    }
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    db.close(vec![first]).await
+}

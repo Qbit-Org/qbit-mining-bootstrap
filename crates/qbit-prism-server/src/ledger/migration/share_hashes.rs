@@ -32,6 +32,33 @@
 //! database has the table is therefore a backfill that has not finished,
 //! which `migrate_schema` resumes; without the table it is an edited
 //! record, refused as before.
+//!
+//! The migration record alone is a weak fence: an earlier build that meets
+//! 3 without 2 tells the operator to record 2 by hand, and after that it
+//! would serve with legacy headers unmapped. So while the backfill is
+//! pending the database also declares the capability
+//! `share_hash_backfill_pending = 1` (#669). The transaction that creates
+//! the cursor declares it, and the transaction that records 2 removes it
+//! with the cursor. Every earlier build that checks capabilities refuses
+//! the declaration at connect and at migrate, whatever the record says, and
+//! this release refuses the cursor itself.
+//!
+//! The fence is declared there and nowhere else, never again on a resume.
+//! An earlier build cannot remove it, so it must never coexist with an
+//! earlier build's runner. Migrations serialize on the migration lock, and
+//! no earlier build's migrate passes its capability check once the fence
+//! has committed. So the only runners an earlier build can have started are
+//! for a cursor an earlier build created, which carries no fence. Declared
+//! later, by a resume, a fence could meet such a runner already past its
+//! check: still mapping, or queued for the runners' lock. That runner would
+//! record 2 without removing the fence, and leave it behind. The price is
+//! that a backfill a #582 build started, before #669, stays unfenced to its
+//! end. A declaration whose cursor is gone, which only a hand-dropped
+//! cursor leaves, is refused by every start and migrate of this release.
+//! Before it records 2, the runner reads the declaration again under the
+//! migration lock and stops at any value but 1: a newer release declared
+//! it meanwhile, and the cursor, the declaration and the record are that
+//! release's to finish.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
 use sqlx::{Connection, PgConnection};
@@ -85,6 +112,27 @@ impl Progress {
             self.start_seq, self.next_seq, self.next_seq, self.end_seq
         )
     }
+}
+
+/// The capability a pending backfill declares, fencing every build before
+/// #669 off the database (see the module doc).
+pub(super) const PENDING_CAPABILITY: &str = "share_hash_backfill_pending";
+
+/// Declare the fence of a pending backfill, in the migration transaction
+/// that creates its cursor and nowhere else (see the module doc).
+pub(super) async fn declare_pending(connection: &mut PgConnection) -> Result<()> {
+    sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES($1,1) ON CONFLICT (capability) DO NOTHING")
+        .bind(PENDING_CAPABILITY)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+/// Why a database that declares the fence without its cursor is refused.
+pub(super) fn orphaned_fence_refusal() -> String {
+    format!(
+        "database declares {PENDING_CAPABILITY} = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again, or, once qbit_prism_share_hashes is verified to map every accepted share whose ID ends in 64 hex digits (docs/prism-rust-migration.md has the query), remove the declaration with DELETE FROM qbit_prism_schema_capabilities WHERE capability='{PENDING_CAPABILITY}' and migrate again"
+    )
 }
 
 /// The kind of the relation under the progress table's name in the
@@ -195,6 +243,7 @@ pub(super) async fn apply(
         tracing::info!(version = VERSION, "share-hash backfill already complete");
         return Ok(());
     };
+
     let started = Instant::now();
     let first_seq = progress.next_seq;
     tracing::info!(
@@ -286,6 +335,20 @@ pub(super) async fn apply(
         .execute(&mut *tx)
         .await?;
         lock(&mut tx, MIGRATION_LOCK, metrics).await?;
+        // The fence is this release's at 1, or absent on a cursor an
+        // earlier build created. Any other value was declared by a newer
+        // release while this runner mapped without the migration lock. That
+        // declaration is the newer release's to remove, with the cursor and
+        // the record, so this runner leaves all three to it (#669).
+        let fence: Option<i32> = sqlx::query_scalar(
+            "SELECT capability_value FROM qbit_prism_schema_capabilities WHERE capability=$1",
+        )
+        .bind(PENDING_CAPABILITY)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(value) = fence.filter(|value| *value != 1) {
+            bail!("refusing to record migration 2: while its share-hash backfill ran, a newer PRISM release declared {PENDING_CAPABILITY} = {value}, but this server understands {PENDING_CAPABILITY} 1 to 1 only. That release finishes the backfill; upgrade the server before starting or migrating here");
+        }
         let (next_seq, end_seq): (i64, i64) = sqlx::query_as("SELECT next_seq,(SELECT COALESCE(max(share_seq),-1)+1 FROM qbit_share_ledger) FROM qbit_prism_share_hash_backfill WHERE singleton FOR UPDATE")
             .fetch_one(&mut *tx)
             .await?;
@@ -306,6 +369,10 @@ pub(super) async fn apply(
             continue;
         }
         sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability=$1")
+            .bind(PENDING_CAPABILITY)
             .execute(&mut *tx)
             .await?;
         sqlx::query(

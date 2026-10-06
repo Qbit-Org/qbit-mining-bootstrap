@@ -603,6 +603,13 @@ never reads it. It is applied online, as 013 is: on an existing ledger
 transaction commits, so no write to `qbit_ctv_fanout_artifacts` waits for the
 build, a found block's landing included, and records 24 once it is valid. See
 [the claim lane](prism-ledger-ops.md#the-claim-lane-and-settled-history-024-668).
+While a share-hash backfill that this release started is pending on a
+populated `2.x.x` source, the database declares
+`share_hash_backfill_pending = 1` (#669). It is declared with the backfill's
+cursor and removed with it when 2 is recorded, so every earlier build that
+checks capabilities is refused until then. A backfill that a #582 build
+started carries no declaration (see
+[the backfill](#migration-002s-share-hash-backfill-applied-online)).
 A database missing any required migration is refused
 at connect, naming the gap, before any accounting statement runs, and so is
 one declaring a
@@ -731,11 +738,61 @@ They refuse the same way while the cursor table exists, even if 2 has been
 recorded by hand, and so does the recovery evidence export
 (`scripts/prism-recovery-evidence.sql`).
 
-**Never run an earlier 3.x.x build against the database while the backfill is
-pending, and never record 2 by hand.** An earlier build knows nothing of the
-cursor. Its `migrate` refuses 3 without 2 as an edited record, and its remedy,
-recording 2 once 002's objects are present, would let it serve with legacy
-headers unmapped. Resume with this release's `migrate` instead.
+**Earlier builds are fenced off while the backfill is pending (#669).** A
+build from before #582 knows nothing of the cursor. Its `migrate` refuses 3
+without 2 as an edited record, and its remedy is to record 2 once 002's
+objects are present. On its own, that would let it serve with legacy headers
+unmapped. So the database also declares the capability
+`share_hash_backfill_pending = 1` while the backfill is pending:
+
+- the migration transaction that creates the cursor declares it, and nothing
+  declares it later;
+- the transaction that records 2 removes it with the cursor. It is the one
+  capability native code removes, because it describes a state, not a format.
+  That transaction first reads the declaration again under the migration lock.
+  At a value other than 1, a newer release declared it while the runner mapped
+  between holds of that lock, and the runner stops: the cursor, the
+  declaration and the record are that release's to finish.
+
+An earlier build cannot remove the fence, so the fence must never coexist
+with an earlier build's runner, and that is why it is declared only with a new
+cursor. Migrations serialize on the migration lock, and no earlier build's
+`migrate` passes its capability check once the fence has committed. So any
+runner an earlier build started belongs to a cursor an earlier build created,
+which carries no fence. Declared later, by a resume, a fence could meet such a
+runner already past its check, still mapping or queued for the runners' lock.
+That runner would record 2 and leave the fence behind. The price: a backfill
+that a #582 build (before #669) started stays unfenced to its end. Resume it
+with this release, and don't record 2 by hand.
+
+How earlier builds react to a fenced backfill, once each checks declared
+capabilities at connect and at `migrate`:
+- **Every start** of an earlier build refuses the capability, so recording 2
+  by hand lets nothing serve. This release refuses the cursor itself, and so
+  does the evidence export.
+- **A build from before #582** still answers its first `migrate` with the
+  3-without-2 refusal and its remedy. Following that remedy changes nothing:
+  its next `migrate` refuses the capability.
+- **A #582 build** refuses the capability at once.
+
+A declaration whose cursor is gone can only be left by dropping the cursor by
+hand. Every `migrate` of this release refuses it, and so does every start once
+the record is otherwise complete. Restore the full pre-migration backup. If
+the mapping is verified complete instead, remove the declaration. This query
+counts the legacy headers that are not mapped to their earliest accepted
+share; the count must be 0:
+
+```sql
+SELECT count(*) AS unmapped
+FROM (SELECT DISTINCT ON (lower(right(share_id, 64)))
+             lower(right(share_id, 64)) AS header, share_id
+      FROM qbit_share_ledger
+      WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$'
+      ORDER BY lower(right(share_id, 64)), share_seq) expected
+LEFT JOIN qbit_prism_share_hashes mapped
+  ON mapped.header_hash = expected.header AND mapped.share_id = expected.share_id
+WHERE mapped.header_hash IS NULL;
+```
 
 **Progress.** No frontend runs while the backfill does, so there is no
 Prometheus series for it. `migrate` logs the backfill's start, a progress line
@@ -774,6 +831,8 @@ boundary.
 | `refusing to continue migration 2: its share-hash backfill's cursor is no longer at share_seq <a>, where this run, which holds the runner lock, left it; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
 | `a <kind> named qbit_prism_share_hash_backfill holds the name of migration 2's share-hash backfill progress table; check what it holds, then rename or move it aside` | on a native database, a relation that is not the cursor table holds its name; move it aside, then start or migrate again |
 | `qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup` | the cursor table was edited; restore the full backup |
+| `database declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again, or, once qbit_prism_share_hashes is verified to map every accepted share whose ID ends in 64 hex digits (...), remove the declaration with DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending' and migrate again` | from `migrate`, and from a start once every migration is recorded: the cursor was dropped by hand while the backfill was pending. Restore the full pre-migration backup, or verify the mapping with the query above and remove the declaration |
+| `refusing to record migration 2: while its share-hash backfill ran, a newer PRISM release declared share_hash_backfill_pending = <n>, but this server understands share_hash_backfill_pending 1 to 1 only. That release finishes the backfill; upgrade the server before starting or migrating here` | a newer release's `migrate` ran while this release's runner was mapping. Upgrade the server and migrate with the newer release |
 | `refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup` | the cursor table was dropped by hand during a run; restore the full backup |
 
 **Plan for the backfill on a large ledger.** The backfill writes every legacy
