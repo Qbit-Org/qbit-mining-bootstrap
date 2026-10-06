@@ -1030,9 +1030,10 @@ capacity-envelope evidence beyond D1 (#555 decisions 7 and 11), never D1
 verdicts (decision 5): their rows carry no D1 verdict, and only their own
 gates hold them. #555's 10,000-recipient point (ten fanout chunks per block,
 under the 20/80 stress shape, with seeded and submitted recipient counts
-reported apart) waits on CTV fanout settlement in the harness (#548). Its
-50,000-recipient follow-up runs only on this trigger, written down before
-the 10,000 point has run:
+reported apart) has no preset yet. The harness has settled through CTV
+fanout since #548 (`--ctv-settlement`, #644), so it can now be written with
+the flag on. Its 50,000-recipient follow-up runs only on this trigger,
+written down before the 10,000 point has run:
 
 > The 10,000-recipient point costs more than 25% more **per recipient** than
 > the same preset at 1,000 recipients (one fanout chunk), run on the same
@@ -1043,8 +1044,8 @@ the 10,000 point has run:
 >   work for the new payout revision, the median over landings.
 
 A fixed cost only lowers the per-recipient figure at the larger size, so a
-linear cost never fires the trigger. It is evaluated once #548 lands and both
-presets run weekly.
+linear cost never fires the trigger. It is evaluated once the 10,000 point's
+preset exists and both presets run weekly.
 
 `.github/workflows/prism-load-runner-probe.yml` (#541, dispatch only, no
 schedule) measures the Blacksmith runner classes themselves before a lane

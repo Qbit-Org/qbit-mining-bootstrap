@@ -689,8 +689,8 @@ owner = "#555"
 lanes = ["L3"]
 criteria = "Window-rebuild and payout-revision cost stays linear; seeded and submitted counts reported separately."
 runs = false
-reason = "No preset yet: ten fanout chunks per block need CTV fanout settlement in qbit-prism-load (#548)."
-notes = "The 50,000-recipient run's trigger (#555): this point costs more than 25% more per recipient than the same preset at 1,000 recipients (one fanout chunk), run on the same runner class the same week, in window rebuild (the tip-to-last-notify p99 over its tips) or in payout revision (from a landing to every session holding the new revision's work, the median over landings). A fixed cost only lowers the per-recipient figure at the larger size, so a linear cost never fires it. Evaluated once #548 lands and both presets run weekly (crates/qbit-prism-load/README.md, L3)."
+reason = "No preset yet (#555): ten fanout chunks per block need CTV fanout settlement, which qbit-prism-load has had since #548 (--ctv-settlement, #644), so the preset can now be written with it on."
+notes = "The 50,000-recipient run's trigger (#555): this point costs more than 25% more per recipient than the same preset at 1,000 recipients (one fanout chunk), run on the same runner class the same week, in window rebuild (the tip-to-last-notify p99 over its tips) or in payout revision (from a landing to every session holding the new revision's work, the median over landings). A fixed cost only lowers the per-recipient figure at the larger size, so a linear cost never fires it. Evaluated once this point's preset exists and both presets run weekly (crates/qbit-prism-load/README.md, L3)."
 
 [[scenario]]
 id = "mainnet-shapes-reduced-l3"
