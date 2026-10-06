@@ -718,11 +718,12 @@ pub(super) const SERVING: &str =
     "fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'";
 
 /// The write guard's reads, from the cluster row aliased `c`, which
-/// [`check_writable`] refuses on. [`writable`] and [`writable_unless_held`]
-/// share them, so a new halt condition reaches both.
-const WRITABLE_COLUMNS: &str = "c.fatal_error,EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at>clock_timestamp()) AS legacy_live";
+/// [`check_writable`] refuses on. [`writable`], [`writable_unless_held`] and
+/// the share append's first statement (`Ledger::append_first_read_sql`,
+/// #711) share them, so a new halt condition reaches all three.
+pub(super) const WRITABLE_COLUMNS: &str = "c.fatal_error,EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at>clock_timestamp()) AS legacy_live";
 
-fn check_writable(row: &PgRow) -> Result<()> {
+pub(super) fn check_writable(row: &PgRow) -> Result<()> {
     let fatal: Option<String> = row.try_get("fatal_error")?;
     if let Some(error) = fatal {
         bail!("cluster halted: {error}");

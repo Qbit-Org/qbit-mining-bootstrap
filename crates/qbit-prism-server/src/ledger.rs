@@ -42,7 +42,7 @@ pub use candidates::{
 use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
 mod connect;
 pub(crate) use connect::shielded_begin;
-use connect::{require_revision, writable, writable_unless_held};
+use connect::{check_writable, require_revision, writable, writable_unless_held, WRITABLE_COLUMNS};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod divergence;
