@@ -68,9 +68,10 @@ pub const PHASE: &str = "faults";
 const TERMINATION_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the settlement-lock fault waits, from its injection's start, for
-/// every frontend to serve current work on a quiet cluster before it takes
-/// the lock (#692). A steady baseline is there at once; after a fault that
-/// landed a block it takes a few seconds.
+/// every frontend to serve current work with no settlement under way before
+/// it takes the lock (#692). A steady baseline is quiet at once; after a
+/// fault that landed a block it takes a few seconds. A cluster that never
+/// goes quiet gets the lock at the bound, on the work it then serves.
 pub const LOCK_WORK_WAIT: Duration = Duration::from_secs(60);
 
 /// What the fault driver acts on, lent to it by the scheduling loop on each
@@ -221,9 +222,9 @@ enum Action {
         error: Option<String>,
     },
     SettlementLock {
-        /// Every frontend's work and what the cluster is still settling,
-        /// read until the work is current and the cluster quiet: the lock is
-        /// taken only then (#692).
+        /// Every frontend's work and the settlements under way, read until
+        /// the work is current on a quiet cluster or the bound passes: the
+        /// lock is taken only then (#692).
         work: WorkCurrentWait,
         holder: Option<LockHolder>,
         mint_at: Option<Instant>,
@@ -489,10 +490,12 @@ impl FaultDriver {
         if let Some((mut run, _)) = self.current.take() {
             match &mut run.action {
                 Action::SlowDatabase { .. } => env.delay_proxy.set_delay_millis(0),
-                Action::SettlementLock {
-                    holder: Some(holder),
-                    ..
-                } => holder.release(),
+                Action::SettlementLock { work, holder, .. } => {
+                    work.abort();
+                    if let Some(holder) = holder {
+                        holder.release();
+                    }
+                }
                 Action::PoolExhaustion {
                     exhauster: Some(exhauster),
                     ..
@@ -638,9 +641,11 @@ fn inject(
                     // until every frontend publishes work at it, shares on
                     // the old work are refused stale-job. A hold taken first
                     // blocks that publication too, so it would measure the
-                    // landing, not the lock; so would a landing still to
-                    // come, or a hold queued behind a settlement under way.
-                    // The verdict fails a hold that had to start without it.
+                    // landing, not the lock. A hold queued behind a
+                    // settlement under way would start in the middle of it.
+                    // A landing still to come cannot move the revision under
+                    // the lock: every bump takes SETTLEMENT_LOCK. The verdict
+                    // fails a hold taken without current work.
                     let started = run.inject_start.unwrap_or_else(Instant::now);
                     if !work.poll(started + LOCK_WORK_WAIT, env, tools) {
                         return Ok(false);

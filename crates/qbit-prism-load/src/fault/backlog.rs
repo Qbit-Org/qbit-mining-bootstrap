@@ -37,7 +37,7 @@ pub const SETTLE_WAIT: Duration = Duration::from_secs(180);
 pub const ORPHAN_CONFIRMATIONS: usize = 6;
 
 /// The unfinished candidate states (`CandidateState::UNFINISHED_SQL`).
-pub(super) const UNFINISHED: [&str; 4] = ["pending", "offer_reserved", "offered", "reconciliation"];
+const UNFINISHED: [&str; 4] = ["pending", "offer_reserved", "offered", "reconciliation"];
 
 enum Stage {
     Start,
