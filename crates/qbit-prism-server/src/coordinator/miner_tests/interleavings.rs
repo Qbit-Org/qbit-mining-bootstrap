@@ -97,10 +97,12 @@ async fn cross_frontend_revision_change_before_append_cannot_ack_or_credit() {
     gate.entered.notified().await;
     fixture.store.revision.store(8, Ordering::SeqCst);
     gate.release.notify_one();
-    assert_error(
-        submitted.await.unwrap().unwrap_err(),
-        "ledger-confirmation-failed",
-        "share was not confirmed by the database",
+    // The append's fence refuses it as the submit check refuses superseded
+    // work: `stale-job`, cause `payout_revision`, not a ledger failure (#675).
+    super::stale_causes::assert_stale_wire(submitted.await.unwrap().unwrap_err(), "stale job");
+    assert_eq!(
+        super::stale_causes::stale_causes(&fixture.coordinator.metrics),
+        [0., 0., 0., 1.]
     );
     assert!(fixture.store.records.lock().unwrap().is_empty());
     assert_eq!(fixture.coordinator.accepted.load(Ordering::SeqCst), 0);

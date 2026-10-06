@@ -1279,8 +1279,33 @@ async fn commit_reconcile_block_whose_revision_moves_before_its_commit_is_captur
     settle(outcome, fixture.close().await)
 }
 
-/// A share without a block keeps the fence's refusal: nothing written, the
-/// typed reason logged, `ledger-confirmation-failed` answered.
+/// The fence's refusal, from a share queued behind `ORDER_LOCK` and so past
+/// its submit check: the submit check's own answer for superseded work,
+/// `stale-job` with its one `payout_revision` cause, never the
+/// `ledger-confirmation-failed` that feeds the share-append failure warning,
+/// and no persistence WARN (#675).
+fn ensure_refused_by_the_fence(fixture: &Fixture, answer: &Answer, log: &SharedLog) -> Result<()> {
+    ensure!(
+        reason(answer).as_deref() == Some("stale-job"),
+        "a share past its revision was answered {:?}",
+        reason(answer)
+    );
+    let causes = super::miner_tests::stale_causes::stale_causes(&fixture.coordinator.metrics);
+    ensure!(
+        causes == [0., 0., 0., 1.],
+        "the refusal was not the fence's payout-revision cause: {causes:?}"
+    );
+    ensure!(
+        !log.text().contains("share persistence failed"),
+        "the fence's refusal was logged as a database failure:\n{}",
+        log.text()
+    );
+    Ok(())
+}
+
+/// A share without a block keeps the fence's refusal: nothing written, and
+/// `stale-job` answered, as the submit check answers superseded work, counted
+/// and not logged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_reconcile_plain_share_whose_revision_moves_before_its_commit_writes_nothing(
 ) -> Result<()> {
@@ -1301,15 +1326,10 @@ async fn commit_reconcile_plain_share_whose_revision_moves_before_its_commit_wri
         wait_until_blocked(&fixture, holder_pid).await?;
         fixture.bump_revision_and_release(&mut holder).await?;
         let answer = answer(submitted).await?;
+        ensure_refused_by_the_fence(&fixture, &answer, &log)?;
         ensure!(
-            reason(&answer).as_deref() == Some("ledger-confirmation-failed"),
-            "a share past its revision was answered {:?}",
-            reason(&answer)
-        );
-        ensure!(
-            log.text()
-                .contains("payout revision changed before share commit: admitted at"),
-            "the refusal was not the fence's:\n{}",
+            !log.text().contains("payout revision changed"),
+            "a plain share's refusal is counted, not logged:\n{}",
             log.text()
         );
         ensure!(
@@ -1385,8 +1405,9 @@ async fn commit_reconcile_block_append_queued_past_its_deadline_still_captures_i
 
 /// With capture off (`PRISM_CAPTURE_OVERPAY_CEILING_BPS=0`) the fence refuses
 /// a block-bearing share whose revision moved, exactly as before #657 and as
-/// the submit check refuses one whose revision had already moved: nothing
-/// written, nothing enqueued or offered, nothing credited.
+/// the submit check refuses one whose revision had already moved, with the
+/// same `stale-job` answer: nothing written, nothing enqueued or offered,
+/// nothing credited. The found block is lost, so a WARN names it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_reconcile_block_whose_revision_moves_with_capture_off_is_refused_as_before(
 ) -> Result<()> {
@@ -1408,16 +1429,13 @@ async fn commit_reconcile_block_whose_revision_moves_with_capture_off_is_refused
         wait_until_blocked(&fixture, holder_pid).await?;
         fixture.bump_revision_and_release(&mut holder).await?;
         let answer = answer(submitted).await?;
+        ensure_refused_by_the_fence(&fixture, &answer, &log)?;
+        let text = log.text();
         ensure!(
-            reason(&answer).as_deref() == Some("ledger-confirmation-failed"),
-            "a block past its revision with capture off was answered {:?}",
-            reason(&answer)
-        );
-        ensure!(
-            log.text()
-                .contains("payout revision changed before share commit: admitted at"),
-            "the refusal was not the fence's:\n{}",
-            log.text()
+            text.contains("found block refused at the payout-revision fence with capture off")
+                && text.contains(&block_hash)
+                && text.contains("payout revision changed before share commit: admitted at"),
+            "the lost block was not logged with the fence's reason:\n{text}"
         );
         ensure!(
             fixture.outbox_state(&block_hash).await?.is_none(),
