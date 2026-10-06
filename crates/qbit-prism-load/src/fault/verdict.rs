@@ -329,9 +329,35 @@ impl FaultDriver {
                 });
             }
             Action::SettlementLock {
-                minted, tip, stall, ..
+                work,
+                minted,
+                tip,
+                stall,
+                ..
             } => {
                 let injected = run.injected_at.unwrap_or(inject_start);
+                // Every check below assumes retained work was current when
+                // the lock was taken (#692): a hold taken while a landing's
+                // revision bump was still unpublished blocks the publication
+                // too, and refuses every share on the old work.
+                checks.push(check(
+                    "every frontend served current work when the lock was taken",
+                    work.current_at.is_some(),
+                    match work.current_at {
+                        Some(at) => format!(
+                            "current {:.1} s after the injection started (bound {} s)",
+                            at.saturating_duration_since(inject_start).as_secs_f64(),
+                            LOCK_WORK_WAIT.as_secs()
+                        ),
+                        None => format!(
+                            "not within {} s of the injection starting, so the lock was taken on \
+                             work that may be stale; {}",
+                            LOCK_WORK_WAIT.as_secs(),
+                            work.last_read()
+                        ),
+                    },
+                ));
+                let hold = window_shares(inputs, injected, removed);
                 let before_tip = window_shares(inputs, injected, minted.unwrap_or(removed));
                 // Shares take ORDER_LOCK, never SETTLEMENT_LOCK, so none may
                 // wait on the holder: every answer in the hold, accepted or
@@ -460,10 +486,14 @@ impl FaultDriver {
                     })
                     .collect();
                 evidence = json!({
+                    "work_current_after_seconds": at(work.current_at),
+                    "work_wait_seconds": LOCK_WORK_WAIT.as_secs(),
+                    "work_before_the_lock": work.last,
+                    "work_read_error": work.error,
                     "hold_seconds": removed.saturating_duration_since(injected).as_secs_f64(),
                     "tip_minted_after_seconds": at(*minted),
                     "tip": tip.as_ref().map(|tip| &tip.hash),
-                    "ack_milliseconds_during_hold": during.ack_milliseconds,
+                    "ack_milliseconds_during_hold": hold.ack_milliseconds,
                     "ack_milliseconds_before_the_tip": before_tip.ack_milliseconds,
                     "shares_before_the_tip": before_tip,
                     "work_refresh_stalled_seconds_peak_during_hold": peak_during,

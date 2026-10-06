@@ -46,7 +46,7 @@ use backlog::CandidateBacklog;
 use database::{Exhauster, Exhaustion, LockHolder};
 use disk::WalDiskFull;
 use failover::{Failover, FailoverControl};
-use frontend::{FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain};
+use frontend::{FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain, WorkCurrentWait};
 use plan::{FaultKind, FaultPlan, Scheduled};
 use rpc_relay::RpcFaultRelay;
 use serde::Serialize;
@@ -66,6 +66,12 @@ pub const PHASE: &str = "faults";
 /// How long a saturated server is given to show a frontend backend
 /// terminated into it before the exhaustion counts as in effect anyway.
 const TERMINATION_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the settlement-lock fault waits, from its injection's start, for
+/// every frontend to serve current work before it takes the lock (#692). A
+/// steady baseline is current at once; after a fault that landed a block it
+/// takes a few seconds.
+pub const LOCK_WORK_WAIT: Duration = Duration::from_secs(60);
 
 /// What the fault driver acts on, lent to it by the scheduling loop on each
 /// poll.
@@ -208,7 +214,10 @@ enum Action {
         error: Option<String>,
     },
     SettlementLock {
-        holder: LockHolder,
+        /// Every frontend's work, read until it is current: the lock is
+        /// taken only then (#692).
+        work: WorkCurrentWait,
+        holder: Option<LockHolder>,
         mint_at: Option<Instant>,
         minted: Option<Instant>,
         tip: Option<TipChange>,
@@ -253,7 +262,8 @@ impl Action {
                 error: None,
             },
             FaultKind::SettlementLock => Self::SettlementLock {
-                holder: LockHolder::start(tools.direct_url.clone(), database::SETTLEMENT_LOCK_KEY),
+                work: WorkCurrentWait::new(),
+                holder: None,
                 mint_at: None,
                 minted: None,
                 tip: None,
@@ -471,7 +481,10 @@ impl FaultDriver {
         if let Some((mut run, _)) = self.current.take() {
             match &mut run.action {
                 Action::SlowDatabase { .. } => env.delay_proxy.set_delay_millis(0),
-                Action::SettlementLock { holder, .. } => holder.release(),
+                Action::SettlementLock {
+                    holder: Some(holder),
+                    ..
+                } => holder.release(),
                 Action::PoolExhaustion {
                     exhauster: Some(exhauster),
                     ..
@@ -603,28 +616,51 @@ fn inject(
             Ok(true)
         }
         Action::SettlementLock {
+            work,
             holder,
             mint_at,
             stall,
             ..
-        } => match holder.poll_acquired() {
-            Ok(None) => Ok(false),
-            Ok(Some(at)) => {
-                run.injected_at = Some(at);
-                *mint_at = Some(at + Duration::from_secs(plan.hold_seconds) / 2);
-                *stall = Some(StallSampler::start(
-                    env.frontends
-                        .iter()
-                        .map(|child| (child.spec.instance_id.clone(), child.metrics_url()))
-                        .collect(),
-                ));
-                Ok(true)
+        } => {
+            let holder = match holder {
+                Some(holder) => holder,
+                None => {
+                    // Only on current work (#692). A fault before this one
+                    // that landed a block bumped the payout revision, and
+                    // until every frontend publishes work at it, shares on
+                    // the old work are refused stale-job. A hold taken first
+                    // blocks that publication too, so it would measure the
+                    // landing, not the lock. The verdict fails a hold that
+                    // had to start without it.
+                    let started = run.inject_start.unwrap_or_else(Instant::now);
+                    if !work.poll(started + LOCK_WORK_WAIT, env, tools) {
+                        return Ok(false);
+                    }
+                    holder.insert(LockHolder::start(
+                        tools.direct_url.clone(),
+                        database::SETTLEMENT_LOCK_KEY,
+                    ))
+                }
+            };
+            match holder.poll_acquired() {
+                Ok(None) => Ok(false),
+                Ok(Some(at)) => {
+                    run.injected_at = Some(at);
+                    *mint_at = Some(at + Duration::from_secs(plan.hold_seconds) / 2);
+                    *stall = Some(StallSampler::start(
+                        env.frontends
+                            .iter()
+                            .map(|child| (child.spec.instance_id.clone(), child.metrics_url()))
+                            .collect(),
+                    ));
+                    Ok(true)
+                }
+                Err(error) => {
+                    run.problems.push(format!("{error:#}"));
+                    Ok(true)
+                }
             }
-            Err(error) => {
-                run.problems.push(format!("{error:#}"));
-                Ok(true)
-            }
-        },
+        }
         Action::PoolExhaustion {
             warm,
             exhauster,
@@ -740,6 +776,11 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
             Ok(true)
         }
         Action::SettlementLock { holder, .. } => {
+            // The injection ends only once the holder has started.
+            let Some(holder) = holder else {
+                run.removed_at = Some(Instant::now());
+                return Ok(true);
+            };
             holder.release();
             match holder.poll_released()? {
                 Some(at) => {
