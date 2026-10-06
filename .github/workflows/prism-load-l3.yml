@@ -1,0 +1,534 @@
+name: PRISM load harness (L3 production-window matrix)
+
+# #550 (S5 of #487): #447's production-window matrix (L3) in CI. The full
+# suite, `l3-full` in crates/qbit-prism-load/presets/suites.toml, is every
+# cell #473 ran by hand, three repeats each; the reduced suite, `l3-reduced`,
+# is 400k at 1, 2 and 4 frontends, async, once each. Each preset pins every
+# flag its result depends on, so the suite file and the presets are the whole
+# configuration.
+#
+# What runs it (decision 8 of #487):
+#   - a pull request into 3.x.x or main that changes VERSION, the version
+#     bump, on every push to it. Only a pull request from this repository;
+#     a fork's needs the label below. The VERSION check is the `changes` job's,
+#     not a trigger-level `paths` filter, which would also swallow the label
+#     event;
+#   - a maintainer applying the `release-candidate` label to a pull request
+#     into 3.x.x or main. Only that label's `labeled` event starts it: a
+#     later push needs the label applied again (or a VERSION change);
+#   - a `v*` tag push, on either line. The tag promotes the version-bump pull
+#     request's run when that run's tree is the tagged commit's tree, and runs
+#     the full suite otherwise (cost lever P1; scripts/prism_l3_promote.py
+#     says what a promotable run is). A push event reads this file at the
+#     tagged commit, so a tag cut before this file reached its line does not
+#     trigger it;
+#   - workflow_dispatch: any suite on any ref, and `tag_dry_run`, which acts
+#     as a `v*` tag push on `ref` (promote or rerun) without pushing a tag;
+#   - weekly, Monday 06:13 UTC: the reduced suite on 3.x.x. Schedules run
+#     from the default branch's copy of this file; the build and the presets
+#     come from 3.x.x.
+#
+# The plan job pins the ref to one commit and records its tree
+# (`git rev-parse HEAD^{tree}`) in the `prism-l3-plan` artifact; one job
+# builds the release binaries there; each preset repeat runs in its own job
+# on the suite's runner, through .github/scripts/prism-load-run.sh, the
+# nightly's own runner script, and is gated by its preset. The collate job
+# renders every run into #473's document tables with qbit-prism-load-compare
+# --collate (#511's summarizer) and writes a verdict the tag's promotion
+# reads, as `prism-l3-verdict-<tree>`. Reports, the tables and the verdict
+# are kept 90 days (#487 decision 3).
+#
+# Runners: the 32 vCPU class for both suites (suites.toml) until #542 picks a
+# class per lane. At most eight preset jobs run at once. Cost, at about
+# $0.064 per 32 vCPU minute and about 20 minutes a job: the full suite is 33
+# jobs, about 660 runner-minutes or $42 a release candidate; the reduced
+# suite 3 jobs, about 60 minutes or $4 a week.
+#
+# This workflow is never a required check. A per-PR, per-label group lets a
+# new push cancel the older push's run without touching a labelled run, and an
+# unrelated label never cancels anything; a tag has a group per tag, the
+# weekly run its own, and neither is cancelled by a later event.
+
+on:
+  pull_request:
+    branches: [3.x.x, main]
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    tags: ["v*"]
+  schedule:
+    - cron: "13 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: >-
+          Suite from crates/qbit-prism-load/presets/suites.toml: l3-full
+          (#447's matrix, three repeats) or l3-reduced (400k at 1, 2 and 4
+          frontends). Ignored when tag_dry_run is set, which runs l3-full.
+        required: true
+        default: l3-full
+      ref:
+        description: Git ref to build and run.
+        required: true
+        default: 3.x.x
+      tag_dry_run:
+        description: >-
+          Act as a v* tag push on `ref`: promote the newest finished
+          same-repository pull request run of l3-full on the same tree, or
+          run l3-full. No tag is pushed.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+    && format('prism-l3-pr-{0}-{1}', github.event.pull_request.number,
+    github.event.action == 'labeled' && github.event.label.name || 'push')
+    || github.event_name == 'push' && format('prism-l3-tag-{0}', github.ref_name)
+    || github.event_name == 'schedule' && 'prism-l3-weekly'
+    || format('prism-l3-dispatch-{0}-{1}-{2}', inputs.ref, inputs.suite, inputs.tag_dry_run) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Decide what this event runs
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      suite: ${{ steps.decide.outputs.suite }}
+      ref: ${{ steps.decide.outputs.ref }}
+      mode: ${{ steps.decide.outputs.mode }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          INPUT_SUITE: ${{ inputs.suite }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TAG_DRY_RUN: ${{ inputs.tag_dry_run }}
+        run: |
+          set -euo pipefail
+          run=true suite=l3-full ref="${REF}" mode=pr
+          case "${EVENT}" in
+            pull_request)
+              # The merge result (refs/pull/N/merge), which is what would land.
+              if [[ "${ACTION}" == labeled ]]; then
+                if [[ "${LABEL}" == release-candidate ]]; then
+                  why="a maintainer applied release-candidate"
+                else
+                  run=false why="the ${LABEL} label starts nothing"
+                fi
+              elif [[ "${HEAD_REPO}" != "${REPO}" ]]; then
+                run=false why="a fork's pull request runs L3 only under the release-candidate label"
+              else
+                # A failed listing fails this job rather than skipping the suite.
+                files="$(gh api --paginate "repos/${REPO}/pulls/${PR}/files?per_page=100" --jq '.[].filename')"
+                if grep -qx VERSION <<<"${files}"; then
+                  why="the pull request changes VERSION"
+                else
+                  run=false why="the pull request does not change VERSION"
+                fi
+              fi
+              ;;
+            push)
+              mode=tag why="tag ${REF#refs/tags/}: promote a matching pull request run or run the full suite"
+              ;;
+            schedule)
+              suite=l3-reduced ref=3.x.x mode=weekly why="the weekly reduced L3"
+              ;;
+            workflow_dispatch)
+              ref="${INPUT_REF}"
+              if [[ "${INPUT_TAG_DRY_RUN}" == true ]]; then
+                mode=tag why="a tag dry run on ${INPUT_REF}"
+              else
+                suite="${INPUT_SUITE}" mode=dispatch why="dispatched: ${INPUT_SUITE} on ${INPUT_REF}"
+              fi
+              ;;
+            *)
+              echo "unexpected event ${EVENT}" >&2
+              exit 1
+              ;;
+          esac
+          {
+            printf 'run=%s\n' "${run}"
+            printf 'suite=%s\n' "${suite}"
+            printf 'ref=%s\n' "${ref}"
+            printf 'mode=%s\n' "${mode}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "run=${run}: ${why}"
+          heading="nothing to run"
+          if [[ "${run}" == true ]]; then
+            heading="runs ${suite} on ${ref}"
+          fi
+          printf '### L3: %s\n\n%s.\n' "${heading}" "${why}" >> "${GITHUB_STEP_SUMMARY}"
+
+  plan:
+    name: Plan the suite and pin the commit
+    needs: changes
+    if: ${{ needs.changes.outputs.run == 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      sha: ${{ steps.plan.outputs.sha }}
+      tree: ${{ steps.plan.outputs.tree }}
+      promote: ${{ steps.promote.outputs.promote }}
+      source_run: ${{ steps.promote.outputs.source_run }}
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.changes.outputs.ref }}
+      - name: Select the suite and pin the commit and its tree
+        id: plan
+        env:
+          SUITE: ${{ needs.changes.outputs.suite }}
+          REF: ${{ needs.changes.outputs.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          matrix="$(python3 scripts/prism_load_matrix.py "suite:${SUITE}")"
+          echo "${matrix}"
+          sha="$(git rev-parse HEAD)"
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          mkdir -p "${RUNNER_TEMP}/plan"
+          # The collate job reads this, and a tag's promotion matches the tree.
+          jq -n --arg suite "${SUITE}" --arg ref "${REF}" --arg commit "${sha}" \
+            --arg tree "${tree}" --arg event "${EVENT}" --argjson matrix "${matrix}" \
+            '{schema: "qbit.prism.l3-plan.v1", suite: $suite, ref: $ref, commit: $commit,
+              tree: $tree, event: $event, include: $matrix.include}' \
+            > "${RUNNER_TEMP}/plan/plan.json"
+          {
+            printf 'matrix=%s\n' "${matrix}"
+            # Every later job checks out this commit, so the binaries built
+            # once and the presets each run reads are one revision even if
+            # the ref moves while the suite runs.
+            printf 'sha=%s\n' "${sha}"
+            printf 'tree=%s\n' "${tree}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "Commit \`${sha}\`, tree \`${tree}\`, $(jq '.include | length' <<<"${matrix}") runs."
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Decide whether the tag promotes a pull request's run
+        id: promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.changes.outputs.mode }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TREE: ${{ steps.plan.outputs.tree }}
+        run: |
+          set -euo pipefail
+          if [[ "${MODE}" != tag ]]; then
+            printf 'promote=false\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          python3 scripts/prism_l3_promote.py --repo "${REPO}" --tree "${TREE}" \
+            --run-id "${RUN_ID}" --out "${RUNNER_TEMP}/plan/promotion.json"
+          promote="$(jq -r '.promote' "${RUNNER_TEMP}/plan/promotion.json")"
+          printf 'promote=%s\n' "${promote}" >> "${GITHUB_OUTPUT}"
+          printf 'source_run=%s\n' "$(jq -r '.source_run // empty' "${RUNNER_TEMP}/plan/promotion.json")" >> "${GITHUB_OUTPUT}"
+          {
+            echo "#### Tag decision: $([[ "${promote}" == true ]] && echo promote || echo "run the full suite")"
+            echo
+            jq -r '.reason' "${RUNNER_TEMP}/plan/promotion.json"
+            echo
+            jq -r '.considered[] | "- run \(.run): \(.rejected)"' "${RUNNER_TEMP}/plan/promotion.json"
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-l3-plan
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/plan
+          if-no-files-found: error
+
+  build:
+    name: Build the release binaries once
+    needs: plan
+    if: ${{ needs.plan.outputs.promote != 'true' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Build the server, the harness, the gate and the summarizer in release mode
+        run: cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
+      # The Cargo dep-info files go with the binaries: the harness ties the
+      # server to the checkout through them, as it does for a local build.
+      # A tar keeps the executable bits an artifact upload would drop.
+      - name: Pack the binaries and their dep-info
+        run: |
+          set -euo pipefail
+          tar -C target/release -cf "${RUNNER_TEMP}/prism-load-binaries.tar" \
+            qbit-prism-server qbit-prism-server.d \
+            qbit-prism-load qbit-prism-load.d qbit-prism-load-gate qbit-prism-load-compare
+      - name: Upload the binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-load-binaries
+          overwrite: true
+          retention-days: 3
+          path: ${{ runner.temp }}/prism-load-binaries.tar
+          if-no-files-found: error
+
+  run:
+    name: ${{ matrix.id }}
+    needs: [plan, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Download the binaries built once
+        uses: actions/download-artifact@v8
+        with:
+          name: prism-load-binaries
+          path: ${{ runner.temp }}
+      # Unpacked where a local release build puts them and stamped after this
+      # checkout, so the harness can show the server was built from the
+      # sources beside it.
+      - name: Unpack the binaries into target/release
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          tar -C target/release -xf "${RUNNER_TEMP}/prism-load-binaries.tar"
+          touch target/release/qbit-prism-server target/release/qbit-prism-load \
+            target/release/qbit-prism-load-gate
+      - name: Name the run in the summary
+        env:
+          RUN_ID: ${{ matrix.id }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${RUN_ID} on ${RUNNER_LABEL}"
+            echo
+            echo "Commit \`$(git rev-parse HEAD)\`; the host, its disk and the runner label are in host.json below."
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+      # The preset's own gates only: no override reaches an L3 run.
+      - name: Run and gate the preset
+        env:
+          PRESET: ${{ matrix.preset }}
+          RUNNER_LABEL: ${{ matrix.runner }}
+        run: bash .github/scripts/prism-load-run.sh "${PRESET}" "${RUNNER_TEMP}/prism-load-out"
+      - name: Upload the harness reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-l3-run-${{ matrix.id }}
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/prism-load-out
+          if-no-files-found: error
+
+  # Every planned run in #473's tables, and the verdict: complete when every
+  # planned run reached its gate, passed when every one passed it. A run with
+  # no artifact is listed, never dropped.
+  collate:
+    name: Collate the suite into #473's tables
+    needs: [plan, build, run]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.promote != 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      # A failed build leaves no binaries; the collate step then lists every
+      # planned run as never run instead of failing on the download.
+      - name: Download the binaries built once
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: prism-load-binaries
+          path: ${{ runner.temp }}
+      - name: Download the plan
+        uses: actions/download-artifact@v8
+        with:
+          name: prism-l3-plan
+          path: ${{ runner.temp }}/plan
+      # No run uploading anything is a result for the collation to report,
+      # not a download failure.
+      - name: Download every run's reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-l3-run-*
+          path: ${{ runner.temp }}/runs
+      - name: Collate
+        id: collate
+        run: |
+          set -euo pipefail
+          mkdir -p target/release "${RUNNER_TEMP}/runs" "${RUNNER_TEMP}/collated"
+          cp "${RUNNER_TEMP}/plan/plan.json" "${RUNNER_TEMP}/collated/"
+          if [[ ! -f "${RUNNER_TEMP}/prism-load-binaries.tar" ]]; then
+            # No verdict is written, so a tag never promotes this run.
+            {
+              echo "## L3 suite \`$(jq -r .suite "${RUNNER_TEMP}/plan/plan.json")\`: the build failed"
+              echo
+              echo "None of the planned runs ran:"
+              echo
+              jq -r '.include[] | "- `\(.id)`"' "${RUNNER_TEMP}/plan/plan.json"
+            } > "${RUNNER_TEMP}/collated/collated.md"
+            cat "${RUNNER_TEMP}/collated/collated.md" >> "${GITHUB_STEP_SUMMARY}"
+            printf 'status=build-failed\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          tar -C target/release -xf "${RUNNER_TEMP}/prism-load-binaries.tar" qbit-prism-load-compare
+          set +e
+          target/release/qbit-prism-load-compare \
+            --collate "${RUNNER_TEMP}/plan/plan.json" \
+            --runs-dir "${RUNNER_TEMP}/runs" \
+            --presets-dir crates/qbit-prism-load/presets \
+            --verdict-out "${RUNNER_TEMP}/collated/verdict.json" \
+            > "${RUNNER_TEMP}/collated/collated.md"
+          status=$?
+          set -e
+          printf 'status=%s\n' "${status}" >> "${GITHUB_OUTPUT}"
+          # Exit 2 (unreadable inputs) writes no verdict.
+          if [[ -s "${RUNNER_TEMP}/collated/verdict.json" ]]; then
+            printf 'verdict=true\n' >> "${GITHUB_OUTPUT}"
+          fi
+          cat "${RUNNER_TEMP}/collated/collated.md" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the tables and the verdict
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-l3-collated
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/collated
+          if-no-files-found: error
+      # Named for the tree, so a tag's promotion lists only its candidates.
+      - name: Upload the verdict for the tag's promotion
+        if: ${{ !cancelled() && steps.collate.outputs.verdict == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-l3-verdict-${{ needs.plan.outputs.tree }}
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/collated/verdict.json
+          if-no-files-found: error
+      - name: Fail unless every planned run passed its gate
+        env:
+          STATUS: ${{ steps.collate.outputs.status }}
+        run: |
+          set -euo pipefail
+          case "${STATUS}" in
+            0) echo "every planned run reached its gate and passed it" ;;
+            1) echo "not every planned run passed its gate; see the tables above" >&2; exit 1 ;;
+            build-failed) echo "the build failed, so no planned run ran" >&2; exit 1 ;;
+            *) echo "the collation could not read its inputs (exit ${STATUS:-none})" >&2; exit 1 ;;
+          esac
+
+  # A tag whose tree a pull request's full run already measured: that run's
+  # tables and verdict become this run's, linked to their source, and the
+  # verdict is carried: a promoted failure fails the tag run.
+  promote:
+    name: Promote the pull request's run
+    needs: plan
+    if: ${{ needs.plan.outputs.promote == 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download the source run's tables and verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE: ${{ needs.plan.outputs.source_run }}
+        run: |
+          set -euo pipefail
+          gh run download "${SOURCE}" --repo "${REPO}" -n prism-l3-collated -D "${RUNNER_TEMP}/promoted"
+      - name: Check the tree, write the summary and the promotion record
+        id: check
+        env:
+          REPO: ${{ github.repository }}
+          SOURCE: ${{ needs.plan.outputs.source_run }}
+          TREE: ${{ needs.plan.outputs.tree }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          verdict="${RUNNER_TEMP}/promoted/verdict.json"
+          tree="$(jq -r '.tree' "${verdict}")"
+          if [[ "${tree}" != "${TREE}" ]]; then
+            echo "run ${SOURCE}'s verdict is for tree ${tree}, not ${TREE}" >&2
+            exit 1
+          fi
+          url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${SOURCE}"
+          jq -n --arg source "${SOURCE}" --arg url "${url}" --arg tree "${TREE}" --arg commit "${SHA}" \
+            '{source_run: ($source | tonumber), source_url: $url, tree: $tree, tagged_commit: $commit}' \
+            > "${RUNNER_TEMP}/promoted/promotion.json"
+          {
+            echo "### Promoted [run ${SOURCE}](${url})"
+            echo
+            echo "The tagged commit \`${SHA}\` has tree \`${TREE}\`, which that pull request run measured; its raw reports stay on it (\`prism-l3-run-*\`, 90 days)."
+            echo
+            cat "${RUNNER_TEMP}/promoted/collated.md"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          printf 'passed=%s\n' "$(jq -r '.passed' "${verdict}")" >> "${GITHUB_OUTPUT}"
+      - name: Upload the promoted tables and verdict
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-l3-collated
+          overwrite: true
+          retention-days: 90
+          path: ${{ runner.temp }}/promoted
+          if-no-files-found: error
+      - name: Carry the promoted verdict
+        env:
+          PASSED: ${{ steps.check.outputs.passed }}
+        run: |
+          set -euo pipefail
+          if [[ "${PASSED}" != true ]]; then
+            echo "the promoted run did not pass every gate; see its tables above" >&2
+            exit 1
+          fi

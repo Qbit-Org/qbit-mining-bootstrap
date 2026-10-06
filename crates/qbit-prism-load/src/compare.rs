@@ -100,7 +100,8 @@ pub struct LoadedRun {
 }
 
 impl LoadedRun {
-    fn phase(&self, name: &str) -> Option<&Value> {
+    /// The report's phase `name`, when the run has a report that drove it.
+    pub fn phase(&self, name: &str) -> Option<&Value> {
         self.report
             .as_ref()?
             .get("phases")?

@@ -20,6 +20,10 @@ evidence, and the evidence decides its lanes:
   that is not `#[ignore]`d; `cargo test --workspace` runs it in `pr`.
 - `lane_checks`: names from `CHECKS` in `scripts/prism_shipped_image_lane.py`,
   the checks lane L6 (#544) holds the shipped images to; they run in `L6`.
+- `suites`: preset suites in `crates/qbit-prism-load/presets/suites.toml`
+  (#550); a suite runs in the lane it names (`L3` for both today). A
+  scenario that cites suites and presets cites only presets those suites
+  run, so a preset's own schedule and its suite membership are both claimed.
 
 This check fails when:
 
@@ -34,7 +38,7 @@ This check fails when:
   reason; the owner is the linked issue);
 - a lane runs a scenario the manifest does not name: a gated test in one of
   the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly or weekly
-  test, a preset, or an L6 check that no running scenario cites;
+  test, a preset, a suite, or an L6 check that no running scenario cites;
 - a lane the manifest marks as running no longer has the workflow wiring
   that runs it.
 
@@ -57,7 +61,7 @@ import tomllib
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_gate_manifest import ManifestError, read_expected  # noqa: E402
-from prism_load_matrix import SelectionError, load as load_presets  # noqa: E402
+from prism_load_matrix import SelectionError, load as load_presets, load_suites  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -115,13 +119,27 @@ LANE_WIRING = {
         ".github/workflows/prism-load-nightly.yml",
         ('cron: "43 3 * * 0"', "pull_request:", f"{L6_DRIVER} run"),
     ),
+    # #550: the suites, planned by name, on the version bump, the
+    # release-candidate label, a v* tag, dispatch and the weekly schedule.
+    "L3": (
+        ".github/workflows/prism-load-l3.yml",
+        (
+            'scripts/prism_load_matrix.py "suite:${SUITE}"',
+            "grep -qx VERSION",
+            "release-candidate",
+            'tags: ["v*"]',
+            "cron:",
+            "suite=l3-reduced",
+            "scripts/prism_l3_promote.py",
+        ),
+    ),
 }
 LANE_KEYS = {"title", "runs", "owner", "workflow"}
 SCENARIO_KEYS = {
     "id", "title", "owner", "lanes", "criteria", "runs", "reason",
-    "tests", "presets", "unit_tests", "lane_checks", "notes",
+    "tests", "presets", "unit_tests", "lane_checks", "suites", "notes",
 }
-EVIDENCE_KEYS = ("tests", "presets", "unit_tests", "lane_checks")
+EVIDENCE_KEYS = ("tests", "presets", "unit_tests", "lane_checks", "suites")
 ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 ISSUE = re.compile(r"^#[1-9][0-9]*$")
 UNIT_TEST = re.compile(r"^(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*)$")
@@ -138,6 +156,7 @@ class Lanes:
         self.weekly = read_expected(root / WEEKLY_LIST)
         self.presets = load_presets(root / PRESETS)
         self.l6_checks = read_lane_checks(root / L6_DRIVER)
+        self.suites = load_suites(root / PRESETS, self.presets)
 
     def test_lanes(self, test_id: str) -> set[str]:
         lanes = set()
@@ -157,6 +176,10 @@ class Lanes:
         if lane == "pr" and not any(t.startswith(SMOKE_BINARIES) for t in self.pr):
             return set()
         return {lane} if lane else set()
+
+    def suite_lanes(self, name: str) -> set[str]:
+        suite = self.suites.get(name)
+        return {suite["lane"]} if suite else set()
 
     def unit_test_problem(self, reference: str) -> str | None:
         """Why `reference` is not a test `cargo test` runs, or None."""
@@ -319,7 +342,7 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
         if "reason" in scenario:
             problems.append(f"{where} runs; reason is only for an unexercised scenario")
         if not any(evidence.values()):
-            problems.append(f"{where} runs but cites no tests, presets, unit_tests or lane_checks")
+            problems.append(f"{where} runs but cites no tests, presets, unit_tests, lane_checks or suites")
             continue
         derived: set[str] = set()
         for test_id in evidence["tests"]:
@@ -346,6 +369,21 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
                 derived.add("L6")
             else:
                 problems.append(f"{where}: {L6_DRIVER} defines no check {name!r}, so L6 does not run it")
+        suite_members: set[str] = set()
+        for suite in evidence["suites"]:
+            found = lanes_run.suite_lanes(suite)
+            if not found:
+                problems.append(f"{where}: suite {suite!r} is not in {PRESETS}/suites.toml")
+            else:
+                suite_members |= set(lanes_run.suites[suite]["presets"])
+            derived |= found
+        if evidence["suites"]:
+            for preset in evidence["presets"]:
+                if preset not in suite_members:
+                    problems.append(
+                        f"{where}: preset {preset!r} is in none of its suites "
+                        f"({', '.join(evidence['suites'])})"
+                    )
         for key in EVIDENCE_KEYS:
             cited[key] |= set(evidence[key])
         for lane in sorted(set(declared) - derived):
@@ -372,6 +410,9 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
         lane = PRESET_LANES.get(preset.get("schedule"))
         if lane and name not in cited["presets"]:
             problems.append(f"{lane} runs preset {name}, which no running scenario names")
+    for name, suite in sorted(lanes_run.suites.items()):
+        if name not in cited["suites"]:
+            problems.append(f"{suite['lane']} runs suite {name}, which no running scenario names")
     return problems
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -89,6 +91,99 @@ class Malformed(unittest.TestCase):
             )
             with self.assertRaises(matrix.SelectionError):
                 matrix.load(Path(directory))
+
+
+class Suites(unittest.TestCase):
+    """The checked-in suites (#550) and what a malformed one is refused for."""
+
+    def setUp(self) -> None:
+        self.presets = matrix.load(matrix.PRESETS)
+        self.suites = matrix.load_suites(matrix.PRESETS, self.presets)
+
+    def test_the_full_l3_runs_every_473_cell_three_times_on_one_runner_class(self) -> None:
+        entries = matrix.select(self.presets, "suite:l3-full", suites=self.suites)
+        names = sorted({entry["preset"] for entry in entries})
+        self.assertEqual(len(names), 11)
+        for name in (
+            "throughput-200k-window-1fe-async",
+            "throughput-400k-window-1fe-async",
+            "throughput-400k-window-2fe-sync",
+            "throughput-400k-window-2fe-async-3-blocks",
+            "dense-cadence-400k-window-1fe-async",
+            "dense-cadence-400k-window-2fe-async",
+            "throughput-500k-window-4fe-async",
+        ):
+            self.assertIn(name, names)
+        self.assertEqual(len(entries), 33)
+        self.assertEqual({entry["runner"] for entry in entries}, {"blacksmith-32vcpu-ubuntu-2404"})
+        self.assertEqual(
+            sorted(entry["id"] for entry in entries if entry["preset"] == names[0]),
+            [f"{names[0]}-r1", f"{names[0]}-r2", f"{names[0]}-r3"],
+        )
+        # One job per repeat: every id is distinct.
+        self.assertEqual(len({entry["id"] for entry in entries}), 33)
+        for entry in entries:
+            self.assertEqual(entry["timeout_minutes"], self.presets[entry["preset"]]["timeout_minutes"])
+
+    def test_the_reduced_l3_is_400k_at_1_2_and_4_frontends_async_once(self) -> None:
+        entries = matrix.select(self.presets, "suite:l3-reduced", suites=self.suites)
+        names = [entry["preset"] for entry in entries]
+        for fe in (1, 2, 4):
+            self.assertIn(f"throughput-400k-window-{fe}fe-async", names)
+        self.assertEqual({entry["repeat"] for entry in entries}, {1})
+
+    def test_a_suite_preset_can_keep_its_own_schedule(self) -> None:
+        # throughput-400k-window-1fe-async is nightly and in both L3 suites.
+        self.assertEqual(self.presets["throughput-400k-window-1fe-async"]["schedule"], "nightly")
+        nightly = [entry["preset"] for entry in matrix.select(self.presets, "nightly")]
+        self.assertIn("throughput-400k-window-1fe-async", nightly)
+        self.assertNotIn("repeat", matrix.select(self.presets, "nightly")[0])
+
+    def test_every_suite_runner_is_known_to_actionlint(self) -> None:
+        config = (ROOT / ".github" / "actionlint.yaml").read_text(encoding="utf-8")
+        for name, suite in self.suites.items():
+            if "runner" in suite:
+                self.assertIn(f"- {suite['runner']}", config, name)
+
+    def test_an_unknown_suite_is_refused(self) -> None:
+        with self.assertRaises(matrix.SelectionError):
+            matrix.select(self.presets, "suite:l3-nope", suites=self.suites)
+
+    def test_a_malformed_suite_is_refused_and_only_a_suite_selection_reads_the_file(self) -> None:
+        good = (
+            'schema = "qbit.prism.load-suites.v1"\n[suites.s]\ndescription = "d"\nlane = "L3"\n'
+            'issues = ["#550"]\nrepeats = 2\npresets = ["pr-smoke"]\n'
+        )
+        cases = {
+            "schema": good.replace("load-suites.v1", "load-suites.v0"),
+            "unknown key": good + "extra = 1\n",
+            "missing key": good.replace('lane = "L3"\n', ""),
+            "unknown preset": good.replace('["pr-smoke"]', '["no-such-preset"]'),
+            "alias": good.replace('["pr-smoke"]', '["smoke"]'),
+            "repeated preset": good.replace('["pr-smoke"]', '["pr-smoke", "pr-smoke"]'),
+            "zero repeats": good.replace("repeats = 2", "repeats = 0"),
+            "too many repeats": good.replace("repeats = 2", "repeats = 6"),
+            "boolean repeats": good.replace("repeats = 2", "repeats = true"),
+            "runner": good + 'runner = "ubuntu-latest"\n',
+            "issue": good.replace('["#550"]', '["550"]'),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for preset in matrix.PRESETS.glob("*.json"):
+                (root / preset.name).write_bytes(preset.read_bytes())
+            (root / "suites.toml").write_text(good, encoding="utf-8")
+            presets = matrix.load(root)
+            self.assertEqual(len(matrix.select(presets, "suite:s", suites=matrix.load_suites(root, presets))), 2)
+            for name, text in cases.items():
+                with self.subTest(case=name):
+                    (root / "suites.toml").write_text(text, encoding="utf-8")
+                    with self.assertRaises(matrix.SelectionError):
+                        matrix.load_suites(root, presets)
+            # A broken suites file never stops the nightly's plan.
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(matrix.main(["nightly", "--presets", str(root)]), 0)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(matrix.main(["suite:s", "--presets", str(root)]), 2)
 
 
 if __name__ == "__main__":

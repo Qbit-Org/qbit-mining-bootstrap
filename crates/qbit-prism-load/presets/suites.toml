@@ -1,0 +1,60 @@
+# Named preset suites (#550): which checked-in presets a lane runs together,
+# kept apart from each preset's own `schedule` so a preset can be nightly and
+# in the reduced L3 at once. scripts/prism_load_matrix.py plans a suite with
+# the selection `suite:<name>`, and scripts/check_e2e_scenarios.py holds
+# test/e2e-scenarios.toml to what each suite runs.
+#
+# Keys of a suite, every one but `runner` required:
+#   description  what the suite is for
+#   lane         the test/e2e-scenarios.toml lane that runs it
+#   issues       the issues it answers to
+#   repeats      how many times each preset runs (1..5), one job per repeat
+#   runner       optional: the runner every preset of the suite takes instead
+#                of its own, so a suite's rates are one runner class's
+#   presets      preset names from this directory, no alias, no repeat
+#
+# Runner: the 32 vCPU class for both L3 suites until #542 (S2 of #487)
+# measures the noise and picks a class per lane. #447 found the 8 vCPU host
+# too small for 400k at 2 and 4 frontends; the 16 vCPU class the manual
+# presets name is the nightly workflow's, not a measured choice.
+
+schema = "qbit.prism.load-suites.v1"
+
+# #447's production-window matrix as #473 ran it on a1937054: 200k, 400k and
+# 500k at 1, 2 and 4 frontends, async and one synchronous comparison, the
+# found-block run and dense cadence at 400k, three repeats each (#447 asked
+# for three so an outlier can be named). The 20k dense attempt, which exited 6,
+# and #473's flush and build controls, which need a wrapper directory or a
+# second build, are not presets.
+[suites.l3-full]
+description = "#447's production-window matrix (L3, full): every #473 cell, three repeats each, on the version-bump PR, a release-candidate label, a v* tag and dispatch"
+lane = "L3"
+issues = ["#447", "#473", "#550"]
+repeats = 3
+runner = "blacksmith-32vcpu-ubuntu-2404"
+presets = [
+  "throughput-200k-window-1fe-async",
+  "throughput-400k-window-1fe-async",
+  "throughput-400k-window-2fe-async",
+  "throughput-400k-window-4fe-async",
+  "throughput-400k-window-2fe-sync",
+  "throughput-400k-window-2fe-async-3-blocks",
+  "dense-cadence-400k-window-1fe-async",
+  "dense-cadence-400k-window-2fe-async",
+  "throughput-500k-window-1fe-async",
+  "throughput-500k-window-2fe-async",
+  "throughput-500k-window-4fe-async",
+]
+
+# The weekly reduced L3: 400k at 1, 2 and 4 frontends, async, once each.
+[suites.l3-reduced]
+description = "The reduced L3, weekly: 400k at 1, 2 and 4 frontends, async"
+lane = "L3"
+issues = ["#550"]
+repeats = 1
+runner = "blacksmith-32vcpu-ubuntu-2404"
+presets = [
+  "throughput-400k-window-1fe-async",
+  "throughput-400k-window-2fe-async",
+  "throughput-400k-window-4fe-async",
+]
