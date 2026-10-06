@@ -772,9 +772,12 @@ async fn incident_2_body(
     // answers `stale-job` too since #675, or a publication lease's commit
     // gate, which the move can close without proving the work stale
     // (docs/prism-rejections.md, "Commit-gate refusals"). That gate answers
-    // `backend-rpc-unavailable` when it could not read its authority (#716),
-    // and `ledger-confirmation-failed` when its deadline or an unspecified
-    // refusal closed it. Nothing else.
+    // `current chain state is unavailable` when it could not read its
+    // authority (#716): `backend-rpc-unavailable`, since this database is
+    // healthy. It answers `ledger-confirmation-failed` when its deadline or an
+    // unspecified refusal closed it. Nothing else. By design that first answer
+    // is also admission's for readiness it cannot prove, so the wire cannot
+    // tell the two apart here; the coordinator's unit tests pin admission's.
     for (frontend, acks) in phase_a.iter().enumerate() {
         for ack in acks {
             ack.outcome.clone().map_err(|error| {

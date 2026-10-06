@@ -19,12 +19,12 @@ share-rejection label set.
 | `invalid-ntime-or-nonce` | `ntime` or `nonce` was not a 4-byte hex string. |
 | `candidate-audit-mismatch` | Legacy taxonomy; no native share producer. The final PRISM audit bundle did not match the submitted coinbase. |
 | `submitblock-rejected` | Legacy taxonomy; no native share producer. qbit `submitblock` rejected the candidate or did not advance to the submitted block. |
-| `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission, including stale-grace parent lookup. Also chain authority the frontend could not prove (`current chain state is unavailable`), including a published-work lease whose commit gate could not read that authority immediately before COMMIT (#716; see "Commit-gate refusals"). |
-| `backend-database-unavailable` | A ledger database statement failed, or did not answer in time, while authorizing a session, a job or a submission (#581, #655): a database session allocation (`database unavailable`), issued-job persistence or resume (persistence that outlived the issued job's own deadline while it waited on the database included, whichever of that deadline and the statement it cut short failed first), the payout revision and payout state a submission is checked against (`current payout state is unavailable`), and readiness that aged out because the latest template refresh failed on the database (`current chain state is unavailable`). A Stratum session's own deadline that passes while the coordinator is still waiting on the database lands here too, with the session's message (`session allocation timed out`, `job persistence timed out`, `job resume timed out`, `initial job delivery timed out`; #655): the coordinator names each step it waits on the database for, and the session reads that at its deadline. For issued-job persistence those steps are its clock and revision reads and its batch or repair write; a compact repair's lock, build admission and encoding are not (a persistence that outlives the issued job's own deadline stays the database's whatever it was doing, as #581 decided). So does readiness that aged out while the refresh in flight has outlived its deadline, the health timeout, and is still waiting on the database, although it has not failed yet (`current chain state is unavailable`). A lock held past its bound, a full connection pool and PostgreSQL down land here; so does a cluster halted by its fatal state or a read-only database, whose payout read returns no row. A refusal on a path that also reads the node is attributed to whichever dependency failed, or, for a timeout, to the one the work was still waiting on. Not here: corrupt or changed stored data and a failed blocking task (`backend-rpc-unavailable`, as before), and a session timeout that passes while the work waits on anything the coordinator does not name as the database, such as the node, CPU work or admission behind other work (`backend-rpc-unavailable`, as before #655). |
+| `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission, including stale-grace parent lookup. Also chain authority the frontend could not prove (`current chain state is unavailable`) when no database failure explains it, including a published-work lease whose commit gate could not read or prove that authority immediately before COMMIT (#716; see "Commit-gate refusals"). |
+| `backend-database-unavailable` | A ledger database statement failed, or did not answer in time, while authorizing a session, a job or a submission (#581, #655): a database session allocation (`database unavailable`), issued-job persistence or resume (persistence that outlived the issued job's own deadline while it waited on the database included, whichever of that deadline and the statement it cut short failed first), the payout revision and payout state a submission is checked against (`current payout state is unavailable`), and readiness that aged out because the latest template refresh failed on the database (`current chain state is unavailable`). A Stratum session's own deadline that passes while the coordinator is still waiting on the database lands here too, with the session's message (`session allocation timed out`, `job persistence timed out`, `job resume timed out`, `initial job delivery timed out`; #655): the coordinator names each step it waits on the database for, and the session reads that at its deadline. For issued-job persistence those steps are its clock and revision reads and its batch or repair write; a compact repair's lock, build admission and encoding are not (a persistence that outlives the issued job's own deadline stays the database's whatever it was doing, as #581 decided). So does readiness that aged out while the refresh in flight has outlived its deadline, the health timeout, and is still waiting on the database, although it has not failed yet (`current chain state is unavailable`). So does a published-work lease's commit gate that cannot prove its authority while either holds (#716). A lock held past its bound, a full connection pool and PostgreSQL down land here; so does a cluster halted by its fatal state or a read-only database, whose payout read returns no row. A refusal on a path that also reads the node is attributed to whichever dependency failed, or, for a timeout, to the one the work was still waiting on. Not here: corrupt or changed stored data and a failed blocking task (`backend-rpc-unavailable`, as before), and a session timeout that passes while the work waits on anything the coordinator does not name as the database, such as the node, CPU work or admission behind other work (`backend-rpc-unavailable`, as before #655). |
 | `internal-error` | An internal coordinator failure prevented normal classification. |
 | `pool-closed` | The coordinator was no longer accepting shares. |
 | `block-stale` | Legacy taxonomy; no native share producer. The block candidate height was stale against the active qbit tip. |
-| `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back. A share whose payout revision moved between its submit check and its commit is not answered here: the append's fence refuses it before any write as `stale-job`, cause `payout_revision` (#675), and while capture is on (`PRISM_CAPTURE_OVERPAY_CEILING_BPS` > 0) a share-pass submission that carries a found block is not refused at all: its block is captured and its answer follows the block's, as for a block-only proof (#657). Nor is a share whose published-work lease's commit gate could not read its authority: since #716 that is `backend-rpc-unavailable` (see "Commit-gate refusals"). For block-only proofs, the block was not on the active chain when its candidate was abandoned, refused by the node after the offer, or settled as a proven orphan (#415); a later reorg or late landing can still credit it. |
+| `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back. A share whose payout revision moved between its submit check and its commit is not answered here: the append's fence refuses it before any write as `stale-job`, cause `payout_revision` (#675), and while capture is on (`PRISM_CAPTURE_OVERPAY_CEILING_BPS` > 0) a share-pass submission that carries a found block is not refused at all: its block is captured and its answer follows the block's, as for a block-only proof (#657). Nor is a share whose published-work lease's commit gate could not read or prove its authority: since #716 that is answered as admission answers readiness it cannot prove (see "Commit-gate refusals"). For block-only proofs, the block was not on the active chain when its candidate was abandoned, refused by the node after the offer, or settled as a proven orphan (#415); a later reorg or late landing can still credit it. |
 | `ledger-outcome-unknown` | The ledger outcome was not known by the acknowledgement deadline; the share may still be credited (logged with `share_id`). |
 
 The native coordinator exposes its produced reason IDs in:
@@ -120,9 +120,11 @@ classification, not payout eligibility, stale grace, candidate authority or
 the share acknowledgement deadline. No new credit is recorded for this refusal.
 
 Gate closure alone does **not** prove stale work. Authority the gate cannot
-read is answered `backend-rpc-unavailable` (code **20**, message
-**`current chain state is unavailable`**), the answer admission gives when it
-cannot prove readiness or the lease (#716). That covers:
+read or prove is answered as admission answers readiness it cannot prove
+(#716): code **20**, message **`current chain state is unavailable`**. The
+reason is `backend-rpc-unavailable`, or `backend-database-unavailable` when
+the latest template refresh failed on the ledger database or the refresh in
+flight is still blocked on it (#581, #655). That covers:
 - an authority lock the gate could not take without waiting, because the tip
   poll, a fee or readiness write, or the publication itself held or was
   queued for it;
@@ -132,12 +134,14 @@ cannot prove readiness or the lease (#716). That covers:
 Before #716 these were `ledger-confirmation-failed`. Nothing is written, and
 neither a stale race nor a ledger failure is proven. A share acknowledgement
 deadline that closes the gate before COMMIT, or a refusal that records no
-closure, remains `ledger-confirmation-failed` (code **20**).
+closure, remains `ledger-confirmation-failed` (code **20**). The first
+closure wins: if a lease fence closed the gate and its ROLLBACK is still in
+flight at the deadline, the fence's answer stands.
 
 For example, a non-refresh probe may observe a return to the published
 parent while its cached observation has aged out. That does not prove the
 unchanged publication or the original lease expired, so the refused append
-is answered `backend-rpc-unavailable`, not `stale-job`. The winning
+is answered `current chain state is unavailable`, not `stale-job`. The winning
 closure cause is fixed atomically: a subsequent tip change cannot turn a
 timeout or backend refusal into an expected stale race. Once COMMIT has
 started, later lease changes cannot change its result: confirmed credit stays
@@ -152,18 +156,23 @@ completed ledger result, including its immutable-row duplicate check.
 **Telling the cases apart in logs.** A gate refusal that isn't a proven stale
 lease logs INFO `share commit gate refused before COMMIT`, with a `closure`
 field:
-- `authority-unavailable`, usually within seconds of a tip change, is the
-  contention case above (#716).
-- Any other closure is a strict refusal.
+- `authority-unavailable`: the gate could not read or prove its authority.
+  - Within seconds of a tip change, this is ordinary lock contention with
+    that tip's poll, fee and readiness writes, or publication.
+  - Away from tip changes, or alongside stale readiness, it is a readiness
+    or tip-observation loss; investigate that as you would the same answer
+    at admission.
+- `deadline-or-cancelled` or `unspecified`: a strict refusal.
 
 A WARN `share persistence failed` is a real ledger failure. That includes
 `share commit deadline passed before COMMIT was sent`: a share that waited
 out its acknowledgement deadline.
 `PrismShareAppendFailures` counts only `ledger-confirmation-failed` and
 `ledger-outcome-unknown`, so contention at a tip change no longer fires it.
-These refusals count under `backend-rpc-unavailable` in
-`qbit_prism_rejections_total`. The credit-preserving fix, which retries the
-append once the authority is readable instead of refusing, is tracked in #716.
+These refusals count under `backend-rpc-unavailable`, or
+`backend-database-unavailable` as above, in `qbit_prism_rejections_total`.
+The credit-preserving fix, which retries the append once the authority is
+readable instead of refusing, remains open in #716.
 
 The load harness follows the stable reason ID, including for mixed producer
 versions and saved reports:
@@ -172,7 +181,7 @@ versions and saved reports:
 | --- | --- |
 | `stale-job` | Expected race; excluded from `rejected_valid_shares`, never counted as accepted credit. |
 | `ledger-confirmation-failed` | Backend refusal; remains in `rejected_valid_shares`, including the historical message `share was not committed because its commit gate closed`. |
-| `backend-rpc-unavailable` | Backend refusal; remains in `rejected_valid_shares`. Since #716 it also covers a lease whose commit gate could not read its authority (`current chain state is unavailable`). |
+| `backend-rpc-unavailable`, `backend-database-unavailable` | Backend refusal; remains in `rejected_valid_shares`. Since #716 they also cover a lease whose commit gate could not read or prove its authority (`current chain state is unavailable`). |
 | `ledger-outcome-unknown` | Backend/uncertain outcome; remains in `rejected_valid_shares` and reconciliation. |
 | Missing or unrecognised gate reason | Unknown; no stale exemption from the message alone. |
 

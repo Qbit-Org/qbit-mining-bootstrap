@@ -29,7 +29,15 @@ fn proof(fixture: &Fixture, candidate: bool) -> (MiningJob<JobContext>, codec::S
 
 fn submit(
     fixture: &Fixture,
+    proof: (MiningJob<JobContext>, codec::Submission),
+) -> (JoinHandle<Result<(), StratumError>>, SharedLog) {
+    submit_logging(fixture, proof, tracing::Level::WARN)
+}
+
+fn submit_logging(
+    fixture: &Fixture,
     (job, proof): (MiningJob<JobContext>, codec::Submission),
+    level: tracing::Level,
 ) -> (JoinHandle<Result<(), StratumError>>, SharedLog) {
     let log = SharedLog::default();
     let coordinator = fixture.coordinator.clone();
@@ -39,7 +47,7 @@ fn submit(
                 .submit(&job.context.worker, &job, proof, false.into())
                 .await
         }
-        .with_subscriber(log.dispatch()),
+        .with_subscriber(log.dispatch_at(level)),
     );
     (submitted, log)
 }
@@ -165,37 +173,122 @@ async fn commit_reconcile_append_before_commit_is_refused_and_aborted_at_the_dea
 /// #716: a refused gate is answered by the closure that won it.
 /// - Only a proven stale lease is a stale race.
 /// - Authority the lease's fence could not read is answered as admission
-///   answers authority it cannot prove, not as a ledger failure.
+///   answers readiness it cannot prove, naming the ledger database when the
+///   refresh failed on it, not as a ledger failure.
 /// - A deadline closure and a refusal that records no closure stay strict.
 ///
 /// None of them credits the share, and none logs the WARN that marks a real
-/// ledger failure. The deadline's own answer, when it closes the gate first,
-/// is pinned above.
+/// ledger failure. Every refusal that isn't stale logs the INFO line with
+/// its closure, which the operator reads to tell the cases apart. The
+/// deadline's own answer, when it closes the gate first, is pinned above.
 #[tokio::test]
 async fn commit_reconcile_each_gate_closure_keeps_its_own_answer() {
     use submit_ledger::GateClosure;
-    for (closure, reason, message) in [
-        (Some(GateClosure::StaleAuthority), "stale-job", "stale job"),
+    for (closure, failed_on_database, reason, message, label) in [
+        (
+            Some(GateClosure::StaleAuthority),
+            false,
+            "stale-job",
+            "stale job",
+            None,
+        ),
         (
             Some(GateClosure::AuthorityUnavailable),
+            false,
             "backend-rpc-unavailable",
             "current chain state is unavailable",
+            Some("closure=\"authority-unavailable\""),
+        ),
+        (
+            Some(GateClosure::AuthorityUnavailable),
+            true,
+            "backend-database-unavailable",
+            "current chain state is unavailable",
+            Some("closure=\"authority-unavailable\""),
         ),
         (
             Some(GateClosure::DeadlineOrCancelled),
+            false,
             "ledger-confirmation-failed",
             "share was not committed because its commit gate closed",
+            Some("closure=\"deadline-or-cancelled\""),
         ),
         (
             None,
+            false,
             "ledger-confirmation-failed",
             "share was not committed because its commit gate closed",
+            Some("closure=\"unspecified\""),
         ),
     ] {
+        let case = format!("{closure:?}, failed on the database: {failed_on_database}");
         let fixture = fixture(|_| {}, None).await;
+        // The latest refresh failed on the database; readiness is still
+        // fresh, so admission itself passes.
+        fixture
+            .coordinator
+            .readiness
+            .write()
+            .await
+            .refresh_failed_on_database = failed_on_database;
         *fixture.store.refuse_commit.lock().unwrap() = Some(closure);
-        let (submitted, log) = submit(&fixture, proof(&fixture, false));
+        let (submitted, log) =
+            submit_logging(&fixture, proof(&fixture, false), tracing::Level::INFO);
         assert_error(submitted.await.unwrap().unwrap_err(), reason, message);
+        assert_eq!(records(&fixture), 0, "{case}");
+        assert_eq!(
+            fixture.coordinator.accepted.load(Ordering::SeqCst),
+            0,
+            "{case}"
+        );
+        let text = log.text();
+        assert!(!text.contains("share persistence failed"), "{case}: {text}");
+        let refused = text
+            .lines()
+            .find(|line| line.contains("share commit gate refused before COMMIT"));
+        match label {
+            Some(label) => assert!(
+                refused.is_some_and(|line| line.contains(label)),
+                "{case}: {text}"
+            ),
+            None => assert!(refused.is_none(), "{case}: {text}"),
+        }
+    }
+}
+
+/// #716, the deadline race: a lease fence closes the gate at the pre-COMMIT
+/// hook, and the append's ROLLBACK is still in flight at the acknowledgement
+/// deadline. The deadline aborts the append, but the fence won the gate, so
+/// its closure decides the answer, never the deadline's ledger failure.
+#[tokio::test]
+async fn commit_reconcile_a_fence_closure_keeps_its_answer_when_the_rollback_outlasts_the_deadline()
+{
+    use submit_ledger::GateClosure;
+    for (closure, reason, message) in [
+        (GateClosure::StaleAuthority, "stale-job", "stale job"),
+        (
+            GateClosure::AuthorityUnavailable,
+            "backend-rpc-unavailable",
+            "current chain state is unavailable",
+        ),
+    ] {
+        let fixture = fixture(|config| config.share_commit_timeout = MS(300), None).await;
+        let rollback = Arc::new(Gate::default());
+        *fixture.store.rollback_gate.lock().unwrap() = Some(rollback.clone());
+        *fixture.store.refuse_commit.lock().unwrap() = Some(Some(closure));
+        let started = TokioInstant::now();
+        let (submitted, log) = submit(&fixture, proof(&fixture, false));
+        rollback.entered.notified().await;
+        assert_error(submitted.await.unwrap().unwrap_err(), reason, message);
+        let answered = started.elapsed();
+        assert!(
+            answered >= MS(300),
+            "{closure:?}: answered after {answered:?}, before the deadline"
+        );
+        eventually("the refused append to be aborted", || {
+            fixture.store.cancelled.load(Ordering::SeqCst) == 1
+        })
+        .await;
         assert_eq!(records(&fixture), 0, "{closure:?}");
         assert_eq!(
             fixture.coordinator.accepted.load(Ordering::SeqCst),

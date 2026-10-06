@@ -684,18 +684,6 @@ fn protocol_error(reason: &'static str, message: &str) -> StratumError {
     StratumError::new(code, message, reason)
 }
 
-/// The refusal of a submission whose chain authority this frontend cannot
-/// prove: no readiness proof, a readiness epoch that changed during
-/// admission, an unreadable tip, a lease it cannot revalidate, or (#716) a
-/// share lease whose commit gate could not read that authority immediately
-/// before COMMIT. Nothing was credited, and no stale cause is proven.
-fn chain_state_unavailable() -> StratumError {
-    protocol_error(
-        "backend-rpc-unavailable",
-        "current chain state is unavailable",
-    )
-}
-
 /// The reason id of a refusal whose cause lies with the ledger database, not
 /// the node (#581): a lock, a full connection pool, a stalled or failed
 /// statement, PostgreSQL down. Kept apart from `backend-rpc-unavailable` so

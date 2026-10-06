@@ -85,7 +85,7 @@
       "labels": {
         "reason_id": "RejectReason"
       },
-      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. backend-rpc-unavailable names the node, or chain authority the frontend could not prove, including a published-work lease whose commit gate could not read it before COMMIT (#716); backend-database-unavailable names the ledger database (#581): a refusal on a path that reads both names whichever failed, and a timeout or aged-out readiness names the ledger database while the work it waited for was still waiting on it (#655). Incremented per refusal and overlaid on cached metric bodies at scrape time (#581), so refusals during a database outage are counted while the cached body is stale."
+      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. backend-rpc-unavailable names the node, backend-database-unavailable the ledger database (#581): a refusal on a path that reads both names whichever failed, and a timeout or aged-out readiness names the ledger database while the work it waited for was still waiting on it (#655). A published-work lease whose commit gate cannot read or prove its chain authority before COMMIT is answered the same way as readiness it cannot prove (#716), so contention with no failed dependency counts as backend-rpc-unavailable. Incremented per refusal and overlaid on cached metric bodies at scrape time (#581), so refusals during a database outage are counted while the cached body is stale."
     },
     "stale_shares_total": {
       "replaces": [
