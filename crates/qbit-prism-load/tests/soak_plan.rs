@@ -120,13 +120,13 @@ fn every_soak_preset_plans_and_the_short_ones_fit_their_timeouts() -> Result<()>
     Ok(())
 }
 
-/// #600's resident-memory ratchet is expected only where it was measured:
-/// the weekly soak's 400k-window lifetime. The shorter soaks keep a real
-/// resident-memory gate.
+/// #600's resident-memory ratchet is fixed (#627): the weekly soak passed
+/// every resident-memory row, so no soak expects a resident-memory failure
+/// and every soak gates resident memory for real.
 #[test]
-fn only_the_weekly_soak_expects_600s_resident_memory_failure() -> Result<()> {
+fn no_soak_expects_a_resident_memory_failure() -> Result<()> {
     for (name, issue) in [
-        ("soak-weekly", Some("#600")),
+        ("soak-weekly", None),
         ("soak-short", None),
         ("soak-smoke", None),
     ] {

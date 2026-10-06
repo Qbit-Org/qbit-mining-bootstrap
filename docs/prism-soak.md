@@ -47,9 +47,11 @@ exact reconciliation of every offered, acknowledged and committed share, no
 durability finding, no shortfall in any phase, and the tip-delivery budgets.
 
 **A known resident-memory failure.** `rss_expected_failure` names an issue,
-or is `null`. `soak-weekly` names #600: its first run found a 400k-window
-frontend's resident set ratcheting up with block landings to about 3.3 GB,
-while every other gate passed. While the key is set, the resident-memory
+or is `null`. Every checked-in soak sets `null`. `soak-weekly` named #600
+until #627: its first run found a 400k-window frontend's resident set
+ratcheting up with block landings to about 3.3 GB. After #627's
+post-landing `malloc_trim`, a 5.5 h `soak-weekly` (run 37403129136) passed
+every resident-memory row, so the gate is real again. While the key is set, the resident-memory
 rows of every process are an expected failure as a group. A measured failure
 is reported as `expected failure (#600)` and does not fail the soak; a soak in
 which every resident-memory row passed fails with `#600 looks fixed`, so the
