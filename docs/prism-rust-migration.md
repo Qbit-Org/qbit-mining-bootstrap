@@ -776,13 +776,18 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
 ```
 
 - The checker reads each body once. A row whose sidecar is in `--sidecar-dir`
-  is `has-sidecar` and its body is not read; the sidecar tool and import
-  verify the sidecar's bytes. `2x-order-only` and `matches-neither` rows are
-  the ones import refuses: `--affected-csv` lists them in the tool's `--rows`
-  format, and stderr counts them as `import_refuses`. The checker exits 0 only
-  when no row would be refused and every body is readable and holds the row's
-  digest; restore any `body-missing`, `body-unreadable` or
-  `body-digest-differs` evidence instead.
+  is `has-sidecar` and its body is not read. That status means only that the
+  file is there: import verifies the sidecar's bytes and stops on a bad one.
+  The sidecar tool checks an existing sidecar (`sidecar-ok` or `sidecar-bad`)
+  for every row it is given. `2x-order-only` and `matches-neither` rows are
+  the ones import refuses for this digest: `--affected-csv` lists them in the
+  tool's `--rows` format, and stderr counts them as `import_refuses`.
+- The checker exits 0 only when no row is refused for this digest, no body is
+  missing or unreadable, and no v2 body is for another digest. Restore any
+  `body-missing`, `body-unreadable` or `body-digest-differs` evidence instead.
+  It checks nothing else: a body-ref or plain bundle is `no-window-proof`, and
+  rows that import refuses for other reasons, such as the escaped range
+  digests above, need the previous section's classification run.
 - The runner splits the rows round robin into shards, each with its own CSV,
   work directory and report, and runs the tool with `--write` on each. Its
   last argument is the number of shards, 8 by default. The output directory
