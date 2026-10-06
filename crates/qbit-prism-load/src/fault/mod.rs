@@ -132,8 +132,15 @@ impl<T: Send + 'static> Spawned<T> {
         }
     }
 
+    /// The task ended without a result: it panicked or was cancelled, and
+    /// `poll` will never yield one.
+    pub fn lost(&self) -> bool {
+        self.task.is_none() && self.value.is_none()
+    }
+
     /// The result, once the task has finished. A task that panicked or was
-    /// cancelled never yields one; the caller's own deadline covers it.
+    /// cancelled never yields one; the caller's own deadline covers it, or
+    /// `lost` tells it apart from one still running.
     pub fn poll(&mut self) -> Option<&T> {
         if self.value.is_none() {
             let task = self.task.as_ref()?;
@@ -801,11 +808,14 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
 }
 
 /// Anything a fault still waits for once its recovery window has passed:
-/// the SIGKILL's landing through the candidate lease, a failover's census of
-/// the new primary and its block's landing, the backlog's settling.
+/// the SIGKILL's landing through the candidate lease, the drained block's
+/// landing and every frontend's work at the revision it committed (#686), a
+/// failover's census of the new primary and its block's landing, the
+/// backlog's settling. The next fault's gap starts only after it.
 fn settle(run: &mut FaultRun, env: &FaultEnv<'_>, tools: &FaultTools) -> Result<bool> {
     match &mut run.action {
         Action::FrontendSigkill(kill) => kill.poll_landing(tools),
+        Action::SigtermDrain(drain) => Ok(drain.poll_settle(env, tools)),
         Action::Failover(failover) => failover.poll_settle(env, tools),
         Action::CandidateBacklog(backlog) => Ok(backlog.poll_settle(env, tools)),
         _ => Ok(true),

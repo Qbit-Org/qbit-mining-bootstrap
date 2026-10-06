@@ -9,7 +9,9 @@
 //!   relay, and the frontend offering it gets SIGTERM the moment the call
 //!   arrives. #585's shutdown has to wait for the offer: the block reaches
 //!   the node exactly once, the node's `accepted` is recorded before the
-//!   process exits 0, and no committed share goes unanswered.
+//!   process exits 0, and no committed share goes unanswered. The relaunch
+//!   then lands the block, and the next fault waits until every frontend
+//!   serves work at the payout revision the landing committed (#686).
 //! - `settlement-lock`: an outside transaction holds `SETTLEMENT_LOCK` while
 //!   the sessions keep mining, and a tip is minted halfway through. Shares on
 //!   retained work keep being acknowledged, the tip's jobs wait for the

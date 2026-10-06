@@ -611,6 +611,14 @@ impl FaultDriver {
                             .unwrap_or_default()
                     ),
                 ));
+                // The settle the next fault waited for (#686): without it a
+                // drain whose block never landed would pass, and the next
+                // fault would measure the landing's revision bump instead.
+                checks.push(check(
+                    "the block landed and every frontend served work at its revision",
+                    drain.current_at.is_some(),
+                    drain.settle_detail(),
+                ));
                 evidence = drain.evidence(origin);
             }
             Action::RollingRestart(rolling) => {
