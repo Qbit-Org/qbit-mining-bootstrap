@@ -1036,23 +1036,16 @@ struct LevelResult {
     append_seconds: f64,
     shares_per_second: f64,
     passed_minimum: bool,
-    /// A first pass that fell below the floor, when the level was measured a
-    /// second time; the fields around it are that second pass's (#683).
-    first_pass: Option<FirstPass>,
+    /// The whole first pass, when it fell below the floor and the level was
+    /// measured a second time; the fields around it are that second pass's
+    /// (#683).
+    first_pass: Option<Box<LevelResult>>,
     /// `Some(true)` when a backend outside this run held or waited on
     /// `ORDER_LOCK` while this level was being timed, `Some(false)` when the
     /// sampler looked and found none, `None` when it could not look.
     contaminated: Option<bool>,
     per_appender: Vec<(String, i64)>,
     order_lock: Value,
-}
-
-/// What the report keeps of a first pass that fell below the floor.
-struct FirstPass {
-    share_count: i64,
-    append_seconds: f64,
-    shares_per_second: f64,
-    contaminated: Option<bool>,
 }
 
 struct Measurement {
@@ -1317,12 +1310,7 @@ async fn measure_level(
             first.appenders, first.shares_per_second
         )
     })?;
-    second.first_pass = Some(FirstPass {
-        share_count: first.share_count,
-        append_seconds: first.append_seconds,
-        shares_per_second: first.shares_per_second,
-        contaminated: first.contaminated,
-    });
+    second.first_pass = Some(Box::new(first));
     Ok(second)
 }
 
@@ -1695,58 +1683,49 @@ fn build_report(config: &Config, measurement: &Measurement) -> Value {
     let results = measurement
         .levels
         .iter()
-        .map(|level| {
-            let mut entry = Map::new();
-            entry.insert("appenders".to_owned(), Value::from(level.appenders));
-            entry.insert("share_count".to_owned(), Value::from(level.share_count));
-            entry.insert("append_seconds".to_owned(), json_f64(level.append_seconds));
-            entry.insert(
-                "shares_per_second".to_owned(),
-                json_f64(level.shares_per_second),
-            );
-            entry.insert(
-                "passed_minimum".to_owned(),
-                Value::from(level.passed_minimum),
-            );
-            entry.insert(
-                "first_pass".to_owned(),
-                level.first_pass.as_ref().map_or(Value::Null, |first| {
-                    let mut pass = Map::new();
-                    pass.insert("share_count".to_owned(), Value::from(first.share_count));
-                    pass.insert("append_seconds".to_owned(), json_f64(first.append_seconds));
-                    pass.insert(
-                        "shares_per_second".to_owned(),
-                        json_f64(first.shares_per_second),
-                    );
-                    pass.insert(
-                        "contaminated".to_owned(),
-                        first.contaminated.map_or(Value::Null, Value::from),
-                    );
-                    Value::Object(pass)
-                }),
-            );
-            entry.insert(
-                "contaminated".to_owned(),
-                level.contaminated.map_or(Value::Null, Value::from),
-            );
-            let per_appender = level
-                .per_appender
-                .iter()
-                .map(|(writer_id, count)| {
-                    let mut one = Map::new();
-                    one.insert("writer_id".to_owned(), Value::from(writer_id.clone()));
-                    one.insert("share_count".to_owned(), Value::from(*count));
-                    Value::Object(one)
-                })
-                .collect::<Vec<_>>();
-            entry.insert("per_appender".to_owned(), Value::Array(per_appender));
-            entry.insert("order_lock".to_owned(), level.order_lock.clone());
-            Value::Object(entry)
-        })
+        .map(level_entry)
         .collect::<Vec<_>>();
     root.insert("results".to_owned(), Value::Array(results));
     root.insert("notes".to_owned(), Value::from(NOTES));
     Value::Object(root)
+}
+
+/// One level's report entry. A first pass below the floor sits under
+/// `first_pass` in the same shape, its lock evidence included (#683).
+fn level_entry(level: &LevelResult) -> Value {
+    let mut entry = Map::new();
+    entry.insert("appenders".to_owned(), Value::from(level.appenders));
+    entry.insert("share_count".to_owned(), Value::from(level.share_count));
+    entry.insert("append_seconds".to_owned(), json_f64(level.append_seconds));
+    entry.insert(
+        "shares_per_second".to_owned(),
+        json_f64(level.shares_per_second),
+    );
+    entry.insert(
+        "passed_minimum".to_owned(),
+        Value::from(level.passed_minimum),
+    );
+    entry.insert(
+        "first_pass".to_owned(),
+        level.first_pass.as_deref().map_or(Value::Null, level_entry),
+    );
+    entry.insert(
+        "contaminated".to_owned(),
+        level.contaminated.map_or(Value::Null, Value::from),
+    );
+    let per_appender = level
+        .per_appender
+        .iter()
+        .map(|(writer_id, count)| {
+            let mut one = Map::new();
+            one.insert("writer_id".to_owned(), Value::from(writer_id.clone()));
+            one.insert("share_count".to_owned(), Value::from(*count));
+            Value::Object(one)
+        })
+        .collect::<Vec<_>>();
+    entry.insert("per_appender".to_owned(), Value::Array(per_appender));
+    entry.insert("order_lock".to_owned(), level.order_lock.clone());
+    Value::Object(entry)
 }
 
 /// Writes the report and returns its path. Called before the floor assertion so
