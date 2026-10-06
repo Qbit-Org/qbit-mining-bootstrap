@@ -267,9 +267,12 @@ reservation or an adopted block.
   an offered row (exit 3).
 - **Alerts.** While it lasts, a lost landing counts as landing-failed, a lost
   finish as pending only, and a recovered reservation as unacknowledged, for
-  its unknown outcome. No candidate alert fires before a row has been
-  unfinished for at least 3 minutes. A race that clears on the next retry or
-  two stays under all of them. If one fires, look at the row.
+  its unknown outcome. The candidate alerts measure a row's age from when it
+  was created or reserved, not from the race, and none fires before a row has
+  been unfinished for at least 3 minutes. So a freshly found block whose race
+  clears on the next retry or two stays under all of them. A row that was
+  already old, or that has many attempts behind it (its retry waits
+  `10 × attempt_count` s), can fire one anyway. If one fires, look at the row.
 
 #630 tracks retrying the write in place, so that a lost race stops logging an
 ALERT.
