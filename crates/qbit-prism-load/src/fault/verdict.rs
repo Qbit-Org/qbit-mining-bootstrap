@@ -329,9 +329,73 @@ impl FaultDriver {
                 });
             }
             Action::SettlementLock {
-                minted, tip, stall, ..
+                work,
+                holder,
+                under_lock,
+                minted,
+                tip,
+                stall,
+                ..
             } => {
                 let injected = run.injected_at.unwrap_or(inject_start);
+                // Every check below assumes retained work was current when
+                // the lock was taken (#692): a hold taken while a landing's
+                // revision bump was still unpublished blocks the publication
+                // too, and refuses every share on the old work. Under the
+                // lock nothing can publish, so a reading taken then must
+                // find every frontend serving the revision the lock keeps.
+                let locked = holder.as_ref().and_then(LockHolder::revision);
+                let before = match work.current_at {
+                    Some(at) => format!(
+                        "every frontend served current work with no settlement under way {:.1} s \
+                         after the injection started",
+                        at.saturating_duration_since(inject_start).as_secs_f64()
+                    ),
+                    None => format!(
+                        "no reading within the {} s bound found current work on a quiet cluster \
+                         ({})",
+                        LOCK_WORK_WAIT.as_secs(),
+                        work.last_read()
+                    ),
+                };
+                let (pass, under) = match (locked, under_lock) {
+                    (Some(locked), Some(Ok(reading))) if reading.published_at(locked) => (
+                        true,
+                        format!(
+                            "the lock kept revision {locked}, and under it every frontend served \
+                             work at it"
+                        ),
+                    ),
+                    (Some(locked), Some(Ok(reading))) => (
+                        false,
+                        format!("the lock kept revision {locked}, but under it {reading:?}"),
+                    ),
+                    (Some(locked), Some(Err(error))) => (
+                        false,
+                        format!("the lock kept revision {locked}, and the work under it was not read: {error}"),
+                    ),
+                    (Some(locked), None) => (
+                        false,
+                        format!("the lock kept revision {locked}, and the work under it was not read"),
+                    ),
+                    (None, _) => (
+                        false,
+                        format!(
+                            "the revision under the lock is unknown{}",
+                            holder
+                                .as_ref()
+                                .and_then(LockHolder::revision_error)
+                                .map(|error| format!(": {error}"))
+                                .unwrap_or_default()
+                        ),
+                    ),
+                };
+                checks.push(check(
+                    "every frontend served work at the revision the lock kept",
+                    pass,
+                    format!("{before}; {under}"),
+                ));
+                let hold = window_shares(inputs, injected, removed);
                 let before_tip = window_shares(inputs, injected, minted.unwrap_or(removed));
                 // Shares take ORDER_LOCK, never SETTLEMENT_LOCK, so none may
                 // wait on the holder: every answer in the hold, accepted or
@@ -460,10 +524,24 @@ impl FaultDriver {
                     })
                     .collect();
                 evidence = json!({
+                    "quiet_after_seconds": at(work.current_at),
+                    "quiet_after_injection_started_seconds": work.current_at
+                        .map(|quiet| quiet.saturating_duration_since(inject_start).as_secs_f64()),
+                    "quiet_wait_seconds": LOCK_WORK_WAIT.as_secs(),
+                    "work_before_the_lock": work.last,
+                    "work_read_error": work.error,
+                    "payout_revision_under_the_lock": locked,
+                    "work_under_the_lock": under_lock.as_ref().map(|read| match read {
+                        Ok(reading) => json!(reading),
+                        Err(error) => json!({ "error": error }),
+                    }),
+                    "payout_revision_under_the_lock_error": holder
+                        .as_ref()
+                        .and_then(LockHolder::revision_error),
                     "hold_seconds": removed.saturating_duration_since(injected).as_secs_f64(),
                     "tip_minted_after_seconds": at(*minted),
                     "tip": tip.as_ref().map(|tip| &tip.hash),
-                    "ack_milliseconds_during_hold": during.ack_milliseconds,
+                    "ack_milliseconds_during_hold": hold.ack_milliseconds,
                     "ack_milliseconds_before_the_tip": before_tip.ack_milliseconds,
                     "shares_before_the_tip": before_tip,
                     "work_refresh_stalled_seconds_peak_during_hold": peak_during,

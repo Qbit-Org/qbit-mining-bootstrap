@@ -362,9 +362,10 @@ impl FaultPlan {
 
     /// An upper bound on the `faults` phase: every planned window, every gap,
     /// and each action fault's drain and relaunch allowance, plus the lease
-    /// wait for a SIGKILL and the settle wait for a drain. The phase ends as
-    /// soon as the last fault's recovery window closes; this bound only stops
-    /// a fault that never finishes from running forever.
+    /// wait for a SIGKILL, the settle wait for a drain and the wait for
+    /// current work before a settlement lock. The phase ends as soon as the
+    /// last fault's recovery window closes; this bound only stops a fault
+    /// that never finishes from running forever.
     pub fn phase_seconds_bound(&self, frontends: usize) -> u64 {
         self.schedule()
             .iter()
@@ -385,6 +386,9 @@ impl FaultPlan {
                 }
                 if scheduled.kind == FaultKind::SigtermDrain {
                     seconds += super::frontend::DRAIN_SETTLE_WAIT.as_secs();
+                }
+                if scheduled.kind == FaultKind::SettlementLock {
+                    seconds += super::LOCK_WORK_WAIT.as_secs();
                 }
                 if scheduled.kind.is_failover() {
                     seconds += FAILOVER_ALLOWANCE_SECONDS + self.cut_seconds;
@@ -615,6 +619,11 @@ mod tests {
                 + ACTION_ALLOWANCE_SECONDS
                 + crate::fault::frontend::DRAIN_SETTLE_WAIT.as_secs()
                 + 30
+        );
+        let lock = FaultPlan::parse("settlement-lock;baseline=5;hold=10;recovery=20").unwrap();
+        assert_eq!(
+            lock.phase_seconds_bound(1),
+            5 + 10 + 20 + crate::fault::LOCK_WORK_WAIT.as_secs() + 30
         );
         let rolling = FaultPlan::parse("rolling-restart;baseline=5;hold=10;recovery=20").unwrap();
         assert_eq!(

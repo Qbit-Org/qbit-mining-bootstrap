@@ -48,8 +48,8 @@ pub const SHUTDOWN_GAVE_UP_LINE: &str =
 /// and every frontend to serve work at the payout revision the landing
 /// committed (#686). It normally takes a few seconds.
 pub const DRAIN_SETTLE_WAIT: Duration = Duration::from_secs(60);
-/// How often the drain's settle reads the row, or the revision and every
-/// `/healthz`.
+/// How often the drain's settle reads the row, and a [`WorkCurrentWait`] the
+/// revision and every `/healthz`.
 const SETTLE_READ_INTERVAL: Duration = Duration::from_millis(250);
 /// Each `/healthz` read's limit: the server answers from its last published
 /// snapshot, so a slow answer means a frontend that is not serving.
@@ -188,17 +188,17 @@ pub struct SigtermDrain {
     /// frontend's `/healthz` until each serves work at it.
     settle_deadline: Option<Instant>,
     landing: Option<Spawned<Result<Option<CandidateRow>>>>,
-    work: Option<Spawned<Result<WorkReading>>>,
     next_settle_read: Instant,
-    client: Option<reqwest::Client>,
+    /// Once the block has landed: every frontend's work at its revision.
+    work: WorkCurrentWait,
     pub landed_at: Option<Instant>,
     pub current_at: Option<Instant>,
     /// Why the settle stopped without current work: the bound, or a row
     /// that went terminal without landing.
     pub unsettled: Option<String>,
     pub last_row: Option<CandidateRow>,
-    pub last_work: Option<WorkReading>,
-    /// The latest read's failure; a later successful read clears it.
+    /// The latest read of the row's failure; a later successful read clears
+    /// it. The work's reads keep their own.
     pub settle_error: Option<String>,
     pub problems: Vec<String>,
     log_before: (usize, usize),
@@ -229,14 +229,12 @@ impl SigtermDrain {
             ready_at: None,
             settle_deadline: None,
             landing: None,
-            work: None,
             next_settle_read: Instant::now(),
-            client: None,
+            work: WorkCurrentWait::new(),
             landed_at: None,
             current_at: None,
             unsettled: None,
             last_row: None,
-            last_work: None,
             settle_error: None,
             problems: Vec::new(),
             log_before: (0, 0),
@@ -438,33 +436,15 @@ impl SigtermDrain {
                 return true;
             }
         }
-        if let Some(read) = self.work.as_mut() {
-            let finished = read.poll().map(|result| match result {
-                Ok(value) => Ok(value.clone()),
-                Err(error) => Err(format!("{error:#}")),
-            });
-            match finished {
-                None if !read.lost() => {
-                    self.unsettled = past_settle_bound(deadline);
-                    return self.unsettled.is_some();
-                }
-                None => self.settle_error = Some("a read of the frontends' work was lost".into()),
-                Some(Err(error)) => {
-                    self.settle_error = Some(format!("reading the frontends' work: {error}"));
-                }
-                Some(Ok(reading)) => {
-                    self.settle_error = None;
-                    // A reading that finished past the bound does not count.
-                    if reading.current() && Instant::now() < deadline {
-                        self.current_at = Some(Instant::now());
-                    }
-                    self.last_work = Some(reading);
-                }
+        if self.landed_at.is_some() {
+            if !self.work.poll(deadline, env, tools) {
+                return false;
             }
-            self.work = None;
-            if self.current_at.is_some() {
-                return true;
+            match self.work.current_at {
+                Some(at) => self.current_at = Some(at),
+                None => self.unsettled = past_settle_bound(deadline),
             }
+            return true;
         }
         self.unsettled = past_settle_bound(deadline);
         if self.unsettled.is_some() {
@@ -472,30 +452,10 @@ impl SigtermDrain {
         }
         if Instant::now() >= self.next_settle_read {
             self.next_settle_read = Instant::now() + SETTLE_READ_INTERVAL;
-            if self.landed_at.is_none() {
-                self.landing = Some(Spawned::spawn(CandidateRow::read(
-                    tools.side.clone(),
-                    seen.block_hash.clone(),
-                )));
-            } else {
-                let client = self
-                    .client
-                    .get_or_insert_with(|| {
-                        reqwest::Client::builder()
-                            .timeout(HEALTH_READ_TIMEOUT)
-                            .build()
-                            .unwrap_or_default()
-                    })
-                    .clone();
-                self.work = Some(Spawned::spawn(WorkReading::read(
-                    tools.side.clone(),
-                    client,
-                    env.frontends
-                        .iter()
-                        .map(|frontend| frontend.health_url())
-                        .collect(),
-                )));
-            }
+            self.landing = Some(Spawned::spawn(CandidateRow::read(
+                tools.side.clone(),
+                seen.block_hash.clone(),
+            )));
         }
         false
     }
@@ -536,13 +496,18 @@ impl SigtermDrain {
                     .as_deref()
                     .unwrap_or("the settle did not finish"),
                 self.last_row,
-                self.last_work,
-                self.settle_error
-                    .as_deref()
+                self.work.last,
+                self.settle_error()
                     .map(|error| format!(" ({error})"))
                     .unwrap_or_default()
             ),
         }
+    }
+
+    /// The latest read's failure, of the row or, once the block landed, of
+    /// the work.
+    fn settle_error(&self) -> Option<&str> {
+        self.settle_error.as_deref().or(self.work.error.as_deref())
     }
 
     pub fn evidence(&self, origin: Instant) -> Value {
@@ -572,19 +537,23 @@ impl SigtermDrain {
             "work_current_after_seconds": at(self.current_at),
             "settle_wait_seconds": DRAIN_SETTLE_WAIT.as_secs(),
             "candidate_at_settle": self.last_row,
-            "work_at_settle": self.last_work,
+            "work_at_settle": self.work.last,
             "settle_unsettled": self.unsettled,
-            "settle_error": self.settle_error,
+            "settle_error": self.settle_error(),
             "problems": self.problems,
         })
     }
 }
 
 /// One reading of the work every frontend serves, as #640's gate takes it:
-/// the cluster's payout revision, then each frontend's published `/healthz`.
+/// the cluster's payout revision and the settlements under way, then each
+/// frontend's published `/healthz`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WorkReading {
     pub payout_revision: i64,
+    /// Backends holding or waiting for `SETTLEMENT_LOCK`: a rebuild, a job
+    /// build or a landing the server is still settling.
+    pub settlements_in_progress: i64,
     /// One per frontend, in order; `None` where `/healthz` gave no JSON.
     pub frontends: Vec<Option<FrontendWork>>,
 }
@@ -603,10 +572,19 @@ impl WorkReading {
     /// The revision first, then every frontend's `/healthz` at once, so a
     /// bump between the two shows as a frontend behind it and is read again.
     async fn read(pool: PgPool, client: reqwest::Client, health_urls: Vec<String>) -> Result<Self> {
-        let payout_revision: i64 =
-            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
-                .fetch_one(&pool)
-                .await?;
+        let (payout_revision, settlements_in_progress): (i64, i64) = sqlx::query_as(
+            "SELECT payout_revision, \
+               (SELECT count(*) FROM pg_locks l WHERE l.locktype = 'advisory' \
+                  AND l.database = (SELECT oid FROM pg_database \
+                                    WHERE datname = current_database()) \
+                  AND l.classid = $1::bigint::oid AND l.objid = $2::bigint::oid \
+                  AND l.objsubid = 1) \
+             FROM qbit_prism_cluster WHERE singleton",
+        )
+        .bind(crate::measure::PRISM_LOCK_CLASSID)
+        .bind(crate::measure::SETTLEMENT_LOCK_OBJID)
+        .fetch_one(&pool)
+        .await?;
         let reads: Vec<_> = health_urls
             .into_iter()
             .map(|url| {
@@ -631,6 +609,7 @@ impl WorkReading {
         }
         Ok(Self {
             payout_revision,
+            settlements_in_progress,
             frontends,
         })
     }
@@ -646,6 +625,199 @@ impl WorkReading {
                         && work.authorized_missing_current_work == Some(0)
                 })
             })
+    }
+
+    /// Current, with no settlement under way: a lock taken now is not queued
+    /// behind a rebuild, a job build or a landing the server is still
+    /// settling.
+    pub fn quiet(&self) -> bool {
+        self.current() && self.settlements_in_progress == 0
+    }
+
+    /// Every frontend ready and publishing work at `revision`, as a reading
+    /// taken under `SETTLEMENT_LOCK` must show for the lock to keep retained
+    /// work current. A session still waiting for its first job has nothing
+    /// to submit, so it is not counted.
+    pub fn published_at(&self, revision: i64) -> bool {
+        !self.frontends.is_empty()
+            && self.frontends.iter().all(|work| {
+                work.as_ref()
+                    .is_some_and(|work| work.ok && work.payout_state_generation == Some(revision))
+            })
+    }
+}
+
+/// A spawned [`WorkReading`] of every frontend.
+fn reading(
+    client: reqwest::Client,
+    env: &FaultEnv<'_>,
+    tools: &FaultTools,
+) -> Spawned<Result<WorkReading>> {
+    Spawned::spawn(WorkReading::read(
+        tools.side.clone(),
+        client,
+        env.frontends
+            .iter()
+            .map(|frontend| frontend.health_url())
+            .collect(),
+    ))
+}
+
+/// A wait, up to a deadline, for every frontend to serve current work, read
+/// as [`WorkReading`] every [`SETTLE_READ_INTERVAL`]. The drain's settle
+/// waits for it once its block has landed (#686), and the settlement-lock
+/// fault for current work on a quiet cluster before it takes the lock
+/// (#692).
+pub struct WorkCurrentWait {
+    /// Wait for [`WorkReading::quiet`], not only [`WorkReading::current`].
+    quiet: bool,
+    read: Option<Spawned<Result<WorkReading>>>,
+    next_read: Instant,
+    client: Option<reqwest::Client>,
+    /// When a reading showed every frontend's work current, before the
+    /// deadline.
+    pub current_at: Option<Instant>,
+    /// The deadline passed first.
+    pub timed_out: bool,
+    pub last: Option<WorkReading>,
+    /// The latest read's failure; a later successful read clears it.
+    pub error: Option<String>,
+}
+
+impl Default for WorkCurrentWait {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkCurrentWait {
+    pub fn new() -> Self {
+        Self {
+            quiet: false,
+            read: None,
+            next_read: Instant::now(),
+            client: None,
+            current_at: None,
+            timed_out: false,
+            last: None,
+            error: None,
+        }
+    }
+
+    /// A wait for current work on a quiet cluster: a lock queued behind a
+    /// settlement under way would start its hold in the middle of it.
+    pub fn quiet() -> Self {
+        Self {
+            quiet: true,
+            ..Self::new()
+        }
+    }
+
+    /// `true` once every frontend serves current work, or once `deadline`
+    /// passed first.
+    pub fn poll(&mut self, deadline: Instant, env: &FaultEnv<'_>, tools: &FaultTools) -> bool {
+        self.poll_with(deadline, |client| reading(client, env, tools))
+    }
+
+    /// One more reading, outside the wait: the settlement-lock fault's
+    /// reading under the lock.
+    pub fn read_once(
+        &mut self,
+        env: &FaultEnv<'_>,
+        tools: &FaultTools,
+    ) -> Spawned<Result<WorkReading>> {
+        reading(self.client(), env, tools)
+    }
+
+    fn client(&mut self) -> reqwest::Client {
+        self.client
+            .get_or_insert_with(|| {
+                reqwest::Client::builder()
+                    .timeout(HEALTH_READ_TIMEOUT)
+                    .build()
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
+    /// [`Self::poll`], with each read started by `read`.
+    fn poll_with(
+        &mut self,
+        deadline: Instant,
+        read: impl FnOnce(reqwest::Client) -> Spawned<Result<WorkReading>>,
+    ) -> bool {
+        if self.current_at.is_some() || self.timed_out {
+            return true;
+        }
+        if let Some(pending) = self.read.as_mut() {
+            let finished = pending.poll().map(|result| match result {
+                Ok(value) => Ok(value.clone()),
+                Err(error) => Err(format!("{error:#}")),
+            });
+            match finished {
+                // A read still in flight at the bound is abandoned with the
+                // wait; one whose task was lost is replaced.
+                None if !pending.lost() => {
+                    if Instant::now() < deadline {
+                        return false;
+                    }
+                    pending.abort();
+                    self.read = None;
+                    self.timed_out = true;
+                    return true;
+                }
+                None => self.error = Some("a read of the frontends' work was lost".into()),
+                Some(Err(error)) => {
+                    self.error = Some(format!("reading the frontends' work: {error}"));
+                }
+                Some(Ok(reading)) => {
+                    self.error = None;
+                    let done = if self.quiet {
+                        reading.quiet()
+                    } else {
+                        reading.current()
+                    };
+                    // A reading that finished past the bound does not count.
+                    if done && Instant::now() < deadline {
+                        self.current_at = Some(Instant::now());
+                    }
+                    self.last = Some(reading);
+                }
+            }
+            self.read = None;
+            if self.current_at.is_some() {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            self.timed_out = true;
+            return true;
+        }
+        if Instant::now() >= self.next_read {
+            self.next_read = Instant::now() + SETTLE_READ_INTERVAL;
+            let client = self.client();
+            self.read = Some(read(client));
+        }
+        false
+    }
+
+    /// Cancel a read still in flight, for a caller that stopped waiting.
+    pub fn abort(&mut self) {
+        if let Some(mut read) = self.read.take() {
+            read.abort();
+        }
+    }
+
+    /// What the wait last read, and the latest read's failure.
+    pub fn last_read(&self) -> String {
+        format!(
+            "last reading {:?}{}",
+            self.last,
+            self.error
+                .as_deref()
+                .map(|error| format!(" ({error})"))
+                .unwrap_or_default()
+        )
     }
 }
 
@@ -1162,6 +1334,7 @@ mod tests {
     fn work_is_current_once_every_frontend_serves_the_revision_to_every_session() {
         let reading = |frontends| WorkReading {
             payout_revision: 7,
+            settlements_in_progress: 0,
             frontends,
         };
         assert!(reading(vec![
@@ -1185,5 +1358,165 @@ mod tests {
         assert!(!reading(vec![work(true, None, Some(0))]).current());
         assert!(!reading(vec![work(true, Some(7), None)]).current());
         assert!(!reading(Vec::new()).current());
+    }
+
+    fn at_revision(generation: i64) -> WorkReading {
+        WorkReading {
+            payout_revision: 7,
+            settlements_in_progress: 0,
+            frontends: vec![work(true, Some(generation), Some(0))],
+        }
+    }
+
+    /// A read that has already finished with `reading`.
+    fn read(reading: WorkReading) -> impl FnOnce(reqwest::Client) -> Spawned<Result<WorkReading>> {
+        move |_| Spawned::ready(Ok(reading))
+    }
+
+    fn no_read(_: reqwest::Client) -> Spawned<Result<WorkReading>> {
+        panic!("the wait started a read it should not have")
+    }
+
+    fn hold_off_reads(wait: &mut WorkCurrentWait) {
+        wait.next_read = Instant::now() + Duration::from_secs(3600);
+    }
+
+    #[test]
+    fn the_wait_reads_until_the_work_is_current_then_stops() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut wait = WorkCurrentWait::new();
+        // The first poll starts a read; the next takes it. A frontend still
+        // behind the revision is read again, but only after the interval.
+        assert!(!wait.poll_with(deadline, read(at_revision(6))));
+        hold_off_reads(&mut wait);
+        assert!(!wait.poll_with(deadline, no_read));
+        assert_eq!(wait.last, Some(at_revision(6)));
+        wait.next_read = Instant::now();
+        assert!(!wait.poll_with(deadline, read(at_revision(7))));
+        assert!(wait.poll_with(deadline, no_read));
+        assert!(wait.current_at.is_some() && !wait.timed_out);
+        assert_eq!(wait.last, Some(at_revision(7)));
+        // Done: no more reads.
+        wait.next_read = Instant::now();
+        assert!(wait.poll_with(deadline, no_read));
+    }
+
+    #[test]
+    fn a_failed_or_lost_read_is_replaced_and_a_later_reading_clears_it() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut wait = WorkCurrentWait::new();
+        assert!(!wait.poll_with(deadline, |_| {
+            Spawned::ready(Err(anyhow::anyhow!("connection refused")))
+        }));
+        hold_off_reads(&mut wait);
+        assert!(!wait.poll_with(deadline, no_read));
+        assert!(wait
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("connection refused")));
+        assert!(!wait.timed_out, "a failed read does not end the wait");
+        // A read whose task panicked or was cancelled yields nothing.
+        wait.read = Some(Spawned {
+            task: None,
+            value: None,
+        });
+        assert!(!wait.poll_with(deadline, no_read));
+        assert_eq!(
+            wait.error.as_deref(),
+            Some("a read of the frontends' work was lost")
+        );
+        wait.next_read = Instant::now();
+        assert!(!wait.poll_with(deadline, read(at_revision(7))));
+        assert!(wait.poll_with(deadline, no_read));
+        assert!(wait.current_at.is_some());
+        assert_eq!(wait.error, None);
+    }
+
+    #[test]
+    fn the_bound_ends_the_wait_and_a_reading_past_it_does_not_count() {
+        let mut wait = WorkCurrentWait::new();
+        assert!(!wait.poll_with(
+            Instant::now() + Duration::from_secs(60),
+            read(at_revision(7))
+        ));
+        // Current, but only once the bound had passed.
+        assert!(wait.poll_with(Instant::now(), no_read));
+        assert!(wait.timed_out && wait.current_at.is_none());
+        assert_eq!(wait.last, Some(at_revision(7)), "kept for the verdict");
+        assert!(wait.poll_with(Instant::now(), no_read));
+        assert!(wait.last_read().contains("payout_revision: 7"));
+    }
+
+    #[test]
+    fn work_published_at_the_locked_revision_ignores_sessions_without_a_first_job() {
+        let reading = |frontends| WorkReading {
+            payout_revision: 7,
+            settlements_in_progress: 1,
+            frontends,
+        };
+        // Our own holder is the settlement under way, and a session that
+        // has just authorized waits for its first job behind it.
+        assert!(reading(vec![work(true, Some(7), Some(1))]).published_at(7));
+        // A tip that reached a frontend before the lock: unready, or still
+        // publishing the previous revision's work.
+        assert!(!reading(vec![
+            work(true, Some(7), Some(0)),
+            work(false, Some(7), Some(0))
+        ])
+        .published_at(7));
+        assert!(!reading(vec![work(true, Some(6), Some(0))]).published_at(7));
+        assert!(!reading(vec![None]).published_at(7));
+        assert!(!reading(Vec::new()).published_at(7));
+    }
+
+    #[test]
+    fn a_settlement_under_way_holds_only_a_quiet_wait() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let settling = WorkReading {
+            settlements_in_progress: 1,
+            ..at_revision(7)
+        };
+        assert!(settling.current() && !settling.quiet());
+        let mut plain = WorkCurrentWait::new();
+        assert!(!plain.poll_with(deadline, read(settling.clone())));
+        assert!(plain.poll_with(deadline, no_read));
+        assert!(plain.current_at.is_some());
+        let mut quiet = WorkCurrentWait::quiet();
+        assert!(!quiet.poll_with(deadline, read(settling.clone())));
+        hold_off_reads(&mut quiet);
+        assert!(!quiet.poll_with(deadline, no_read));
+        assert_eq!(quiet.last, Some(settling));
+        quiet.next_read = Instant::now();
+        assert!(!quiet.poll_with(deadline, read(at_revision(7))));
+        assert!(quiet.poll_with(deadline, no_read));
+        assert!(quiet.current_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_abort_cancels_a_read_in_flight() {
+        let mut wait = WorkCurrentWait::quiet();
+        assert!(
+            !wait.poll_with(Instant::now() + Duration::from_secs(60), |_| {
+                Spawned::spawn(std::future::pending::<Result<WorkReading>>())
+            })
+        );
+        wait.abort();
+        assert!(wait.read.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_bound_abandons_a_read_still_in_flight() {
+        let mut wait = WorkCurrentWait::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert!(!wait.poll_with(deadline, |_| {
+            Spawned::spawn(std::future::pending::<Result<WorkReading>>())
+        }));
+        assert!(!wait.poll_with(deadline, no_read), "still within the bound");
+        assert!(wait.poll_with(Instant::now(), no_read));
+        assert!(wait.timed_out && wait.current_at.is_none() && wait.last.is_none());
+        assert!(
+            wait.read.is_none(),
+            "the read is cancelled, not left running"
+        );
     }
 }

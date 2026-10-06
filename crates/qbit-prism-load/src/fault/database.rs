@@ -28,8 +28,9 @@ pub const EXHAUSTION_NAME: &str = "load-fault-exhaustion";
 
 /// An outside transaction holding an advisory lock until it is released.
 pub struct LockHolder {
-    acquired: Option<oneshot::Receiver<Instant>>,
+    acquired: Option<oneshot::Receiver<(Instant, Result<i64, String>)>>,
     acquired_at: Option<Instant>,
+    revision: Option<Result<i64, String>>,
     release: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<Instant>>>,
     released_at: Option<Instant>,
@@ -39,6 +40,9 @@ pub struct LockHolder {
 impl LockHolder {
     /// Connect to `url` and take `key` inside a transaction. The lock is
     /// queued behind whoever holds it now, as a server writer's would be.
+    /// Once it is taken, the cluster's payout revision is read in the same
+    /// transaction: every bump of it takes `SETTLEMENT_LOCK`, so that is the
+    /// revision the whole hold keeps.
     pub fn start(url: String, key: i64) -> Self {
         let (acquired_tx, acquired) = oneshot::channel();
         let (release, release_rx) = oneshot::channel::<()>();
@@ -59,7 +63,16 @@ impl LockHolder {
                 .execute(&mut connection)
                 .await
                 .context("taking the advisory lock")?;
-            let _ = acquired_tx.send(Instant::now());
+            let acquired_at = Instant::now();
+            // A failed read still leaves the lock held until the ROLLBACK;
+            // the verdict reports why the revision is unknown.
+            let revision = sqlx::query_scalar(
+                "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&mut connection)
+            .await
+            .map_err(|error| format!("reading the payout revision under the lock: {error}"));
+            let _ = acquired_tx.send((acquired_at, revision));
             // A dropped sender releases too: the lock never outlives the
             // driver that asked for it.
             let _ = release_rx.await;
@@ -74,6 +87,7 @@ impl LockHolder {
         Self {
             acquired: Some(acquired),
             acquired_at: None,
+            revision: None,
             release: Some(release),
             task: Some(task),
             released_at: None,
@@ -89,8 +103,9 @@ impl LockHolder {
         }
         if let Some(receiver) = self.acquired.as_mut() {
             match receiver.try_recv() {
-                Ok(at) => {
+                Ok((at, revision)) => {
                     self.acquired_at = Some(at);
+                    self.revision = Some(revision);
                     self.acquired = None;
                     return Ok(Some(at));
                 }
@@ -110,6 +125,17 @@ impl LockHolder {
             );
         }
         Ok(None)
+    }
+
+    /// The cluster's payout revision as the lock was taken, if it could be
+    /// read.
+    pub fn revision(&self) -> Option<i64> {
+        self.revision.as_ref()?.as_ref().ok().copied()
+    }
+
+    /// Why the revision under the lock could not be read.
+    pub fn revision_error(&self) -> Option<&str> {
+        self.revision.as_ref()?.as_ref().err().map(String::as_str)
     }
 
     pub fn release(&mut self) {

@@ -46,7 +46,9 @@ use backlog::CandidateBacklog;
 use database::{Exhauster, Exhaustion, LockHolder};
 use disk::WalDiskFull;
 use failover::{Failover, FailoverControl};
-use frontend::{FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain};
+use frontend::{
+    FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain, WorkCurrentWait, WorkReading,
+};
 use plan::{FaultKind, FaultPlan, Scheduled};
 use rpc_relay::RpcFaultRelay;
 use serde::Serialize;
@@ -66,6 +68,13 @@ pub const PHASE: &str = "faults";
 /// How long a saturated server is given to show a frontend backend
 /// terminated into it before the exhaustion counts as in effect anyway.
 const TERMINATION_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the settlement-lock fault waits, from its injection's start, for
+/// every frontend to serve current work with no settlement under way before
+/// it takes the lock (#692). A steady baseline is quiet at once; after a
+/// fault that landed a block it takes a few seconds. A cluster that never
+/// goes quiet gets the lock at the bound, on the work it then serves.
+pub const LOCK_WORK_WAIT: Duration = Duration::from_secs(60);
 
 /// What the fault driver acts on, lent to it by the scheduling loop on each
 /// poll.
@@ -129,6 +138,13 @@ impl<T: Send + 'static> Spawned<T> {
         Self {
             task: None,
             value: Some(value),
+        }
+    }
+
+    /// Cancel the task, for a caller that stopped waiting for it.
+    pub fn abort(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 
@@ -208,7 +224,14 @@ enum Action {
         error: Option<String>,
     },
     SettlementLock {
-        holder: LockHolder,
+        /// Every frontend's work and the settlements under way, read until
+        /// the work is current on a quiet cluster or the bound passes: the
+        /// lock is taken only then (#692).
+        work: WorkCurrentWait,
+        holder: Option<LockHolder>,
+        /// The work read once more once the lock is held, and what it found.
+        reading_under_lock: Option<Spawned<Result<WorkReading>>>,
+        under_lock: Option<Result<WorkReading, String>>,
         mint_at: Option<Instant>,
         minted: Option<Instant>,
         tip: Option<TipChange>,
@@ -253,7 +276,10 @@ impl Action {
                 error: None,
             },
             FaultKind::SettlementLock => Self::SettlementLock {
-                holder: LockHolder::start(tools.direct_url.clone(), database::SETTLEMENT_LOCK_KEY),
+                work: WorkCurrentWait::quiet(),
+                holder: None,
+                reading_under_lock: None,
+                under_lock: None,
                 mint_at: None,
                 minted: None,
                 tip: None,
@@ -471,7 +497,20 @@ impl FaultDriver {
         if let Some((mut run, _)) = self.current.take() {
             match &mut run.action {
                 Action::SlowDatabase { .. } => env.delay_proxy.set_delay_millis(0),
-                Action::SettlementLock { holder, .. } => holder.release(),
+                Action::SettlementLock {
+                    work,
+                    holder,
+                    reading_under_lock,
+                    ..
+                } => {
+                    work.abort();
+                    if let Some(read) = reading_under_lock {
+                        read.abort();
+                    }
+                    if let Some(holder) = holder {
+                        holder.release();
+                    }
+                }
                 Action::PoolExhaustion {
                     exhauster: Some(exhauster),
                     ..
@@ -603,28 +642,75 @@ fn inject(
             Ok(true)
         }
         Action::SettlementLock {
+            work,
             holder,
+            reading_under_lock,
+            under_lock,
             mint_at,
             stall,
             ..
-        } => match holder.poll_acquired() {
-            Ok(None) => Ok(false),
-            Ok(Some(at)) => {
-                run.injected_at = Some(at);
-                *mint_at = Some(at + Duration::from_secs(plan.hold_seconds) / 2);
-                *stall = Some(StallSampler::start(
-                    env.frontends
-                        .iter()
-                        .map(|child| (child.spec.instance_id.clone(), child.metrics_url()))
-                        .collect(),
-                ));
-                Ok(true)
+        } => {
+            let holder = match holder {
+                Some(holder) => holder,
+                None => {
+                    // Only on current work (#692). A fault before this one
+                    // that landed a block bumped the payout revision, and
+                    // until every frontend publishes work at it, shares on
+                    // the old work are refused stale-job. A hold taken first
+                    // blocks that publication too, so it would measure the
+                    // landing, not the lock. A hold queued behind a
+                    // settlement under way would start in the middle of it.
+                    // A landing still to come cannot move the revision under
+                    // the lock: every bump takes SETTLEMENT_LOCK. The verdict
+                    // fails a hold taken without current work.
+                    let started = run.inject_start.unwrap_or_else(Instant::now);
+                    if !work.poll(started + LOCK_WORK_WAIT, env, tools) {
+                        return Ok(false);
+                    }
+                    holder.insert(LockHolder::start(
+                        tools.direct_url.clone(),
+                        database::SETTLEMENT_LOCK_KEY,
+                    ))
+                }
+            };
+            match holder.poll_acquired() {
+                Ok(None) => Ok(false),
+                Ok(Some(at)) => {
+                    // The work once more, now that nothing can publish: a tip
+                    // that reached the frontends after the last reading
+                    // leaves the revision as it was, but not their work, and
+                    // the hold now blocks its rebuild. The verdict fails a
+                    // hold whose work was not current under the lock.
+                    if under_lock.is_none() {
+                        let read =
+                            reading_under_lock.get_or_insert_with(|| work.read_once(env, tools));
+                        let finished = read.poll().map(|result| match result {
+                            Ok(reading) => Ok(reading.clone()),
+                            Err(error) => Err(format!("{error:#}")),
+                        });
+                        *under_lock = Some(match finished {
+                            None if !read.lost() => return Ok(false),
+                            None => Err("the reading under the lock was lost".into()),
+                            Some(result) => result,
+                        });
+                        *reading_under_lock = None;
+                    }
+                    run.injected_at = Some(at);
+                    *mint_at = Some(at + Duration::from_secs(plan.hold_seconds) / 2);
+                    *stall = Some(StallSampler::start(
+                        env.frontends
+                            .iter()
+                            .map(|child| (child.spec.instance_id.clone(), child.metrics_url()))
+                            .collect(),
+                    ));
+                    Ok(true)
+                }
+                Err(error) => {
+                    run.problems.push(format!("{error:#}"));
+                    Ok(true)
+                }
             }
-            Err(error) => {
-                run.problems.push(format!("{error:#}"));
-                Ok(true)
-            }
-        },
+        }
         Action::PoolExhaustion {
             warm,
             exhauster,
@@ -740,6 +826,13 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
             Ok(true)
         }
         Action::SettlementLock { holder, .. } => {
+            let Some(holder) = holder else {
+                // The injection ends only once the holder has started.
+                run.problems
+                    .push("removed without a lock holder ever started".into());
+                run.removed_at = Some(Instant::now());
+                return Ok(true);
+            };
             holder.release();
             match holder.poll_released()? {
                 Some(at) => {
