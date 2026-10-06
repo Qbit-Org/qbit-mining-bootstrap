@@ -225,12 +225,61 @@ accounting after it, and the row records where the block is between them:
 | `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. A recovered reservation, whose call's answer was never recorded, lands with `offer_outcome = unknown` (#529). |
 | `abandoned` | Reachable from `pending` only. |
 
+### A lost revision race after the offer (#630)
+
+After an offer, a frontend can log either of these ERROR lines:
+
+```
+ALERT: offered candidate could not land; kept for reconciliation, never offered again
+ALERT: offered candidate could not be processed; kept for reconciliation, never offered again
+```
+
+When the reason ends `payout revision changed while observing chain state`,
+the line records a lost race, not a failure. The reason starts `landing
+failed after the offer (…)` on the first line and `post-offer processing
+failed (…)` on the second. The parentheses hold the offer's outcome: usually
+`node accepted the offer`, or `offer outcome unknown: …` for a recovered
+reservation or an adopted block.
+
+- **What happened.** Each post-offer write is fenced on the payout revision
+  its claim observed: the landing, the finish as `submitted`, and the
+  settlement as `orphaned`. The revision moves whenever a frontend records a
+  new chain tip, or confirms, deactivates or matures a block, and on a policy
+  transition or a fatal-state clear. An accepted own block becomes the node's
+  tip, so a template refresh on either frontend records that tip and, once the
+  audit has landed, confirms the block, credits its deferred share and bumps
+  the revision again. If such a bump commits between a claim's observation and
+  its write, the write is refused, and the row is settled in `reconciliation`
+  with that reason.
+- **Why it is benign.** The refused write changed nothing. The row keeps its
+  offer record and is never offered again. Its next claim comes at the
+  `next_attempt` that `candidates list` shows, the `reconciliation` backoff
+  above. It observes again, lands the audit if it had not landed, and settles
+  the row `submitted`, or `orphaned` once the chain proves a competitor. The
+  block's confirmation and deferred-share credit commit once, whichever side
+  commits them first. A retry that loses the race again logs the line again,
+  and waits longer.
+- **What to do.** Nothing, as long as the row finishes. Run
+  `qbit-prism-server candidates list` once its `next_attempt` has passed; the
+  block should be gone. Act only if it is still listed after a few retries, or
+  its `last_error` names another reason. Then handle it as any other
+  `reconciliation` row. Never try to abandon it: `candidates abandon` refuses
+  an offered row (exit 3).
+- **Alerts.** While it lasts, a lost landing counts as landing-failed, a lost
+  finish as pending only, and a recovered reservation as unacknowledged, for
+  its unknown outcome. No candidate alert fires before a row has been
+  unfinished for at least 3 minutes. A race that clears on the next retry or
+  two stays under all of them. If one fires, look at the row.
+
+#630 tracks retrying the write in place, so that a lost race stops logging an
+ALERT.
+
 ### Candidate commands
 
-Three operator commands read and finish the rows above. Neither `list` nor
-`abandon` builds a node client, reads a signing key, loads the server
-configuration or starts a listener, so neither can offer a block. `list`
-needs only `PRISM_DATABASE_URL`, as `fatal-state show` does. `abandon` writes
+Three operator commands read and finish the rows in the state table above.
+Neither `list` nor `abandon` builds a node client, reads a signing key, loads
+the server configuration or starts a listener, so neither can offer a block.
+`list` needs only `PRISM_DATABASE_URL`, as `fatal-state show` does. `abandon` writes
 an ordinary ledger row, so it uses the one-shot tool connection and the
 stored-data settings behind it — `PRISM_DATABASE_URL`, `PRISM_INSTANCE_ID`
 (generated when unset) and `PRISM_DATABASE_MAX_CONNECTIONS`. `recover` is the
