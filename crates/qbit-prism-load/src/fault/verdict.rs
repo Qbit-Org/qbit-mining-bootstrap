@@ -615,7 +615,7 @@ impl FaultDriver {
                 // drain whose block never landed would pass, and the next
                 // fault would measure the landing's revision bump instead.
                 checks.push(check(
-                    "the relaunch landed the block and every frontend served work at its revision",
+                    "the block landed and every frontend served work at its revision",
                     drain.current_at.is_some(),
                     drain.settle_detail(),
                 ));

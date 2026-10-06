@@ -51,6 +51,19 @@ pub const DRAIN_SETTLE_WAIT: Duration = Duration::from_secs(60);
 /// How often the drain's settle reads the row, or the revision and every
 /// `/healthz`.
 const SETTLE_READ_INTERVAL: Duration = Duration::from_millis(250);
+/// Each `/healthz` read's limit: the server answers from its last published
+/// snapshot, so a slow answer means a frontend that is not serving.
+const HEALTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Why the drain's settle stops, once its bound has passed.
+fn past_settle_bound(deadline: Instant) -> Option<String> {
+    (Instant::now() >= deadline).then(|| {
+        format!(
+            "not settled within {} s of the frontend serving again",
+            DRAIN_SETTLE_WAIT.as_secs()
+        )
+    })
+}
 
 /// SIGTERM, the signal a service manager sends to stop a process.
 pub fn terminate(pid: u32) {
@@ -177,10 +190,15 @@ pub struct SigtermDrain {
     landing: Option<Spawned<Result<Option<CandidateRow>>>>,
     work: Option<Spawned<Result<WorkReading>>>,
     next_settle_read: Instant,
+    client: Option<reqwest::Client>,
     pub landed_at: Option<Instant>,
     pub current_at: Option<Instant>,
+    /// Why the settle stopped without current work: the bound, or a row
+    /// that went terminal without landing.
+    pub unsettled: Option<String>,
     pub last_row: Option<CandidateRow>,
     pub last_work: Option<WorkReading>,
+    /// The latest read's failure; a later successful read clears it.
     pub settle_error: Option<String>,
     pub problems: Vec<String>,
     log_before: (usize, usize),
@@ -213,8 +231,10 @@ impl SigtermDrain {
             landing: None,
             work: None,
             next_settle_read: Instant::now(),
+            client: None,
             landed_at: None,
             current_at: None,
+            unsettled: None,
             last_row: None,
             last_work: None,
             settle_error: None,
@@ -354,56 +374,90 @@ impl SigtermDrain {
 
     /// Wait, once the drained frontend serves again, for its block to land
     /// and for every frontend to serve work at the payout revision the
-    /// landing committed (#686). The relaunched process lands the block it
-    /// offered; the confirmation bumps the revision, and until work at the
-    /// new revision is published every share on the old work is refused
-    /// `stale-job`. A fault started before then measures the drain rather
-    /// than itself: a settlement-lock holder even blocks that publication, so
-    /// all the shares in the first half of its hold were refused. `true` once
-    /// settled, or once [`DRAIN_SETTLE_WAIT`] has passed, which the verdict
-    /// fails.
+    /// landing committed (#686). The relaunched process normally lands the
+    /// block it offered; the confirmation bumps the revision, and until work
+    /// at the new revision is published every share on the old work is
+    /// refused `stale-job`. A fault started before then measures the drain
+    /// rather than itself: a settlement-lock holder even blocks that
+    /// publication, so all the shares in the first half of its hold were
+    /// refused. `true` once settled, or once it cannot settle: the row went
+    /// terminal without landing, or [`DRAIN_SETTLE_WAIT`] passed. The verdict
+    /// fails both.
     pub fn poll_settle(&mut self, env: &FaultEnv<'_>, tools: &FaultTools) -> bool {
         let Some(seen) = &self.seen else {
             // Nothing was offered, so nothing lands; the verdict fails that.
             return true;
         };
-        if self.current_at.is_some() {
+        if self.current_at.is_some() || self.unsettled.is_some() {
             return true;
         }
         let deadline = *self
             .settle_deadline
             .get_or_insert_with(|| Instant::now() + DRAIN_SETTLE_WAIT);
-        // A read still in flight at the bound is abandoned with the wait.
+        if self.landed_at.is_none()
+            && self
+                .row_after_exit
+                .as_ref()
+                .is_some_and(CandidateRow::landed)
+        {
+            // The shutdown landed it before the process exited.
+            self.landed_at = self.exited_at;
+        }
         if let Some(read) = self.landing.as_mut() {
-            let Some(result) = read.poll() else {
-                return Instant::now() >= deadline;
-            };
-            match result {
-                Ok(row) => {
-                    if row.as_ref().is_some_and(CandidateRow::landed) {
-                        self.landed_at = Some(Instant::now());
-                    }
-                    self.last_row = row.clone();
+            let finished = read.poll().map(|result| match result {
+                Ok(value) => Ok(value.clone()),
+                Err(error) => Err(format!("{error:#}")),
+            });
+            match finished {
+                // A read still in flight at the bound is abandoned with the
+                // wait; one whose task was lost is replaced.
+                None if !read.lost() => {
+                    self.unsettled = past_settle_bound(deadline);
+                    return self.unsettled.is_some();
                 }
-                Err(error) => {
-                    self.settle_error = Some(format!("reading the candidate: {error:#}"));
+                None => self.settle_error = Some("a read of the candidate was lost".into()),
+                Some(Err(error)) => {
+                    self.settle_error = Some(format!("reading the candidate: {error}"));
+                }
+                Some(Ok(row)) => {
+                    self.settle_error = None;
+                    match &row {
+                        Some(row) if row.landed() => self.landed_at = Some(Instant::now()),
+                        Some(row) if super::backlog::terminal(&row.state) => {
+                            self.unsettled =
+                                Some(format!("the candidate went {} without landing", row.state));
+                        }
+                        Some(_) => {}
+                        None => self.unsettled = Some("the candidate row is gone".into()),
+                    }
+                    self.last_row = row;
                 }
             }
             self.landing = None;
+            if self.unsettled.is_some() {
+                return true;
+            }
         }
         if let Some(read) = self.work.as_mut() {
-            let Some(result) = read.poll() else {
-                return Instant::now() >= deadline;
-            };
-            match result {
-                Ok(reading) => {
+            let finished = read.poll().map(|result| match result {
+                Ok(value) => Ok(value.clone()),
+                Err(error) => Err(format!("{error:#}")),
+            });
+            match finished {
+                None if !read.lost() => {
+                    self.unsettled = past_settle_bound(deadline);
+                    return self.unsettled.is_some();
+                }
+                None => self.settle_error = Some("a read of the frontends' work was lost".into()),
+                Some(Err(error)) => {
+                    self.settle_error = Some(format!("reading the frontends' work: {error}"));
+                }
+                Some(Ok(reading)) => {
+                    self.settle_error = None;
                     if reading.current() {
                         self.current_at = Some(Instant::now());
                     }
-                    self.last_work = Some(reading.clone());
-                }
-                Err(error) => {
-                    self.settle_error = Some(format!("reading the frontends' work: {error:#}"));
+                    self.last_work = Some(reading);
                 }
             }
             self.work = None;
@@ -411,7 +465,8 @@ impl SigtermDrain {
                 return true;
             }
         }
-        if Instant::now() >= deadline {
+        self.unsettled = past_settle_bound(deadline);
+        if self.unsettled.is_some() {
             return true;
         }
         if Instant::now() >= self.next_settle_read {
@@ -422,8 +477,18 @@ impl SigtermDrain {
                     seen.block_hash.clone(),
                 )));
             } else {
+                let client = self
+                    .client
+                    .get_or_insert_with(|| {
+                        reqwest::Client::builder()
+                            .timeout(HEALTH_READ_TIMEOUT)
+                            .build()
+                            .unwrap_or_default()
+                    })
+                    .clone();
                 self.work = Some(Spawned::spawn(WorkReading::read(
                     tools.side.clone(),
+                    client,
                     env.frontends
                         .iter()
                         .map(|frontend| frontend.health_url())
@@ -435,26 +500,40 @@ impl SigtermDrain {
     }
 
     /// The settle's line in the verdict: when the block landed and every
-    /// frontend's work was current, counted from the frontend serving again,
-    /// or what was still missing at the bound.
+    /// frontend served work at its revision, counted from the frontend
+    /// serving again, or why it did not settle and what it last read.
     pub fn settle_detail(&self) -> String {
         if self.seen.is_none() {
             return "no offer was seen, so no landing to wait for".into();
         }
-        let after_ready = |at: Option<Instant>| {
-            self.ready_at
-                .zip(at)
-                .map(|(ready, at)| at.saturating_duration_since(ready).as_secs_f64())
+        let since_ready = |at: Instant| {
+            self.ready_at.map_or(0.0, |ready| {
+                at.saturating_duration_since(ready).as_secs_f64()
+            })
         };
-        let bound = DRAIN_SETTLE_WAIT.as_secs();
-        match (after_ready(self.landed_at), after_ready(self.current_at)) {
-            (Some(landed), Some(current)) => format!(
-                "landed {landed:.1} s and every frontend's work at its revision {current:.1} s \
-                 after the frontend served again (bound {bound} s)"
+        let landed = match self.landed_at {
+            _ if self
+                .row_after_exit
+                .as_ref()
+                .is_some_and(CandidateRow::landed) =>
+            {
+                "before the process exited".to_owned()
+            }
+            Some(at) => format!("{:.1} s after the frontend served again", since_ready(at)),
+            None => "no".to_owned(),
+        };
+        match self.current_at {
+            Some(at) => format!(
+                "landed {landed}; every frontend served work at its revision {:.1} s after the \
+                 frontend served again (bound {} s)",
+                since_ready(at),
+                DRAIN_SETTLE_WAIT.as_secs()
             ),
-            (landed, _) => format!(
-                "not within {bound} s of the frontend serving again: landed after {landed:?} s, \
-                 candidate {:?}, last reading {:?}{}",
+            None => format!(
+                "{}; landed: {landed}; candidate {:?}; last reading {:?}{}",
+                self.unsettled
+                    .as_deref()
+                    .unwrap_or("the settle did not finish"),
                 self.last_row,
                 self.last_work,
                 self.settle_error
@@ -493,6 +572,7 @@ impl SigtermDrain {
             "settle_wait_seconds": DRAIN_SETTLE_WAIT.as_secs(),
             "candidate_at_settle": self.last_row,
             "work_at_settle": self.last_work,
+            "settle_unsettled": self.unsettled,
             "settle_error": self.settle_error,
             "problems": self.problems,
         })
@@ -519,21 +599,28 @@ pub struct FrontendWork {
 }
 
 impl WorkReading {
-    async fn read(pool: PgPool, health_urls: Vec<String>) -> Result<Self> {
+    /// The revision first, then every frontend's `/healthz` at once, so a
+    /// bump between the two shows as a frontend behind it and is read again.
+    async fn read(pool: PgPool, client: reqwest::Client, health_urls: Vec<String>) -> Result<Self> {
         let payout_revision: i64 =
             sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
                 .fetch_one(&pool)
                 .await?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?;
-        let mut frontends = Vec::with_capacity(health_urls.len());
-        for url in health_urls {
-            // A frontend that is not ready answers 503 with the same body.
-            let health: Option<Value> = match client.get(&url).send().await {
-                Ok(response) => response.json().await.ok(),
-                Err(_) => None,
-            };
+        let reads: Vec<_> = health_urls
+            .into_iter()
+            .map(|url| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    // A frontend that is not ready answers 503 with the same
+                    // body.
+                    let response = client.get(&url).send().await.ok()?;
+                    response.json::<Value>().await.ok()
+                })
+            })
+            .collect();
+        let mut frontends = Vec::with_capacity(reads.len());
+        for read in reads {
+            let health = read.await.ok().flatten();
             frontends.push(health.map(|health| FrontendWork {
                 ok: health["ok"] == true,
                 payout_state_generation: health["payout_state_generation"].as_i64(),

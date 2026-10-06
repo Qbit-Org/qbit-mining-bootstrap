@@ -362,9 +362,9 @@ impl FaultPlan {
 
     /// An upper bound on the `faults` phase: every planned window, every gap,
     /// and each action fault's drain and relaunch allowance, plus the lease
-    /// wait for a SIGKILL. The phase ends as soon as the last fault's
-    /// recovery window closes; this bound only stops a fault that never
-    /// finishes from running forever.
+    /// wait for a SIGKILL and the settle wait for a drain. The phase ends as
+    /// soon as the last fault's recovery window closes; this bound only stops
+    /// a fault that never finishes from running forever.
     pub fn phase_seconds_bound(&self, frontends: usize) -> u64 {
         self.schedule()
             .iter()
@@ -382,6 +382,9 @@ impl FaultPlan {
                 }
                 if scheduled.kind == FaultKind::FrontendSigkill {
                     seconds += self.lease_wait_seconds;
+                }
+                if scheduled.kind == FaultKind::SigtermDrain {
+                    seconds += super::frontend::DRAIN_SETTLE_WAIT.as_secs();
                 }
                 if scheduled.kind.is_failover() {
                     seconds += FAILOVER_ALLOWANCE_SECONDS + self.cut_seconds;
@@ -603,6 +606,15 @@ mod tests {
         assert_eq!(
             plan.phase_seconds_bound(2),
             5 + 10 + 20 + ACTION_ALLOWANCE_SECONDS + 150 + 30
+        );
+        let drain = FaultPlan::parse("sigterm-drain;baseline=5;hold=10;recovery=20").unwrap();
+        assert_eq!(
+            drain.phase_seconds_bound(1),
+            5 + 10
+                + 20
+                + ACTION_ALLOWANCE_SECONDS
+                + crate::fault::frontend::DRAIN_SETTLE_WAIT.as_secs()
+                + 30
         );
         let rolling = FaultPlan::parse("rolling-restart;baseline=5;hold=10;recovery=20").unwrap();
         assert_eq!(

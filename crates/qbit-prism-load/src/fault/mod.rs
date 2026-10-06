@@ -132,8 +132,15 @@ impl<T: Send + 'static> Spawned<T> {
         }
     }
 
+    /// The task ended without a result: it panicked or was cancelled, and
+    /// `poll` will never yield one.
+    pub fn lost(&self) -> bool {
+        self.task.is_none() && self.value.is_none()
+    }
+
     /// The result, once the task has finished. A task that panicked or was
-    /// cancelled never yields one; the caller's own deadline covers it.
+    /// cancelled never yields one; the caller's own deadline covers it, or
+    /// `lost` tells it apart from one still running.
     pub fn poll(&mut self) -> Option<&T> {
         if self.value.is_none() {
             let task = self.task.as_ref()?;
