@@ -66,13 +66,6 @@ pub(crate) struct MemoryLedger {
     pub commit_gate: StdMutex<Option<Arc<Gate>>>,
     /// Fails the next COMMIT with an indeterminate error.
     pub fail_commit: StdMutex<Option<FailCommit>>,
-    /// Refuses the next plain append at its pre-COMMIT hook as a closed gate
-    /// (#716). With `Some(closure)` that closure wins the gate first, as the
-    /// deadline or a lease fence does. With `None` the refusal records no
-    /// closure at all.
-    pub(super) refuse_commit: StdMutex<Option<Option<submit_ledger::GateClosure>>>,
-    /// Holds a refused append before it returns, as a slow ROLLBACK does.
-    pub rollback_gate: StdMutex<Option<Arc<Gate>>>,
     /// Appends dropped before they returned, as an aborted task is.
     pub cancelled: AtomicUsize,
     /// #657: block-bearing appends the revision fence captured instead:
@@ -158,19 +151,9 @@ impl MemoryLedger {
             ensure!(share == *old, "duplicate share_id payload mismatch");
         }
         // Model the production pre-commit hook: every statement has run.
-        let refusal = self.refuse_commit.lock().unwrap().take();
-        if let Some(Some(closure)) = refusal {
-            commit.close_for_test(closure);
-        }
-        if refusal == Some(None) || !commit.begin_commit() {
+        if !commit.begin_commit() {
             if existing.is_some() && candidate.is_none() {
                 return Ok(Appended::Recorded);
-            }
-            // The refused append rolls back before it returns.
-            let rollback = self.rollback_gate.lock().unwrap().take();
-            if let Some(rollback) = rollback {
-                rollback.entered.notify_one();
-                rollback.release.notified().await;
             }
             return Err(crate::ledger::CommitGateClosed.into());
         }
@@ -271,16 +254,12 @@ impl SharedLog {
     }
 
     pub fn dispatch(&self) -> tracing::Dispatch {
-        self.dispatch_at(tracing::Level::WARN)
-    }
-
-    pub fn dispatch_at(&self, level: tracing::Level) -> tracing::Dispatch {
         Undecided::install();
         tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
                 .with_ansi(false)
-                .with_max_level(level)
+                .with_max_level(tracing::Level::WARN)
                 .finish(),
         )
     }

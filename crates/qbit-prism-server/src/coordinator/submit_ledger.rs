@@ -82,12 +82,6 @@ impl CommitGate {
         self.close_for(GateClosure::DeadlineOrCancelled)
     }
 
-    /// Close the gate for `reason`, as the deadline or a lease fence does.
-    #[cfg(test)]
-    pub(super) fn close_for_test(&self, reason: GateClosure) -> bool {
-        self.close_for(reason)
-    }
-
     fn close_for(&self, reason: GateClosure) -> bool {
         match self
             .state

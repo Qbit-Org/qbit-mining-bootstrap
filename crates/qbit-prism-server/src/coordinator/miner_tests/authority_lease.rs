@@ -132,12 +132,10 @@ async fn late_lease_append_and_issued_save_recheck_publication_and_epoch() {
             if operation == "append" && changed == "publication" {
                 stale_causes::assert_stale_wire(result.unwrap_err(), "stale job");
             } else if operation == "append" && changed == "epoch" {
-                // A changed readiness epoch revokes the lease's authority
-                // without proving the work stale (#716).
                 assert_error(
                     result.unwrap_err(),
-                    "backend-rpc-unavailable",
-                    "current chain state is unavailable",
+                    "ledger-confirmation-failed",
+                    "share was not committed because its commit gate closed",
                 );
             }
             let records = f.store.records.lock().unwrap();
@@ -907,12 +905,10 @@ async fn aged_tip_observation_after_return_is_not_a_proven_stale_commit() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    // The lapsed tip authority is unavailable authority, not a stale race
-    // and not a ledger failure (#716).
     assert_error(
         error,
-        "backend-rpc-unavailable",
-        "current chain state is unavailable",
+        "ledger-confirmation-failed",
+        "share was not committed because its commit gate closed",
     );
     assert!(f.store.records.lock().unwrap().is_empty());
     assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 0);
@@ -977,13 +973,10 @@ async fn commit_gate_contention_or_unknown_readiness_is_not_stale() {
             .unwrap()
             .unwrap_err();
         drop((prepared, readiness, tip));
-        // #716: answered as admission answers authority it cannot prove,
-        // not as `ledger-confirmation-failed`, which feeds the share-append
-        // failure warning.
         assert_error(
             error,
-            "backend-rpc-unavailable",
-            "current chain state is unavailable",
+            "ledger-confirmation-failed",
+            "share was not committed because its commit gate closed",
         );
         assert!(f.store.records.lock().unwrap().is_empty(), "{changed}");
         assert_eq!(
