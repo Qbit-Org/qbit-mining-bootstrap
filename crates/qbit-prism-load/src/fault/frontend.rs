@@ -454,7 +454,8 @@ impl SigtermDrain {
                 }
                 Some(Ok(reading)) => {
                     self.settle_error = None;
-                    if reading.current() {
+                    // A reading that finished past the bound does not count.
+                    if reading.current() && Instant::now() < deadline {
                         self.current_at = Some(Instant::now());
                     }
                     self.last_work = Some(reading);
