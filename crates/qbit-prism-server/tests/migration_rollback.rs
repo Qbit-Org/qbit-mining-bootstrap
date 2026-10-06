@@ -1158,13 +1158,21 @@ async fn the_parallel_evidence_export_prints_the_serial_export_byte_for_byte() -
 /// Export `db` serially, then in parallel at several job counts and batch
 /// sizes. Each parallel export must print the serial rows byte for byte, in
 /// as many ranges as it was asked for, and leave none of its parts behind.
-/// Returns the summary of the rows.
+/// So must the serial export with the has_* flags where they were before
+/// #712 moved them ahead of the shares. Returns the summary of the rows.
 async fn assert_parallel_export_is_serial(
     db: &recovery::Database,
     pg_bin: &std::path::Path,
 ) -> Result<serde_json::Value> {
-    let serial = recovery::records(db, pg_bin).await?;
+    let serial = recovery::records(db, pg_bin, recovery::SCRIPT).await?;
     let expected = std::fs::read(serial.path())?;
+    let before =
+        recovery::records(db, pg_bin, &flags_before_share_hashes(recovery::SCRIPT)?).await?;
+    ensure_same_rows(
+        &expected,
+        &std::fs::read(before.path())?,
+        "the pre-#712 flag layout",
+    )?;
     for (jobs, fetch_count) in [(1, None), (3, None), (8, None), (2, Some("1"))] {
         let jobs_arg = jobs.to_string();
         let mut args = vec!["--jobs", jobs_arg.as_str()];
@@ -1188,20 +1196,53 @@ async fn assert_parallel_export_is_serial(
             stderr.contains(&split),
             "the parallel export {args:?} did not split as asked: {stderr}"
         );
-        let printed = std::fs::read(records.path())?;
-        if printed != expected {
-            let line = expected
-                .split(|byte| *byte == b'\n')
-                .zip(printed.split(|byte| *byte == b'\n'))
-                .position(|(serial, parallel)| serial != parallel);
-            anyhow::bail!(
-                "the parallel export {args:?} printed {} bytes, the serial export {}, first differing at line {line:?}",
-                printed.len(),
-                expected.len()
-            );
-        }
+        ensure_same_rows(
+            &expected,
+            &std::fs::read(records.path())?,
+            &format!("the parallel export {args:?}"),
+        )?;
     }
     recovery::summarize(serial.path()).await
+}
+
+/// `script` with its has_* flags back just before the share-hash export,
+/// where they were until #712 moved them ahead of the shares.
+fn flags_before_share_hashes(script: &str) -> Result<String> {
+    let start = script
+        .find("SELECT (to_regclass('qbit_prism_cpfp_packages')")
+        .context("the script sets no has_* flags")?;
+    let end = start
+        + script[start..]
+            .find("\\gset\n")
+            .context("the has_* flags are not gset")?
+        + "\\gset\n".len();
+    let hashes = script
+        .find("-- Native replay protection must survive recovery.")
+        .context("the script has no share-hash export")?;
+    ensure!(end <= hashes, "the has_* flags already follow the shares");
+    Ok([
+        &script[..start],
+        &script[end..hashes],
+        &script[start..end],
+        &script[hashes..],
+    ]
+    .concat())
+}
+
+/// Fails at the first line where `printed` differs from the serial rows.
+fn ensure_same_rows(expected: &[u8], printed: &[u8], what: &str) -> Result<()> {
+    if printed != expected {
+        let line = expected
+            .split(|byte| *byte == b'\n')
+            .zip(printed.split(|byte| *byte == b'\n'))
+            .position(|(serial, other)| serial != other);
+        anyhow::bail!(
+            "{what} printed {} bytes, the serial export {}, first differing at line {line:?}",
+            printed.len(),
+            expected.len()
+        );
+    }
+    Ok(())
 }
 
 async fn assert_share_sequence_fingerprint(

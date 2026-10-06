@@ -458,18 +458,26 @@ async fn evidence_with_options(
     format: &str,
     fetch_count: Option<u32>,
 ) -> Result<Value> {
-    let records = records_with_options(db, pg_bin, format, fetch_count).await?;
+    let records = records_with_options(db, pg_bin, SCRIPT, format, fetch_count).await?;
     summarize(records.path()).await
 }
 
-/// The rows the serial export prints, as the runbooks save them.
-pub async fn records(db: &Database, pg_bin: &Path) -> Result<tempfile::NamedTempFile> {
-    records_with_options(db, pg_bin, "hex", None).await
+/// The checked-in export script.
+pub const SCRIPT: &str = include_str!("../../../../scripts/prism-recovery-evidence.sql");
+
+/// The rows the serial export of `script` prints, as the runbooks save them.
+pub async fn records(
+    db: &Database,
+    pg_bin: &Path,
+    script: &str,
+) -> Result<tempfile::NamedTempFile> {
+    records_with_options(db, pg_bin, script, "hex", None).await
 }
 
 async fn records_with_options(
     db: &Database,
     pg_bin: &Path,
+    script: &str,
     format: &str,
     fetch_count: Option<u32>,
 ) -> Result<tempfile::NamedTempFile> {
@@ -478,9 +486,7 @@ async fn records_with_options(
     let mut input = tempfile::tempfile()?;
     writeln!(input, "SET search_path TO {};", db.schema)?;
     writeln!(input, "SET bytea_output TO '{format}';")?;
-    input.write_all(include_bytes!(
-        "../../../../scripts/prism-recovery-evidence.sql"
-    ))?;
+    input.write_all(script.as_bytes())?;
     input.seek(SeekFrom::Start(0))?;
     // The export goes straight to a file: at production size it is tens of
     // gigabytes, and the script's FETCH_COUNT keeps psql from buffering it
