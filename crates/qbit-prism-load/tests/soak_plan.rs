@@ -120,20 +120,28 @@ fn every_soak_preset_plans_and_the_short_ones_fit_their_timeouts() -> Result<()>
     Ok(())
 }
 
-/// #600's resident-memory ratchet is fixed (#627): the weekly soak passed
-/// every resident-memory row, so no soak expects a resident-memory failure
-/// and every soak gates resident memory for real.
+/// #600's resident-memory ratchet is fixed (#627), so no checked-in soak
+/// expects a resident-memory failure: every soak preset and every soak-gates
+/// file gates resident memory for real.
 #[test]
 fn no_soak_expects_a_resident_memory_failure() -> Result<()> {
-    for (name, issue) in [
-        ("soak-weekly", None),
-        ("soak-short", None),
-        ("soak-smoke", None),
-    ] {
-        let (loaded, _) = load(name)?;
-        let spec = loaded.soak.as_ref().context("no soak block")?;
-        assert_eq!(spec.gates.rss_expected_failure.as_deref(), issue, "{name}");
+    let mut checked = 0;
+    for loaded in preset::load_all(&preset::presets_dir())? {
+        if let Some(spec) = loaded.soak.as_ref() {
+            assert_eq!(spec.gates.rss_expected_failure, None, "{}", loaded.name);
+            checked += 1;
+        }
     }
+    let gates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("soak-gates");
+    for entry in std::fs::read_dir(&gates_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let gates = soak::Gates::load(&path)?;
+            assert_eq!(gates.rss_expected_failure, None, "{}", path.display());
+            checked += 1;
+        }
+    }
+    assert!(checked >= 4, "found only {checked} soak configurations");
     Ok(())
 }
 
