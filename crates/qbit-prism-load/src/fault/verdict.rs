@@ -330,6 +330,7 @@ impl FaultDriver {
             }
             Action::SettlementLock {
                 work,
+                holder,
                 minted,
                 tip,
                 stall,
@@ -339,13 +340,19 @@ impl FaultDriver {
                 // Every check below assumes retained work was current when
                 // the lock was taken (#692): a hold taken while a landing's
                 // revision bump was still unpublished blocks the publication
-                // too, and refuses every share on the old work.
+                // too, and refuses every share on the old work. The revision
+                // read under the lock is the one the hold keeps.
+                let current = work.last.as_ref().map(|reading| reading.payout_revision);
+                let locked = holder.as_ref().and_then(LockHolder::revision);
                 checks.push(check(
-                    "every frontend served current work when the lock was taken",
-                    work.current_at.is_some(),
+                    "the lock was taken on current work, with nothing left to settle",
+                    work.current_at.is_some() && locked.is_some() && locked == current,
                     match work.current_at {
                         Some(at) => format!(
-                            "current {:.1} s after the injection started (bound {} s)",
+                            "every frontend served revision {current:?}'s work, with no found \
+                             block unfinished and no settlement under way, {:.1} s after the \
+                             injection started (bound {} s); the lock was taken at revision \
+                             {locked:?}",
                             at.saturating_duration_since(inject_start).as_secs_f64(),
                             LOCK_WORK_WAIT.as_secs()
                         ),
@@ -490,6 +497,7 @@ impl FaultDriver {
                     "work_wait_seconds": LOCK_WORK_WAIT.as_secs(),
                     "work_before_the_lock": work.last,
                     "work_read_error": work.error,
+                    "payout_revision_under_the_lock": locked,
                     "hold_seconds": removed.saturating_duration_since(injected).as_secs_f64(),
                     "tip_minted_after_seconds": at(*minted),
                     "tip": tip.as_ref().map(|tip| &tip.hash),

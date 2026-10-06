@@ -28,8 +28,9 @@ pub const EXHAUSTION_NAME: &str = "load-fault-exhaustion";
 
 /// An outside transaction holding an advisory lock until it is released.
 pub struct LockHolder {
-    acquired: Option<oneshot::Receiver<Instant>>,
+    acquired: Option<oneshot::Receiver<(Instant, Option<i64>)>>,
     acquired_at: Option<Instant>,
+    revision: Option<i64>,
     release: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<Instant>>>,
     released_at: Option<Instant>,
@@ -39,6 +40,9 @@ pub struct LockHolder {
 impl LockHolder {
     /// Connect to `url` and take `key` inside a transaction. The lock is
     /// queued behind whoever holds it now, as a server writer's would be.
+    /// Once it is taken, the cluster's payout revision is read in the same
+    /// transaction: every bump of it takes `SETTLEMENT_LOCK`, so that is the
+    /// revision the whole hold keeps.
     pub fn start(url: String, key: i64) -> Self {
         let (acquired_tx, acquired) = oneshot::channel();
         let (release, release_rx) = oneshot::channel::<()>();
@@ -59,7 +63,17 @@ impl LockHolder {
                 .execute(&mut connection)
                 .await
                 .context("taking the advisory lock")?;
-            let _ = acquired_tx.send(Instant::now());
+            let acquired_at = Instant::now();
+            // Evidence only: a failed read leaves the lock held, and the
+            // verdict says the revision is unknown.
+            let revision: Option<i64> = sqlx::query_scalar(
+                "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_optional(&mut connection)
+            .await
+            .ok()
+            .flatten();
+            let _ = acquired_tx.send((acquired_at, revision));
             // A dropped sender releases too: the lock never outlives the
             // driver that asked for it.
             let _ = release_rx.await;
@@ -74,6 +88,7 @@ impl LockHolder {
         Self {
             acquired: Some(acquired),
             acquired_at: None,
+            revision: None,
             release: Some(release),
             task: Some(task),
             released_at: None,
@@ -89,8 +104,9 @@ impl LockHolder {
         }
         if let Some(receiver) = self.acquired.as_mut() {
             match receiver.try_recv() {
-                Ok(at) => {
+                Ok((at, revision)) => {
                     self.acquired_at = Some(at);
+                    self.revision = revision;
                     self.acquired = None;
                     return Ok(Some(at));
                 }
@@ -110,6 +126,12 @@ impl LockHolder {
             );
         }
         Ok(None)
+    }
+
+    /// The cluster's payout revision as the lock was taken, if it could be
+    /// read.
+    pub fn revision(&self) -> Option<i64> {
+        self.revision
     }
 
     pub fn release(&mut self) {

@@ -546,10 +546,17 @@ impl SigtermDrain {
 }
 
 /// One reading of the work every frontend serves, as #640's gate takes it:
-/// the cluster's payout revision, then each frontend's published `/healthz`.
+/// the cluster's payout revision, its unfinished found blocks and the
+/// settlements under way, then each frontend's published `/healthz`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WorkReading {
     pub payout_revision: i64,
+    /// Found blocks still on their way to landing: each one's landing bumps
+    /// the revision again.
+    pub unfinished_candidates: i64,
+    /// Backends holding or waiting for `SETTLEMENT_LOCK`: a rebuild, a job
+    /// build or a landing the server is still settling.
+    pub settlements_in_progress: i64,
     /// One per frontend, in order; `None` where `/healthz` gave no JSON.
     pub frontends: Vec<Option<FrontendWork>>,
 }
@@ -568,10 +575,22 @@ impl WorkReading {
     /// The revision first, then every frontend's `/healthz` at once, so a
     /// bump between the two shows as a frontend behind it and is read again.
     async fn read(pool: PgPool, client: reqwest::Client, health_urls: Vec<String>) -> Result<Self> {
-        let payout_revision: i64 =
-            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
-                .fetch_one(&pool)
-                .await?;
+        let (payout_revision, unfinished_candidates, settlements_in_progress): (i64, i64, i64) =
+            sqlx::query_as(
+                "SELECT payout_revision, \
+                   (SELECT count(*) FROM qbit_block_candidate_outbox WHERE state = ANY($1)), \
+                   (SELECT count(*) FROM pg_locks l WHERE l.locktype = 'advisory' \
+                      AND l.database = (SELECT oid FROM pg_database \
+                                        WHERE datname = current_database()) \
+                      AND l.classid = $2::bigint::oid AND l.objid = $3::bigint::oid \
+                      AND l.objsubid = 1) \
+                 FROM qbit_prism_cluster WHERE singleton",
+            )
+            .bind(&super::backlog::UNFINISHED[..])
+            .bind(crate::measure::PRISM_LOCK_CLASSID)
+            .bind(crate::measure::SETTLEMENT_LOCK_OBJID)
+            .fetch_one(&pool)
+            .await?;
         let reads: Vec<_> = health_urls
             .into_iter()
             .map(|url| {
@@ -596,6 +615,8 @@ impl WorkReading {
         }
         Ok(Self {
             payout_revision,
+            unfinished_candidates,
+            settlements_in_progress,
             frontends,
         })
     }
@@ -612,13 +633,21 @@ impl WorkReading {
                 })
             })
     }
+
+    /// Current, with no found block left to land and no settlement under
+    /// way: nothing is about to bump the revision or hold `SETTLEMENT_LOCK`.
+    pub fn quiet(&self) -> bool {
+        self.current() && self.unfinished_candidates == 0 && self.settlements_in_progress == 0
+    }
 }
 
 /// A wait, up to a deadline, for every frontend to serve current work, read
 /// as [`WorkReading`] every [`SETTLE_READ_INTERVAL`]. The drain's settle
 /// waits for it once its block has landed (#686), and the settlement-lock
-/// fault before it takes the lock (#692).
+/// fault for a quiet cluster before it takes the lock (#692).
 pub struct WorkCurrentWait {
+    /// Wait for [`WorkReading::quiet`], not only [`WorkReading::current`].
+    quiet: bool,
     read: Option<Spawned<Result<WorkReading>>>,
     next_read: Instant,
     client: Option<reqwest::Client>,
@@ -641,6 +670,7 @@ impl Default for WorkCurrentWait {
 impl WorkCurrentWait {
     pub fn new() -> Self {
         Self {
+            quiet: false,
             read: None,
             next_read: Instant::now(),
             client: None,
@@ -648,6 +678,16 @@ impl WorkCurrentWait {
             timed_out: false,
             last: None,
             error: None,
+        }
+    }
+
+    /// A wait for current work on a quiet cluster: a landing still to come
+    /// would bump the revision again, and a lock queued behind a settlement
+    /// under way would start the hold in the middle of it.
+    pub fn quiet() -> Self {
+        Self {
+            quiet: true,
+            ..Self::new()
         }
     }
 
@@ -684,8 +724,13 @@ impl WorkCurrentWait {
                 // A read still in flight at the bound is abandoned with the
                 // wait; one whose task was lost is replaced.
                 None if !pending.lost() => {
-                    self.timed_out = Instant::now() >= deadline;
-                    return self.timed_out;
+                    if Instant::now() < deadline {
+                        return false;
+                    }
+                    pending.abort();
+                    self.read = None;
+                    self.timed_out = true;
+                    return true;
                 }
                 None => self.error = Some("a read of the frontends' work was lost".into()),
                 Some(Err(error)) => {
@@ -693,8 +738,13 @@ impl WorkCurrentWait {
                 }
                 Some(Ok(reading)) => {
                     self.error = None;
+                    let done = if self.quiet {
+                        reading.quiet()
+                    } else {
+                        reading.current()
+                    };
                     // A reading that finished past the bound does not count.
-                    if reading.current() && Instant::now() < deadline {
+                    if done && Instant::now() < deadline {
                         self.current_at = Some(Instant::now());
                     }
                     self.last = Some(reading);
@@ -1251,6 +1301,8 @@ mod tests {
     fn work_is_current_once_every_frontend_serves_the_revision_to_every_session() {
         let reading = |frontends| WorkReading {
             payout_revision: 7,
+            unfinished_candidates: 0,
+            settlements_in_progress: 0,
             frontends,
         };
         assert!(reading(vec![
@@ -1279,6 +1331,8 @@ mod tests {
     fn at_revision(generation: i64) -> WorkReading {
         WorkReading {
             payout_revision: 7,
+            unfinished_candidates: 0,
+            settlements_in_progress: 0,
             frontends: vec![work(true, Some(generation), Some(0))],
         }
     }
@@ -1362,6 +1416,35 @@ mod tests {
         assert!(wait.last_read().contains("payout_revision: 7"));
     }
 
+    #[test]
+    fn a_landing_or_settlement_still_under_way_holds_only_a_quiet_wait() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let landing = WorkReading {
+            unfinished_candidates: 1,
+            ..at_revision(7)
+        };
+        let settling = WorkReading {
+            settlements_in_progress: 1,
+            ..at_revision(7)
+        };
+        for busy in [landing, settling] {
+            assert!(busy.current() && !busy.quiet());
+            let mut plain = WorkCurrentWait::new();
+            assert!(!plain.poll_with(deadline, read(busy.clone())));
+            assert!(plain.poll_with(deadline, no_read));
+            assert!(plain.current_at.is_some());
+            let mut quiet = WorkCurrentWait::quiet();
+            assert!(!quiet.poll_with(deadline, read(busy.clone())));
+            hold_off_reads(&mut quiet);
+            assert!(!quiet.poll_with(deadline, no_read));
+            assert_eq!(quiet.last, Some(busy));
+            quiet.next_read = Instant::now();
+            assert!(!quiet.poll_with(deadline, read(at_revision(7))));
+            assert!(quiet.poll_with(deadline, no_read));
+            assert!(quiet.current_at.is_some());
+        }
+    }
+
     #[tokio::test]
     async fn the_bound_abandons_a_read_still_in_flight() {
         let mut wait = WorkCurrentWait::new();
@@ -1372,5 +1455,9 @@ mod tests {
         assert!(!wait.poll_with(deadline, no_read), "still within the bound");
         assert!(wait.poll_with(Instant::now(), no_read));
         assert!(wait.timed_out && wait.current_at.is_none() && wait.last.is_none());
+        assert!(
+            wait.read.is_none(),
+            "the read is cancelled, not left running"
+        );
     }
 }

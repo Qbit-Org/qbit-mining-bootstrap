@@ -68,9 +68,9 @@ pub const PHASE: &str = "faults";
 const TERMINATION_WAIT: Duration = Duration::from_secs(5);
 
 /// How long the settlement-lock fault waits, from its injection's start, for
-/// every frontend to serve current work before it takes the lock (#692). A
-/// steady baseline is current at once; after a fault that landed a block it
-/// takes a few seconds.
+/// every frontend to serve current work on a quiet cluster before it takes
+/// the lock (#692). A steady baseline is there at once; after a fault that
+/// landed a block it takes a few seconds.
 pub const LOCK_WORK_WAIT: Duration = Duration::from_secs(60);
 
 /// What the fault driver acts on, lent to it by the scheduling loop on each
@@ -135,6 +135,13 @@ impl<T: Send + 'static> Spawned<T> {
         Self {
             task: None,
             value: Some(value),
+        }
+    }
+
+    /// Cancel the task, for a caller that stopped waiting for it.
+    pub fn abort(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 
@@ -214,7 +221,8 @@ enum Action {
         error: Option<String>,
     },
     SettlementLock {
-        /// Every frontend's work, read until it is current: the lock is
+        /// Every frontend's work and what the cluster is still settling,
+        /// read until the work is current and the cluster quiet: the lock is
         /// taken only then (#692).
         work: WorkCurrentWait,
         holder: Option<LockHolder>,
@@ -262,7 +270,7 @@ impl Action {
                 error: None,
             },
             FaultKind::SettlementLock => Self::SettlementLock {
-                work: WorkCurrentWait::new(),
+                work: WorkCurrentWait::quiet(),
                 holder: None,
                 mint_at: None,
                 minted: None,
@@ -630,8 +638,9 @@ fn inject(
                     // until every frontend publishes work at it, shares on
                     // the old work are refused stale-job. A hold taken first
                     // blocks that publication too, so it would measure the
-                    // landing, not the lock. The verdict fails a hold that
-                    // had to start without it.
+                    // landing, not the lock; so would a landing still to
+                    // come, or a hold queued behind a settlement under way.
+                    // The verdict fails a hold that had to start without it.
                     let started = run.inject_start.unwrap_or_else(Instant::now);
                     if !work.poll(started + LOCK_WORK_WAIT, env, tools) {
                         return Ok(false);
@@ -776,8 +785,10 @@ fn remove(run: &mut FaultRun, env: &mut FaultEnv<'_>) -> Result<bool> {
             Ok(true)
         }
         Action::SettlementLock { holder, .. } => {
-            // The injection ends only once the holder has started.
             let Some(holder) = holder else {
+                // The injection ends only once the holder has started.
+                run.problems
+                    .push("removed without a lock holder ever started".into());
                 run.removed_at = Some(Instant::now());
                 return Ok(true);
             };
