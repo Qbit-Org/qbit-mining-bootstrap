@@ -878,3 +878,133 @@ async fn a_halted_cluster_or_a_live_legacy_writer_refuses_the_append_before_its_
     .await;
     h.close(result).await
 }
+
+/// A fenced append whose first statement finds a revision writer holding the
+/// cluster row waits it out and compares the revision that writer committed,
+/// and goes ahead when the writer rolls back: `FOR SHARE` still rechecks the
+/// latest row although the statement also reads the probe's bounds (#711).
+#[tokio::test]
+async fn a_fenced_append_waits_out_a_revision_writer_and_compares_what_it_commits() -> Result<()> {
+    let Some(h) = Harness::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        for (id, commit) in [(1, true), (2, false)] {
+            let revision = h.ledger.payout_revision().await?;
+            let mut writer = h.control.begin().await?;
+            sqlx::query(
+                "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton",
+            )
+            .execute(&mut *writer)
+            .await?;
+            let mut append = {
+                let ledger = h.ledger.clone();
+                Running(tokio::spawn(async move {
+                    ledger.append_at_revision(share(id), None, revision).await
+                }))
+            };
+            let mut observer = h.control.acquire().await?;
+            timeout(WAIT, async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
+                         AND wait_event_type='Lock' AND query LIKE 'WITH probe AS MATERIALIZED%')",
+                    )
+                    .fetch_one(&mut *observer)
+                    .await?;
+                    if waiting {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("the append's first statement never waited on the revision writer")??;
+            drop(observer);
+            if commit {
+                writer.commit().await?;
+                let error = timeout(WAIT, &mut append.0)
+                    .await??
+                    .err()
+                    .context("an append fenced at a superseded revision succeeded")?;
+                ensure!(
+                    error.to_string().contains("payout revision changed"),
+                    "{error:#}"
+                );
+            } else {
+                writer.rollback().await?;
+                ensure!(
+                    timeout(WAIT, &mut append.0).await???.inserted,
+                    "the append did not land after the revision writer rolled back"
+                );
+            }
+        }
+        ensure!(h.ids().await? == vec![share(2).share_id]);
+        Ok(())
+    }
+    .await;
+    h.close(result).await
+}
+
+/// The fenced first statement's probe columns keep the snapshot taken before
+/// it waited on the cluster row. When the writer it waited on commits a
+/// change to that row but leaves the revision alone, the append reads its
+/// probe again (#711). Here the writer also mapped the share's header to
+/// another share, so the append must refuse the header as already credited,
+/// not take it for a new one and collide with the mapping on insert.
+#[tokio::test]
+async fn a_fenced_append_rereads_its_probe_after_waiting_on_a_cluster_row_writer() -> Result<()> {
+    let Some(h) = Harness::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let revision = h.ledger.payout_revision().await?;
+        let mut writer = h.control.begin().await?;
+        sqlx::query("UPDATE qbit_prism_cluster SET updated_at=clock_timestamp() WHERE singleton")
+            .execute(&mut *writer)
+            .await?;
+        sqlx::query(
+            "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,'other:'||$1)",
+        )
+        .bind(format!("{:064x}", 1))
+        .execute(&mut *writer)
+        .await?;
+        let mut append = {
+            let ledger = h.ledger.clone();
+            Running(tokio::spawn(async move {
+                ledger.append_at_revision(share(1), None, revision).await
+            }))
+        };
+        let mut observer = h.control.acquire().await?;
+        timeout(WAIT, async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
+                     AND wait_event_type='Lock' AND query LIKE 'WITH probe AS MATERIALIZED%')",
+                )
+                .fetch_one(&mut *observer)
+                .await?;
+                if waiting {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the append's first statement never waited on the cluster row's writer")??;
+        drop(observer);
+        writer.commit().await?;
+        let error = timeout(WAIT, &mut append.0)
+            .await??
+            .err()
+            .context("a share whose header another share holds was appended")?;
+        ensure!(
+            format!("{error:#}").contains("duplicate-share: header already credited globally"),
+            "{error:#}"
+        );
+        ensure!(h.ids().await?.is_empty(), "the refused share was written");
+        Ok(())
+    }
+    .await;
+    h.close(result).await
+}

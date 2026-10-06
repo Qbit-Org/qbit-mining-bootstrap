@@ -754,6 +754,13 @@ impl Ledger {
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
+        // Everything the first statement needs is ready before the lock.
+        let header_hash = share_header_hash(&share.share_id);
+        let first_read: &str = if expected_revision.is_some() {
+            &APPEND_FENCED_FIRST_READ_SQL
+        } else {
+            &APPEND_FIRST_READ_SQL
+        };
         let admission = super::append_admission::Admission::acquire(&self.pool).await?;
         let mut connection = admission.attach(self.acquire().await?);
         let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
@@ -770,19 +777,22 @@ impl Ledger {
         // lock's: under READ COMMITTED a statement's snapshot is taken when
         // it starts, so reads in the lock's own statement would predate the
         // lock and miss the commit of the share appended just before it.
-        let header_hash = share_header_hash(&share.share_id);
-        let first = sqlx::query(&Self::append_first_read_sql(expected_revision.is_some()))
+        let first = sqlx::query(first_read)
             .bind(&header_hash)
             .bind(&share.share_id)
             .fetch_one(&mut *tx)
             .await?;
         check_writable(&first)?;
-        let probe = AppendProbe::from_row(header_hash, &first)?;
+        // `FOR SHARE` waits out a writer holding the cluster row and then
+        // returns the row it committed, but the probe's columns keep the
+        // statement's snapshot, which predates that commit. They are read
+        // again below when the cluster row changed after the snapshot.
+        let probe_current: bool = first.try_get("probe_current")?;
+        let probe = AppendProbe::from_row(&first)?;
         // The payout-revision fence: `Some((expected, observed))` when a
         // settlement moved the revision between the share's submit check and
-        // this read, and the append captures its block (#657). `FOR SHARE`
-        // waits out a revision writer holding the row and then returns the
-        // row it committed, so the revision compared is the latest one.
+        // this read, and the append captures its block (#657). The revision
+        // compared is the latest one, as `FOR SHARE` returns it.
         let mut moved = None;
         if let Some(expected) = expected_revision {
             let revision: i64 = first.try_get("payout_revision")?;
@@ -840,9 +850,13 @@ impl Ledger {
                 }
             }
             _ => {
-                let result = self
-                    .append_probed(&mut tx, validated_share(share)?, probe)
-                    .await?;
+                let share = validated_share(share)?;
+                let probe = if probe_current {
+                    probe
+                } else {
+                    Self::read_append_probe(&mut tx, &share).await?
+                };
+                let result = self.append_probed(&mut tx, share, probe).await?;
                 if let Some(prepared) = prepared {
                     self.persist_prepared_candidate(
                         &mut tx,
@@ -891,14 +905,21 @@ impl Ledger {
         share: AcceptedShare,
     ) -> Result<AppendResult> {
         let share = validated_share(share)?;
-        let header_hash = share_header_hash(&share.share_id);
+        let probe = Self::read_append_probe(tx, &share).await?;
+        self.append_probed(tx, share, probe).await
+    }
+
+    /// [`Self::APPEND_PROBE_SQL`] for `share`, as a statement of its own.
+    async fn read_append_probe(
+        tx: &mut Transaction<'_, Postgres>,
+        share: &AcceptedShare,
+    ) -> Result<AppendProbe> {
         let row = sqlx::query(Self::APPEND_PROBE_SQL)
-            .bind(&header_hash)
+            .bind(share_header_hash(&share.share_id))
             .bind(&share.share_id)
             .fetch_one(&mut **tx)
             .await?;
-        let probe = AppendProbe::from_row(header_hash, &row)?;
-        self.append_probed(tx, share, probe).await
+        AppendProbe::from_row(&row)
     }
 
     /// What the share append reads before it probes for the share_id, as
@@ -946,19 +967,47 @@ impl Ledger {
          (SELECT CASE WHEN is_called THEN last_value+1 ELSE last_value END AS value \
             FROM qbit_share_ledger_share_seq_seq) AS next_seq WHERE singleton";
 
-    /// The share append's first statement under `ORDER_LOCK` (#711): the
-    /// write guard's columns ([`check_writable`] refuses on them), the
-    /// cluster row's `payout_revision`, and [`Self::APPEND_PROBE_SQL`]'s
-    /// columns, with its parameters. A fenced append reads the cluster row
-    /// `FOR SHARE`, as the separate fence statement did: a revision writer
-    /// holding the row is waited out and its committed row is the one
-    /// returned. The probe is a materialized CTE, so the lock and its
-    /// recheck involve the cluster row alone.
+    /// The share append's first statement under `ORDER_LOCK` (#711), built
+    /// once as [`APPEND_FIRST_READ_SQL`] and [`APPEND_FENCED_FIRST_READ_SQL`]:
+    /// the write guard's columns ([`check_writable`] refuses on them), the
+    /// cluster row's `payout_revision`, `probe_current`, and
+    /// [`Self::APPEND_PROBE_SQL`]'s columns, with its parameters.
+    ///
+    /// A fenced append reads the cluster row `FOR SHARE`, as the separate
+    /// fence statement did: a writer holding the row is waited out, and the
+    /// row it committed is the one returned. Every other column keeps the
+    /// statement's snapshot, taken before that wait, where the separate
+    /// statements after the fence took a fresh one. `probe_current` says
+    /// whether the cluster row returned is still the one in that snapshot
+    /// (its `xmin` is compared with the snapshot's own read of the row, an
+    /// InitPlan that the recheck does not re-run). When it is not, a writer
+    /// committed while the read waited, and the caller reads the probe again
+    /// in a statement of its own. The probe is a materialized CTE on the
+    /// outer side of a `LEFT JOIN`, so `FOR SHARE` and its recheck involve
+    /// the cluster row alone, and a missing probe row cannot hide the write
+    /// guard's refusal behind an empty result.
     fn append_first_read_sql(fenced: bool) -> String {
         format!(
-            "WITH probe AS MATERIALIZED ({}) SELECT {WRITABLE_COLUMNS},c.payout_revision,probe.* FROM qbit_prism_cluster c CROSS JOIN probe WHERE c.singleton{}",
+            "WITH probe AS MATERIALIZED ({}) SELECT {WRITABLE_COLUMNS},c.payout_revision,\
+             c.xmin=(SELECT xmin FROM qbit_prism_cluster WHERE singleton) AS probe_current,probe.* \
+             FROM qbit_prism_cluster c LEFT JOIN probe ON true WHERE c.singleton{}",
             Self::APPEND_PROBE_SQL,
             if fenced { " FOR SHARE OF c" } else { "" }
+        )
+    }
+
+    /// The share_id probe between the bounds, then the fallback `condition`
+    /// (on `$4`) only when that found nothing, in one statement (#711): the
+    /// bounded probe is a materialized CTE, and `NOT EXISTS` over it is a
+    /// one-time filter on the fallback, so a share found between the bounds
+    /// never runs the fallback, and at most one branch returns a row. Both
+    /// branches keep their bounds as parameters, so executor startup prunes
+    /// each to its own leaves.
+    fn bounded_probe_then_sql(condition: &str) -> String {
+        format!(
+            "WITH recent AS MATERIALIZED ({SELECT_SHARE} WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3 LIMIT 1) \
+             SELECT * FROM recent UNION ALL \
+             ({SELECT_SHARE} WHERE share_id=$1 AND {condition} AND NOT EXISTS(SELECT 1 FROM recent) LIMIT 1)"
         )
     }
 
@@ -982,21 +1031,20 @@ impl Ledger {
          hashed AS (INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT $13,$1 FROM appended) \
          SELECT clock.ledger_clock_ms AS accepted_at_ms,appended.share_seq FROM clock LEFT JOIN appended ON true";
 
-    /// The share append once `probe` has been read under `ORDER_LOCK`: one
+    /// The share append once `probe` has been read under `ORDER_LOCK`: the
     /// share_id probe, then, for a new share, [`Self::APPEND_WRITE_SQL`].
     ///
     /// The probe tries the newest partitions first, between the bounds, then
     /// a registered rejected sequence or the legacy range on an unmapped
-    /// miss, so a new share never probes every retained leaf. A credited
-    /// header needs the full-parent fallback, including legacy worker-scoped
-    /// duplicates mapped to an earlier row. A credited row that has left the
-    /// online ledger cannot be compared and is refused as the duplicate it
-    /// is. The bounded probe and the fallback are one statement (#711): the
-    /// bounded probe is a materialized CTE, and the fallback runs only when
-    /// the CTE is empty (`NOT EXISTS` over it is a one-time filter), so a
-    /// share found between the bounds never runs the fallback, as before.
-    /// The bounds stay bound parameters, so executor startup still prunes
-    /// the bounded probe to the leaves between them.
+    /// miss, so a new share never probes every retained leaf. Either
+    /// fallback runs in the bounded probe's statement
+    /// ([`Self::bounded_probe_then_sql`], #711). A credited header needs the
+    /// full-parent fallback, including legacy worker-scoped duplicates mapped
+    /// to an earlier row. Nothing bounds it, so executor startup could not
+    /// prune it and would open every retained leaf on every duplicate; it
+    /// stays a statement of its own that runs only when the bounded probe
+    /// found nothing. A credited row that has left the online ledger cannot
+    /// be compared and is refused as the duplicate it is.
     async fn append_probed(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -1004,31 +1052,50 @@ impl Ledger {
         probe: AppendProbe,
     ) -> Result<AppendResult> {
         let AppendProbe {
-            header_hash,
             credited,
             rejected_seq,
             legacy_bound,
             floor,
             ceiling,
         } = probe;
-        let (fallback, fallback_bound) = match (rejected_seq, &credited) {
-            (Some(seq), _) => (" AND share_seq=$4", Some(seq)),
-            (None, Some(_)) => ("", None),
-            (None, None) => (" AND share_seq<$4", Some(legacy_bound)),
+        let existing = match (rejected_seq, &credited) {
+            (Some(seq), _) => {
+                sqlx::query(&APPEND_PROBE_THEN_REJECTED_SQL)
+                    .bind(&share.share_id)
+                    .bind(floor)
+                    .bind(ceiling)
+                    .bind(seq)
+                    .fetch_optional(&mut **tx)
+                    .await?
+            }
+            (None, None) => {
+                sqlx::query(&APPEND_PROBE_THEN_LEGACY_SQL)
+                    .bind(&share.share_id)
+                    .bind(floor)
+                    .bind(ceiling)
+                    .bind(legacy_bound)
+                    .fetch_optional(&mut **tx)
+                    .await?
+            }
+            (None, Some(_)) => {
+                let bounded = sqlx::query(&APPEND_BOUNDED_PROBE_SQL)
+                    .bind(&share.share_id)
+                    .bind(floor)
+                    .bind(ceiling)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                match bounded {
+                    Some(row) => Some(row),
+                    None => {
+                        sqlx::query(&APPEND_FULL_PARENT_PROBE_SQL)
+                            .bind(&share.share_id)
+                            .fetch_optional(&mut **tx)
+                            .await?
+                    }
+                }
+            }
         };
-        let sql = format!(
-            "WITH recent AS MATERIALIZED ({SELECT_SHARE} WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3 LIMIT 1) \
-             SELECT * FROM recent UNION ALL \
-             ({SELECT_SHARE} WHERE share_id=$1{fallback} AND NOT EXISTS(SELECT 1 FROM recent) LIMIT 1)"
-        );
-        let mut query = sqlx::query(&sql)
-            .bind(&share.share_id)
-            .bind(floor)
-            .bind(ceiling);
-        if let Some(bound) = fallback_bound {
-            query = query.bind(bound);
-        }
-        if let Some(row) = query.fetch_optional(&mut **tx).await? {
+        if let Some(row) = existing {
             let previous = share_from_row(&row)?;
             share.share_seq = previous.share_seq;
             share.accepted_at_ms = previous.accepted_at_ms;
@@ -1063,7 +1130,7 @@ impl Ledger {
             .bind(i64::from(share.ntime))
             .bind(&share.credit_policy)
             .bind(&self.instance_id)
-            .bind(header_hash)
+            .bind(share_header_hash(&share.share_id))
             .fetch_one(&mut **tx)
             .await?;
         ensure!(
@@ -1813,10 +1880,27 @@ fn refused_for_want_of_a_partition(error: &anyhow::Error) -> bool {
     })
 }
 
+/// The share append's statements whose text is built from shared fragments,
+/// built once rather than per share inside `ORDER_LOCK` (#711); see
+/// [`Ledger::append_first_read_sql`], [`Ledger::bounded_probe_then_sql`] and
+/// [`Ledger::append_probed`].
+static APPEND_FIRST_READ_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| Ledger::append_first_read_sql(false));
+static APPEND_FENCED_FIRST_READ_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| Ledger::append_first_read_sql(true));
+static APPEND_PROBE_THEN_REJECTED_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| Ledger::bounded_probe_then_sql("share_seq=$4"));
+static APPEND_PROBE_THEN_LEGACY_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| Ledger::bounded_probe_then_sql("share_seq<$4"));
+static APPEND_BOUNDED_PROBE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3")
+});
+static APPEND_FULL_PARENT_PROBE_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{SELECT_SHARE} WHERE share_id=$1"));
+
 /// What the share append reads before its share_id probe, from
 /// [`Ledger::APPEND_PROBE_SQL`]'s columns; see there.
 struct AppendProbe {
-    header_hash: String,
     credited: Option<String>,
     rejected_seq: Option<i64>,
     legacy_bound: i64,
@@ -1825,9 +1909,8 @@ struct AppendProbe {
 }
 
 impl AppendProbe {
-    fn from_row(header_hash: String, row: &PgRow) -> Result<Self> {
+    fn from_row(row: &PgRow) -> Result<Self> {
         Ok(Self {
-            header_hash,
             credited: row.try_get("credited")?,
             rejected_seq: row.try_get("rejected_seq")?,
             legacy_bound: row.try_get("conversion_bound")?,
