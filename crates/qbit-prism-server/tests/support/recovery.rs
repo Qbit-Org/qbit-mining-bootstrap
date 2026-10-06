@@ -516,20 +516,27 @@ async fn records_with_options(
 /// The summary of exported rows, as `scripts/prism-recovery-evidence.py`
 /// prints it.
 pub async fn summarize(records: &Path) -> Result<Value> {
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../scripts/prism-recovery-evidence.py"
-        ))
-        .arg(records)
-        .output()
-        .await?;
+    let output = summarize_with(records, &[]).await?;
     ensure!(
         output.status.success(),
         "recovery evidence summary failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// `scripts/prism-recovery-evidence.py` with `args` over `records`: what it
+/// printed, and how it exited.
+pub async fn summarize_with(records: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/prism-recovery-evidence.py"
+        ))
+        .args(args)
+        .arg(records)
+        .output()
+        .await?)
 }
 
 /// Run the parallel export (#712) with `args`, its parts under `work_dir`:
