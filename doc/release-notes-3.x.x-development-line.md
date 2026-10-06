@@ -47,8 +47,8 @@ carries a banner with the same statement.
   submodules, `ledger/candidates.rs`, `ledger/jobs.rs`, `ledger/window.rs`,
   and `ledger/connect.rs`, with no behaviour change and no signature change,
   so parallel workstream pull requests stop colliding on one file.
-- One release identity per #284: `3.0.0`, and `3.0.0-rc.1` since the first
-  release candidate (#557). The single source is
+- One release identity per #284, currently `3.0.0-rc.1`, the first release
+  candidate of `3.0.0` (#557). The single source is
   `[workspace.package].version` in the root `Cargo.toml`, which every crate
   inherits with `version.workspace = true`, plus the `VERSION` file; bump the
   two together. `scripts/check_version_skew.py` (also `make
@@ -125,7 +125,7 @@ they fixed or configured no longer exists on this line:
   line has been released as 3.0.0; `doc/release-notes-3.0.0.md` currently
   records only the unreleased D5 recovery contract. #291 completes those
   notes and the rollout record.
-- Native candidate recovery is #268.
+- Native candidate recovery (#268) landed with #439.
 
 ## Upgrade and rollback
 

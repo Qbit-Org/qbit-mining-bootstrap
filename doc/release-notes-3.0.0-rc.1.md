@@ -7,15 +7,18 @@ This is the first release candidate of 3.0.0, the native Rust PRISM line. It
 is the tree that #291's go/no-go evaluates on the PRISM production pair: two
 frontends, each with its own `qbitd`, a PostgreSQL primary with one
 asynchronous standby, and a public-read replica. It is not a production
-release. Until #291 records a go, the production line stays 2.x.x (v2.0.0).
+release. Until #291 records a go, the production line stays 2.x.x.
 
 A candidate runs in pre-production with block submission and broadcasting off,
-so it offers the network no found block and no transaction:
+so it offers the network no found block and no transaction. A rehearsal uses
+both holds, as the rehearsal procedure requires:
 
-- per frontend, with `PRISM_BLOCK_SUBMIT_ENABLED=0` (#661), which also keeps the
-  CTV fanout broadcaster from starting;
-- or for every frontend of a ledger, with `qbit-prism-server submission-hold
-  set --reason ...` (#664, migration 023).
+- hold the ledger itself with `qbit-prism-server submission-hold set --reason
+  ...` (#664, migration 023) before any frontend starts on it, so that it
+  holds every frontend that connects;
+- and start every frontend with `PRISM_BLOCK_SUBMIT_ENABLED=0` (#661), which
+  also keeps the CTV fanout broadcaster from starting. A frontend started
+  without it, on a ledger with no hold, offers every `pending` row it finds.
 
 See [the block submission kill switch](../docs/prism-configuration.md#block-submission-kill-switch)
 and [the rehearsal procedure](../docs/prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals).
@@ -182,18 +185,19 @@ migration is one-way, with no down-migrations (decision D5, #287, #366):
 
 A candidate is verified by the full suite (#557):
 
-- **CI** (`ci.yml`), on the version-bump pull request and on the tag: lint,
-  compile and Compose validation; the Python and Rust unit tests; the
-  PostgreSQL contract shards and the proof that every gated test executed;
-  the dependency audit; and the Docker and real-`qbitd` image builds.
+- **CI** (`ci.yml`), on the version-bump pull request, and dispatched by hand
+  on the tag, since `ci.yml` has no tag trigger: lint, compile and Compose
+  validation; the Python and Rust unit tests; the PostgreSQL contract shards
+  and the proof that every gated test executed; the dependency audit; and the
+  Docker and real-`qbitd` image builds.
 - **The L3 production-window matrix** (`prism-load-l3.yml`, suite `l3-full`:
   every #473 cell, three repeats, on 32 vCPU runners). It runs by itself on
   the version-bump pull request. The `v*` tag promotes that run when the
   tagged commit's tree is the one the run measured, and runs the suite again
   otherwise (#550, #608).
 - **The load harness** (`prism-load-nightly.yml`), dispatched by hand on the
-  candidate's commit with `preset=all live=true weekly=true fuzz=true
-  images=true bridging=true`:
+  version-bump pull request and on the tag, with `preset=all live=true
+  weekly=true fuzz=true images=true bridging=true`:
   - every nightly and manual preset, including #473's 400k and 500k window
     cells at 1, 2 and 4 frontends, the 200k one-frontend cell and the
     mainnet shapes;
@@ -203,10 +207,10 @@ A candidate is verified by the full suite (#557):
   - the shipped images under the Compose `prism` profile with the HA
     overlay (L6, #544).
 - **The 5.5 h soak and the long fault set** (`preset=weekly`: `soak-weekly`
-  and `faults-long-real-node`). For this candidate the soak ran once, at
+  and `faults-long-real-node`). For this candidate the soak runs once, at
   3.x.x `c95febb3`. The only runtime change between that commit and this
-  candidate is #698 (#675). `faults-long-real-node` ran there and again at
-  the candidate's commit.
+  candidate is #698 (#675). `faults-long-real-node` runs there and again on
+  the version-bump pull request. Their verdicts are in the evidence bundle.
 
 The evidence bundle on the `v3.0.0-rc.1` GitHub pre-release lists:
 - every run, with the commit and tree it tested;
@@ -241,13 +245,14 @@ Open on `3.x.x` when this candidate was cut:
   "offered candidate could not be processed" about twice per 30 minutes
   under load. The ledger runbook says when those ALERT lines are benign and
   when to act on them (#696).
-- #632: the live transcript replay in required CI fails intermittently when
-  a payout-revision change refuses a share mid-commit.
 - #670: `broadcast-ctv` cannot take over a dead frontend's fanout claim
   within one pass.
 - #688, #689 and #690: the public pending-fanouts query, the CTV claim lane
   in a backlog, and fatal-state clearing each do work that grows with the
   number of fanouts.
+- #582 (the share-hash backfill on a production-sized ledger) and #604
+  (first jobs queued behind rebuild storms) are fixed in code (#663, #680,
+  #681; #625) and stay open for #291's go/no-go sweep.
 - #701: in `faults-long-real-node` at `c95febb3`, one public-API request
   failed with a connection error during the block failover. It was the run's
   only read-tier failure, and it fell outside the window in which the public
