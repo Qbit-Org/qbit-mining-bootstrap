@@ -1304,15 +1304,36 @@ async fn measure_level(
     if first.passed_minimum || !retry {
         return Ok(first);
     }
-    let mut second = pass("-retry").await.with_context(|| {
-        format!(
-            "measuring the level of {} appender(s) a second time, after a first pass at {:.1} \
-             shares/s below the floor",
-            first.appenders, first.shares_per_second
-        )
+    let mut second = pass("-retry").await.map_err(|error| {
+        error.context(SecondPassFailed {
+            appenders: first.appenders,
+            first_pass_shares_per_second: first.shares_per_second,
+            first_pass: level_entry(&first),
+        })
     })?;
     second.first_pass = Some(Box::new(first));
     Ok(second)
+}
+
+/// The context on a second pass's error (#683). The error below it says what
+/// went wrong; the first pass it followed rides along, so the error report
+/// still carries that pass's entry.
+#[derive(Debug)]
+struct SecondPassFailed {
+    appenders: u32,
+    first_pass_shares_per_second: f64,
+    first_pass: Value,
+}
+
+impl std::fmt::Display for SecondPassFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measuring the level of {} appender(s) a second time, after a first pass at {:.1} \
+             shares/s below the floor",
+            self.appenders, self.first_pass_shares_per_second
+        )
+    }
 }
 
 /// The run's contamination verdict, over every pass it timed: a foreign
@@ -1625,6 +1646,13 @@ fn build_error_report(config: &Config, error: &anyhow::Error) -> Value {
     root.insert("error".to_owned(), Value::from(format!("{error:#}")));
     root.insert("passed_minimum".to_owned(), Value::from(false));
     root.insert("results".to_owned(), Value::Array(Vec::new()));
+    // A second pass that failed leaves the first pass's entry behind (#683).
+    if let Some(failed) = error.downcast_ref::<SecondPassFailed>() {
+        root.insert(
+            "first_pass_before_the_error".to_owned(),
+            failed.first_pass.clone(),
+        );
+    }
     Value::Object(root)
 }
 
@@ -2208,6 +2236,26 @@ async fn a_level_below_the_floor_is_measured_once_more_and_only_that_pass_decide
     let (level, suffixes) = scripted_level(false, vec![timed_pass(130.0, Some(false))]).await;
     assert_eq!(suffixes, [""]);
     assert!(!level.passed_minimum && level.first_pass.is_none());
+
+    // A second pass that errors keeps the first pass for the error report,
+    // under whatever context the run adds on its way out.
+    let mut passes = vec![
+        Ok(timed_pass(130.0, Some(false))),
+        Err(anyhow::anyhow!("pool timed out")),
+    ]
+    .into_iter();
+    let error = measure_level(true, async |_| {
+        passes.next().expect("no further pass was scripted")
+    })
+    .await
+    .err()
+    .expect("the second pass errors")
+    .context("measuring the run");
+    let failed = error
+        .downcast_ref::<SecondPassFailed>()
+        .expect("the first pass rides on the error");
+    assert_eq!(failed.first_pass["shares_per_second"], 130.0);
+    assert!(format!("{error:#}").contains("pool timed out"));
 }
 
 #[test]
