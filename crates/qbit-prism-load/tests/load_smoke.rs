@@ -399,13 +399,10 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             .and_then(|v| v.as_array())
             .context("a pinned list")?;
         assert_eq!(listed.len(), pinned as usize, "{pointer} for {flag}");
-        let named: std::collections::BTreeSet<&str> = listed
-            .iter()
-            .filter_map(|entry| entry[*key].as_str())
-            .collect();
+        // Held by the comparator's own rule, so the two cannot drift.
         assert_eq!(
-            named.len(),
-            listed.len(),
+            compare::distinct_named(listed, key),
+            Some(listed.len()),
             "{pointer} names a distinct {key}"
         );
     }

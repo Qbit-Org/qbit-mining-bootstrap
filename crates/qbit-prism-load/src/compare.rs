@@ -556,11 +556,11 @@ pub const DURATION_TOLERANCE: f64 = 0.05;
 
 /// Whether every counted run of either build drove `phase` as one workload:
 /// `None` when they did (or none ran it), otherwise why not. A run that
-/// left the phase out while another ran it, reported no target rate or no
-/// length, a second distinct target, or lengths spread past
-/// [`DURATION_TOLERANCE`] each fail. A phase reported only for information
-/// still has to be the same workload on both sides. `frontends` is the
-/// pinned count, which decides the planned restarts.
+/// left the phase out while another ran it, reported it as not completed,
+/// reported no target rate or no length, a second distinct target, or
+/// lengths spread past [`DURATION_TOLERANCE`] each fail. A phase reported
+/// only for information still has to be the same workload on both sides.
+/// `frontends` is the pinned count, which decides the planned restarts.
 fn phase_workload(
     runs: &[LoadedRun],
     phase: &str,
@@ -587,6 +587,17 @@ fn phase_workload(
                 }
             ));
         };
+        // A phase an abort cut short says so (`completed: false`, in every
+        // harness since #271), and its figures cover only the part that ran.
+        // Cut in its last 5% it would still be within the length tolerance,
+        // and a run whose exit code missed the abort would still count.
+        if value["completed"].as_bool() != Some(true) {
+            return Some(format!(
+                "**the runs did not drive the pinned workload**: {id} reports `{phase}` as \
+                 completed {}, so it ran only part of the phase",
+                value["completed"]
+            ));
+        }
         if let Some(expected) = expected {
             if let Some(why) = off_plan(id, value, expected, frontends) {
                 return Some(format!(
@@ -698,7 +709,10 @@ pub const PINNED_REPORT_COUNTS: &[(&str, &str, &str)] =
 /// How many distinct values of `key` the entries name, or `None` when an
 /// entry names none. A list padded with one entry repeated holds the planned
 /// number of entries but drove fewer, so an entry counts once, by its name.
-fn distinct_named<'a>(entries: impl IntoIterator<Item = &'a Value>, key: &str) -> Option<usize> {
+pub fn distinct_named<'a>(
+    entries: impl IntoIterator<Item = &'a Value>,
+    key: &str,
+) -> Option<usize> {
     let mut names = std::collections::BTreeSet::new();
     for entry in entries {
         names.insert(entry[key].as_str()?);
@@ -813,9 +827,9 @@ pub fn expected_phases(pinned: &BTreeMap<String, Value>) -> Result<Vec<crate::cl
 /// Why a counted run's report of `phase` does not match the preset's plan
 /// for it, or `None` when it does: the target rate and whether the phase is
 /// in the artifact exactly, the configured database delay (seen to be paid)
-/// and the frontend restarts exactly (with `frontends` running), the phase
-/// reported as completed, and the length within [`DURATION_TOLERANCE`] of
-/// the planned seconds.
+/// and the frontend restarts exactly (with `frontends` running), and the
+/// length within [`DURATION_TOLERANCE`] of the planned seconds.
+/// [`phase_workload`] has already held every reported phase to completion.
 fn off_plan(
     id: &str,
     reported: &Value,
@@ -831,16 +845,6 @@ fn off_plan(
             "{id} ran `{name}` at {} shares/s, not the planned {}",
             number(target, None),
             number(plan.rate, None)
-        ));
-    }
-    // A phase an abort cut short says so (`completed: false`, in every
-    // harness since #271), and its figures cover only the part that ran. Cut
-    // in its last 5% it would still be within the length tolerance, and a
-    // run whose exit code missed the abort would still count.
-    if reported["completed"].as_bool() != Some(true) {
-        return Some(format!(
-            "{id} reports `{name}` as completed {}, so it ran only part of the planned phase",
-            reported["completed"]
         ));
     }
     let seconds = plan.seconds as f64;
@@ -1268,9 +1272,17 @@ fn churn_unrealised(
         };
         // Each churn tip counts once, by its hash: a list padded with one tip
         // repeated holds the plan's length but delivered fewer.
-        let tips = churn
+        let tip_list = churn
             .and_then(|c| c.pointer("/tip_delivery/tips"))
-            .and_then(Value::as_array)
+            .and_then(Value::as_array);
+        if tip_list.is_some_and(|tips| distinct_named(tips, "tip").is_none()) {
+            return Ok(Some(format!(
+                "**the runs did not drive the pinned workload**: {} reports a churn tip \
+                 delivered without its `tip`, so its tips cannot be told apart",
+                run.run.id
+            )));
+        }
+        let tips = tip_list
             .and_then(|tips| distinct_named(tips, "tip"))
             .map(|n| n as u64);
         for (what, realised, planned) in [
@@ -1461,7 +1473,11 @@ fn block_landings_off(
     let seconds = |when: chrono::DateTime<chrono::FixedOffset>| {
         (when - started).num_microseconds().unwrap_or(i64::MAX) as f64 / 1e6
     };
-    let mut landed: Vec<Option<f64>> = run
+    // One landing per block, its first acceptance, as the count above counts
+    // each block once: a block accepted again cannot stand in for one that
+    // landed outside its slot, nor push a real landing out of its own.
+    let mut first: BTreeMap<&str, Option<f64>> = BTreeMap::new();
+    for submission in run
         .report
         .as_ref()
         .and_then(|r| r.pointer("/node/submissions"))
@@ -1469,8 +1485,19 @@ fn block_landings_off(
         .into_iter()
         .flatten()
         .filter(|s| s["accepted"] == true)
-        .map(|s| at(&s["received_at"]).map(seconds))
-        .collect();
+    {
+        let when = at(&submission["received_at"]).map(seconds);
+        first
+            .entry(submission["block_hash"].as_str().unwrap_or_default())
+            .and_modify(|earliest| {
+                *earliest = match (*earliest, when) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            })
+            .or_insert(when);
+    }
+    let mut landed: Vec<Option<f64>> = first.into_values().collect();
     landed.sort_by(|a, b| a.unwrap_or(f64::NAN).total_cmp(&b.unwrap_or(f64::NAN)));
     let slots = crate::run::scheduled_block_offsets(plan.seconds as f64, blocks as usize);
     let end = seconds(ended);

@@ -528,6 +528,32 @@ fn a_phase_an_abort_cut_short_fails_though_its_length_is_within_tolerance() {
         "{}",
         result.markdown
     );
+    // Nor a phase the runs report only for information, outside the plan.
+    let with_extra = |cut_short: bool| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for (index, run) in runs.iter_mut().enumerate() {
+            let mut extra = plain_phase("extra", 100.0, 100.0, 0, 0, 30.0);
+            if cut_short && index == 1 {
+                extra["completed"] = json!(false);
+            }
+            run.report.as_mut().unwrap()["phases"]
+                .as_array_mut()
+                .unwrap()
+                .push(extra);
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap()
+    };
+    let result = with_extra(false);
+    assert!(result.passed, "{}", result.markdown);
+    let result = with_extra(true);
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("reports `extra` as completed false"),
+        "{}",
+        result.markdown
+    );
 }
 
 #[test]
@@ -1215,7 +1241,9 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
             + chrono::Duration::milliseconds((seconds * 1000.0) as i64))
         .to_rfc3339()
     };
-    let landed_as = |hashes: [&str; 2], accepted: [bool; 2], seconds: [f64; 2]| {
+    // Each run's node submissions, as (block hash, accepted, seconds into
+    // `steady_state`).
+    let landed_as = |submissions: &[(&str, bool, f64)]| {
         let mut runs = loaded(&manifest, |_, _| met_steady());
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
@@ -1223,18 +1251,27 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
             steady["scheduled_blocks"] = json!(2);
             steady["started_at"] = json!(at(0.0));
             steady["ended_at"] = json!(at(300.004));
-            report["node"]["submissions"] = json!([
-                {"block_hash": hashes[0], "accepted": accepted[0], "rejection": null,
-                 "received_at": at(seconds[0])},
-                {"block_hash": hashes[1], "accepted": accepted[1], "rejection": "parent mismatch",
-                 "received_at": at(seconds[1])},
-            ]);
+            report["node"]["submissions"] = Value::Array(
+                submissions
+                    .iter()
+                    .map(|(hash, accepted, seconds)| {
+                        json!({"block_hash": hash, "accepted": accepted,
+                               "rejection": (!accepted).then_some("parent mismatch"),
+                               "received_at": at(*seconds)})
+                    })
+                    .collect(),
+            );
             report["node"]["tip_changes"] =
                 tip_changes(&pinned, &["e01", "e02", "e03", "p01", "p02"]);
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
-    let landed = |accepted, seconds| landed_as(["p01", "p02"], accepted, seconds);
+    let landed = |accepted: [bool; 2], seconds: [f64; 2]| {
+        landed_as(&[
+            ("p01", accepted[0], seconds[0]),
+            ("p02", accepted[1], seconds[1]),
+        ])
+    };
     let result = landed([true, true], [103.3, 200.1]);
     assert!(result.passed, "{}", result.markdown);
     let result = landed([true, false], [103.3, 200.1]);
@@ -1248,12 +1285,28 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
     );
     // One block accepted twice is one landing: a node answers a block it
     // already holds as a duplicate.
-    let result = landed_as(["p01", "p01"], [true, true], [103.3, 200.1]);
+    let result = landed_as(&[("p01", true, 103.3), ("p01", true, 200.1)]);
     assert!(!result.passed);
     assert!(
         result
             .markdown
             .contains("landed 1 of its 2 scheduled own blocks"),
+        "{}",
+        result.markdown
+    );
+    // Nor can it stand in for the other block's slot: the second block
+    // landed after the phase, and its first acceptance is what is placed.
+    let result = landed_as(&[
+        ("p01", true, 103.3),
+        ("p01", true, 200.1),
+        ("p02", true, 400.0),
+    ]);
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "landed own block 1 at 400.0 s into `steady_state`, not between its 200.0 s slot and \
+             300.0 s"
+        ),
         "{}",
         result.markdown
     );
@@ -1470,7 +1523,7 @@ fn a_churn_phase_that_spawned_fewer_rentals_than_planned_fails() {
         ("/churn/realised/storms/0/dropped", json!(5)),
     ] {
         let mut runs = churn_runs(&manifest, &pinned);
-        set_pointer(runs[1].report.as_mut().unwrap(), pointer, short);
+        set_pointer(runs[1].report.as_mut().unwrap(), pointer, short.clone());
         let result = compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap();
         assert!(!result.passed, "{pointer}");
         // A missing record fails on the count, a short storm on its drop.
@@ -1478,6 +1531,8 @@ fn a_churn_phase_that_spawned_fewer_rentals_than_planned_fails() {
             "not the plan's 0.3 of them"
         } else if pointer.ends_with("/reconnects_completed") {
             "completed 0 reconnects, short of the"
+        } else if short == json!([{}]) {
+            "reports a churn tip delivered without its `tip`"
         } else {
             "the preset's churn plan holds"
         };

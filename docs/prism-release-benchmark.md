@@ -142,8 +142,9 @@ naming a revision other than its build's is refused rather than pooled.
 Every run is also held to the preset's own gates, as
 `qbit-prism-load-gate` holds a nightly run: reconciliation, durability, and
 any tip-delivery or churn budget the preset sets. Both builds must report the
-same target rate and, within 5%, the same phase length in every phase, each
-planned phase reported as completed, and every counted run must report every phase any run reported and the
+same target rate and, within 5%, the same phase length in every phase,
+every phase reported as completed, and every counted run must report
+every phase any run reported and the
 preset's pinned frontends, sessions, submits in flight per session, plan,
 window size, replication (observed at entry and after the load) and ACK p99
 limit, with every frontend launched
