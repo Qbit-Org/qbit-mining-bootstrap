@@ -542,10 +542,25 @@ impl ShareClient {
     /// An error means nothing was submitted; a failure after the submission
     /// is [`Answer::TimedOut`] or [`Answer::Lost`].
     pub(crate) async fn submit(&mut self, proof: Proof) -> Result<Submitted> {
-        let (params, mut submitted) = self
-            .session
+        let (params, submitted) = self.solve(proof).await?;
+        Ok(self.submit_solved(params, submitted).await)
+    }
+
+    /// Solve the latest job for `proof` without submitting it: work a miner
+    /// keeps, to submit later with [`ShareClient::submit_solved`] (#474).
+    pub(crate) async fn solve(&mut self, proof: Proof) -> Result<(Value, Submitted)> {
+        self.session
             .solve_latest(&self.username, Some(proof), false)
-            .await?;
+            .await
+    }
+
+    /// Submit `params`, solved earlier, and wait for the answer, recorded in
+    /// `submitted`.
+    pub(crate) async fn submit_solved(
+        &mut self,
+        params: Value,
+        mut submitted: Submitted,
+    ) -> Submitted {
         self.next_id += 1;
         let id = json!(self.next_id);
         let request = json!({"id":id,"method":"mining.submit","params":params});
@@ -560,6 +575,6 @@ impl ShareClient {
                 Err(error) => Answer::Lost(format!("{error:#}")),
             },
         };
-        Ok(submitted)
+        submitted
     }
 }
