@@ -60,10 +60,15 @@ async fn newer_same_parent_publication_cannot_lend_its_lease_to_an_older_payout(
     drop(readiness);
     gate.release.notify_one();
     let result = timeout(Duration::from_secs(5), submitted).await.unwrap();
-    assert_error(
+    // The append's payout-revision fence refuses it, answered as the submit
+    // check answers superseded work (#675).
+    super::stale_causes::assert_stale_wire(
         result.expect_err("A/R1's replacement lease must not credit A/R0"),
-        "ledger-confirmation-failed",
-        "share was not confirmed by the database",
+        "stale job",
+    );
+    assert_eq!(
+        super::stale_causes::stale_causes(&fixture.coordinator.metrics),
+        [0., 0., 0., 1.]
     );
     assert!(fixture.store.records.lock().unwrap().is_empty());
     // The actual selected publication still earns ordinary credit, not a

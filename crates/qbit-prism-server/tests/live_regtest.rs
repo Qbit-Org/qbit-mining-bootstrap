@@ -764,10 +764,9 @@ impl Fixture {
     /// the node. A block lands after its submit is answered, and its landing
     /// and each server's observation of it move the payout revision. A share
     /// on work from before a move passes its submit check and is then refused
-    /// at the append's revision fence as `ledger-confirmation-failed`
-    /// ("payout revision changed before share commit", #632). A case that
-    /// needs every share accepted mines only on settled work, waiting at
-    /// most `seconds` for it.
+    /// at the append's revision fence (#632), as `stale-job` since #675. A
+    /// case that needs every share accepted mines only on settled work,
+    /// waiting at most `seconds` for it.
     async fn settled(&self, index: usize, seconds: u64) -> Result<()> {
         until(
             &format!("server {index} on the node's tip and payout revision"),

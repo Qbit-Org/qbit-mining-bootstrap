@@ -768,8 +768,11 @@ async fn incident_2_body(
     // Every phase-A ACK, and every phase-B ACK that finished before the block
     // moved the tip, is an acceptance. A call still running when the node
     // adopted the block may be refused by the fences that tip move trips:
-    // admission's `stale-job`, or the append's payout-revision check, which
-    // the miner sees as `ledger-confirmation-failed`. Nothing else.
+    // admission's `stale-job`, the append's payout-revision fence, which
+    // answers `stale-job` too since #675, or a publication lease's commit
+    // gate, which the move can close without proving the work stale
+    // (`ledger-confirmation-failed`, docs/prism-rejections.md, "Commit-gate
+    // refusals"). Nothing else.
     for (frontend, acks) in phase_a.iter().enumerate() {
         for ack in acks {
             ack.outcome.clone().map_err(|error| {

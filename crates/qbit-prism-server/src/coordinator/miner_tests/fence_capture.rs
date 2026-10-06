@@ -4,6 +4,7 @@
 //! models the production fence: a plain share is refused before any write,
 //! and a block-bearing one captures its block with the share deferred. The
 //! real transaction is pinned against PostgreSQL in `commit_reconcile_tests`.
+use super::stale_causes::{assert_stale_wire, stale_causes};
 use super::*;
 use tokio::task::JoinHandle;
 use tracing::instrument::WithSubscriber;
@@ -111,32 +112,44 @@ async fn a_block_whose_revision_moves_before_its_append_is_captured_not_dropped(
     );
 }
 
+/// The fence's refusal is the submit check's own answer for superseded work:
+/// `stale-job` with cause `payout_revision`, counted once (#675). It passed
+/// the submit check at revision 0, so the cause can only be the fence's. It
+/// is not a database failure: no `ledger-confirmation-failed`, which feeds
+/// the share-append failure warning, and no persistence WARN.
+fn assert_refused_by_the_fence(fixture: &Fixture, error: StratumError, log: &SharedLog) {
+    assert_stale_wire(error, "stale job");
+    assert_eq!(stale_causes(&fixture.coordinator.metrics), [0., 0., 0., 1.]);
+    let text = log.text();
+    assert!(!text.contains("share persistence failed"), "{text}");
+}
+
 /// With capture off (`PRISM_CAPTURE_OVERPAY_CEILING_BPS=0`) the fence refuses
 /// a block-bearing share as it always did, just as the submit check refuses
-/// one whose revision had already moved: nothing is captured.
+/// one whose revision had already moved, and with the same answer: nothing
+/// is captured. The found block is lost, so a WARN names it.
 #[tokio::test]
 async fn a_block_whose_revision_moves_with_capture_off_is_refused() {
     let fixture = fixture_with(|config| config.capture_overpay_ceiling_bps = 0).await;
     let gate = Arc::new(Gate::default());
     *fixture.store.append_gate.lock().unwrap() = Some(gate.clone());
-    let (submitted, log, _) = submit(&fixture, true);
+    let (submitted, log, block_hash) = submit(&fixture, true);
     move_revision_at_the_fence(&fixture, &gate).await;
-    assert_error(
-        submitted.await.unwrap().unwrap_err(),
-        "ledger-confirmation-failed",
-        "share was not confirmed by the database",
-    );
+    assert_refused_by_the_fence(&fixture, submitted.await.unwrap().unwrap_err(), &log);
     assert!(fixture.store.records.lock().unwrap().is_empty());
     assert!(fixture.store.captures.lock().unwrap().is_empty());
     let text = log.text();
     assert!(
-        text.contains("payout revision changed before share commit: admitted at 0, now 1"),
+        text.contains("found block refused at the payout-revision fence with capture off")
+            && text.contains(&block_hash)
+            && text.contains("payout revision changed before share commit: admitted at 0, now 1"),
         "{text}"
     );
 }
 
-/// A share without a block keeps the fence's refusal, now typed, and the
-/// fence captures nothing for it.
+/// A share without a block keeps the fence's refusal, answered as the submit
+/// check answers superseded work, and the fence captures nothing for it. Like
+/// the submit check's refusal it is counted, not logged.
 #[tokio::test]
 async fn a_plain_share_whose_revision_moves_before_its_append_is_still_refused() {
     let fixture = fixture().await;
@@ -144,18 +157,12 @@ async fn a_plain_share_whose_revision_moves_before_its_append_is_still_refused()
     *fixture.store.append_gate.lock().unwrap() = Some(gate.clone());
     let (submitted, log, _) = submit(&fixture, false);
     move_revision_at_the_fence(&fixture, &gate).await;
-    assert_error(
-        submitted.await.unwrap().unwrap_err(),
-        "ledger-confirmation-failed",
-        "share was not confirmed by the database",
-    );
+    assert_refused_by_the_fence(&fixture, submitted.await.unwrap().unwrap_err(), &log);
     assert!(fixture.store.records.lock().unwrap().is_empty());
     assert!(fixture.store.captures.lock().unwrap().is_empty());
+    assert_eq!(fixture.coordinator.accepted.load(Ordering::SeqCst), 0);
     let text = log.text();
-    assert!(
-        text.contains("payout revision changed before share commit: admitted at 0, now 1"),
-        "{text}"
-    );
+    assert!(!text.contains("payout revision changed"), "{text}");
 }
 
 /// A capture whose COMMIT is still in flight at the acknowledgement deadline

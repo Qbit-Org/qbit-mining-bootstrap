@@ -37,12 +37,14 @@ impl std::fmt::Display for CommitGateClosed {
 
 impl std::error::Error for CommitGateClosed {}
 
-/// The share append's payout-revision fence refused a share without a
-/// candidate: the revision moved between the submit check that admitted it
-/// at `expected` and the append's read under `ORDER_LOCK`. It is raised
-/// before any write, and the transaction is rolled back. An append that
-/// carries a block is never refused this way; its block is captured instead
-/// (#657, [`AppendResult::captured`]).
+/// The share append's payout-revision fence refused a share: the revision
+/// moved between the submit check that admitted it at `expected` and the
+/// append's read under `ORDER_LOCK`. It is raised before any write, and the
+/// transaction is rolled back. A share without a candidate is always refused
+/// this way, and so is one that carries a block when capture is off
+/// ([`MovedRevision::Refuse`]); with capture on, its block is captured
+/// instead (#657, [`AppendResult::captured`]). The miner is answered
+/// `stale-job`, as the submit check answers superseded work (#675).
 #[derive(Debug)]
 pub struct PayoutRevisionChanged {
     pub expected: i64,

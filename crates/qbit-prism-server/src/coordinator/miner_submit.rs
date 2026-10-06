@@ -35,8 +35,9 @@ pub(super) enum SaveOutcome {
     /// A block-only proof whose block is stale by the pool's own decision,
     /// not by a ledger failure: its candidate was abandoned before its offer
     /// (a parent change, the #478 overpay ceiling, or capture turned off), or
-    /// it is block-only work, whose share is never credited. `stale-job`,
-    /// with the cause recorded once.
+    /// it is block-only work, whose share is never credited. Also a
+    /// share-pass append the payout-revision fence refused before any write
+    /// (#675). `stale-job`, with the cause recorded once.
     Superseded(StaleJobCause),
     /// Not known by the acknowledgement deadline; the share may still be
     /// credited.
@@ -760,6 +761,30 @@ impl Coordinator {
                     && gate.closure() == Some(GateClosure::StaleAuthority) =>
             {
                 SaveOutcome::Stale
+            }
+            // The append's payout-revision fence refused the share before any
+            // write: a settlement moved the revision between the submit check
+            // and the append's read under `ORDER_LOCK`. Its work was
+            // superseded, which the submit check itself answers `stale-job`
+            // with cause `payout_revision` a moment later, so the answer is
+            // the same (#675). The ledger is healthy: this is not
+            // `ledger-confirmation-failed`, which feeds the share-append
+            // failure warning. A block-bearing append is refused here only
+            // with capture off, and its found block is then never offered, as
+            // the submit check drops one; that loss is logged.
+            SaveOutcome::Failed(error)
+                if error
+                    .downcast_ref::<crate::ledger::PayoutRevisionChanged>()
+                    .is_some() =>
+            {
+                if !refusable {
+                    tracing::warn!(
+                        %error,
+                        block_hash,
+                        "found block refused at the payout-revision fence with capture off; it is not offered"
+                    );
+                }
+                SaveOutcome::Superseded(StaleJobCause::PayoutRevision)
             }
             outcome => outcome,
         };
