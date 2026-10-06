@@ -81,6 +81,7 @@ labels!(RejectReason {
     UnknownJob => "unknown-job", InvalidExtranonce => "invalid-extranonce",
     InvalidNtimeOrNonce => "invalid-ntime-or-nonce",
     BackendRpcUnavailable => "backend-rpc-unavailable",
+    BackendDatabaseUnavailable => "backend-database-unavailable",
     InternalError => "internal-error", PoolClosed => "pool-closed",
     LedgerConfirmationFailed => "ledger-confirmation-failed",
     LedgerOutcomeUnknown => "ledger-outcome-unknown", Unrecognised => "unrecognised"
@@ -105,7 +106,8 @@ labels!(WindowAcquisition {
 // What invalidated the published work and made a refresh rebuild it.
 labels!(RefreshTrigger {
     Initial => "initial", Tip => "tip", Revision => "revision", Balances => "balances",
-    Reanchor => "reanchor", Shares => "shares", Template => "template", Fee => "fee"
+    Reanchor => "reanchor", Shares => "shares", Template => "template", Fee => "fee",
+    WriterTimeline => "writer_timeline"
 });
 // Where the rebuilt work's window came from: the delta path, the full scan,
 // or the cached window the previous refresh captured.
@@ -113,7 +115,15 @@ labels!(RefreshAcquisition { Delta => "delta", Full => "full", Cached => "cached
 // The stale-job decision that refused a share. The wire reason stays `stale-job`.
 labels!(StaleJobCause {
     ResumeExpired => "resume_expired", FeeFloor => "fee_floor",
-    ParentGrace => "parent_grace", PayoutRevision => "payout_revision"
+    ParentGrace => "parent_grace", PayoutRevision => "payout_revision",
+    WindowNotHeld => "window_not_held"
+});
+// #622: the first check that refused a job preparation. Tip authority's own
+// refusals come first, so a stale poll masks retired work behind it.
+labels!(JobDeferral {
+    TipPollingStale => "tip_polling_stale", TipPollingUnavailable => "tip_polling_unavailable",
+    NewTipPending => "new_tip_pending", WorkRetired => "work_retired",
+    FeeFloor => "fee_floor", Other => "other"
 });
 // #478: what the offer did with a pending block on the current tip whose
 // payout revision was superseded.

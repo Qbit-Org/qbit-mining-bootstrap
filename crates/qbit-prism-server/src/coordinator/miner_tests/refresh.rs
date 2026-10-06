@@ -200,6 +200,7 @@ async fn resume_stale_payout_returns_unknown_while_revision_outage_remains_unava
         .unwrap()
         .is_none());
     fixture.store.fail_revision.store(true, Ordering::SeqCst);
+    // #581: the outage is the database's, and the refusal says so.
     assert_error(
         fixture
             .coordinator
@@ -207,7 +208,7 @@ async fn resume_stale_payout_returns_unknown_while_revision_outage_remains_unava
             .await
             .err()
             .unwrap(),
-        "backend-rpc-unavailable",
+        "backend-database-unavailable",
         "job resume unavailable",
     );
 }
@@ -319,7 +320,8 @@ async fn same_tip_template_change_names_a_revision_change_ahead_of_template() {
     assert_refresh_observations(&fixture.coordinator, "revision", 1.0);
 }
 
-/// The label's precedence over what changed, `template` last.
+/// The label's precedence over what changed: a new writer timeline first
+/// (#619), `template` last.
 #[test]
 fn refresh_trigger_precedence_is_tip_revision_balances_reanchor_shares_fee_template() {
     let within = RefreshChanges {
@@ -380,7 +382,20 @@ fn refresh_trigger_precedence_is_tip_revision_balances_reanchor_shares_fee_templ
             window_within_reanchor: false,
             shares: true,
             fee: true,
+            ..within
         }),
         RefreshTrigger::Tip
+    );
+    assert_eq!(
+        classify_refresh(RefreshChanges {
+            writer_timeline: true,
+            tip: true,
+            revision: true,
+            balances: true,
+            window_within_reanchor: false,
+            shares: true,
+            fee: true,
+        }),
+        RefreshTrigger::WriterTimeline
     );
 }

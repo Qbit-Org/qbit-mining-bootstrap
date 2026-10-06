@@ -76,6 +76,25 @@ carries a banner with the same statement.
   been archived, and `/audit/share-window` for an anchor inside an archived
   range returns no rows. See `docs/prism-share-ledger-partitioning.md`,
   `docs/prism-ledger-ops.md` and `docs/prism-rust-migration.md`.
+- #582: migration 002's share-hash backfill no longer runs inside the
+  migration transaction. As one statement it outlasted the statement timeout
+  on a production-sized ledger, so `migrate` could not complete. On a `2.x.x`
+  source with rows, the legacy shares' headers are now mapped after the
+  commit, in batches of consecutive `share_seq` that each take about half a
+  second, with a durable cursor (`qbit_prism_share_hash_backfill`). The
+  mapping is the single statement's, row for row, and an interrupted
+  `migrate` resumes at the cursor. 2 is recorded last, so every start, of
+  any native build, refuses the database until the backfill has finished.
+  A backfill started from #669 on also declares the capability
+  `share_hash_backfill_pending = 1`, in the transaction that creates its
+  cursor, and the transaction that records 2 removes it. Every earlier build
+  refuses that capability at connect, so recording 2 by hand does not let
+  one serve, and a declaration left without its cursor is refused (#669).
+  The fence covers only those backfills. One that a #582 build started
+  before #669 carries no declaration, and resuming it does not add one, so
+  recording 2 by hand could still let a pre-#582 build start with legacy
+  headers unmapped: let it finish. `migrate` needs no statement timeout
+  above the default 15 s. See `docs/prism-rust-migration.md`.
 
 The following 2.x.x changes were deliberately not carried, because the code
 they fixed or configured no longer exists on this line:

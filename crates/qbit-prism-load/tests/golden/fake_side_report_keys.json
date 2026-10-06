@@ -42,6 +42,7 @@
     "run_id",
     "run_tag",
     "schema",
+    "settlement",
     "soak",
     "stale_outputs_removed",
     "started_at",

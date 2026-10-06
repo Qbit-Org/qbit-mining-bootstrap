@@ -360,6 +360,7 @@ impl Coordinator {
                     original_expires_at_ms,
                     original_source.created,
                     original_source.build_proof,
+                    Some(crate::ledger::WriterTimeline::new(1)),
                 )?;
                 Ok::<_, anyhow::Error>(CompactOwner::new((captured, _permit)))
             })

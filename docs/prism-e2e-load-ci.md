@@ -56,6 +56,10 @@ runners have 2 vCPU and the builds are debug.
   with 100 sessions over 20 addresses, 3 tips and 30 s of churn.
 - `qbit-prism-load::real_node` runs `real-node-smoke` against a ramped real
   regtest node.
+- `qbit-prism-load::ctv_settlement` runs the harness with `--ctv-settlement`
+  (#548): 400 addresses overflow the direct-output cap, so the landed block
+  pays 12 directly and the rest through one CTV fanout chunk, counted in the
+  side report's `settlement` block.
 - `live_regtest::weighted_recipients_tests::real_weighted_recipients_pay_exact_pplns_outputs_through_fanout_spend`
   is #524's wallets, mined through to spent outputs.
 
@@ -298,9 +302,34 @@ debug). Weekly, at 400 shares/s: scenario 4's other four cases, scenario 5's
 **Proves:** each listed scenario's own assertions on a real regtest node and
 PostgreSQL 16, and that every listed id executed.
 
-**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #604 in
-debug and #622 in release and runs only by hand until both are fixed. Fault
-injection under load is #554.
+**Does not prove:** #521 scenario 7 at 2,000 wallets, which fails on #621 in
+debug and #622 in release and runs only by hand until both are fixed.
+
+**Faults under load (#554)** run in the load harness's `faults` phase
+(`crates/qbit-prism-load/README.md`, "Faults under load"), one fault at a
+time while the sessions keep mining, each held to its criteria in the
+manifest:
+
+- per PR, `faults-pr-smoke` (`qbit-prism-load::faults`): a SIGTERM drain with
+  an offer in flight and a `SETTLEMENT_LOCK` holder, on the fake node;
+- nightly, `faults-short-real-node`: every fault but the full WAL volume, on
+  the real node with 500 sessions: the slow database, pool exhaustion, the
+  lock holder, the frontend SIGKILL, the drain, the rolling restart, the
+  reconnect storm, the restart over a candidate backlog, the primary lost
+  with its async standby promoted, the fenced switch and a found block across
+  a failover;
+- weekly, on the Saturday selection beside the soak, `faults-long-real-node`:
+  every fault, the full WAL volume included, with 2,000 sessions on a 16 vCPU
+  runner;
+- on dispatch, `faults-failover-fake-node`: the five database and landing
+  faults on the fake node.
+
+They prove D3's loss policy under load (only acknowledged shares in the
+replication gap are lost, each listed), that the frontends serve the promoted
+primary within 30 s without a restart, that a block mid-landing lands once
+across a failover, and that a full WAL volume acknowledges nothing it cannot
+keep. They do not prove a real network partition: the relays and endpoints
+stand in for one.
 
 ## L5: soak and chaos
 
@@ -331,6 +360,16 @@ builds the images with `docker compose build` and brings up `compose.yaml` +
 - the public API lists every found block.
 
 **Does not prove:** anything about capacity. The load is a few miners.
+
+**Reading a failure:** an error outside the checks leaves the checks after it
+`not reached`. The job summary and `l6-report.json` (`failed_phase`) name the
+phase it stopped in: `node`, `stack`, `resume`, `load`, `quiesce`, `ledger` or
+`blocks`. A qbitd RPC that times out names its method. In the `node` phase,
+qbitd's `createwallet` takes about 25-30 s on the runner, which is mostly the
+create-time P2MR keys. If the call outlasts its 30 s client timeout, the lane
+waits for `listwallets` to show the wallet instead of failing (#637).
+`createwallet` plus that wait is bounded at 300 s. The report's `wallet`
+records which way the wallet arrived and how long it took.
 
 ## Dispatching a run
 

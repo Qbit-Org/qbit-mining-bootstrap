@@ -638,6 +638,7 @@ fn config(database_url: String, rpc_url: String, instance: &str) -> Result<Confi
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(10),
         block_submit_timeout: Duration::from_secs(10),
+        block_submit_enabled: true,
         candidate_orphan_confirmations: 6,
         capture_overpay_ceiling_bps: 100,
         offer_standby: None,
@@ -950,15 +951,19 @@ async fn drain_the_storm(storm: &Storm, candidates: usize) -> Result<()> {
 /// the native drain in an isolated fixture database and pinned here so a
 /// change to it is a change to this line. Four transactions, in order:
 ///
-/// - `Ledger::claim_candidate`, 5: `BEGIN`; the writer fence
+/// - `Ledger::claim_candidate`, 6: `BEGIN`; the writer fence
 ///   (`fatal_error` and the legacy writer lease, read from
-///   `qbit_prism_cluster`); the due-work probe, which conditionally allocates
+///   `qbit_prism_cluster`); the claim survey (#581,
+///   `Ledger::claim_survey_sql`), one statement that reschedules retries a
+///   clock step back left too far ahead and reads the claimed rows' versions,
+///   which no live claim here has held for its lease, so no takeover is
+///   tried; the due-work probe, which conditionally allocates
 ///   one sequence slot via `Ledger::due_work_probe_sql`; the one claiming lane
 ///   statement, `Ledger::claim_lane_sql` wrapped in the `UPDATE` that takes
 ///   the token and bumps `attempt_count`; `COMMIT`.
 /// - `Coordinator::process_candidate`'s opening `Ledger::renew_candidate_claim`,
 ///   5: `BEGIN`; the writer fence; the row lock (`FOR NO KEY UPDATE`); the
-///   renewing `UPDATE` of `claim_expires_at`; `COMMIT`. The 30-second renewal
+///   renewing `UPDATE` of the claim's version; `COMMIT`. The 30-second renewal
 ///   tick never fires under [`CLAIM_LEASE_SECONDS`], so this is the only
 ///   renewal a drained row pays for.
 /// - `Ledger::observe_chain_view`, inside the pre-offer probe, 5: `BEGIN`;
@@ -969,14 +974,14 @@ async fn drain_the_storm(storm: &Storm, candidates: usize) -> Result<()> {
 /// - `Ledger::finish_candidate_at_revision`, the abandonment, 11: `BEGIN`;
 ///   the settlement advisory lock; the order advisory lock; the writer fence;
 ///   the revision read; the row lock (`FOR KEY SHARE`); the claim fence
-///   (token, expiry and state in one read); the maturity check against
+///   (token and state in one read); the maturity check against
 ///   `qbit_pool_blocks`; the pool-block `UPDATE` that marks an immature block
 ///   inactive; the terminal `UPDATE` of the outbox row; `COMMIT`.
 ///
 /// Asserted **equal** at [`storm_scale::BASELINE_CANDIDATES`] and at the run's
 /// own cardinality before it is compared with this constant, so a drift in the
 /// sequence and a dependence on N fail with different messages.
-const STATEMENTS_PER_DRAINED_ROW: usize = 26;
+const STATEMENTS_PER_DRAINED_ROW: usize = 27;
 
 /// Rows drained before anything is counted, once [`saturate_ledger_pool`] has
 /// opened every pool slot, so whatever the drain path pays only on its first

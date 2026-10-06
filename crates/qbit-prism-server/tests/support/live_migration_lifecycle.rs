@@ -99,23 +99,13 @@ async fn weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation() 
     result.and(cleanup).and(closed)
 }
 
-/// #575: the share density of the weekly mainnet-shaped ledger. At 1/32 it
-/// holds about 2.05M of mainnet's 65.5M shares, each carrying 32 times a
+/// #575: the share density of the weekly mainnet-shaped ledger. At 1/16 it
+/// holds about 4.1M of mainnet's 65.5M shares, each carrying 16 times a
 /// share's difficulty; every block, address and payout row is mainnet's.
-/// 1/32 rather than 1/16 until #582 lands: at 4.13M rows 002's backfill
-/// alone took 321 s of the 600 s statement-timeout cap on a 22-core host, too
-/// close for a slower runner. Return to 1/16 once `migrate` runs on defaults.
-const WEEKLY_DENSITY: f64 = 1.0 / 32.0;
-/// The statement timeout the weekly cutover's `migrate` runs with, the
-/// highest the server accepts. At the default 15 s, 002's share-hash
-/// backfill, one statement inside the migration transaction, times out on
-/// this ledger (#582); drop this once #582 lets `migrate` run on defaults.
-const WEEKLY_STATEMENT_TIMEOUT_MS: &str = "600000";
-/// From this many ledger rows, 002's backfill outlasts the default 15 s
-/// statement timeout with a wide margin whatever the runner (#582: 26-38 s
-/// at 1.03M rows and 321 s at 4.13M on a 22-core host), so the weekly 1x/32
-/// ledger (about 2.05M rows) checks it and a smaller local run does not.
-const KNOWN_582_ROWS: u64 = 1_500_000;
+/// `migrate` runs at the server's default statement timeout: since #582,
+/// 002's share-hash backfill runs after the migration transaction in
+/// bounded batches, and the cutover fails if it does not.
+const WEEKLY_DENSITY: f64 = 1.0 / 16.0;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "weekly: #575's mainnet-shaped 2.x.x ledger through the measured cutover, mining and rollback; run with --ignored"]
@@ -536,39 +526,6 @@ async fn run_mainnet(
             "the isolated restore must be the pre-migration database"
         );
 
-        // #582: 002's share-hash backfill is one statement inside the
-        // migration transaction, so `migrate` at the default statement
-        // timeout refuses a ledger of this size, and changes nothing. When
-        // #582 is fixed this fails: drop it and WEEKLY_STATEMENT_TIMEOUT_MS.
-        let started_582 = Instant::now();
-        let rows = summary["rows"].as_u64().unwrap_or(0);
-        if rows < KNOWN_582_ROWS {
-            eprintln!(
-                "#582 expected-failure check skipped: {rows} rows, under the {KNOWN_582_ROWS} it needs"
-            );
-        } else {
-            let refused = fixture
-                .tool(&fixture.database_url, &["migrate"])
-                .await
-                .err()
-                .context("migrate at the default statement timeout succeeded: #582 looks fixed, so remove this check and WEEKLY_STATEMENT_TIMEOUT_MS")?;
-            let refused = format!("{refused:#}");
-            ensure!(
-                refused.contains("canceling statement due to statement timeout"),
-                "migrate at the default statement timeout failed for another reason than #582: {refused}"
-            );
-            // One transaction: its native tables, its scratch schema and its
-            // recorded versions all went with the rollback.
-            let leftovers: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'qbit_prism_scratch%')+(SELECT count(*) FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname IN ('qbit_prism_schema_migrations','qbit_prism_cluster','qbit_prism_migration_source','qbit_prism_share_hashes'))")
-                .fetch_one(&fixture.pool)
-                .await?;
-            ensure!(
-                leftovers == 0 && recovery::evidence(&source, pg_bin).await? == source_evidence,
-                "the refused migrate changed the source"
-            );
-            timings.0.push(("#582 refusal at the default timeout", started_582.elapsed()));
-        }
-
         // Steps 4-5 on the source itself, measured: check-config, migrate,
         // import-audits, then evidence, sums, balances and the window.
         let mut report = rehearsal::Report::new(summary);
@@ -593,10 +550,8 @@ async fn run_mainnet(
                     chain: "regtest".into(),
                 },
                 start_frontend: false,
-                extra_env: vec![(
-                    "PRISM_DATABASE_STATEMENT_TIMEOUT_MS".into(),
-                    WEEKLY_STATEMENT_TIMEOUT_MS.into(),
-                )],
+                // The server's own statement timeout (#582).
+                extra_env: Vec::new(),
                 // The cutover runs on the source itself; the isolated
                 // restore is checked against it above.
                 source_evidence: None,
@@ -608,6 +563,15 @@ async fn run_mainnet(
         eprintln!("{}", report.render());
         eprintln!("{}", serde_json::to_string(&report)?);
         ensure!(report.pass, "the measured cutover failed");
+        // The ledger has rows, so 002's share-hash backfill ran after the
+        // migration transaction, as its own measured step (#582).
+        ensure!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.name == "migrate: 002 share-hash backfill"),
+            "the cutover did not run 002's share-hash backfill online"
+        );
         // A sample of the historical artifacts, served from PostgreSQL
         // once the original files are gone.
         artifacts_dir.close()?;

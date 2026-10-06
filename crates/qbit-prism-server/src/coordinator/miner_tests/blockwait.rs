@@ -245,6 +245,171 @@ async fn same_hash_notification_has_no_verification_rpc_and_wait_is_cancellable(
     next_wait.release.notify_one();
 }
 
+/// #622: a rebuild holding the refresh loop no longer ages readiness while
+/// the node answers. An unchanged notification polls once readiness is old,
+/// at most once per interval and never while it is young.
+#[tokio::test]
+async fn unchanged_notification_polls_for_aged_readiness_at_most_once_per_interval() {
+    let fixture = Fixture::new(Duration::from_secs(10)).await;
+    fixture.coordinator.refresh_once().await.unwrap();
+    let aged = Instant::now() - fixture.coordinator.config.health_timeout;
+    fixture.coordinator.readiness.write().await.last_poll = Some(aged);
+    fixture.node.lock().unwrap().calls.clear();
+    let first = gate(&fixture, "waitfornewblock");
+    let running = Running::start(&fixture);
+    entered(&first).await;
+    let second = gate(&fixture, "waitfornewblock");
+    first.release.notify_one();
+    entered(&second).await;
+    assert_eq!(
+        fixture.node.lock().unwrap().calls,
+        ["waitfornewblock", "getblockchaininfo", "waitfornewblock"]
+    );
+    let renewed = fixture
+        .coordinator
+        .readiness
+        .read()
+        .await
+        .last_poll
+        .unwrap();
+    assert!(renewed > aged);
+
+    // Aged again within the interval: this loop's last poll bounds it, so a
+    // poll that could not renew (an old template, say) cannot spin.
+    fixture.coordinator.readiness.write().await.last_poll = Some(aged);
+    let third = gate(&fixture, "waitfornewblock");
+    second.release.notify_one();
+    entered(&third).await;
+    assert_eq!(
+        fixture.node.lock().unwrap().calls,
+        [
+            "waitfornewblock",
+            "getblockchaininfo",
+            "waitfornewblock",
+            "waitfornewblock"
+        ]
+    );
+    assert_eq!(
+        fixture.coordinator.readiness.read().await.last_poll,
+        Some(aged)
+    );
+    running.stop().await;
+    third.release.notify_one();
+}
+
+/// #622: the block wait's poll interval stays strictly inside every health
+/// timeout a node call could meet, however short it is configured.
+#[tokio::test]
+async fn the_poll_interval_stays_inside_the_health_timeout() {
+    for (timeout, interval) in [
+        (Duration::from_secs(60), Duration::from_secs(5)),
+        (Duration::from_secs(15), Duration::from_secs(5)),
+        (Duration::from_secs(3), Duration::from_secs(1)),
+        (Duration::from_millis(300), Duration::from_millis(100)),
+        (Duration::from_millis(150), Duration::from_millis(50)),
+        (Duration::from_millis(3), Duration::from_millis(1)),
+    ] {
+        let fixture = Fixture::build(
+            Duration::from_secs(10),
+            |c| c.health_timeout = timeout,
+            None,
+        )
+        .await;
+        let polls = fixture.coordinator.unchanged_tip_poll_interval();
+        assert_eq!(polls, interval, "{timeout:?}");
+        assert!(polls < timeout, "{timeout:?}");
+    }
+}
+
+/// #622: a health timeout shorter than the default shortens the interval,
+/// so the poll still lands before readiness expires during a slow rebuild.
+#[tokio::test]
+async fn a_short_health_timeout_polls_before_readiness_expires() {
+    let fixture = Fixture::build(
+        Duration::from_secs(10),
+        |config| config.health_timeout = Duration::from_secs(3),
+        None,
+    )
+    .await;
+    assert_eq!(
+        fixture.coordinator.unchanged_tip_poll_interval(),
+        Duration::from_secs(1)
+    );
+    fixture.coordinator.refresh_once().await.unwrap();
+    // Older than the interval, still inside the 3 s health timeout.
+    let aged = Instant::now() - Duration::from_millis(1500);
+    fixture.coordinator.readiness.write().await.last_poll = Some(aged);
+    fixture.node.lock().unwrap().calls.clear();
+    let first = gate(&fixture, "waitfornewblock");
+    let running = Running::start(&fixture);
+    entered(&first).await;
+    let second = gate(&fixture, "waitfornewblock");
+    first.release.notify_one();
+    entered(&second).await;
+    assert_eq!(
+        fixture.node.lock().unwrap().calls,
+        ["waitfornewblock", "getblockchaininfo", "waitfornewblock"]
+    );
+    assert!(fixture.coordinator.readiness.read().await.last_poll > Some(aged));
+    running.stop().await;
+    second.release.notify_one();
+}
+
+/// #622 under CTV settlement: refreshes have stopped before reading the relay
+/// floor, so the block wait's poll must read it too. A failed read renews
+/// nothing; a good one renews readiness and the floor together.
+#[tokio::test]
+async fn unchanged_notification_under_ctv_renews_only_with_a_fresh_relay_floor() {
+    let fixture = super::tip_poll::ctv_fixture().await;
+    fixture.coordinator.refresh_once().await.unwrap();
+    let floor_read = fixture
+        .coordinator
+        .readiness
+        .read()
+        .await
+        .ctv_fee_floor_read;
+    let aged = Instant::now() - fixture.coordinator.config.health_timeout;
+    fixture.coordinator.readiness.write().await.last_poll = Some(aged);
+    fixture.node.lock().unwrap().calls.clear();
+    fixture.node.lock().unwrap().fail = Some("getmempoolinfo".into());
+    let first = gate(&fixture, "waitfornewblock");
+    let running = Running::start(&fixture);
+    entered(&first).await;
+    let second = gate(&fixture, "waitfornewblock");
+    first.release.notify_one();
+    entered(&second).await;
+    assert_eq!(
+        fixture.node.lock().unwrap().calls,
+        [
+            "waitfornewblock",
+            "getblockchaininfo",
+            "getmempoolinfo",
+            "waitfornewblock"
+        ]
+    );
+    let readiness = fixture.coordinator.readiness.read().await;
+    assert_eq!(readiness.last_poll, Some(aged));
+    assert_eq!(readiness.ctv_fee_floor_read, floor_read);
+    drop(readiness);
+    running.stop().await;
+    second.release.notify_one();
+
+    fixture.node.lock().unwrap().fail = None;
+    let third = gate(&fixture, "waitfornewblock");
+    let running = Running::start(&fixture);
+    entered(&third).await;
+    let fourth = gate(&fixture, "waitfornewblock");
+    third.release.notify_one();
+    entered(&fourth).await;
+    let readiness = fixture.coordinator.readiness.read().await;
+    let renewed = readiness.last_poll.unwrap();
+    assert!(renewed > aged);
+    assert!(readiness.ctv_fee_floor_read.unwrap() >= renewed);
+    drop(readiness);
+    running.stop().await;
+    fourth.release.notify_one();
+}
+
 #[tokio::test]
 async fn fresh_verification_rpc_is_cancellable_without_publishing_work() {
     let fixture = Fixture::new(Duration::from_secs(10)).await;

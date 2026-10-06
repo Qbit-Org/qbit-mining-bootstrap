@@ -23,10 +23,20 @@
 //!    retrying, and `PrismWorkRefreshStalledCritical` must fire. Corrected,
 //!    it serves again;
 //! 3. the database two hours ahead while server 0's block is held
-//!    mid-landing, so every live claim looks expired;
+//!    mid-landing, so the database clock calls every live claim expired;
+//!    since #581 no frontend takes a claim over by the database clock, so
+//!    the holder keeps it;
 //! 4. the database back to the real clock (two hours back) while server 1's
 //!    block is held mid-landing;
 //! 5. every clock real again.
+//!
+//! A server mines in a phase only once its work is settled
+//! ([`Fixture::settled`]): on the node's tip, at the cluster's payout
+//! revision, with no block still landing. A landing moves the payout revision
+//! after the node takes the block, and a share on work from before the move
+//! would meet the append's revision fence (#632), whatever the clocks. Since
+//! #581 each held block is landed by its holder as soon as it is released, so
+//! phases 3 and 4 start mining while that landing is in flight.
 //!
 //! It asserts that each server's HTTP `Date` and the database's
 //! `clock_timestamp()` really moved; every acknowledged share is in the
@@ -34,9 +44,10 @@
 //! every accepted block was offered exactly once and landed once, as one
 //! confirmed pool block on the node's chain whose coinbase matches its audit
 //! bundle; and the carry-forward integrity report is clean. Every outbox row
-//! is `submitted`, except the one documented current behaviour (#581):
-//! phase 3's held block, recovered as an unknown offer while held, stays in
-//! reconciliation after phase 4, its retry two hours out.
+//! is `submitted` (#581): neither held block is taken over across its
+//! database step, so each records its own one offer as accepted, rather
+//! than phase 3's block being recovered as an unknown offer and stranded in
+//! reconciliation with a retry two hours out, as it was before #581.
 use super::alert_rules::{sample, scrape, snapshot_stale, Mirror, Verdict};
 use super::host_tools::program;
 use super::private_postgres::{ClusterOptions, PrivateCluster};
@@ -47,7 +58,8 @@ use std::{collections::BTreeMap, path::Path};
 
 /// Shares each serving server mines per phase.
 const PHASE_SHARES: usize = 5;
-/// How long a server has to serve work on the current tip in a phase.
+/// How long a server has to serve work on the current tip in a phase,
+/// settling included.
 const WORK_SECONDS: u64 = 30;
 /// How long a held landing stays held after its clock jump.
 const HOLD_AFTER_JUMP: Duration = Duration::from_secs(8);
@@ -245,22 +257,17 @@ enum Served {
     NoWork(String),
 }
 
-/// Refusals of ordinary shares that the phase after the database clock
-/// steps back may show (seen once in four runs; #581); every other phase
-/// must accept every share.
-const REFUSED_AFTER_STEP_BACK: [&str; 2] = ["stale-job", "ledger-confirmation-failed"];
-
-/// Mine `PHASE_SHARES` shares and one block on `server`, on the current
-/// tip, and wait for the block on the node. Every share must be accepted,
-/// or refused for one of `refusable`; the block must be accepted.
-async fn mine_on(f: &Fixture, server: usize, label: &str, refusable: &[&str]) -> Result<Served> {
+/// Mine `PHASE_SHARES` shares and one block on `server`, on work on the
+/// current tip by `deadline`, and wait for the block on the node. Every share
+/// and the block must be accepted.
+async fn mine_on(f: &Fixture, server: usize, label: &str, deadline: Instant) -> Result<Served> {
     let tip = f.rpc("getbestblockhash", json!([])).await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
     let username = format!("{}.clock-{server}", f.address);
     let current = async {
         let mut client = ShareClient::connect(f.stratum[server], &username).await?;
         client
-            .work_on(&tip, Duration::from_secs(WORK_SECONDS))
+            .work_on(&tip, deadline.saturating_duration_since(Instant::now()))
             .await?;
         Ok::<_, anyhow::Error>(client)
     };
@@ -272,11 +279,7 @@ async fn mine_on(f: &Fixture, server: usize, label: &str, refusable: &[&str]) ->
     for _ in 0..PHASE_SHARES {
         let share = client.submit(Proof::Share).await?;
         ensure!(
-            share.answer.accepted()
-                || share
-                    .answer
-                    .reason_id()
-                    .is_some_and(|reason| refusable.contains(&reason)),
+            share.answer.accepted(),
             "{label}: server {server} answered a share {}",
             share.answer
         );
@@ -314,16 +317,14 @@ struct Run {
 }
 
 impl Run {
-    /// Mine on `server` in a phase where it must serve work, and keep what
-    /// it did.
-    async fn mine(
-        &mut self,
-        f: &Fixture,
-        server: usize,
-        label: &str,
-        refusable: &[&str],
-    ) -> Result<()> {
-        match mine_on(f, server, label, refusable).await? {
+    /// Mine on `server` in a phase where it must serve work, once its work
+    /// is settled, and keep what it did.
+    async fn mine(&mut self, f: &Fixture, server: usize, label: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(WORK_SECONDS);
+        f.settled(server, WORK_SECONDS)
+            .await
+            .with_context(|| format!("{label}: server {server} before mining"))?;
+        match mine_on(f, server, label, deadline).await? {
             Served::NoWork(why) => bail!("{label}: server {server} served no current work: {why}"),
             Served::Mined { submitted, block } => {
                 self.submitted.extend(
@@ -444,13 +445,17 @@ async fn held_landing(
     offset: i64,
     label: &str,
 ) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(WORK_SECONDS);
+    f.settled(holder, WORK_SECONDS)
+        .await
+        .with_context(|| format!("{label}: server {holder} before its held block"))?;
     let held = proxy.arm();
     let tip = f.rpc("getbestblockhash", json!([])).await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
     let username = format!("{}.clock-held-{holder}", f.address);
     let mut client = ShareClient::connect(f.stratum[holder], &username).await?;
     client
-        .work_on(&tip, Duration::from_secs(WORK_SECONDS))
+        .work_on(&tip, deadline.saturating_duration_since(Instant::now()))
         .await?;
     // The block's answer waits for its landing, which the proxy holds:
     // submit it concurrently.
@@ -529,7 +534,7 @@ async fn jumps(
     }
     database_offset(f, 0).await?;
     for server in 0..2 {
-        run.mine(f, server, "baseline", &[]).await?;
+        run.mine(f, server, "baseline").await?;
     }
 
     // 2. Each server alone, minutes then hours: behind, then ahead.
@@ -539,16 +544,17 @@ async fn jumps(
         let other = 1 - server;
         let behind = format!("server {server} {}", span(-seconds));
         move_server(f, clocks, &mut highest, server, -seconds).await?;
-        run.mine(f, other, &behind, &[]).await?;
-        run.mine(f, server, &behind, &[]).await?;
+        run.mine(f, other, &behind).await?;
+        run.mine(f, server, &behind).await?;
 
         // Ahead of the node by more than PRISM_TEMPLATE_MAX_AGE_SECONDS
         // (120 s), every template the server reads looks stale: it builds no
         // work on the new tip (fail-safe), until its clock is corrected.
         let ahead = format!("server {server} {}", span(seconds));
         move_server(f, clocks, &mut highest, server, seconds).await?;
-        run.mine(f, other, &ahead, &[]).await?;
-        let Served::NoWork(why) = mine_on(f, server, &ahead, &[]).await? else {
+        run.mine(f, other, &ahead).await?;
+        let deadline = Instant::now() + Duration::from_secs(WORK_SECONDS);
+        let Served::NoWork(why) = mine_on(f, server, &ahead, deadline).await? else {
             bail!("{ahead}: server {server} served work on a template its clock calls stale");
         };
         run.notes.push(format!(
@@ -558,19 +564,18 @@ async fn jumps(
             run.notes.push(unserved_alerts(f, server).await?);
         }
         move_server(f, clocks, &mut highest, server, 0).await?;
-        run.mine(f, server, &format!("server {server} corrected"), &[])
+        run.mine(f, server, &format!("server {server} corrected"))
             .await?;
     }
 
     // 3 and 4. The database clock jumps while a block is mid-landing.
     held_landing(f, clocks, proxy, &mut run, 0, 2 * 3600, HELD_FORWARD).await?;
     for server in 0..2 {
-        run.mine(f, server, HELD_FORWARD, &[]).await?;
+        run.mine(f, server, HELD_FORWARD).await?;
     }
     held_landing(f, clocks, proxy, &mut run, 1, 0, HELD_BACK).await?;
     for server in 0..2 {
-        run.mine(f, server, HELD_BACK, &REFUSED_AFTER_STEP_BACK)
-            .await?;
+        run.mine(f, server, HELD_BACK).await?;
     }
 
     // 5. Every clock real again: every share is accepted again.
@@ -580,7 +585,7 @@ async fn jumps(
     Clocks::set(&clocks.database, 0)?;
     database_offset(f, 0).await?;
     for server in 0..2 {
-        run.mine(f, server, "real again", &[]).await?;
+        run.mine(f, server, "real again").await?;
     }
     f.quiesce().await?;
     verify(f, &mut run, proxy).await
@@ -638,8 +643,9 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
     for (label, hash) in &run.blocks {
         // A row the server released into reconciliation (a post-offer step
         // that lost a race, say) finishes on its retry, 10 s per attempt
-        // later; quiesce does not wait for that. Only #581's row, below,
-        // stays unfinished, its retry two hours out.
+        // later; quiesce does not wait for that. Since #581 a retry the
+        // database clock's step back left two hours out is due at once, so
+        // every row finishes.
         let rows = || async {
             Ok::<_, anyhow::Error>(
                 sqlx::query_as::<_, (String, i32, Option<String>)>(
@@ -655,9 +661,7 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
             120,
             || async {
                 let rows = rows().await?;
-                Ok(rows.len() == 1
-                    && (rows[0].0 == "submitted"
-                        || (label == HELD_FORWARD && rows[0].2.as_deref() == Some("unknown"))))
+                Ok(rows.len() == 1 && rows[0].0 == "submitted")
             },
         )
         .await?;
@@ -675,14 +679,15 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
             landed == ["confirmed"],
             "{label}: block {hash} pool-block rows {landed:?}"
         );
-        if !(rows.len() == 1 && rows[0].0 == "submitted") {
-            // #581: the held block whose claim the +2 h database jump
-            // expired is recovered as an unknown offer before it is on the
-            // chain, and parked in reconciliation with a retry at the
-            // database's +2 h clock. Once that clock steps back the retry is
-            // two hours away, so the row stays in reconciliation although
-            // the block landed once and its pool block is confirmed. Only
-            // that row may be left so, and only in that state.
+        ensure!(
+            rows.len() == 1 && rows[0].0 == "submitted",
+            "{label}: block {hash} outbox rows {rows:?}"
+        );
+        if label == HELD_FORWARD || label == HELD_BACK {
+            // #581: the held block's holder kept its claim across the
+            // database step and recorded its one offer itself. Before #581
+            // the +2 h step handed phase 3's live claim to a second frontend,
+            // which recovered the reservation as an unknown offer.
             let (outcome,): (Option<String>,) = sqlx::query_as(
                 "SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$1",
             )
@@ -690,17 +695,10 @@ async fn verify(f: &Fixture, run: &mut Run, proxy: &SubmitProxy) -> Result<()> {
             .fetch_one(&f.pool)
             .await?;
             ensure!(
-                label == HELD_FORWARD
-                    && rows.len() == 1
-                    && rows[0].0 == "reconciliation"
-                    && outcome.as_deref() == Some("unknown")
-                    && proxy.offers(hash) == 1,
-                "{label}: block {hash} outbox rows {rows:?}, offer outcome {outcome:?}, {} submitblock call(s)",
+                outcome.as_deref() == Some("accepted") && proxy.offers(hash) == 1,
+                "{label}: block {hash} offer outcome {outcome:?}, {} submitblock call(s): its claim was taken over across the database step",
                 proxy.offers(hash)
             );
-            run.notes.push(format!(
-                "{label}: block {hash} landed once and is confirmed, its outbox row left in reconciliation (#581)"
-            ));
         }
         let block = f.rpc("getblock", json!([hash, 2])).await?;
         ensure!(

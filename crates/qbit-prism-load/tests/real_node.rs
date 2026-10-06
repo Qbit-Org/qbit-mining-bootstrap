@@ -154,6 +154,7 @@ fn fake_frontend_environment() -> Result<Value> {
         &spec,
         args.pool_fee_bps,
         &frontend::pool_fee_address("pload10123abcd"),
+        args.ctv_settlement,
         args.node_mode()?,
     );
     Ok(serde_json::to_value(environment)?)
@@ -385,6 +386,36 @@ async fn real_node_smoke_reconciles_against_postgres_and_the_chain() -> Result<(
     );
     let chain = &node["chain_reconciliation"];
     assert_eq!(chain["reconciled"], true, "{chain}");
+    if chain["pool_blocks"] != 1 {
+        // #638: say whether the block was never found or sent, refused by
+        // the server, or taken by the node as a losing branch.
+        let phases: Vec<Value> = report["phases"]
+            .as_array()
+            .context("phases")?
+            .iter()
+            .map(|phase| {
+                json!({
+                    "phase": phase["name"],
+                    "scheduled_blocks_ordered_against_tips":
+                        phase["scheduled_blocks_ordered_against_tips"],
+                    "external_tips_unminted": phase["external_tips_unminted"],
+                    "client_failures_by_kind":
+                        phase["offer_accounting"]["client_failures_by_kind"],
+                    "client_failures_sample": phase["offer_accounting"]["client_failures_sample"],
+                })
+            })
+            .collect();
+        eprintln!(
+            "pool_blocks is {}\nrelay submissions: {:#}\nnode submissions: {:#}\nmints: {:#}\n\
+             phases: {:#}\n{}",
+            chain["pool_blocks"],
+            node["relay"]["submissions"],
+            node["submissions"],
+            node["mints"],
+            json!(phases),
+            post_ramp_node_logs(&out.path.join("logs"))
+        );
+    }
     assert_eq!(
         chain["pool_blocks"], 1,
         "the preset lands one own block: {chain}"
@@ -416,6 +447,26 @@ async fn real_node_smoke_reconciles_against_postgres_and_the_chain() -> Result<(
         vec![qbitd::RAMP_BITS],
         "every template at the ramped bits"
     );
+    // The block was ordered against the tips (#638): sent, answered by the
+    // node before the next tip was minted, and no tip left unminted.
+    let warm_up = report["phases"]
+        .as_array()
+        .context("phases")?
+        .iter()
+        .find(|phase| phase["name"] == "warm_up")
+        .context("the warm-up phase")?;
+    let ordered = &warm_up["scheduled_blocks_ordered_against_tips"];
+    assert_eq!(
+        ordered.as_array().map(Vec::len),
+        Some(1),
+        "the warm-up's one block: {ordered}"
+    );
+    assert_eq!(
+        ordered[0]["settled"], "the node answered its submitblock",
+        "{ordered}"
+    );
+    assert_eq!(ordered[0]["block_hash"], submissions[0]["block_hash"]);
+    assert_eq!(warm_up["external_tips_unminted"], 0);
     let pool_tips = node["tip_changes"]
         .as_array()
         .context("tip changes")?

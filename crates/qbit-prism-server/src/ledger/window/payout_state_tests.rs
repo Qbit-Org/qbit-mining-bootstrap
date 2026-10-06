@@ -141,10 +141,10 @@ async fn revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_con
                 // weaker isolation, with the writer committing before SELECT 2.
                 let mut tx = source.begin().await?;
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
-                let payout_revision = sqlx::query_scalar(PAYOUT_REVISION_SQL).fetch_one(&mut *tx).await?;
+                let (payout_revision, timeline) = refresh_revision(&mut tx).await?;
                 let (accepted_share_seq, prior_balances_digest) = refresh_balances(&mut tx, &ReadAdmission::default()).await?;
                 tx.commit().await?;
-                Ok(RefreshProbe { payout_state: PayoutState { payout_revision, prior_balances_digest }, accepted_share_seq })
+                Ok(RefreshProbe { payout_state: PayoutState { payout_revision, prior_balances_digest }, accepted_share_seq, timeline })
             }));
             wait_for_advisory_gate(admin, key).await?;
             sqlx::raw_sql("UPDATE probe_state_source SET payout_revision=payout_revision+1; UPDATE qbit_payout_carry_forward_current SET balance_sats=balance_sats+1")
@@ -447,4 +447,65 @@ async fn failed_guard_precedes_locked_share_history() -> Result<()> {
         lock.rollback().await?;
         Ok(())
     })).await
+}
+
+/// #619: the work's writer timeline is read in the transaction that reads the
+/// window's rows, never in the anchor's. A promotion between the two then
+/// cannot tag one writer's rows with another writer's timeline: whichever
+/// server the scan reached, the tag names it.
+#[tokio::test]
+async fn a_snapshot_reads_its_writer_timeline_in_the_transaction_that_reads_its_rows() -> Result<()>
+{
+    run(gate::site!(), |ledger, admin| {
+        Box::pin(async move {
+            let mut connection = admin.acquire().await?;
+            for seq in 1..=3 {
+                insert_share(&mut connection, seq, true).await?;
+            }
+            sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',3)")
+                .execute(&mut *connection)
+                .await?;
+            let current = WriterTimeline::read(&mut connection).await?;
+            drop(connection);
+            let (source, observer) = proxied(ledger).await?;
+            let mark = observer.mark();
+            let capture = source
+                .snapshot_with_admission(1, ReadAdmission::default(), None)
+                .await?
+                .into_inner();
+            let executions = observer.executions_since(mark)?;
+            let timeline = executions
+                .iter()
+                .position(|e| e.sql.contains("pg_walfile_name"))
+                .context("the snapshot read no writer timeline")?;
+            let last_page = executions
+                .iter()
+                .rposition(|e| e.sql.contains("ORDER BY share_seq DESC"))
+                .context("the snapshot read no window page")?;
+            ensure!(
+                timeline < last_page,
+                "the timeline was read after the window: {executions:#?}"
+            );
+            let reader = executions[timeline].connection;
+            let span = &executions[timeline..=last_page];
+            ensure!(
+                span.iter()
+                    .all(|e| e.connection == reader && !e.is_commit() && !e.begins_transaction()),
+                "the timeline and the window rows were read in different transactions: {span:#?}"
+            );
+            ensure!(
+                capture.timeline == current,
+                "the capture's tag {:?} is not this writer's {current:?}",
+                capture.timeline
+            );
+            ensure!(
+                capture.snapshot.shares.len() == 3,
+                "the window read {} rows",
+                capture.snapshot.shares.len()
+            );
+            source.pool.close().await;
+            observer.finish().await
+        })
+    })
+    .await
 }

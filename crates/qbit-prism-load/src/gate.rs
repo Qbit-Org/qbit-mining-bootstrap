@@ -248,21 +248,35 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
     let phases = report["phases"].as_array().cloned().unwrap_or_default();
     let mut missing = Some(0u64);
     let mut unexpected = Some(0u64);
+    // Missing shares a failover's verdict proves lie in its replication gap
+    // (#554, D3's loss policy): listed in the fault's row and gated there.
+    let mut in_a_gap = 0u64;
     for phase in &phases {
         let add = |total: Option<u64>, key: &str| {
             total.and_then(|t| phase["reconciliation"][key].as_u64().map(|n| t + n))
         };
         missing = add(missing, "missing");
         unexpected = add(unexpected, "unexpected");
+        in_a_gap += phase["reconciliation"][crate::run::MISSING_IN_A_FAILOVER_GAP]
+            .as_u64()
+            .unwrap_or(0);
     }
     if phases.is_empty() {
         (missing, unexpected) = (None, None);
     }
+    let unexplained = missing.map(|m| m.saturating_sub(in_a_gap));
     checks.push(Check::gate(
         "reconciliation: acknowledged shares missing from PostgreSQL",
-        missing.map_or("not reported".into(), |m| m.to_string()),
+        match unexplained {
+            None => "not reported".into(),
+            Some(m) if in_a_gap > 0 => format!(
+                "{m} (and {in_a_gap} in a failover's replication gap, each listed in its fault \
+                 row)"
+            ),
+            Some(m) => m.to_string(),
+        },
         "0".into(),
-        missing == Some(0),
+        unexplained == Some(0),
     ));
     // A committed share the client holds no acknowledgement for is not a
     // loss. The harness explains each one -- an answer that never came back

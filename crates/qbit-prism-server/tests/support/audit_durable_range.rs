@@ -106,10 +106,14 @@ async fn wrote_block_or_audit_row(pool: &PgPool, hash: &str) -> Result<bool> {
 /// - one field of the last share of the final partial page differs, so the
 ///   short page is compared too;
 /// - the window has a gap in the final page, so the durable page outruns the
-///   window slice and the bounded slice refuses it;
-/// - the window reaches past its anchor with a share the ledger accepted
-///   after it, so every page matches, the loop runs out of durable rows, and
-///   the final count refuses it.
+///   window slice and the bounded slice refuses it.
+///
+/// A window that reaches past its anchor, with a share the ledger accepted
+/// after it, no longer gets as far as the proof. The enqueue's own check
+/// refuses it first (#619): the window's last row is not held at the anchor.
+/// The proof's final count is still what refuses such a window when it was
+/// enqueued before that check existed, but share history is immutable, so
+/// that state cannot be built here.
 ///
 /// A refused landing writes nothing. The unaltered window then lands and
 /// serves identical bytes, so the same fixture proves the loop accepts a
@@ -164,11 +168,6 @@ async fn durable_range_proof_refuses_a_window_that_differs_from_ledger_history_o
             window.remove(2 * PROOF_PAGE_ROWS + 1);
             window
         }),
-        ("a share accepted after the anchor", {
-            let mut window = window.clone();
-            window.push(beyond);
-            window
-        }),
     ];
     for (nonce, (what, window)) in (2674u32..).zip(cases) {
         let candidate = signed_candidate(window, &snapshot, &plan, nonce)?;
@@ -191,6 +190,33 @@ async fn durable_range_proof_refuses_a_window_that_differs_from_ledger_history_o
         );
         ledger.finish_candidate(&claim, false, Some(what)).await?;
     }
+
+    // A share accepted after the anchor: refused before its offer (#619),
+    // typed, with nothing enqueued for a landing to claim.
+    let mut past_anchor = window.clone();
+    past_anchor.push(beyond);
+    let candidate = signed_candidate(past_anchor, &snapshot, &plan, 2677)?;
+    let refused = ledger
+        .enqueue_candidate(candidate.candidate.clone())
+        .await
+        .err()
+        .context("a window reaching past its anchor was enqueued")?;
+    let not_held = refused
+        .downcast_ref::<WindowNotHeld>()
+        .with_context(|| format!("past the anchor: untyped refusal {refused:#}"))?;
+    ensure!(
+        not_held.block_hash == candidate.candidate.block_hash
+            && not_held.last_share_seq == PROOF_WINDOW_SHARES + 1,
+        "past the anchor: {not_held:?}"
+    );
+    ensure!(
+        ledger.claim_candidate(60).await?.is_none(),
+        "past the anchor: a refused candidate is pending"
+    );
+    ensure!(
+        !wrote_block_or_audit_row(&ledger.pool, &candidate.candidate.block_hash).await?,
+        "past the anchor: a refused enqueue wrote the block or its audit row"
+    );
 
     // Control: the same three pages, unaltered, land and serve.
     let candidate = signed_candidate(window.clone(), &snapshot, &plan, 2680)?;

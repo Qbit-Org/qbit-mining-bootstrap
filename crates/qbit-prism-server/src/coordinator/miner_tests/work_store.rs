@@ -105,6 +105,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 state.map(|payout_state| RefreshProbe {
                     payout_state,
                     accepted_share_seq: snapshot.share_seq,
+                    timeline: crate::ledger::WriterTimeline::new(1),
                 })
             };
             let gate = self.compact.state_gate.lock().unwrap().take();
@@ -127,8 +128,16 @@ impl work_ledger::WorkLedger for MemoryLedger {
             Ok(work_ledger::ClockedRevision {
                 now_ms,
                 payout_revision,
+                timeline: crate::ledger::WriterTimeline::new(1),
             })
         })
+    }
+    // One writer timeline, never promoted: every window it serves is held.
+    fn window_held<'a>(
+        &'a self,
+        _window: &'a WindowRef,
+    ) -> BoxFuture<'a, Result<bool, WindowError>> {
+        Box::pin(async { Ok(true) })
     }
     fn chain_observation_state(
         &self,
@@ -468,6 +477,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 acquisition: crate::ledger::AcquisitionReport::full(
                     crate::metrics::WindowAcquisition::NoPrior,
                 ),
+                timeline: crate::ledger::WriterTimeline::new(1),
             }))
         })
     }

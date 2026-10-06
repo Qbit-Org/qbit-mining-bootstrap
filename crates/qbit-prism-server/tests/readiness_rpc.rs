@@ -400,6 +400,7 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(5),
         block_submit_timeout: Duration::from_secs(1),
+        block_submit_enabled: true,
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 2,
@@ -515,10 +516,12 @@ async fn assert_unsettled(
 
 /// Expire the row's released claim and take it again for the next attempt.
 async fn reclaim(coordinator: &Coordinator, block_hash: &str) -> Result<CandidateClaim> {
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-        .bind(block_hash)
-        .execute(&coordinator.ledger.pool)
-        .await?;
+    qbit_prism_server::ledger::revoke_candidate_claims(
+        &coordinator.ledger.pool,
+        Some(block_hash),
+        true,
+    )
+    .await?;
     coordinator
         .ledger
         .claim_candidate(120)

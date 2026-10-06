@@ -580,7 +580,12 @@ async fn recover_plan_fails_closed_on_missing_terminal_inactive_legacy_and_unlis
     // The claim refusal must still identify a terminal native row, even
     // though its candidate document has already been released.
     let refused = ledger
-        .claim_candidate_for_recovery(&terminal_orphan.hash, 120, "orphan-recovery-test")
+        .claim_candidate_for_recovery(
+            &terminal_orphan.hash,
+            120,
+            "orphan-recovery-test",
+            qbit_prism_server::ledger::RecoveryTakeover::Observed,
+        )
         .await?;
     let qbit_prism_server::ledger::RecoveryClaim::Refused(outcome) = refused else {
         bail!("recovery claimed a terminal orphan");
@@ -1247,15 +1252,20 @@ async fn recover_apply_refuses_a_live_foreign_claim_and_leaves_the_row_untouched
     let mut apply = allowlist(&[&hash]);
     apply.push("--apply");
 
+    // #581: the command must itself watch the claim go unrenewed for its
+    // lease, and a claim written without one is timed as the 600-second
+    // maximum, which the default deadline leaves no room for.
     let refused = recover(&db, &node, &apply).await?;
     assert_eq!(code(&refused), 5, "{}", stderr(&refused));
     let message = stderr(&refused);
     assert!(
-        message.contains(&format!("candidate {hash} is held by frontend-b until ")),
+        message.contains(&format!(
+            "candidate {hash} is held by frontend-b, whose claim this command must watch go unrenewed for 600 more seconds of its lease"
+        )),
         "{message}"
     );
     assert!(
-        message.contains("retry after the claim expires"),
+        message.contains("Retry with a longer --timeout-seconds"),
         "{message}"
     );
     // The plan ran and named the holder; the apply stopped at the claim.
@@ -1276,11 +1286,30 @@ async fn recover_apply_refuses_a_live_foreign_claim_and_leaves_the_row_untouched
         "nothing landed under a foreign claim"
     );
 
-    // An expired claim is not a live claim: the row is claimed and finished.
+    // Nor does the database clock end it: a claim_expires_at in the past, as
+    // a forward clock step leaves it, is refused the same way.
     sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1")
         .bind(&hash).execute(&ledger.pool).await?;
+    let before = whole_row(&ledger.pool, &hash).await?;
+    let refused = recover(&db, &node, &apply).await?;
+    assert_eq!(code(&refused), 5, "{}", stderr(&refused));
+    assert_eq!(whole_row(&ledger.pool, &hash).await?, before);
+
+    // A dead holder's one-second lease is waited out, watched by the command
+    // itself, and the row is then claimed and finished.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_lease_seconds=1 WHERE block_hash=$1")
+        .bind(&hash)
+        .execute(&ledger.pool)
+        .await?;
     let done = recover(&db, &node, &apply).await?;
     assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert!(
+        stdout(&done).contains(&format!(
+            "candidate {hash} is claimed by frontend-b; waiting 1 s for the claim to go unrenewed for its whole lease"
+        )),
+        "{}",
+        stdout(&done)
+    );
     let after = whole_row(&ledger.pool, &hash).await?;
     assert_eq!(after["state"], "submitted", "{after}");
     assert_eq!(after["offer_reserved_by"], RECOVERY_INSTANCE);
@@ -1326,9 +1355,26 @@ async fn recover_apply_refuses_a_live_foreign_claim_and_leaves_the_row_untouched
             .is_some_and(|reason| reason.contains("could not authenticate the row")),
         "{after}"
     );
-    assert_eq!(
-        after["next_attempt_at"], before["next_attempt_at"],
-        "the schedule is untouched"
+    // The schedule is kept, but never further ahead than the row's own
+    // backoff (#581: a schedule a backward clock step stretched would wait
+    // out the step), so this seed's 30-second schedule is pulled in to the
+    // one-second backoff of its one counted attempt. It is never pushed out
+    // and never parked.
+    let at = |row: &Value| {
+        chrono::DateTime::parse_from_rfc3339(row["next_attempt_at"].as_str().unwrap_or_default())
+    };
+    let (scheduled, kept) = (at(&before)?, at(&after)?);
+    assert!(
+        kept <= scheduled,
+        "the release pushed the schedule out: {kept} after {scheduled}"
+    );
+    let (ahead,): (f64,) = sqlx::query_as("SELECT extract(epoch FROM next_attempt_at-clock_timestamp())::float8 FROM qbit_block_candidate_outbox WHERE block_hash=$1")
+        .bind(&forged.hash)
+        .fetch_one(&ledger.pool)
+        .await?;
+    assert!(
+        ahead <= 1.0,
+        "the schedule is {ahead} s out, beyond the row's own backoff"
     );
     assert_eq!(
         after["candidate"], before["candidate"],

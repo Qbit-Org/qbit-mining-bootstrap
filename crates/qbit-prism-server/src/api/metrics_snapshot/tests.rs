@@ -142,6 +142,10 @@ async fn stale_snapshot_overlays_new_pool_waits_without_republishing_other_obser
     );
     metrics.record_grace_credit();
     metrics.publish_database(None);
+    // #581: the share counters the refusal rules read are live, so a stale
+    // body cannot hide the refusals and acceptances that came after it.
+    metrics.read_accepted_shares_at_scrape(|| 57);
+    metrics.record_rejection(crate::metrics::RejectReason::BackendDatabaseUnavailable);
 
     for elapsed in [31, 32] {
         let response = snapshot.clone().response_with_runtime(
@@ -161,7 +165,11 @@ async fn stale_snapshot_overlays_new_pool_waits_without_republishing_other_obser
             ("metrics_snapshot_available", 1.),
             ("metrics_snapshot_stale", 1.),
             ("metrics_snapshot_age_seconds", elapsed as f64),
-            ("accepted_shares_total", 42.),
+            ("accepted_shares_total", 57.),
+            (
+                "rejections_total{reason_id=\"backend-database-unavailable\"}",
+                1.,
+            ),
             ("connections", 7.),
             ("grace_credited_shares_total", 0.),
             ("block_candidates_pending", -1.),
@@ -472,7 +480,7 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
         }
     }
     state
-        .publish_metrics(HEALTHY.replace("total 42", "total 43"))
+        .publish_metrics(HEALTHY.replace("connections 7", "connections 8"))
         .unwrap();
     let response = app
         .oneshot(
@@ -488,7 +496,10 @@ async fn expired_publication_fails_closed_through_the_router_and_recovers() {
     let text = body(response).await;
     assert_eq!(sample(&text, "qbit_prism_health_state"), 1.);
     assert_eq!(sample(&text, "qbit_prism_metrics_snapshot_stale"), 0.);
-    assert_eq!(sample(&text, "qbit_prism_accepted_shares_total"), 43.);
+    assert_eq!(sample(&text, "qbit_prism_connections"), 8.);
+    // The accepted-share counter is live (#581): the registry's, never the
+    // body's 42.
+    assert_eq!(sample(&text, "qbit_prism_accepted_shares_total"), 0.);
 }
 
 #[tokio::test]
@@ -520,6 +531,12 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
             metrics.observe_refresh(*trigger, *acquisition, Duration::from_millis(40));
         }
     }
+    // So is the post-landing trim histogram (#600).
+    metrics.observe_landing_trim(&crate::memory::Trim {
+        elapsed: Duration::from_millis(40),
+        resident_before: Some(2 << 30),
+        resident_after: Some(1 << 30),
+    });
     for (age, expected_state) in [
         (None, "unavailable"),
         (Some(0), "fresh"),

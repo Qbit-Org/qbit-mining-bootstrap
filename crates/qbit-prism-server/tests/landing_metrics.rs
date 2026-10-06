@@ -401,7 +401,12 @@ async fn operator_recovery_binds_first_confirmation_until_real_delivery() -> Res
         ensure!(f.a.ledger.release_recovery_claim(&claim, "interrupted before confirmation").await?);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let qbit_prism_server::ledger::RecoveryClaim::Claimed(recovery) =
-            f.a.claim_candidate_for_recovery(&hash, deadline).await? else {
+            f.a.claim_candidate_for_recovery(
+                &hash,
+                deadline,
+                qbit_prism_server::ledger::RecoveryTakeover::Observed,
+            )
+            .await? else {
                 anyhow::bail!("operator recovery claim refused")
             };
         let parent: Vec<_> = recovery.candidate.block_bytes[4..36].iter().rev().copied().collect();

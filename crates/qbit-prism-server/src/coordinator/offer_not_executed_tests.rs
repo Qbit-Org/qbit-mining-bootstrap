@@ -3,7 +3,7 @@
 //! to `submitblock` itself do; every other result stays with
 //! [`classify_offer`], where a failure is an unknown outcome.
 use super::*;
-use crate::rpc::{RpcNotSentError, RpcReplyError, RPC_IN_WARMUP};
+use crate::rpc::{RpcNotSentError, RpcRelayRefused, RpcReplyError, RPC_IN_WARMUP};
 
 /// The node's error object, as qbitd writes it into a JSON-RPC 1.0 reply.
 fn reply(method: &str, error: Value) -> Result<Value> {
@@ -40,6 +40,18 @@ fn a_refused_connection_is_still_not_executed() {
     .into());
     let reason = offer_not_executed(&result).expect("a refused connection is not executed");
     assert!(reason.contains("connection refused"), "{reason}");
+}
+
+/// #291: a held frontend's client refuses `submitblock` before it is sent,
+/// so the call provably never ran.
+#[test]
+fn a_relay_refused_under_the_kill_switch_was_not_executed() {
+    let result: Result<Value> = Err(RpcRelayRefused {
+        method: "submitblock".into(),
+    }
+    .into());
+    let reason = offer_not_executed(&result).expect("a refused relay is not executed");
+    assert!(reason.contains("PRISM_BLOCK_SUBMIT_ENABLED"), "{reason}");
 }
 
 /// Another call's warmup answer says nothing about this `submitblock`: the

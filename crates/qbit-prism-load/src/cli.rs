@@ -103,7 +103,9 @@ impl StratumLimits {
 #[command(
     name = "qbit-prism-load",
     about = "Stratum-to-PostgreSQL load harness and capacity-evidence producer",
-    version
+    version,
+    after_help = "External-target mode, for frontends the harness did not launch: \
+                  `qbit-prism-load external --help` and `qbit-prism-load external-merge --help`."
 )]
 pub struct Args {
     /// `qbit-prism-server` executable. Defaults to the one beside this binary.
@@ -327,6 +329,17 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub pool_fee_bps: u16,
 
+    /// Settle payouts through CTV fanout, as mainnet does (#548): every
+    /// frontend is launched with `PRISM_CTV_SETTLEMENT_ENABLED=1` and the
+    /// fanout fee policy `tests/fixtures/mainnet-compose.env` pins, with the
+    /// broadcaster left off, so a block with more payable recipients than
+    /// the direct-output cap builds fanout chunks. Off (the default) every
+    /// frontend settles directly in the coinbase, as every earlier run did.
+    /// The side report's `settlement` block counts each landed block's
+    /// direct, fanout and carried recipients either way.
+    #[arg(long)]
+    pub ctv_settlement: bool,
+
     /// Length of the `churn` side phase, in seconds; 0 (the default) runs
     /// none. The phase follows `slow_database` (or warm-up, under `--plan
     /// tips`) with no proxy delay, and drives the rental bursts, lifetimes
@@ -406,6 +419,7 @@ impl Args {
     pub fn validate(&self) -> Result<()> {
         if let Some(plan) = self.fault_plan()? {
             plan.check_against(self.frontends, self.database_url.is_none())?;
+            plan.check_replication(&self.replication)?;
             // A soak's phases come from its looped presets, never this
             // flag's, so its fault verdict would silently be missing.
             ensure!(

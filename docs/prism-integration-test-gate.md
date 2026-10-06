@@ -128,11 +128,28 @@ count verified in a green run.
 
 The job has four shards, each with its own PostgreSQL service and qbitd.
 [scripts/run_rust_test_shard.py](../scripts/run_rust_test_shard.py) discovers
-all workspace targets from Cargo metadata, sorts by package, kind, and name,
-and assigns them round-robin. Each test binary stays intact, preserving its
-fixtures and process-wide locks. New workspace targets join automatically.
+all workspace targets from Cargo metadata and assigns them longest first,
+each to the shard with the least estimated time so far. The estimates are
+measured durations for the few heavy targets and 20 seconds for the rest; each
+shard's job summary lists its per-command durations for the next re-measure.
+Each test binary stays intact, preserving its fixtures and process-wide locks.
+New workspace targets join automatically.
 The three explicit `--ignored` targets run only on the shards owning them.
 Use `--shard-index 0 --shard-count 4 --dry-run` to inspect a shard's commands.
+
+Each shard's PostgreSQL service keeps its data directory on a tmpfs, so a
+busy disk on the shared runner host cannot stall its commits; `fsync`,
+`full_page_writes` and `synchronous_commit` stay on. The disposable clusters
+some tests start from `PRISM_TEST_PG_BIN_DIR` stay on disk. The service logs
+every statement that runs over a second and every lock wait over a second, and
+the runner prints that log when the job ends. The job sets
+`PRISM_DATABASE_STATEMENT_TIMEOUT_MS=60000` for the ledgers the tests open in
+process: production keeps its 15 s default, but these 2 vCPU runners take 1 to
+4 s for the heaviest statements and, in a slow spell, more than 15 s. The
+servers and operator tools the tests spawn drop inherited `PRISM_` settings and
+keep the production default. `authorization_rpc` re-runs its own test binary in
+a cleared environment and forwards the setting to it. Tests of timeout
+behaviour set their own values.
 
 Each shard uploads its manifest and test log as `prism-gate-shard-<index>`.
 The `prism-integration-proof` job requires every shard to succeed, downloads

@@ -109,6 +109,7 @@ pub fn expected(populated: bool) -> Census {
         "blocks_total",
         "job_delivery_successes_total",
         "job_delivery_failures_total",
+        "job_delivery_cancellations_total",
         "stale_shares_total",
         "duplicate_shares_total",
         "low_difficulty_shares_total",
@@ -118,6 +119,7 @@ pub fn expected(populated: bool) -> Census {
         "revision_work_build_timeouts_total",
         "divergent_landings_total",
         "divergent_landing_overpay_sats_total",
+        "landing_malloc_trim_released_bytes_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -131,12 +133,14 @@ pub fn expected(populated: bool) -> Census {
         "authorized_missing_current_work",
         "stratum_pending_initial_jobs",
         "stratum_oldest_pending_initial_job_seconds",
+        "stratum_rebuild_lane_waiters",
         "stratum_current_tip_coverage_gap_seconds",
         "stratum_semantic_current_work_ratio",
         "block_candidates_pending",
         "block_candidate_oldest_pending_seconds",
         "block_candidate_oldest_unacknowledged_seconds",
         "block_candidate_oldest_landing_failed_seconds",
+        "block_submission_enabled",
         "share_ledger_partition_lead_rows",
         "process_resident_memory_bytes",
         "process_open_fds",
@@ -153,10 +157,12 @@ pub fn expected(populated: bool) -> Census {
         "node_initial_block_download",
         "node_observation_age_seconds",
         "work_refresh_stalled_seconds",
+        "landing_malloc_trim_resident_bytes",
+        "tip_poll_age_seconds",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
-    result.family("rejections_total", "counter", &labels("reason_id", "stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised"), &[]);
+    result.family("rejections_total", "counter", &labels("reason_id", "stale-job,duplicate-share,low-difficulty,malformed-submit,unauthorized-worker,unknown-job,invalid-extranonce,invalid-ntime-or-nonce,backend-rpc-unavailable,backend-database-unavailable,internal-error,pool-closed,ledger-confirmation-failed,ledger-outcome-unknown,unrecognised"), &[]);
     result.family(
         "accepted_block_to_revision_work_seconds",
         "histogram",
@@ -193,11 +199,20 @@ pub fn expected(populated: bool) -> Census {
         &[],
     );
     result.family(
+        "job_preparation_deferrals_total",
+        "counter",
+        &labels(
+            "reason",
+            "tip_polling_stale,tip_polling_unavailable,new_tip_pending,work_retired,fee_floor,other",
+        ),
+        &[],
+    );
+    result.family(
         "stale_job_rejections_total",
         "counter",
         &labels(
             "cause",
-            "resume_expired,fee_floor,parent_grace,payout_revision",
+            "resume_expired,fee_floor,parent_grace,payout_revision,window_not_held",
         ),
         &[],
     );
@@ -232,6 +247,13 @@ pub fn expected(populated: bool) -> Census {
     );
     result.family(
         "ctv_fanout_broadcaster_chunk_seconds",
+        "histogram",
+        &unlabelled,
+        SECONDS,
+    );
+    // #621: a request that waited for its session's own job delivery.
+    result.family(
+        "stratum_request_delivery_wait_seconds",
         "histogram",
         &unlabelled,
         SECONDS,
@@ -277,6 +299,12 @@ pub fn expected(populated: bool) -> Census {
         SECONDS,
     );
     result.family(
+        "landing_malloc_trim_seconds",
+        "histogram",
+        if populated { &unlabelled } else { &[] },
+        SECONDS,
+    );
+    result.family(
         "database_advisory_lock_wait_seconds",
         "histogram",
         if populated { &locks } else { &[] },
@@ -293,7 +321,15 @@ pub fn expected(populated: bool) -> Census {
         HOLD_SECONDS,
     );
     let refreshes: Vec<_> = [
-        "initial", "tip", "revision", "balances", "reanchor", "shares", "template", "fee",
+        "initial",
+        "tip",
+        "revision",
+        "balances",
+        "reanchor",
+        "shares",
+        "template",
+        "fee",
+        "writer_timeline",
     ]
     .into_iter()
     .flat_map(|trigger| {

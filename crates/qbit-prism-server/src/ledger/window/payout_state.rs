@@ -19,9 +19,30 @@ pub struct PayoutState {
 pub(crate) struct RefreshProbe {
     pub payout_state: PayoutState,
     pub accepted_share_seq: u64,
+    /// The writer timeline of the same snapshot (#619).
+    pub timeline: WriterTimeline,
 }
 
 const PAYOUT_REVISION_SQL: &str = "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'";
+
+/// [`PAYOUT_REVISION_SQL`] with the writer timeline in the same statement,
+/// behind the same guards, so the refresh probe gains no round trip (#619).
+fn refresh_revision_sql() -> String {
+    format!("SELECT payout_revision, {WRITER_TIMELINE_SQL} FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'")
+}
+
+/// The refresh probe's revision and writer timeline, from one statement.
+async fn refresh_revision(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(i64, WriterTimeline), WindowError> {
+    let (payout_revision, timeline): (i64, String) = sqlx::query_as(&refresh_revision_sql())
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok((
+        payout_revision,
+        WriterTimeline::parse(&timeline).map_err(WindowError::Decode)?,
+    ))
+}
 
 fn refresh_balances_sql() -> String {
     // Keep the guard in its own first SELECT: merely referencing share history
@@ -74,9 +95,7 @@ impl Ledger {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *tx)
             .await?;
-        let payout_revision = sqlx::query_scalar(PAYOUT_REVISION_SQL)
-            .fetch_one(&mut *tx)
-            .await?;
+        let (payout_revision, timeline) = refresh_revision(&mut tx).await?;
         let (accepted_share_seq, prior_balances_digest) =
             refresh_balances(&mut tx, &completion).await?;
         tx.commit().await?;
@@ -86,6 +105,7 @@ impl Ledger {
                 prior_balances_digest,
             },
             accepted_share_seq,
+            timeline,
         })
     }
 }

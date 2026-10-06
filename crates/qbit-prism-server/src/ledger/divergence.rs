@@ -232,7 +232,12 @@ impl Ledger {
     ) -> Result<OfferReservation> {
         let candidate = &claim.candidate;
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        // #664: no reservation, and no capture decision, while the cluster
+        // holds block submission. The error releases the claim and leaves the
+        // row pending; a refusal here would abandon the block.
+        if let Some(hold) = writable_unless_held(&mut tx, true).await? {
+            return Err(SubmissionHeld(hold).into());
+        }
         let Some(bps) = ceiling_bps.filter(|_| !candidate.leased) else {
             return self.reserve_in(tx, claim, None).await;
         };
@@ -275,7 +280,9 @@ impl Ledger {
         };
         let offered = bound.bound_sats <= bound.ceiling_sats;
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        if let Some(hold) = writable_unless_held(&mut tx, true).await? {
+            return Err(SubmissionHeld(hold).into());
+        }
         record_offer_decision(
             &mut tx,
             candidate,
@@ -353,7 +360,7 @@ impl Ledger {
         let candidate = &claim.candidate;
         sqlx::query("SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR NO KEY UPDATE")
             .bind(&candidate.block_hash).fetch_optional(&mut *tx).await?;
-        let reserved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offer_reserved',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending' AND claim_expires_at>clock_timestamp()")
+        let reserved = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='offer_reserved',offer_reserved_at=clock_timestamp(),offer_reserved_by=$3,updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='pending'")
             .bind(&candidate.block_hash).bind(&claim.claim_token).bind(&self.instance_id).execute(&mut *tx).await?.rows_affected();
         ensure!(
             reserved == 1,

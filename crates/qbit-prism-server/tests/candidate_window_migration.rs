@@ -574,14 +574,16 @@ async fn outbox_window_check_accepts_exactly_the_three_states_and_indexes_the_di
         db.apply_pre_007().await?;
         let before = outbox_columns(&db.pool).await?;
         let _ledger = db.ledger("check").await?;
-        // 007 adds exactly its own columns to the table, and 011, which the
-        // same connect applies after it, exactly its own.
+        // 007 adds exactly its own columns to the table, and 011 and 021
+        // (#581's claim lease), which the same connect applies after it,
+        // exactly theirs.
         let added: Vec<String> = outbox_columns(&db.pool).await?
             .into_iter().filter(|column| !before.contains(column)).collect();
         let mut expected = WINDOW_COLUMNS.map(str::to_owned).to_vec();
         expected.extend(OFFER_COLUMNS.map(str::to_owned));
+        expected.extend(["claim_lease_seconds", "claim_renewals"].map(str::to_owned));
         expected.sort();
-        ensure!(added == expected, "007 and 011 changed the outbox column set: {added:?}");
+        ensure!(added == expected, "007, 011 and 021 changed the outbox column set: {added:?}");
         // Every partial-null combination matters: a CHECK that evaluates to
         // NULL passes, so only num_nulls/num_nonnulls rejects a partial group.
         for mask in 0..64u32 {

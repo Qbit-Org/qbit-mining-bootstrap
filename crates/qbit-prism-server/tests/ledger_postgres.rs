@@ -38,12 +38,22 @@ mod candidates_cli;
 
 #[path = "support/candidates_recover.rs"]
 mod candidates_recover;
+#[path = "support/clock_steps.rs"]
+mod clock_steps;
+#[path = "support/fanout_lane_plan.rs"]
+mod fanout_lane_plan;
 
 #[path = "support/index_trim.rs"]
 mod index_trim;
 
 #[path = "support/share_partitions.rs"]
 mod share_partitions;
+
+#[path = "support/share_hash_backfill.rs"]
+mod share_hash_backfill;
+
+#[path = "support/block_solvers.rs"]
+mod block_solvers;
 
 #[path = "support/policy_transition.rs"]
 mod policy_transition;
@@ -359,28 +369,19 @@ async fn candidate_renewal_requires_a_live_pending_token() -> Result<()> {
     let mut stranger = owner.clone();
     stranger.claim_token = Uuid::new_v4().to_string();
     assert!(b.renew_candidate_claim(&stranger, 60).await.is_err());
+    // #581: the database clock ends no claim. Past its claim_expires_at the
+    // holder's token still holds the row, no other frontend takes it, and
+    // the holder may renew it.
     sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'")
         .execute(&a.pool).await?;
     assert!(
-        a.renew_candidate_claim(&owner, 60).await.is_err(),
-        "expired claim revived"
+        b.claim_candidate(60).await?.is_none(),
+        "the database clock handed a live claim to another frontend"
     );
-    let before: serde_json::Value =
-        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
-            .fetch_one(&a.pool)
-            .await?;
-    assert!(
-        a.retry_candidate(&owner, "expired worker").await.is_err(),
-        "expired owner delayed recovery"
-    );
-    let after: serde_json::Value =
-        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
-            .fetch_one(&a.pool)
-            .await?;
-    assert_eq!(
-        before, after,
-        "expired retry cleared ownership or changed its due time"
-    );
+    a.renew_candidate_claim(&owner, 60).await?;
+    // Only a takeover ends it: here the revocation hook stands in for a lease
+    // the taker watched go unrenewed.
+    qbit_prism_server::ledger::revoke_candidate_claims(&a.pool, None, false).await?;
     // Failed transactions can release their row locks asynchronously in SQLx.
     let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -392,6 +393,26 @@ async fn candidate_renewal_requires_a_live_pending_token() -> Result<()> {
     })
     .await??;
     assert_ne!(owner.claim_token, recovered.claim_token);
+    assert!(
+        a.renew_candidate_claim(&owner, 60).await.is_err(),
+        "taken-over claim revived"
+    );
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+            .fetch_one(&a.pool)
+            .await?;
+    assert!(
+        a.retry_candidate(&owner, "expired worker").await.is_err(),
+        "former owner released its successor's claim"
+    );
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o")
+            .fetch_one(&a.pool)
+            .await?;
+    assert_eq!(
+        before, after,
+        "former owner's retry cleared ownership or changed its due time"
+    );
     assert!(
         a.renew_candidate_claim(&owner, 60).await.is_err(),
         "former owner renewed takeover token"
@@ -407,7 +428,7 @@ async fn candidate_renewal_requires_a_live_pending_token() -> Result<()> {
 }
 
 #[tokio::test]
-async fn candidate_mutations_reject_a_token_expired_while_waiting_for_its_row() -> Result<()> {
+async fn candidate_mutations_reject_a_token_taken_over_while_waiting_for_its_row() -> Result<()> {
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
@@ -421,17 +442,21 @@ async fn candidate_mutations_reject_a_token_expired_while_waiting_for_its_row() 
         a.enqueue_candidate(block.candidate.clone()).await?;
         let claim = block.claim(a.claim_candidate(60).await?.unwrap());
         assert_eq!(claim.candidate.block_hash, hash);
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()+interval '400 milliseconds' WHERE block_hash=$1")
-            .bind(&hash).execute(&a.pool).await?;
-        let before: serde_json::Value = sqlx::query_scalar(
-            "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
-        )
-        .bind(&hash)
-        .fetch_one(&a.pool)
-        .await?;
+        // #581: the token is the fence. A takeover commits while the
+        // mutation waits for the row: the stand-in below replaces the token
+        // as the compare and set of a frontend that watched the lease go
+        // unrenewed does.
         let mut blocker = a.pool.begin().await?;
         sqlx::query(
             "SELECT block_hash FROM qbit_block_candidate_outbox WHERE block_hash=$1 FOR UPDATE",
+        )
+        .bind(&hash)
+        .fetch_one(&mut *blocker)
+        .await?;
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_token='taken-over',claim_instance_id='c',claim_renewals=0,claim_lease_seconds=60,attempt_count=attempt_count+1 WHERE block_hash=$1")
+            .bind(&hash).execute(&mut *blocker).await?;
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
         )
         .bind(&hash)
         .fetch_one(&mut *blocker)
@@ -455,7 +480,7 @@ async fn candidate_mutations_reject_a_token_expired_while_waiting_for_its_row() 
         blocker.commit().await?;
         assert!(
             attempt.await?.is_err(),
-            "{operation} accepted a token expired during the lock wait"
+            "{operation} accepted a token taken over during the lock wait"
         );
         let after: serde_json::Value = sqlx::query_scalar(
             "SELECT to_jsonb(o) FROM qbit_block_candidate_outbox o WHERE block_hash=$1",
@@ -465,7 +490,7 @@ async fn candidate_mutations_reject_a_token_expired_while_waiting_for_its_row() 
         .await?;
         assert_eq!(
             before, after,
-            "{operation} changed expired ownership or disposition"
+            "{operation} changed the new owner's claim or disposition"
         );
     }
     db.close(vec![a, b]).await
@@ -493,8 +518,7 @@ async fn candidate_processing_lock_allows_renewal_and_blocks_expired_takeover() 
     )
     .await
     .context("processing lock blocked its own renewal")??;
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'")
-        .execute(&a.pool).await?;
+    qbit_prism_server::ledger::revoke_candidate_claims(&a.pool, None, false).await?;
     assert!(
         b.claim_candidate(60).await?.is_none(),
         "takeover bypassed the processing transaction"
@@ -775,7 +799,7 @@ async fn candidate_outbox_is_atomic_and_claims_recover_after_owner_loss() -> Res
         .await?
         .context("candidate not claimed")?;
     assert!(b.claim_candidate(60).await?.is_none());
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'").execute(&a.pool).await?;
+    qbit_prism_server::ledger::revoke_candidate_claims(&a.pool, None, false).await?;
     let recovered = b
         .claim_candidate(60)
         .await?
@@ -1103,7 +1127,7 @@ async fn late_acceptance_after_abandoned_claim_recovers_deferred_credit() -> Res
     let expired = block.claim(a.claim_candidate(60).await?.unwrap());
     a.land_candidate(&expired, &keys().1.public_key_hex())
         .await?;
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second'").execute(&a.pool).await?;
+    qbit_prism_server::ledger::revoke_candidate_claims(&a.pool, None, false).await?;
     let recovered = b.claim_candidate(60).await?.unwrap();
     b.finish_candidate_at_revision(
         &recovered,
@@ -1280,24 +1304,19 @@ async fn ctv_artifacts_wait_for_maturity_and_claims_are_fenced() -> Result<()> {
     );
     a.save_cpfp_package(&first, "aabb", &"66".repeat(32))
         .await?;
-    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&first.fanout_txid).execute(&a.pool).await?;
+    // #654: only a takeover ends a claim. The revocation hook stands in for
+    // a lease b watched go unrenewed; until b takes the fanout, its owner is
+    // still the holder.
+    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&first.fanout_txid)).await?;
+    let recovered = b
+        .claim_fanout(60)
+        .await?
+        .context("a revoked fanout claim was not taken over")?;
+    assert_eq!(first.fanout_txid, recovered.fanout_txid);
     assert!(
         a.renew_fanout_claim(&first, 60).await.is_err(),
-        "expired owner revived its lease"
+        "a taken-over owner revived its lease"
     );
-    // SQLx queues rollback when the rejected renewal drops its transaction.
-    // SKIP LOCKED may briefly skip that row until the rollback releases it.
-    let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(claim) = b.claim_fanout(60).await? {
-                return Ok::<_, anyhow::Error>(claim);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("expired fanout was not reclaimed after renewal rollback")??;
-    assert_eq!(first.fanout_txid, recovered.fanout_txid);
     assert_eq!(recovered.progress["scan_next_height"], json!(1103));
     assert_eq!(
         recovered.progress["scan_anchor_hash"],
@@ -1515,23 +1534,20 @@ async fn cpfp_retirement_requires_current_claim_and_preserves_signed_packages() 
         b.cpfp_package(&old.fanout_txid).await?.unwrap(),
         unsigned_before
     );
-    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE fanout_txid=$1").bind(&old.fanout_txid).execute(&a.pool).await?;
+    // #654: only a takeover ends b's claim; the revocation hook stands in for
+    // a lease a watched go unrenewed.
+    qbit_prism_server::ledger::revoke_fanout_claims(&a.pool, Some(&old.fanout_txid)).await?;
+    let current = a
+        .claim_fanout(60)
+        .await?
+        .context("a revoked fanout claim was not taken over")?;
+    assert_eq!(current.fanout_txid, old.fanout_txid);
     assert!(
         b.retire_unsigned_cpfp_funding(&old, &unsigned_funding, 2, "spent")
             .await
             .is_err(),
-        "expired claim retired funding"
+        "a taken-over claim retired funding"
     );
-    let current = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Some(claim) = a.claim_fanout(60).await? {
-                break Ok::<_, anyhow::Error>(claim);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    assert_eq!(current.fanout_txid, old.fanout_txid);
     a.retire_unsigned_cpfp_funding(
         &current,
         &unsigned_funding,

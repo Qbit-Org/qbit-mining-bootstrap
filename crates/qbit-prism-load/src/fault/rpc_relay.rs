@@ -16,7 +16,16 @@
 //!   block, and never returns the node's answer: the offering frontend waits
 //!   on a reply that is not coming, the shape #474 C names.
 //!
+//! - [`Arm::Hold`] holds the call until [`RpcFaultRelay::release_held`], so
+//!   a fault can fail the database over while a found block is mid-landing
+//!   and then let the call reach the node.
+//!
 //! Either way the arm reports the call when it arrives.
+//!
+//! The relay can also refuse every `submitblock` with qbitd's warmup error
+//! ([`RpcFaultRelay::set_refusing`]), which the server knows was never run
+//! (#526): the candidate goes back to `pending` and is retried, so a fault
+//! can build a backlog of found blocks.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -40,7 +49,12 @@ use tokio::{sync::oneshot, task::JoinHandle};
 pub enum Arm {
     DelayForward(Duration),
     WithholdReply,
+    /// Hold the call until released, then forward it.
+    Hold,
 }
+
+/// qbitd's JSON-RPC error while it is still starting (`RPC_IN_WARMUP`).
+pub const WARMUP_CODE: i64 = -28;
 
 /// An armed call, as it arrived.
 #[derive(Clone, Debug)]
@@ -81,6 +95,10 @@ struct Shared {
     submits: Mutex<Vec<RelaySubmit>>,
     /// Set when the relay is dropped, so no withheld reply outlives it.
     closed: tokio::sync::watch::Sender<bool>,
+    /// Bumped by `release_held`, which lets every held call go on.
+    released: tokio::sync::watch::Sender<u64>,
+    /// Every `submitblock` is answered with the warmup error, unforwarded.
+    refusing: std::sync::atomic::AtomicBool,
 }
 
 pub struct RpcFaultRelay {
@@ -107,12 +125,15 @@ impl RpcFaultRelay {
             .build()
             .context("building the fault relay's HTTP client")?;
         let (closed, _) = tokio::sync::watch::channel(false);
+        let (released, _) = tokio::sync::watch::channel(0);
         let shared = Arc::new(Shared {
             upstream_origin: origin_of(upstream)?,
             client,
             arms: (0..frontends).map(|_| Mutex::new(None)).collect(),
             submits: Mutex::new(Vec::new()),
             closed,
+            released,
+            refusing: std::sync::atomic::AtomicBool::new(false),
         });
         let mut urls = Vec::with_capacity(frontends);
         let mut tasks = Vec::with_capacity(frontends);
@@ -156,6 +177,20 @@ impl RpcFaultRelay {
         for arm in &self.shared.arms {
             *arm.lock().expect("relay arm lock") = None;
         }
+    }
+
+    /// Let every call an [`Arm::Hold`] is holding go on to the node.
+    pub fn release_held(&self) {
+        self.shared
+            .released
+            .send_modify(|generation| *generation += 1);
+    }
+
+    /// Answer every `submitblock` with qbitd's warmup error, or stop.
+    pub fn set_refusing(&self, refusing: bool) {
+        self.shared
+            .refusing
+            .store(refusing, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn submits(&self) -> Vec<RelaySubmit> {
@@ -234,6 +269,9 @@ async fn carry(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Subscribed before the arm can report the call, so a release that
+    // follows the report at once is never missed.
+    let mut released = shared.released.subscribe();
     let request: Option<Value> = serde_json::from_slice(&body).ok();
     let submitted = request
         .as_ref()
@@ -258,6 +296,7 @@ async fn carry(
             armed: armed.as_ref().map(|armed| match armed.arm {
                 Arm::DelayForward(_) => "delay-forward",
                 Arm::WithholdReply => "withhold-reply",
+                Arm::Hold => "hold",
             }),
         });
         drop(submits);
@@ -272,7 +311,40 @@ async fn carry(
         }
     }
     let arm = armed.map(|armed| armed.arm);
+    if let Some(record) = record_index {
+        if arm.is_none() && shared.refusing.load(std::sync::atomic::Ordering::SeqCst) {
+            // Never forwarded: the node is warming up, as far as the
+            // offering frontend can tell.
+            let id = request
+                .as_ref()
+                .map(|request| request["id"].clone())
+                .unwrap_or(Value::Null);
+            let mut submits = shared.submits.lock().expect("relay submits lock");
+            submits[record].armed = Some("refused-warmup");
+            submits[record].rpc_error = Some(json!({"code": WARMUP_CODE}));
+            drop(submits);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json!({
+                    "result": null,
+                    "error": {"code": WARMUP_CODE, "message": "Loading block index…"},
+                    "id": id,
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    }
     let mut closed = shared.closed.subscribe();
+    if let Some(Arm::Hold) = arm {
+        tokio::select! {
+            _ = released.changed() => {}
+            _ = closed.wait_for(|closed| *closed) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+    }
     if let Some(Arm::DelayForward(delay)) = arm {
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}

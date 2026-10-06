@@ -131,9 +131,19 @@ impl CompactPublicationGuard<'_> {
             &self.captured.original.template,
             self.template_max_age,
         )?;
+        // A block-wait floor read may have raised the live relay floor while
+        // this work was built (#622): never publish a fee admission would
+        // refuse at once.
+        if let (Some(fee), Some(floor)) = (
+            self.captured.original.fee,
+            self.view.readiness.ctv_fee_floor,
+        ) {
+            crate::coordinator::validate_fee_floor(fee, floor)?;
+        }
         self.view.tip.publish(&self.captured.record.parent_hash)?;
         *self.view.prepared = Some(self.captured.original.clone());
         self.view.readiness.last_poll = Some(Instant::now());
+        self.view.readiness.poll_renews = true;
         self.refresh.send_replace(self.captured.original.generation);
         Ok(())
     }
@@ -233,6 +243,7 @@ pub(in crate::coordinator) fn assemble_captured(
     original_expires_at_ms: i64,
     created: Instant,
     build_proof: Option<CompactBuildProof>,
+    timeline: Option<crate::ledger::WriterTimeline>,
 ) -> Result<CapturedCompactPrepared> {
     ensure!(
         record.template_sha256 == template.sha256(),
@@ -265,6 +276,7 @@ pub(in crate::coordinator) fn assemble_captured(
         generation: record.generation,
         created,
         parent_of_tip: record.parent_of_tip.clone(),
+        timeline,
     });
     Ok(CapturedCompactPrepared {
         original,
@@ -467,6 +479,7 @@ impl Coordinator {
                     source.original_expires_at_ms,
                     Instant::now(),
                     Some(source.proof),
+                    Some(source.window.timeline),
                 )?;
                 // The refresh loop alone retains the original accepted rows
                 // until invalidation; the counted shares leave with admission.
@@ -545,23 +558,24 @@ impl Coordinator {
             info["blocks"].as_u64() == Some(height),
             "compact template height changed"
         );
-        let revision = self
-            .work_ledger
-            .observe_chain_view(
+        // #655: the ledger steps here are marked for a refresh's deadline.
+        let revision = on_database(
+            self.work_ledger.observe_chain_view(
                 parent,
                 height,
                 info["chainwork"]
                     .as_str()
                     .context("node chainwork missing")?,
-            )
-            .await?;
+            ),
+        )
+        .await?;
         ensure!(
             revision == captured.record.payout_revision,
             "payout snapshot stale"
         );
         let requested_at = tokio::time::Instant::now();
         let clock = AbsoluteDeadline::from_database(
-            self.work_ledger.now_ms().await?,
+            on_database(self.work_ledger.now_ms()).await?,
             requested_at,
             captured.original_expires_at_ms,
         )?;
@@ -574,7 +588,7 @@ impl Coordinator {
         );
         // Match refresh's final economic fence after node I/O: balances or
         // revision may have changed while that second node proof waited.
-        let state = self.work_ledger.payout_state().await?;
+        let state = on_database(self.work_ledger.payout_state()).await?;
         ensure!(
             state.payout_revision == captured.record.payout_revision
                 && state.prior_balances_digest == captured.record.window.prior_balances_digest,
@@ -604,17 +618,15 @@ impl Coordinator {
         captured: &'a CapturedCompactPrepared,
     ) -> Result<ReservedCompact<'a>> {
         let deadline = self.prove_fresh_compact(captured).await?;
-        let _inserted = self
-            .work_ledger
-            .save_compact_prepared(
-                &captured.original.storage_key,
-                &captured.record,
-                &captured.template,
-                &captured.original.reservation.balances,
-                captured.record.payout_revision,
-                captured.original_expires_at_ms,
-            )
-            .await?;
+        let _inserted = on_database(self.work_ledger.save_compact_prepared(
+            &captured.original.storage_key,
+            &captured.record,
+            &captured.template,
+            &captured.original.reservation.balances,
+            captured.record.payout_revision,
+            captured.original_expires_at_ms,
+        ))
+        .await?;
         self.prove_fresh_compact(captured).await?;
         ensure!(deadline.live(), "prepared reservation deadline elapsed");
         Ok(ReservedCompact {

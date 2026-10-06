@@ -9,9 +9,12 @@ standby**, separate from the public-read replica. Writer sessions use
 `synchronous_commit=on` and the primary uses `synchronous_standby_names=''`:
 positive share ACKs require local WAL durability and do not wait for the standby.
 Primary loss can lose acknowledged shares in the replication gap, and the
-rows of blocks found in it; this is **not lossless failover and has no
-guaranteed lag bound**. An optional bounded wait keeps a found block's rows on
-the standby before its offer; see [Found blocks](#found-blocks-a-bounded-standby-flush-before-the-offer-529).
+rows of blocks found in it; blocks found after a promotion on work whose
+window lay in the replication gap are refused `stale-job`, given
+NTP-synchronized database clocks. This is **not
+lossless failover and has no guaranteed lag bound**. An optional bounded wait
+keeps a found block's rows on the standby before its offer; see
+[Found blocks](#found-blocks-a-bounded-standby-flush-before-the-offer-529).
 
 This separate document owns the complete frontend-to-database architecture.
 [prism-postgres-replica.md](prism-postgres-replica.md) remains the detailed guide
@@ -288,6 +291,22 @@ reservation on the standby, which lets a held attempt record its outcome on
 the promoted primary. The wait does not make D3 synchronous and is not a strict
 durability claim.
 
+Since #619 the accepted asynchronous loss also names blocks found after a
+promotion on work whose window lay in the replication gap. Such a block is
+refused `stale-job` before its enqueue, counted under
+`qbit_prism_stale_job_rejections_total{cause="window_not_held"}`, and never
+offered: only its reward is lost. See
+[work from a lost replication gap](prism-ledger-ops.md#work-from-a-lost-replication-gap-619).
+
+**Precondition: synchronized database clocks.** The refusal compares time,
+not row identity: a share the promoted primary reissues under a lost number
+fails the check only because the promoted host stamps it later than the gap
+work's anchor. Keep the primary and the standby NTP-synchronized. A promoted
+host whose clock lags the old primary's by more than the time from the last
+gap work to the first reissued share (seconds) can let such a block pass, be
+offered, and end in `reconciliation` with a window digest mismatch, as before
+#619; step 6 reconciles it.
+
 ### Current timeout/cancellation behavior and remaining limits
 
 The ledger sets `statement_timeout=15000` ms by default
@@ -495,7 +514,17 @@ primary/failover pair; the pair alone does not supply a partition-safe election.
    `recover` cannot land it; it refuses a hash with no candidate row. The same
    check covers blocks found while `PRISM_OFFER_STANDBY_APPLICATION_NAME` was
    unset, whose offers log nothing: compare the node's recent blocks carrying
-   the pool's coinbase tag with `qbit_block_candidate_outbox` instead.
+   the pool's coinbase tag with `qbit_block_candidate_outbox` instead. Also
+   collect each `block refused stale-job before its offer` WARN (#619): a block
+   found after the promotion on work whose window lay in the gap, never
+   offered, so only its reward was lost. A candidate in `reconciliation`
+   whose `last_error` starts `window not held by this primary` (or, from an
+   older release, `window range incomplete: … read 0`) was offered before the
+   refusal existed and is on chain: reconcile it as an accounting loss, and
+   with CTV settlement on export its window's rows from the fenced old primary
+   before step 7 reuses that storage, as
+   [the ledger runbook](prism-ledger-ops.md#work-from-a-lost-replication-gap-619)
+   describes.
 7. Rejoin the fenced former primary only after a verified rewind or fresh base
    backup of the new primary. Create/reconcile the physical slot on the new
    primary; PostgreSQL 16 physical slots are not automatically transferred by
@@ -540,7 +569,13 @@ needed for these probes:
 `ready` is an instantaneous ability to provide current work: prepared work must
 match the observed node tip and database payout revision, the tip poll must be
 younger than `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` (default 15), and an enabled
-CTV policy must satisfy the current fee floor. The server can also clear readiness
+CTV policy must satisfy the current fee floor. The tip poll is the last refresh
+that published or revalidated work, or the last refresh-grade node poll that found
+the published tip with its template still within `PRISM_TEMPLATE_MAX_AGE_SECONDS`
+and, under CTV settlement, a relay floor read no older than the poll that the
+published fee still meets (#622), so a slow rebuild on a responsive node does not
+clear readiness;
+`qbit_prism_tip_poll_age_seconds` exports its age. The server can also clear readiness
 for stalled job delivery. A new tip **or payout-revision change** invalidates
 prepared work until rebuilding and publishing its replacement; this normal
 transition clears readiness even when the process and TCP listener are alive.

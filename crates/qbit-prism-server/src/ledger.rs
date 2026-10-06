@@ -27,17 +27,22 @@ pub use audit::{
     decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReader,
 };
 mod candidates;
-use candidates::prepare_candidate_observed;
+#[cfg(test)]
+pub(crate) use candidates::faults as candidate_faults;
+mod claim_observer;
+pub use candidates::revoke_candidate_claims;
 pub use candidates::{
     adoption_evidence, authenticate_landed_audit, build_claim_parts,
     coinbase_witness_reserved_value, header_bits_hex, Candidate, CandidateClaim, CandidateCtv,
     CandidateState, ClaimLifecycle, ClaimParts, LandedAudit, OfferOutcome, OfferRecord,
-    RecoveryClaim, RecoveryReader, RecoveryRow, SignerKeys, ADOPTED_OFFER_REPLY_PREFIX,
-    LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX, ORPHANED_STATE, SIDE_CHAIN_REPLIES,
+    RecoveryClaim, RecoveryReader, RecoveryRow, RecoveryTakeover, SignerKeys,
+    ADOPTED_OFFER_REPLY_PREFIX, LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX,
+    ORPHANED_STATE, SIDE_CHAIN_REPLIES,
 };
+use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
 mod connect;
 pub(crate) use connect::shielded_begin;
-use connect::{require_revision, writable};
+use connect::{require_revision, writable, writable_unless_held};
 pub use connect::{SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod divergence;
@@ -46,16 +51,20 @@ pub use divergence::{
     rows_divergence, AccountOverpay, CarryRow, LandingDivergence, OfferReservation, OverpayBound,
 };
 mod fanout;
+pub use fanout::revoke_fanout_claims;
 mod fatal_state;
+pub use fatal_state::require_operator_reason;
 mod instances;
 mod policy_transition;
 mod signing_transition;
 mod standby_durability;
+mod submission_hold;
 pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
 pub use instances::{HeartbeatHealth, HeartbeatStatus};
 pub use standby_durability::{
     OfferStandbyReport, OfferStandbyWait, StandbyDurability, StandbyWait,
 };
+pub use submission_hold::{SubmissionHeld, SubmissionHold, SubmissionHoldCleared};
 mod jobs;
 pub use jobs::{
     BlobPruneCursor, BlobPruneResult, CompactBatchAttempt, CompactDependency, CompactIssuedJob,
@@ -70,17 +79,17 @@ pub use migration::{
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
-pub use window::CommitGateClosed;
 pub use window::{
-    probe_share_rows, put_balance_snapshot, read_range_paged, AppendResult, BalanceSource,
-    ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot, Window, WindowError,
-    WindowRef,
+    probe_share_rows, probe_window_holding, put_balance_snapshot, read_range_paged, AppendResult,
+    BalanceSource, ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot,
+    Window, WindowError, WindowHolding, WindowNotHeld, WindowRef, WriterTimeline,
 };
 use window::{read_prior_balances, share_from_row};
 pub(crate) use window::{
     AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
-    RetainedShares, SnapshotCapture,
+    RetainedShares, SnapshotCapture, WRITER_TIMELINE_SQL,
 };
+pub use window::{CommitGateClosed, MovedRevision, PayoutRevisionChanged};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -110,6 +119,13 @@ pub struct Ledger {
     /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
     /// SHARE` in its own transaction and compares it against this.
     config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The candidate claims this frontend has watched, each timed on its own
+    /// monotonic clock (#581). Shared across clones: one process, one clock
+    /// per claim.
+    claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
+    /// The CTV fanout claims this frontend has watched, timed the same way
+    /// (#654).
+    fanout_claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
     #[cfg(test)]
     pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
     #[cfg(test)]

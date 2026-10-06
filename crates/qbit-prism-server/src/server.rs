@@ -19,6 +19,7 @@ pub async fn run(config: Config) -> Result<()> {
     config.ensure_pool_fee_settles_dust()?;
     let rollup_settings = crate::rollups::settings_from_env()?;
     let partition_settings = crate::partitions::settings_from_env()?;
+    let landing_trim = crate::memory::landing_trim_from_env()?;
     let stratum_config = StratumConfig::from_env()?;
     let stats = stratum_config.stats.clone();
     // Validate and bind both Stratum listeners before coordinator startup can
@@ -49,7 +50,23 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let registry = Arc::new(metrics::Metrics::default());
+    // #291: 0 from the start with the switch off. With it on, unknown until
+    // the first health publication has read the cluster's hold (#664).
+    registry.publish_block_submission(config.block_submit_enabled, None);
+    // #581: the accepted-share counter is rendered at scrape time, beside the
+    // event-driven rejection counter, so the share-refusal rules see an
+    // outage that stalls the health publisher.
+    registry.read_accepted_shares_at_scrape({
+        let stats = stats.clone();
+        move || stats.accepted_submissions()
+    });
     let coordinator = Coordinator::new(config, registry.clone()).await?;
+    coordinator.landing_trim.set_enabled(landing_trim);
+    tracing::info!(
+        enabled = landing_trim,
+        supported = crate::memory::SUPPORTED,
+        "post-landing malloc_trim (#600)"
+    );
     // The share ledger has no DEFAULT partition, so an append whose sequence
     // value has run past the last attached bound is refused (#144). Attaching
     // the lead is a precondition of serving, not a background convenience: an
@@ -125,6 +142,8 @@ pub async fn run(config: Config) -> Result<()> {
             Ok(())
         }
     }));
+    // With PRISM_BLOCK_SUBMIT_ENABLED off (#291) this loop claims nothing and
+    // waits for the shutdown: found blocks stay pending, never offered.
     tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
@@ -143,11 +162,15 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }));
     }
-    if config.ctv_broadcast {
-        tasks.spawn(runtime.track(
-            TaskKind::Broadcast,
-            crate::broadcaster::run(coordinator.clone(), shutdown_rx.clone()),
-        ));
+    match config.block_submission().ctv_broadcaster {
+        config::CtvBroadcaster::On => {
+            tasks.spawn(runtime.track(
+                TaskKind::Broadcast,
+                crate::broadcaster::run(coordinator.clone(), shutdown_rx.clone()),
+            ));
+        }
+        config::CtvBroadcaster::Held => tracing::warn!("{}", config::CTV_BROADCASTER_HELD),
+        config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
         tasks.spawn(runtime.track(
@@ -365,7 +388,13 @@ async fn publish_health(
                 coordinator.blocks.load(Ordering::Relaxed),
             );
             registry.publish_delivery(stats.delivery_metrics());
+            // #664: the switch, and the cluster hold as this publication read it.
+            registry.publish_block_submission(
+                coordinator.config.block_submit_enabled,
+                health["block_submission_hold"]["held"].as_bool(),
+            );
             registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
+            registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
             state.publish_metrics(registry.render())?;
             Ok(health)
         })

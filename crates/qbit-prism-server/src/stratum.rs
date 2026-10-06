@@ -3,14 +3,17 @@ use crate::{
     codec::{self, Job, Submission},
     ledger::SessionId,
     vardiff::{password_difficulties, Vardiff, VardiffConfig},
+    waiting::Dependency,
 };
 use anyhow::{ensure, Context, Result};
+use futures_util::future::{Fuse, FusedFuture, FutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     net::IpAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -75,6 +78,21 @@ impl StratumError {
     pub fn backend(message: impl Into<String>) -> Self {
         Self::new(20, message, "backend-rpc-unavailable")
     }
+    /// A refusal whose cause lies with the ledger database, not the node
+    /// (#581).
+    pub fn database(message: impl Into<String>) -> Self {
+        Self::new(20, message, "backend-database-unavailable")
+    }
+    /// One of the session's own deadlines passed while a backend call was
+    /// still waiting (#655): the database's when the call was waiting on the
+    /// ledger database then, otherwise the node's, as every such timeout was
+    /// before.
+    pub fn timed_out(message: impl Into<String>, waiting_on: Dependency) -> Self {
+        match waiting_on {
+            Dependency::Database => Self::database(message),
+            Dependency::Unattributed => Self::backend(message),
+        }
+    }
     pub fn malformed(message: impl Into<String>) -> Self {
         Self::new(20, message, "malformed-submit")
     }
@@ -94,6 +112,13 @@ pub trait MiningBackend: Send + Sync + 'static {
     type Context: Send + Sync + 'static;
     /// In-memory retention hint only. Authoritative submit checks stay in the backend.
     fn observed_tip_hint(&self) -> impl Future<Output = Option<RetentionTip>> + Send {
+        async { None }
+    }
+    /// The published work's parent and payout revision, an admission hint
+    /// only (#604): a session whose newest job matches it holds current work
+    /// and rebuilds through the rebuild lane. `None` when unknown, which
+    /// sends every delivery to the shared admission, as before #604.
+    fn published_work_hint(&self) -> impl Future<Output = Option<(String, i64)>> + Send {
         async { None }
     }
     fn health_ready(&self) -> impl Future<Output = bool> + Send {
@@ -182,6 +207,14 @@ pub struct StratumConfig {
     pub write_timeout_seconds: f64,
     pub connection_limit: ConnectionLimit,
     pub initial_job_limit: Arc<Semaphore>,
+    /// The rebuild lane (#604): a session that already holds current work
+    /// (its newest job, for its current worker, is on the published parent
+    /// and payout revision) takes one of these before `initial_job_limit`
+    /// and keeps it through persistence, so rebuilds hold at most a quarter of the
+    /// initial-job permits (one, below four) and a first job never queues
+    /// behind a whole fan-out. Sized from
+    /// `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` by [`rebuild_lane_permits`].
+    pub rebuild_job_limit: Arc<Semaphore>,
     pub max_connections_per_username: usize,
     pub username_connections: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
     pub max_connections_per_ip: usize,
@@ -215,6 +248,7 @@ impl Default for StratumConfig {
             write_timeout_seconds: 20.0,
             connection_limit: ConnectionLimit::new(384),
             initial_job_limit: Arc::new(Semaphore::new(128)),
+            rebuild_job_limit: Arc::new(Semaphore::new(rebuild_lane_permits(128))),
             max_connections_per_username: 0,
             username_connections: Arc::new(Mutex::new(HashMap::new())),
             max_connections_per_ip: 0,
@@ -225,6 +259,25 @@ impl Default for StratumConfig {
             max_authorize_attempts_per_interval: 0,
             stats: Arc::new(StratumStats::default()),
         }
+    }
+}
+
+/// Rebuild-lane permits for `initial` initial-job permits: a quarter, at
+/// least one (#604). At the default 128 that is 32, enough to keep the build
+/// workers and the database pool busy with rebuilds while at least 96
+/// initial-job permits stay free for sessions with no work yet. A first job
+/// waits for about this many rebuilds, so a larger lane is slower for it.
+/// The lane also bounds how many rebuilds share one issued-job batch
+/// transaction, so while commits are slow, rebuilds complete at about the
+/// lane per commit. Revisit the quarter if
+/// `qbit_prism_stratum_rebuild_lane_waiters` stays high while first jobs
+/// are not queueing, which would mean the lane, not first-job admission, is
+/// the bottleneck.
+pub const fn rebuild_lane_permits(initial: usize) -> usize {
+    if initial < 4 {
+        1
+    } else {
+        initial / 4
     }
 }
 
@@ -299,8 +352,10 @@ pub struct StratumStats {
     connections: AtomicUsize,
     authorized: AtomicUsize,
     pending_builds: AtomicUsize,
+    rebuild_lane_waiters: AtomicUsize,
     job_delivery_successes: AtomicU64,
     job_delivery_failures: AtomicU64,
+    job_delivery_cancellations: AtomicU64,
     accepted_submissions: AtomicU64,
     rejected_submissions: AtomicU64,
     delivered_generations: Mutex<HashMap<u64, usize>>,
@@ -314,8 +369,10 @@ pub struct StratumStatsSnapshot {
     pub connections: usize,
     pub authorized: usize,
     pub pending_builds: usize,
+    pub rebuild_lane_waiters: usize,
     pub job_delivery_successes: u64,
     pub job_delivery_failures: u64,
+    pub job_delivery_cancellations: u64,
     pub accepted_submissions: u64,
     pub rejected_submissions: u64,
     pub current_generation: u64,
@@ -325,6 +382,12 @@ pub struct StratumStatsSnapshot {
 }
 
 impl StratumStats {
+    /// Shares the listeners have accepted, as `snapshot` reports them; read
+    /// at every metrics scrape (#581).
+    pub fn accepted_submissions(&self) -> u64 {
+        self.accepted_submissions.load(Ordering::Relaxed)
+    }
+
     pub fn delivery_metrics(&self) -> crate::metrics::DeliveryMetrics {
         let jobs = self.initial_jobs.lock().unwrap();
         crate::metrics::DeliveryMetrics {
@@ -347,8 +410,10 @@ impl StratumStats {
             connections: self.connections.load(Ordering::Relaxed),
             authorized,
             pending_builds: self.pending_builds.load(Ordering::Relaxed),
+            rebuild_lane_waiters: self.rebuild_lane_waiters.load(Ordering::Relaxed),
             job_delivery_successes: self.job_delivery_successes.load(Ordering::Relaxed),
             job_delivery_failures: self.job_delivery_failures.load(Ordering::Relaxed),
+            job_delivery_cancellations: self.job_delivery_cancellations.load(Ordering::Relaxed),
             accepted_submissions: self.accepted_submissions.load(Ordering::Relaxed),
             rejected_submissions: self.rejected_submissions.load(Ordering::Relaxed),
             current_generation,
@@ -447,31 +512,60 @@ impl Drop for SessionObservation {
     }
 }
 
+/// How a job delivery ended, counted once when its observation drops.
+#[derive(Clone, Copy)]
+enum DeliveryOutcome {
+    Success,
+    Failure,
+    /// Abandoned unannounced because its session ended (#621).
+    Cancelled,
+}
+
 struct DeliveryObservation {
     stats: Arc<StratumStats>,
-    success: bool,
+    outcome: DeliveryOutcome,
 }
 impl DeliveryObservation {
     fn new(stats: Arc<StratumStats>) -> Self {
         stats.pending_builds.fetch_add(1, Ordering::Relaxed);
+        // Until it settles, a delivery that drops was abandoned by its
+        // session (#621): a miner that leaves, or a shutdown, is not a
+        // failed delivery.
         Self {
             stats,
-            success: false,
+            outcome: DeliveryOutcome::Cancelled,
         }
+    }
+    /// Settle as failed, handing back the error that failed it.
+    fn failed(mut self, error: StratumError) -> StratumError {
+        self.outcome = DeliveryOutcome::Failure;
+        error
     }
 }
 impl Drop for DeliveryObservation {
     fn drop(&mut self) {
         self.stats.pending_builds.fetch_sub(1, Ordering::Relaxed);
-        if self.success {
-            self.stats
-                .job_delivery_successes
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.stats
-                .job_delivery_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        let counter = match self.outcome {
+            DeliveryOutcome::Success => &self.stats.job_delivery_successes,
+            DeliveryOutcome::Failure => &self.stats.job_delivery_failures,
+            DeliveryOutcome::Cancelled => &self.stats.job_delivery_cancellations,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Counts one rebuild waiting for the rebuild lane (#604) until it holds a
+/// permit, times out or its session goes away.
+struct RebuildLaneWait(Arc<StratumStats>);
+impl RebuildLaneWait {
+    fn new(stats: Arc<StratumStats>) -> Self {
+        stats.rebuild_lane_waiters.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+impl Drop for RebuildLaneWait {
+    fn drop(&mut self) {
+        self.0.rebuild_lane_waiters.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -583,6 +677,7 @@ impl StratumConfig {
             "Stratum pending initial job limit must be positive and no greater than connection limit");
         config.connection_limit = ConnectionLimit::new(connections);
         config.initial_job_limit = Arc::new(Semaphore::new(initial));
+        config.rebuild_job_limit = Arc::new(Semaphore::new(rebuild_lane_permits(initial)));
         config.max_connections_per_username =
             value("PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME", 0usize)?;
         config.max_connections_per_ip = value("PRISM_STRATUM_MAX_CONNECTIONS_PER_IP", 0usize)?;
@@ -799,6 +894,9 @@ struct Session<C> {
     retained: retained_jobs::RetainedJobs<C>,
     tip_work_delivered: Option<(String, Instant)>,
     retry_job: bool,
+    /// A job delivery is being built and persisted while the session keeps
+    /// answering submits (#621).
+    delivery_in_flight: bool,
     authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     observation: SessionObservation,
     pending_retarget: Option<(f64, Vardiff)>,
@@ -832,6 +930,7 @@ impl<C> Session<C> {
             retained: retained_jobs::RetainedJobs::default(),
             tip_work_delivered: None,
             retry_job: false,
+            delivery_in_flight: false,
             authorization_permit: None,
             observation,
             pending_retarget: None,
@@ -898,7 +997,10 @@ impl<C> Session<C> {
     }
 
     fn retarget(&mut self) {
-        if self.pending_retarget.is_some() {
+        // A delivery in flight was built at the current difficulty, so a
+        // retarget now would be announced with that job (#621). It waits for
+        // the announcement; the next delivery or timer tick retargets.
+        if self.pending_retarget.is_some() || self.delivery_in_flight {
             return;
         }
         let previous = self.vardiff.clone();
@@ -1029,66 +1131,203 @@ async fn result(
     write_json(writer, json!({"id":id,"result":value,"error":null}), config).await
 }
 
-async fn deliver_job<B: MiningBackend>(
+/// Whether `prior`, the parent and payout revision of the session's newest
+/// live job for its current worker, is the published work (#604). An
+/// unknown publication counts nothing as current. An admission hint only.
+async fn holds_current_work<B: MiningBackend>(backend: &B, prior: Option<&(String, i64)>) -> bool {
+    let Some((prior_parent, prior_revision)) = prior else {
+        return false;
+    };
+    backend
+        .published_work_hint()
+        .await
+        .is_some_and(|(parent, revision)| {
+            // Jobs carry the template's hash lowercased; the hint may not.
+            prior_parent.eq_ignore_ascii_case(&parent) && *prior_revision == revision
+        })
+}
+
+/// What a job delivery is built from, read from the session as it starts.
+/// Building and persisting the job borrow nothing else from the session, so
+/// the session keeps answering submits meanwhile (#621). The requests it
+/// answers then cannot change any of these: see [`answered_during_delivery`].
+struct DeliveryInputs {
+    worker: Worker,
+    extranonce1: String,
+    difficulty: f64,
+    miner_version_mask: Option<u32>,
+    /// The parent and payout revision of the session's newest live job for
+    /// this worker, owned, for the rebuild lane's hint (#604). A job resumed
+    /// after a reconnect is retired and is not current work.
+    prior: Option<(String, i64)>,
+}
+
+impl DeliveryInputs {
+    fn of<C>(session: &Session<C>) -> Option<Self> {
+        let worker = session.worker.clone()?;
+        let prior = session
+            .jobs
+            .back()
+            .filter(|prior| prior.worker.username == worker.username && prior.retired_at.is_none())
+            .map(|prior| {
+                (
+                    prior.job.wire.previousblockhash.clone(),
+                    prior.job.wire.payout_revision,
+                )
+            });
+        Some(Self {
+            extranonce1: session.extranonce1.clone()?,
+            difficulty: session.difficulty,
+            miner_version_mask: session.miner_version_mask,
+            prior,
+            worker,
+        })
+    }
+}
+
+/// A built job, durable but not yet announced to the miner.
+struct PreparedJob<C> {
+    job: MiningJob<C>,
+    worker: Worker,
+    mask: u32,
+    observation: DeliveryObservation,
+}
+
+/// Requests a session answers while its job delivery is in flight (#621):
+/// `mining.submit` and `mining.get_health`, neither of which changes what
+/// that job is built from or how it is announced. A submit's own retarget
+/// waits for the delivery (`Session::retarget`). Every other object frame
+/// (`mining.subscribe`, `mining.authorize`, `mining.configure`,
+/// `mining.suggest_difficulty`, `mining.extranonce.subscribe`, any other
+/// method, or a method that is missing or not a string) waits for the
+/// delivery, and the session reads nothing after it until it is handled, so
+/// responses keep request order and those requests see the session exactly
+/// as before #621. A frame that is not a JSON object is answered at once.
+fn answered_during_delivery(request: &Value) -> bool {
+    matches!(
+        request.get("method").and_then(Value::as_str),
+        Some("mining.submit" | "mining.get_health")
+    )
+}
+
+/// Handle `work`, a request answered during a delivery, while that delivery
+/// keeps being polled, so it never stalls behind the request (#621). A
+/// delivery that finishes meanwhile is kept in `finished` and announced
+/// after the request's answer.
+async fn alongside<T, D: FusedFuture>(
+    work: impl Future<Output = T>,
+    mut delivery: Pin<&mut D>,
+    finished: &mut Option<D::Output>,
+) -> T {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut work => return output,
+            prepared = delivery.as_mut(), if !delivery.is_terminated() => *finished = Some(prepared),
+        }
+    }
+}
+
+/// Await a backend call under one of the session's own deadlines (#655): its
+/// output, or, once `seconds` have passed, what the call was waiting on then,
+/// which names the refusal ([`StratumError::timed_out`]). The backend marks
+/// the steps it waits on the ledger database (`crate::waiting`); a call that
+/// marks none keeps the node's label.
+async fn within_session_deadline<F: Future>(
+    seconds: f64,
+    call: F,
+) -> std::result::Result<F::Output, Dependency> {
+    crate::waiting::timeout(Duration::from_secs_f64(seconds), call).await
+}
+
+/// Admit, build and persist one job. The session loop polls this while it
+/// keeps answering submits (#621) and announces the job with
+/// [`announce_job`] once it is durable. `refresh` is this delivery's own
+/// receiver, for the rebuild lane's re-check (#604).
+async fn prepare_job<B: MiningBackend>(
     backend: &B,
-    session: &mut Session<B::Context>,
-    writer: &mut (impl AsyncWrite + Unpin),
+    inputs: DeliveryInputs,
     config: &StratumConfig,
     metrics: &crate::metrics::Metrics,
-) -> Result<()> {
-    let Some(extranonce1) = session.extranonce1.as_deref() else {
-        return Ok(());
-    };
-    let Some(worker) = session.worker.as_ref().cloned() else {
-        return Ok(());
-    };
-    let worker = &worker;
-    let mut observation = DeliveryObservation::new(config.stats.clone());
+    mut refresh: watch::Receiver<u64>,
+) -> std::result::Result<PreparedJob<B::Context>, StratumError> {
+    let DeliveryInputs {
+        worker,
+        extranonce1,
+        difficulty,
+        miner_version_mask,
+        prior,
+    } = inputs;
+    let prior = prior.as_ref();
+    let observation = DeliveryObservation::new(config.stats.clone());
+    // #604: a session that holds current work (its newest job, for this
+    // worker, is on the published parent and payout revision) can keep
+    // mining meanwhile, so its rebuild (a same-tip republication, a
+    // retarget) queues in the rebuild lane first and holds that permit
+    // through persistence. Rebuilds of current work therefore occupy at most
+    // the lane's permits anywhere between admission and a durable job, and a
+    // session without current work (a first job, a new worker, a tip change
+    // or a payout revision landing) waits for those, not for every session's
+    // rebuild. It takes only the shared initial-job admission, as before.
     let build = async {
+        let lane = if holds_current_work(backend, prior).await {
+            match config.rebuild_job_limit.try_acquire() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let _waiting = RebuildLaneWait::new(config.stats.clone());
+                    // A publication that supersedes the work while it waits
+                    // (a new tip, a payout revision landing) sends it to the
+                    // shared admission instead. The acquire stays pinned, so
+                    // a same-tip publication keeps its place in the lane.
+                    let acquire = config.rebuild_job_limit.acquire();
+                    tokio::pin!(acquire);
+                    loop {
+                        tokio::select! {
+                            permit = &mut acquire => break Some(permit
+                                .map_err(|_| StratumError::internal("pool is shutting down"))?),
+                            changed = refresh.changed() => {
+                                if changed.is_err() || !holds_current_work(backend, prior).await {
+                                    break None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let _admission = config
             .initial_job_limit
             .acquire()
             .await
             .map_err(|_| StratumError::internal("pool is shutting down"))?;
         backend
-            .build_job(
-                worker,
-                extranonce1,
-                session.difficulty,
-                config.minimum_difficulty,
-            )
+            .build_job(&worker, &extranonce1, difficulty, config.minimum_difficulty)
             .await
+            .map(|job| (job, lane))
     };
     let revision_build = metrics.revision_work_build();
-    let mut job = match timeout(
-        Duration::from_secs_f64(config.initial_job_timeout_seconds),
-        build,
-    )
-    .await
+    let (job, lane) = match within_session_deadline(config.initial_job_timeout_seconds, build).await
     {
-        Ok(Ok(job)) => job,
-        Ok(Err(error)) => {
-            session.retry_job = true;
-            return Err(error.into());
-        }
-        Err(_) => {
+        Ok(Ok(built)) => built,
+        Ok(Err(error)) => return Err(observation.failed(error)),
+        Err(waiting_on) => {
             revision_build.deadline_hit();
-            session.retry_job = true;
-            return Err(StratumError::backend("initial job delivery timed out").into());
+            return Err(observation.failed(StratumError::timed_out(
+                "initial job delivery timed out",
+                waiting_on,
+            )));
         }
     };
-    let work_invalidated = session.jobs.back().is_none_or(|prior| {
-        prior.job.wire.previousblockhash != job.wire.previousblockhash
-            || prior.job.wire.payout_revision != job.wire.payout_revision
-    });
-    job.wire.clean_jobs = work_invalidated;
-    let mask = session.miner_version_mask.map_or(0, |miner| {
+    let mask = miner_version_mask.map_or(0, |miner| {
         miner & config.version_rolling_mask & job.wire.version_mask
     });
-    match timeout(
-        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+    match within_session_deadline(
+        config.initial_job_timeout_seconds,
         backend.persist_issued_job(
-            worker,
+            &worker,
             &job,
             mask,
             Duration::from_secs_f64(config.job_retention_seconds.max(config.stale_grace_seconds)),
@@ -1097,15 +1336,76 @@ async fn deliver_job<B: MiningBackend>(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            session.retry_job = true;
-            return Err(error.into());
-        }
-        Err(_) => {
-            session.retry_job = true;
-            return Err(StratumError::backend("job persistence timed out").into());
+        Ok(Err(error)) => return Err(observation.failed(error)),
+        Err(waiting_on) => {
+            return Err(observation.failed(StratumError::timed_out(
+                "job persistence timed out",
+                waiting_on,
+            )))
         }
     }
+    // The job is durable. Neither a slow miner's socket nor a submit the
+    // session answers before announcing it (#621) may hold the lane.
+    drop(lane);
+    Ok(PreparedJob {
+        job,
+        worker,
+        mask,
+        observation,
+    })
+}
+
+/// Build, persist and announce one job in turn, as the session loop did
+/// before #621; the in-crate session tests drive a delivery this way.
+#[cfg(test)]
+async fn deliver_job<B: MiningBackend>(
+    backend: &B,
+    session: &mut Session<B::Context>,
+    writer: &mut (impl AsyncWrite + Unpin),
+    config: &StratumConfig,
+    metrics: &crate::metrics::Metrics,
+    refresh: watch::Receiver<u64>,
+) -> Result<()> {
+    let Some(inputs) = DeliveryInputs::of(session) else {
+        return Ok(());
+    };
+    session.retry_job = false;
+    match prepare_job(backend, inputs, config, metrics, refresh).await {
+        Ok(prepared) => announce_job(backend, session, writer, config, metrics, prepared).await,
+        Err(error) => {
+            session.retry_job = true;
+            Err(error.into())
+        }
+    }
+}
+
+/// Announce a prepared job: its version mask and difficulty, then the work,
+/// and retire what it replaces.
+async fn announce_job<B: MiningBackend>(
+    backend: &B,
+    session: &mut Session<B::Context>,
+    writer: &mut (impl AsyncWrite + Unpin),
+    config: &StratumConfig,
+    metrics: &crate::metrics::Metrics,
+    prepared: PreparedJob<B::Context>,
+) -> Result<()> {
+    let PreparedJob {
+        mut job,
+        worker,
+        mask,
+        mut observation,
+    } = prepared;
+    // A failed write from here ends the session and counts as a failed
+    // delivery, as it did before #621.
+    observation.outcome = DeliveryOutcome::Failure;
+    let worker = &worker;
+    // Against the work the miner holds now: a submit answered while this job
+    // was built may have resumed or pruned some (#621).
+    let work_invalidated = session.jobs.back().is_none_or(|prior| {
+        prior.job.wire.previousblockhash != job.wire.previousblockhash
+            || prior.job.wire.payout_revision != job.wire.payout_revision
+    });
+    job.wire.clean_jobs = work_invalidated;
     if session.miner_version_mask.is_some() && mask != session.advertised_version_mask {
         write_json(
             writer,
@@ -1161,8 +1461,9 @@ async fn deliver_job<B: MiningBackend>(
         version_mask: mask,
         retired_at: None,
     });
-    session.retry_job = false;
-    observation.success = true;
+    // `retry_job` was consumed when this delivery started: a publication or
+    // retarget seen since asks for the next one.
+    observation.outcome = DeliveryOutcome::Success;
     if let Some((difficulty, evidence, downward_only)) = hint {
         remember_difficulty(
             backend,
@@ -1218,12 +1519,14 @@ async fn request<B: MiningBackend>(
             }
             "mining.subscribe" => {
                 if session.extranonce1.is_none() {
-                    let id = timeout(
-                        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                    let id = within_session_deadline(
+                        config.initial_job_timeout_seconds,
                         backend.new_session_id(),
                     )
                     .await
-                    .map_err(|_| StratumError::backend("session allocation timed out"))??;
+                    .map_err(|waiting_on| {
+                        StratumError::timed_out("session allocation timed out", waiting_on)
+                    })??;
                     // Requests are serial within a session. Publish only a
                     // successful allocation; later subscribes reuse this ID.
                     session.extranonce1 = Some(format!("{id:08x}"));
@@ -1254,12 +1557,14 @@ async fn request<B: MiningBackend>(
                     }
                     .into());
                 }
-                let worker = timeout(
-                    Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                let worker = within_session_deadline(
+                    config.initial_job_timeout_seconds,
                     backend.authorize(username),
                 )
                 .await
-                .map_err(|_| StratumError::backend("payout address validation timed out"))??;
+                .map_err(|waiting_on| {
+                    StratumError::timed_out("payout address validation timed out", waiting_on)
+                })??;
                 let same_username = session
                     .worker
                     .as_ref()
@@ -1486,13 +1791,14 @@ async fn request<B: MiningBackend>(
                 if !session.jobs.iter().any(|j| j.job.wire.job_id == fields[1])
                     && session.retained.get(fields[1]).is_none()
                 {
-                    if let Some(job) = timeout(
-                        Duration::from_secs_f64(config.initial_job_timeout_seconds),
+                    if let Some(job) = within_session_deadline(
+                        config.initial_job_timeout_seconds,
                         backend.resume_job(&worker, fields[1]),
                     )
                     .await
-                    .map_err(|_| StratumError::backend("job resume timed out"))??
-                    {
+                    .map_err(|waiting_on| {
+                        StratumError::timed_out("job resume timed out", waiting_on)
+                    })?? {
                         if job.wire.job_id != fields[1] {
                             return Err(StratumError::internal("restored job ID mismatch").into());
                         }
@@ -1570,6 +1876,11 @@ async fn request<B: MiningBackend>(
                     .submit(&issued.worker, &issued.job, submission, grace)
                     .await?;
                 session.vardiff.accepted(proved_difficulty);
+                // Also in the state a failed retarget delivery restores, so a
+                // share answered while it is in flight (#621) counts either way.
+                if let Some((_, previous)) = &mut session.pending_retarget {
+                    previous.accepted(proved_difficulty);
+                }
                 session.last_accepted_share = Some((share_id.clone(), proved_difficulty));
                 config
                     .stats
@@ -1647,6 +1958,19 @@ async fn session<B: MiningBackend>(
     serve_connection(reader, writer, backend, config, refresh, shutdown, metrics).await
 }
 
+/// Whether the session breached a per-session budget. The breach was
+/// recorded and answered; the session closes after the response.
+fn budget_breached<C>(session: &Session<C>) -> bool {
+    let Some(reason) = session.budget_exceeded else {
+        return false;
+    };
+    tracing::warn!(
+        reason = reason.as_str(),
+        "Stratum session disconnected by a per-session budget"
+    );
+    true
+}
+
 /// One Stratum connection's request loop over any byte stream (#575).
 /// `run_listener` calls it with an accepted socket's halves; the fuzz targets
 /// and property tests call it over an in-memory pipe, so the line framing and
@@ -1671,68 +1995,137 @@ pub async fn serve_connection<B: MiningBackend>(
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // An unauthenticated peer must not retain admission indefinitely.
     let connected = Instant::now();
+    // The session's job delivery in flight (#621): built and persisted while
+    // the loop below keeps answering submits, then announced from it.
+    let delivery = Fuse::terminated();
+    tokio::pin!(delivery);
+    // That delivery once it finished, until it is announced.
+    let mut finished = None;
+    // A request that waits for that delivery (see `answered_during_delivery`)
+    // and when its frame completed. Nothing after it is read until it is
+    // handled.
+    let mut held: Option<(Value, tokio::time::Instant)> = None;
+    // A frame over the size limit ends the session; its rejection is the
+    // session's last write.
+    let mut oversized = false;
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // A failed delivery is retried after the next event, the timer at the
+        // latest, never in the pass that saw it fail.
+        let mut delivery_failed = false;
         let remaining = config.max_message_bytes + 1 - buffer.len();
         let mut bounded_reader = (&mut reader).take(remaining as u64);
+        // Reads come last (#621). Every other branch is ready at most once per
+        // tick, publication or delivery and returns promptly, so none starves
+        // a pending request, and a backlog of requests cannot hold off a
+        // finished delivery, a new publication or the unauthenticated-peer
+        // deadline.
         tokio::select! {
+            biased;
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
+            prepared = &mut delivery, if !delivery.is_terminated() => finished = Some(prepared),
             changed = refresh.changed() => {
                 if changed.is_err() { break; }
                 session.retry_job = session.worker.is_some() && session.extranonce1.is_some();
             }
             _ = timer.tick() => {
-                if session.jobs.is_empty() && session.retained.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
+                // A delivery in flight ends at its own deadlines first.
+                if delivery.is_terminated() && session.jobs.is_empty() && session.retained.is_empty() && connected.elapsed().as_secs_f64() > config.initial_job_timeout_seconds { break; }
                 let observed_tip = backend.observed_tip_hint().await;
                 session.prune_jobs(&config, observed_tip.as_ref());
                 session.retarget();
             }
-            read = bounded_reader.read_until(b'\n',&mut buffer) => {
+            read = bounded_reader.read_until(b'\n',&mut buffer), if held.is_none() => {
                 if read? == 0 { break; }
-                if buffer.len() > config.max_message_bytes {
-                    write_json(&mut writer,StratumError::malformed("Stratum message exceeds size limit").response(Value::Null),&config).await?;
-                    break;
-                }
+                if buffer.len() > config.max_message_bytes { oversized = true; break; }
                 if buffer.last() != Some(&b'\n') { continue; }
                 let received_at = tokio::time::Instant::now();
                 let frame = std::mem::take(&mut buffer);
                 match serde_json::from_slice::<Value>(&frame) {
-                    Ok(value) if value.is_object() => request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics).await?,
+                    Ok(value) if value.is_object() && !delivery.is_terminated() && !answered_during_delivery(&value) => held = Some((value, received_at)),
+                    Ok(value) if value.is_object() => alongside(request(backend.as_ref(),&mut session,&mut writer,&config,value,received_at,&metrics), delivery.as_mut(), &mut finished).await?,
                     _ => {
-                        write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config).await?;
+                        alongside(write_json(&mut writer,StratumError::malformed("invalid JSON request").response(Value::Null),&config), delivery.as_mut(), &mut finished).await?;
                         session.charge(crate::metrics::ConnectionRefusalReason::MalformedFrameBudget,&metrics);
                     }
                 }
             }
         }
-        if let Some(reason) = session.budget_exceeded {
-            // The breach was recorded and answered; close after the response.
-            tracing::warn!(
-                reason = reason.as_str(),
-                "Stratum session disconnected by a per-session budget"
-            );
+        // A breach closes the session right after its answer, before any
+        // work that finished meanwhile is announced (#621).
+        if budget_breached(&session) {
             break;
         }
-        if session.retry_job {
-            if let Err(error) = deliver_job(
-                backend.as_ref(),
-                &mut session,
-                &mut writer,
-                &config,
-                &metrics,
-            )
-            .await
-            {
-                session.restore_retarget();
-                if error.downcast_ref::<StratumError>().is_none() {
-                    return Err(error);
+        if let Some(prepared) = finished.take() {
+            session.delivery_in_flight = false;
+            match prepared {
+                Ok(prepared) => {
+                    announce_job(
+                        backend.as_ref(),
+                        &mut session,
+                        &mut writer,
+                        &config,
+                        &metrics,
+                        prepared,
+                    )
+                    .await?
                 }
-                // Template/RPC trouble is retried on the timer while existing
-                // work remains usable. Do not disconnect a healthy miner.
+                Err(_) => {
+                    // Template/RPC trouble is retried on the timer while existing
+                    // work remains usable. Do not disconnect a healthy miner.
+                    session.restore_retarget();
+                    session.retry_job = true;
+                    delivery_failed = true;
+                }
             }
         }
+        if delivery.is_terminated() {
+            if let Some((value, received_at)) = held.take() {
+                metrics.observe_request_delivery_wait(received_at.elapsed());
+                request(
+                    backend.as_ref(),
+                    &mut session,
+                    &mut writer,
+                    &config,
+                    value,
+                    received_at,
+                    &metrics,
+                )
+                .await?;
+            }
+        }
+        // A held request handled above may breach a budget too.
+        if budget_breached(&session) {
+            break;
+        }
+        if session.retry_job && delivery.is_terminated() && !delivery_failed {
+            // A retarget that waited for the delivery just announced rides
+            // this one, so back-to-back deliveries never starve vardiff.
+            session.retarget();
+            if let Some(inputs) = DeliveryInputs::of(&session) {
+                session.retry_job = false;
+                session.delivery_in_flight = true;
+                delivery.set(
+                    prepare_job(backend.as_ref(), inputs, &config, &metrics, refresh.clone())
+                        .fuse(),
+                );
+            }
+        }
+    }
+    // The session is ending: abandon a delivery still in flight before the
+    // last writes, so a peer that is not reading cannot hold its admission
+    // or lane permit through them (#621).
+    delivery.set(Fuse::terminated());
+    drop(finished);
+    if oversized {
+        write_json(
+            &mut writer,
+            StratumError::malformed("Stratum message exceeds size limit").response(Value::Null),
+            &config,
+        )
+        .await?;
     }
     writer.shutdown().await?;
     Ok(())

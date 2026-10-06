@@ -84,6 +84,7 @@ impl Metrics {
             (Family::Connections, snapshot.connections as f64),
             (Family::Authorized, snapshot.authorized as f64),
             (Family::Builds, snapshot.pending_builds as f64),
+            (Family::RebuildWaiters, snapshot.rebuild_lane_waiters as f64),
             (
                 Family::Covered,
                 snapshot.authorized_with_current_work as f64,
@@ -100,6 +101,10 @@ impl Metrics {
                 Family::DeliveryFailed,
                 snapshot.job_delivery_failures as f64,
             ),
+            (
+                Family::DeliveryCancelled,
+                snapshot.job_delivery_cancellations as f64,
+            ),
             (Family::Coverage, coverage),
         ] {
             registry.set(family, vec![], value);
@@ -111,6 +116,33 @@ impl Metrics {
     pub fn publish_work_refresh_stalled(&self, age: Duration) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         registry.set(Family::WorkRefreshStalled, vec![], age.as_secs_f64());
+    }
+    /// Whether this frontend submits: its `PRISM_BLOCK_SUBMIT_ENABLED`
+    /// (#291), a fixed setting of the process, and the cluster's block
+    /// submission hold (#664) as the frontend last read it, `None` until a
+    /// read has succeeded. 1 only with the switch on and nothing held, 0
+    /// when either holds blocks back, and unknown (-1) when the switch is on
+    /// but the hold has not been read yet.
+    pub fn publish_block_submission(&self, enabled: bool, held: Option<bool>) {
+        let value = match (enabled, held) {
+            (false, _) | (true, Some(true)) => 0.,
+            (true, Some(false)) => 1.,
+            (true, None) => -1.,
+        };
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(Family::BlockSubmission, vec![], value);
+    }
+    /// #622: the age of the readiness proof admission reads, or unknown
+    /// (-1) while readiness is revoked or was never established. Distinct
+    /// from `publish_work_refresh_stalled`: a frontend whose rebuilds stall
+    /// while its polls find the published tip reads young here and old there.
+    pub fn publish_tip_poll_age(&self, age: Option<Duration>) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(
+            Family::TipPollAge,
+            vec![],
+            age.map_or(-1., |age| age.as_secs_f64()),
+        );
     }
     /// Stratum delivery observations cannot overwrite the refresh owner's state.
     pub fn publish_delivery(&self, snapshot: DeliveryMetrics) {
@@ -306,6 +338,27 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+    /// #291: the kill switch is visible to a scrape, so an alert can page on
+    /// a frontend left holding its blocks. #664: so is the cluster's hold,
+    /// and a hold that could not be read is unknown, never on.
+    #[test]
+    fn block_submission_gauge_follows_the_kill_switch_and_the_cluster_hold() {
+        let metrics = Metrics::default();
+        let gauge =
+            |metrics: &Metrics| sample(&metrics.render(), "qbit_prism_block_submission_enabled");
+        assert_eq!(gauge(&metrics), -1., "unknown, never on, until published");
+        for (enabled, held, expected) in [
+            (false, None, 0.),
+            (false, Some(false), 0.),
+            (false, Some(true), 0.),
+            (true, Some(true), 0.),
+            (true, Some(false), 1.),
+            (true, None, -1.),
+        ] {
+            metrics.publish_block_submission(enabled, held);
+            assert_eq!(gauge(&metrics), expected, "switch {enabled}, hold {held:?}");
+        }
     }
     #[test]
     fn collector_expiry_and_failure_preserve_last_success_time_without_fabricating_values() {

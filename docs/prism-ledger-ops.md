@@ -238,8 +238,8 @@ one of the three that reads the node, and is described after the other two.
 
 ```sh
 qbit-prism-server candidates list [--json] [--limit <1..10000, default 100>]
-qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>"
-qbit-prism-server candidates recover --block-hash <64 lowercase hex> [--block-hash <hash> ...] [--apply] [--timeout-seconds <1..3600, default 600>]
+qbit-prism-server candidates abandon --block-hash <64 lowercase hex> --reason "<nonblank explanation>" [--unsafe-database-clock-expiry]
+qbit-prism-server candidates recover --block-hash <64 lowercase hex> [--block-hash <hash> ...] [--apply] [--timeout-seconds <1..3600, default 600>] [--unsafe-database-clock-expiry]
 ```
 
 `list` prints unfinished rows up to the selected limit — `pending`, `offer_reserved`, `offered`
@@ -265,7 +265,7 @@ b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1  pending       
 | `height` | `candidate->'found_block'->>'block_height'`, extracted server-side. `-` (text) or `null` (`--json`) when the document holds no readable height — an unknown-`storage_version` row, for example. Never `0`. |
 | `attempts` | `attempt_count`: how many claims the row has taken, not how many offers were made. |
 | `next_attempt` | `next_attempt_at`, or `parked` when it is `infinity`. |
-| `claim` | `<claim_instance_id> until <claim_expires_at>` for a live claim, `expired` for a claim past its expiry (the row is workable again), `-` for none. `--json` keeps the stale holder and expiry. |
+| `claim` | `<claim_instance_id> until <claim_expires_at>` for a claim the database clock still calls live, `expired` for one past that expiry, `-` for none. The expiry is the database clock's estimate only: a frontend takes a claimed row over once it has watched the claim go unrenewed for its whole lease (see [Candidate claim leases and database clock steps](#candidate-claim-leases-and-database-clock-steps-021-581)). `--json` keeps the stale holder and expiry. |
 | `sv` | `storage_version`. Anything other than `1` is a row this server cannot decode. |
 | `last_error` | Why the last attempt stopped. Truncated in text mode only, and marked `…(truncated)` when it is; `--json` prints it whole. |
 
@@ -327,7 +327,7 @@ there stays as evidence that the row had been parked.
 | 2 | No such row. | `no candidate row for <hash>` |
 | 3 | Offered to the node; never abandonable. | `candidate <hash> is in state <state>; it was offered to the node and is never abandoned. Its block may already have been submitted. Leave it to reconciliation` |
 | 4 | Already terminal. | `candidate <hash> is already <submitted\|abandoned\|orphaned>; nothing to do` |
-| 5 | Held by a live claim. | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
+| 5 | Held by a live claim: one that changed while the command watched it, or, with `--unsafe-database-clock-expiry`, one the database clock calls live. | `candidate <hash> is held by <instance>, whose claim changed while this command watched it (the holder renewed it, or a frontend took the row over), so it is live (database clock estimate: until <expiry>); retry once the holder has released it`, or with the flag `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 6 | Pending, but its block has landed. | `candidate <hash> is pending but its block is already in qbit_pool_blocks; reconcile it before abandoning — abandoning would discard landed accounting` |
 | 7 | Unsupported storage version; evidence preserved. | Names the version and directs legacy rows to the pinned `2.x.x` drain, newer formats to a compatible release. |
 | 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | `candidate <hash> holds a pre-migration 2.x.x document at storage_version 1; evidence preserved. This release cannot replay it, and abandoning it would discard the block the legacy drain still owes: drain it with the pinned 2.x.x image, never an operator abandon` |
@@ -335,10 +335,26 @@ there stays as evidence that the row had been parked.
 Codes 3, 6, 7 and 8 protect offer, accounting, storage-format and legacy-era
 evidence. Code 4
 is kept distinct from code 2 so that re-running a successful abandon reads as
-"nothing to do" rather than as a lost row. An **expired** claim is not a live
-claim, so a supported row whose owner died is abandonable without waiting;
-code 5 reflects whether the claim was live at one database timestamp captured
-after acquiring the settlement lock. The UPDATE and refusal diagnosis share that
+"nothing to do" rather than as a lost row.
+
+A claim is over for `abandon` as it is for a frontend (#581): only once the
+command has itself watched it go unrenewed for its whole lease, on its own
+monotonic clock. A holder's writes are fenced on its token alone, so a
+`claim_expires_at` the database clock has passed does not mean the holder
+stopped, and after a forward step it would otherwise abandon a block its live
+holder is about to offer. On a claimed row the command prints `candidate
+<hash> is claimed by <instance>; waiting <N> s for the claim to go unrenewed
+for its whole lease`, waits once (up to one lease: 120 s, or 600 s for a claim
+taken before 021, and 0 s for a revoked one), and abandons the row by compare
+and set on the version it watched. A claim that changed meanwhile, renewed or
+taken over, is live, and its refusal (exit 5) is the answer.
+`--unsafe-database-clock-expiry` restores the pre-021 rule instead: an
+**expired** claim, `claim_expires_at` before the database clock, is not a live
+claim, so a supported row whose owner died is abandonable without waiting.
+That is wrong by the size of any database clock step, so use it only when the
+holder is known to be gone and the clock has not stepped. Under that rule code
+5 reflects whether the claim was live at one database timestamp captured after
+acquiring the settlement lock. The UPDATE and refusal diagnosis share that
 timestamp, so expiry between them still reports a claim refusal rather than an
 internal consistency error; a fresh invocation can abandon the now-expired row. Unsupported versions report
 code 7, and an unreplayable version-1 document code 8, both ahead of claim
@@ -455,7 +471,17 @@ Then, for each planned block in height order:
    ordinary lease heartbeat renews the claim while the work runs. The claim
    statement's `WHERE` is the safety property — an unfinished state, no live
    claim, `storage_version = 1` and a document this release wrote, the same
-   shape test `abandon` uses. A row parked with `next_attempt_at =
+   shape test `abandon` uses. Another holder's claim is over only once this
+   command has itself watched it go unrenewed for its whole lease, as a
+   frontend does (#581): it prints `candidate <hash> is claimed by <instance>;
+   waiting <N> s for the claim to go unrenewed for its whole lease`, waits
+   once when the deadline leaves room, and takes the row over by compare and
+   set on the version it watched. A holder that renews meanwhile is live, and
+   its refusal (exit 5) is the answer. `--unsafe-database-clock-expiry`
+   restores the pre-021 rule instead, `claim_expires_at` before the database
+   clock; it is wrong by the size of any database clock step (a forward step
+   takes a live holder's row), so use it only when the holder is known to be
+   gone and the database clock has not stepped. A row parked with `next_attempt_at =
    'infinity'` is claimable here, because a parked row is operator work,
    but its schedule is left untouched.
 3. It decodes and authenticates the row exactly as the claim lane does
@@ -516,7 +542,7 @@ Codes shared with `abandon` keep their meaning.
 | 1 | Configuration, database or node failure, including unconfirmed claim cleanup, a halted cluster, a live legacy Python writer lease, a node that is unreachable or not caught up, and an allowlist the command refuses (a duplicate, more than 32 or a malformed hash). | The underlying error, as for every other command. |
 | 2 | A listed hash has no outbox row. | `no candidate row for <hash>` |
 | 4 | A listed row is terminal and cannot be recovered. | `candidate <hash> is already abandoned; its evidence was released and it cannot be recovered`, `candidate <hash> is already orphaned; its candidate payload was released and its accounting remains in the ledger. Leave chain changes to reconciliation`, or `candidate <hash> is submitted but its accounting is not proven complete (<what is missing>); inspect qbit_pool_blocks and qbit_pool_audit_bundles before retrying` |
-| 5 | A listed row is held by a live claim (`--apply` only; the plan reports the holder). | `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
+| 5 | A listed row is held by a live claim (`--apply` only; the plan reports the holder). | `candidate <hash> is held by <instance>, whose claim this command must watch go unrenewed for <N> more seconds of its lease (database clock estimate: until <expiry>); the deadline leaves no room for that, or the holder renewed while this command waited and is live. Retry with a longer --timeout-seconds, or once the holder has released it`; with `--unsafe-database-clock-expiry`, `candidate <hash> is held by <instance> until <expiry>; retry after the claim expires` |
 | 7 | Unsupported storage version; evidence preserved. | Names the version, as for `abandon`. |
 | 8 | A pre-migration `2.x.x` document parked at `storage_version = 1`; evidence preserved. | As for `abandon`, ending in `drain it with the pinned 2.x.x image` |
 | 9 | Not on the active chain: the node does not hold the block at its height. Nothing to recover; `recover` never offers. | `candidate <hash> is not on the active chain (<node detail>); nothing to recover. recover never offers a block: a block the node never accepted stays with the coordinator (or, while pending, may be abandoned); a block a reorg removed stays in reconciliation` |
@@ -606,8 +632,10 @@ error returns a row to `pending` or abandons it. Only when that settlement
 itself cannot be written does the error propagate, and the row keeps its
 reservation or offer record for the next claim.
 
-**Recovery.** Every unfinished state is claimable once its lease expires, on
-any frontend, and counts toward the candidate backlog and retention. A
+**Recovery.** Every unfinished state is claimable once its lease is over, on
+any frontend (a frontend that has watched the claim go unrenewed for its
+whole lease takes it over, #581), and counts toward the candidate backlog and
+retention. A
 recovered `offer_reserved` row is delivery unknown: the call may or may not
 have been made, so it is never offered again even when the node reports the
 block unknown; it lands its audit and waits in `reconciliation` for the chain.
@@ -826,6 +854,275 @@ PostgreSQL and qbitd do not share a transaction. Accounting effects are
 idempotent and claim-fenced. Do not infer active-chain acceptance from a
 socket write or a missing RPC reply: an offered block is confirmed only by a
 fresh active-chain observation.
+
+## Candidate claim leases and database clock steps (021, #581)
+
+Every outbox deadline used to be the database clock: `next_attempt_at`
+(`clock_timestamp()` + backoff) and `claim_expires_at` (`clock_timestamp()` +
+lease), compared with `clock_timestamp()` by the claim lanes and by every
+write the holder made. A database clock step moved all of them by the step.
+Forward, a live claim looked expired at once, another frontend took the row
+while the holder was still offering its block, and the holder's next write
+was refused. Backward, a dead holder's row waited lease + step, and a retry
+waited backoff + step (the #586 clock-jump test's stranded reconciliation
+row, two hours). Since 021 neither decision reads the database clock's
+estimate of a lease, and a retry the clock stepped back over is due at once.
+
+**Leases.** A claim's version is (`claim_token`, `claim_renewals`): a claim
+writes renewals 0, every renewal adds one. Its lease is
+`claim_lease_seconds`, written by the claim and by every renewal (1 to 600,
+120 for the submit loop and for `candidates recover`).
+
+- Every claim poll (`Ledger::claim_survey_sql`) reads the version and lease
+  of every claimed unfinished row, and the frontend starts its own monotonic
+  clock for a version the first time a reply shows it. That reply arrives
+  after the commit that wrote the version, which comes after the instant the
+  holder started the renewal its own lease is measured from, so the holder's
+  lease always ends first, whatever either wall clock or the database clock
+  reads.
+- A frontend takes a claimed row over only once it has watched the same
+  version for the whole lease, and only by compare and set on that version
+  (`FOR UPDATE SKIP LOCKED`, so a landing transaction holding the row is
+  never taken mid-commit). Any renewal, release or other takeover since
+  changes the version, and the takeover changes nothing. A takeover runs
+  before the dispatch probe and the claim lanes and takes no scheduling slot;
+  the lanes and the probe serve unclaimed rows only.
+- A claimed row is taken over whatever its `next_attempt_at`, unless it is
+  parked (`infinity`). Its schedule is the one it was claimed with, on the
+  clock of that moment, and nothing rewrites it while the claim lasts, while
+  every renewal rewrites `updated_at`: after a backward step and one renewal,
+  neither says the row is due, and a dead holder's row would otherwise wait
+  out the step. The lanes claim only due rows, so only a `candidates recover`
+  claim of a row still in backoff can be taken over before its backoff ends.
+- The holder's writes are fenced on its token alone. Its lease is its own
+  monotonic deadline (`with_tracked_heartbeat`: the start of its last
+  successful renewal plus the lease), which stops its work before any
+  observer's clock can end the lease. A renewal that times out on lock
+  contention only proves the token still holds the row; it never extends the
+  deadline.
+- `claim_expires_at` is still written, as the database clock's estimate of
+  the lease's end, for `candidates list` and the operator. No decision reads
+  it, except `candidates abandon` and `candidates recover` with
+  `--unsafe-database-clock-expiry`.
+
+What this costs: a frontend that starts while a dead holder's claim is in the
+table times it from its own first reply, so that takeover comes up to one
+lease (120 s) later than the claim's true end, never earlier. A claim taken
+before 021, which recorded no lease, is timed as the 600-second maximum.
+Monotonic clocks are not wall clocks: a holder whose host was suspended past
+its lease resumes believing its lease is live, exactly as before 021, and
+its token fence and the offer-before-landing lifecycle (a recovered
+`offer_reserved` row is never offered again) keep that safe.
+
+**Retries.** Every statement that schedules a retry writes `updated_at` from
+the same database clock as `next_attempt_at`. A row whose last write is later
+than the clock now proves the clock stepped back since, so its deadline is
+due at once: each claim poll reschedules such unclaimed rows to the clock (and
+logs `candidate retries were last written later than the database clock reads
+now, so the clock stepped back`). `candidates recover`'s release keeps the
+row's schedule, which its claim's own write may have hidden a step from, but
+never further ahead than the row's own backoff (`min(60, attempt_count)`
+seconds, `min(3600, 10 * attempt_count)` in reconciliation). A backward step
+therefore delays a retry by less than its own backoff, never by the step. A
+forward step makes a retry due early by up to its backoff; retries are pacing,
+not a safety property. A row parked for the operator (`next_attempt_at =
+'infinity'`) is never made due. A deadline set far ahead without a later
+`updated_at` (a test or operator hold) stays held by the claim polls, but a
+`candidates recover` release pulls it in to the row's own backoff.
+
+**Revoking a claim.** `ledger::revoke_candidate_claims` sets
+`claim_lease_seconds = 0` (and moves `claim_expires_at` into the past), so the
+next frontend to read the claim takes it over at once. The holder's token
+stays until then. The lease tests use it where waiting out a real lease is not
+deterministic. An operator may run the same statement only once the holder is
+known to be gone (its process stopped, or its host down for good):
+
+```sql
+UPDATE qbit_block_candidate_outbox
+SET claim_lease_seconds = 0,
+    claim_expires_at = LEAST(claim_expires_at, clock_timestamp() - interval '1 second')
+WHERE block_hash = '<hash>' AND claim_token IS NOT NULL;
+```
+
+**Upgrade (offline, per D5).** 021 adds the two columns, the
+`qbit_block_candidate_outbox_claimed_idx` partial index the claim poll reads
+claimed rows through, and the `candidate_claim_observed_lease = 1`
+capability. A pre-021 frontend takes claims over by the database clock and
+never writes the columns a post-021 frontend times, so the two must never
+run together. As for 018: stop every earlier frontend and one-shot tool,
+disable automatic restarts, and let every `qbit_prism_instances` row report
+`stopped` or `drained`; the migrator refuses any other instance before
+applying 021 and holds the registration lock through the commit. The
+capability refuses older binaries at every later connect; it cannot evict one
+that is already running. Start only post-021 binaries after the commit.
+Removing the capability or the columns is not a supported downgrade.
+
+CTV fanout claims follow the same contract since 022; see the next section.
+
+## CTV fanout claim leases and database clock steps (022, #654)
+
+Before 022 a CTV fanout claim was decided as candidate claims were before
+021: the claim lane took a fanout once `claim_expires_at` was before
+`clock_timestamp()` and its `next_broadcast_attempt_at` was due, and every
+write the holder made required `claim_expires_at` in the future. A forward
+database clock step made a live claim look expired: another frontend took the
+fanout over and broadcast the identical transaction (the node deduplicates
+it), and the holder's settlement write was refused and the attempt retried.
+A backward step made a dead holder's claim wait lease + step, and an attempt
+or a confirmation check scheduled before the step wait its delay + step.
+Nothing was broadcast twice in a way the node does not deduplicate; the cost
+was liveness. Since 022 a fanout claim is timed exactly as a candidate claim
+is (previous section):
+
+- **Leases.** A claim's version is (`claim_token`, `claim_renewals`) on
+  `qbit_ctv_fanout_artifacts`, and its lease `claim_lease_seconds` (1 to
+  600; the broadcaster takes 120 at every claim and renewal). Every fanout
+  claim poll (`Ledger::fanout_claim_survey_sql`) reads every claimed fanout's
+  version through the `qbit_ctv_fanout_artifacts_claimed_idx` partial index,
+  and a frontend takes a claimed fanout over only once it has watched the same
+  version for the whole lease on its own monotonic clock, by compare and set
+  on that version (`FOR UPDATE SKIP LOCKED`, so a holder's fenced write that
+  holds the row is never taken over mid-commit). The takeover runs before
+  the lane, which takes only unclaimed, due fanouts. A claimed fanout is taken
+  over whatever its schedule (the one it was due at when claimed, on the
+  clock of that moment), unless it is held at `infinity`.
+- **Holder.** Every write the holder makes (renewal, scan progress, CPFP
+  reservation, package and wallet cleanup, settlement and the hand-backs) is
+  fenced on its token alone. Its lease is its own monotonic deadline: one
+  attempt runs for at most 90 seconds, less than the 120-second lease every
+  renewal takes, and every renewal is sent inside the attempt, so the attempt
+  ends before any observer can end the lease of any version it wrote. Its
+  completion after that deadline is a compare and set on the token, refused
+  once a takeover has replaced it.
+- `claim_expires_at` is still written, as the database clock's estimate of
+  the lease's end, for operators. No decision reads it.
+
+What this costs is what it costs candidates: a frontend that starts while a
+dead holder's claim is in the table times it from its own first poll, so that
+takeover comes up to one lease (120 s) later than the claim's true end, never
+earlier. The one-shot `broadcast-ctv` times claims from its own first poll
+too, so within one pass it takes over only a revoked claim; a running
+frontend's broadcaster takes over a dead one's. To push a dead holder's
+fanout with `broadcast-ctv` while no frontend is running, revoke its claim
+first, as below. A claim taken before 022, which recorded no lease, is timed
+as the 600-second maximum.
+
+**Attempts and checks.** Every statement that schedules
+`next_broadcast_attempt_at` writes `updated_at` from the same database clock.
+Each fanout claim poll makes due, at once, every unclaimed fanout the lane
+could take whose last write is later than the clock now, which proves the
+clock stepped back (it logs `CTV fanout attempts were last scheduled later
+than the database clock reads now, so the clock stepped back`). A claim handed
+back at shutdown (`release_fanout_claim`) keeps its schedule, but never later
+than the clock: the fanout was due when it was claimed, and the release's own
+`updated_at` would otherwise hide a step from every claim poll. A backward
+step therefore delays an attempt or a confirmation check by less than its own
+delay, never by the step; a forward step makes them due early. A fanout held
+at `infinity` is never made due, and a schedule set far ahead without a later
+`updated_at` (a test or operator hold) stays held while the fanout is
+unclaimed. A claimed fanout is held only at `infinity`: its own schedule is no
+hold, because after a backward step it reads ahead although its holder died,
+so the takeover does not wait for it.
+
+**Revoking a claim.** `ledger::revoke_fanout_claims` sets
+`claim_lease_seconds = 0` (and moves `claim_expires_at` into the past), so the
+next frontend to read the claim takes it over at once; the holder's token
+stays until then. The fanout tests use it where waiting out a real lease is
+not deterministic. An operator may run the same statement only once the
+holder is known to be gone:
+
+```sql
+UPDATE qbit_ctv_fanout_artifacts
+SET claim_lease_seconds = 0,
+    claim_expires_at = LEAST(claim_expires_at, clock_timestamp() - interval '1 second')
+WHERE fanout_txid = '<txid>' AND claim_token IS NOT NULL;
+```
+
+**Upgrade (offline, per D5).** 022 adds the two columns, the
+`qbit_ctv_fanout_artifacts_claimed_idx` partial index and the
+`fanout_claim_observed_lease = 1` capability. A pre-022 frontend or
+`broadcast-ctv` takes fanout claims over by the database clock and never
+writes the columns a post-022 one times, so the two must never run together.
+Upgrade exactly as for 021, and together with it when both are pending: stop
+every earlier frontend and one-shot tool, disable automatic restarts, and let
+every `qbit_prism_instances` row report `stopped` or `drained`; the migrator
+refuses any other instance before applying 022 and holds the registration
+lock through the commit. The capability refuses older binaries at every later
+connect; it cannot evict one that is already running. Start only post-022
+binaries after the commit. Removing the capability or the columns is not a
+supported downgrade.
+
+### The claim lane and settled history (024, #668)
+
+Settled fanouts stay in `qbit_ctv_fanout_artifacts`: a fanout's row remains
+after its 1,000th confirmation, and mainnet adds about 65,000 to 130,000 a
+year at #521's block rate. Before 024 the claim lane's selection matched them
+on its status and schedule predicates and dropped them only after reading
+them, a sequential scan of the whole table on every claim. A broadcaster pass
+claims once per fanout it attempts, up to `PRISM_CTV_BROADCASTER_LIMIT`.
+
+Since 024 the lane (`Ledger::fanout_lane_sql`) gathers its candidates first,
+into one array, and looks only those up by primary key:
+- the due fanouts among those it may still claim, which are every fanout
+  still to broadcast or check (`broadcastable`, `broadcast_submitted`,
+  `failed`) and every confirmed one under 1,000 deep. They are read from the
+  partial index `qbit_ctv_fanout_artifacts_lane_idx`, keyed by
+  `next_broadcast_attempt_at`, as two ranges of it: never attempted (`NULL`)
+  and scheduled at or before `statement_timestamp()`;
+- the newest deep fanout, the checkpoint reconciliation keeps watching,
+  through `qbit_prism_fanout_checkpoint_idx`.
+
+It then applies its full predicate and order to them, as before. Due is read
+at `statement_timestamp()` so the index can serve it as a bound, which only
+means a fanout falling due during the claim statement itself waits for the
+next poll. The candidate query repeats the index's predicate, which must stay
+identical to it, or the planner cannot use the index.
+
+The survey every claim poll opens with (#654) reads the fanouts scheduled
+later than now through the broadcast index (`settlement_status`,
+`next_broadcast_attempt_at`): the watched fanouts waiting for their next
+check, never the settled ones, whose schedules are past.
+`ledger_postgres::fanout_lane_plan` plans and runs both statements, prepared,
+over 20,000 settled and 500 watched fanouts. It fails if either plans a
+sequential scan of the table, if the lane does not read its index or visits
+more rows than the few due, or if the survey visits more than the watched
+fanouts.
+
+Measured on PostgreSQL 16 with a warm cache, the lane statement prepared, per
+claim, with 7,500 watched fanouts: several times the 1,000 to 2,000 that
+today's block rate keeps under 1,000 deep.
+
+| settled fanouts | due now | before 024 | after 024 |
+| ---: | ---: | ---: | ---: |
+| 100,000 | 377 | 63 ms, sequential scan | 1.6 ms |
+| 100,000 | 7,502, all | 67 ms, sequential scan | 28 ms |
+| 1,000,000 | 377 | 357 to 372 ms, sequential scan | 1.8 to 2.0 ms |
+| 1,000,000 | 7,502, all | 412 ms, sequential scan | 38 ms |
+
+After 024 a claim costs what the due fanouts cost: one index entry and one
+primary-key lookup each, then a sort for the first. The settled history only
+deepens the primary key. A confirmed fanout under 1,000 deep is checked again
+5 seconds after each check, so a broadcaster that cannot check every watched
+fanout that often finds most of them due, and each claim then reads them all,
+as in the second and fourth rows. The survey took under 6 ms in the same
+runs.
+
+**Upgrade.** 024 is additive, as 019 and 020 are: no capability and no
+shutdown proof, and it is not applied offline. A binary that does not know
+the index never reads it. It is applied online, as 013 is: on an existing
+ledger `migrate` (or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds the
+index with `CREATE INDEX CONCURRENTLY` after the migration transaction
+commits, on its
+own connection without statement or lock timeouts, and records 24 once the
+index is valid. No write to `qbit_ctv_fanout_artifacts` waits for the build,
+a found block's landing and the broadcasters of frontends still running
+included. The build reads the table twice and waits for the transactions
+already open to finish: about 0.6 s for 1,000,000 settled fanouts on a warm
+cache, against 0.2 s for a plain `CREATE INDEX`. Until 24 is recorded every start
+of a 024 binary refuses the database, as for any missing migration. An
+interrupted build leaves an invalid index that the next run drops and
+builds again. A fresh or empty source applies 024 inside the migration
+transaction.
 
 ## Chain observation epoch upgrade (018)
 
@@ -1327,7 +1624,10 @@ qbit-prism-server broadcast-ctv
 
 The integrated periodic worker uses `PRISM_CTV_BROADCASTER_ENABLED=1`. An optional
 CPFP wallet and fee configuration must be consistent with the intended operating
-policy. Durable claims coordinate work across instances; node RPCs may still
+policy. Durable claims coordinate work across instances, timed on each
+frontend's monotonic clock rather than the database clock (see
+[CTV fanout claim leases](#ctv-fanout-claim-leases-and-database-clock-steps-022-654));
+node RPCs may still
 receive an identical transaction more than once after a lost reply. The one-shot
 `broadcast-ctv` verifies the node, the schema and the cluster fingerprint like a
 frontend but registers no heartbeat: its claims are fenced by their own claim
@@ -1370,6 +1670,169 @@ Automatic replacement fee bumps and abandoned-reservation release are not
 implemented; retain and reconcile the durable reservation when handling those
 cases manually.
 
+## Block submission kill switch for rehearsals
+
+A rehearsal (#291) runs production frontends against a restored copy of the
+mainnet ledger and a real mainnet node. Hold the restored ledger itself with
+`submission-hold set` before any frontend starts on it
+([below](#holding-the-whole-cluster-023-664)), so that it holds every frontend
+that connects to it, and start every frontend of the rehearsal with
+`PRISM_BLOCK_SUBMIT_ENABLED=0` as well, so that no found block and no
+transaction it handles can reach the network:
+
+| Path | With `PRISM_BLOCK_SUBMIT_ENABLED=0` |
+| --- | --- |
+| Found blocks | Validated, credited and enqueued as usual, and the outbox row stays `pending`. The submit loop claims no row at all, so `submitblock` is never called, and no row, restored ones included, is reserved, offered, settled or abandoned. A block proof below the miner's share target is credited only once its block confirms, so it is answered `ledger-outcome-unknown` after `PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`, as with a stuck outbox. |
+| CTV fanouts | The periodic broadcaster does not start, even with `PRISM_CTV_BROADCASTER_ENABLED=1`, and `broadcast-ctv` exits non-zero before it connects. No `sendrawtransaction`, `submitpackage` or CPFP wallet call is made. |
+| Everything else | Unchanged: templates, tip polling, readiness, Stratum, share acknowledgement, rollups and every write to the rehearsal database. `candidates recover` still lands blocks the node has already accepted; it never offers one. |
+
+Inside the process, the claim's processing and the broadcaster pass refuse
+under the switch as well, and the frontend's node client, its wallet clients
+included, refuses every call that would relay a block or a transaction
+(`submitblock`, `sendrawtransaction`, `submitpackage` and the wallet's own
+sends) before sending it. So no other caller reaches the network either. The
+switch is per frontend and is read at startup; `0`, `false`, `no` and `off`
+all turn it off. A frontend started without it offers every `pending` row it
+can claim, held ones included, so set it on every frontend that shares the
+rehearsal database, and restart a frontend to change it. As an independent
+second layer, give the rehearsal frontends a node RPC user that cannot call
+`submitblock`, `sendrawtransaction` or `submitpackage`, for example with
+Bitcoin Core's `-rpcwhitelist` where the qbitd build supports it.
+
+Verify the mode before admitting miners:
+
+- `check-config` prints `WARNING: block submission is disabled by
+  PRISM_BLOCK_SUBMIT_ENABLED: ...` as its first line, followed by a second
+  warning when a configured CTV broadcaster is held. It still exits 0, in
+  production mode too, because a rehearsal on mainnet runs in production mode.
+- `self-check` reports `"block_submission": {"enabled": false, ...}` for its
+  own environment and repeats the warning on stderr. Its
+  `live_instances.instances[].status.block_submission_enabled` is each running
+  frontend's own value, read from its heartbeat; every one must be `false`. A
+  frontend that is still starting is listed under `inactive_instances` until
+  its first health publication, so run `self-check` again once it is up.
+- `/healthz` carries `block_submission_enabled`, and `/metrics` reads
+  `qbit_prism_block_submission_enabled 0` from startup.
+- `qbit-prism-server submission-hold show` reports `"held": true`, and each
+  frontend's heartbeat carries `"held": true` in `block_submission_hold`
+  ([below](#holding-the-whole-cluster-023-664)).
+- Each frontend logs a warning at startup that ends `the submit loop claims no
+  candidate`, and, when a broadcaster was configured, one that it is held.
+
+A held block looks like any other pending candidate:
+`qbit_prism_block_candidates_pending` and
+`qbit_prism_block_candidate_oldest_pending_seconds` count and age it,
+`candidates list` shows it `pending`, and the pending-candidate alerts fire as
+they would for a stuck outbox. `PrismBlockSubmissionHeld` pages a minute after
+each held frontend starts, independently of any found block, because
+`qbit_prism_block_submission_enabled` is not 1 (#666). All of that is expected
+during a rehearsal. Scrape the rehearsal's frontends under another job or
+network, or silence `PrismBlockSubmissionHeld` and the pending-candidate alerts
+for the rehearsal, so they do not reach production paging. Scope such a silence
+with matchers on the rehearsal frontends' `instance` labels, never on the alert
+name alone: that would also hide a production frontend left held, which is what
+`PrismBlockSubmissionHeld` exists to page.
+
+After the rehearsal, do not start a frontend with submission enabled against
+the rehearsal database while held rows remain. That frontend would offer each
+one to its node, and a leased candidate skips the pre-offer staleness screen.
+Discard the database, or first abandon each held row with `candidates
+abandon`. Production frontends run with the setting unset or `1`; the
+[go-live checks](mainnet-deployment.md#go-live-checks) confirm it.
+
+### Holding the whole cluster (023, #664)
+
+`PRISM_BLOCK_SUBMIT_ENABLED` holds one frontend, and only one started with it.
+A hold stored in the ledger holds every frontend that connects to that ledger,
+whatever its own setting says, so a frontend started without the variable on
+a rehearsal database still sends its node nothing:
+
+```sh
+qbit-prism-server submission-hold set --reason "#291 rehearsal on a restored ledger"
+qbit-prism-server submission-hold show
+qbit-prism-server submission-hold clear --reason "<why>" [--offer-pending-candidates]
+```
+
+While the hold is set:
+
+- No frontend claims a block candidate, in any state, so `submitblock` is
+  never called and every row stays as it is. That includes `offered` and
+  `reconciliation` rows: the landing, crediting and fanouts of a block already
+  sent wait for the hold to clear. `candidates recover` still lands a block
+  the node has already accepted, and never offers one.
+- An offer's reservation reads the hold in its own transaction, `FOR SHARE`
+  on the hold's own row, which `set` locks `FOR UPDATE`. A hold therefore
+  commits either before a reservation, which is then refused and leaves its
+  row `pending`, or after one that already reserved, whose single offer
+  completes. Nothing else locks that row and the read takes no lock on the
+  cluster row, so it adds no wait behind a landing or blob GC: a leased
+  candidate's reservation still locks nothing there.
+- No frontend's CTV broadcaster claims or sends a fanout, and `broadcast-ctv`
+  refuses; confirmation tracking of fanouts already sent waits too. A hold set
+  during an attempt hands its claim back unattempted before the send; a send
+  already past that check completes.
+- Everything else runs as usual, as under `PRISM_BLOCK_SUBMIT_ENABLED=0`.
+
+Running frontends obey a hold at their next claim, within a submit-loop tick,
+and report it at their next health publication:
+
+- Each logs `the cluster holds block submission` once, and logs again when
+  the hold is cleared.
+- `/healthz` and the heartbeat keep `block_submission_enabled` as the
+  frontend's own setting, so a frontend started without the variable still
+  shows, and carry the hold as `block_submission_hold`: `held`, `reason`,
+  `set_at` and `set_by`, as the frontend last read it. `held` is null until
+  its first read succeeds; a later failed read keeps the last one, so a
+  database outage does not report the frontend as held.
+- `qbit_prism_block_submission_enabled` reads 0 while the setting or the hold
+  holds blocks back, and -1 while the setting is on but the frontend has not
+  yet read the hold. While a cluster is held, `PrismBlockSubmissionHeld` therefore pages for
+  every frontend: scope a rehearsal's or a cutover's alerting as
+  [above](#block-submission-kill-switch-for-rehearsals).
+- `self-check` reports the hold as `submission_hold` and warns on stderr.
+  `check-config` never reads the database and says where the hold is reported.
+
+`set` and `clear` need only `PRISM_DATABASE_URL`, and both require `--reason`.
+They use the operator connection, which works while frontends run and on a
+halted cluster, and print the resulting hold as JSON. `set` keeps a hold
+already in force, with its original reason. `clear` is refused while any
+candidate is `pending`, because every frontend with submission enabled would
+then offer those blocks; pass `--offer-pending-candidates` only when they
+should be offered. `show` opens the database read-only, gives up after 15
+seconds, and also reads a ledger from before 023, which reports
+`"schema_supports_hold": false`.
+
+Each `set` that holds the cluster and each `clear` that releases it is
+journaled in the append-only `qbit_prism_submission_hold_events`, with who ran
+it, why, and how many candidates were pending. A `set` that finds a hold in
+force, a `clear` that finds none and a refused `clear` change nothing and
+record nothing. `show` prints the latest event as `last_event`; the whole
+history is:
+
+```sql
+SELECT event_id, action, recorded_at, operator_identity, database_role,
+       reason, pending_candidates
+FROM qbit_prism_submission_hold_events
+ORDER BY event_id;
+```
+
+Migration 023 adds the hold's row and its journal and declares
+`block_submission_hold = 1`, so a binary older than the hold, which would
+ignore it, refuses the database at connect. 023 is applied offline in the same
+stopped window as the rest of `migrate`, like 021 and 022.
+
+**Rehearsal.** Restore, run `migrate`, then `submission-hold set` before any
+frontend starts, and confirm `"held": true` with `show`. Never clear the hold
+on a rehearsal database: discard the database afterwards.
+
+**Cutover.** The hold can also keep a freshly migrated production ledger from
+the network until the frontends are verified. Run `submission-hold set` after
+`migrate`, in the stopped window. Start and verify the frontends. Then run
+`submission-hold clear --reason ...`, which a drained source allows because it
+has no pending candidates, and confirm `"held": false` with `show` before
+admitting miners. The [go-live checks](mainnet-deployment.md#go-live-checks)
+require it.
+
 ## Retry, replay and deadline contract
 
 The ledger never replays SQL automatically. After a `statement_timeout`
@@ -1392,7 +1855,7 @@ Every later attempt is a separate public operation with its own claim.
 | --- | --- | --- | --- | --- |
 | Candidate terminal disposition: `finish_candidate`, `finish_candidate_at_revision` | never-retried mutation | none | The same live claim may invoke again after a reported error; otherwise the worker calls `retry_candidate`. A consumed claim is rejected and writes nothing. | dynamic: `candidate_terminal_timeout_executes_once` |
 | Candidate backoff: `retry_candidate` | explicit later operation | none | Releases the claim, records the error and advances `next_attempt_at` by `min(60, attempt_count)` seconds, or `min(3600, 10 × attempt_count)` for a `reconciliation` row. It does not re-run the failed write and never changes the row's lifecycle state. A fresh `claim_candidate` after that time is the next attempt, with a new token; the old token stays rejected. | dynamic: `candidate_backoff_requires_new_claim`; `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once` |
-| Offer lifecycle: `reserve_offer`, `record_offer`, `release_unsent_offer`, `adopt_active_candidate`, `reconcile_candidate` | never-retried mutations, claim-fenced | none | Each is one state transition of the live claim's row (`pending` to `offer_reserved`, `offer_reserved` to `offered`, `offer_reserved` back to `pending` after a `submitblock` that never established its connection (#522) or that the node answered from its warmup (#526), `pending` to `reconciliation`, an offered state to `reconciliation`) and is rejected once the claim is lost or the row has moved on. A reported error after `reserve_offer` leaves the reservation in place: the next claim, on any frontend, treats the row as delivery unknown and never calls `submitblock` for it. | `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once`, `candidate_lease_tests::token_loss_between_heartbeats_is_fenced_immediately_before_submitblock`, `candidate_lease_tests::crash_after_offer_before_landing_recovers_on_another_frontend_without_a_second_offer`, `candidate_lease_tests::offer_not_sent_tests::*` (#522, #526), `offer_not_executed_tests` (#526), `rpc_not_sent`, `live_regtest::node_outage_tests::node_killed_before_submitblock_lands_the_block_once_after_restart`, `live_regtest::node_outage_tests::node_restarted_into_warmup_before_submitblock_lands_the_block_once` (#526) |
+| Offer lifecycle: `reserve_offer`, `record_offer`, `release_unsent_offer`, `adopt_active_candidate`, `reconcile_candidate` | never-retried mutations, claim-fenced | none | Each is one state transition of the live claim's row (`pending` to `offer_reserved`, `offer_reserved` to `offered`, `offer_reserved` back to `pending` after a `submitblock` that never established its connection (#522) or that the node answered from its warmup (#526), `pending` to `reconciliation`, an offered state to `reconciliation`) and is rejected once the claim is lost or the row has moved on. A reported error after `reserve_offer` leaves the reservation in place: the next claim, on any frontend, treats the row as delivery unknown and never calls `submitblock` for it. | `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once`, `candidate_lease_tests::token_loss_between_heartbeats_is_fenced_immediately_before_submitblock`, `candidate_lease_tests::crash_after_offer_before_landing_recovers_on_another_frontend_without_a_second_offer`, `candidate_lease_tests::offer_not_sent_tests::*` (#522, #526), `offer_not_executed_tests` (#526), `rpc_not_sent`, `live_regtest::node_outage_tests::node_killed_before_submitblock_lands_the_block_once_after_restart`, `live_regtest::node_outage_tests::node_restarted_into_warmup_before_submitblock_lands_the_block_once` (#526), `live_regtest::lost_reply_tests::lost_submitblock_reply_owner_killed_survivor_lands_the_block_once` (#474: the owning frontend killed with the node's acceptance unheard) |
 | CTV attempt journal: `finish_fanout` | never-retried mutation; one journal row per authorized claim | none | Every recorded attempt, `failed` included, releases the claim and schedules `next_broadcast_attempt_at` (10 s per attempt, at most 3600 s). A fresh `claim_fanout` after that time is the next attempt and its own journal row; the old token stays rejected. | dynamic: `fanout_journal_timeout_executes_once`, `broadcast_retry_requires_new_claim` |
 | Claims: `claim_candidate`, `claim_fanout`, `renew_candidate_claim`, `renew_fanout_claim` | public reinvocation | none | One token per block hash or fanout. Distinct hashes have independent leases. Candidate terminal dispositions acquire the shared `SETTLEMENT_LOCK`, then `ORDER_LOCK`. The cited test verifies that a disposition does not touch a sibling candidate's locked outbox row; it does not establish concurrent execution of dispositions. | dynamic: `distinct_hashes_hold_independent_claims` |
 | Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |
@@ -1683,6 +2146,86 @@ carries. `candidates recover` cannot land it: it refuses a hash with no
 candidate row. The HA reference's
 [found-block section](prism-ha-reference-architecture.md#found-blocks-a-bounded-standby-flush-before-the-offer-529)
 has the measurements and the accepted-loss statement.
+
+### Work from a lost replication gap (#619)
+
+An asynchronous promotion can also lose the end of the share history that
+work was read from: shares credited in the gap, after the standby's last
+received WAL. The promoted sequence then hands their `share_seq` values out
+again to other shares. Every frontend tags the work it prepares with the
+writer timeline its window was read on (PostgreSQL increments it at every
+promotion), and every check below revalidates on the primary that would hold
+the result:
+
+- **Refresh.** A changed timeline replaces published work at the next poll,
+  even on an unchanged template, revision and balances. The rebuild is
+  counted under `qbit_prism_refresh_seconds{trigger="writer_timeline"}` and
+  logged as `refresh published` with `trigger=writer_timeline`.
+- **Issuance and resume.** Work read on another timeline, or reconstructed
+  from a stored record, is issued only while the primary holds its window's
+  last row as the window's own row. Until the refresh rebuilds, a new session
+  is sent no job: nothing is answered on the wire, and the session retries its
+  build on its timer and at the next publication. The frontend logs `job
+  preparation deferred` (or `job persistence deferred`) with `window_not_held:
+  the work's window is not held by this primary after a writer timeline change
+  (#619)`. A prepared record is never written back, by the repair or by
+  `save_compact_prepared`, unless its window is held.
+- **Found blocks.** The candidate enqueue, in the transaction that would write
+  the candidate, refuses a block whose window this primary does not hold. The
+  miner is answered `stale-job`, the share the proof carried is not credited,
+  `qbit_prism_stale_job_rejections_total{cause="window_not_held"}` counts it
+  and a WARN names the block: `block refused stale-job before its offer: this
+  primary does not hold the window its coinbase pays, which a promotion lost or
+  reissued (#619)`. Nothing is enqueued or offered. The ledger counts the
+  refusal itself, so one that finishes after the miner's acknowledgement
+  deadline is counted too; that miner was answered `ledger-outcome-unknown`.
+  A block whose window replicated, including on work prepared before a planned
+  switchover or on a job resumed after the promotion, lands as before.
+
+**Precondition: synchronized database clocks.** The check compares the window's
+last row with the window's anchor by time: the row must be accepted and issued
+no later than the anchor. A share reissued after the promotion is stamped with
+the promoted host's clock, so it fails the check only while that clock does not
+lag the old primary's by more than the time from the last gap work to the first
+reissued share, a few seconds. Keep every database host NTP-synchronized. If the
+promoted host's clock lags further, a block on gap work can pass the check, be
+offered, and end in `reconciliation` with a window digest mismatch, as before
+#619; reconcile it as below.
+
+A refused block is a lost reward, like a block found in the gap and never
+offered. Record each WARN's hash with the failover's reconciliation. The design
+note [`prism-async-promotion-gap-blocks.md`](prism-async-promotion-gap-blocks.md)
+has the analysis and the options that were weighed.
+
+**A candidate already in `reconciliation` after a promotion.** A block offered
+before this check existed, or by a frontend still running an older release
+during a rolling upgrade, can be on chain while its window is not held. Its
+landing fails with a `last_error` that starts `window not held by this
+primary` (older releases: `window range incomplete: … read 0`; under the clock
+precondition above: a window digest mismatch). The row is retried read-only and never offered again, and
+`abandon` refuses it, because it is not `pending`. Treat it as an
+accounting-loss reconciliation, as
+[promotion step 6](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint)
+does for a block on chain with no candidate:
+
+1. Confirm the block is on the node's active chain (`getblockheader <hash>`,
+   `confirmations` of at least 1) and record its coinbase.
+2. Record the divergence. The coinbase paid the lost window and the as-issued
+   prior balances, which the promoted ledger still carries, so the next
+   landings pay those balances again, up to the block's positive as-issued
+   float. The block's accruals (gross it carried for accounts below the payout
+   floor) are never credited.
+3. **With CTV settlement on,** the coinbase's covenant outputs can only be
+   spent by fanout transactions built from the lost window, and there is no
+   pool spend key. No tool rebuilds a fanout from exported rows today, and
+   `candidates recover` cannot land a window the primary does not hold, so
+   recovering those outputs needs engineering work; record the block for it.
+   What the operator can do now is keep that recovery possible: do not
+   rewind the fenced old primary, rebuild it from the new primary or start it
+   as a writer until the window's rows (the candidate's
+   `window_first_share_seq..window_last_share_seq`, on the old timeline) have
+   been copied out of an isolated copy of its data directory. Without those
+   rows the covenant amount stays unspendable.
 
 SIGTERM closes listener admission and asks tasks to drain before the database
 pool closes. The native server bounds shutdown drain to 30 seconds; unfinished

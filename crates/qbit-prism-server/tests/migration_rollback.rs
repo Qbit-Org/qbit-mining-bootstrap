@@ -1390,6 +1390,43 @@ async fn assert_native_metadata_required(
             .contains("missing required native migrations"));
         ensure!(recovery::evidence(source, pg_bin).await? == *native);
     }
+    // A share-hash backfill still pending (#582) is refused as startup
+    // refuses it, even with 2 recorded: the mapping would be exported partial.
+    sqlx::raw_sql("CREATE TABLE qbit_prism_share_hash_backfill(singleton boolean PRIMARY KEY DEFAULT true, start_seq bigint NOT NULL, next_seq bigint NOT NULL, end_seq bigint NOT NULL); INSERT INTO qbit_prism_share_hash_backfill(start_seq,next_seq,end_seq) VALUES(1,1,2)")
+        .execute(&source.pool)
+        .await?;
+    let pending = recovery::evidence(source, pg_bin).await;
+    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
+        .execute(&source.pool)
+        .await?;
+    ensure!(
+        pending.is_err(),
+        "a pending share-hash backfill was exported"
+    );
+    ensure!(pending
+        .unwrap_err()
+        .to_string()
+        .contains("share-hash backfill has not finished"));
+    ensure!(recovery::evidence(source, pg_bin).await? == *native);
+    // So is its fence without the cursor, which startup refuses (#669).
+    sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('share_hash_backfill_pending',1)")
+        .execute(&source.pool)
+        .await?;
+    let fenced = recovery::evidence(source, pg_bin).await;
+    sqlx::query(
+        "DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'",
+    )
+    .execute(&source.pool)
+    .await?;
+    ensure!(
+        fenced.is_err(),
+        "a share-hash backfill fence without its cursor was exported"
+    );
+    ensure!(fenced
+        .unwrap_err()
+        .to_string()
+        .contains("declares share_hash_backfill_pending = 1"));
+    ensure!(recovery::evidence(source, pg_bin).await? == *native);
     // Unknown additive migrations do not prevent this release from starting.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(999)")
         .execute(&source.pool)
@@ -1480,7 +1517,7 @@ async fn assert_native_metadata_required(
         ),
         (
             "DELETE FROM qbit_prism_schema_capabilities".into(),
-            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1),('chain_observation_epoch',1)".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1),('candidate_offer_lifecycle',1),('instance_offer_startup',1),('candidate_orphan_disposition',1),('chain_observation_epoch',1),('candidate_claim_observed_lease',1),('fanout_claim_observed_lease',1),('block_submission_hold',1)".into(),
             "has no candidate_storage_version row",
         ),
         (
@@ -1532,6 +1569,36 @@ async fn assert_native_metadata_required(
             "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='chain_observation_epoch'".into(),
             "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='chain_observation_epoch'".into(),
             "chain_observation_epoch",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='candidate_claim_observed_lease'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_claim_observed_lease',1)".into(),
+            "candidate_claim_observed_lease",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='candidate_claim_observed_lease'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='candidate_claim_observed_lease'".into(),
+            "candidate_claim_observed_lease",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='fanout_claim_observed_lease'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('fanout_claim_observed_lease',1)".into(),
+            "fanout_claim_observed_lease",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='fanout_claim_observed_lease'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='fanout_claim_observed_lease'".into(),
+            "fanout_claim_observed_lease",
+        ),
+        (
+            "DELETE FROM qbit_prism_schema_capabilities WHERE capability='block_submission_hold'".into(),
+            "INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('block_submission_hold',1)".into(),
+            "block_submission_hold",
+        ),
+        (
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=2 WHERE capability='block_submission_hold'".into(),
+            "UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='block_submission_hold'".into(),
+            "block_submission_hold",
         ),
         (
             "ALTER TABLE qbit_prism_cluster RENAME COLUMN chain_epoch TO saved_chain_epoch".into(),

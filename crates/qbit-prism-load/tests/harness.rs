@@ -14,7 +14,7 @@ use qbit_prism_load::{
     frontend::{self, FrontendSpec, SharedEnvironment},
     measure,
     node::{self, NodeState},
-    profile, proxy, run, window,
+    profile, proxy, run, settlement, window,
 };
 use qbit_prism_server::{
     capacity::{validate_capacity_evidence, CONFIGURATION_KEYS, REQUIRED_PHASES, SUBJECT_KEYS},
@@ -1189,19 +1189,22 @@ async fn serve_stratum(
     }
 }
 
+/// Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share search
+/// costs microseconds even in a debug build.
+const SESSION_DIFFICULTY: f64 = 1.0 / 67_108_864.0;
+
 fn session_config(index: usize) -> client::SessionConfig {
     client::SessionConfig {
         index,
         username: format!("pload1test.s{index:05}"),
         password: "x".into(),
-        // Diff 1 is 2^32 hashes per share; 2^-26 is about 64, so a share
-        // search costs microseconds even in a debug build.
-        share_difficulty: 1.0 / 67_108_864.0,
+        difficulty: client::DifficultySource::Configured(SESSION_DIFFICULTY),
         version_rolling_mask: codec::VERSION_ROLLING_MASK,
         connect_timeout: std::time::Duration::from_secs(5),
         handshake_timeout: std::time::Duration::from_secs(20),
         // What the run derives from the default 15 s commit timeout.
         quiesce_limit: run::drain_limit(15.0),
+        drop_offers_held_while_disconnected: false,
     }
 }
 
@@ -1237,6 +1240,7 @@ async fn quiesced_submit(
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let config = client::SessionConfig {
         quiesce_limit,
@@ -1302,6 +1306,7 @@ async fn a_reconnect_across_several_failed_attempts_reports_the_whole_outage() -
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(session_config(0), 0, server.address.clone(), shared, 1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1390,6 +1395,7 @@ async fn a_disconnected_session_flushes_its_census_through_the_collector() -> Re
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(session_config(0), 0, "127.0.0.1:1".into(), shared, 1);
     assert!(handle.try_offer(1, &Arc::from("mid_flight_kill")));
@@ -1436,6 +1442,7 @@ async fn work_that_reaches_a_disconnected_session_is_reported_not_dropped() -> R
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     // Nothing listens on port 1, so the session never holds a connection.
     let handle = client::spawn_session(session_config(3), 1, "127.0.0.1:1".into(), shared, 1);
@@ -1562,6 +1569,7 @@ async fn a_queued_offer_is_recorded_under_the_phase_that_offered_it() -> Result<
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1639,6 +1647,7 @@ async fn a_reconnect_is_attributed_to_the_phase_that_asked_for_it() -> Result<()
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -1711,7 +1720,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
 
     // The observation: a session reports the disagreement with the values
     // on both sides, and still connects and holds work.
-    let configured = session_config(0).share_difficulty;
+    let configured = SESSION_DIFFICULTY;
     let server = fake_stratum_with(StratumOptions {
         advertised_difficulty: Some(configured / 2.0),
         ..Default::default()
@@ -1723,6 +1732,7 @@ async fn an_advertised_difficulty_other_than_the_configured_one_refuses_qualific
         events,
         record_notifies: std::sync::atomic::AtomicBool::new(false),
         kill_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let handle = client::spawn_session(
         session_config(0),
@@ -3065,6 +3075,14 @@ fn the_rejection_classifier_separates_harness_bugs_from_expected_races() {
         (
             rejection(
                 20,
+                Some("backend-database-unavailable"),
+                "current payout state is unavailable",
+            ),
+            RejectionClass::Backend,
+        ),
+        (
+            rejection(
+                20,
                 Some("ledger-confirmation-failed"),
                 "share was not confirmed by the database",
             ),
@@ -3483,6 +3501,7 @@ fn driven(name: &str, kill_indeterminate: &[&str]) -> run::DrivenPhase {
             .iter()
             .map(|id| (*id).to_owned())
             .collect(),
+        fault_excused: Default::default(),
     }
 }
 
@@ -6171,6 +6190,7 @@ async fn a_socket_closed_before_the_kill_is_not_stamped_as_kill_induced() -> Res
         events,
         record_notifies: AtomicBool::new(false),
         kill_fence: kill_fence.clone(),
+        stopping: Arc::new(AtomicBool::new(false)),
     });
     // The session gets its own single-threaded runtime on its own thread. The
     // gate below parks the session task on a `std` lock, and a parked thread
@@ -10571,4 +10591,948 @@ fn process_cpu_seconds_covers_cpu_the_process_really_spent() {
         spent <= ceiling,
         "process CPU rose by {spent} s, more than {cores} cores could spend in the time ({ceiling} s)"
     );
+}
+
+/// #554: a database failover's verdict proves which acknowledged shares lie
+/// in the replication gap, and which commits were answered
+/// `ledger-outcome-unknown` while the primary was going. Only those are
+/// excused from the durability finding and the divergence bucket; a share
+/// the database lost for any other reason in the same phase is still exit 4.
+#[test]
+fn a_failover_excuses_only_the_losses_its_verdict_proves() {
+    use qbit_prism_load::client::Outcome;
+    use qbit_prism_load::run::{classify_gaps, DrivenPhase};
+    use std::collections::BTreeSet;
+    let set =
+        |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+    let with = |id: &str, outcome: Outcome| client::SubmitRecord {
+        share_id: id.to_owned(),
+        ..submit_record("faults", outcome)
+    };
+    let unknown = || {
+        Outcome::Rejected(rejection(
+            20,
+            Some(qbit_prism_load::classify::LEDGER_OUTCOME_UNKNOWN),
+            "ledger outcome unknown",
+        ))
+    };
+    let records = vec![
+        with("kept", Outcome::Accepted),
+        with("in-gap", Outcome::Accepted),
+        with("lost", Outcome::Accepted),
+        with("unknown-committed", unknown()),
+    ];
+    let committed = set(&["kept", "unknown-committed"]);
+    let (offered, acknowledged) = run::offered_and_acknowledged(&records, "faults");
+    let reconciliation = digest::reconcile(offered, acknowledged, &committed);
+    let attribution =
+        digest::attribute_unexpected(&committed, &[("faults".to_owned(), &reconciliation)]);
+    let gaps = |excused: &[&str]| {
+        classify_gaps(
+            &[DrivenPhase {
+                name: "faults".into(),
+                kill_indeterminate: BTreeSet::new(),
+                fault_excused: set(excused),
+            }],
+            &[("faults".to_owned(), reconciliation.clone())],
+            &attribution,
+            &records,
+            15.0,
+        )
+    };
+    // Nothing excused: both losses are findings, and the unknown commit is
+    // in its bucket.
+    let plain = gaps(&[]);
+    assert_eq!(plain.findings[0]["count"], json!(2), "{}", plain.findings);
+    assert_eq!(plain.unknown_outcome_commits.len(), 1);
+    // The fault's proven gap and its unknown answer are excused; `lost`,
+    // which the verdict did not prove, is still a finding.
+    let excused = gaps(&["in-gap", "unknown-committed"]);
+    assert_eq!(
+        excused.findings[0]["count"],
+        json!(1),
+        "{}",
+        excused.findings
+    );
+    assert_eq!(excused.findings[0]["sample"], json!(["lost"]));
+    assert!(excused.unknown_outcome_commits.is_empty());
+}
+
+// --- CTV settlement (#548) -------------------------------------------------
+
+/// The environment the first frontend of a fake-node run launches with, for
+/// `extra` added to a bare command line.
+fn launched_environment(extra: &[&str]) -> Result<BTreeMap<String, String>> {
+    use clap::Parser;
+    use qbit_prism_load::cli::Args;
+    let args =
+        Args::try_parse_from(std::iter::once("qbit-prism-load").chain(extra.iter().copied()))?;
+    let spec = FrontendSpec {
+        index: 0,
+        instance_id: "load-fe-0".into(),
+        stratum_port: 3340,
+        audit_port: 3341,
+        database_url: "postgresql://u@127.0.0.1:5432/postgres".into(),
+    };
+    let shared = run::shared_environment(
+        &args,
+        "http://127.0.0.1:1/".into(),
+        "secret".into(),
+        "0.0000000122070312".into(),
+    );
+    Ok(run::launch_environment(
+        &shared,
+        &spec,
+        args.pool_fee_bps,
+        &frontend::pool_fee_address("pload1run"),
+        args.ctv_settlement,
+        args.node_mode()?,
+    ))
+}
+
+/// `--ctv-settlement` sets exactly the CTV keys mainnet's configuration
+/// sets, to mainnet's values, through the one composition the run launches
+/// with; the broadcaster stays off; and without the flag the environment is
+/// unchanged (EP-CONFIG). Each key is one `config.rs` reads.
+#[test]
+fn ctv_settlement_sets_mainnets_ctv_keys_and_leaves_the_broadcaster_off() -> Result<()> {
+    let off = launched_environment(&[])?;
+    let on = launched_environment(&["--ctv-settlement"])?;
+    assert_eq!(off["PRISM_CTV_SETTLEMENT_ENABLED"], "0");
+    assert!(!off.contains_key("PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"));
+    assert!(!off.contains_key("PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"));
+    let changed: BTreeMap<&String, &String> = on
+        .iter()
+        .filter(|(key, value)| off.get(*key) != Some(*value))
+        .collect();
+    let mainnet = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/mainnet-compose.env"
+    ))?;
+    let mainnet: BTreeMap<&str, &str> = mainnet
+        .lines()
+        .filter(|line| line.starts_with("PRISM_CTV_"))
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let expected = [
+        "PRISM_CTV_SETTLEMENT_ENABLED",
+        "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT",
+        "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS",
+    ];
+    assert_eq!(
+        changed.keys().map(|key| key.as_str()).collect::<Vec<_>>(),
+        {
+            let mut keys = expected.to_vec();
+            keys.sort_unstable();
+            keys
+        },
+        "the flag changes the CTV keys and nothing else"
+    );
+    let config = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../qbit-prism-server/src/config.rs"
+    ))?;
+    for key in expected {
+        assert_eq!(
+            on[key], mainnet[key],
+            "{key} is the value mainnet-compose.env pins"
+        );
+        assert!(
+            config.contains(&format!("\"{key}\"")),
+            "{key} is read by the server's config.rs"
+        );
+    }
+    assert_eq!(on["PRISM_CTV_BROADCASTER_ENABLED"], "0");
+    assert_eq!(mainnet["PRISM_CTV_BROADCASTER_ENABLED"], "1");
+    // A real node's chain key and the pool fee compose with it as before.
+    let real = launched_environment(&["--ctv-settlement", "--node", "qbitd"])?;
+    assert_eq!(real["QBIT_CHAIN"], "regtest");
+    assert_eq!(real["PRISM_CTV_SETTLEMENT_ENABLED"], "1");
+    assert_eq!(real["PRISM_POOL_FEE_ENABLED"], "1");
+    Ok(())
+}
+
+/// The fake node's relay floor is the rate a CTV frontend pins, so the
+/// server's floor check (`validated_ctv_fee_policy`) admits it.
+#[tokio::test]
+async fn the_fake_nodes_relay_floor_admits_the_pinned_ctv_fee_rate() {
+    let state = NodeState::new(window::TEMPLATE_BITS, "pload1");
+    let answer = state
+        .handle(&json!({"id": 1, "method": "getmempoolinfo", "params": []}))
+        .await;
+    for name in ["minrelaytxfee", "mempoolminfee"] {
+        let coins: f64 = answer["result"][name]
+            .as_str()
+            .expect("a decimal string")
+            .parse()
+            .expect("a decimal");
+        let bits = (coins * 1e8).round() as u64;
+        assert!(
+            bits <= frontend::CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT,
+            "{name}: floor {bits} above the pinned rate"
+        );
+    }
+}
+
+fn landed(
+    hash: &str,
+    direct: u64,
+    fanout: u64,
+    carried: u64,
+    chunks: u64,
+) -> settlement::BlockSettlement {
+    settlement::BlockSettlement {
+        block_hash: hash.into(),
+        block_height: 101,
+        chain_state: "confirmed".into(),
+        settlement_mode: if chunks == 0 {
+            "direct_coinbase".into()
+        } else {
+            "hybrid_coinbase_ctv_fanout".into()
+        },
+        direct_recipients: direct,
+        fanout_recipients: fanout,
+        carried_recipients: carried,
+        fanout_chunks: chunks,
+        fanout_outputs: fanout,
+        unreadable_chunks: 0,
+    }
+}
+
+/// A landed block with no fanout measured 0 fanout recipients; a run with no
+/// landed block measured nothing, and says so rather than reporting 0; an
+/// accepted block with no landing is listed, not counted; a failed read
+/// leaves every count null (EP-OBSERVABILITY).
+#[test]
+fn the_settlement_block_keeps_unmeasured_apart_from_zero() {
+    let hashes = vec!["aa".to_owned(), "bb".to_owned()];
+
+    let direct_only = settlement::report(false, &hashes[..1], Ok(vec![landed("aa", 12, 0, 3, 0)]));
+    assert_eq!(direct_only["ctv_settlement"], false);
+    assert_eq!(direct_only["measured_blocks"], 1);
+    assert_eq!(direct_only["totals"]["fanout_recipients"], 0);
+    assert_eq!(direct_only["totals"]["direct_recipients"], 12);
+    assert_eq!(direct_only["totals"]["carried_recipients"], 3);
+    assert_eq!(direct_only["totals_unavailable_reason"], Value::Null);
+    assert_eq!(
+        direct_only["blocks"][0]["settlement_mode"],
+        "direct_coinbase"
+    );
+
+    let fanned = settlement::report(
+        true,
+        &hashes,
+        Ok(vec![
+            landed("aa", 12, 288, 0, 1),
+            landed("bb", 11, 1_989, 7, 2),
+        ]),
+    );
+    assert_eq!(fanned["totals"]["fanout_recipients"], 2_277);
+    assert_eq!(fanned["totals"]["direct_recipients"], 23);
+    assert_eq!(fanned["totals"]["carried_recipients"], 7);
+    assert_eq!(fanned["totals"]["fanout_chunks"], 3);
+    assert_eq!(fanned["totals"]["blocks_with_fanout"], 2);
+    assert_eq!(
+        fanned["totals"]["blocks_by_chain_state"],
+        json!({"confirmed": 2})
+    );
+    assert_eq!(fanned["unmeasured_blocks"], json!([]));
+
+    let partly = settlement::report(true, &hashes, Ok(vec![landed("bb", 12, 0, 0, 0)]));
+    assert_eq!(partly["accepted_blocks"], 2);
+    assert_eq!(partly["measured_blocks"], 1);
+    assert_eq!(partly["unmeasured_blocks"][0]["block_hash"], "aa");
+    assert_eq!(partly["totals"]["covers"], "measured_blocks only");
+
+    // A landed block whose chain later reorged it still settled: it is
+    // counted, and the totals say in which state.
+    let mut reorged = landed("bb", 12, 88, 0, 1);
+    reorged.chain_state = "reorged".into();
+    let mixed = settlement::report(
+        true,
+        &hashes,
+        Ok(vec![landed("aa", 12, 288, 0, 1), reorged]),
+    );
+    assert_eq!(mixed["totals"]["fanout_recipients"], 376);
+    assert_eq!(
+        mixed["totals"]["blocks_by_chain_state"],
+        json!({"confirmed": 1, "reorged": 1})
+    );
+
+    // One unreadable chunk beside a readable one still makes the block
+    // unmeasured: its chunk's recipients would count as direct.
+    let mut half = landed("aa", 112, 100, 0, 2);
+    half.unreadable_chunks = 1;
+    let half = settlement::report(true, &hashes[..1], Ok(vec![half]));
+    assert_eq!(half["measured_blocks"], 0, "{half}");
+    assert_eq!(half["unmeasured_blocks"][0]["block_hash"], "aa");
+    assert!(half["unmeasured_blocks"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.starts_with("1 of its 2 fanout chunk(s)")));
+
+    let mut unreadable = landed("aa", 12, 0, 0, 1);
+    unreadable.fanout_outputs = 0;
+    unreadable.unreadable_chunks = 1;
+    let unreadable = settlement::report(true, &hashes[..1], Ok(vec![unreadable]));
+    assert_eq!(unreadable["measured_blocks"], 0);
+    assert_eq!(unreadable["totals"], Value::Null);
+    assert_eq!(unreadable["unmeasured_blocks"][0]["block_hash"], "aa");
+    assert!(unreadable["unmeasured_blocks"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("list no output")));
+
+    let none = settlement::report(true, &[], Ok(Vec::new()));
+    assert_eq!(none["totals"], Value::Null);
+    assert!(none["totals_unavailable_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("no block")));
+
+    let unlanded = settlement::report(false, &hashes[..1], Ok(Vec::new()));
+    assert_eq!(unlanded["totals"], Value::Null);
+    assert_eq!(unlanded["unmeasured_blocks"][0]["block_hash"], "aa");
+
+    let failed = settlement::report(
+        true,
+        &hashes,
+        Err(anyhow::anyhow!(
+            "connect postgresql://u:hunter2@127.0.0.1/db refused"
+        )),
+    );
+    for key in ["measured_blocks", "unmeasured_blocks", "totals", "blocks"] {
+        assert_eq!(failed[key], Value::Null, "{key}");
+    }
+    let reason = failed["totals_unavailable_reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(reason.contains("settlement read failed"), "{reason}");
+    assert!(
+        !reason.contains("hunter2"),
+        "the error is redacted: {reason}"
+    );
+}
+
+/// What a stand-in session does in [`ordered_tips_run`]: how long its newest
+/// job trails the node's tip, how long its scheduled block's search takes,
+/// what the server answers, and whether and how long after that it offers
+/// the block to the node.
+#[derive(Clone)]
+struct StandIn {
+    notify_delay: std::time::Duration,
+    search: std::time::Duration,
+    answer: client::Outcome,
+    /// Also report the submit's write as failed, as `client::offer` does
+    /// when the socket write errors after the line may have left.
+    write_failed: bool,
+    offer: Option<std::time::Duration>,
+}
+
+impl StandIn {
+    fn accepted(
+        notify_delay: std::time::Duration,
+        search: std::time::Duration,
+        offer: std::time::Duration,
+    ) -> Self {
+        Self {
+            notify_delay,
+            search,
+            answer: client::Outcome::Accepted,
+            write_failed: false,
+            offer: Some(offer),
+        }
+    }
+}
+
+/// The tips plan's warm-up (#638) over a fake node, 6 s long: tips due at
+/// 1.2, 2.4 and 3.6 s and the one scheduled block at 3 s. Session 0 has no
+/// task behind it; a stand-in plays it from the outside. It sights each tip
+/// `notify_delay` after the node takes it, the way a job reaches a session,
+/// and answers `ScheduledBlock` the way the client and the server do: it
+/// mines on its newest sighted tip for `search`, records the server's
+/// `answer`, and `offer` later, if at all, submits the block to the node.
+/// Every delay is injected, so whichever of block and tip is first is fixed
+/// by the timings, not by the host.
+async fn ordered_tips_run(stand_in: StandIn) -> Result<(run::PhaseOutcome, Arc<NodeState>, usize)> {
+    let (outcome, node, remaining_tips, _) = ordered_tips_run_holding(stand_in).await?;
+    Ok((outcome, node, remaining_tips))
+}
+
+/// The fake node, recording every keepalive hold the scheduler sets and
+/// when: the fake node has no keepalives of its own to hold.
+struct HoldRecorder {
+    node: Arc<NodeState>,
+    holds: std::sync::Mutex<Vec<(bool, std::time::Instant)>>,
+}
+
+impl node::ExternalMint for HoldRecorder {
+    fn mint_external(&self, purpose: node::MintPurpose) -> Option<node::TipChange> {
+        self.node.mint_external(purpose)
+    }
+    fn settled_tip(&self) -> Option<String> {
+        self.node.settled_tip()
+    }
+    fn block_answered(&self, block_hash: &str) -> bool {
+        self.node.block_answered(block_hash)
+    }
+    fn hold_keepalives(&self, held: bool) {
+        self.holds
+            .lock()
+            .unwrap()
+            .push((held, std::time::Instant::now()));
+    }
+}
+
+/// [`ordered_tips_run`], also returning the keepalive holds it set.
+async fn ordered_tips_run_holding(
+    stand_in: StandIn,
+) -> Result<(
+    run::PhaseOutcome,
+    Arc<NodeState>,
+    usize,
+    Vec<(bool, std::time::Instant)>,
+)> {
+    use clap::Parser;
+    use qbit_prism_load::cli::{Args, PhasePlan};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    let args = Args::parse_from([
+        "qbit-prism-load",
+        "--plan",
+        "tips",
+        "--external-tips",
+        "3",
+        "--scheduled-blocks",
+        "1",
+        "--min-mem-available-mib",
+        "0",
+        // The boundary's wait for an outstanding landing is this plus the
+        // drain margin.
+        "--share-commit-timeout-seconds",
+        "1",
+    ]);
+    let plan = PhasePlan {
+        name: "warm_up".into(),
+        kind: "warm_up".into(),
+        seconds: 6,
+        rate: 0.0,
+        in_artifact: false,
+        reconnects: false,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+        restart_frontend: false,
+    };
+    let node = Arc::new(NodeState::new(window::TEMPLATE_BITS, "pload1"));
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    let (session, mut control, _work) = queued_session(0, 0, 0, 1);
+
+    // The session's jobs: each tip the node takes is sighted `notify_delay`
+    // later.
+    let notify_delay = stand_in.notify_delay;
+    let notify = {
+        let (node, collected) = (node.clone(), collected.clone());
+        tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                let (tip, _) = node.tip();
+                if tip != last {
+                    last = tip.clone();
+                    let collected = collected.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(notify_delay).await;
+                        collected.lock().unwrap().tips.push(client::TipSighting {
+                            session: 0,
+                            frontend: 0,
+                            tip,
+                            at: Instant::now(),
+                        });
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    // The session's scheduled block, and the server's offer of it.
+    let blocks = {
+        let (node, collected) = (node.clone(), collected.clone());
+        tokio::spawn(async move {
+            let mut nonce = 0u32;
+            while let Some(message) = control.recv().await {
+                let client::Control::ScheduledBlock = message else {
+                    continue;
+                };
+                let parent = collected
+                    .lock()
+                    .unwrap()
+                    .tips
+                    .iter()
+                    .rev()
+                    .find(|sighting| sighting.session == 0)
+                    .map(|sighting| sighting.tip.clone())
+                    .expect("the session holds a job");
+                tokio::time::sleep(stand_in.search).await;
+                nonce += 1;
+                let mut prev = hex::decode(&parent).unwrap();
+                prev.reverse();
+                let header = client::assemble_header(
+                    0x2000_0000,
+                    &prev,
+                    &[9u8; 32],
+                    1_800_000_000,
+                    codec::parse_u32_hex(window::TEMPLATE_BITS).unwrap(),
+                    nonce,
+                );
+                let sent = Instant::now();
+                collected
+                    .lock()
+                    .unwrap()
+                    .submits
+                    .push(client::SubmitRecord {
+                        share_id: format!("pload1abc.s00000:block{nonce}"),
+                        session: 0,
+                        frontend: 0,
+                        phase: "warm_up".into(),
+                        job_id: format!("job-{parent}"),
+                        sent,
+                        responded: Some(sent),
+                        latency_millis: Some(0.0),
+                        outcome: stand_in.answer.clone(),
+                        scheduled_block: true,
+                        reoffer: false,
+                        fence: 0,
+                        header_hex: hex::encode(&header),
+                        extranonce2_hex: String::new(),
+                        ntime_hex: String::new(),
+                        nonce_hex: format!("{nonce:08x}"),
+                    });
+                if stand_in.write_failed {
+                    collected
+                        .lock()
+                        .unwrap()
+                        .failures
+                        .push(client::ClientFailure {
+                            session: 0,
+                            phase: "warm_up".into(),
+                            kind: client::FailureKind::ScheduledBlock,
+                            recorded: true,
+                            error: "write failed: broken pipe".into(),
+                            at: Instant::now(),
+                        });
+                }
+                let Some(offer) = stand_in.offer else {
+                    continue;
+                };
+                tokio::time::sleep(offer).await;
+                let block = format!("{}01{}", hex::encode(&header), "00".repeat(64));
+                node.handle(&json!({"jsonrpc": "1.0", "id": 1, "method": "submitblock",
+                    "params": [block]}))
+                    .await;
+            }
+        })
+    };
+    // The session holds work on the starting tip before the phase begins.
+    tokio::time::sleep(notify_delay + std::time::Duration::from_millis(50)).await;
+
+    let mut external_tips = Vec::new();
+    let (mut remaining_blocks, mut remaining_tips) = (1usize, 3usize);
+    let recorder = HoldRecorder {
+        node: node.clone(),
+        holds: Mutex::new(Vec::new()),
+    };
+    let outcome = run::drive_phase(
+        &args,
+        &plan,
+        std::slice::from_ref(&session),
+        &mut [],
+        &[],
+        &recorder,
+        &mut external_tips,
+        &mut remaining_blocks,
+        &mut remaining_tips,
+        &collected,
+        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    )
+    .await?;
+    notify.abort();
+    blocks.abort();
+    let holds = recorder.holds.into_inner().unwrap();
+    Ok((outcome, node, remaining_tips, holds))
+}
+
+/// The chain above the starting tip, by origin, and every submission's
+/// verdict.
+fn ordered_chain(node: &NodeState) -> (Vec<node::TipOrigin>, Vec<(bool, Option<String>)>) {
+    (
+        node.tip_changes()
+            .iter()
+            .map(|change| change.origin)
+            .filter(|origin| *origin != node::TipOrigin::Bootstrap)
+            .collect(),
+        node.submissions()
+            .iter()
+            .map(|record| (record.accepted, record.rejection.clone()))
+            .collect(),
+    )
+}
+
+/// #638: the one scheduled block of the tips plan was sent at 15 s and the
+/// third tip minted at 18 s whatever had become of the block, so a search
+/// and offer that outlasted the gap lost the block's height to the tip and
+/// the run landed no own block. Here the block takes 1.5 s to find and its
+/// offer 0.3 s more, past the third tip's 3.6 s slot. The tip is held until
+/// the node has answered the block's `submitblock`, so the block lands on
+/// the second tip and the third tip is minted on top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_next_warm_up_tip_waits_for_the_scheduled_block_the_node_has_not_answered() -> Result<()>
+{
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn::accepted(
+        Duration::from_millis(20),
+        Duration::from_millis(1500),
+        Duration::from_millis(300),
+    ))
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "the block reached the node on the tip it was mined on: {:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(
+        chain,
+        vec![External, External, Pool, External],
+        "the third tip was minted on top of the pool block"
+    );
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    let landing = &outcome.ordered_landings[..];
+    assert_eq!(landing.len(), 1, "{landing:?}");
+    assert_eq!(
+        landing[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    let (sent, settled) = (
+        landing[0].sent_seconds.expect("sent"),
+        landing[0].settled_seconds.expect("settled"),
+    );
+    assert!(
+        settled - sent >= 1.7 && settled > 3.6,
+        "settled once the injected search and offer were over, after the tip's slot: {landing:?}"
+    );
+    Ok(())
+}
+
+/// The other side of #638's race: the block was sent on the wall clock
+/// whether or not its session had a job on the tip minted just before, so a
+/// slow notify had it mined on a parent that tip had already replaced. Here
+/// every job reaches the session 1 s after its tip, so at the block's 3 s
+/// slot the session still mines on the first tip. The block is held until
+/// the session holds work on the second, and lands on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_scheduled_block_waits_until_its_session_holds_work_on_the_settled_tip() -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn::accepted(
+        Duration::from_millis(1000),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+    ))
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "the block was mined on the tip the node held: {:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    let sent = outcome.ordered_landings[0].sent_seconds.expect("sent");
+    assert!(
+        sent >= 3.4,
+        "sent once the second tip's job had reached the session: {:?}",
+        outcome.ordered_landings
+    );
+    Ok(())
+}
+
+/// A block candidate's append is never refused, so the server can answer it
+/// `ledger-outcome-unknown` at its deadline and still offer it afterwards.
+/// That answer is not the block's verdict: the tip stays held until the node
+/// has answered the offer that came 1.5 s later, past the tip's slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_refused_with_its_outcome_unknown_still_holds_the_next_tip() -> Result<()>
+{
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::Rejected(Rejection {
+            code: 20,
+            reason_id: Some("ledger-outcome-unknown".into()),
+            message: "share outcome is not yet known".into(),
+        }),
+        write_failed: false,
+        offer: Some(Duration::from_millis(1500)),
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    Ok(())
+}
+
+/// A block on block-only work, retired by a same-parent payout replacement,
+/// is answered `stale-job` and still captured and offered (#478). So the
+/// refusal is not the block's verdict: the tip stays held until the node
+/// has answered the offer that came 1.5 s later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_captured_after_a_stale_job_refusal_still_holds_the_next_tip(
+) -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::Rejected(Rejection {
+            code: 21,
+            reason_id: Some("stale-job".into()),
+            message: "stale job".into(),
+        }),
+        write_failed: false,
+        offer: Some(Duration::from_millis(1500)),
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    Ok(())
+}
+
+/// A refused block the node never sees is never settled: the tip held
+/// behind it is reported unminted and the landing unsettled, after the
+/// boundary's wait, rather than released on the server's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_block_the_node_never_sees_is_reported_unsettled() -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::Rejected(Rejection {
+            code: 21,
+            reason_id: Some("stale-job".into()),
+            message: "stale job".into(),
+        }),
+        write_failed: false,
+        offer: None,
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::External;
+    assert_eq!(verdicts, vec![]);
+    assert_eq!(chain, vec![External, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (1, 1));
+    let landing = &outcome.ordered_landings[0];
+    assert!(landing.sent_seconds.is_some(), "{landing:?}");
+    assert_eq!(
+        (landing.settled.as_deref(), landing.settled_seconds),
+        (None, None),
+        "{landing:?}"
+    );
+    Ok(())
+}
+
+/// A session whose task has already stopped never receives its scheduled
+/// block and reports no failure for it. The refused send is the block's
+/// verdict, so the tips after it are still minted rather than held to the
+/// phase's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_its_session_never_received_releases_the_next_tip() -> Result<()> {
+    use clap::Parser;
+    use qbit_prism_load::cli::{Args, PhasePlan};
+    use std::sync::Mutex;
+    let args = Args::parse_from([
+        "qbit-prism-load",
+        "--plan",
+        "tips",
+        "--external-tips",
+        "3",
+        "--scheduled-blocks",
+        "1",
+        "--min-mem-available-mib",
+        "0",
+    ]);
+    let plan = PhasePlan {
+        name: "warm_up".into(),
+        kind: "warm_up".into(),
+        seconds: 3,
+        rate: 0.0,
+        in_artifact: false,
+        reconnects: false,
+        database_delay_ms: 0,
+        mid_flight_kill: false,
+        dense_cadence: false,
+        restart_frontend: false,
+    };
+    let node = NodeState::new(window::TEMPLATE_BITS, "pload1");
+    let collected = Arc::new(Mutex::new(run::Collected::default()));
+    // The session's control receiver is gone, as it is once its task ends.
+    let (session, control, _work) = queued_session(0, 0, 0, 1);
+    drop(control);
+    // Its last job was on each tip as soon as the node took it.
+    let sighting = |tip: String| client::TipSighting {
+        session: 0,
+        frontend: 0,
+        tip,
+        at: std::time::Instant::now(),
+    };
+    collected.lock().unwrap().tips.push(sighting(node.tip().0));
+    let node = Arc::new(node);
+    let notify = {
+        let (node, collected) = (node.clone(), collected.clone());
+        tokio::spawn(async move {
+            let mut last = node.tip().0;
+            loop {
+                let (tip, _) = node.tip();
+                if tip != last {
+                    last = tip.clone();
+                    collected.lock().unwrap().tips.push(sighting(tip));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let mut external_tips = Vec::new();
+    let (mut remaining_blocks, mut remaining_tips) = (1usize, 3usize);
+    let outcome = run::drive_phase(
+        &args,
+        &plan,
+        std::slice::from_ref(&session),
+        &mut [],
+        &[],
+        &*node,
+        &mut external_tips,
+        &mut remaining_blocks,
+        &mut remaining_tips,
+        &collected,
+        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    )
+    .await?;
+    notify.abort();
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::External;
+    assert_eq!(verdicts, vec![]);
+    assert_eq!(chain, vec![External, External, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the session's task had stopped, so it was never sent")
+    );
+    Ok(())
+}
+
+/// A scheduled block whose submit write failed is reported twice, as a
+/// no-response submit and as a recorded client failure, and the write can
+/// fail after the line reached the server. The recorded failure is not the
+/// block's verdict: the tip stays held until the node has answered the offer
+/// that came 1.5 s later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scheduled_block_whose_write_failed_still_holds_the_next_tip() -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips) = ordered_tips_run(StandIn {
+        notify_delay: Duration::from_millis(20),
+        search: Duration::from_millis(50),
+        answer: client::Outcome::NoResponse {
+            reason: "write failed: broken pipe".into(),
+        },
+        write_failed: true,
+        offer: Some(Duration::from_millis(1500)),
+    })
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool, External]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    assert_eq!(
+        outcome.ordered_landings[0].settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    Ok(())
+}
+
+/// A scheduled block still outstanding at the phase's deadline: its search
+/// ends 0.5 s after the 6 s warm-up and the node answers 0.3 s later. The
+/// phase sees it through with the keepalives still held, so no keepalive
+/// due during teardown, nor the next phase's tips, can take its height. The
+/// hold is released only once the node has answered, and the third tip,
+/// held behind the block, is reported as unminted rather than minted late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_landing_outstanding_at_the_deadline_keeps_the_keepalives_held_until_it_settles(
+) -> Result<()> {
+    use std::time::Duration;
+    let (outcome, node, remaining_tips, holds) = ordered_tips_run_holding(StandIn::accepted(
+        Duration::from_millis(20),
+        Duration::from_millis(3500),
+        Duration::from_millis(300),
+    ))
+    .await?;
+    let (chain, verdicts) = ordered_chain(&node);
+    use node::TipOrigin::{External, Pool};
+    assert_eq!(
+        verdicts,
+        vec![(true, None)],
+        "{:?}",
+        outcome.ordered_landings
+    );
+    assert_eq!(chain, vec![External, External, Pool]);
+    assert_eq!((remaining_tips, outcome.tips_unminted), (1, 1));
+    let landing = &outcome.ordered_landings[0];
+    assert_eq!(
+        landing.settled.as_deref(),
+        Some("the node answered its submitblock")
+    );
+    assert!(
+        landing.settled_seconds.expect("settled") > 6.0,
+        "settled after the deadline: {landing:?}"
+    );
+    let landed = node
+        .tip_changes()
+        .iter()
+        .find(|change| change.origin == Pool)
+        .expect("the pool block")
+        .monotonic;
+    let flags: Vec<bool> = holds.iter().map(|(held, _)| *held).collect();
+    assert_eq!(flags, vec![true, false], "held once, released once");
+    assert!(
+        holds[1].1 >= landed,
+        "released only once the block was on the chain"
+    );
+    Ok(())
 }

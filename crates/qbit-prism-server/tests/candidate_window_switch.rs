@@ -12,8 +12,8 @@ use qbit_prism::{
     CarryForwardBalance, FoundBlock, PayoutPolicy,
 };
 use qbit_prism_server::ledger::{
-    authenticate_landed_audit, BalanceSource, Candidate, CandidateClaim, Ledger, ShareRange,
-    SignerKeys, Snapshot, WindowError, WindowRef,
+    authenticate_landed_audit, probe_window_holding, BalanceSource, Candidate, CandidateClaim,
+    Ledger, ShareRange, SignerKeys, Snapshot, WindowError, WindowHolding, WindowNotHeld, WindowRef,
 };
 use qbit_prism_test_gate as gate;
 use serde_json::{json, Value};
@@ -532,21 +532,36 @@ async fn enqueue_refuses_a_fingerprint_the_writer_did_not_pin() -> Result<()> {
 
 /// A window whose prefix row is gone still publishes: the block must reach the
 /// node. The enqueue raises an alert instead, and the claim's read then meets
-/// `Incomplete`.
+/// `Incomplete`. The window's last row is its own, which is what makes a
+/// missing first row retention rather than lost history (#619).
 #[tokio::test]
 async fn enqueue_alerts_but_publishes_when_the_window_prefix_row_is_missing() -> Result<()> {
     run(|db| {
         Box::pin(async move {
             let ledger = db.ledger("probe").await?;
             ledger.append(appended_share(1), None).await?;
+            // A refused append consumes a sequence value and leaves no row:
+            // share rows are immutable, so this is how a prefix row can be
+            // absent below a present last row.
+            let revision = ledger.payout_revision().await?;
+            ensure!(
+                ledger
+                    .append_at_revision_gated(appended_share(2), None, revision, &|| false)
+                    .await
+                    .is_err(),
+                "the gated append committed"
+            );
+            let last = ledger
+                .append(appended_share(3), None)
+                .await?
+                .share
+                .share_seq;
             let snapshot = ledger.snapshot(100).await?;
             let mut block = found(&snapshot, 4)?;
-            // Share rows are immutable, so a missing prefix can only be a
-            // reference to rows that were never there.
             block.candidate.window.shares = Some(ShareRange {
-                first_share_seq: 5_000_000,
-                last_share_seq: 5_000_010,
-                share_count: 11,
+                first_share_seq: last - 1,
+                last_share_seq: last,
+                share_count: 2,
                 snapshot_sha256: [7; 32],
             });
             let logs = Logs::default();
@@ -579,6 +594,142 @@ async fn enqueue_alerts_but_publishes_when_the_window_prefix_row_is_missing() ->
                 .err()
                 .context("the missing range read as a window")?;
             ensure!(matches!(error, WindowError::Incomplete { .. }), "{error:?}");
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// A window whose last row this primary does not hold, absent or another
+/// share credited after the window's anchor, is refused before the enqueue:
+/// its coinbase pays history no landing here could rebuild (#619). Nothing is
+/// written, the refusal is typed, and its log names the cause, not pruning.
+#[tokio::test]
+async fn enqueue_refuses_a_window_whose_last_row_this_primary_does_not_hold() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("probe").await?;
+            ledger.append(appended_share(1), None).await?;
+            let snapshot = ledger.snapshot(100).await?;
+            // A later share: present, but credited after the snapshot's
+            // anchor, as a number reissued by a promoted primary is.
+            let reissued = ledger
+                .append(appended_share(2), None)
+                .await?
+                .share
+                .share_seq;
+            for (case, last) in [("absent", 5_000_010), ("reissued", reissued)] {
+                let mut block = found(&snapshot, 4)?;
+                block.candidate.window.shares = Some(ShareRange {
+                    first_share_seq: 1,
+                    last_share_seq: last,
+                    share_count: 2,
+                    snapshot_sha256: [7; 32],
+                });
+                let logs = Logs::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer({
+                        let logs = logs.clone();
+                        move || logs.clone()
+                    })
+                    .with_ansi(false)
+                    .finish();
+                let refused = {
+                    let _guard = tracing::subscriber::set_default(subscriber);
+                    ledger
+                        .enqueue_candidate_once(block.candidate.clone())
+                        .await
+                        .err()
+                        .with_context(|| format!("{case}: the candidate was enqueued"))?
+                };
+                let not_held = refused
+                    .downcast_ref::<WindowNotHeld>()
+                    .with_context(|| format!("{case}: untyped refusal {refused:#}"))?;
+                ensure!(
+                    not_held.block_hash == block.candidate.block_hash
+                        && not_held.last_share_seq == last,
+                    "{case}: {not_held:?}"
+                );
+                let text = logs.text();
+                ensure!(
+                    text.contains("#619") && !text.contains("prefix row is missing"),
+                    "{case}: the log does not name the cause: {text}"
+                );
+                let rows: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+                )
+                .bind(&block.candidate.block_hash)
+                .fetch_one(&ledger.pool)
+                .await?;
+                ensure!(rows == 0, "{case}: a refused candidate wrote its row");
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The precondition #619's durability test documents: it compares time, not
+/// identity. A reissued last row stamped before the window's anchor, as a
+/// promoted host whose clock lags the old primary's by more than the
+/// promotion would stamp it, passes: the candidate is enqueued, and only the
+/// landing's digest check refuses the window. The HA reference therefore
+/// requires the database hosts' clocks to agree to well within that time.
+#[tokio::test]
+async fn a_reissued_last_row_stamped_before_the_anchor_by_a_lagging_clock_passes_the_time_test(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let ledger = db.ledger("skew").await?;
+            let first = ledger
+                .append(appended_share(1), None)
+                .await?
+                .share
+                .share_seq;
+            let snapshot = ledger.snapshot(100).await?;
+            // The next number, reissued to another share whose host clock ran
+            // a second behind the anchor. Raw, because a native append stamps
+            // this host's clock.
+            let reissued: i64 = sqlx::query_scalar(
+                "INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) VALUES('skewed:reissued','miner','miner',decode(repeat('11',32),'hex'),1,100,100,'skewed-job',to_timestamp($1::double precision/1000),1,to_timestamp($1::double precision/1000),true,'skew-test',0) RETURNING share_seq",
+            )
+            .bind(snapshot.anchor_ms - 1000)
+            .fetch_one(&db.pool)
+            .await?;
+            let mut block = found(&snapshot, 4)?;
+            block.candidate.window.shares = Some(ShareRange {
+                first_share_seq: first,
+                last_share_seq: u64::try_from(reissued)?,
+                share_count: 2,
+                // The lost original rows' digest, which no row here matches.
+                snapshot_sha256: [7; 32],
+            });
+            let holding = probe_window_holding(
+                &mut *ledger.pool.acquire().await?,
+                &block.candidate.window,
+            )
+            .await?;
+            ensure!(
+                holding == WindowHolding::Held,
+                "the time test caught a reissued row stamped before the anchor: {holding:?}; update the HA precondition"
+            );
+            ensure!(
+                ledger.enqueue_candidate_once(block.candidate.clone()).await?,
+                "the candidate was not enqueued"
+            );
+            let claim = ledger
+                .claim_candidate(60)
+                .await?
+                .context("the enqueued row was not claimable")?;
+            let error = ledger
+                .read_window(&claim.candidate.window, BalanceSource::Current)
+                .await
+                .err()
+                .context("a window of another share's row read whole")?;
+            ensure!(
+                matches!(error, WindowError::SnapshotDigestMismatch { .. }),
+                "{error:?}"
+            );
             Ok(())
         })
     })

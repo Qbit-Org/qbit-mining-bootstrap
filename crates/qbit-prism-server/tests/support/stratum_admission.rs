@@ -31,6 +31,9 @@ pub struct Backend {
     pub build_calls: AtomicU32,
     pub fail_once: AtomicBool,
     pub stall_once: AtomicBool,
+    /// Stalls the next allocation in a step it names as the ledger
+    /// database's (#655).
+    pub stall_on_database_once: AtomicBool,
     pub allocation_started: Notify,
     pub allocation_release: Notify,
 }
@@ -55,6 +58,11 @@ impl MiningBackend for Backend {
         if self.stall_once.swap(false, Ordering::SeqCst) {
             self.allocation_started.notify_one();
             self.allocation_release.notified().await;
+        }
+        // The same, held by the database: the backend names the step.
+        if self.stall_on_database_once.swap(false, Ordering::SeqCst) {
+            self.allocation_started.notify_one();
+            qbit_prism_server::waiting::on_database(self.allocation_release.notified()).await;
         }
         Ok(id)
     }

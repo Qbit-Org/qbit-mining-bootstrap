@@ -16,6 +16,7 @@ pub(super) fn test_config() -> Config {
         rpc_password: "test-only".into(),
         rpc_timeout: Duration::from_secs(15),
         block_submit_timeout: Duration::from_secs(1),
+        block_submit_enabled: true,
         poll_interval: Duration::from_secs(2),
         blockwait: true,
         build_workers: 2,

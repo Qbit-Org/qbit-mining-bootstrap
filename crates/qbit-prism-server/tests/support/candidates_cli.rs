@@ -961,8 +961,7 @@ async fn abandon_waits_for_inflight_landing_after_claim_expiry() -> Result<()> {
         }
     };
     waiting_for(LANDING_GATE).await?;
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1")
-        .bind(&hash).execute(&ledger.pool).await?;
+    qbit_prism_server::ledger::revoke_candidate_claims(&ledger.pool, Some(&hash), false).await?;
     let before = whole_row(&ledger.pool, &hash).await?;
     let visible: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1)")
@@ -1144,6 +1143,8 @@ async fn abandon_refuses_a_parked_legacy_document_and_leaves_its_evidence_whole(
     db.close(vec![ledger]).await
 }
 
+/// The database clock's rule, which `--unsafe-database-clock-expiry` names
+/// (#581): the claim decision and its diagnosis share one database instant.
 #[tokio::test]
 async fn abandon_reports_claimed_when_lease_expires_before_diagnosis() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -1176,6 +1177,7 @@ async fn abandon_reports_claimed_when_lease_expires_before_diagnosis() -> Result
         &held.hash,
         "--reason",
         "operator sweep",
+        "--unsafe-database-clock-expiry",
     ];
     let refused = cli(&db, &node, &args).await?;
     assert_eq!(code(&refused), 5, "{}", stderr(&refused));
@@ -1197,8 +1199,14 @@ async fn abandon_reports_claimed_when_lease_expires_before_diagnosis() -> Result
     db.close(vec![ledger]).await
 }
 
+/// A claim is over once the command has watched it go unrenewed for its
+/// whole lease, on its own clock (#581): a holder that renews meanwhile is
+/// live and refuses the abandon, and one that stops is abandoned after one
+/// lease. The database clock's rule, by name, refuses a claim its clock
+/// calls live.
 #[tokio::test]
 async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
@@ -1207,7 +1215,11 @@ async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> 
     let mut held = Row::new("11", "pending");
     held.claim = Some(("frontend-b".to_owned(), 3600.0));
     seed(&ledger.pool, &held).await?;
-    let before = whole_row(&ledger.pool, &held.hash).await?;
+    // A post-021 claim with a two-second lease.
+    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_lease_seconds=2 WHERE block_hash=$1")
+        .bind(&held.hash)
+        .execute(&ledger.pool)
+        .await?;
     let reason = "INC-311: superseded before any offer";
     let args = [
         "candidates",
@@ -1218,7 +1230,56 @@ async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> 
         reason,
     ];
 
-    let refused = cli(&db, &node, &args).await?;
+    // The holder renews throughout the command's wait.
+    let stop = Arc::new(AtomicBool::new(false));
+    let renewer = tokio::spawn({
+        let pool = ledger.pool.clone();
+        let hash = held.hash.clone();
+        let stop = stop.clone();
+        async move {
+            while !stop.load(Ordering::SeqCst) {
+                sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_renewals=claim_renewals+1,claim_expires_at=clock_timestamp()+interval '1 hour' WHERE block_hash=$1")
+                    .bind(&hash)
+                    .execute(&pool)
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            anyhow::Ok(())
+        }
+    });
+    let refused = cli(&db, &node, &args).await;
+    stop.store(true, Ordering::SeqCst);
+    renewer.await??;
+    let refused = refused?;
+    assert_eq!(code(&refused), 5, "{}", stderr(&refused));
+    assert!(
+        stdout(&refused).contains(&format!(
+            "candidate {} is claimed by frontend-b; waiting 2 s for the claim to go unrenewed for its whole lease",
+            held.hash
+        )),
+        "{}",
+        stdout(&refused)
+    );
+    let message = stderr(&refused);
+    assert!(
+        message
+            .contains("is held by frontend-b, whose claim changed while this command watched it"),
+        "{message}"
+    );
+    assert!(
+        message.contains("retry once the holder has released it"),
+        "{message}"
+    );
+    let before = whole_row(&ledger.pool, &held.hash).await?;
+    assert_eq!(before["state"], "pending");
+    assert_eq!(before["claim_token"], "token-frontend-b");
+    assert!(before["candidate"].is_object());
+
+    // The database clock's rule, by name, still refuses a claim that clock
+    // calls live, and writes nothing.
+    let mut unsafe_args = args.to_vec();
+    unsafe_args.push("--unsafe-database-clock-expiry");
+    let refused = cli(&db, &node, &unsafe_args).await?;
     assert_eq!(code(&refused), 5, "{}", stderr(&refused));
     let message = stderr(&refused);
     assert!(
@@ -1231,11 +1292,15 @@ async fn abandon_refuses_a_live_foreign_claim_and_succeeds_once_it_expires() -> 
     );
     assert_eq!(whole_row(&ledger.pool, &held.hash).await?, before);
 
-    // An expired claim is not a live claim: the row is abandonable again.
-    sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second' WHERE block_hash=$1")
-        .bind(&held.hash).execute(&ledger.pool).await?;
+    // The holder stopped renewing: one watched lease later the row is
+    // abandoned, although the database clock still calls the claim live.
     let done = cli(&db, &node, &args).await?;
     assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert!(
+        stdout(&done).contains("waiting 2 s for the claim to go unrenewed"),
+        "{}",
+        stdout(&done)
+    );
     let after = whole_row(&ledger.pool, &held.hash).await?;
     assert_eq!(after["state"], "abandoned");
     assert_eq!(after["last_error"], reason);

@@ -258,11 +258,6 @@ impl Verdict {
             report: lines.join("\n"),
         }
     }
-
-    /// Whether some rule fires on every server.
-    pub(crate) fn every_server_paged(&self) -> bool {
-        self.fired.values().all(|rules| !rules.is_empty())
-    }
 }
 
 /// Scrape every `(server, port)` every quarter second for `duration`.

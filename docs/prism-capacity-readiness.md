@@ -275,10 +275,17 @@ state and has no native producer.
 
 ### `malloc_trim`
 
-Retired. The trimmer, `PRISM_MALLOC_TRIM_SIGNAL` and <!-- retired-setting: PRISM_MALLOC_TRIM_SIGNAL -->
-`PRISM_MALLOC_TRIM_INTERVAL_SECONDS` were a Python-process instrument (#244). <!-- retired-setting: PRISM_MALLOC_TRIM_INTERVAL_SECONDS -->
-The native server exposes no trim hook, and `SIGRTMIN+1` is unhandled there,
+The signal-driven trimmer, `PRISM_MALLOC_TRIM_SIGNAL` and <!-- retired-setting: PRISM_MALLOC_TRIM_SIGNAL -->
+`PRISM_MALLOC_TRIM_INTERVAL_SECONDS` were a Python-process instrument (#244) and are retired. <!-- retired-setting: PRISM_MALLOC_TRIM_INTERVAL_SECONDS -->
+The native server exposes no trim signal, and `SIGRTMIN+1` is unhandled there,
 so the same warning as for `SIGUSR1` applies.
+
+Instead the native frontend that lands a block trims once, after the landing
+(#600): glibc keeps the heap a landing's window rebuild frees, so without it
+a 400k-window frontend's resident set climbs with each landing to a plateau of
+about 3.3 GB. `PRISM_LANDING_MALLOC_TRIM_ENABLED` (default `1`) controls it;
+[landing memory per frontend](prism-storage-sizing.md#landing-memory-per-frontend)
+has the measurements and the memory limit to set.
 
 ### Allocator settings and the storm instrument
 
@@ -287,10 +294,11 @@ Retired. The image no longer sets `MALLOC_ARENA_MAX`, `compose.yaml` and
 `tests/` that produced the arena experiment was deleted with the Python lane
 (#244). The `MALLOC_ARENA_MAX=1` setting in
 `docs/prism-payout-artifact-measurement.md` applies to that test process on
-the operator's host, not to the coordinator image. No native allocator
-experiment exists on this branch; if the soak below fails at flat load, the
-allocator is one candidate cause among others and gets its own issue with the
-soak evidence attached.
+the operator's host, not to the coordinator image. The native allocator
+experiment is #600's: its weekly soak's resident-set failure was glibc keeping
+the heap each block landing frees, answered by the post-landing trim above;
+`MALLOC_ARENA_MAX=2` only halved that growth and slowed a full 400k refresh
+from 7.5 s to 13 s.
 
 ### The resident-set bound
 

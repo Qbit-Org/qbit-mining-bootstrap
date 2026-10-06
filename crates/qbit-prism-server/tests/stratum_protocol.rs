@@ -897,6 +897,443 @@ async fn superseded_same_parent_work_is_dropped_not_grace_credited_after_a_flip(
     task.await.unwrap();
 }
 
+// #621: a session answers a submit while its own job rebuild is held inside
+// the build, and announces the rebuilt job only once it is persisted, after
+// that answer. Before the fix the session read nothing until the rebuild
+// returned, so the answer never came while the build was held.
+#[tokio::test]
+async fn a_submit_is_answered_while_the_sessions_own_rebuild_is_held() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.rebuild").await;
+    let current = client.notify["params"][0].clone();
+    let gate = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    client
+        .send(client.solved_submit(20, "miner.rebuild", 0))
+        .await;
+    let answer = client.read().await;
+    assert_eq!(answer["id"], 20, "answered before the rebuild: {answer}");
+    assert_eq!(answer["result"], true, "{answer}");
+    assert_eq!(client.request_health(21).await["result"]["ready"], false);
+    assert_eq!(backend.stored.lock().unwrap().len(), 1, "nothing persisted");
+    gate.release.notify_one();
+    // Difficulty precedes the work it applies to, and the work is durable.
+    assert_eq!(client.read().await["method"], "mining.set_difficulty");
+    let notify = client.read().await;
+    assert_eq!(notify["method"], "mining.notify");
+    let rebuilt = notify["params"][0].as_str().unwrap();
+    assert_ne!(notify["params"][0], current);
+    assert!(backend.stored.lock().unwrap().contains_key(rebuilt));
+    assert_eq!(notify["params"][8], false, "same tip and revision");
+    client.notify = notify;
+    client
+        .send(client.solved_submit(22, "miner.rebuild", 50_000))
+        .await;
+    assert_eq!(client.response(22).await["result"], true);
+    assert_eq!(
+        backend.credited_workers.lock().unwrap().as_slice(),
+        ["miner.rebuild", "miner.rebuild"]
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #621: the session keeps building and persisting its job while it handles a
+// submit, and announces that job only after the submit's answer.
+#[tokio::test]
+async fn a_rebuild_keeps_moving_while_a_submit_is_handled() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.overlap").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    let submit = Arc::new(observability::Gate::default());
+    *backend.submit_gate.lock().unwrap() = Some(submit.clone());
+    client
+        .send(client.solved_submit(20, "miner.overlap", 0))
+        .await;
+    submit.entered.notified().await;
+    build.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while backend.stored.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rebuild stalled behind the submit");
+    submit.release.notify_one();
+    let answer = client.read().await;
+    assert_eq!(answer["id"], 20, "{answer}");
+    assert_eq!(answer["result"], true, "{answer}");
+    assert_eq!(client.read().await["method"], "mining.set_difficulty");
+    assert_eq!(client.read().await["method"], "mining.notify");
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+/// A writer whose writes wait, once armed, until the test releases them, or
+/// fail, once broken.
+#[derive(Default)]
+struct WriteHold {
+    armed: AtomicBool,
+    broken: AtomicBool,
+    held: tokio::sync::Notify,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+impl WriteHold {
+    fn release(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+struct HeldWriter<W> {
+    inner: W,
+    hold: Arc<WriteHold>,
+}
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for HeldWriter<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.hold.broken.load(Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        if this.hold.armed.load(Ordering::SeqCst) {
+            if this
+                .hold
+                .waker
+                .lock()
+                .unwrap()
+                .replace(cx.waker().clone())
+                .is_none()
+            {
+                this.hold.held.notify_one();
+            }
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+async fn next_frame(lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>) -> Value {
+    let line = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+type DuplexLines = tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
+
+/// One session served over an in-memory pipe whose server-side writes the
+/// test can hold or break, logged in as `username` with its first job read.
+async fn held_writer_session(
+    config: StratumConfig,
+    username: &str,
+) -> (
+    Arc<Backend>,
+    watch::Sender<u64>,
+    watch::Sender<bool>,
+    Arc<WriteHold>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    DuplexLines,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let backend = Arc::new(Backend::default());
+    let (refresh, refresh_rx) = watch::channel(0);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (server_reader, server_writer) = tokio::io::split(server);
+    let hold = Arc::new(WriteHold::default());
+    let task = tokio::spawn(serve_connection(
+        server_reader,
+        HeldWriter {
+            inner: server_writer,
+            hold: hold.clone(),
+        },
+        backend.clone(),
+        config,
+        refresh_rx,
+        shutdown_rx,
+        Arc::new(qbit_prism_server::metrics::Metrics::default()),
+    ));
+    let (client_reader, mut client_writer) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_reader).lines();
+    for request in [
+        json!({"id":1,"method":"mining.subscribe","params":[]}),
+        json!({"id":2,"method":"mining.authorize","params":[username,"x"]}),
+    ] {
+        client_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    while next_frame(&mut lines).await["method"] != "mining.notify" {}
+    (backend, refresh, shutdown, hold, client_writer, lines, task)
+}
+
+// #621: a peer that stops reading cannot stall the session's rebuild through
+// the answer to an invalid frame: the delivery keeps moving while that write
+// is held, as it does for every other answer.
+#[tokio::test]
+async fn a_rebuild_keeps_moving_while_an_invalid_frame_answer_is_held() {
+    let config = StratumConfig::default();
+    let (backend, refresh, shutdown, hold, mut client_writer, mut lines, task) =
+        held_writer_session(config, "miner.held-write").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    hold.armed.store(true, Ordering::SeqCst);
+    client_writer.write_all(b"not json\n").await.unwrap();
+    hold.held.notified().await;
+    build.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while backend.stored.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rebuild stalled behind a held write");
+    hold.release();
+    let answer = next_frame(&mut lines).await;
+    assert_eq!(
+        answer["error"][2]["reason_id"], "malformed-submit",
+        "{answer}"
+    );
+    assert_eq!(
+        next_frame(&mut lines).await["method"],
+        "mining.set_difficulty"
+    );
+    assert_eq!(next_frame(&mut lines).await["method"], "mining.notify");
+    shutdown.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+// #621: a delivery its session abandons (the miner left, or the listener shut
+// down) is neither a success nor a failure: it is counted as a cancellation,
+// so the failure counter keeps meaning a build, persistence or write failed.
+#[tokio::test]
+async fn a_delivery_abandoned_by_its_session_is_a_cancellation_not_a_failure() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let (address, backend, refresh, shutdown, task) = start(config).await;
+    for (generation, username) in [(1, "miner.leaves"), (2, "miner.stays")] {
+        let mut client = Client::connect(address).await;
+        client.login(username).await;
+        let gate = Arc::new(observability::Gate::default());
+        *backend.build_gate.lock().unwrap() = Some(gate.clone());
+        refresh.send(generation).unwrap();
+        gate.entered.notified().await;
+        if generation == 1 {
+            drop(client);
+            wait_for_connections(&stats, 0).await;
+        } else {
+            shutdown.send(true).unwrap();
+        }
+    }
+    task.await.unwrap();
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.job_delivery_failures, 0);
+    assert_eq!(snapshot.job_delivery_successes, 2, "the two first jobs");
+    assert_eq!(snapshot.job_delivery_cancellations, 2);
+    assert_eq!(snapshot.pending_builds, 0);
+}
+
+// #621 review: a session that breaches a per-session budget closes right
+// after its answer, as before, even when its delivery finished while that
+// answer was written: the job is not announced, and the delivery counts as
+// a cancellation.
+#[tokio::test]
+async fn a_budget_breach_closes_the_session_before_a_finished_delivery_is_announced() {
+    let config = StratumConfig {
+        max_malformed_frames_per_interval: 1,
+        ..Default::default()
+    };
+    let stats = config.stats.clone();
+    let (backend, refresh, _shutdown, hold, mut client_writer, mut lines, task) =
+        held_writer_session(config, "miner.breach").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    client_writer.write_all(b"first junk\n").await.unwrap();
+    assert!(next_frame(&mut lines).await["error"].is_array());
+    // The breaching frame's answer is held while the delivery finishes.
+    hold.armed.store(true, Ordering::SeqCst);
+    client_writer.write_all(b"second junk\n").await.unwrap();
+    hold.held.notified().await;
+    build.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while backend.stored.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the rebuild stalled behind a held write");
+    hold.release();
+    assert!(next_frame(&mut lines).await["error"].is_array());
+    let after = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, None, "the session announced work after its breach");
+    task.await.unwrap().unwrap();
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.job_delivery_successes, 1, "the first job only");
+    assert_eq!(snapshot.job_delivery_cancellations, 1);
+}
+
+// #621 review: a session that closes on an oversized frame abandons its
+// delivery before it writes the rejection, so a peer that is not reading
+// cannot hold the delivery's admission permit through that write.
+#[tokio::test]
+async fn an_oversized_frame_abandons_the_delivery_before_its_rejection_is_written() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let admission = config.initial_job_limit.clone();
+    let permits = admission.available_permits();
+    let max_message_bytes = config.max_message_bytes;
+    let (backend, refresh, _shutdown, hold, mut client_writer, _lines, task) =
+        held_writer_session(config, "miner.oversized").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    assert_eq!(admission.available_permits(), permits - 1);
+    hold.armed.store(true, Ordering::SeqCst);
+    client_writer
+        .write_all(&vec![b'a'; max_message_bytes + 1])
+        .await
+        .unwrap();
+    hold.held.notified().await;
+    assert_eq!(
+        admission.available_permits(),
+        permits,
+        "the delivery kept its admission permit through the held rejection"
+    );
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.pending_builds, 0);
+    assert_eq!(snapshot.job_delivery_cancellations, 1);
+    hold.release();
+    task.await.unwrap().unwrap();
+}
+
+// The boundary of the test above: a delivery whose announcement write fails
+// still counts as a failed delivery, as it did before #621.
+#[tokio::test]
+async fn a_failed_announcement_write_is_still_a_failed_delivery() {
+    let config = StratumConfig::default();
+    let stats = config.stats.clone();
+    let (backend, refresh, _shutdown, hold, _client_writer, _lines, task) =
+        held_writer_session(config, "miner.broken-pipe").await;
+    let build = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(build.clone());
+    refresh.send(1).unwrap();
+    build.entered.notified().await;
+    hold.broken.store(true, Ordering::SeqCst);
+    build.release.notify_one();
+    assert!(
+        task.await.unwrap().is_err(),
+        "the write failure ends the session"
+    );
+    let snapshot = stats.snapshot(0);
+    assert_eq!(snapshot.job_delivery_successes, 1, "the first job");
+    assert_eq!(snapshot.job_delivery_failures, 1);
+    assert_eq!(snapshot.job_delivery_cancellations, 0);
+    assert_eq!(snapshot.pending_builds, 0);
+}
+
+// #621: a publication the session sees while its rebuild is held is not lost
+// when that older delivery finishes: the session delivers again after it.
+#[tokio::test]
+async fn a_publication_seen_during_a_held_rebuild_is_delivered_after_it() {
+    let (address, backend, refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.republish").await;
+    let gate = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    let built = backend.jobs.load(Ordering::Relaxed);
+    backend.payout_revision.store(1, Ordering::Relaxed);
+    refresh.send(2).unwrap();
+    // The session takes a publication before a request, so this answer means
+    // it has seen the one above while its rebuild was still held.
+    client.request_health(20).await;
+    gate.release.notify_one();
+    client.next_job().await;
+    assert_eq!(client.notify["params"][8], true, "the held rebuild");
+    client.next_job().await;
+    assert_eq!(client.notify["params"][8], false, "the delivery after it");
+    assert_eq!(backend.jobs.load(Ordering::Relaxed), built + 2);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #621: shares answered during a held rebuild do not retarget under it (that
+// job keeps the difficulty it was built at), and the retarget they earn rides
+// the very next delivery, so back-to-back rebuilds cannot starve vardiff.
+#[tokio::test]
+async fn a_retarget_earned_during_a_held_rebuild_rides_the_next_delivery() {
+    let mut config = StratumConfig {
+        startup_difficulty: 1e-8,
+        ..Default::default()
+    };
+    config.vardiff.minimum = 1e-8;
+    config.vardiff.initial_min_shares = 2;
+    config.vardiff.initial_min_seconds = 1e-9;
+    let (address, backend, refresh, shutdown, task) = start(config).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let mut client = Client::connect(address).await;
+    client.login("miner.retarget").await;
+    let start_difficulty = client.difficulty;
+    let gate = Arc::new(observability::Gate::default());
+    *backend.build_gate.lock().unwrap() = Some(gate.clone());
+    refresh.send(1).unwrap();
+    gate.entered.notified().await;
+    for id in [20, 21] {
+        let share = client.solved_share(id, "miner.retarget", id as u32 * 100_000);
+        client.send(share).await;
+        assert_eq!(client.response(id).await["result"], true);
+    }
+    refresh.send(2).unwrap();
+    client.request_health(22).await;
+    gate.release.notify_one();
+    client.next_job().await;
+    assert_eq!(client.difficulty, start_difficulty, "the held rebuild");
+    client.next_job().await;
+    assert!(
+        client.difficulty >= start_difficulty * 4.0,
+        "the delivery right after it carries the retarget: {}",
+        client.difficulty
+    );
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
 // This runs against an in-memory backend, so it proves only that the frame is
 // forwarded: the credited amount and its timing are covered by
 // `coordinator::d2_below_target_tests` (decision D2b).

@@ -702,6 +702,11 @@ struct Shared {
     /// No more keepalives: the run is tearing down. A lock, not a flag, so
     /// no keepalive is asked for after [`Qbitd::quiesce`] closed it.
     stop_minting: Mutex<bool>,
+    /// No keepalive for now: a scheduled block is due or outstanding (#638).
+    /// Set and read under `stop_minting`, so a keepalive is either already
+    /// counted in `requested` when the scheduler reads the settled tip, or
+    /// is not asked for until the block's verdict.
+    keepalives_held: AtomicBool,
     /// The watcher lost A: the node is gone, which is an abort (exit 6),
     /// not a disagreement.
     lost: AtomicBool,
@@ -822,6 +827,7 @@ impl Qbitd {
             failure: Mutex::new(None),
             requested: AtomicU64::new(0),
             stop_minting: Mutex::new(false),
+            keepalives_held: AtomicBool::new(false),
             lost: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
@@ -1380,6 +1386,61 @@ impl crate::node::ExternalMint for Qbitd {
         });
         None
     }
+
+    /// A's tip as its watcher saw it, once every mint asked of B and every
+    /// block A accepted from the relay is among the tips the watcher saw:
+    /// before then, the tip a frontend serves work on is about to change.
+    fn settled_tip(&self) -> Option<String> {
+        // A mint that failed is never seen and does not hold the tip; one
+        // still in the channel or on B does.
+        let minted: Vec<String> = {
+            let mints = self.shared.mints.lock().expect("mints");
+            if (mints.len() as u64) < self.shared.requested.load(Ordering::SeqCst) {
+                return None;
+            }
+            mints.iter().filter_map(|mint| mint.hash.clone()).collect()
+        };
+        let accepted: Vec<String> = self
+            .relay
+            .log
+            .lock()
+            .expect("relay log")
+            .submissions
+            .iter()
+            .filter(|submission| submission.accepted)
+            .map(|submission| submission.block_hash.clone())
+            .collect();
+        let tips = self.shared.tips.lock().expect("tips");
+        let seen: HashSet<&str> = tips.iter().map(|tip| tip.hash.as_str()).collect();
+        if minted
+            .iter()
+            .chain(&accepted)
+            .any(|hash| !seen.contains(hash.as_str()))
+        {
+            return None;
+        }
+        Some(
+            tips.last()
+                .map_or_else(|| self.ramp_tip.0.clone(), |tip| tip.hash.clone()),
+        )
+    }
+
+    fn hold_keepalives(&self, held: bool) {
+        let _gate = self.shared.stop_minting.lock().expect("stop minting");
+        self.shared.keepalives_held.store(held, Ordering::SeqCst);
+    }
+
+    /// The relay records a `submitblock` once A has answered it, and A's
+    /// answer to an accepted block comes after A connected it.
+    fn block_answered(&self, block_hash: &str) -> bool {
+        self.relay
+            .log
+            .lock()
+            .expect("relay log")
+            .submissions
+            .iter()
+            .any(|submission| submission.block_hash == block_hash)
+    }
 }
 
 fn latency_summary(samples: &[f64]) -> Value {
@@ -1717,6 +1778,9 @@ async fn keepalive(requests: mpsc::UnboundedSender<MintRecord>, shared: Arc<Shar
         if *stopped {
             return;
         }
+        if shared.keepalives_held.load(Ordering::SeqCst) {
+            continue;
+        }
         let (tips, tip_time) = {
             let tips = shared.tips.lock().expect("tips");
             (
@@ -1744,6 +1808,39 @@ async fn keepalive(requests: mpsc::UnboundedSender<MintRecord>, shared: Arc<Shar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #638: a keepalive held while a scheduled block is due or outstanding
+    /// is neither counted nor asked for, and goes out once released.
+    #[tokio::test]
+    async fn a_held_keepalive_is_asked_for_only_after_its_release() {
+        let shared = Arc::new(Shared {
+            ramp_tip_time: now_seconds() - KEEPALIVE_SECONDS as i64 - 1,
+            tips: Mutex::new(Vec::new()),
+            mints: Mutex::new(Vec::new()),
+            failure: Mutex::new(None),
+            requested: AtomicU64::new(0),
+            stop_minting: Mutex::new(false),
+            keepalives_held: AtomicBool::new(true),
+            lost: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(keepalive(tx, shared.clone()));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(rx.try_recv().is_err(), "held: nothing asked for");
+        assert_eq!(shared.requested.load(Ordering::SeqCst), 0);
+        {
+            let _gate = shared.stop_minting.lock().unwrap();
+            shared.keepalives_held.store(false, Ordering::SeqCst);
+        }
+        let record = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("released: asked for")
+            .expect("a request");
+        assert_eq!(record.purpose, MintPurpose::Keepalive);
+        assert_eq!(shared.requested.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
 
     #[test]
     fn the_address_encoder_matches_what_qbitd_issued() {

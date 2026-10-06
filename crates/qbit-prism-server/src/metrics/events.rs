@@ -95,6 +95,18 @@ impl Metrics {
             self.landing_acks.record(received_at, elapsed);
         }
     }
+    /// #621: a Stratum request waited `elapsed`, from its complete frame, for
+    /// its session's own job delivery in flight to end.
+    pub fn observe_request_delivery_wait(&self, elapsed: Duration) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(
+                Family::RequestDeliveryWait,
+                Labels::Empty,
+                elapsed.as_secs_f64(),
+            );
+    }
     /// Record stale-grace credit only after durable acceptance.
     pub fn record_grace_credit(&self) {
         self.inner
@@ -261,6 +273,9 @@ impl Metrics {
     }
     /// Exactly once, at the stale-job branch that refused the share. The coarse
     /// `stale-job` reason is still counted separately by the share observation.
+    /// `window_not_held` is recorded by the ledger at the candidate enqueue's
+    /// refusal (#619), so it also counts a refusal whose miner was already
+    /// answered `ledger-outcome-unknown`.
     pub fn record_stale_job_rejection(&self, cause: StaleJobCause) {
         self.inner
             .lock()
@@ -268,6 +283,17 @@ impl Metrics {
             .increment(
                 Family::StaleJobRejections,
                 Labels::One(("cause", cause.as_str())),
+            );
+    }
+    /// Exactly once per deferred job preparation, with the reason its log
+    /// line names (#622).
+    pub fn record_job_preparation_deferral(&self, reason: JobDeferral) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::JobPreparationDeferrals,
+                Labels::One(("reason", reason.as_str())),
             );
     }
     /// Exactly one observation at the actual first-offer boundary. A/#266
@@ -325,6 +351,24 @@ impl Metrics {
             Family::OrderLockHold,
             Labels::One(("holder", holder.as_str())),
             elapsed,
+        );
+    }
+    /// Exactly once per post-landing `malloc_trim` (#600): its duration, the
+    /// resident bytes it returned, and the resident set it left.
+    pub fn observe_landing_trim(&self, trim: &crate::memory::Trim) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.observe(
+            Family::LandingTrimSeconds,
+            Labels::Empty,
+            trim.elapsed.as_secs_f64(),
+        );
+        if let Some(released) = trim.released() {
+            registry.add(Family::LandingTrimReleased, Labels::Empty, released as f64);
+        }
+        registry.set(
+            Family::LandingTrimResident,
+            Labels::Empty,
+            trim.resident_after.map_or(-1., |bytes| bytes as f64),
         );
     }
     fn observe(&self, family: Family, labels: Labels, elapsed: Duration) {

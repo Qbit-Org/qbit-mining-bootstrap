@@ -36,6 +36,7 @@
     "--churn-rate": 250,
     "--churn-seconds": 0,
     "--churn-tips": 0,
+    "--ctv-settlement": false,
     "--database-url": null,
     "--db-max-connections": 16,
     "--external-tips": 6,

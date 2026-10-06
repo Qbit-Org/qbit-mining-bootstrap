@@ -57,6 +57,13 @@ name: PRISM load harness (nightly)
 # 350 runner-minutes a week, about $5.60 at $0.016 per 8 vCPU minute.
 # `preset: soak-weekly` (or `weekly`) dispatches it by hand.
 #
+# #554: the same Saturday selection runs faults-long-real-node on its own
+# 16 vCPU runner beside the soak: every fault under load with 2,000 sessions
+# on the real node, the primary's WAL on a fuse2fs volume the `wal-disk-full`
+# fault fills, about 60 minutes with the ramp (timeout 100). Cost: about
+# $2 a week at $0.032 per 16 vCPU minute. The run job installs fuse2fs
+# and fuse3 only for a preset whose --faults lists wal-disk-full.
+#
 # The `shipped-images` job is #487's lane L6 (#544): the images and the
 # Compose wiring operators run, under the `prism` profile with the HA overlay
 # on a real regtest node, mined by cpuminer-opt and qbit-prism-miner. It runs
@@ -133,7 +140,8 @@ on:
           Preset name(s), comma separated, from crates/qbit-prism-load/presets;
           `nightly` for the nightly set, `all` for nightly plus manual
           (mainnet-shape-2600-addresses and #473's cells other than 400k fe1 async),
-          `weekly` for the 5.5 h soak (soak-weekly).
+          `weekly` for the 5.5 h soak (soak-weekly) and the long fault set
+          (faults-long-real-node).
         required: true
         default: nightly
       ref:
@@ -363,6 +371,24 @@ jobs:
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
+      # #554: a preset whose faults fill the primary's WAL volume mounts a
+      # small ext4 image with fuse2fs, without root, as #575's disk-full
+      # scenario does.
+      - name: Check whether the preset fills a WAL volume
+        id: wal_volume
+        env:
+          PRESET: ${{ matrix.preset }}
+        run: |
+          set -euo pipefail
+          faults="$(jq -r '.args["--faults"] // ""' "crates/qbit-prism-load/presets/${PRESET}.json")"
+          if [[ "${faults}" == *wal-disk-full* ]]; then
+            printf 'needed=true\n' >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Install the disk-full tools
+        if: ${{ steps.wal_volume.outputs.needed == 'true' }}
+        uses: ./.github/actions/apt-install
+        with:
+          packages: fuse2fs fuse3
       # A `--node qbitd` preset (#547) drives the pinned qbit release; the
       # install script exports QBITD_BIN, which the harness reads when the
       # command line gives no --qbitd-bin. A fake-node preset ignores it.
@@ -744,10 +770,10 @@ jobs:
     name: Live regtest weekly scenarios
     if: ${{ github.event.schedule == '43 3 * * 0' || inputs.weekly }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    # #575's scenario writes mainnet's 13,566 blocks and about 2M of its 65.5M
-    # share rows (1x at 1/32 until #582 lands, then 1/16 at 4.1M rows), keeps
-    # two copies of that ledger (about 8 GB at 1/32, 15 GB at 1/16)
-    # in the service database, and cuts it over. It takes 7.6 minutes at 1/64
+    # #575's scenario writes mainnet's 13,566 blocks and about 4.1M of its
+    # 65.5M share rows (1x at 1/16), keeps two copies of that ledger (about
+    # 15 GB) in the service database, and cuts it over at the server's
+    # default statement timeout (#582). It takes 7.6 minutes at 1/64
     # of the rows on a 22-core host in release, and its row-proportional
     # phases put 1/16 near 20 minutes there, so the job builds in release and
     # allowed two hours; #553's long set adds about 75 minutes (45 of

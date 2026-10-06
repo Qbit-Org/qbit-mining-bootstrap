@@ -8,8 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod block_solvers;
 mod online;
 mod partition;
+mod share_hashes;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 
 /// The schema migrations every native start requires, each checked on its
@@ -23,11 +25,12 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect. Existing native
-/// ledgers apply 013 and 017 online (`ONLINE_MIGRATIONS`) and record each
-/// after its last change, so a start refuses the database until that has
-/// completed.
+/// ledgers apply 013, 017 and 024 online (`ONLINE_MIGRATIONS`) and record
+/// each after its last change, so a start refuses the database until that
+/// has completed. A populated 2.x.x source records 2 the same way, after its
+/// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -67,6 +70,28 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // 018: every accepted chain update advances a durable epoch. Older
     // writers must be stopped before migration, not just refused at restart.
     ("chain_observation_epoch", 1),
+    // 021: a claim is taken over only after its taker has timed its lease on
+    // its own monotonic clock (#581). An older binary takes over by the
+    // database clock, so it must be stopped before migration and refused at
+    // every connect after it.
+    ("candidate_claim_observed_lease", 1),
+    // 022: a CTV fanout claim is taken over the same way (#654). An older
+    // binary takes fanouts over by the database clock, so it too must be
+    // stopped before migration and refused at every connect after it.
+    ("fanout_claim_observed_lease", 1),
+    // 023: the cluster-wide block submission hold (#664). An older binary
+    // would claim and offer candidates while the cluster holds submission,
+    // so it must be stopped before migration and refused at every connect
+    // after it.
+    ("block_submission_hold", 1),
+    // #669: migration 2's share-hash backfill has not finished (#582). Unlike
+    // the formats above it describes a state: declared with the backfill's
+    // cursor and removed with it when 2 is recorded (`share_hashes.rs`). A
+    // binary without this entry, every build before #669, refuses the
+    // database at connect and at migrate while it is declared, so none can
+    // serve a ledger whose legacy headers are not all mapped, whatever the
+    // migration record says.
+    (share_hashes::PENDING_CAPABILITY, 1),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -603,7 +628,22 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
         } else {
             ""
         };
-        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}, then start or migrate again");
+        let lease_remedy = if versions.contains(&21) {
+            " and restore candidate_claim_observed_lease = 1 from migrations/021_candidate_claim_observed_lease.sql after verifying its claim_renewals and claim_lease_seconds columns are present"
+        } else {
+            ""
+        };
+        let fanout_lease_remedy = if versions.contains(&22) {
+            " and restore fanout_claim_observed_lease = 1 from migrations/022_fanout_claim_observed_lease.sql after verifying its claim_renewals and claim_lease_seconds columns on qbit_ctv_fanout_artifacts are present"
+        } else {
+            ""
+        };
+        let hold_remedy = if versions.contains(&23) {
+            " and restore block_submission_hold = 1 from migrations/023_block_submission_hold.sql after verifying its qbit_prism_submission_hold and qbit_prism_submission_hold_events tables are present"
+        } else {
+            ""
+        };
+        bail!("database is at schema migration 6 but has no qbit_prism_schema_capabilities: 006 created it and nothing native drops it, so the table was dropped or restored selectively and the database can no longer declare which PRISM release wrote it. Restore the full backup, or, if every pending candidate is known to use this server's version 1 format, re-create the table and its {DECLARED_CAPABILITY} row from migrations/006_source_schema.sql (1){lifecycle_remedy}{startup_remedy}{orphan_remedy}{epoch_remedy}{lease_remedy}{fanout_lease_remedy}{hold_remedy}, then start or migrate again");
     };
     ensure!(
         rows.iter().any(|(name, _)| name == DECLARED_CAPABILITY),
@@ -636,6 +676,24 @@ fn require_declared_capabilities(rows: Option<&[(String, i32)]>, versions: &[i32
             "database is at schema migration 18 but does not declare chain_observation_epoch = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup including its durable chain_epoch and migration 018 capability; never reset the epoch or resume an older writer; nothing was changed"
         );
     }
+    if versions.contains(&21) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "candidate_claim_observed_lease" && *value == 1),
+            "database is at schema migration 21 but does not declare candidate_claim_observed_lease = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 021's claim columns and capability; never resume a pre-021 frontend beside a post-021 one; nothing was changed"
+        );
+    }
+    if versions.contains(&22) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "fanout_claim_observed_lease" && *value == 1),
+            "database is at schema migration 22 but does not declare fanout_claim_observed_lease = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 022's fanout claim columns and capability; never resume a pre-022 frontend beside a post-022 one; nothing was changed"
+        );
+    }
+    if versions.contains(&23) {
+        ensure!(
+            rows.iter().any(|(name, value)| name == "block_submission_hold" && *value == 1),
+            "database is at schema migration 23 but does not declare block_submission_hold = 1. Upgrade the server if a newer release wrote the database; otherwise restore the full backup, including migration 023's hold tables and capability; never resume a pre-023 frontend beside a post-023 one; nothing was changed"
+        );
+    }
     Ok(())
 }
 
@@ -656,6 +714,9 @@ fn refuse_undeclared_native_database(versions: &[i32], inventory: &SourceInvento
         && !versions.contains(&12)
         && !versions.contains(&15)
         && !versions.contains(&18)
+        && !versions.contains(&21)
+        && !versions.contains(&22)
+        && !versions.contains(&23)
     {
         return Ok(());
     }
@@ -693,18 +754,22 @@ fn refuse_newer_native_database(versions: &[i32], inventory: &SourceInventory) -
     Ok(())
 }
 
-/// A native database whose record has 3 and not 2. Every native build
-/// records both in the one transaction that applies them, so such a record
-/// was edited or restored selectively. Only 2 can be hidden that way: 3
-/// applies it, and every later migration is checked on its own.
+/// A native database whose record has 3 and not 2, and no share-hash
+/// backfill pending. Every native build records 2 in the transaction that
+/// records 3, or, on a populated 2.x.x source, after the backfill that
+/// `qbit_prism_share_hash_backfill` tracks until then (`share_hashes.rs`,
+/// #582), which the caller resumes rather than refuses. Without that table
+/// such a record was edited or restored selectively. Only 2 can be hidden
+/// that way: 3 applies it, and every later migration is checked on its own.
 /// `require_schema_version` refuses the gap at every start, and
 /// `migrate_schema` neither re-runs 002 on a database at 3 nor records it
-/// unseen, which would vouch for objects this run never checked, so nothing
-/// would repair it. Refused before any DDL, naming the remedy.
+/// unseen, which would vouch for objects and a share-hash mapping this run
+/// never checked, so nothing would repair it. Refused before any DDL,
+/// naming the remedy.
 fn refuse_inconsistent_native_record(versions: &[i32]) -> Result<()> {
     ensure!(
         !versions.contains(&3) || versions.contains(&2),
-        "refusing to migrate a native database at schema migrations {} before any DDL: migration 3 is recorded and 2 is not, and every native build records both in one transaction, so the migration record was edited or restored selectively; every start refuses the gap, and no migrate repairs it, because 002_multi_instance.sql is not re-run on a database at 3 and recording it unseen would vouch for objects this run never checked. Nothing was changed. Restore the full pre-migration backup, or, once every object 002_multi_instance.sql creates is verified present, record it with INSERT INTO qbit_prism_schema_migrations(version) VALUES(2) and migrate again",
+        "refusing to migrate a native database at schema migrations {} before any DDL: migration 3 is recorded and 2 is not, and no share-hash backfill is pending (there is no qbit_prism_share_hash_backfill). Every native build records 2 in the transaction that records 3, or, on a populated 2.x.x source, after the backfill that table tracks, so the migration record was edited or restored selectively; every start refuses the gap, and no migrate repairs it, because 002_multi_instance.sql is not re-run on a database at 3 and recording it unseen would vouch for objects and a share-hash mapping this run never checked. Nothing was changed. Restore the full pre-migration backup, or, once every object 002_multi_instance.sql creates is verified present and qbit_prism_share_hashes maps every accepted share whose ID ends in 64 hex digits, record it with INSERT INTO qbit_prism_schema_migrations(version) VALUES(2) and migrate again",
         schema_version_list(versions)
     );
     Ok(())
@@ -2143,6 +2208,22 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         20,
         include_str!("../../migrations/020_payout_divergences.sql"),
     ),
+    (
+        21,
+        include_str!("../../migrations/021_candidate_claim_observed_lease.sql"),
+    ),
+    (
+        22,
+        include_str!("../../migrations/022_fanout_claim_observed_lease.sql"),
+    ),
+    (
+        23,
+        include_str!("../../migrations/023_block_submission_hold.sql"),
+    ),
+    (
+        24,
+        include_str!("../../migrations/024_fanout_lane_index.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -2155,14 +2236,20 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// ledger into a partitioned table (see `partition.rs`): its validation
 /// scan runs for hours on a large ledger and its swap must take the table
 /// lock with a short timeout and retries, neither of which the migration
-/// transaction can do. Each is recorded last, so the startup gate refuses
+/// transaction can do. 024 creates the CTV fanout claim lane's index
+/// (#668) the way 013 does: a plain `CREATE INDEX` would hold every write
+/// to `qbit_ctv_fanout_artifacts` for the build, a found block's landing
+/// included, on a ledger whose other frontends keep running, since 024
+/// needs no shutdown proof. Each is recorded last, so the startup gate refuses
 /// the database until it has completed. Fresh and empty 2.x.x sources apply
 /// these inside the transaction while holding the cutover locks that
 /// exclude writers. A later transactional migration must not depend on an
 /// online one's objects: within one run it is applied first. 017 depends on
 /// 013's indexes and on 016's functions; 013 is applied before it by
-/// version order, and 016 is transactional.
-pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17];
+/// version order, and 016 is transactional. 002 is not listed: its file is
+/// always transactional, and only its share-hash backfill on a populated
+/// 2.x.x source runs after the commit, ahead of these (`share_hashes.rs`).
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 24];
 
 /// The online migration a version declares, from the scratch apply's
 /// before and after readings.
@@ -2172,7 +2259,7 @@ fn derive_online(
     after: &SchemaFingerprint,
 ) -> Result<OnlineMigration> {
     match version {
-        13 => Ok(OnlineMigration::Indexes(online::derive(
+        13 | 24 => Ok(OnlineMigration::Indexes(online::derive(
             version, before, after,
         )?)),
         17 => Ok(OnlineMigration::Partitions(partition::derive(
@@ -2803,6 +2890,9 @@ pub(super) async fn migrate_schema(
     // The online migrations this run must apply after the commit, from the
     // definitions the scratch apply rendered.
     let mut online = Vec::new();
+    // Whether this transaction created a share-hash backfill cursor, which
+    // it fences as soon as 006 has created the capability table (#669).
+    let mut cursor_created = false;
     if !versions.contains(&3) {
         // Existing native writers use this same lock order. Keep the
         // schema repair and cutover atomic with their accounting. Its hold
@@ -2874,6 +2964,9 @@ pub(super) async fn migrate_schema(
         // Nothing a native migration creates may be there yet, or its IF
         // NOT EXISTS would keep it as it is.
         require_no_native_collision(state, &reserved, &found)?;
+        // The share-hash backfill's progress table is no migration file's
+        // object, so its name is checked on its own.
+        share_hashes::refuse_held_name(tx).await?;
         refuse_undrained_outbox(tx, &inventory, None).await?;
         sqlx::raw_sql(&base_schema).execute(&mut **tx).await?;
         // 001 repaired what it re-asserts; what it skipped must already be
@@ -2885,9 +2978,18 @@ pub(super) async fn migrate_schema(
             sqlx::raw_sql(native_migration(2))
                 .execute(&mut **tx)
                 .await?;
-            sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
-                .execute(&mut **tx)
-                .await?;
+            if ledger_empty {
+                // Nothing to map, so nothing to leave for after the commit.
+                sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
+                    .execute(&mut **tx)
+                    .await?;
+            } else {
+                // The legacy shares are mapped after the commit, in batches,
+                // before 013, 017 and 024, and that run records 2 (#582).
+                share_hashes::create_cursor(tx).await?;
+                cursor_created = true;
+                online.insert(0, OnlineMigration::ShareHashes);
+            }
         }
         sqlx::raw_sql(native_migration(3))
             .execute(&mut **tx)
@@ -2906,11 +3008,26 @@ pub(super) async fn migrate_schema(
         // 005 and 006, or 008 and 009, would alter a database a newer
         // release wrote and record their versions, and only the connect-time
         // gate, after the commit, would refuse it. A record with 3 and not
-        // 2, which no native build writes, is refused first: 004 to 009
-        // must not run above a record every start refuses and no migrate
-        // repairs.
-        refuse_inconsistent_native_record(&versions)?;
+        // 2 is refused first: 004 to 009 must not run above a record every
+        // start refuses and no migrate repairs. The one exception is a
+        // populated 2.x.x source whose share-hash backfill has not finished,
+        // which records 2 last (#582): this run resumes it.
+        let backfill = share_hashes::progress(tx).await?;
         let inventory = inspect_source_schema(tx).await?;
+        if backfill.is_none() {
+            // A fence without its cursor: the cursor was dropped by hand, and
+            // "3 without 2" would only suggest recording 2 by hand (#669).
+            // Only this release's value: at another, the name is a newer
+            // release's declaration, refused below as any newer one is.
+            if inventory.capability(share_hashes::PENDING_CAPABILITY) == Some(1) {
+                bail!(
+                    "refusing to migrate a native database at schema migrations {} before any DDL: {}",
+                    schema_version_list(&versions),
+                    share_hashes::orphaned_fence_refusal()
+                );
+            }
+            refuse_inconsistent_native_record(&versions)?;
+        }
         // A database at 6 that no longer declares its capabilities is
         // refused before 008 or 009 run above it, as connect refuses it.
         refuse_undeclared_native_database(&versions, &inventory)?;
@@ -2945,7 +3062,24 @@ pub(super) async fn migrate_schema(
             refuse_undrained_outbox(tx, &inventory, Some(&versions)).await?;
             source = (None, inventory.capability("candidate_storage_version"));
         }
-        online.extend(require_no_native_gap_collisions(tx, &versions).await?);
+        // A pending backfill's database has 002's objects: the transaction
+        // that created its progress table applied 002 too. The gap check
+        // would find them and refuse 2 as a gap to repair.
+        let applied: Vec<i32> = match backfill {
+            Some(_) if !versions.contains(&2) => {
+                std::iter::once(2).chain(versions.iter().copied()).collect()
+            }
+            _ => versions.clone(),
+        };
+        online.extend(require_no_native_gap_collisions(tx, &applied).await?);
+        if let Some(progress) = backfill {
+            tracing::info!(
+                next_seq = progress.next_seq,
+                end_seq = progress.end_seq,
+                "resuming migration 2's share-hash backfill after the commit"
+            );
+            online.insert(0, OnlineMigration::ShareHashes);
+        }
     }
     if !versions.contains(&4) {
         sqlx::raw_sql(native_migration(4))
@@ -2981,6 +3115,14 @@ pub(super) async fn migrate_schema(
         if let Some(state) = state {
             tracing::info!(source=state.rule().name, release=?release, "migrated PRISM database source");
         }
+    }
+    // A cursor this transaction created fences every earlier build at once
+    // (#669); 006 has created the capability table by here. Only here, never
+    // on a resume: a runner an earlier build started before then could still
+    // finish the backfill, and would leave a later fence behind
+    // (`share_hashes.rs`).
+    if cursor_created {
+        share_hashes::declare_pending(tx).await?;
     }
     if !versions.contains(&7) {
         // 007's own drain check, which is not the one `refuse_undrained_outbox`
@@ -3103,6 +3245,9 @@ pub(super) async fn migrate_schema(
         sqlx::raw_sql(native_migration(16))
             .execute(&mut **tx)
             .await?;
+        // The existing blocks' solvers, in this transaction but in short
+        // statements, not one long one (#672).
+        block_solvers::attribute(tx).await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(16)")
             .execute(&mut **tx)
             .await?;
@@ -3137,6 +3282,42 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(20)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&21) {
+        // #581: a pre-021 frontend takes claims over by the database clock
+        // and never writes the claim columns a post-021 taker times, so the
+        // two must never run together. The capability refuses future
+        // connects; every earlier instance must already be stopped.
+        refuse_unquiesced_instances(tx, 21).await?;
+        sqlx::raw_sql(native_migration(21))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(21)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&22) {
+        // #654: a pre-022 frontend takes CTV fanout claims over by the
+        // database clock and never writes the claim columns a post-022 taker
+        // times, so the two must never run together, exactly as for 021.
+        refuse_unquiesced_instances(tx, 22).await?;
+        sqlx::raw_sql(native_migration(22))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(22)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !versions.contains(&23) {
+        // #664: a pre-023 frontend ignores the cluster's block submission
+        // hold, so it must never run beside a post-023 one, as for 021.
+        refuse_unquiesced_instances(tx, 23).await?;
+        sqlx::raw_sql(native_migration(23))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(23)")
             .execute(&mut **tx)
             .await?;
     }
@@ -3254,6 +3435,11 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     );
     let mut connection = pool.acquire().await?;
     require_migration_history(&mut connection).await?;
+    // Named before the missing 2 it explains, and refused even with 2
+    // recorded: while the table is there, legacy shares may be unmapped.
+    if let Some(progress) = share_hashes::progress(&mut connection).await? {
+        bail!("{}", progress.refusal());
+    }
     let applied: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&mut *connection)
@@ -3309,6 +3495,17 @@ where
     let rows = read_capabilities(&mut *connection).await?;
     require_declared_capabilities(rows.as_deref(), &versions)?;
     refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)?;
+    // A pending backfill's fence is removed only with its cursor, which
+    // `require_schema_version` refuses while it exists (#669).
+    if rows
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|(name, value)| name == share_hashes::PENDING_CAPABILITY && *value == 1)
+        && share_hashes::progress(&mut connection).await?.is_none()
+    {
+        bail!("{}", share_hashes::orphaned_fence_refusal());
+    }
     if versions.contains(&18) {
         let epoch: i64 = sqlx::query_scalar("SELECT chain_epoch FROM qbit_prism_cluster WHERE singleton")
             .fetch_one(&mut *connection).await
@@ -5372,6 +5569,54 @@ mod tests {
             })
             .collect();
         assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
+    }
+
+    /// The export refuses the capabilities startup refuses, so its list of
+    /// understood ones must be startup's, the backfill fence among them.
+    #[test]
+    fn recovery_evidence_understands_the_capabilities_startup_understands() {
+        let script = include_str!("../../../../scripts/prism-recovery-evidence.sql");
+        let lists: Vec<&str> = script
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("ELSIF capability.capability NOT IN (")
+                    .and_then(|rest| rest.strip_suffix(") THEN"))
+            })
+            .collect();
+        let [list] = lists[..] else {
+            panic!("expected one list of understood capabilities, found {lists:?}");
+        };
+        let mut understood: Vec<&str> = list
+            .split(',')
+            .map(|name| name.trim().trim_matches('\''))
+            .collect();
+        let mut native: Vec<&str> = NATIVE_CAPABILITIES.iter().map(|(name, _)| *name).collect();
+        understood.sort_unstable();
+        native.sort_unstable();
+        assert_eq!(understood, native);
+    }
+
+    /// While 2's backfill is pending the database declares a capability no
+    /// build before #669 understands: each refuses it at connect and at
+    /// migrate, even once 2 has been recorded by hand (#669). This build
+    /// understands it, and refuses the pending cursor instead.
+    #[test]
+    fn a_pending_share_hash_backfill_fences_every_earlier_build() {
+        let declared = [(share_hashes::PENDING_CAPABILITY.to_owned(), 1)];
+        let earlier: Vec<(&str, i32)> = NATIVE_CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|(name, _)| *name != share_hashes::PENDING_CAPABILITY)
+            .collect();
+        let error = refuse_unknown_capabilities(&declared, &earlier)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("database declares capability share_hash_backfill_pending = 1, which this server does not understand"),
+            "{error}"
+        );
+        refuse_unknown_capabilities(&declared, NATIVE_CAPABILITIES).unwrap();
     }
 
     #[test]

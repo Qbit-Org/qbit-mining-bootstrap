@@ -360,7 +360,7 @@ impl Ledger {
         // offer. A recovered reservation whose call's answer was never
         // recorded lands with an `unknown` outcome, as reconciliation and
         // the orphan disposition record it (#529); a pending row keeps none.
-        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=CASE WHEN state IN {} THEN COALESCE(offer_outcome,'unknown') ELSE offer_outcome END,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2", CandidateState::OFFERED_SQL))
+        sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=CASE WHEN state IN {} THEN COALESCE(offer_outcome,'unknown') ELSE offer_outcome END,completed_at=clock_timestamp(),updated_at=clock_timestamp(),last_error=$4,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0 WHERE block_hash=$1 AND claim_token=$2", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(if submitted {"submitted"} else {"abandoned"}).bind(error).execute(&mut *tx).await?;
         // Shared by ordinary processing and operator recovery. Arm only at the
         // actual COMMIT attempt, after all proven precommit failures are past.
@@ -457,7 +457,7 @@ impl Ledger {
         // lifecycle left it, with an `unknown` outcome for a reservation
         // whose call was lost. An offer-state row has no `body_id` under
         // 011's payload rule, so there is no body to release.
-        let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL WHERE block_hash=$1 AND claim_token=$2 AND state IN {} AND claim_expires_at>clock_timestamp()", CandidateState::OFFERED_SQL))
+        let settled = sqlx::query(&format!("UPDATE qbit_block_candidate_outbox SET state=$3,{RELEASE_PAYLOAD_SQL},offer_outcome=COALESCE(offer_outcome,'unknown'),last_error=$4,completed_at=clock_timestamp(),updated_at=clock_timestamp(),claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0 WHERE block_hash=$1 AND claim_token=$2 AND state IN {}", CandidateState::OFFERED_SQL))
             .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(ORPHANED_STATE).bind(reason).execute(&mut *tx).await?.rows_affected();
         ensure!(settled == 1, CandidateState::OFFERED_CLAIM_LOST);
         let orphan = self
@@ -609,7 +609,7 @@ impl Ledger {
                 // ACK. Reconciliation must credit its deferred share as part
                 // of the same confirmation transaction.
                 self.credit_deferred_share(tx, &hash).await?;
-                sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='awaiting_maturity',claim_token=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1 AND settlement_status='reorged'").bind(&hash).execute(&mut **tx).await?;
+                sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='awaiting_maturity',{},updated_at=clock_timestamp() WHERE block_hash=$1 AND settlement_status='reorged'", super::fanout::CLEAR_FANOUT_CLAIM_SQL)).bind(&hash).execute(&mut **tx).await?;
                 changed = true;
             } else if !active && state == "confirmed" {
                 // Immature here: a mature block returned the fatal above.
@@ -635,13 +635,41 @@ impl Ledger {
         Ok((None, effects))
     }
 
+    /// Claim the next CTV fanout to attempt or check, for `lease_seconds`.
+    ///
+    /// #654: a claimed fanout is taken over only once this process has
+    /// watched its version go unrenewed for its whole lease, on its own
+    /// monotonic clock, as a candidate is (#581); the database clock's
+    /// `claim_expires_at` decides nothing. Every poll first surveys the
+    /// claims (and makes due every attempt a backward clock step stretched),
+    /// then takes over such a claim before any new one. The lane itself takes
+    /// only an unclaimed, due fanout, reading only the fanouts it may claim
+    /// ([`Ledger::fanout_lane_sql`], #668).
     pub async fn claim_fanout(&self, lease_seconds: i64) -> Result<Option<FanoutClaim>> {
-        ensure!(lease_seconds > 0, "claim duration must be positive");
+        ensure!(
+            (1..=600).contains(&lease_seconds),
+            "invalid fanout lease duration"
+        );
         let mut tx = self.begin().await?;
-        writable(&mut tx).await?;
+        // #664: no fanout is claimed, by any frontend, while the cluster
+        // holds block submission.
+        if writable_unless_held(&mut tx, false).await?.is_some() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         let token = Uuid::new_v4().to_string();
-        let row = sqlx::query("WITH next AS (SELECT a.fanout_txid FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' AND b.maturity_state='mature' AND (a.settlement_status IN ('broadcastable','broadcast_submitted','failed') OR (a.settlement_status='confirmed' AND (a.confirmed_depth<1000 OR a.fanout_txid=(SELECT fanout_txid FROM qbit_ctv_fanout_artifacts WHERE settlement_status='confirmed' AND confirmed_depth>=1000 ORDER BY confirmed_block_height DESC,fanout_txid DESC LIMIT 1)))) AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at<=clock_timestamp()) AND (a.claim_expires_at IS NULL OR a.claim_expires_at<=clock_timestamp()) ORDER BY (a.settlement_status='confirmed'),a.next_broadcast_attempt_at NULLS FIRST,b.block_height,a.chunk_index FOR UPDATE OF a SKIP LOCKED LIMIT 1) UPDATE qbit_ctv_fanout_artifacts a SET claim_token=$1,claim_instance_id=$2,claim_expires_at=clock_timestamp()+$3*interval '1 second' FROM next WHERE a.fanout_txid=next.fanout_txid RETURNING a.fanout_txid,a.block_hash,a.manifest,a.broadcast_attempt_count,jsonb_build_object('status',a.settlement_status,'confirmed_block_hash',a.confirmed_block_hash,'confirmed_block_height',a.confirmed_block_height,'confirmed_depth',a.confirmed_depth,'scan_next_height',a.spend_scan_next_height,'scan_anchor_height',a.spend_scan_anchor_height,'scan_anchor_hash',a.spend_scan_anchor_hash) AS progress")
-            .bind(&token).bind(&self.instance_id).bind(lease_seconds).fetch_optional(&mut *tx).await?;
+        let claims = self.survey_fanout_claims(&mut tx).await?;
+        let mut row = self
+            .take_over_fanout(&mut tx, &claims, &token, lease_seconds)
+            .await?;
+        if row.is_none() {
+            row = sqlx::query(&Self::fanout_lane_sql())
+                .bind(&token)
+                .bind(&self.instance_id)
+                .bind(lease_seconds)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         row.map(|row| {
             Ok(FanoutClaim {
@@ -715,7 +743,7 @@ impl Ledger {
             "failed" => "failed",
             _ => "planned",
         };
-        sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET settlement_status=CASE WHEN $3='failed' AND settlement_status='confirmed' THEN settlement_status ELSE $3 END,{},{},claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2", super::fanout::attempt_columns("$4", "$5", "$6"), super::fanout::ATTEMPT_BACKOFF))
+        sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET settlement_status=CASE WHEN $3='failed' AND settlement_status='confirmed' THEN settlement_status ELSE $3 END,{},{},{},updated_at=clock_timestamp() WHERE fanout_txid=$1 AND claim_token=$2", super::fanout::attempt_columns("$4", "$5", "$6"), super::fanout::ATTEMPT_BACKOFF, super::fanout::CLEAR_FANOUT_CLAIM_SQL))
             .bind(&claim.fanout_txid).bind(&claim.claim_token).bind(status).bind(attempt_status).bind(&submit_result).bind(error).execute(&mut *tx).await?;
         super::fanout::record_attempt_history(
             &mut tx,
@@ -879,7 +907,9 @@ async fn require_claim(
     .bind(&claim.candidate.block_hash)
     .fetch_optional(&mut **tx)
     .await?;
-    let row: Option<(bool, String)> = sqlx::query_as(&format!("SELECT claim_token=$2 AND claim_expires_at>clock_timestamp() AND state IN {},state FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL))
+    // #581: the token is the fence. Whether the lease is still live is the
+    // holder's own monotonic deadline, never the database clock.
+    let row: Option<(bool, String)> = sqlx::query_as(&format!("SELECT COALESCE(claim_token=$2,false) AND state IN {},state FROM qbit_block_candidate_outbox WHERE block_hash=$1", CandidateState::UNFINISHED_SQL))
         .bind(&claim.candidate.block_hash).bind(&claim.claim_token).fetch_optional(&mut **tx).await?;
     match row {
         Some((true, state)) => CandidateState::parse(&state),
@@ -906,7 +936,7 @@ async fn deactivate_pool_block(
     let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='inactive',inactive_since=CASE WHEN chain_state='confirmed' THEN clock_timestamp() ELSE inactive_since END WHERE block_hash=$1 AND chain_state IN ('prepared','confirmed') AND maturity_state='immature'")
         .bind(block_hash).execute(&mut **tx).await?.rows_affected();
     if changed > 0 {
-        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,updated_at=clock_timestamp() WHERE block_hash=$1")
+        sqlx::query(&format!("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='reorged',{},updated_at=clock_timestamp() WHERE block_hash=$1", super::fanout::CLEAR_FANOUT_CLAIM_SQL))
             .bind(block_hash).execute(&mut **tx).await?;
     }
     Ok(changed > 0)

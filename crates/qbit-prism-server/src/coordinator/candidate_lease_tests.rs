@@ -26,6 +26,9 @@ mod claim_release_tests;
 #[path = "offer_shutdown_tests.rs"]
 mod offer_shutdown_tests;
 
+#[path = "submit_disabled_tests.rs"]
+mod submit_disabled_tests;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn landing_transaction_renews_across_expiries_and_terminal_contention_finishes_once(
 ) -> Result<()> {
@@ -217,6 +220,7 @@ impl Fixture {
             rpc_password: "test".into(),
             rpc_timeout: Duration::from_secs(5),
             block_submit_timeout: Duration::from_secs(1),
+            block_submit_enabled: true,
             poll_interval: Duration::from_secs(1),
             blockwait: false,
             build_workers: 1,
@@ -474,8 +478,12 @@ impl Fixture {
     }
 
     async fn expire_hash(&self, block_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-            .bind(block_hash).execute(&self.coordinator.ledger.pool).await?;
+        crate::ledger::revoke_candidate_claims(
+            &self.coordinator.ledger.pool,
+            Some(block_hash),
+            true,
+        )
+        .await?;
         Ok(())
     }
 
@@ -562,6 +570,66 @@ async fn saturated_build_capacity_keeps_the_lease_until_one_candidate_confirms()
     result
 }
 
+/// #581: a database clock step of two hours forward, while the holder waits
+/// for build capacity after its offer, makes the database clock call the
+/// live claim expired. The holder's heartbeat keeps renewing it on its
+/// token, no other frontend takes the row however long it waits, and the
+/// same attempt lands it with its one `submitblock`. Before #581 the next
+/// renewal was refused, the attempt failed, and a successor took the row.
+/// The step moves every stored outbox timestamp back instead of the clock
+/// forward, which is what each comparison with the clock sees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forward_database_clock_step_keeps_the_holders_lease_through_its_landing() -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let held = fixture
+            .coordinator
+            .build_slots
+            .clone()
+            .acquire_owned()
+            .await?;
+        let process = fixture.process(SHORT_LEASE);
+        fixture.wait_for_offer().await?;
+        fixture.wait_for_renewal().await?;
+        ensure!(
+            fixture.successor.claim_candidate(10).await?.is_none(),
+            "a live claim was taken"
+        );
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET created_at=created_at-interval '2 hours',updated_at=updated_at-interval '2 hours',claim_expires_at=claim_expires_at-interval '2 hours',offer_reserved_at=offer_reserved_at-interval '2 hours',next_attempt_at=next_attempt_at-interval '2 hours' WHERE block_hash=$1")
+            .bind(&fixture.claim.candidate.block_hash)
+            .execute(&fixture.coordinator.ledger.pool)
+            .await?;
+        // Several leases long: every renewal is a new version, so the
+        // successor never sees one go unrenewed for a whole lease.
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            ensure!(
+                !process.is_finished(),
+                "the holder lost its lease to the clock step"
+            );
+            ensure!(
+                fixture.successor.claim_candidate(10).await?.is_none(),
+                "another frontend took a live claim after a forward clock step"
+            );
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), process).await???;
+        ensure!(fixture.state().await? == "submitted");
+        ensure!(fixture.landed().await?);
+        ensure!(
+            fixture.submissions().await == 1,
+            "candidate was not submitted exactly once"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
 /// The work queued on build capacity is now the post-offer landing. An
 /// attempt that is aborted, taken over or blocked on its renewal while it
 /// waits must not land, must release the build slot, and must leave the
@@ -583,7 +651,10 @@ async fn canceled_or_lost_renewal_cannot_resume_queued_work() -> Result<()> {
                 "abort" => {
                     process.abort();
                     ensure!(process.await.unwrap_err().is_cancelled());
-                    // No detached heartbeat may renew after cancellation.
+                    // No detached heartbeat may renew after cancellation. The
+                    // successor starts timing the claim now and takes it below
+                    // only if it stays unrenewed for its whole lease (#581).
+                    ensure!(fixture.successor.claim_candidate(10).await?.is_none(),"the successor took a live claim");
                     tokio::time::sleep(Duration::from_millis(1100)).await;
                 }
                 "takeover" => {

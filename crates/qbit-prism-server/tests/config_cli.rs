@@ -75,6 +75,26 @@ async fn configured_command(
         .unwrap()
 }
 
+/// A command line with several arguments, isolated like `configured_command`
+/// and with the database unreachable.
+async fn configured_command_args(args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    command.args(args).kill_on_drop(true);
+    for (name, _) in std::env::vars().filter(|(name, _)| {
+        name.starts_with("PRISM_") || name.starts_with("QBIT_") || name == "RUST_LOG"
+    }) {
+        command.env_remove(name);
+    }
+    command.env("PRISM_RUNTIME_WORKERS", "2").env(
+        "PRISM_DATABASE_URL",
+        "postgresql://operator:test-only-password@127.0.0.1:1/offline",
+    );
+    timeout(Duration::from_secs(3), command.output())
+        .await
+        .expect("the command attempted network access or stalled")
+        .unwrap()
+}
+
 async fn rejects(production: bool, settings: &[(&str, &str)], message: &str) {
     let output = check(production, settings).await;
     assert!(
@@ -111,6 +131,97 @@ async fn valid_regtest_and_production_configuration_are_checked_without_services
         assert!(String::from_utf8_lossy(&output.stdout).contains("configuration valid"));
     }
     assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// #664: check-config never reads the database, so it says where the
+/// cluster-wide hold that overrides the switch is reported instead.
+const CLUSTER_HOLD: &str = "a cluster-wide block submission hold in the database overrides \
+    PRISM_BLOCK_SUBMIT_ENABLED; `qbit-prism-server submission-hold show` and self-check report it";
+
+/// #291: `check-config` states the block submission mode, and leads with the
+/// kill switch when it is on, in production too: a rehearsal runs on mainnet.
+#[tokio::test]
+async fn check_config_reports_the_block_submission_kill_switch_first() {
+    let output = check(false, &[]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        "PRISM_BLOCK_SUBMIT_ENABLED is on: found blocks are offered to the node's submitblock",
+        "found-block offers do not wait for a failover standby",
+        CLUSTER_HOLD,
+    ] {
+        assert!(report.contains(line), "{line:?} missing from {report}");
+    }
+    assert!(!report.contains("WARNING"), "{report}");
+    // Every spelling `flag` accepts turns it off, and the report names the
+    // setting rather than a value.
+    for (production, off) in [(false, "0"), (true, "off")] {
+        let output = check(
+            production,
+            &[
+                ("PRISM_BLOCK_SUBMIT_ENABLED", off),
+                ("PRISM_CTV_BROADCASTER_ENABLED", "1"),
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<_> = report.lines().take(3).collect();
+        assert_eq!(
+            lines,
+            [
+                "WARNING: block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED: found \
+                 blocks stay pending in the candidate outbox and are never sent to the node's \
+                 submitblock, and no CTV fanout is broadcast",
+                "WARNING: PRISM_CTV_BROADCASTER_ENABLED is held by PRISM_BLOCK_SUBMIT_ENABLED: \
+                 the CTV fanout broadcaster does not start",
+                "PRISM configuration valid; 2 runtime workers",
+            ],
+            "production={production}: {report}"
+        );
+        // A held frontend makes no offer, so it reports none.
+        assert!(!report.contains("found blocks are offered"), "{report}");
+        assert!(report.contains(CLUSTER_HOLD), "{report}");
+        assert!(!report.contains("found-block offers"), "{report}");
+    }
+    rejects(
+        false,
+        &[("PRISM_BLOCK_SUBMIT_ENABLED", "maybe")],
+        "PRISM_BLOCK_SUBMIT_ENABLED must be a boolean",
+    )
+    .await;
+}
+
+/// #291: the one-shot broadcaster refuses under the kill switch before it
+/// reaches the node or the database. Both are unreachable here, so any later
+/// refusal would name a connection instead.
+#[tokio::test]
+async fn broadcast_ctv_refuses_before_reaching_services_when_block_submission_is_disabled() {
+    let output = configured_command(
+        "broadcast-ctv",
+        false,
+        &[("PRISM_BLOCK_SUBMIT_ENABLED", "0")],
+    )
+    .await;
+    assert!(
+        !output.status.success(),
+        "broadcast-ctv ran under the kill switch: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED")
+            && error.contains("broadcast-ctv refuses to run"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -894,4 +1005,30 @@ async fn retired_inventory_covers_the_final_python_runtime_name() {
     let mut sorted = retired.clone();
     sorted.sort_unstable();
     assert_eq!(retired, sorted, "retired inventory is not sorted");
+}
+
+/// #664: `submission-hold set` and `clear` check their reason before they
+/// open a connection, so a blank one is refused even with the database
+/// unreachable, and both require one: each is journaled.
+#[tokio::test]
+async fn submission_hold_set_and_clear_refuse_a_blank_reason_before_reaching_the_database() {
+    for command in ["set", "clear"] {
+        let blank = configured_command_args(&["submission-hold", command, "--reason", "  "]).await;
+        assert!(!blank.status.success(), "{command}");
+        let error = String::from_utf8_lossy(&blank.stderr);
+        assert!(
+            error.contains("--reason must contain 1 to 4096 bytes of nonblank text"),
+            "{command}: {error}"
+        );
+        let missing = configured_command_args(&["submission-hold", command]).await;
+        assert_eq!(
+            missing.status.code(),
+            Some(2),
+            "{command}: clap's usage exit code"
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).contains("--reason"),
+            "{command}"
+        );
+    }
 }

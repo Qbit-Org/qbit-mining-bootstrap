@@ -10,6 +10,7 @@ use crate::{
     metrics::{RefreshAcquisition, RefreshTrigger},
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
+    waiting::{self, on_database, Dependency, Waiting},
 };
 use anyhow::{ensure, Context, Result};
 use num_bigint::BigUint;
@@ -150,6 +151,11 @@ pub struct Prepared {
     pub generation: u64,
     pub created: Instant,
     pub parent_of_tip: String,
+    /// The writer timeline `window`'s rows were read on, or `None` when the
+    /// work was reconstructed from a stored record and its window was not
+    /// re-read on a known timeline. Work used on any other timeline must
+    /// prove its window is still held first (#619). Runtime-only.
+    pub timeline: Option<crate::ledger::WriterTimeline>,
 }
 
 #[cfg(test)]
@@ -219,6 +225,49 @@ struct RefreshState {
     cached_window: Option<prepared_storage::compact::CompactOwner<refresh_window::CachedWindow>>,
 }
 
+/// A template refresh in flight (#655).
+struct RefreshInFlight {
+    started: Instant,
+    /// Its ledger steps mark this tracker (`crate::waiting`).
+    waiting: Waiting,
+}
+
+/// Registers a refresh in flight on `Coordinator::refresh_in_flight` and
+/// clears it when the refresh ends, cancellation included.
+struct InFlightRefresh<'a> {
+    slot: &'a std::sync::Mutex<Option<RefreshInFlight>>,
+    waiting: Waiting,
+}
+
+impl<'a> InFlightRefresh<'a> {
+    fn register(slot: &'a std::sync::Mutex<Option<RefreshInFlight>>) -> Self {
+        let waiting = Waiting::default();
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RefreshInFlight {
+            started: Instant::now(),
+            waiting: waiting.clone(),
+        });
+        Self { slot, waiting }
+    }
+}
+
+impl Drop for InFlightRefresh<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only its own entry: the refresh lock serializes refreshes, so
+        // another is never registered meanwhile, but a guard never clears
+        // what it did not write.
+        if slot
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.waiting.same_as(&self.waiting))
+        {
+            *slot = None;
+        }
+    }
+}
+
 pub struct Coordinator {
     pub config: Arc<Config>,
     pub ledger: Arc<Ledger>,
@@ -254,6 +303,12 @@ pub struct Coordinator {
     // Both states survive cancelled refreshes under the same serialization:
     // retiring cached inputs must not reset a consumed node transition.
     refresh_lock: Mutex<RefreshState>,
+    /// The template refresh in flight, if any (#655): when it started and
+    /// what it is waiting on, so a submit refused for stale readiness can
+    /// tell a refresh blocked on the database past its deadline from one
+    /// waiting on the node. Written only by the refresh holding
+    /// `refresh_lock`; never held across an await.
+    refresh_in_flight: std::sync::Mutex<Option<RefreshInFlight>>,
     resume_flights: compact_resume::ResumeFlights,
     /// One shared clock+revision read per fan-out burst; see `clocked_flight`.
     clocked_flights: clocked_flight::ClockedFlights,
@@ -279,6 +334,11 @@ pub struct Coordinator {
     /// Attempts between their offer reservation and its recorded answer,
     /// which a graceful shutdown lets finish (#578).
     offer_sections: offer_shutdown::OfferSections,
+    /// Returns a landing's freed heap to the kernel once its rebuilt window
+    /// is released (#600); on by default, `PRISM_LANDING_MALLOC_TRIM_ENABLED`.
+    pub landing_trim: Arc<crate::memory::LandingTrim>,
+    /// The cluster's block submission hold (#664) as `health` last read it.
+    submission_hold: SubmissionHoldView,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -305,16 +365,21 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 
 /// Why the one `submitblock` call provably did not run on the node, if it
 /// did not: its connection was never established, so no byte of it left this
-/// process (`rpc::RpcNotSentError`, #522), or the node answered it with
-/// `RPC_IN_WARMUP`, which qbitd returns before it dispatches any call
-/// (`rpc::RpcReplyError::in_warmup`, #526). Only a `submitblock` reply
-/// counts: a warmup answer to another call says nothing about this one.
-/// Every other result, any other error code, a transport failure after the
-/// connection existed or a timeout included, may have run and is `None`.
+/// process (`rpc::RpcNotSentError`, #522), the client refused to send it
+/// under `PRISM_BLOCK_SUBMIT_ENABLED` (`rpc::RpcRelayRefused`, #291), or the
+/// node answered it with `RPC_IN_WARMUP`, which qbitd returns before it
+/// dispatches any call (`rpc::RpcReplyError::in_warmup`, #526). Only a
+/// `submitblock` reply counts: a warmup answer to another call says nothing
+/// about this one. Every other result, any other error code, a transport
+/// failure after the connection existed or a timeout included, may have run
+/// and is `None`.
 fn offer_not_executed(result: &Result<Value>) -> Option<String> {
     let error = result.as_ref().err()?;
     if let Some(not_sent) = error.downcast_ref::<crate::rpc::RpcNotSentError>() {
         return Some(not_sent.to_string());
+    }
+    if let Some(refused) = error.downcast_ref::<crate::rpc::RpcRelayRefused>() {
+        return Some(refused.to_string());
     }
     error
         .downcast_ref::<crate::rpc::RpcReplyError>()
@@ -354,11 +419,68 @@ fn describe_offer(outcome: OfferOutcome, reply: Option<&str>) -> String {
     }
 }
 
+/// The longest interval the block wait waits for a new block, and so the
+/// longest between its readiness polls (#622); a shorter health timeout
+/// shortens it ([`Coordinator::unchanged_tip_poll_interval`]).
+const UNCHANGED_TIP_POLL: Duration = Duration::from_secs(5);
+/// The shortest such interval: `waitfornewblock` takes whole milliseconds and
+/// reads 0 as no timeout at all.
+const UNCHANGED_TIP_POLL_FLOOR: Duration = Duration::from_millis(1);
+
+/// A refresh-grade node poll: the readiness epoch read before it, the tip
+/// sequence it reserved, the tip it found and when it was sent (#622).
+struct TipPoll {
+    epoch: u64,
+    sequence: u64,
+    hash: String,
+    requested: Instant,
+}
+
 #[derive(Default)]
 struct ReadinessState {
     last_poll: Option<Instant>,
     generation: u64,
     ctv_fee_floor: Option<u64>,
+    /// When the read that produced `ctv_fee_floor` was sent. A poll renews
+    /// readiness under CTV settlement only with a floor read no older than
+    /// the poll, so fresh readiness keeps implying a fresh floor (#622).
+    ctv_fee_floor_read: Option<Instant>,
+    /// Whether a node poll may renew `last_poll` (#622). A refresh whose
+    /// chain observation and reconciliation agree sets it, as does every
+    /// refresh that renews readiness; one whose chain observation finds the
+    /// cluster on a heavier chain clears it, because this node's tip, even
+    /// when it is still the published one, is then no longer current.
+    poll_renews: bool,
+    /// Whether the latest template refresh failed on the ledger database
+    /// (#581). A guarded tip poll (#622) renews readiness only while the
+    /// published work is current, and only a refresh, which reads the
+    /// database, makes new work current. So readiness that has aged out
+    /// while this holds aged out because refreshes kept failing on the
+    /// database, not on the node, and a submit refused for it says so. A
+    /// node that fails stops the polls too, but the next refresh then fails
+    /// on the node and clears this, as does any refresh that succeeds.
+    refresh_failed_on_database: bool,
+}
+
+impl ReadinessState {
+    /// Revoke readiness: admission and submissions in flight fence on the
+    /// changed generation, and only a refresh restores it.
+    fn revoke(&mut self) {
+        self.last_poll = None;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("readiness generation exhausted");
+    }
+
+    /// Record a relay floor read sent at `requested`, unless a read sent
+    /// later is already recorded: a slow read cannot roll the floor back.
+    fn record_fee_floor(&mut self, floor: u64, requested: Instant) {
+        if self.ctv_fee_floor_read.is_none_or(|read| read <= requested) {
+            self.ctv_fee_floor = Some(floor);
+            self.ctv_fee_floor_read = Some(requested);
+        }
+    }
 }
 
 struct ChainCache {
@@ -438,6 +560,22 @@ pub enum RecoveryStop {
     Deadline,
 }
 
+/// The reason a claim gives for a window this primary does not hold
+/// ([`crate::ledger::WindowHolding::NotHeld`]): its last row is absent or is
+/// another share, so the read failure is lost or reissued history, never
+/// pruning or corruption. The block cannot land here; it is on chain, and
+/// the HA reference's runbook reconciles it as an accounting loss (#619).
+fn window_not_held_reason(window: &WindowRef, error: &WindowError) -> String {
+    let range = window.shares.map_or_else(
+        || "empty".to_owned(),
+        |range| format!("{}..={}", range.first_share_seq, range.last_share_seq),
+    );
+    format!(
+        "window not held by this primary: {error}; its last row is absent or is another share credited after anchor {}, so window {range}'s rows were lost or reissued by an asynchronous promotion, not pruned or corrupt (#619: the block cannot land here; reconcile it as an accounting loss)",
+        window.anchor_ms
+    )
+}
+
 /// Map a window read error to the claim's action. A database error is not
 /// mapped: it propagates to `submit_loop`, whose retry releases the claim.
 fn classify_window_error(error: WindowError) -> Result<RebuildFailure> {
@@ -471,29 +609,48 @@ fn classify_window_error(error: WindowError) -> Result<RebuildFailure> {
 /// on a runtime worker would stall candidate-lease heartbeats and share
 /// processing, so every path, early returns included, hands it to a blocking
 /// thread instead.
-struct OffRuntime<T: Send + 'static>(Option<T>);
+struct OffRuntime<T: Send + 'static> {
+    value: Option<T>,
+    then: Option<Box<dyn FnOnce() + Send>>,
+}
 
 impl<T: Send + 'static> OffRuntime<T> {
     fn new(value: T) -> Self {
-        Self(Some(value))
+        Self {
+            value: Some(value),
+            then: None,
+        }
+    }
+
+    /// Run `then` on the same blocking thread once the value is dropped.
+    fn then(mut self, then: impl FnOnce() + Send + 'static) -> Self {
+        self.then = Some(Box::new(then));
+        self
     }
 }
 
 impl<T: Send + 'static> std::ops::Deref for OffRuntime<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.0.as_ref().expect("owned until dropped")
+        self.value.as_ref().expect("owned until dropped")
     }
 }
 
 impl<T: Send + 'static> Drop for OffRuntime<T> {
     fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
+        if let Some(value) = self.value.take() {
+            let then = self.then.take();
+            let release = move || {
+                drop(value);
+                if let Some(then) = then {
+                    then();
+                }
+            };
             match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => {
-                    runtime.spawn_blocking(move || drop(value));
+                    runtime.spawn_blocking(release);
                 }
-                Err(_) => drop(value),
+                Err(_) => release(),
             }
         }
     }
@@ -525,6 +682,33 @@ fn protocol_error(reason: &'static str, message: &str) -> StratumError {
         _ => 20,
     };
     StratumError::new(code, message, reason)
+}
+
+/// The reason id of a refusal whose cause lies with the ledger database, not
+/// the node (#581): a lock, a full connection pool, a stalled or failed
+/// statement, PostgreSQL down. Kept apart from `backend-rpc-unavailable` so
+/// the reason-labelled rejection counters and alerts name the right
+/// dependency.
+const DATABASE_UNAVAILABLE: &str = "backend-database-unavailable";
+
+/// Refuse a submission or session whose backend dependency failed, naming
+/// that dependency: `backend-database-unavailable` when a ledger statement
+/// failed (a SQLx error anywhere in the chain, which every statement's
+/// failure carries, `WindowError::Database` and a halted or read-only
+/// cluster's empty row included), otherwise `backend-rpc-unavailable`.
+/// Corrupt or changed stored data and a failed blocking task are not the
+/// database being unavailable and keep the older label. The error itself is
+/// passed on unchanged, so its logs and downcasts read as before.
+fn backend_refusal(error: &anyhow::Error, message: &str) -> StratumError {
+    let database = error.chain().any(|cause| cause.is::<sqlx::Error>());
+    protocol_error(
+        if database {
+            DATABASE_UNAVAILABLE
+        } else {
+            "backend-rpc-unavailable"
+        },
+        message,
+    )
 }
 
 fn template_parent_height(candidate_height: u64) -> Result<u64> {
@@ -599,6 +783,8 @@ fn fee_estimate_bits(value: &Value) -> Result<u64> {
 pub(crate) struct ValidatedFeePolicy {
     policy: FanoutFeeRatePolicy,
     floor: u64,
+    /// When the `getmempoolinfo` that produced `floor` was sent (#622).
+    floor_requested: Instant,
 }
 
 pub(crate) async fn validated_ctv_fee_policy(
@@ -613,6 +799,20 @@ pub(crate) async fn validated_ctv_fee_policy(
         let bits = fee_estimate_bits(&estimate["feerate"]).context("CTV fee estimate unavailable; configure PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT")?;
         FanoutFeeRatePolicy::new(bits, premium_bps)
     };
+    let (required_rate, floor_requested) = relay_fee_floor(rpc).await?;
+    validate_fee_floor(policy, required_rate)?;
+    Ok(ValidatedFeePolicy {
+        policy,
+        floor: required_rate,
+        floor_requested,
+    })
+}
+
+/// The connected node's relay fee floor, in bits per 1,000 weight: the higher
+/// of `minrelaytxfee` and `mempoolminfee`, with when its request was sent, so
+/// reads order by the observation itself (#622).
+async fn relay_fee_floor(rpc: &Rpc) -> Result<(u64, Instant)> {
+    let requested = Instant::now();
     let mempool = rpc.call("getmempoolinfo", json!([])).await?;
     ensure!(mempool.is_object(), "getmempoolinfo returned non-object");
     let mut required_rate = None;
@@ -624,11 +824,7 @@ pub(crate) async fn validated_ctv_fee_policy(
         }
     }
     let required_rate = required_rate.context("getmempoolinfo did not report a relay fee floor")?;
-    validate_fee_floor(policy, required_rate)?;
-    Ok(ValidatedFeePolicy {
-        policy,
-        floor: required_rate,
-    })
+    Ok((required_rate, requested))
 }
 
 fn validate_fee_floor(policy: FanoutFeeRatePolicy, required_rate: u64) -> Result<()> {
@@ -685,6 +881,13 @@ impl Coordinator {
             config.rpc_password.clone(),
             config.rpc_timeout,
         )?;
+        // #291: whatever calls it, a held frontend's node client and every
+        // wallet client made from it refuse to relay a block or a transaction.
+        let rpc = if config.block_submit_enabled {
+            rpc
+        } else {
+            rpc.without_relay()
+        };
         if let Some(address) = &config.fee_address {
             let validation = rpc.call("validateaddress", json!([address])).await?;
             let script = validation["scriptPubKey"]
@@ -799,6 +1002,7 @@ impl Coordinator {
             last_error: RwLock::new(None),
             refreshed_at: std::sync::Mutex::new(Instant::now()),
             refresh_lock: Mutex::new(RefreshState::default()),
+            refresh_in_flight: std::sync::Mutex::new(None),
             identities: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(None),
             statement_timeout,
@@ -809,6 +1013,8 @@ impl Coordinator {
             #[cfg(test)]
             build_job_probe: Default::default(),
             offer_sections: Default::default(),
+            landing_trim: Default::default(),
+            submission_hold: Default::default(),
         }))
     }
 
@@ -816,7 +1022,7 @@ impl Coordinator {
         if !self.config.ctv_enabled {
             return Ok(None);
         }
-        match validated_ctv_fee_policy(
+        let validated = match validated_ctv_fee_policy(
             &self.rpc,
             self.config.ctv_fee,
             self.config.ctv_fee_premium_bps,
@@ -826,9 +1032,19 @@ impl Coordinator {
             Ok(validated) => {
                 // Admission uses the latest observed floor even while a new
                 // bundle is being built. Replaced jobs retain their own fee.
-                self.readiness.write().await.ctv_fee_floor = Some(validated.floor);
-                Ok(Some(validated.policy))
+                // A block-wait floor read sent after this one may already be
+                // recorded (#622): the policy must meet the floor that is
+                // kept, not only the one this read returned.
+                let mut readiness = self.readiness.write().await;
+                readiness.record_fee_floor(validated.floor, validated.floor_requested);
+                let floor = readiness.ctv_fee_floor.unwrap_or(validated.floor);
+                drop(readiness);
+                validate_fee_floor(validated.policy, floor).map(|()| validated.policy)
             }
+            Err(error) => Err(error),
+        };
+        match validated {
+            Ok(policy) => Ok(Some(policy)),
             Err(error) => {
                 self.invalidate_readiness().await;
                 Err(error)
@@ -854,7 +1070,31 @@ impl Coordinator {
     }
 
     async fn observe_chain_info(&self, from_refresh: bool) -> Result<Value> {
+        // Read before the node call, so a revocation while it is in flight
+        // wins. Renewal is opportunistic: never wait for readiness here, and
+        // skip it when a writer holds it; the next poll renews.
+        let epoch = from_refresh
+            .then(|| self.readiness.try_read().ok().map(|state| state.generation))
+            .flatten();
+        let (info, poll) = self.poll_chain_info(from_refresh, epoch).await?;
+        if let Some(poll) = poll {
+            self.renew_readiness_from_poll(&poll).await;
+        }
+        Ok(info)
+    }
+
+    /// [`Self::observe_chain_info`] without its readiness renewal, for a
+    /// refresh, which renews from its own poll only once its chain
+    /// observation agreed and it read the relay floor. `epoch` is the
+    /// readiness generation read before this call, if any; without one the
+    /// poll cannot renew.
+    async fn poll_chain_info(
+        &self,
+        from_refresh: bool,
+        epoch: Option<u64>,
+    ) -> Result<(Value, Option<TipPoll>)> {
         let sequence = self.observed_tip.write().await.reserve();
+        let requested = Instant::now();
         let result = crate::readiness::chain_info_with_metrics(
             &self.rpc,
             &self.config.chain,
@@ -874,7 +1114,13 @@ impl Coordinator {
                     .write()
                     .await
                     .observe(&hash, sequence, from_refresh);
-                Ok(info)
+                let poll = epoch.map(|epoch| TipPoll {
+                    epoch,
+                    sequence,
+                    hash,
+                    requested,
+                });
+                Ok((info, poll))
             }
             Err(error) => {
                 // An observed unsafe node state closes admission immediately;
@@ -885,13 +1131,103 @@ impl Coordinator {
         }
     }
 
+    /// A poll outside a refresh (the block wait's) carries no relay floor.
+    /// Under CTV settlement it re-reads the floor before renewing; a failed
+    /// read leaves readiness to age, without revoking it, as a refresh's
+    /// failed fee read would. Only a poll that found the published tip pays
+    /// for the read.
+    async fn renew_readiness_from_poll(&self, poll: &TipPoll) {
+        if self.config.ctv_enabled
+            && self
+                .observed_tip
+                .read()
+                .await
+                .polled_published(&poll.hash, poll.sequence)
+        {
+            match relay_fee_floor(&self.rpc).await {
+                Ok((floor, requested)) => {
+                    let prepared = self.prepared.read().await;
+                    let mut readiness = self.readiness.write().await;
+                    readiness.record_fee_floor(floor, requested);
+                    // A kept floor above the published fee retires that work,
+                    // as a refresh's fee read would: revoke readiness, so a
+                    // job or share admitted against the old floor fences on
+                    // the changed generation instead of completing.
+                    if prepared
+                        .as_deref()
+                        .and_then(|work| work.fee)
+                        .zip(readiness.ctv_fee_floor)
+                        .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_err())
+                    {
+                        readiness.revoke();
+                        return;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "relay floor unavailable; readiness not renewed");
+                    return;
+                }
+            }
+        }
+        self.renew_readiness(poll).await;
+    }
+
+    /// A refresh-grade poll that found the published tip proves what readiness
+    /// stands for, the node's tip within the health timeout, whether or not
+    /// the rebuild that follows it finishes in time (#622). It only renews:
+    /// revoked readiness waits for a refresh that revalidates everything, as
+    /// before. It also never renews across a revocation that raced the poll,
+    /// once a newer observation found another tip, for work on another
+    /// parent, for a template the reuse path would refuse as too old, after
+    /// a refresh found the cluster on a heavier chain, or, under CTV
+    /// settlement, without a relay floor read no older than the poll that
+    /// the work's fee still meets, so work that cannot be rebuilt in time
+    /// still ages out of admission and health. The stamp is when the poll
+    /// was sent, the earliest instant its answer describes.
+    async fn renew_readiness(&self, poll: &TipPoll) {
+        // Most polls that cannot renew fail here, without touching readiness.
+        if !self
+            .observed_tip
+            .read()
+            .await
+            .polled_published(&poll.hash, poll.sequence)
+        {
+            return;
+        }
+        let prepared = self.prepared.read().await;
+        let mut readiness = self.readiness.write().await;
+        let tip = self.observed_tip.read().await;
+        let floor_current = !self.config.ctv_enabled
+            || readiness
+                .ctv_fee_floor_read
+                .is_some_and(|read| read >= poll.requested);
+        let current = prepared.as_deref().is_some_and(|work| {
+            work.template["previousblockhash"].as_str() == Some(poll.hash.as_str())
+                && crate::readiness::validate_template_age(
+                    &work.template,
+                    self.config.template_max_age,
+                )
+                .is_ok()
+                && (!self.config.ctv_enabled
+                    || work
+                        .fee
+                        .zip(readiness.ctv_fee_floor)
+                        .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
+        });
+        if readiness.generation == poll.epoch
+            && readiness.poll_renews
+            && floor_current
+            && current
+            && tip.polled_published(&poll.hash, poll.sequence)
+        {
+            if let Some(last_poll) = readiness.last_poll.as_mut() {
+                *last_poll = (*last_poll).max(poll.requested);
+            }
+        }
+    }
+
     async fn invalidate_readiness(&self) {
-        let mut state = self.readiness.write().await;
-        state.last_poll = None;
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .expect("readiness generation exhausted");
+        self.readiness.write().await.revoke();
     }
 
     async fn ensure_template_fresh(&self, template: &Value) -> Result<()> {
@@ -915,7 +1251,7 @@ impl Coordinator {
     /// Reconcile against one coherent tip. Every frontend observes prepared
     /// parents before building a descendant with its carry-forward snapshot.
     pub async fn reconcile(&self, tip: &str, tip_height: u64, revision: i64) -> Result<()> {
-        let blocks = self.work_ledger.pool_blocks().await?;
+        let blocks = on_database(self.work_ledger.pool_blocks()).await?;
         let mut cache = self.chain_cache.lock().await;
         let extends = if let Some(previous) = cache.as_ref() {
             tip_height >= previous.height
@@ -986,10 +1322,12 @@ impl Coordinator {
         }
         // Reconciliation and settlement both count the block's durable first
         // confirmation, regardless of the outbox state at that moment.
-        let first_confirmations = self
-            .work_ledger
-            .reconcile(&observations, tip_height, revision)
-            .await?;
+        let first_confirmations = on_database(self.work_ledger.reconcile(
+            &observations,
+            tip_height,
+            revision,
+        ))
+        .await?;
         self.metrics.revision_work_matured(mature_height);
         self.blocks
             .fetch_add(first_confirmations, Ordering::Relaxed);
@@ -1017,6 +1355,13 @@ impl Coordinator {
         result
     }
 
+    /// Age of the readiness proof admission reads (#622): the last refresh,
+    /// or refresh-grade poll on the published tip, that renewed it; `None`
+    /// while readiness is revoked or before it is first established.
+    pub async fn tip_poll_age(&self) -> Option<Duration> {
+        self.readiness.read().await.last_poll.map(|at| at.elapsed())
+    }
+
     /// Time since the last successful refresh, or since start before one.
     pub fn work_refresh_age(&self) -> Duration {
         self.refreshed_at
@@ -1034,10 +1379,62 @@ impl Coordinator {
             .map(|since| since.as_millis())
             .unwrap_or_default();
         let mut refresh = self.refresh_lock.lock().await;
+        // #655: while it runs, its ledger steps mark this tracker, so a
+        // submit refused for stale readiness can see a refresh still blocked
+        // on the database past its deadline (`stale_readiness_reason`).
+        let in_flight = InFlightRefresh::register(&self.refresh_in_flight);
+        let result = in_flight
+            .waiting
+            .track(self.refresh_locked(&mut refresh, refresh_started, refresh_started_unix_ms))
+            .await;
+        // #581: recorded before the refresh lock is released, so outcomes
+        // land in the order the refreshes ran: an older refresh that finishes
+        // late can never overwrite a newer one's.
+        let failed_on_database = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.chain().any(|cause| cause.is::<sqlx::Error>()));
+        self.readiness.write().await.refresh_failed_on_database = failed_on_database;
+        // Its outcome is recorded: no longer in flight.
+        drop(in_flight);
+        result
+    }
+
+    /// The reason id of a submit refused because readiness aged out (#581,
+    /// #655). The database's when the latest refresh failed on it, or when
+    /// the refresh in flight has outlived its deadline, the health timeout,
+    /// and is waiting on the database now: a refresh slower than that cannot
+    /// have kept readiness fresh, and one still blocked on the database is
+    /// the database's failure although it has not failed yet. Otherwise the
+    /// node's.
+    fn stale_readiness_reason(&self, refresh_failed_on_database: bool) -> &'static str {
+        let blocked_on_database = self
+            .refresh_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|in_flight| {
+                in_flight.started.elapsed() >= self.config.health_timeout
+                    && in_flight.waiting.on() == Dependency::Database
+            });
+        if refresh_failed_on_database || blocked_on_database {
+            DATABASE_UNAVAILABLE
+        } else {
+            "backend-rpc-unavailable"
+        }
+    }
+
+    /// [`Self::refresh_once_inner`]'s work, under the refresh lock.
+    async fn refresh_locked(
+        &self,
+        refresh: &mut RefreshState,
+        refresh_started: Instant,
+        refresh_started_unix_ms: u128,
+    ) -> Result<()> {
         let RefreshState {
             observation,
             cached_window,
-        } = &mut *refresh;
+        } = refresh;
         // Concurrent candidate observations can revoke trust while this
         // refresh waits for RPC or database work. Their later failure must
         // survive an older successful proof completing afterwards.
@@ -1045,8 +1442,12 @@ impl Coordinator {
         let readiness_generation = proof.readiness_epoch();
         // Capture before node I/O, so a delayed equal-work observation cannot
         // overwrite a replacement accepted while its proof was in flight.
-        let chain_observation = self.work_ledger.chain_observation_state().await?;
-        let info = self.observe_chain_info(true).await?;
+        // #655: every ledger step below is marked; node calls are not.
+        let chain_observation = on_database(self.work_ledger.chain_observation_state()).await?;
+        // The refresh's own readiness epoch, read before any of its node I/O.
+        let (info, tip_poll) = self
+            .poll_chain_info(true, Some(readiness_generation))
+            .await?;
         let chainwork = info["chainwork"]
             .as_str()
             .context("node chainwork missing")?;
@@ -1082,17 +1483,32 @@ impl Coordinator {
             "template tip is stale"
         );
         self.cache_tip_parent(parent).await?;
-        let observed_revision = observation
-            .observe(
-                &*self.work_ledger,
-                parent,
-                height - 1,
-                chainwork,
-                &chain_observation,
-            )
-            .await?;
+        let observed_revision = match on_database(observation.observe(
+            &*self.work_ledger,
+            parent,
+            height - 1,
+            chainwork,
+            &chain_observation,
+        ))
+        .await
+        {
+            Err(error) if error.is::<crate::ledger::ChainObservationBehind>() => {
+                self.readiness.write().await.poll_renews = false;
+                return Err(error);
+            }
+            observed => observed?,
+        };
         self.reconcile(parent, height - 1, observed_revision)
             .await?;
+        // The chain observation agreed: re-arm poll renewal, and without CTV
+        // settlement renew from this refresh's poll now (#622); nothing read
+        // after this point backs readiness.
+        self.readiness.write().await.poll_renews = true;
+        if !self.config.ctv_enabled {
+            if let Some(poll) = &tip_poll {
+                self.renew_readiness(poll).await;
+            }
+        }
         // The landing metric's "revision observed" instant stays here, where
         // the ledger probe used to feed it: the chain-observation write
         // returned the current revision. A bump after this point is recorded
@@ -1121,10 +1537,11 @@ impl Coordinator {
             .as_ref()
             .is_some_and(|current| current.fingerprint == fingerprint);
         let probe = if same_template {
-            let probe = self
-                .work_ledger
-                .refresh_probe(crate::ledger::ReadAdmission::default())
-                .await?;
+            let probe = on_database(
+                self.work_ledger
+                    .refresh_probe(crate::ledger::ReadAdmission::default()),
+            )
+            .await?;
             self.metrics
                 .revision_work_observed(probe.payout_state.payout_revision);
             Some(probe)
@@ -1134,6 +1551,13 @@ impl Coordinator {
         // Relay floors can change without changing the template or ledger.
         // Validate them on every refresh, including the cached-work path.
         let fee = self.fee_policy().await?;
+        // #622: under CTV settlement this refresh's poll renews readiness only
+        // now, after its chain observation agreed and it read the relay floor.
+        if self.config.ctv_enabled {
+            if let Some(poll) = &tip_poll {
+                self.renew_readiness(poll).await;
+            }
+        }
         let current_prepared = self.prepared.read().await;
         // Whether the cached window, as held at entry, is still inside the
         // reanchor interval: an input of the trigger label below, read here
@@ -1152,6 +1576,7 @@ impl Coordinator {
             refresh_trigger(
                 current_prepared.as_deref(),
                 parent,
+                probe.timeline,
                 probe.payout_state.payout_revision,
                 probe.payout_state.prior_balances_digest,
                 probe.accepted_share_seq,
@@ -1166,10 +1591,15 @@ impl Coordinator {
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
             // reads the latest shares. Empty-to-first-share remains immediate.
+            // A new writer timeline does replace it: a promotion can lose the
+            // window's rows while revision, balances and template stay equal
+            // (#619). Issuance re-checks the timeline at every admission, so a
+            // promotion after this probe is caught there.
             if cached_window.as_ref().is_some_and(|window| {
                 window.reference == current.window
                     && window.within_reanchor_interval(self.config.snapshot_interval)
-            }) && current.fee == fee
+            }) && current.timeline == Some(probe.timeline)
+                && current.fee == fee
                 && current.fingerprint == fingerprint
                 && current.snapshot.payout_revision == state.payout_revision
                 && current.window.prior_balances_digest == state.prior_balances_digest
@@ -1183,7 +1613,7 @@ impl Coordinator {
                 self.ready_tip(parent).await?;
                 self.ensure_template_fresh(&template).await?;
                 ensure!(
-                    self.work_ledger.payout_state().await? == state,
+                    on_database(self.work_ledger.payout_state()).await? == state,
                     "payout state changed during work reuse"
                 );
                 let mut readiness = self.readiness.write().await;
@@ -1196,6 +1626,7 @@ impl Coordinator {
                     .await
                     .refresh_publication(parent)?;
                 readiness.last_poll = Some(Instant::now());
+                readiness.poll_renews = true;
                 return Ok(());
             }
         }
@@ -1219,9 +1650,7 @@ impl Coordinator {
             shared_ttl < i64::MAX as f64 / 1000.0,
             "prepared TTL overflow"
         );
-        let original_expires_at_ms = self
-            .work_ledger
-            .now_ms()
+        let original_expires_at_ms = on_database(self.work_ledger.now_ms())
             .await?
             .checked_add(
                 (shared_ttl as i64)
@@ -1241,14 +1670,16 @@ impl Coordinator {
             .as_ref()
             .filter(|window| window.snapshot.payout_revision >= observed_revision)
         {
-            let probe = self
-                .work_ledger
-                .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone()))
-                .await?;
+            let probe = on_database(
+                self.work_ledger
+                    .refresh_probe(crate::ledger::ReadAdmission::shared(permit.clone())),
+            )
+            .await?;
             window.reusable(
                 network,
                 probe.accepted_share_seq,
                 probe.payout_state,
+                probe.timeline,
                 self.config.snapshot_interval,
             )
         } else {
@@ -1317,6 +1748,7 @@ impl Coordinator {
             refresh_trigger(
                 current.as_deref(),
                 parent,
+                admitted.0.timeline,
                 admitted.0.snapshot.payout_revision,
                 admitted.0.reference.prior_balances_digest,
                 admitted.0.snapshot.share_seq,
@@ -1326,6 +1758,7 @@ impl Coordinator {
         });
         let equivalent = current.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
+                && current.timeline == Some(admitted.0.timeline)
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
                 && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
                 && current.window.prior_balances_digest
@@ -1513,6 +1946,8 @@ impl Coordinator {
     }
 
     pub async fn blockwait_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        let mut unchanged_polled = None::<Instant>;
+        let wait = self.unchanged_tip_poll_interval();
         loop {
             if *shutdown.borrow() {
                 break;
@@ -1520,7 +1955,7 @@ impl Coordinator {
             let notification = tokio::select! {
                 biased;
                 _=shutdown.changed()=>break,
-                result=self.rpc.call_timeout("waitfornewblock",json!([5000]),Some(Duration::from_secs(7)))=>result,
+                result=self.rpc.call_timeout("waitfornewblock",json!([wait.as_millis() as u64]),Some(wait+Duration::from_secs(2)))=>result,
             };
             // A notification is a wake hint, not a sequenced chain proof. Even
             // errors wake normal polling; an unavailable long-poll method must
@@ -1535,6 +1970,13 @@ impl Coordinator {
                     // Reserve order when this fresh request starts, after the
                     // wait completes. A later poll can still supersede it.
                     // No refresh lock: a pending build must not delay fencing.
+                    self.observe_chain_info(true).await?;
+                } else if self.unchanged_tip_poll_due(unchanged_polled).await {
+                    // #622: a rebuild holding the refresh loop must not age
+                    // readiness while the node answers. Only once readiness
+                    // is that old, and at most once per interval, so an idle
+                    // or healthy frontend adds no call.
+                    unchanged_polled = Some(Instant::now());
                     self.observe_chain_info(true).await?;
                 }
                 Ok::<_, anyhow::Error>(())
@@ -1553,6 +1995,37 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    /// How old readiness must be before an unchanged block notification
+    /// polls the node for it, the least time between two such polls, and how
+    /// long the block wait waits for a new block, so it returns at least this
+    /// often while the tip is idle (#622): a third of the health timeout, at
+    /// most [`UNCHANGED_TIP_POLL`] (5 s at the default 15 s timeout), so the
+    /// poll always lands before readiness expires; a short timeout polls
+    /// often, as configured. Only below 3 ms, where no node call can answer
+    /// in time anyway, does [`UNCHANGED_TIP_POLL_FLOOR`] decide. A frontend
+    /// adds at most one readiness check per interval, and none while its
+    /// refreshes keep readiness younger: `getblockchaininfo`, `getnetworkinfo`
+    /// on a public chain (the peer floor is part of readiness), and
+    /// `getmempoolinfo` under CTV settlement (the relay floor is too).
+    fn unchanged_tip_poll_interval(&self) -> Duration {
+        (self.config.health_timeout / 3).clamp(UNCHANGED_TIP_POLL_FLOOR, UNCHANGED_TIP_POLL)
+    }
+
+    /// Whether an unchanged block notification should poll the node for
+    /// readiness: it is live but at least one interval old, and this loop has
+    /// not polled for it within that interval. Revoked readiness is never
+    /// polled for; only a refresh restores it.
+    async fn unchanged_tip_poll_due(&self, polled: Option<Instant>) -> bool {
+        let interval = self.unchanged_tip_poll_interval();
+        polled.is_none_or(|at| at.elapsed() >= interval)
+            && self
+                .readiness
+                .read()
+                .await
+                .last_poll
+                .is_some_and(|at| at.elapsed() >= interval)
     }
 
     /// One coherent read-only observation of a candidate's block against the
@@ -1667,8 +2140,11 @@ impl Coordinator {
         let initially_renewed = tokio::time::Instant::now();
         self.renew_candidate(claim, lease).await?;
         track(initially_renewed + Duration::from_secs(lease.seconds as u64));
+        // #581: whether the token still holds the row. Its remaining lease
+        // is this heartbeat's own `valid_until`, never the database clock's
+        // `claim_expires_at`, which a clock step moves.
         let live_token_query = format!(
-            "SELECT CASE WHEN state IN {} AND claim_token=$2 AND claim_expires_at>clock_timestamp() THEN floor(extract(epoch FROM claim_expires_at-clock_timestamp())*1000)::bigint END FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+            "SELECT state IN {} AND claim_token IS NOT DISTINCT FROM $2 FROM qbit_block_candidate_outbox WHERE block_hash=$1",
             CandidateState::UNFINISHED_SQL
         );
         let heartbeat = async {
@@ -1708,29 +2184,30 @@ impl Coordinator {
                             return Err(error);
                         }
                         // A brief terminal UPDATE can conflict with renewal.
-                        // Continue only after a read proves the exact token is
-                        // still live, and never run beyond that database expiry.
+                        // Continue only after a read proves the exact token
+                        // still holds the row, and never beyond the lease the
+                        // last successful renewal started: nothing renewed
+                        // it since, and every observer times it from there.
                         let observed = tokio::time::Instant::now();
                         let budget = lease
                             .timeout
                             .min(valid_until.saturating_duration_since(observed));
-                        let remaining = tokio::time::timeout(budget, async {
-                            sqlx::query_scalar::<_, Option<i64>>(&live_token_query)
+                        let held = tokio::time::timeout(budget, async {
+                            sqlx::query_scalar::<_, bool>(&live_token_query)
                                 .bind(&claim.candidate.block_hash)
                                 .bind(&claim.claim_token)
                                 .fetch_optional(&mut *self.ledger.acquire().await?)
                                 .await
                         })
                         .await;
-                        let Ok(Ok(Some(Some(remaining)))) = remaining else {
+                        let Ok(Ok(Some(true))) = held else {
                             return Err(error);
                         };
-                        if remaining <= 0 {
+                        let remaining =
+                            valid_until.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
                             return Err(error);
                         }
-                        let remaining = Duration::from_millis(remaining as u64);
-                        valid_until = observed + remaining;
-                        track(valid_until);
                         delay = lease
                             .interval
                             .min((remaining / 2).max(Duration::from_millis(1)));
@@ -1772,12 +2249,17 @@ impl Coordinator {
         &self,
         block_hash: &str,
         deadline: tokio::time::Instant,
+        takeover: crate::ledger::RecoveryTakeover,
     ) -> Result<RecoveryClaim> {
         let token = uuid::Uuid::new_v4().to_string();
         let result = match tokio::time::timeout_at(
             deadline,
-            self.ledger
-                .claim_candidate_for_recovery(block_hash, CANDIDATE_LEASE.seconds, &token),
+            self.ledger.claim_candidate_for_recovery(
+                block_hash,
+                CANDIDATE_LEASE.seconds,
+                &token,
+                takeover,
+            ),
         )
         .await
         {
@@ -1818,9 +2300,10 @@ impl Coordinator {
     ///
     /// Every stop, the deadline included, attempts a bounded claim release.
     /// A confirmed release leaves the row recoverable with its reason: its
-    /// state (a row adopted into `reconciliation` stays there), evidence and
-    /// schedule are untouched, and an audit that landed is reused by the next
-    /// attempt. A [`RecoveryStop`] names why; node and database errors
+    /// state (a row adopted into `reconciliation` stays there) and evidence
+    /// are untouched, its schedule is kept within the row's own backoff
+    /// (#581; a parked row stays parked), and an audit that landed is reused
+    /// by the next attempt. A [`RecoveryStop`] names why; node and database errors
     /// propagate as themselves. Unconfirmed cleanup is a failure that names
     /// the original stop without asserting the row's current disposition.
     pub async fn recover_candidate(
@@ -2032,6 +2515,30 @@ impl Coordinator {
         let rebuild = async {
             let window = match self.read_window(&candidate.window, balances).await {
                 Ok(window) => window,
+                Err(
+                    error @ (WindowError::Incomplete { .. }
+                    | WindowError::SnapshotDigestMismatch { .. }),
+                ) => {
+                    // Tell a window this primary no longer holds, after a
+                    // promotion lost or reissued its rows (#619), from
+                    // pruning or corruption. A failed probe leaves the
+                    // original classification: unknown is never "not held".
+                    let holding = match self.ledger.acquire().await {
+                        Ok(mut connection) => {
+                            crate::ledger::probe_window_holding(&mut connection, &candidate.window)
+                                .await
+                                .ok()
+                        }
+                        Err(_) => None,
+                    };
+                    if holding == Some(crate::ledger::WindowHolding::NotHeld) {
+                        return Ok(Err(RebuildFailure::Retry(window_not_held_reason(
+                            &candidate.window,
+                            &error,
+                        ))));
+                    }
+                    return classify_window_error(error).map(Err);
+                }
                 Err(error) => return classify_window_error(error).map(Err),
             };
             // No await between here and the hand-off: the window moves into
@@ -2129,8 +2636,12 @@ impl Coordinator {
             Err(failure) => return Ok(Err(Self::rebuild_reason(candidate, failure))),
         };
         // The rebuilt window is released off the runtime once the landing
-        // returns, whichever way it went.
-        let rebuilt = OffRuntime::new(claim.clone().with_parts(parts));
+        // returns, whichever way it went. The same blocking thread, holding
+        // no lock and no transaction, then trims (#600), so glibc returns the
+        // heap the landing freed instead of keeping it.
+        let (trimmer, metrics) = (self.landing_trim.clone(), self.metrics.clone());
+        let rebuilt = OffRuntime::new(claim.clone().with_parts(parts))
+            .then(move || trimmer.after_landing(&metrics));
         let revision = self.observe_candidate(claim).await?.revision;
         match self
             .ledger
@@ -2147,6 +2658,14 @@ impl Coordinator {
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
+        // #291: a frontend with PRISM_BLOCK_SUBMIT_ENABLED off processes no
+        // claim. Its submit loop takes none; any other caller is refused here,
+        // before the probe, the reservation or a settlement, so the row stays
+        // as it is and its block never reaches the node.
+        self.config.require_block_submission(format_args!(
+            "block {} was not processed",
+            claim.candidate.block_hash
+        ))?;
         match claim.lifecycle.state {
             CandidateState::Pending => self.offer_candidate(claim, lease).await,
             // A reservation this or another frontend took and never recorded
@@ -2638,7 +3157,23 @@ impl Coordinator {
     }
 
     pub async fn submit_loop(self: Arc<Self>, shutdown: watch::Receiver<bool>) {
+        if !self.config.block_submit_enabled {
+            return Self::hold_candidates(shutdown).await;
+        }
         self.submit_loop_with(CANDIDATE_LEASE, shutdown).await
+    }
+
+    /// `PRISM_BLOCK_SUBMIT_ENABLED` off (#291): claim nothing until shutdown.
+    /// Every unfinished row stays as it is, a found block `pending`, counted
+    /// by the candidate gauges and left for a frontend with submission
+    /// enabled; nothing reaches the node's `submitblock`.
+    async fn hold_candidates(mut shutdown: watch::Receiver<bool>) {
+        tracing::warn!(
+            "{}; the submit loop claims no candidate",
+            crate::config::BLOCK_SUBMIT_DISABLED
+        );
+        // As in the drain, any change or a closed channel ends the hold.
+        let _ = shutdown.changed().await;
     }
 
     async fn submit_loop_with(
@@ -2724,7 +3259,12 @@ impl Coordinator {
         };
         let prepared = self.prepared.read().await.clone();
         let observed = self.observed_tip.read().await.as_deref().map(str::to_owned);
-        let revision = self.ledger.payout_revision().await.ok();
+        // #664: the cluster's hold in the same statement, as last read.
+        let (revision, hold) = match self.ledger.health_reads().await {
+            Ok((revision, hold)) => (revision, Some(hold)),
+            Err(_) => (None, None),
+        };
+        let hold = self.submission_hold.observe(hold);
         let ready = prepared.as_ref().is_some_and(|work| {
             work.template["previousblockhash"].as_str() == observed.as_deref()
                 && Some(work.snapshot.payout_revision) == revision
@@ -2735,11 +3275,100 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"block_submission_hold":submission_hold_report(hold.as_ref()),"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
         else {
             unreachable!("coordinator health fields are an object");
         };
         HeartbeatHealth::new(ready, fields).into_value()
+    }
+}
+
+/// The cluster's block submission hold (#664) as this frontend last read it:
+/// unknown until a read succeeds, then the latest successful read. A failed
+/// read keeps that, so a database outage does not report every frontend as
+/// held; nothing enforces the hold from here, since every claim and
+/// reservation reads it itself.
+#[derive(Default)]
+struct SubmissionHoldView(std::sync::Mutex<Option<Option<crate::ledger::SubmissionHold>>>);
+
+impl SubmissionHoldView {
+    /// Record a read, `None` when it failed, and return the hold as last
+    /// read. A change is logged once, where the operator who set or cleared
+    /// it looks.
+    fn observe(
+        &self,
+        read: Option<Option<crate::ledger::SubmissionHold>>,
+    ) -> Option<Option<crate::ledger::SubmissionHold>> {
+        let mut known = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(current) = read else {
+            return known.clone();
+        };
+        if known.as_ref() != Some(&current) {
+            match &current {
+                Some(hold) => tracing::warn!(
+                    reason = %hold.reason,
+                    set_at = %hold.set_at,
+                    set_by = %hold.set_by,
+                    "the cluster holds block submission: no frontend claims a candidate, offers a block or sends a CTV fanout until `qbit-prism-server submission-hold clear`"
+                ),
+                None if matches!(*known, Some(Some(_))) => tracing::warn!(
+                    "the cluster's block submission hold was cleared: frontends with submission enabled offer pending candidates again"
+                ),
+                None => {}
+            }
+            *known = Some(current);
+        }
+        known.clone()
+    }
+}
+
+/// The cluster's block submission hold as health and the heartbeat report
+/// it (#664): `held` is null until the frontend has read it.
+fn submission_hold_report(read: Option<&Option<crate::ledger::SubmissionHold>>) -> Value {
+    let hold = read.and_then(Option::as_ref);
+    json!({
+        "held": read.map(Option::is_some),
+        "reason": hold.map(|hold| &hold.reason),
+        "set_at": hold.map(|hold| &hold.set_at),
+        "set_by": hold.map(|hold| &hold.set_by),
+    })
+}
+
+/// Job preparation found the authority its work was read with retired: a
+/// payout revision or balance change, a tip its parent lost, a lease or
+/// publication the work no longer matches, or a window this primary does not
+/// hold (#619). It reads as the refusal's own context, as the log always has.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct WorkRetired(&'static str);
+
+/// The job's CTV fee is below the live relay floor, or the floor is unknown.
+/// Displays as the refusal it carries, so the deferral's log line is unchanged.
+#[derive(Debug)]
+struct JobFeeRefused(anyhow::Error);
+
+impl std::fmt::Display for JobFeeRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for JobFeeRefused {}
+
+/// The first check that refused a job preparation (#622), for its counter.
+fn job_deferral(error: &anyhow::Error) -> crate::metrics::JobDeferral {
+    use crate::metrics::JobDeferral;
+    use tip_observation::TipRefusal;
+    match error.downcast_ref::<TipRefusal>() {
+        Some(TipRefusal::PollingStale) => JobDeferral::TipPollingStale,
+        Some(TipRefusal::PollingUnavailable) => JobDeferral::TipPollingUnavailable,
+        Some(TipRefusal::NewTipPending) => JobDeferral::NewTipPending,
+        None if error.is::<WorkRetired>() => JobDeferral::WorkRetired,
+        None if error.is::<JobFeeRefused>() => JobDeferral::FeeFloor,
+        None => JobDeferral::Other,
     }
 }
 
@@ -2751,6 +3380,11 @@ fn header_parent(block: &[u8]) -> Result<String> {
 impl MiningBackend for Coordinator {
     async fn observed_tip_hint(&self) -> Option<crate::stratum::RetentionTip> {
         self.observed_tip.read().await.retention_hint()
+    }
+    async fn published_work_hint(&self) -> Option<(String, i64)> {
+        let prepared = self.prepared.read().await.clone()?;
+        let parent = prepared.template["previousblockhash"].as_str()?.to_owned();
+        Some((parent, prepared.snapshot.payout_revision))
     }
     type Context = JobContext;
 
@@ -2798,13 +3432,17 @@ impl MiningBackend for Coordinator {
     }
 
     async fn new_session_id(&self) -> Result<crate::ledger::SessionId, StratumError> {
-        self.ledger.new_session_id().await.map_err(|error| {
-            if error.is::<crate::ledger::SessionAllocationExhausted>() {
-                protocol_error("session-allocation-exhausted", &error.to_string())
-            } else {
-                protocol_error("backend-rpc-unavailable", "database unavailable")
-            }
-        })
+        // #655: allocation is a ledger statement, so a session timeout that
+        // passes while it waits is the database's.
+        on_database(self.ledger.new_session_id())
+            .await
+            .map_err(|error| {
+                if error.is::<crate::ledger::SessionAllocationExhausted>() {
+                    protocol_error("session-allocation-exhausted", &error.to_string())
+                } else {
+                    protocol_error(DATABASE_UNAVAILABLE, "database unavailable")
+                }
+            })
     }
 
     async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {
@@ -2917,8 +3555,10 @@ impl MiningBackend for Coordinator {
             drop(initial);
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
-                .context("payout snapshot stale")?;
-            self.ensure_job_fee_current(prepared.fee).await?;
+                .ok_or_else(|| WorkRetired(issuance_authority.refusal_context()))?;
+            self.ensure_job_fee_current(prepared.fee)
+                .await
+                .map_err(JobFeeRefused)?;
             let (base, bundle, bootstrap_share) = self
                 .materialize_wire(
                     prepared.clone(),
@@ -2938,7 +3578,7 @@ impl MiningBackend for Coordinator {
             Self::probe(&self.build_job_probe).await;
             self.revalidate_issuance_authority(&mut issuance_authority, None)
                 .await?
-                .context("payout snapshot stale")?;
+                .ok_or_else(|| WorkRetired(issuance_authority.refusal_context()))?;
             Ok::<_, anyhow::Error>(MiningJob {
                 wire,
                 context: Arc::new(JobContext {
@@ -2952,6 +3592,8 @@ impl MiningBackend for Coordinator {
         };
         build.await.map_err(|error| {
             tracing::warn!(%error,"job preparation deferred");
+            self.metrics
+                .record_job_preparation_deferral(job_deferral(&error));
             protocol_error("pool-closed", "current work temporarily unavailable")
         })
     }
@@ -2963,10 +3605,24 @@ impl MiningBackend for Coordinator {
         version_mask: u32,
         ttl: Duration,
     ) -> Result<(), StratumError> {
+        // #655: its ledger steps (the clock and revision reads, the batch
+        // and repair writes) are marked where they run, so a session timeout
+        // that passes during one is the database's, and one that passes while
+        // a compact repair waits for its lock or admission, or encodes, is not.
         let save = self.save_issued_record(worker, job, version_mask, ttl);
         save.await.map_err(|error| {
-            tracing::warn!(%error,"job persistence deferred");
-            protocol_error("backend-rpc-unavailable", "job persistence unavailable")
+            tracing::warn!(error = format!("{error:#}"), "job persistence deferred");
+            // #581: an expiry is the database's, whichever of the deadline
+            // and the statement it cut short failed first; decided here, by
+            // the deadline, never by the race.
+            if error
+                .downcast_ref::<prepared_storage::IssuedPersistenceExpired>()
+                .is_some()
+            {
+                protocol_error(DATABASE_UNAVAILABLE, "job persistence unavailable")
+            } else {
+                backend_refusal(&error, "job persistence unavailable")
+            }
         })
     }
 
@@ -2989,7 +3645,10 @@ impl MiningBackend for Coordinator {
             if job_id.len() > 256 || job_id.starts_with("prepared:") {
                 return Ok(None);
             }
-            let Some(payload) = self.work_ledger.job(job_id).await? else {
+            // #655: each ledger step is the database's when the session's
+            // timeout passes during it; the reconstruction below follows its
+            // shared flight's own steps.
+            let Some(payload) = on_database(self.work_ledger.job(job_id)).await? else {
                 return Ok(None);
             };
             let stored: StoredJob = serde_json::from_value(payload)?;
@@ -3006,7 +3665,7 @@ impl MiningBackend for Coordinator {
             prepared_storage::compact::prepared_dependency_key(&stored.prepared_key)?;
             let clock_started = tokio::time::Instant::now();
             let deadline = publication_authority::AbsoluteDeadline::from_database(
-                self.work_ledger.now_ms().await?,
+                on_database(self.work_ledger.now_ms()).await?,
                 clock_started,
                 stored.expires_at_ms,
             )?;
@@ -3021,7 +3680,7 @@ impl MiningBackend for Coordinator {
                     .resume_flights
                     .join(self, &stored.prepared_key, stored.extranonce2_size)
                     .await;
-                let Some(metadata) = flight.metadata.clone().await? else {
+                let Some(metadata) = on_database(flight.metadata.clone()).await? else {
                     return Ok(None);
                 };
                 let (published_parent, published_revision) =
@@ -3030,7 +3689,7 @@ impl MiningBackend for Coordinator {
                     &stored.prepared_key,
                     &metadata.record,
                 );
-                let Some(mut issuance_authority) = self
+                let Ok(mut issuance_authority) = self
                     .begin_issuance_authority(identity, readiness_epoch, Some(stored.expires_at_ms))
                     .await?
                 else {
@@ -3055,14 +3714,16 @@ impl MiningBackend for Coordinator {
                     return Ok(None);
                 }
                 self.ensure_job_fee_current(metadata.record.fee).await?;
-                let prepared = flight
-                    .reconstruction(
+                let prepared = waiting::follow(
+                    flight.waiting(),
+                    flight.reconstruction(
                         self,
                         stored.prepared_key.clone(),
                         metadata,
                         stored.extranonce2_size,
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 if !deadline.live()
                     || self
                         .revalidate_issuance_authority(
@@ -3147,7 +3808,7 @@ impl MiningBackend for Coordinator {
         };
         resume.await.map_err(|error| {
             tracing::warn!(%error,"job resume unavailable");
-            protocol_error("backend-rpc-unavailable", "job resume unavailable")
+            backend_refusal(&error, "job resume unavailable")
         })
     }
 
@@ -3160,6 +3821,39 @@ impl MiningBackend for Coordinator {
     ) -> Result<(), StratumError> {
         self.submit_share(worker, job, submission, stale_grace)
             .await
+    }
+}
+
+#[cfg(test)]
+mod submission_hold_view_tests {
+    use super::SubmissionHoldView;
+    use crate::ledger::SubmissionHold;
+
+    /// #664: the hold is unknown until a read succeeds. After that a failed
+    /// read keeps the last one, so a database outage does not turn every
+    /// frontend's gauge to -1 and page it as held, and a change is taken at
+    /// the next successful read.
+    #[test]
+    fn a_failed_read_keeps_the_hold_last_read() {
+        let view = SubmissionHoldView::default();
+        let hold = SubmissionHold {
+            reason: "rehearsal".into(),
+            set_at: "2026-10-05T20:00:00+00:00".into(),
+            set_by: "operator".into(),
+        };
+        assert_eq!(view.observe(None), None, "unknown before any read");
+        assert_eq!(view.observe(Some(None)), Some(None));
+        assert_eq!(view.observe(None), Some(None), "a failed read cleared it");
+        assert_eq!(
+            view.observe(Some(Some(hold.clone()))),
+            Some(Some(hold.clone()))
+        );
+        assert_eq!(
+            view.observe(None),
+            Some(Some(hold)),
+            "a failed read released it"
+        );
+        assert_eq!(view.observe(Some(None)), Some(None));
     }
 }
 
@@ -3279,6 +3973,9 @@ mod clocked_revision_tests;
 mod d2_bootstrap_tests;
 
 #[cfg(test)]
+mod first_job_lane_tests;
+
+#[cfg(test)]
 mod d2_test_support;
 #[cfg(test)]
 mod test_serial;
@@ -3309,9 +4006,11 @@ mod offer_not_executed_tests;
 /// on a same-template poll and the admitted window's on a new template. A
 /// missing cached window with published work is labelled `reanchor`. A
 /// label for the refresh metric and log, never a decision input.
+#[allow(clippy::too_many_arguments)]
 fn refresh_trigger(
     current: Option<&Prepared>,
     parent: &str,
+    timeline: crate::ledger::WriterTimeline,
     payout_revision: i64,
     prior_balances_digest: [u8; 32],
     share_seq: u64,
@@ -3322,6 +4021,7 @@ fn refresh_trigger(
         return RefreshTrigger::Initial;
     };
     classify_refresh(RefreshChanges {
+        writer_timeline: current.timeline != Some(timeline),
         tip: current.template["previousblockhash"].as_str() != Some(parent),
         revision: current.snapshot.payout_revision != payout_revision,
         balances: current.window.prior_balances_digest != prior_balances_digest,
@@ -3334,6 +4034,7 @@ fn refresh_trigger(
 /// Which of the published work's inputs a refresh found changed.
 #[derive(Clone, Copy, Debug, Default)]
 struct RefreshChanges {
+    writer_timeline: bool,
     tip: bool,
     revision: bool,
     balances: bool,
@@ -3346,7 +4047,11 @@ struct RefreshChanges {
 /// everything else: a changed fingerprint, an aged template, or a cached
 /// window that no longer matches the published reference.
 fn classify_refresh(changes: RefreshChanges) -> RefreshTrigger {
-    if changes.tip {
+    // A promotion invalidates the published window whatever else moved with
+    // it, so it is named first (#619).
+    if changes.writer_timeline {
+        RefreshTrigger::WriterTimeline
+    } else if changes.tip {
         RefreshTrigger::Tip
     } else if changes.revision {
         RefreshTrigger::Revision

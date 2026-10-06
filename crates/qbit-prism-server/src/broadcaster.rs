@@ -1,19 +1,44 @@
 //! Recoverable, non-custodial CTV submission. A database claim coordinates
 //! frontends; every attempt verifies the covenant and live parent maturity.
-use crate::{codec, config, coordinator::Coordinator, ledger::FanoutClaim};
+use crate::{
+    codec, config,
+    coordinator::Coordinator,
+    ledger::{FanoutClaim, SubmissionHeld},
+};
 use anyhow::{bail, ensure, Context, Result};
 use qbit_prism::{CpfpChildRequest, CtvFanoutManifest};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+/// The lease, in seconds, every fanout claim and renewal takes.
+const LEASE: i64 = 120;
+
+/// The holder's own deadline for one attempt (#654). Another frontend takes a
+/// fanout over only once it has watched the claim's version go unrenewed for
+/// the whole lease on its own monotonic clock, timed from a reply that comes
+/// after the renewal's commit, so after the instant this holder sent it. The
+/// claim's first renewal opens the attempt and every later one is sent
+/// inside it, so an attempt that ends within the lease of its first renewal
+/// ends before any takeover of any version it wrote. Its completion, after
+/// this deadline, is fenced on the token and refused once a takeover has
+/// replaced it.
+const ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+const _: () = assert!(ATTEMPT_DEADLINE.as_secs() < LEASE as u64);
+
 pub async fn run(coordinator: Arc<Coordinator>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let mut tick = tokio::time::interval(coordinator.config.ctv_broadcast_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-        if let Err(error) = run_pass(&coordinator, &shutdown).await {
-            tracing::warn!(%error,"CTV broadcaster attempt deferred");
+        match run_pass(&coordinator, &shutdown).await {
+            // #664: the health publisher logs the cluster's hold once; a pass
+            // it refuses is expected for as long as the hold lasts.
+            Err(error) if error.is::<SubmissionHeld>() => {
+                tracing::debug!(%error, "CTV broadcaster pass held")
+            }
+            Err(error) => tracing::warn!(%error,"CTV broadcaster attempt deferred"),
+            Ok(_) => {}
         }
     }
     Ok(())
@@ -33,12 +58,41 @@ async fn stopping(shutdown: &watch::Receiver<bool>) {
     }
 }
 
+/// Hand an abandoned attempt's claim back unrecorded, bounded so a database
+/// that stops answering cannot stall the broadcaster. A failed release falls
+/// back to the claim's expiry.
+async fn hand_back(coordinator: &Coordinator, claim: &FanoutClaim, when: &str) {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        coordinator.ledger.release_fanout_claim(claim),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(release)) => {
+            tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release {when} failed; the claim waits for its expiry")
+        }
+        Err(_) => {
+            tracing::warn!(fanout=%claim.fanout_txid,"CTV claim release {when} timed out; the claim waits for its expiry")
+        }
+    }
+}
+
 /// One pass over due fanouts that stops at `shutdown`: between fanouts, and
 /// inside an attempt by abandoning it and handing its claim back (#573).
 pub async fn run_pass(
     coordinator: &Coordinator,
     shutdown: &watch::Receiver<bool>,
 ) -> Result<usize> {
+    // #291: with PRISM_BLOCK_SUBMIT_ENABLED off `run` starts no broadcaster
+    // and `broadcast-ctv` refuses. Any other caller is refused here, before
+    // the node is read or a fanout is claimed.
+    coordinator
+        .config
+        .require_block_submission("the CTV broadcaster claimed no fanout")?;
+    // #664: nor while the cluster holds block submission, whatever this
+    // frontend's own switch says.
+    coordinator.ledger.require_no_submission_hold().await?;
     // Tip observations recorded from here on can supersede this chain view.
     let pass_started = tokio::time::Instant::now();
     // A node behind its peers must leave their settlement claims available.
@@ -86,14 +140,14 @@ pub async fn run_pass(
         if *shutdown.borrow() {
             break;
         }
-        let Some(claim) = coordinator.ledger.claim_fanout(120).await? else {
+        let Some(claim) = coordinator.ledger.claim_fanout(LEASE).await? else {
             break;
         };
         let started = std::time::Instant::now();
         let outcome = tokio::select! {
             biased;
             outcome = tokio::time::timeout(
-                std::time::Duration::from_secs(90),
+                ATTEMPT_DEADLINE,
                 process(coordinator, &claim),
             ) => outcome,
             () = stopping(shutdown) => {
@@ -102,21 +156,19 @@ pub async fn run_pass(
                 // another frontend wait for the lease. Nothing is recorded:
                 // the next claim re-verifies the chain from scratch, as after
                 // an expiry, and anything this attempt sent is already known
-                // to the node. A failed release falls back to the expiry.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    coordinator.ledger.release_fanout_claim(&claim),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(release)) => tracing::warn!(%release,fanout=%claim.fanout_txid,"CTV claim release at shutdown failed; the claim waits for its expiry"),
-                    Err(_) => tracing::warn!(fanout=%claim.fanout_txid,"CTV claim release at shutdown timed out; the claim waits for its expiry"),
-                }
+                // to the node.
+                hand_back(coordinator, &claim, "at shutdown").await;
                 break;
             }
         };
         let finished = match outcome {
+            // #664: a hold set during the pass refused the send. Hand the claim
+            // back unattempted, as at shutdown, and end the pass: the next
+            // claim re-verifies the chain from scratch once the hold clears.
+            Ok(Err(error)) if error.is::<SubmissionHeld>() => {
+                hand_back(coordinator, &claim, "under the submission hold").await;
+                return Err(error);
+            }
             Ok(Ok((status, result))) => {
                 let attempted = result.clone();
                 let finished = coordinator
@@ -201,7 +253,7 @@ fn confirmed(hash: &str, height: u64, tip: u64) -> Result<(&'static str, Value)>
 }
 
 async fn process(coordinator: &Coordinator, claim: &FanoutClaim) -> Result<(&'static str, Value)> {
-    coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+    coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
     let chain = crate::readiness::chain_info_with_metrics(
         &coordinator.rpc,
         &coordinator.config.chain,
@@ -342,7 +394,8 @@ async fn process_view(
     )?;
     let result = if manifest.precommitment.fanout_fee_sats > 0 {
         // Built-in-fee fanouts are anchorless and need no wallet sponsorship.
-        coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+        coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
+        coordinator.ledger.require_no_submission_hold().await?;
         ensure!(
             rpc.call("getbestblockhash", json!([])).await? == tip_hash,
             "tip changed before CTV submission"
@@ -352,7 +405,8 @@ async fn process_view(
     } else {
         ensure!(fee > 0, "zero-fee fanout requires CPFP fee sponsorship");
         let child = build_child(coordinator, claim, &manifest, fee).await?;
-        coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+        coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
+        coordinator.ledger.require_no_submission_hold().await?;
         ensure!(
             rpc.call("getbestblockhash", json!([])).await? == tip_hash,
             "tip changed before CTV package submission"
@@ -397,7 +451,7 @@ async fn scan_spender(
     }
     let end = tip.min(next.saturating_add(budget - 1));
     for number in next..=end {
-        coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+        coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
         let hash = rpc.call("getblockhash", json!([number])).await?;
         let block = rpc.call("getblock", json!([hash, 2])).await?;
         ensure!(
@@ -491,7 +545,7 @@ async fn build_child(
         .ledger
         .mark_cpfp_wallet_lock_pending(claim)
         .await?;
-    coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+    coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
     ensure!(
         wallet
             .call("lockunspent", json!([false, [outpoint], true]))
@@ -521,7 +575,7 @@ async fn build_child(
             .context("change script missing")?
             .into(),
     })?;
-    coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+    coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
     let signed=wallet.call("signrawtransactionwithwallet",json!([child.unsigned_child_tx_hex,[{"txid":manifest.fanout_txid,"vout":anchor,"scriptPubKey":qbit_prism::P2A_ANCHOR_SCRIPT_PUBKEY_HEX,"amount":0}]])).await?;
     ensure!(
         signed["complete"] == true,
@@ -774,7 +828,7 @@ async fn cleanup_retired_funding(coordinator: &Coordinator, claim: &FanoutClaim)
                 .context("wallet locked UTXO list missing")?
                 .contains(&outpoint)
             {
-                coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+                coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
                 ensure!(
                     wallet
                         .call("lockunspent", json!([true, [outpoint]]))
@@ -888,7 +942,7 @@ async fn maintain_funding_reservation_inner(
             }
         }
         if !protected {
-            coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+            coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
             ensure!(
                 wallet
                     .call("lockunspent", json!([false, [outpoint], true]))
@@ -958,7 +1012,7 @@ async fn maintain_funding_reservation_inner(
         // reject per-output unlock once that child spends it. Keep cleanup
         // pending on that error; unlocking all coins would endanger other
         // reservations in the sponsorship wallet.
-        coordinator.ledger.renew_fanout_claim(claim, 120).await?;
+        coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
         ensure!(
             wallet
                 .call("lockunspent", json!([true, [outpoint]]))

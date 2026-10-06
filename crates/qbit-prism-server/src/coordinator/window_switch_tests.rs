@@ -214,6 +214,7 @@ impl Fixture {
             rpc_password: "test".into(),
             rpc_timeout: Duration::from_secs(5),
             block_submit_timeout: Duration::from_secs(5),
+            block_submit_enabled: true,
             poll_interval: Duration::from_secs(1),
             blockwait: false,
             build_workers: 1,
@@ -509,8 +510,12 @@ impl Fixture {
     }
 
     async fn expire(&self, block_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-            .bind(block_hash).execute(&self.coordinator.ledger.pool).await?;
+        crate::ledger::revoke_candidate_claims(
+            &self.coordinator.ledger.pool,
+            Some(block_hash),
+            true,
+        )
+        .await?;
         Ok(())
     }
 
@@ -823,11 +828,12 @@ async fn window_read_failures_retry_with_an_alert_and_never_abandon() -> Result<
             .window
             .shares
             .context("the fixture window has a range")?;
+        // A count the held range does not match. A range this database does
+        // not hold at all is refused at the enqueue instead (#619).
+        ensure!(range.share_count > 1, "the fixture window is too small");
         let mut incomplete = fixture.found(0)?;
         incomplete.candidate.window.shares = Some(ShareRange {
-            first_share_seq: 5_000_000,
-            last_share_seq: 5_000_002,
-            share_count: 3,
+            share_count: range.share_count - 1,
             ..range
         });
         let mut digest = fixture.found(10_000)?;
@@ -877,6 +883,43 @@ async fn window_read_failures_retry_with_an_alert_and_never_abandon() -> Result<
             .fetch_one(&fixture.coordinator.ledger.pool)
             .await?;
         ensure!(blocks == 0, "a failed rebuild landed");
+
+        // A window held at its enqueue whose last row is another share by
+        // its landing, as after an asynchronous promotion reissued the
+        // number (#619). Share rows are immutable, so the fixture rewrites
+        // the row with triggers off. The reason names lost history, never
+        // pruning or corruption. Last: every case above shares this window.
+        let found = fixture.found(40_000)?;
+        let claim = fixture.enqueue_and_claim(&found).await?;
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE qbit_share_ledger DISABLE TRIGGER qbit_prism_immutable_share_history; \
+             UPDATE qbit_share_ledger SET accepted_at=to_timestamp({}::double precision/1000) WHERE share_seq={}; \
+             ALTER TABLE qbit_share_ledger ENABLE TRIGGER qbit_prism_immutable_share_history",
+            found.candidate.window.anchor_ms + 1,
+            range.last_share_seq
+        ))
+        .execute(&fixture.coordinator.ledger.pool)
+        .await?;
+        tokio::time::timeout(Duration::from_secs(10), fixture.process(&claim)).await???;
+        assert_reconciled(
+            &fixture,
+            &found.candidate.block_hash,
+            "window not held by this primary",
+        )
+        .await?;
+        let reason: String = sqlx::query_scalar(
+            "SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        )
+        .bind(&found.candidate.block_hash)
+        .fetch_one(&fixture.coordinator.ledger.pool)
+        .await?;
+        ensure!(
+            reason.contains("#619")
+                && !reason.contains("rows pruned or missing")
+                && !reason.contains("corruption or"),
+            "{reason}"
+        );
+        ensure!(!fixture.landed(&found.candidate.block_hash).await?);
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -1236,6 +1279,32 @@ async fn off_runtime_releases_its_value_on_a_blocking_thread() -> Result<()> {
     ensure!(
         thread != runtime_thread,
         "a cancelled holder dropped on the runtime thread"
+    );
+    Ok(())
+}
+
+/// #600: the post-landing trim runs on the releasing blocking thread, and
+/// only after the value is gone, so it can return the value's memory.
+#[tokio::test(flavor = "current_thread")]
+async fn off_runtime_runs_its_follow_up_after_the_drop_on_the_same_blocking_thread() -> Result<()> {
+    let runtime_thread = std::thread::current().id();
+    let (sender, mut dropped) = tokio::sync::oneshot::channel();
+    let (followed, receiver) = tokio::sync::oneshot::channel();
+    let probe = Probe(Some(sender));
+    drop(OffRuntime::new(probe).then(move || {
+        // Whether the value's drop has already reported, read from inside
+        // the follow-up: a drop after it would report too late to be seen.
+        let _ = followed.send((std::thread::current().id(), dropped.try_recv().ok()));
+    }));
+    let (thread, dropped_on) = tokio::time::timeout(Duration::from_secs(2), receiver).await??;
+    ensure!(
+        thread != runtime_thread,
+        "followed up on the runtime thread"
+    );
+    let dropped_on = dropped_on.context("follow-up ran before the drop")?;
+    ensure!(
+        dropped_on == thread,
+        "dropped and followed up on different threads"
     );
     Ok(())
 }

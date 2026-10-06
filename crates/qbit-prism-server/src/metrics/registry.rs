@@ -49,6 +49,7 @@ families! {
     Connections: Gauge, "connections", "Current local Stratum connections.";
     Authorized: Gauge, "authorized_clients", "Current local authorized Stratum connections.";
     Builds: Gauge, "pending_job_builds", "Current local pending job deliveries.";
+    RebuildWaiters: Gauge, "stratum_rebuild_lane_waiters", "Local job rebuilds waiting for a rebuild-lane permit; sessions whose work is still on the published parent and payout revision queue here, first jobs never do.";
     Covered: Gauge, "authorized_with_current_work", "Authorized connections holding the current semantic work generation.";
     Missing: Gauge, "authorized_missing_current_work", "Authorized connections missing the current semantic work generation.";
     Accepted: Counter, "accepted_shares_total", "Shares accepted by this instance since process start.";
@@ -76,6 +77,7 @@ families! {
     CandidateAge: Gauge, "block_candidate_oldest_pending_seconds", "Oldest cluster-wide pending candidate age, or -1 when unknown.";
     CandidateUnacknowledgedAge: Gauge, "block_candidate_oldest_unacknowledged_seconds", "Oldest cluster-wide candidate age the node has not accepted: pending and offer-reserved rows, offered rows whose one submitblock outcome is unknown (not a row adopted on the node's active-chain evidence), and rows the node rejected unless the reply names a side-chain block; zero when every unfinished row was accepted, or -1 when unknown.";
     CandidateLandingFailedAge: Gauge, "block_candidate_oldest_landing_failed_seconds", "Oldest cluster-wide time since the offer reservation of an offered or reconciliation row whose audit landing has not committed (no pool-block row) or whose last error names a landing refusal; zero when none, or -1 when unknown.";
+    BlockSubmission: Gauge, "block_submission_enabled", "Whether this frontend offers found blocks to its node and lets its CTV fanout broadcaster send: 1 normally, 0 while PRISM_BLOCK_SUBMIT_ENABLED is off (#291) or the cluster holds block submission (#664), so block candidates stay pending and no fanout is sent, -1 while the switch is on but the frontend has not yet read the cluster's hold; a later failed read keeps the last one.";
     PartitionLead: Gauge, "share_ledger_partition_lead_rows", "Rows of attached share ledger partition headroom above the next share_seq, or -1 when unknown.";
     PoolAcquire: Histogram, "database_pool_acquire_seconds", "Actual database pool acquisition wait by outcome.";
     LockWait: Histogram, "database_advisory_lock_wait_seconds", "Database advisory transaction lock wait by lock and outcome.";
@@ -109,9 +111,16 @@ families! {
     NodeObservationAge: Gauge, "node_observation_age_seconds", "Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable.";
     RollupLag: Gauge, "hashrate_rollup_watermark_lag_seconds", "Monotonic time since this frontend last completed a caught-up hashrate rollup pass, or -1 before its first; no sample when the rollup is disabled.";
     WorkRefreshStalled: Gauge, "work_refresh_stalled_seconds", "Monotonic time since this frontend's last successful template refresh, which publishes or revalidates its work, or since start before the first; -1 before the coordinator publishes it.";
+    TipPollAge: Gauge, "tip_poll_age_seconds", "Monotonic age of this frontend's readiness proof, the node's tip as its last refresh or refresh-grade poll on the published tip found it, which job, share and block admission require within the health timeout; -1 while readiness is unavailable or before the coordinator publishes it.";
+    JobPreparationDeferrals: Counter, "job_preparation_deferrals_total", "Job preparations this frontend deferred (each logged as job preparation deferred), by the first check that refused them.";
     OrderLockHold: Histogram, "database_order_lock_hold_seconds", "ORDER_LOCK hold from the grant of the lock to the end of the transaction holding it, by holder, in seconds (#602).";
     ShareAckLandingWindow: Histogram, "share_ack_landing_window_seconds", "The share_ack_seconds observations whose submission arrived within 30 seconds after a pool block acceptance this frontend observed, by outcome (#602); steady state is share_ack_seconds minus this family.";
     SlowLandingWindows: Gauge, "share_ack_slow_landing_windows", "Consecutive most recent closed landing windows on this frontend whose share acknowledgement p99 exceeded the bound in seconds (#602); -1 before a landing window holding an acknowledgement has closed.";
+    LandingTrimSeconds: Histogram, "landing_malloc_trim_seconds", "Duration of each malloc_trim(0) this frontend ran after a block landing released its rebuilt window (#600), in seconds; glibc builds only, none while PRISM_LANDING_MALLOC_TRIM_ENABLED=0.";
+    LandingTrimReleased: Counter, "landing_malloc_trim_released_bytes_total", "Resident bytes this frontend's post-landing malloc_trim calls returned to the kernel (#600): the process resident set just before each trim minus just after it, never negative; allocation on other threads during a trim can hide part of its release.";
+    LandingTrimResident: Gauge, "landing_malloc_trim_resident_bytes", "Process resident bytes right after this frontend's latest post-landing trim, its resident floor after the landing, or -1 before the first trim or when procfs could not be read.";
+    RequestDeliveryWait: Histogram, "stratum_request_delivery_wait_seconds", "Complete Stratum request frame to the end of its session's own job delivery, for a request that waited for that delivery (#621): every JSON object frame but mining.submit and mining.get_health, that is mining.subscribe, mining.authorize, mining.configure, mining.suggest_difficulty, mining.extranonce.subscribe, any other method, or a missing or non-string method; the session reads nothing after it meanwhile, so a submit sent behind it waits as long. Submits and health probes are answered during a delivery and never wait.";
+    DeliveryCancelled: Counter, "job_delivery_cancellations_total", "Local job deliveries abandoned before their announcement because their session ended: the miner disconnected or broke the protocol, or the listener shut down (#621); counted neither as successes nor as failures.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -156,7 +165,12 @@ impl Family {
         self.is_collection()
             || matches!(
                 self,
-                Self::PoolAcquire
+                // #581: the share-refusal rules read these two, and they must
+                // see an outage while the health publisher, and so the
+                // cached body, is stalled behind the database.
+                Self::Accepted
+                    | Self::Rejections
+                    | Self::PoolAcquire
                     | Self::RevisionWork
                     | Self::RevisionWorkPending
                     | Self::RevisionWorkUnknown
@@ -166,6 +180,10 @@ impl Family {
                     | Self::NodeIbd
                     | Self::NodeObservationAge
                     | Self::RollupLag
+                    // #664: a cluster hold set or cleared while the frontend
+                    // runs moves it, and PrismBlockSubmissionHeld reads it on
+                    // a successful scrape rather than a fresh snapshot.
+                    | Self::BlockSubmission
             )
     }
 
@@ -228,7 +246,7 @@ impl Registry {
         // These owner-dependent families have no samples at startup. Reserve
         // their closed keys now so even the first event needs no allocation.
         match family {
-            Family::FirstOffer | Family::RollupLag => {
+            Family::FirstOffer | Family::RollupLag | Family::LandingTrimSeconds => {
                 self.samples
                     .insert((family, Labels::Empty), Sample::Pending);
             }

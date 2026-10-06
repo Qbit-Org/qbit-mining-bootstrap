@@ -706,10 +706,7 @@ impl Fixture {
 
     /// End a claim's lease so the next legal attempt can take the row.
     async fn expire(&self, block_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET claim_expires_at=clock_timestamp()-interval '1 second',next_attempt_at=clock_timestamp() WHERE block_hash=$1")
-            .bind(block_hash)
-            .execute(&self.direct)
-            .await?;
+        super::revoke_candidate_claims(&self.direct, Some(block_hash), true).await?;
         Ok(())
     }
 
@@ -875,6 +872,7 @@ fn fixture_config(database_url: &str, rpc_url: &str) -> Config {
         rpc_password: "test".into(),
         rpc_timeout: Duration::from_secs(5),
         block_submit_timeout: Duration::from_secs(5),
+        block_submit_enabled: true,
         poll_interval: Duration::from_secs(1),
         blockwait: false,
         build_workers: 1,

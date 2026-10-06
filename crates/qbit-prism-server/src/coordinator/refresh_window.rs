@@ -34,6 +34,8 @@ pub(super) struct RefreshWindow {
     pub acquisition: crate::ledger::AcquisitionReport,
     network: u128,
     leaf: Option<crate::ledger::LeafWitness>,
+    /// The writer timeline the window's rows were read on (#619).
+    pub timeline: crate::ledger::WriterTimeline,
     anchored: Instant,
 }
 
@@ -52,14 +54,20 @@ impl RefreshWindow {
         self.anchored.elapsed() < interval
     }
 
+    /// Whether a new template may reuse this window. A window read on
+    /// another writer timeline never is: a promotion can lose its rows and
+    /// hand their numbers to other shares, so an equal cutoff proves nothing
+    /// (#619).
     pub fn reusable(
         &self,
         network: u128,
         share_seq: u64,
         state: crate::ledger::PayoutState,
+        timeline: crate::ledger::WriterTimeline,
         interval: Duration,
     ) -> bool {
         self.network == network
+            && self.timeline == timeline
             && self.snapshot.share_seq == share_seq
             && self.snapshot.payout_revision == state.payout_revision
             && self.reference.prior_balances_digest == state.prior_balances_digest
@@ -79,14 +87,12 @@ impl Coordinator {
     ) -> Result<CapturedWindow> {
         // The interval starts before the read, not after each template build.
         let anchored = Instant::now();
-        let snapshot = self
-            .work_ledger
-            .snapshot_with_admission(
-                network,
-                crate::ledger::ReadAdmission::shared(permit.clone()),
-                prior,
-            )
-            .await?;
+        let snapshot = on_database(self.work_ledger.snapshot_with_admission(
+            network,
+            crate::ledger::ReadAdmission::shared(permit.clone()),
+            prior,
+        ))
+        .await?;
         // The anchor transaction's revision is the one this work will carry;
         // record it before the build so the landing metric sees it as early
         // as the ledger probe it replaces did.
@@ -138,6 +144,7 @@ impl Coordinator {
                     snapshot,
                     leaf,
                     acquisition,
+                    timeline,
                 } = Arc::try_unwrap(capture)
                     .ok()
                     .expect("both borrowed computations have finished");
@@ -148,6 +155,7 @@ impl Coordinator {
                     acquisition,
                     network,
                     leaf,
+                    timeline,
                     anchored,
                 });
                 // Keep the original cache behavior even when body preparation failed.

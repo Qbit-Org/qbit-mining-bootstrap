@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 72bd9b2d28c6354c1d9ab6dbfc7db7625a59b83caf1cb6b37c24e4433d0184fe
++   Specification SHA-256: 9436a7246611e8a13adcdd2c242ea6d4bf2c6aae82db55913745395eefd11d3d
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,854 @@
+@@ -118,53 +14,892 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -384,7 +384,7 @@
 +  {
 +    "uid": "qbit-prism-reject-ratio",
 +    "title": "PrismRejectRatioByReasonHigh",
-+    "expr": "(((sum by (job, instance, network, reason_id) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) / on(job, instance, network) group_left() (sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])))) > bool 0.05) and on(job, instance, network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]))) >= 100)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "expr": "(((sum by (job, instance, network, reason_id) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) / on(job, instance, network) group_left() (sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])))) > bool 0.05) and on(job, instance, network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]))) >= 100))",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -395,7 +395,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismRejectRatioByReasonHigh",
-+    "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, ledger-outcome-unknown, backend-rpc-unavailable, stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Provisional, measure in #291.",
++    "description": "Preserves reason_id on each alert; rejected includes failed response writes. Diagnose ledger-confirmation-failed, ledger-outcome-unknown, backend-rpc-unavailable (the node), backend-database-unavailable (the ledger database, #581), stale-job, duplicate-share and low-difficulty separately. Five percent per canonical reason over five minutes, with at least 100 acceptance/rejection decisions. Not gated on a fresh metrics snapshot: qbit_prism_rejections_total and qbit_prism_accepted_shares_total are rendered at scrape time since #581, so a database outage that stalls the health publisher does not freeze them. Provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
@@ -420,7 +420,7 @@
 +  {
 +    "uid": "qbit-prism-share-append-failures",
 +    "title": "PrismShareAppendFailures",
-+    "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",reason_id=~\"ledger-confirmation-failed|ledger-outcome-unknown\"}[5m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "expr": "(sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",reason_id=~\"ledger-confirmation-failed|ledger-outcome-unknown\"}[5m])) > bool 0)",
 +    "condition_type": "threshold",
 +    "evaluator": "gt",
 +    "threshold": 0,
@@ -431,7 +431,7 @@
 +      "alert_class": "prism-runtime"
 +    },
 +    "summary": "PrismShareAppendFailures",
-+    "description": "At least one share was rejected in the five-minute window because its ledger confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown). This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id and freshness guards.",
++    "description": "At least one share was rejected in the five-minute window because its ledger confirmation failed or outcome unknown (ledger-confirmation-failed or ledger-outcome-unknown). This preserves the low-volume total-write-failure signal from the deployed rule while retaining the native reason_id. Not gated on a fresh metrics snapshot (#581): qbit_prism_rejections_total is rendered at scrape time, so the rule holds through a database outage that stalls the health publisher instead of flapping with the snapshot's freshness.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
@@ -523,7 +523,7 @@
 +      "page": "true"
 +    },
 +    "summary": "PrismWorkRefreshStalledCritical",
-+    "description": "This frontend's template refresh has not succeeded for 120 seconds, so it has neither published nor revalidated work: share and block admission already refuse once readiness is older than the health timeout, so every miner on it is stalled whatever the cause. That covers #525 on either settlement path, where a pool without a fee cannot settle sub-floor dust and every build fails with PayoutExceedsCandidateBalance, whether the dust meets a new tip or a same-parent rebuild; it also covers a refresh that fails before its tip observation or hangs. Semantic coverage cannot see this: it compares sessions with the latest published generation, which stays put while every refresh fails. A healthy refresh succeeds every poll interval (2 s by default, and within the health timeout for the frontend to be ready at all); 120 seconds is the default replacement-build lease (PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS). One-minute dwell: the gauge is monotonic during a stall. Not gated on connected miners: a frontend without working refreshes is stalled for every miner that connects. A node still syncing or short of peers also pages here, since it builds no work. -1 (not yet published) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements, and a draining process stops its snapshot. Provisional, measure in #291.",
++    "description": "This frontend's template refresh has not succeeded for 120 seconds, so it has neither published nor revalidated work: job, share and block admission refuse once readiness is older than the health timeout, and while refreshes fail only a node poll that finds the published tip with its template within PRISM_TEMPLATE_MAX_AGE_SECONDS (120 s by default) renews it (#622), so by then plus the health timeout every miner on it is stalled whatever the cause; qbit_prism_tip_poll_age_seconds shows which side of that a paged frontend is on. That covers #525 on either settlement path, where a pool without a fee cannot settle sub-floor dust and every build fails with PayoutExceedsCandidateBalance, whether the dust meets a new tip or a same-parent rebuild; it also covers a refresh that fails before its tip observation or hangs. Semantic coverage cannot see this: it compares sessions with the latest published generation, which stays put while every refresh fails. A healthy refresh succeeds every poll interval (2 s by default, and within the health timeout for the frontend to be ready at all); 120 seconds is the default replacement-build lease (PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS). One-minute dwell: the gauge is monotonic during a stall. Not gated on connected miners: a frontend without working refreshes is stalled for every miner that connects. A node still syncing or short of peers also pages here, since it builds no work. -1 (not yet published) never fires; no-data and evaluation errors are OK because the snapshot rules own missing measurements, and a draining process stops its snapshot. Provisional, measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
 +  },
@@ -690,6 +690,44 @@
 +    "description": "Database candidate age/count are unknown, not zero; collector state is live at scrape time. Collector failure, cancellation or expiry after 30 seconds invalidates all four gauges, the unacknowledged and landing-failed ages included (#493).",
 +    "no_data_state": "Alerting",
 +    "exec_err_state": "Alerting"
++  },
++  {
++    "uid": "qbit-prism-block-submission-held",
++    "title": "PrismBlockSubmissionHeld",
++    "expr": "(last_over_time(qbit_prism_block_submission_enabled{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[2m]) != bool 1) and on(job, instance, network) (max_over_time(up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[2m]) == 1)",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "1m",
++    "severity": "critical",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime",
++      "page": "true"
++    },
++    "summary": "PrismBlockSubmissionHeld",
++    "description": "This frontend holds block submission: its PRISM_BLOCK_SUBMIT_ENABLED is off (#661, the #291 rehearsal kill switch), or the cluster's block submission hold is set in the ledger (#664, qbit-prism-server submission-hold set), so it offers no block it finds to its node's submitblock and sends no CTV fanout. Its found blocks wait in the shared candidate outbox: a peer frontend that still submits offers them, and when every frontend is held, as under the cluster hold, none is offered. This rule pages a minute after a frontend is held, independently of whether it has found a block; the candidate rules page only once a found block has waited (PrismBlockCandidateOldestPendingCritical: an age of 60 seconds, then a three-minute dwell). A frontend that cannot yet show that it submits pages too (-1): its switch is on but it has not read the cluster's hold yet. A later failed read keeps the last one, so a database outage does not page here. The gauge is rendered at scrape time from the frontend's last health publication, so the rule reads its last sample in the past two minutes and is gated on a successful scrape in that window rather than on a fresh snapshot: a held frontend keeps paging through a stale snapshot or an occasional failed scrape. A missing endpoint, no data and evaluation errors are OK, because PrismMetricsEndpointDown and PrismMetricsNoData own them, and an image older than #661 exports no series. A rehearsal against the production network holds its frontends on purpose: scrape them under another job or network, or silence this rule with matchers on the rehearsal frontends' instance labels, never on the alert name alone, which would also hide a production frontend left held (docs/prism-ledger-ops.md, block submission kill switch for rehearsals). Remedy: when qbit-prism-server submission-hold show reports \"held\": true, clear the hold with submission-hold clear --reason once the cutover is verified (docs/prism-ledger-ops.md, holding the whole cluster); otherwise unset PRISM_BLOCK_SUBMIT_ENABLED or set it to 1, restart the frontend, and confirm check-config prints no block submission WARNING. #666, #664.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
++  },
++  {
++    "uid": "qbit-prism-database-unavailable",
++    "title": "PrismDatabaseUnavailable",
++    "expr": "(qbit_prism_collector_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",collector=\"database\"} == bool 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "2m",
++    "severity": "critical",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime",
++      "page": "true"
++    },
++    "summary": "PrismDatabaseUnavailable",
++    "description": "This frontend has had no complete successful observation of its ledger database for two minutes: the database collector, which reads PostgreSQL every 10 seconds through this frontend's own connection pool, in a read-only transaction with a 3-second deadline that includes the pool acquire and a 500 ms lock timeout, failed, was cancelled, or last succeeded more than 30 seconds ago. That covers PostgreSQL down or unreachable, and also a pool saturated, or a lock blocking the collector's reads, for two minutes. While it holds, the frontend refuses the shares and sessions it cannot record, mostly as backend-database-unavailable or ledger-confirmation-failed (#581), so every miner on it is stalled. Pages on exactly this state and says so: before #581 a PostgreSQL outage held only PrismBlockCandidateMetricsUnavailable, a warning titled for block-candidate metrics. Not this rule's: a database that still serves reads but refuses writes (a read-only standby or demoted primary, or a cluster halted by its fatal state) and a stall shorter than two minutes; both show as backend-database-unavailable refusals in PrismRejectRatioByReasonHigh. Collector state is live at scrape time and not gated on a fresh metrics snapshot, whose freshness flaps while the health publisher waits on the database. Gated on a successful scrape; a missing endpoint, no data and evaluation errors are OK because PrismMetricsEndpointDown and PrismMetricsNoData own them. Provisional, measure in #291.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
 +  },
 +  {
 +    "uid": "qbit-prism-block-offer-standby-unconfirmed",
@@ -1008,7 +1046,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +927,17 @@
+@@ -230,752 +965,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1764,7 +1802,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1416,84 @@
+@@ -1454,5 +1454,84 @@
    }
  ] %}
  {% endif %}

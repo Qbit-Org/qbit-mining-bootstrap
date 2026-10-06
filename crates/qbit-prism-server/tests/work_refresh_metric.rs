@@ -81,9 +81,16 @@ async fn failing_refreshes_grow_the_refresh_stall_gauge_while_coverage_reads_one
 
 async fn stalls(database_url: &str) -> Result<()> {
     let node = FakeNode::open().await?;
-    let (stratum, api) = (free_port()?, free_port()?);
+    let (stratum, stratum_held) = reserve_port()?;
+    let (api, api_held) = reserve_port()?;
     let log = tempfile::NamedTempFile::new()?;
-    let mut server = spawn(database_url, &node.url, stratum, api, &log)?;
+    let mut server = spawn(
+        database_url,
+        &node.url,
+        (stratum, api),
+        [stratum_held, api_held],
+        &log,
+    )?;
     let result = async {
         let client = reqwest::Client::new();
         let metrics = format!("http://127.0.0.1:{api}/metrics");
@@ -125,7 +132,9 @@ async fn stalls(database_url: &str) -> Result<()> {
     result.map_err(|error| {
         let bytes = std::fs::read(log.path()).unwrap_or_default();
         let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4096)..]).into_owned();
-        error.context(format!("server stderr tail:\n{tail}"))
+        error.context(format!(
+            "server (Stratum 127.0.0.1:{stratum}, audit 127.0.0.1:{api}) stderr tail:\n{tail}"
+        ))
     })
 }
 
@@ -168,15 +177,19 @@ fn template(parent: &str, height: u64) -> serde_json::Value {
     })
 }
 
-fn free_port() -> Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+/// A port held by its bound listener until the server is about to bind it
+/// (#639): a dropped ephemeral bind can be picked again or handed to another
+/// socket first.
+fn reserve_port() -> Result<(u16, TcpListener)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    Ok((listener.local_addr()?.port(), listener))
 }
 
 fn spawn(
     database_url: &str,
     node_url: &str,
-    stratum: u16,
-    api: u16,
+    (stratum, api): (u16, u16),
+    held: [TcpListener; 2],
     log: &tempfile::NamedTempFile,
 ) -> Result<Child> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
@@ -217,6 +230,7 @@ fn spawn(
         .env("PRISM_BLOCKPOLL_SECONDS", "0.2")
         .env("PRISM_HEALTH_REFRESH_SECONDS", "1")
         .env("PRISM_HASHRATE_ROLLUP_ENABLED", "0");
+    drop(held);
     command.spawn().context("spawning the server binary")
 }
 

@@ -78,10 +78,13 @@ async fn population(conn: &mut PgConnection, name: &str, unfinished: i64) -> Res
             "clock_timestamp()+interval '1 day'",
             name == "sparse_last",
         ),
+        // #581: a claim past its database expiry is still a claim. Only a
+        // frontend that watched it go unrenewed for its lease takes it, by a
+        // takeover outside the dispatch probe, so it is never due work here.
         "expired" => (
             "'2020-01-01'::timestamptz",
             "'2020-01-01'::timestamptz",
-            true,
+            false,
         ),
         _ => anyhow::bail!("unknown fixture population {name}"),
     };
@@ -386,10 +389,12 @@ async fn canonical_probe_preserves_slots_clocks_and_candidate_ownership() -> Res
             let after: Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(o) ORDER BY block_hash) FROM qbit_block_candidate_outbox o").fetch_one(&mut *conn).await?;
             assert_eq!(before, after, "the probe grants no candidate ownership");
         }
-        // Freeze only the two clock expressions in the canonical SQL for an
-        // exact +/-1 microsecond comparator model. This is not an executed
+        // Freeze the one clock expression in the canonical SQL for an exact
+        // +/-1 microsecond comparator model. This is not an executed
         // volatile-query plan and does not claim a frozen real-world instant.
-        assert_eq!(query.matches("clock_timestamp()").count(), 2);
+        // A claim's database expiry is no longer one of them (#581): any
+        // claim keeps its row out of the dispatch set.
+        assert_eq!(query.matches("clock_timestamp()").count(), 1);
         sqlx::raw_sql("CREATE TEMP TABLE dispatch_probe_cutoff AS SELECT clock_timestamp() t")
             .execute(&mut *conn).await?;
         let boundary_query = query.replace("clock_timestamp()", "(SELECT t FROM dispatch_probe_cutoff)");
@@ -397,9 +402,9 @@ async fn canonical_probe_preserves_slots_clocks_and_candidate_ownership() -> Res
             population(&mut conn, "backoff", 4).await?;
             for due in [-1_i32, 0, 1] {
                 for expiry in [None, Some(-1_i32), Some(0), Some(1)] {
-                    sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=t+$2*interval '1 microsecond',claim_expires_at=t+$3*interval '1 microsecond' FROM dispatch_probe_cutoff WHERE state=$1")
+                    sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=t+$2*interval '1 microsecond',claim_expires_at=t+$3*interval '1 microsecond',claim_token=CASE WHEN $3 IS NULL THEN NULL ELSE 'fixture-token' END,claim_instance_id=CASE WHEN $3 IS NULL THEN NULL ELSE 'fixture' END FROM dispatch_probe_cutoff WHERE state=$1")
                         .bind(state).bind(due).bind(expiry).execute(&mut *conn).await?;
-                    probe(&mut conn, &boundary_query, due<=0 && expiry.is_none_or(|e| e<=0)).await?;
+                    probe(&mut conn, &boundary_query, due<=0 && expiry.is_none()).await?;
                 }
             }
         }
@@ -422,11 +427,14 @@ async fn canonical_probe_preserves_slots_clocks_and_candidate_ownership() -> Res
     db.close(outcome).await
 }
 
+/// The claim's first statement on the outbox is the claim survey (#581),
+/// then the probe: whichever meets the lock first. The survey is longer than
+/// `track_activity_query_size`, so `pg_stat_activity` shows a prefix of it.
 async fn wait_for_probe_lock(conn: &mut PgConnection) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query=$1)")
-                .bind(Ledger::due_work_probe_sql()).fetch_one(&mut *conn).await?;
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND (query=$1 OR starts_with($2,query)))")
+                .bind(Ledger::due_work_probe_sql()).bind(Ledger::claim_survey_sql()).fetch_one(&mut *conn).await?;
             if waiting { return anyhow::Ok(()); }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -453,11 +461,13 @@ async fn canonical_probe_errors_remain_failures_and_pool_recovers() -> Result<()
         let _spare = db.ledger.pool.acquire().await?;
         let mut blocker = PgConnection::connect(&db.fixture.url).await?;
         sqlx::raw_sql("BEGIN; LOCK qbit_block_candidate_outbox IN ACCESS EXCLUSIVE MODE").execute(&mut blocker).await?;
+        // Restored below to whatever the ledger configured, which CI raises.
+        let configured: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&db.ledger.pool).await?;
         sqlx::raw_sql("SET statement_timeout='100ms'").execute(&db.ledger.pool).await?;
         let error = db.ledger.claim_candidate(60).await.err().context("timeout became idle")?;
         let code = error.downcast_ref::<sqlx::Error>().and_then(|e| e.as_database_error()).and_then(|e| e.code());
         ensure!(code.as_deref() == Some("57014"), "expected query cancellation: {error:#}");
-        sqlx::raw_sql("SET statement_timeout='15s'").execute(&db.ledger.pool).await?;
+        sqlx::query("SELECT set_config('statement_timeout',$1,false)").bind(&configured).execute(&db.ledger.pool).await?;
         let ledger = db.ledger.clone();
         let cancelled = tokio::spawn(async move { ledger.claim_candidate(60).await });
         wait_for_probe_lock(&mut control).await?;
@@ -471,8 +481,8 @@ async fn canonical_probe_errors_remain_failures_and_pool_recovers() -> Result<()
         let ledger = db.ledger.clone();
         let disconnected = tokio::spawn(async move { ledger.claim_candidate(60).await });
         wait_for_probe_lock(&mut control).await?;
-        let killed: bool = sqlx::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query=$1")
-            .bind(Ledger::due_work_probe_sql()).fetch_one(&mut control).await?;
+        let killed: bool = sqlx::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND (query=$1 OR starts_with($2,query))")
+            .bind(Ledger::due_work_probe_sql()).bind(Ledger::claim_survey_sql()).fetch_one(&mut control).await?;
         ensure!(killed);
         ensure!(tokio::time::timeout(Duration::from_secs(10), disconnected).await??.is_err(), "lost connection became idle");
         sqlx::raw_sql("ROLLBACK").execute(&mut blocker).await?;

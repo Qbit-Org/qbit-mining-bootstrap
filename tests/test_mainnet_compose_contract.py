@@ -127,6 +127,19 @@ class MainnetComposeContractTests(unittest.TestCase):
                  if str(p["published"]) != "0"]
         self.assertEqual(len(ports), len(set(ports)))
 
+    def test_block_submission_kill_switch_defaults_on_and_reaches_both_frontends(self) -> None:
+        # #291: production submits; a rehearsal holds every frontend of the pair.
+        self.assertEqual(
+            self._environment("prism-coordinator")["PRISM_BLOCK_SUBMIT_ENABLED"], "1"
+        )
+        held = self.render_ha(PRISM_BLOCK_SUBMIT_ENABLED="0")
+        for name in ("prism-coordinator", "prism-coordinator-2"):
+            with self.subTest(service=name):
+                default = self.ha_config["services"][name]["environment"]
+                self.assertEqual(default["PRISM_BLOCK_SUBMIT_ENABLED"], "1")
+                env = held["services"][name]["environment"]
+                self.assertEqual(env["PRISM_BLOCK_SUBMIT_ENABLED"], "0")
+
     def test_ha_requires_http_health_despite_base_listener_disable(self) -> None:
         for port in ("3341", "25351"):
             config = self.render_ha(PRISM_AUDIT_PORT="0", PRISM_HA_AUDIT_PORT=port)

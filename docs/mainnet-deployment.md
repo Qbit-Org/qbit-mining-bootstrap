@@ -521,6 +521,15 @@ Do not expose a lane until all applicable checks pass:
 - every successful PRISM share survives a coordinator restart exactly once
 - a pending winning candidate resumes safely after a forced process exit
 - walletless fee-bearing CTV fanout construction and broadcast have passed
+- every PRISM frontend runs with `PRISM_BLOCK_SUBMIT_ENABLED` unset or `1`:
+  `check-config` prints no `WARNING: block submission is disabled` line and
+  `qbit_prism_block_submission_enabled` reads 1, so `PrismBlockSubmissionHeld`
+  is not paging. Set to `0`, that rehearsal kill switch keeps every found block
+  from the node; see
+  [prism-ledger-ops.md](prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals)
+- `qbit-prism-server submission-hold show` reports `"held": false`: a
+  cluster-wide hold holds every frontend whatever its own setting says; see
+  [holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664)
 - AuxPoW uses explicit payout addresses and no helper payout wallet
 - backup restore, Postgres failover, disk alerts, and container restart policies
   have been exercised

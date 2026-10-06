@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicUsize},
     Mutex as StdMutex,
 };
-use submit_ledger::CommitGate;
+use submit_ledger::{Appended, CommitGate};
 
 mod admission_races;
 mod authority_lease;
@@ -20,6 +20,7 @@ mod compact_authority;
 mod compact_prepared;
 mod config;
 mod credit;
+mod fence_capture;
 mod interleavings;
 mod observations;
 mod prepared_expiry;
@@ -29,6 +30,7 @@ mod refresh_window;
 mod resume_inputs;
 mod runtime_recovery;
 pub(crate) mod stale_causes;
+pub(crate) mod tip_poll;
 mod work_store;
 
 pub(super) fn hash(byte: u8) -> String {
@@ -66,6 +68,10 @@ pub(crate) struct MemoryLedger {
     pub fail_commit: StdMutex<Option<FailCommit>>,
     /// Appends dropped before they returned, as an aborted task is.
     pub cancelled: AtomicUsize,
+    /// #657: block-bearing appends the revision fence captured instead:
+    /// the deferred share, the credited candidate it carried, and the
+    /// revision the fence read.
+    pub captures: StdMutex<Vec<(AcceptedShare, Candidate, i64)>>,
 }
 
 /// An indeterminate COMMIT failure: the reply was lost, before or after the
@@ -93,18 +99,45 @@ impl MemoryLedger {
         mut share: AcceptedShare,
         candidate: Option<Candidate>,
         revision: i64,
+        moved: crate::ledger::MovedRevision,
         commit: &CommitGate,
-    ) -> Result<bool> {
+    ) -> Result<Appended> {
         let gate = self.append_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        // Model the production atomic append fence, not share decisions.
-        ensure!(
-            revision == self.revision.load(Ordering::SeqCst),
-            "payout revision changed"
-        );
+        // Model the production atomic append fence, not share decisions: a
+        // moved revision refuses a plain share before any write, and a
+        // block-bearing share captures its block instead when capture is on
+        // (#657).
+        let current = self.revision.load(Ordering::SeqCst);
+        if revision != current {
+            let Some(candidate) =
+                candidate.filter(|_| moved == crate::ledger::MovedRevision::Capture)
+            else {
+                return Err(crate::ledger::PayoutRevisionChanged {
+                    expected: revision,
+                    observed: current,
+                }
+                .into());
+            };
+            if !commit.begin_commit() {
+                return Err(crate::ledger::CommitGateClosed.into());
+            }
+            let (failure, lost) = self.commit_in_flight().await;
+            if matches!(failure, Some(FailCommit::NotRecorded)) {
+                return Err(lost.into());
+            }
+            self.captures
+                .lock()
+                .unwrap()
+                .push((share, candidate, current));
+            if matches!(failure, Some(FailCommit::Recorded)) {
+                return Err(lost.into());
+            }
+            return Ok(Appended::Captured);
+        }
         let existing = self
             .records
             .lock()
@@ -120,32 +153,41 @@ impl MemoryLedger {
         // Model the production pre-commit hook: every statement has run.
         if !commit.begin_commit() {
             if existing.is_some() && candidate.is_none() {
-                return Ok(false);
+                return Ok(Appended::Recorded);
             }
             return Err(crate::ledger::CommitGateClosed.into());
         }
-        let gate = self.commit_gate.lock().unwrap().take();
-        if let Some(gate) = gate {
-            gate.entered.notify_one();
-            gate.release.notified().await;
-        }
-        let failure = self.fail_commit.lock().unwrap().take();
-        let lost = || sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into());
+        let (failure, lost) = self.commit_in_flight().await;
         if matches!(failure, Some(FailCommit::NotRecorded)) {
-            return Err(lost().into());
+            return Err(lost.into());
         }
         let mut records = self.records.lock().unwrap();
         if records
             .iter()
             .any(|(old, _, _)| old.share_id == share.share_id)
         {
-            return Ok(false);
+            return Ok(Appended::Recorded);
         }
         records.push((share, candidate, revision));
         if matches!(failure, Some(FailCommit::Recorded)) {
-            return Err(lost().into());
+            return Err(lost.into());
         }
-        Ok(true)
+        Ok(Appended::Inserted)
+    }
+
+    /// COMMIT in flight: hold at `commit_gate` if one is set, then take the
+    /// planned failure of this COMMIT and the error a lost reply surfaces as.
+    async fn commit_in_flight(&self) -> (Option<FailCommit>, sqlx::Error) {
+        let gate = self.commit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let failure = self.fail_commit.lock().unwrap().take();
+        (
+            failure,
+            sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+        )
     }
 }
 
@@ -158,7 +200,10 @@ impl submit_ledger::SubmitLedger for MemoryLedger {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            ensure!(!self.fail_revision.load(Ordering::SeqCst), "unavailable");
+            // A database read's failure, as the real ledger reports it.
+            if self.fail_revision.load(Ordering::SeqCst) {
+                return Err(sqlx::Error::PoolClosed.into());
+            }
             Ok(revision)
         })
     }
@@ -168,10 +213,30 @@ impl submit_ledger::SubmitLedger for MemoryLedger {
         candidate: Option<Candidate>,
         revision: i64,
         gate: Arc<CommitGate>,
-    ) -> BoxFuture<'_, Result<bool>> {
+    ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            crate::ledger::MovedRevision::Refuse,
+            gate,
+        )
+    }
+    fn append_at_revision_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        _proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        moved: crate::ledger::MovedRevision,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
         Box::pin(async move {
             let mut probe = CancelProbe(&self.cancelled, false);
-            let result = self.append_gated(share, candidate, revision, &gate).await;
+            let result = self
+                .append_gated(share, candidate, revision, moved, &gate)
+                .await;
             probe.1 = true;
             result
         })
@@ -189,6 +254,7 @@ impl SharedLog {
     }
 
     pub fn dispatch(&self) -> tracing::Dispatch {
+        Undecided::install();
         tracing::Dispatch::new(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
@@ -218,8 +284,85 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
     }
 }
 
+/// The global default under every [`SharedLog`] (#649). It records nothing,
+/// and answers every callsite `sometimes`, so no thread can cache `never`.
+///
+/// `tracing` caches one interest per callsite for the whole process. While a
+/// single dispatcher is registered, a callsite's first hit asks only the
+/// hitting thread's default. A test without a subscriber that reaches a
+/// callsite first, on its own thread, while one `SharedLog` is live, therefore
+/// caches `never` for it, and that `SharedLog` silently loses the event. With
+/// this default registered there are always two dispatchers, and it is the
+/// default of any thread without its own, so the cache can only hold
+/// `sometimes` or better and each event asks the current dispatcher.
+struct Undecided;
+
+impl Undecided {
+    fn install() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            // Only `main` sets a global default; a test binary never does.
+            let _ = tracing::subscriber::set_global_default(Undecided);
+        });
+    }
+}
+
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    // The live dispatchers' own hints set the global maximum level.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// #649: a callsite first reached on a thread without a subscriber, while
+/// this `SharedLog` is the only one registered, is still captured.
+#[test]
+fn shared_log_captures_a_callsite_first_reached_without_a_subscriber() {
+    fn emit() {
+        tracing::warn!("shared-log #649 probe");
+    }
+    let log = SharedLog::default();
+    let dispatch = log.dispatch();
+    std::thread::spawn(emit)
+        .join()
+        .expect("the probe thread panicked");
+    tracing::dispatcher::with_default(&dispatch, emit);
+    assert!(
+        log.text().contains("shared-log #649 probe"),
+        "the SharedLog lost an event whose callsite was first reached elsewhere:\n{}",
+        log.text()
+    );
+}
+
 pub(crate) struct Node {
     pub tip: String,
+    /// `getmempoolinfo`'s answer, when a case moves the relay floor.
+    pub mempool: Option<Value>,
     pub template: Option<Value>,
     pub parents: HashMap<String, String>,
     pub calls: Vec<String>,
@@ -255,7 +398,11 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
             "getblockchaininfo" => {
                 json!({"chain":"regtest","initialblockdownload":false,"blocks":100,"headers":100,"bestblockhash":node.tip,"chainwork":"01"})
             }
-            "getmempoolinfo" => json!({"minrelaytxfee":0.00001,"mempoolminfee":0.00001}),
+            "estimatesmartfee" => json!({"feerate":0.001,"blocks":2}),
+            "getmempoolinfo" => node
+                .mempool
+                .clone()
+                .unwrap_or_else(|| json!({"minrelaytxfee":0.00001,"mempoolminfee":0.00001})),
             _ => panic!("unexpected node RPC {method}"),
         };
         (result, node.fail.as_deref() == Some(method), gate)
@@ -299,8 +446,26 @@ impl Fixture {
         tune: impl FnOnce(&mut Config),
         statement_timeout: Option<Duration>,
     ) -> Self {
+        Self::build_with_ledger(
+            max_age,
+            tune,
+            statement_timeout,
+            "postgresql://unused@127.0.0.1:1/unused",
+        )
+        .await
+    }
+
+    /// [`Fixture::build`], with the coordinator's own `Ledger` (session
+    /// allocation) connecting to `ledger_url` instead of a refused port.
+    pub async fn build_with_ledger(
+        max_age: Duration,
+        tune: impl FnOnce(&mut Config),
+        statement_timeout: Option<Duration>,
+        ledger_url: &str,
+    ) -> Self {
         let node = Arc::new(StdMutex::new(Node {
             tip: hash(1),
+            mempool: None,
             template: None,
             parents: [(hash(1), hash(0)), (hash(2), hash(1)), (hash(3), hash(2))].into(),
             calls: vec![],
@@ -320,7 +485,7 @@ impl Fixture {
         tune(&mut config);
         let ledger = Arc::new(Ledger::offline_for_tests(
             sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
+                .connect_lazy(ledger_url)
                 .unwrap(),
             "offline-decisions".into(),
         ));
@@ -349,6 +514,7 @@ impl Fixture {
             build_slots: Arc::new(Semaphore::new(1)),
             window_reads: Arc::new(Semaphore::new(1)),
             refresh_lock: Mutex::new(RefreshState::default()),
+            refresh_in_flight: std::sync::Mutex::new(None),
             clocked_flights: clocked_flight::ClockedFlights::default(),
             resume_flights: compact_resume::ResumeFlights::new(1),
             identities: Mutex::new(HashMap::new()),
@@ -358,6 +524,8 @@ impl Fixture {
             offer_reserved_probe: Default::default(),
             build_job_probe: Default::default(),
             offer_sections: Default::default(),
+            landing_trim: Default::default(),
+            submission_hold: Default::default(),
         });
         let fixture = Self {
             coordinator,
@@ -528,6 +696,7 @@ impl Fixture {
             self.store.database_now() + 86_400_000,
             Instant::now(),
             None,
+            Some(crate::ledger::WriterTimeline::new(1)),
         )
         .unwrap();
         let prepared = captured.original;

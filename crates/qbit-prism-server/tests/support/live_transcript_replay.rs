@@ -16,7 +16,8 @@
 //! keeping the recorded shape (five fields, or six with version bits). It is
 //! a share that is not a block unless the session's share difficulty is at
 //! the network's, as a large `mining.suggest_difficulty` makes it on regtest.
-//! Each transcript starts once the server serves the node's tip; a re-solved
+//! Each transcript starts once every block found earlier has settled and the
+//! server serves the node's tip at the cluster's payout revision; a re-solved
 //! submit refused as `stale-job` or `unknown-job` (its job superseded in
 //! flight) is solved again on newer work, up to three times. A
 //! submit the recorded pool refused is sent as recorded. Timestamps order the
@@ -288,20 +289,11 @@ fn superseded(answer: &Value) -> bool {
 }
 
 /// Until the server is ready on the node's current tip, so a transcript
-/// starts on current work: a block a previous transcript landed is built on.
+/// starts on current work: a block a previous transcript found is built on,
+/// and has landed, so a recorded accepted submit cannot meet the revision
+/// fence ([`Fixture::settled`]).
 async fn current(fixture: &Fixture) -> Result<()> {
-    until("server 0 on the node's tip", 30, || async {
-        let tip = fixture.rpc("getbestblockhash", json!([])).await?;
-        let health: Value = fixture
-            .client
-            .get(format!("http://127.0.0.1:{}/healthz", fixture.api[0]))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(health["ok"] == true && health["observed_tip"] == tip)
-    })
-    .await
+    fixture.settled(0, 30).await
 }
 
 async fn replay(fixture: &Fixture, transcript: &Transcript) -> Result<Replayed> {

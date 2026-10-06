@@ -220,20 +220,13 @@ impl Ledger {
             );
         }
         require_live(&mut tx, expires).await?;
-        if let Some(range) = record.window.shares {
-            // Prefix-only pruning preserves both endpoints of a valid captured
-            // range. Also reject an invented last endpoint beyond the ledger;
-            // this is still no substitute for read_window's count/digest checks.
-            ensure!(
-                probe_share_rows(
-                    &mut tx,
-                    range.first_share_seq as i64,
-                    range.last_share_seq as i64
-                )
-                .await?,
-                "prepared share endpoint missing"
-            );
-        }
+        // Prefix-only pruning preserves both endpoints of a valid captured
+        // range. The last row must also be the window's own: an invented last
+        // endpoint beyond the ledger, or one an asynchronous promotion lost
+        // and reissued to another share (#619), is refused before any blob is
+        // written. This is still no substitute for read_window's count and
+        // digest checks.
+        require_window_held(&mut tx, &record.window).await?;
         put_template(&mut tx, template).await?;
         let digest = put_balance_snapshot(&mut tx, balances).await?;
         ensure!(
@@ -305,6 +298,31 @@ impl Ledger {
             .await?;
         // Synchronous handoff retains the same admission; no unowned await.
         Ok(decoded.into_inner().map(|stored| completion.own(stored)))
+    }
+}
+
+/// Refuse a prepared record whose window this primary does not hold whole:
+/// both endpoints must exist, and the last must be the window's own row
+/// ([`probe_window_holding`]). The message keeps the existing "prepared
+/// share endpoint missing" prefix that callers and operators match on.
+pub(super) async fn require_window_held(
+    tx: &mut Transaction<'_, Postgres>,
+    window: &WindowRef,
+) -> Result<()> {
+    let Some(range) = window.shares else {
+        return Ok(());
+    };
+    match probe_window_holding(tx, window).await? {
+        WindowHolding::Held => Ok(()),
+        WindowHolding::PrefixPruned => bail!(
+            "prepared share endpoint missing: first share_seq {} is not on this primary",
+            range.first_share_seq
+        ),
+        WindowHolding::NotHeld => bail!(
+            "prepared share endpoint missing: last share_seq {} is not this window's own row on this primary (absent, or another share credited after anchor {}, as after an asynchronous promotion; #619)",
+            range.last_share_seq,
+            window.anchor_ms
+        ),
     }
 }
 

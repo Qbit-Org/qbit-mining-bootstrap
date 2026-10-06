@@ -309,6 +309,20 @@ tests = ["qbit-prism-load::load_smoke::the_smoke_preset_serves_every_session_eve
 presets = ["pr-smoke"]
 
 [[scenario]]
+id = "r548-ctv-fanout-settlement-under-load"
+title = "#548: CTV fanout settlement in the load harness (#487 S9)"
+owner = "#548"
+lanes = ["pr"]
+criteria = "With --ctv-settlement, a fake-node run whose 400 payable recipients overflow the direct-output cap lands its block with 12 direct recipients and the rest in one fanout chunk, reconciles exactly, and its side report's settlement block counts the direct, fanout and carried recipients from the server's landing rows."
+runs = true
+tests = ["qbit-prism-load::ctv_settlement::a_ctv_run_pays_the_direct_overflow_through_fanout_and_counts_the_split"]
+unit_tests = [
+  "crates/qbit-prism-load/tests/harness.rs::ctv_settlement_sets_mainnets_ctv_keys_and_leaves_the_broadcaster_off",
+  "crates/qbit-prism-load/tests/harness.rs::the_settlement_block_keeps_unmeasured_apart_from_zero",
+]
+notes = "The economic assertions on spent fanout outputs stay with r521-7 on the real node; this adds the settlement path under load only."
+
+[[scenario]]
 id = "r521-7-weighted-recipients-share-to-spend"
 title = "#521 scenario 7: weighted multi-address shares to spent outputs (#487 L1's wallet half)"
 owner = "#521"
@@ -354,7 +368,7 @@ id = "b575-5-postgres-disk-full"
 title = "#575 item 5: PostgreSQL's data volume fills under mining and is freed"
 owner = "#575"
 lanes = ["nightly"]
-criteria = "Every acknowledged share is durable; the full state is refused explicitly and a paging rule's condition holds for its `for` on every server; once space is freed the same server processes accept shares and land a block with clean carry integrity."
+criteria = "Every acknowledged share is durable; the full state is refused explicitly, and PrismDatabaseUnavailable and at least one more rule hold for their `for` on every server (#581); once space is freed the same server processes accept shares and land a block with clean carry integrity."
 runs = true
 tests = ["qbit-prism-server::live_regtest::disk_exhaustion_tests::postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_freed"]
 
@@ -363,7 +377,7 @@ id = "b575-5-wall-clock-jumps"
 title = "#575 item 5: server and database wall clocks jump minutes and hours, including mid-landing"
 owner = "#575"
 lanes = ["nightly"]
-criteria = "Every acknowledged share is credited once with a monotonic ledger clock; every block is offered exactly once, lands once and matches its audit bundle; a server far ahead of the node serves no work and PrismWorkRefreshStalledCritical fires; the one outbox row #581 tracks is the only unfinished one."
+criteria = "Every acknowledged share is credited once with a monotonic ledger clock; every block is offered exactly once, lands once and matches its audit bundle; a server far ahead of the node serves no work and PrismWorkRefreshStalledCritical fires; every outbox row finishes, and neither block held across a database clock step is taken over (#581)."
 runs = true
 tests = ["qbit-prism-server::live_regtest::clock_jump_tests::wall_clock_jumps_keep_windows_claims_and_payouts_and_land_every_block_once"]
 
@@ -518,8 +532,31 @@ title = "#474 C: the node accepted the operation but its reply was lost"
 owner = "#474"
 lanes = ["pr"]
 criteria = "Set by #474: no fabricated rejection, duplicate credit or second payout after the owning frontend is killed."
-runs = false
-reason = "Not built."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_sendrawtransaction_reply_owner_killed_survivor_confirms_the_fanout_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_submitblock_reply_owner_killed_survivor_lands_the_block_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_submitpackage_reply_owner_killed_survivor_confirms_the_cpfp_package_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::share_credited_but_ack_lost_retry_is_deduplicated_exactly",
+]
+notes = "A proxy withholds qbitd's reply to submitblock, sendrawtransaction or submitpackage after the node accepted it; the owning frontend is killed before it journals the outcome and the survivor reconciles. The miner case withholds a durably credited share's acknowledgement and closes the connection; the retry is a duplicate on both frontends."
+
+[[scenario]]
+id = "r619-gap-work-after-async-promotion"
+title = "#619: work prepared in the replication gap is not payout authority after an async promotion"
+owner = "#619"
+lanes = ["pr"]
+criteria = "After a D3 promotion that lost the gap and reissued its share_seq values, a block on a held gap job is refused stale-job before its enqueue (window_not_held, share not credited), a new session is not issued the gap work and the refresh rebuilds under writer_timeline; a fenced switchover with full replay and a job persisted before the cut keep their authority and land."
+runs = true
+tests = [
+  "qbit-prism-server::b619_gap_work_after_promotion::a_block_on_a_job_issued_in_the_gap_is_refused_stale_job_before_its_offer",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_candidate_accepted_before_the_promotion_cannot_be_published_after_it",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_fenced_switchover_with_full_replay_keeps_pre_switch_work_and_lands_its_block",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_job_persisted_before_the_cut_is_resumed_after_an_async_promotion_and_lands",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_refusal_that_finishes_after_the_acknowledgement_deadline_is_still_counted_once",
+  "qbit-prism-server::b619_gap_work_after_promotion::work_prepared_in_the_gap_is_not_issued_to_a_new_session_after_an_async_promotion",
+]
+notes = "Disposable PostgreSQL 16 primary and async standby, one native frontend and the fake node, no qbitd. See docs/prism-async-promotion-gap-blocks.md."
 
 # ---------------------------------------------------------------------------
 # #487's catalogue entries that no lane runs yet, under the sub-issue that
@@ -533,7 +570,7 @@ owner = "#553"
 lanes = ["L4"]
 criteria = "#521 scenario 7's assertions unchanged at 2,000 payees (two fanout chunks per block): attribution, coinbase, CTV outputs and carry-forward balances match an independent PPLNS recomputation, and the fanouts reach the wallets and are spent (decision 7)."
 runs = false
-reason = "Blocked by #604 and #622. In debug the fixture opens about 1,500 worker sessions per frontend one at a time, and at its 1 s reanchor each first job queues behind every connected session's same-tip rebuild, so some worker never gets work (#604). In release every session opens, and a later round's new tip reaches some worker late while the frontends defer job preparation on stale tip polling (#622). The live_regtest case wallets_2000_share_to_spend_starves_first_jobs_until_604_is_fixed reproduces #604 by hand."
+reason = "Blocked by #621 and #622. In debug, since #604, the fixture opens all of its about 1,500 worker sessions per frontend, but at its 1 s reanchor every session always has a job rebuild queued, and a session answers a submit only after that rebuild completes, so some submit gets no reply within the fixture's 30 s (#621). In release every session opens, and a later round's new tip reaches some worker late while the frontends defer job preparation on stale tip polling (#622). The live_regtest case wallets_2000_share_to_spend_waits_on_submit_acks_until_621_is_fixed reproduces #621 by hand."
 
 [[scenario]]
 id = "chain-events-under-load"
@@ -662,113 +699,115 @@ reason = "The presets run nightly or on dispatch; the reduced weekly L3 does not
 id = "fault-sigterm-drain-offer-in-flight"
 title = "SIGTERM of a frontend while a found block's submitblock is in flight"
 owner = "#554"
-lanes = ["nightly", "pr"]
-criteria = "The shutdown logs that it waits for the offer and no budget ALERT, the frontend exits 0 within 35 s, the block reaches the node exactly once, the node's accepted is recorded on the candidate before the process exits (#578, #585), and the frontend serves again after its relaunch."
+lanes = ["nightly", "pr", "weekly"]
+criteria = "The shutdown logs that it waits for the offer and no budget ALERT, the frontend exits 0 within 35 s, the block reaches the node exactly once, the node's accepted is recorded on the candidate before the process exits (#578, #585), and the frontend serves again after its relaunch; within 60 s of that the relaunch lands the block and every frontend serves work at the payout revision the landing committed, before the next fault starts (#686)."
 runs = true
 tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
-presets = ["faults-pr-smoke", "faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-pr-smoke", "faults-short-real-node"]
 notes = "Per PR on the fake node with one frontend; nightly on the real node with two frontends and 500 sessions."
 
 [[scenario]]
 id = "fault-settlement-lock-holder"
 title = "A long SETTLEMENT_LOCK holder while the sessions keep mining, with a tip minted during the hold"
 owner = "#554"
-lanes = ["nightly", "pr"]
+lanes = ["nightly", "pr", "weekly"]
 criteria = "No share waits on the holder (answer p99 over the whole hold within --ack-p99-limit-ms); shares on retained work are accepted (at least 90%) until the refresh has been stalled for PRISM_SUBMIT_TIP_MAX_AGE_SECONDS, after which the server's refusals are counted; no session gets work on the new tip before the release, and every session has it within 10 s of the release. The share-ACK p50, p99 and max over the hold are recorded."
 runs = true
 tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
-presets = ["faults-pr-smoke", "faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-pr-smoke", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-slow-database"
 title = "The frontends' database path delayed by the proxy under load"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "The delay is shown on the frontends' URL (SELECT 1 at least twice the one-way delay); every answer stays truthful (no loss, no divergence); no frontend exits; the second half of the recovery window offers the full rate with ACK p99 within max(--ack-p99-limit-ms, twice the baseline's)."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-connection-exhaustion"
 title = "PostgreSQL at max_connections with the frontends' idle backends terminated"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "PostgreSQL refuses a connection for want of a slot (53300) and at least one frontend backend is terminated into the full server; no loss and no divergence; no frontend exits; full rate and normal ACK p99 in the second half of the recovery window. The frontends' pool-acquire outcomes are recorded."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-frontend-sigkill-holding-a-block"
 title = "SIGKILL of the frontend holding a found block the node has accepted, before its answer is recorded"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "The node accepted the block and the frontend is killed inside its 1 s submitblock deadline; its in-flight shares are censused and re-offered and credited once; the block reached the node exactly once and lands without a second offer. The time until it lands is reported, not gated: the dead holder's claim waits for the 120 s candidate lease, which is #529's option-A gap that #585 left open."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-rolling-restart"
 title = "SIGTERM and relaunch of each frontend in turn, its sessions moved to the one serving"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "Each frontend exits 0 within 35 s, every moved session has work on the serving frontend within 30 s, no committed share goes unanswered, and the full rate returns after the rebalance."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-reconnect-storm-under-load"
 title = "Half the sessions drop abruptly and return within 5 s, on the real node"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "Every stormed session has work again within 10 s of its return; the abandoned submits are the storm's, never a divergence; full rate afterwards."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 notes = "The fake-node rental-churn shapes (load-rental-churn) run nightly beside it."
 
 [[scenario]]
 id = "read-tier-independence"
 title = "The public API and every /metrics scraped at a realistic rate throughout the faults"
 owner = "#554"
-lanes = ["nightly"]
+lanes = ["nightly", "weekly"]
 criteria = "A separate public-api process on the standby, polled at 5 requests a second, answers at least 99% 2xx with p99 at most 1 s over each fault and the whole phase (excluding a PostgreSQL at max_connections only when the public API reads the primary, whose slots that takes); every live frontend's /metrics answers within 1 s (#189's class, #469)."
 runs = true
-presets = ["faults-short-real-node"]
+presets = ["faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-primary-kill-under-load"
-title = "PostgreSQL primary killed under mining load with async promotion (#474 B and #521 scenario 3 at load)"
+title = "PostgreSQL primary lost under mining load with async promotion, and the fenced switch (#474 B and #521 scenario 3 at load)"
 owner = "#554"
-lanes = ["L4"]
-criteria = "Under D3: every acknowledged share missing on the promoted primary is listed by id and lies after the standby's last flushed position; none before the replication cut; frontends serve on the new primary within 30 s without a restart. A fenced switch loses nothing."
-runs = false
-reason = "#554's second PR, weekly, on #588's schedule."
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "Under D3 (primary-kill): a barrier shows the standby flushed the primary's position, replication is cut and the primary keeps acknowledging, then it is stopped immediately and the standby promoted; every acknowledged share missing on the promoted primary is listed by id, none was acknowledged before the barrier, each is absent from what the standby had received (promotion kept all of that), and the cut left WAL the standby never received; every frontend accepts a share on the new primary within 30 s of the promotion without a restart; a new standby streams afterwards. The fenced switch (primary-switch: writers fenced, the standby replayed through the old primary's flush position) loses nothing."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
+notes = "Every writer reaches the primary through a writer endpoint the fault moves after the promotion; the proven gap losses are excused from the run's durability finding, any other loss is not."
 
 [[scenario]]
 id = "fault-block-mid-landing-failover-under-load"
 title = "A found block mid-landing across an async failover, under load"
 owner = "#554"
-lanes = ["L4"]
-criteria = "The block lands exactly once within 30 s of the promotion with outcome unknown or accepted (#585); with the #529 standby wait on, its row survives a replication cut at submitblock; gap-lost candidates are counted and reconciled against the chain."
-runs = false
-reason = "#554's second PR, weekly, on #588's schedule."
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "The block's submitblock is held at the relay while replication is cut and the primary stopped, then let through; with #529's standby wait on, its reservation is on the promoted primary; it reaches the node exactly once and lands within 30 s of the promotion with outcome unknown or accepted (#585); blocks forwarded around the failover whose rows the gap took are counted with the node's answer."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "fault-wal-disk-full-under-load"
-title = "The WAL volume fills under load, then space is freed and PostgreSQL restarts"
+title = "The WAL volume fills under load, then space is freed and PostgreSQL returns"
 owner = "#554"
-lanes = ["L4"]
-criteria = "No acknowledged share lost and none acknowledged while PostgreSQL is down; the frontends reconnect without a restart; #575's alert condition shows in /metrics."
-runs = false
-reason = "#554's second PR, weekly, on #575's DiskFullInjector."
+lanes = ["dispatch", "weekly"]
+criteria = "PostgreSQL PANICs on the full WAL volume (#575's DiskFullInjector), which is filled again for the hold whenever its crash recovery finds room; no acknowledged share is lost and none is acknowledged inside the intervals PostgreSQL's own log shows it down; every frontend accepts shares again within 30 s without a restart; every frontend's /metrics shows #575's paging condition (qbit_prism_collector_available{collector=\"database\"} == 0) during the outage; a PostgreSQL that cannot be brought back ends the run with its log."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node"]
+notes = "Needs fuse2fs, fuse3 and /dev/fuse on the runner; the primary's pg_wal is on the volume for the whole run."
 
 [[scenario]]
 id = "fault-restart-with-candidate-backlog"
 title = "Both frontends restarted over a pending candidate backlog (#187's class)"
 owner = "#554"
-lanes = ["L4"]
-criteria = "Every backlog row reaches a terminal state, none is offered twice, and the count before equals the count settled after."
-runs = false
-reason = "#554's second PR, weekly."
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "While the node answers submitblock with its warmup error (#526), found blocks build a backlog of unfinished candidates; every frontend exits 0 within 35 s and is relaunched; once the node heals, every backlog row reaches a terminal state (a lost race is orphaned once the fault mints the winner's confirmations), none reaches the node twice, one lands through a single offer, and every row counted before the restart is there after it."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
 
 [[scenario]]
 id = "soak-weekly-one-lifetime"
@@ -827,7 +866,22 @@ tests = [
   "qbit-prism-server::migration_rollback::cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance",
   "qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation",
 ]
-notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/32 of the rows (1/16 once #582 is fixed) on a real regtest chain, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
+notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/16 of the rows (about 4.1M) on a real regtest chain, at the server's default statement timeout, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
+
+[[scenario]]
+id = "external-target-load-through-a-balancer"
+title = "#291: the load harness's client driving frontends it did not launch, through a TCP balancer"
+owner = "#291"
+lanes = ["pr"]
+criteria = "Two external-target client processes drive two in-repo frontends through a round-robin TCP balancer, one asking for its own share difficulty with d=, and each mines at the difficulty the frontend advertised. A frontend SIGKILLed and relaunched mid-run costs reconnects, not acknowledgements: every disconnected session reconnects, no share is refused as mined wrong, every acknowledged share id is committed, every committed id was acknowledged or went unanswered, and the two processes' stats merge into their sums."
+runs = true
+tests = ["qbit-prism-load::external_frontend::external_load_through_a_balancer_reaches_the_in_repo_frontends_and_reconciles"]
+unit_tests = [
+  "crates/qbit-prism-load/tests/external_target.rs::a_run_mines_the_advertised_difficulty_and_counts_what_the_target_did",
+  "crates/qbit-prism-load/tests/external_target.rs::documents_from_two_processes_merge_into_their_sum",
+  "crates/qbit-prism-load/tests/external_target.rs::without_the_guard_flag_nothing_is_sent",
+]
+notes = "The fixture for #291's failover drill, load-balancer exercise and soak, which run `qbit-prism-load external` against the deployed pair behind the operator's balancer; those runs, and their reconciliation against the promoted primary, stay #291's."
 
 [[scenario]]
 id = "shipped-image-lane"

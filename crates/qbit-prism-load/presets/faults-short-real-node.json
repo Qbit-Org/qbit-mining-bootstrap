@@ -1,7 +1,7 @@
 {
   "schema": "qbit.prism.load-preset.v1",
   "name": "faults-short-real-node",
-  "description": "The nightly fault set under load (#554, #487 S16 and L4's short set): a managed regtest qbitd pair ramped to the fake node's difficulty, two frontends with an async standby, 500 sessions at 50 shares/s over a 20k window, then a faults phase that injects, one at a time with a 10 s baseline and a 20 s recovery window: a 20 ms one-way database delay and a PostgreSQL at max_connections (30 s each), a 30 s SETTLEMENT_LOCK holder with a tip minted halfway, SIGKILL of the frontend holding a found block the node accepted, SIGTERM of a frontend with a found block's offer in flight, a rolling restart of both frontends and a 50% reconnect storm, while the public API and every /metrics are scraped. Each fault is held to its #554 pass criteria.",
+  "description": "The nightly fault set under load (#554, #487 S16 and L4's short set): a managed regtest qbitd pair ramped to the fake node's difficulty, two frontends with an async standby, 500 sessions at 50 shares/s over a 20k window, then a faults phase that injects, one at a time with a 10 s baseline and a 20 s recovery window: a 20 ms one-way database delay and a PostgreSQL at max_connections (30 s each), a 30 s SETTLEMENT_LOCK holder with a tip minted halfway, SIGKILL of the frontend holding a found block the node accepted, SIGTERM of a frontend with a found block's offer in flight, a rolling restart of both frontends, a 50% reconnect storm, both frontends restarted over a backlog of four found blocks the node refused while warming up, the primary lost after a 3 s replication cut with the async standby promoted, the fenced planned switch, and a found block's submitblock held across a failover, while the public API and every /metrics are scraped. Each fault is held to its #554 pass criteria.",
   "issues": [
     "#554",
     "#487"
@@ -35,10 +35,11 @@
     "--churn-rate": 50,
     "--churn-seconds": 0,
     "--churn-tips": 0,
+    "--ctv-settlement": false,
     "--database-url": null,
     "--db-max-connections": 16,
     "--external-tips": 2,
-    "--faults": "slow-database,pool-exhaustion,settlement-lock,frontend-sigkill,sigterm-drain,rolling-restart,reconnect-storm;baseline=10;hold=30;recovery=20;storm=0.5;lease-wait=180",
+    "--faults": "slow-database,pool-exhaustion,settlement-lock,frontend-sigkill,sigterm-drain,rolling-restart,reconnect-storm,candidate-backlog,primary-kill,primary-switch,block-failover;baseline=10;hold=30;recovery=20;storm=0.5;lease-wait=180;cut=3;backlog=4",
     "--forecast-peak-shares-per-second": 2000,
     "--frontends": 2,
     "--lock-sample-interval-ms": 10,

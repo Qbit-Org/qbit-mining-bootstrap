@@ -3,7 +3,7 @@ use crate::{
     coordinator::{Coordinator, RecoveryStop},
     ledger::{
         audit_completeness, live_instances, unavailable_live_instances, AuditCompleteness,
-        LiveInstancesReport, RecoveryClaim, RecoveryReader, RecoveryRow,
+        LiveInstancesReport, RecoveryClaim, RecoveryReader, RecoveryRow, RecoveryTakeover,
     },
     rpc::{Rpc, RpcReplyError},
 };
@@ -62,6 +62,11 @@ enum Command {
     FatalState {
         #[command(subcommand)]
         command: FatalStateCommand,
+    },
+    /// Hold block submission for every frontend of the cluster, clear the hold, or show it.
+    SubmissionHold {
+        #[command(subcommand)]
+        command: SubmissionHoldCommand,
     },
     /// Seal, archive, verify, detach, drop and restore share ledger partitions.
     ShareArchive {
@@ -215,6 +220,28 @@ enum FatalStateCommand {
     },
 }
 
+/// #664: the cluster-wide block submission hold, stored in the ledger.
+#[derive(Subcommand)]
+enum SubmissionHoldCommand {
+    /// Print the hold as JSON. Needs only PRISM_DATABASE_URL and opens it read-only.
+    Show,
+    /// Hold submission: no frontend claims a candidate, offers a block or sends a fanout.
+    Set {
+        /// Why submission is held, kept with the hold and journaled (1 to 4096 bytes).
+        #[arg(long)]
+        reason: String,
+    },
+    /// Clear the hold. Refused while a candidate is pending, unless told to offer them.
+    Clear {
+        /// Why the hold is cleared, journaled (1 to 4096 bytes).
+        #[arg(long)]
+        reason: String,
+        /// Let frontends with submission enabled offer the pending candidates the hold kept back.
+        #[arg(long)]
+        offer_pending_candidates: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum CandidatesCommand {
     /// Print unfinished candidates up to --limit, oldest due first; warn if truncated.
@@ -231,6 +258,11 @@ enum CandidatesCommand {
         block_hash: String,
         #[arg(long)]
         reason: String,
+        /// Abandon a claimed row once the database clock passes its claim_expires_at, instead of
+        /// after watching the claim go unrenewed for its whole lease. UNSAFE during or after a
+        /// database clock step: a forward step abandons a row its live holder is landing (#581).
+        #[arg(long)]
+        unsafe_database_clock_expiry: bool,
     },
     /// Land already-accepted blocks for an explicit allowlist of candidates, never offering one.
     Recover {
@@ -243,6 +275,11 @@ enum CandidatesCommand {
         /// One deadline, in seconds, for the whole operation: the plan, every node call and each landing.
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
+        /// Take over another holder's claim once the database clock passes its claim_expires_at,
+        /// instead of after watching it go unrenewed for its whole lease. UNSAFE during or after a
+        /// database clock step: a forward step takes a live holder's row (#581).
+        #[arg(long)]
+        unsafe_database_clock_expiry: bool,
     },
 }
 
@@ -298,22 +335,45 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             config.ensure_pool_fee_settles_dust()?;
             crate::rollups::settings_from_env()?;
             crate::partitions::settings_from_env()?;
+            crate::memory::landing_trim_from_env()?;
             crate::stratum::StratumConfig::from_env()?.highdiff_config()?;
             crate::api::ApiConfig::from_env()?;
             crate::api::public_service::ServiceConfig::from_env()?;
+            // #291: the kill switch leads the report, where a rehearsal
+            // cannot miss it.
+            let submission = config.block_submission();
+            if let Some(warning) = submission.warning {
+                println!("WARNING: {warning}");
+            }
+            if submission.ctv_broadcaster == config::CtvBroadcaster::Held {
+                println!("WARNING: {}", config::CTV_BROADCASTER_HELD);
+            }
             println!(
                 "PRISM configuration valid; {} runtime workers",
                 config.runtime_workers
             );
-            match &config.offer_standby {
-                Some(wait) => println!(
-                    "found-block offers wait up to {} ms for standby {}; self-check verifies the \
-                     role can read its position (pg_monitor)",
-                    wait.bound.as_millis(),
-                    wait.application_name
-                ),
-                None => println!("found-block offers do not wait for a failover standby"),
+            // A held frontend makes no found-block offer, so nothing waits.
+            if submission.enabled {
+                println!(
+                    "PRISM_BLOCK_SUBMIT_ENABLED is on: found blocks are offered to the node's \
+                     submitblock"
+                );
+                match &config.offer_standby {
+                    Some(wait) => println!(
+                        "found-block offers wait up to {} ms for standby {}; self-check verifies \
+                         the role can read its position (pg_monitor)",
+                        wait.bound.as_millis(),
+                        wait.application_name
+                    ),
+                    None => println!("found-block offers do not wait for a failover standby"),
+                }
             }
+            // #664: the hold lives in the database, which this check never reads.
+            println!(
+                "a cluster-wide block submission hold in the database overrides \
+                 PRISM_BLOCK_SUBMIT_ENABLED; `qbit-prism-server submission-hold show` and \
+                 self-check report it"
+            );
             Ok(())
         }
         Command::CheckPublicDatabaseConfig => {
@@ -337,6 +397,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         }
         Command::SigningTransition { confirm } => signing_transition(confirm).await,
         Command::FatalState { command } => fatal_state(command).await,
+        Command::SubmissionHold { command } => submission_hold(command).await,
         Command::ShareArchive { command } => share_archive(command).await,
         Command::Candidates { command } => candidates(command).await,
         Command::HeaderDifficulty { bits } => {
@@ -411,8 +472,11 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             Ok(())
         }
         Command::BroadcastCtv => {
+            let config = Config::from_env()?;
+            // #291: refused before the node or the database is reached.
+            config.require_block_submission("broadcast-ctv refuses to run")?;
             let coordinator = Coordinator::new_tool(
-                Config::from_env()?,
+                config,
                 std::sync::Arc::new(crate::metrics::Metrics::default()),
             )
             .await?;
@@ -493,10 +557,7 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             Ok(())
         }
         FatalStateCommand::Clear { reason } => {
-            ensure!(
-                !reason.trim().is_empty() && reason.len() <= 4096,
-                "--reason must contain 1 to 4096 bytes of nonblank text"
-            );
+            crate::ledger::require_operator_reason(&reason)?;
             let config = Config::from_env()?;
             let ledger =
                 crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
@@ -504,6 +565,68 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             ledger.pool.close().await;
             println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
+        }
+    }
+}
+
+/// #664: every subcommand reads only the database URL, so a frontend-only
+/// setting left invalid cannot stop an operator holding or releasing the
+/// cluster. `show` opens it read-only and also reads a ledger from before
+/// migration 023. `set` and `clear` check their reason before any connection
+/// is opened, as `fatal-state clear` does, then take the operator connection,
+/// which works on a halted cluster and writes no heartbeat; both print the
+/// hold that results as JSON.
+async fn submission_hold(command: SubmissionHoldCommand) -> Result<()> {
+    let printed = |held: bool, fields: Value| -> Result<()> {
+        let mut document = json!({"schema": "qbit.prism.submission-hold.v1", "held": held});
+        if let (Some(document), Value::Object(fields)) = (document.as_object_mut(), fields) {
+            document.extend(fields);
+        }
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        Ok(())
+    };
+    match command {
+        SubmissionHoldCommand::Show => {
+            let url =
+                config::optional("PRISM_DATABASE_URL").context("PRISM_DATABASE_URL is required")?;
+            let state = crate::ledger::Ledger::inspect_submission_hold(&url).await?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+            Ok(())
+        }
+        SubmissionHoldCommand::Set { reason } => {
+            crate::ledger::require_operator_reason(&reason)?;
+            let url = config::DatabaseConfig::url_from_env()?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+            let result = ledger.set_submission_hold(&reason).await;
+            ledger.pool.close().await;
+            let (hold, newly_set) = result?;
+            if !newly_set {
+                eprintln!("the cluster already held block submission; its hold is unchanged");
+            }
+            printed(
+                true,
+                json!({"newly_set": newly_set, "reason": hold.reason, "set_at": hold.set_at, "set_by": hold.set_by}),
+            )
+        }
+        SubmissionHoldCommand::Clear {
+            reason,
+            offer_pending_candidates,
+        } => {
+            crate::ledger::require_operator_reason(&reason)?;
+            let url = config::DatabaseConfig::url_from_env()?;
+            let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+            let result = ledger
+                .clear_submission_hold(&reason, offer_pending_candidates)
+                .await;
+            ledger.pool.close().await;
+            let cleared = result?;
+            if cleared.cleared.is_none() {
+                eprintln!("the cluster held no block submission; nothing was changed");
+            }
+            printed(
+                false,
+                json!({"cleared": cleared.cleared, "pending_candidates": cleared.pending_candidates}),
+            )
         }
     }
 }
@@ -587,16 +710,17 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
             }
             Ok(())
         }
-        CandidatesCommand::Abandon { block_hash, reason } => {
+        CandidatesCommand::Abandon {
+            block_hash,
+            reason,
+            unsafe_database_clock_expiry,
+        } => {
             // Both inputs are checked before any connection is opened, in the
             // formats the row itself uses: `candidate_sha256 ~
             // '^[0-9a-f]{64}$'` for the hash, and `fatal-state clear`'s rule
             // for the reason, which lands in `last_error`.
             require_block_hash(&block_hash)?;
-            ensure!(
-                !reason.trim().is_empty() && reason.len() <= 4096,
-                "--reason must contain 1 to 4096 bytes of nonblank text"
-            );
+            crate::ledger::require_operator_reason(&reason)?;
             // A one-shot writer of ordinary ledger rows, not a recovery
             // command: `connect_tool` refuses a halted cluster at connect
             // exactly as a frontend would, and writes no heartbeat, so a
@@ -610,7 +734,25 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
                 None,
             )
             .await?;
-            let outcome = ledger.abandon_candidate(&block_hash, &reason).await;
+            let takeover = takeover_rule(unsafe_database_clock_expiry);
+            // #581: a claim is over once this command has watched it go
+            // unrenewed for its whole lease. It waits that out, once per
+            // version; a claim that changes meanwhile is live, and its
+            // refusal is the answer.
+            let mut waited_for: Option<String> = None;
+            let outcome = loop {
+                let outcome = ledger
+                    .abandon_candidate(&block_hash, &reason, takeover)
+                    .await;
+                let Ok(refused) = &outcome else {
+                    break outcome;
+                };
+                let Some(left) = observed_claim_wait(refused, &block_hash, &mut waited_for, None)
+                else {
+                    break outcome;
+                };
+                tokio::time::sleep(left).await;
+            };
             // Closed before the outcome is inspected, so a refusal releases
             // the pool exactly as a success does.
             ledger.pool.close().await;
@@ -626,8 +768,56 @@ async fn candidates(command: CandidatesCommand) -> Result<()> {
             block_hash,
             apply,
             timeout_seconds,
-        } => recover(block_hash, apply, timeout_seconds).await,
+            unsafe_database_clock_expiry,
+        } => {
+            let takeover = takeover_rule(unsafe_database_clock_expiry);
+            recover(block_hash, apply, timeout_seconds, takeover).await
+        }
     }
+}
+
+/// The takeover rule the two candidate commands that take a claimed row
+/// share (#581): an observed lease unless the operator names the unsafe one.
+fn takeover_rule(unsafe_database_clock_expiry: bool) -> RecoveryTakeover {
+    if unsafe_database_clock_expiry {
+        RecoveryTakeover::DatabaseClock
+    } else {
+        RecoveryTakeover::Observed
+    }
+}
+
+/// How long a candidate command waits before it retries a refusal of a claim
+/// it times on its own clock (#581), or `None` when the refusal is the
+/// answer: no timed claim, a claim whose version changed while the command
+/// waited (the holder renewed, or a frontend took the row over, so it is
+/// live), or a wait `deadline` leaves no room for. Announces the first wait.
+fn observed_claim_wait(
+    outcome: &Value,
+    hash: &str,
+    waited_for: &mut Option<String>,
+    deadline: Option<tokio::time::Instant>,
+) -> Option<Duration> {
+    let (Some(left), Some(version)) = (
+        outcome["lease_remaining_ms"].as_u64(),
+        outcome["claim_version"].as_str(),
+    ) else {
+        return None;
+    };
+    let left = Duration::from_millis(left);
+    let renewed = waited_for.as_deref().is_some_and(|seen| seen != version);
+    let no_room = deadline.is_some_and(|deadline| tokio::time::Instant::now() + left >= deadline);
+    if renewed || no_room {
+        return None;
+    }
+    if waited_for.is_none() {
+        println!(
+            "candidate {hash} is claimed by {}; waiting {:.0} s for the claim to go unrenewed for its whole lease",
+            outcome["claim_instance_id"].as_str().unwrap_or("unknown"),
+            left.as_secs_f64().ceil()
+        );
+    }
+    *waited_for = Some(version.to_owned());
+    Some(left)
 }
 
 /// Print a candidate command's diagnostic and exit with its status.
@@ -647,7 +837,12 @@ fn refuse(code: i32, message: String) -> ! {
 /// connects as a one-shot tool, exactly as `self-check` and `broadcast-ctv`
 /// do, and drives the coordinator's own landing for each planned block in
 /// height order, stopping at the first that cannot be finished.
-async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Result<()> {
+async fn recover(
+    hashes: Vec<String>,
+    apply: bool,
+    timeout_seconds: u64,
+    takeover: RecoveryTakeover,
+) -> Result<()> {
     ensure!(
         hashes.len() <= MAX_RECOVERY_BLOCKS,
         "--block-hash may be given at most {MAX_RECOVERY_BLOCKS} times; recover takes an explicit allowlist, never everything"
@@ -711,6 +906,8 @@ async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Resu
     // a frontend's startup (node genesis and chain, schema, halt guard,
     // cluster fingerprint), no heartbeat, nothing left behind on exit.
     let config = Config::from_env()?;
+    // It lands blocks as `run` does, so it trims after them as `run` does.
+    let landing_trim = crate::memory::landing_trim_from_env()?;
     let connected = tokio::time::timeout_at(
         deadline,
         Coordinator::new_tool(
@@ -728,7 +925,15 @@ async fn recover(hashes: Vec<String>, apply: bool, timeout_seconds: u64) -> Resu
             ),
         ),
     };
-    let outcome = apply_recovery(&coordinator, &plan.blocks, deadline, timeout_seconds).await;
+    coordinator.landing_trim.set_enabled(landing_trim);
+    let outcome = apply_recovery(
+        &coordinator,
+        &plan.blocks,
+        deadline,
+        timeout_seconds,
+        takeover,
+    )
+    .await;
     // A landing the deadline cut short may hold its connection until the
     // server abandons it, so the close is bounded as well.
     let _ = tokio::time::timeout(Duration::from_secs(5), coordinator.ledger.pool.close()).await;
@@ -1046,6 +1251,7 @@ async fn apply_recovery(
     blocks: &[PlannedBlock],
     deadline: tokio::time::Instant,
     timeout_seconds: u64,
+    takeover: RecoveryTakeover,
 ) -> Result<(usize, usize), Stop> {
     let (mut recovered, mut verified) = (0, 0);
     for block in blocks {
@@ -1097,9 +1303,7 @@ async fn apply_recovery(
             "recovering {} at height {} from {}",
             block.hash, block.height, block.state
         );
-        let claimed = coordinator
-            .claim_candidate_for_recovery(&block.hash, deadline)
-            .await;
+        let claimed = claim_for_recovery(coordinator, &block.hash, deadline, takeover).await;
         let claim = match claimed {
             Err(error) if matches!(error.downcast_ref::<RecoveryStop>(), Some(RecoveryStop::Deadline)) => {
                 return Err(Stop::Exit(
@@ -1124,6 +1328,32 @@ async fn apply_recovery(
         recovered += 1;
     }
     Ok((recovered, verified))
+}
+
+/// Claim one row for recovery. Another holder's claim is taken over, by
+/// default, only after this process has watched it go unrenewed for its
+/// whole lease (#581): a `claimed` refusal that names the time left is
+/// waited out, once, when the deadline leaves room for it, and a holder that
+/// renews meanwhile is live, so its refusal is the answer.
+async fn claim_for_recovery(
+    coordinator: &Coordinator,
+    hash: &str,
+    deadline: tokio::time::Instant,
+    takeover: RecoveryTakeover,
+) -> Result<RecoveryClaim> {
+    let mut waited_for: Option<String> = None;
+    loop {
+        let claimed = coordinator
+            .claim_candidate_for_recovery(hash, deadline, takeover)
+            .await?;
+        let RecoveryClaim::Refused(outcome) = &claimed else {
+            return Ok(claimed);
+        };
+        let Some(left) = observed_claim_wait(outcome, hash, &mut waited_for, Some(deadline)) else {
+            return Ok(claimed);
+        };
+        tokio::time::sleep(left).await;
+    }
 }
 
 /// The exit status of a recovery that stopped after its claim. A typed stop
@@ -1168,11 +1398,20 @@ fn recover_refusal(outcome: &Value, hash: &str) -> Result<(i32, String)> {
         ),
         "claimed" => (
             5,
-            format!(
-                "candidate {hash} is held by {} until {}; retry after the claim expires",
-                field("claim_instance_id"),
-                field("claim_expires_at")
-            ),
+            match outcome["lease_remaining_ms"].as_u64() {
+                // #581: timed by this command, not the database clock.
+                Some(left) => format!(
+                    "candidate {hash} is held by {}, whose claim this command must watch go unrenewed for {} more seconds of its lease (database clock estimate: until {}); the deadline leaves no room for that, or the holder renewed while this command waited and is live. Retry with a longer --timeout-seconds, or once the holder has released it",
+                    field("claim_instance_id"),
+                    left.div_ceil(1000),
+                    field("claim_expires_at")
+                ),
+                None => format!(
+                    "candidate {hash} is held by {} until {}; retry after the claim expires",
+                    field("claim_instance_id"),
+                    field("claim_expires_at")
+                ),
+            },
         ),
         "unsupported_storage_version" => (
             7,
@@ -1245,11 +1484,21 @@ fn abandon_report(outcome: &Value, block_hash: &str, reason: &str) -> Result<(i3
         ),
         "claimed" => (
             5,
-            format!(
-                "candidate {block_hash} is held by {} until {}; retry after the claim expires",
-                field("claim_instance_id"),
-                field("claim_expires_at")
-            ),
+            if outcome["lease_remaining_ms"].is_u64() {
+                // #581: timed by this command, which waited and saw the
+                // claim change, not by the database clock.
+                format!(
+                    "candidate {block_hash} is held by {}, whose claim changed while this command watched it (the holder renewed it, or a frontend took the row over), so it is live (database clock estimate: until {}); retry once the holder has released it",
+                    field("claim_instance_id"),
+                    field("claim_expires_at")
+                )
+            } else {
+                format!(
+                    "candidate {block_hash} is held by {} until {}; retry after the claim expires",
+                    field("claim_instance_id"),
+                    field("claim_expires_at")
+                )
+            },
         ),
         "landed" => (
             6,
@@ -1480,6 +1729,16 @@ struct SelfCheckReport {
     schema: &'static str,
     ok: bool,
     instance_id: Option<String>,
+    /// #291: `PRISM_BLOCK_SUBMIT_ENABLED` as this environment sets it, or
+    /// `null` when the configuration could not be read. Each live frontend's
+    /// own value is `block_submission_enabled` in its heartbeat below.
+    block_submission: Option<config::BlockSubmission>,
+    /// #664: the cluster's block submission hold, as `submission-hold show`
+    /// prints it, or `null` when the database could not be read. A set hold
+    /// holds every frontend, whatever its own setting above says; each live
+    /// frontend's heartbeat carries the hold as it last read it in
+    /// `block_submission_hold`.
+    submission_hold: Option<Value>,
     health: Option<Value>,
     carry_forward_integrity: Option<Value>,
     durability: Option<Vec<(String, String)>>,
@@ -1495,6 +1754,8 @@ async fn self_check() -> Result<()> {
         schema: "qbit.prism.self-check.v2",
         ok: false,
         instance_id: None,
+        block_submission: None,
+        submission_hold: None,
         health: None,
         carry_forward_integrity: None,
         durability: None,
@@ -1511,14 +1772,30 @@ async fn self_check() -> Result<()> {
         let freshness =
             crate::api::health_stale_after(crate::api::health_refresh_interval_from_env()?);
         report.instance_id = Some(config.instance_id.clone());
+        let submission = config.block_submission();
+        if let Some(warning) = submission.warning {
+            eprintln!("WARNING: {warning}");
+        }
+        report.block_submission = Some(submission);
         // Both samples are read-only and independent of the local startup
         // below: a node startup or refresh failure must hide neither the
         // cluster's heartbeats nor an unfinished historical import.
-        let (instances, completeness) = tokio::join!(
+        let (instances, completeness, hold) = tokio::join!(
             live_instances(&config.database_url, freshness),
             sample_audit_completeness(&config.database_url),
+            sample_submission_hold(&config.database_url),
         );
         report.live_instances = instances;
+        if let Some(hold) = hold.as_ref().filter(|hold| hold["held"] == true) {
+            eprintln!(
+                "WARNING: the cluster holds block submission, set by {} at {}: {}; no frontend \
+                 offers a block or sends a fanout until `qbit-prism-server submission-hold clear`",
+                hold["set_by"].as_str().unwrap_or("unknown"),
+                hold["set_at"].as_str().unwrap_or("unknown"),
+                hold["reason"].as_str().unwrap_or("unknown")
+            );
+        }
+        report.submission_hold = hold;
         report.audit_completeness = completeness.as_ref().ok().copied();
         if let Some(completeness) = &report.audit_completeness {
             if config::production_mode()? {
@@ -1543,6 +1820,18 @@ async fn self_check() -> Result<()> {
     report.ok = result.is_ok();
     println!("{}", serde_json::to_string_pretty(&report)?);
     result
+}
+
+/// #664: the cluster's block submission hold, read-only and bounded like the
+/// other samples; `None` when it could not be read.
+async fn sample_submission_hold(database_url: &str) -> Option<Value> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::ledger::Ledger::inspect_submission_hold(database_url),
+    )
+    .await
+    .ok()?
+    .ok()
 }
 
 async fn sample_audit_completeness(database_url: &str) -> Result<AuditCompleteness> {
@@ -1769,6 +2058,84 @@ mod configuration_tests {
     /// The recover allowlist and deadline are checked where clap parses them
     /// and, for the bounds clap cannot express, at the top of `recover`.
     #[test]
+    fn abandon_waits_out_an_observed_lease_unless_named_unsafe() {
+        let hash = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "prism",
+                "candidates",
+                "abandon",
+                "--block-hash",
+                &hash,
+                "--reason",
+                "superseded",
+            ];
+            args.extend_from_slice(extra);
+            let Some(Command::Candidates {
+                command:
+                    CandidatesCommand::Abandon {
+                        unsafe_database_clock_expiry,
+                        ..
+                    },
+            }) = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("wrong command");
+            };
+            takeover_rule(unsafe_database_clock_expiry)
+        };
+        assert_eq!(parse(&[]), RecoveryTakeover::Observed, "#581's default");
+        assert_eq!(
+            parse(&["--unsafe-database-clock-expiry"]),
+            RecoveryTakeover::DatabaseClock
+        );
+    }
+
+    #[test]
+    fn a_timed_claim_is_waited_out_once_per_version_and_never_past_a_deadline() {
+        let refusal = |version: &str| json!({"outcome": "claimed", "claim_instance_id": "a", "lease_remaining_ms": 1500, "claim_version": version});
+        let hash = "ab".repeat(32);
+        let mut waited_for = None;
+        assert_eq!(
+            observed_claim_wait(&refusal("t#0"), &hash, &mut waited_for, None),
+            Some(Duration::from_millis(1500))
+        );
+        // The same version again: time left is waited out again.
+        assert_eq!(
+            observed_claim_wait(&refusal("t#0"), &hash, &mut waited_for, None),
+            Some(Duration::from_millis(1500))
+        );
+        // A renewal since is a live holder: the refusal is the answer.
+        assert_eq!(
+            observed_claim_wait(&refusal("t#1"), &hash, &mut waited_for, None),
+            None
+        );
+        let soon = tokio::time::Instant::now() + Duration::from_millis(1000);
+        assert_eq!(
+            observed_claim_wait(&refusal("t#0"), &hash, &mut None, Some(soon)),
+            None,
+            "a wait the deadline cannot fit"
+        );
+        let untimed = json!({"outcome": "claimed", "claim_instance_id": "a", "claim_expires_at": "2026-01-01T00:00:00+00:00"});
+        assert_eq!(
+            observed_claim_wait(&untimed, &hash, &mut None, None),
+            None,
+            "the database clock's refusal is final"
+        );
+        let (code, message) = abandon_report(&refusal("t#1"), &hash, "superseded").unwrap();
+        assert_eq!(code, 5);
+        assert!(
+            message.contains("whose claim changed while this command watched it"),
+            "{message}"
+        );
+        let (code, message) = abandon_report(&untimed, &hash, "superseded").unwrap();
+        assert_eq!(code, 5);
+        assert!(
+            message.contains("retry after the claim expires"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn recover_arguments_are_bounded_at_the_entry() {
         let hash = "ab".repeat(32);
         let parsed = Cli::try_parse_from([
@@ -1782,6 +2149,7 @@ mod configuration_tests {
             "--apply",
             "--timeout-seconds",
             "3600",
+            "--unsafe-database-clock-expiry",
         ])
         .unwrap();
         let Some(Command::Candidates {
@@ -1790,6 +2158,7 @@ mod configuration_tests {
                     block_hash,
                     apply,
                     timeout_seconds,
+                    unsafe_database_clock_expiry,
                 },
         }) = parsed.command
         else {
@@ -1798,11 +2167,13 @@ mod configuration_tests {
         assert_eq!(block_hash, vec![hash.clone(), "cd".repeat(32)]);
         assert!(apply);
         assert_eq!(timeout_seconds, 3600);
+        assert!(unsafe_database_clock_expiry);
         let Some(Command::Candidates {
             command:
                 CandidatesCommand::Recover {
                     apply,
                     timeout_seconds,
+                    unsafe_database_clock_expiry,
                     ..
                 },
         }) = Cli::try_parse_from(["prism", "candidates", "recover", "--block-hash", &hash])
@@ -1813,6 +2184,10 @@ mod configuration_tests {
         };
         assert!(!apply, "plan-only by default");
         assert_eq!(timeout_seconds, 600, "the 2.x.x runner's default");
+        assert!(
+            !unsafe_database_clock_expiry,
+            "takeover waits out an observed lease by default (#581)"
+        );
         for (args, expected) in [
             (vec!["prism", "candidates", "recover"], "--block-hash"),
             (

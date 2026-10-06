@@ -28,6 +28,9 @@ type Rebuild = Shared<BoxFuture<'static, Result<Arc<Prepared>, SharedFailure>>>;
 pub(super) struct ResumeFlight {
     pub metadata: Metadata,
     rebuild: StdMutex<Option<Rebuild>>,
+    /// What the shared reconstruction is waiting on (#655). Whichever waiter
+    /// polls it, its steps mark this tracker, and every waiter follows it.
+    waiting: Waiting,
     _admission: ReadAdmission,
     changed: Arc<Notify>,
 }
@@ -108,6 +111,7 @@ impl ResumeFlights {
                     let flight = Arc::new(ResumeFlight {
                         metadata,
                         rebuild: StdMutex::new(None),
+                        waiting: Waiting::default(),
                         _admission: admission,
                         changed: self.changed.clone(),
                     });
@@ -122,6 +126,11 @@ impl ResumeFlights {
 }
 
 impl ResumeFlight {
+    /// The tracker of the shared reconstruction, for a waiter to follow.
+    pub fn waiting(&self) -> &Waiting {
+        &self.waiting
+    }
+
     pub fn reconstruction(
         &self,
         coordinator: &Coordinator,
@@ -136,18 +145,20 @@ impl ResumeFlight {
                 let build_slots = coordinator.build_slots.clone();
                 let window_reads = coordinator.window_reads.clone();
                 let config = coordinator.config.clone();
+                let waiting = self.waiting.clone();
                 async move {
-                    reconstruct(
-                        ledger,
-                        build_slots,
-                        window_reads,
-                        config,
-                        key,
-                        metadata,
-                        extra_size,
-                    )
-                    .await
-                    .map_err(|error| SharedFailure(Arc::new(error)))
+                    waiting
+                        .track(reconstruct(
+                            ledger,
+                            build_slots,
+                            window_reads,
+                            config,
+                            key,
+                            metadata,
+                            extra_size,
+                        ))
+                        .await
+                        .map_err(|error| SharedFailure(Arc::new(error)))
                 }
                 .boxed()
                 .shared()
@@ -176,9 +187,12 @@ async fn reconstruct(
     let window = if owned.0.record.window.shares.is_some() {
         let reader = window_reads.acquire_owned().await?;
         Some(
-            ledger
-                .read_window_with_permit(&owned.0.record.window, BalanceSource::AsIssued, reader)
-                .await?,
+            on_database(ledger.read_window_with_permit(
+                &owned.0.record.window,
+                BalanceSource::AsIssued,
+                reader,
+            ))
+            .await?,
         )
     } else {
         None
@@ -275,6 +289,9 @@ async fn reconstruct(
                 wire,
                 metadata.original_expires_at_ms,
                 Instant::now(),
+                None,
+                // Stored, not re-read on a known timeline: its window is
+                // proven again wherever it is used (#619).
                 None,
             )?;
             drop(body);
