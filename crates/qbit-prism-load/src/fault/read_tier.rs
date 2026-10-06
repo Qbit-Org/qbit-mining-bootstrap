@@ -217,14 +217,14 @@ async fn scrape(
                 // lower the offered rate: the tier is offered 5/s whatever
                 // it does with them.
                 tokio::spawn(one(client.clone(), "public-api".into(), format!("{public}{path}"),
-                    path.into(), samples.clone()));
+                    path.into(), samples.clone(), stop.clone()));
             }
             _ = metrics_tick.tick() => {
                 tokio::spawn(one(client.clone(), "public-api".into(),
-                    format!("{public}/metrics"), "/metrics".into(), samples.clone()));
+                    format!("{public}/metrics"), "/metrics".into(), samples.clone(), stop.clone()));
                 for (instance, url) in &frontends {
                     tokio::spawn(one(client.clone(), instance.clone(), url.clone(),
-                        "/metrics".into(), samples.clone()));
+                        "/metrics".into(), samples.clone(), stop.clone()));
                 }
             }
         }
@@ -237,6 +237,7 @@ async fn one(
     url: String,
     path: String,
     samples: Arc<Mutex<Vec<ReadSample>>>,
+    stop: watch::Receiver<bool>,
 ) {
     let at = Instant::now();
     let result = client.get(&url).send().await;
@@ -263,6 +264,13 @@ async fn one(
         }
         Err(error) => (None, Some(transport_failure(error))),
     };
+    // A request still in flight when the tier stops is cut off by the stop
+    // itself, which kills public-api next: its failure says nothing about the
+    // tier, and it would land in the last fault's window, which runs to the
+    // phase's end (#701). An answer that made it back is kept.
+    if status.is_none() && *stop.borrow() {
+        return;
+    }
     samples
         .lock()
         .expect("read tier samples lock")
@@ -478,12 +486,14 @@ mod tests {
             .build()
             .expect("a client");
         let samples = Arc::new(Mutex::new(Vec::new()));
+        let (_stop, stop_rx) = watch::channel(false);
         one(
             client,
             "public-api".into(),
             url.clone(),
             PUBLIC_PATHS[0].into(),
             samples.clone(),
+            stop_rx,
         )
         .await;
         dropper.abort();
@@ -500,6 +510,52 @@ mod tests {
             .strip_prefix(&top)
             .unwrap_or_else(|| panic!("{error:?} does not start with {top:?}"));
         assert!(cause.starts_with(": ") && cause.len() > 2, "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_request_the_stop_cuts_off_is_not_recorded() {
+        // A listener that holds every connection without answering until it
+        // is told to drop them, as public-api is killed under a request in
+        // flight when the tier stops.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let url = format!(
+            "http://{}/public/v1/pool-summary",
+            listener.local_addr().expect("its address")
+        );
+        let (kill, mut killed) = watch::channel(false);
+        let holder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("the scrape connects");
+            let _ = killed.changed().await;
+            drop(stream);
+        });
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .no_proxy()
+            .build()
+            .expect("a client");
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let (stop, stop_rx) = watch::channel(false);
+        let request = tokio::spawn(one(
+            client,
+            "public-api".into(),
+            url,
+            PUBLIC_PATHS[0].into(),
+            samples.clone(),
+            stop_rx,
+        ));
+        // The tier stops, then the process goes: the request fails after the
+        // stop, so it is the stop's doing, not the tier's.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send_replace(true);
+        kill.send_replace(true);
+        request.await.expect("the scrape task");
+        holder.await.expect("the holder");
+        assert!(
+            samples.lock().expect("samples").is_empty(),
+            "a request the stop cut off was recorded"
+        );
     }
 
     #[test]
