@@ -167,6 +167,28 @@ See [prism-b4-stratum-admission.md](prism-b4-stratum-admission.md) for the
 runbook, the recommended starting values and the topologies that make a cap
 unsafe.
 
+## Stratum listen backlog
+
+`PRISM_STRATUM_LISTEN_BACKLOG` (default 4096) is how many connections the kernel
+queues on each Stratum listener before the accept loop takes them. It accepts 1
+through 2147483647, the range `listen(2)` takes. `check-config` rejects an
+out-of-range value with `PRISM_STRATUM_LISTEN_BACKLOG must be between 1 and
+2147483647`, and a value that is not a number with `invalid
+PRISM_STRATUM_LISTEN_BACKLOG`; an empty value selects the default. It applies to the primary and
+high-difficulty listeners alike. A burst of miners reconnecting together, as
+when a cutover re-points every miner, a frontend restarts or a load balancer
+fails over, is held in that queue. Past it, the kernel drops their SYNs
+(`TcpExtListenOverflows`), the miners retry a second later, and a load balancer
+that observes layer-4 errors can mark the frontend down. The kernel caps the
+value at `net.core.somaxconn` in the frontend's network namespace without an
+error, so raise that too if it is lower. The frontend's `PRISM listening` line
+logs both `listen_backlog` and `somaxconn`, and a warning names the cap when
+somaxconn is the lower.
+
+Before this setting the native listeners used mio's fixed backlog of 128; the
+2.x.x runtime read the same name with a default of 1024. The operator and
+public HTTP listeners use a fixed backlog of 1024.
+
 ## Block submission kill switch
 
 `PRISM_BLOCK_SUBMIT_ENABLED` (boolean, default `1`) exists for rehearsals

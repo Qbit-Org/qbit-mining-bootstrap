@@ -3,6 +3,7 @@ use crate::{
     config::{self, Config},
     coordinator::Coordinator,
     ledger::{HeartbeatHealth, HeartbeatStatus},
+    listen::{bind_listener, HTTP_LISTEN_BACKLOG},
     metrics::{self, TaskKind},
     stratum::{run_listener, StratumConfig, StratumStats},
 };
@@ -11,7 +12,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::{net::TcpListener, sync::watch, task::JoinSet};
+use tokio::{sync::watch, task::JoinSet};
 
 const BLOB_PRUNE_BUDGET: Duration = Duration::from_secs(5);
 
@@ -29,20 +30,36 @@ pub async fn run(config: Config) -> Result<()> {
     // because it serves the coordinator's ledger.
     let highdiff = stratum_config.highdiff_config()?;
     let mut api_config = ApiConfig::from_env()?;
-    let primary = TcpListener::bind((
-        config::value("PRISM_STRATUM_BIND", "127.0.0.1"),
-        config::number("PRISM_STRATUM_PORT", 3340u16)?,
-    ))
+    let primary = bind_listener(
+        (
+            config::value("PRISM_STRATUM_BIND", "127.0.0.1"),
+            config::number("PRISM_STRATUM_PORT", 3340u16)?,
+        ),
+        stratum_config.listen_backlog,
+    )
     .await
     .context("bind primary Stratum listener")?;
-    tracing::info!(address=%primary.local_addr()?,instance=%config.instance_id,workers=config.runtime_workers,"PRISM listening");
+    // The kernel caps every listen backlog at the namespace's somaxconn
+    // without an error, so say what the Stratum listeners actually got.
+    let somaxconn = crate::listen::somaxconn();
+    tracing::info!(address=%primary.local_addr()?,instance=%config.instance_id,workers=config.runtime_workers,listen_backlog=stratum_config.listen_backlog,somaxconn=?somaxconn,"PRISM listening");
+    if let Some(cap) = somaxconn.filter(|cap| *cap < stratum_config.listen_backlog) {
+        tracing::warn!(
+            requested = stratum_config.listen_backlog,
+            somaxconn = cap,
+            "net.core.somaxconn caps the Stratum listen backlog below PRISM_STRATUM_LISTEN_BACKLOG; raise it in the frontend's network namespace"
+        );
+    }
     let high_listener = if highdiff.is_some() {
         Some(
-            TcpListener::bind((
-                config::optional("PRISM_STRATUM_HIGHDIFF_BIND")
-                    .unwrap_or_else(|| config::value("PRISM_STRATUM_BIND", "127.0.0.1")),
-                config::number("PRISM_STRATUM_HIGHDIFF_PORT", 4334u16)?,
-            ))
+            bind_listener(
+                (
+                    config::optional("PRISM_STRATUM_HIGHDIFF_BIND")
+                        .unwrap_or_else(|| config::value("PRISM_STRATUM_BIND", "127.0.0.1")),
+                    config::number("PRISM_STRATUM_HIGHDIFF_PORT", 4334u16)?,
+                ),
+                stratum_config.listen_backlog,
+            )
             .await
             .context("bind high difficulty Stratum listener")?,
         )
@@ -102,9 +119,12 @@ pub async fn run(config: Config) -> Result<()> {
     let runtime = metrics.runtime();
     let api_listener = if config.audit_port > 0 {
         Some(
-            TcpListener::bind((config.audit_bind.as_str(), config.audit_port))
-                .await
-                .context("bind audit HTTP listener")?,
+            bind_listener(
+                (config.audit_bind.as_str(), config.audit_port),
+                HTTP_LISTEN_BACKLOG,
+            )
+            .await
+            .context("bind audit HTTP listener")?,
         )
     } else {
         None

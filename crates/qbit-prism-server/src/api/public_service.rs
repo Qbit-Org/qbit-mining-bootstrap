@@ -504,7 +504,11 @@ pub async fn run_from_env(mut shutdown: watch::Receiver<bool>) -> Result<()> {
         config.clone(),
     );
     service.probe_once().await;
-    let listener = tokio::net::TcpListener::bind((config.bind.as_str(), config.port)).await?;
+    let listener = crate::listen::bind_listener(
+        (config.bind.as_str(), config.port),
+        crate::listen::HTTP_LISTEN_BACKLOG,
+    )
+    .await?;
     let mut probe_shutdown = shutdown.clone();
     let probe = tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.probe_interval);
