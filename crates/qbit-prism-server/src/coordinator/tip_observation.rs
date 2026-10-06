@@ -909,12 +909,7 @@ impl Coordinator {
                         self.config.submit_tip_max_age,
                         self.config.template_refresh_failure_exit,
                     )
-                    .map_err(|_| {
-                        protocol_error(
-                            "backend-rpc-unavailable",
-                            "current chain state is unavailable",
-                        )
-                    })?;
+                    .map_err(|_| chain_state_unavailable())?;
                 Some((
                     PreparedIdentity::of(&current),
                     state.publication_stamp(),
@@ -941,18 +936,8 @@ impl Coordinator {
             .rpc
             .call("getbestblockhash", json!([]))
             .await
-            .map_err(|_| {
-                protocol_error(
-                    "backend-rpc-unavailable",
-                    "current chain state is unavailable",
-                )
-            })?;
-        let hash = tip_hash(&result).ok_or_else(|| {
-            protocol_error(
-                "backend-rpc-unavailable",
-                "current chain state is unavailable",
-            )
-        })?;
+            .map_err(|_| chain_state_unavailable())?;
+        let hash = tip_hash(&result).ok_or_else(chain_state_unavailable)?;
         // Work may have published during the RPC. Select that complete pair
         // now, but only a publication matching the answer supplies provenance.
         // RPC itself cannot publish a transition or restore a disabled lease.

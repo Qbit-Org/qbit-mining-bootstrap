@@ -162,6 +162,54 @@ async fn commit_reconcile_append_before_commit_is_refused_and_aborted_at_the_dea
     assert_eq!(late_confirmed(&fixture), 0);
 }
 
+/// #716: a refused gate is answered by the closure that won it.
+/// - Only a proven stale lease is a stale race.
+/// - Authority the lease's fence could not read is answered as admission
+///   answers authority it cannot prove, not as a ledger failure.
+/// - A deadline closure and a refusal that records no closure stay strict.
+///
+/// None of them credits the share, and none logs the WARN that marks a real
+/// ledger failure. The deadline's own answer, when it closes the gate first,
+/// is pinned above.
+#[tokio::test]
+async fn commit_reconcile_each_gate_closure_keeps_its_own_answer() {
+    use submit_ledger::GateClosure;
+    for (closure, reason, message) in [
+        (Some(GateClosure::StaleAuthority), "stale-job", "stale job"),
+        (
+            Some(GateClosure::AuthorityUnavailable),
+            "backend-rpc-unavailable",
+            "current chain state is unavailable",
+        ),
+        (
+            Some(GateClosure::DeadlineOrCancelled),
+            "ledger-confirmation-failed",
+            "share was not committed because its commit gate closed",
+        ),
+        (
+            None,
+            "ledger-confirmation-failed",
+            "share was not committed because its commit gate closed",
+        ),
+    ] {
+        let fixture = fixture(|_| {}, None).await;
+        *fixture.store.refuse_commit.lock().unwrap() = Some(closure);
+        let (submitted, log) = submit(&fixture, proof(&fixture, false));
+        assert_error(submitted.await.unwrap().unwrap_err(), reason, message);
+        assert_eq!(records(&fixture), 0, "{closure:?}");
+        assert_eq!(
+            fixture.coordinator.accepted.load(Ordering::SeqCst),
+            0,
+            "{closure:?}"
+        );
+        assert!(
+            !log.text().contains("share persistence failed"),
+            "{closure:?}: {}",
+            log.text()
+        );
+    }
+}
+
 #[tokio::test]
 async fn commit_reconcile_commit_still_in_flight_after_grace_is_unknown() {
     let fixture = fixture(

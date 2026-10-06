@@ -771,8 +771,10 @@ async fn incident_2_body(
     // admission's `stale-job`, the append's payout-revision fence, which
     // answers `stale-job` too since #675, or a publication lease's commit
     // gate, which the move can close without proving the work stale
-    // (`ledger-confirmation-failed`, docs/prism-rejections.md, "Commit-gate
-    // refusals"). Nothing else.
+    // (docs/prism-rejections.md, "Commit-gate refusals"). That gate answers
+    // `backend-rpc-unavailable` when it could not read its authority (#716),
+    // and `ledger-confirmation-failed` when its deadline or an unspecified
+    // refusal closed it. Nothing else.
     for (frontend, acks) in phase_a.iter().enumerate() {
         for ack in acks {
             ack.outcome.clone().map_err(|error| {
@@ -797,6 +799,8 @@ async fn incident_2_body(
                 Err(error)
                     if ack.finished >= adopted
                         && (error.starts_with("stale-job")
+                            || (error.starts_with("backend-rpc-unavailable")
+                                && error.ends_with("current chain state is unavailable"))
                             || error.starts_with("ledger-confirmation-failed")) => {}
                 Err(error) => bail!(
                     "frontend {}: a phase-B share was refused {:.2} ms after it started, {:+.2} ms from submitblock: {error}",

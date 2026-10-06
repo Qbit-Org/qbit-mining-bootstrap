@@ -30,6 +30,11 @@ pub(super) enum SaveOutcome {
     Duplicate,
     /// The original lease expired or was replaced before COMMIT: `stale-job`.
     Stale,
+    /// The lease's commit gate could not read its chain authority before
+    /// COMMIT (#716): nothing was written, and neither a stale race nor a
+    /// ledger failure is proven. `backend-rpc-unavailable`, as admission
+    /// answers authority it cannot prove.
+    AuthorityUnavailable,
     /// The ledger did not record the share: `ledger-confirmation-failed`.
     Failed(anyhow::Error),
     /// A block-only proof whose block is stale by the pool's own decision,
@@ -140,6 +145,16 @@ fn sync_rep_unknown(
             })
         }
         _ => None,
+    }
+}
+
+/// The `closure` field of a refused commit gate's log line.
+fn gate_closure_label(closure: Option<GateClosure>) -> &'static str {
+    match closure {
+        Some(GateClosure::DeadlineOrCancelled) => "deadline-or-cancelled",
+        Some(GateClosure::AuthorityUnavailable) => "authority-unavailable",
+        Some(GateClosure::StaleAuthority) => "stale-authority",
+        None => "unspecified",
     }
 }
 
@@ -345,12 +360,7 @@ impl Coordinator {
         let proof_observed_at_ms = submission.block_pass.then(|| unix_ms_now().ok()).flatten();
         let (last_poll, readiness_generation, refresh_failed_on_database) = {
             let readiness = self.readiness.read().await;
-            let last_poll = readiness.last_poll.ok_or_else(|| {
-                protocol_error(
-                    "backend-rpc-unavailable",
-                    "current chain state is unavailable",
-                )
-            })?;
+            let last_poll = readiness.last_poll.ok_or_else(chain_state_unavailable)?;
             (
                 last_poll,
                 readiness.generation,
@@ -505,19 +515,15 @@ impl Coordinator {
             // I/O revokes this admission even if a later poll recovers trust.
             let readiness = self.readiness.read().await;
             if readiness.generation != readiness_generation || readiness.last_poll.is_none() {
-                return Err(protocol_error(
-                    "backend-rpc-unavailable",
-                    "current chain state is unavailable",
-                ));
+                return Err(chain_state_unavailable());
             }
         }
         if let Some(lease) = &lease {
-            if !self.revalidate_published_lease(lease).await.map_err(|_| {
-                protocol_error(
-                    "backend-rpc-unavailable",
-                    "current chain state is unavailable",
-                )
-            })? {
+            if !self
+                .revalidate_published_lease(lease)
+                .await
+                .map_err(|_| chain_state_unavailable())?
+            {
                 return Err(protocol_error("stale-job", "stale job"));
             }
         }
@@ -581,6 +587,10 @@ impl Coordinator {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 Err(protocol_error("stale-job", "stale job"))
             }
+            SaveOutcome::AuthorityUnavailable => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(chain_state_unavailable())
+            }
             SaveOutcome::Superseded(cause) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 Err(self.stale_job(cause))
@@ -603,10 +613,10 @@ impl Coordinator {
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
                 if error.downcast_ref::<CommitGateClosed>().is_some() {
-                    // A refused local gate proves COMMIT was never sent. It
-                    // has no proven stale cause: contention/unavailable
-                    // authority and legacy unspecified refusals remain strict.
-                    tracing::info!(%error, "share commit gate refused before COMMIT");
+                    // A refused local gate proves COMMIT was never sent, and
+                    // `persist_share_pass` logged its closure. A deadline
+                    // closure or an unspecified refusal has no proven cause:
+                    // it remains strict.
                     return Err(protocol_error(
                         "ledger-confirmation-failed",
                         "share was not committed because its commit gate closed",
@@ -756,11 +766,35 @@ impl Coordinator {
         let outcome =
             classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout);
         let outcome = match outcome {
-            SaveOutcome::Failed(error)
-                if error.downcast_ref::<CommitGateClosed>().is_some()
-                    && gate.closure() == Some(GateClosure::StaleAuthority) =>
-            {
-                SaveOutcome::Stale
+            // A refused local gate proves COMMIT was never sent. The closure
+            // that won the gate says why, and only a proven stale lease is a
+            // stale race.
+            SaveOutcome::Failed(error) if error.downcast_ref::<CommitGateClosed>().is_some() => {
+                match gate.closure() {
+                    Some(GateClosure::StaleAuthority) => SaveOutcome::Stale,
+                    closure => {
+                        tracing::info!(
+                            %error,
+                            closure = gate_closure_label(closure),
+                            "share commit gate refused before COMMIT"
+                        );
+                        // #716: the lease's fence could not read its chain
+                        // authority without waiting (a tip poll, a fee or
+                        // readiness write, or the publication held or awaited
+                        // its lock), or found readiness or the tip authority
+                        // lapsed. That proves neither stale work nor a ledger
+                        // failure, so it is answered as admission answers
+                        // authority it cannot prove, not as
+                        // `ledger-confirmation-failed`, which feeds the
+                        // share-append failure warning. A deadline closure or
+                        // an unspecified refusal stays strict.
+                        if closure == Some(GateClosure::AuthorityUnavailable) {
+                            SaveOutcome::AuthorityUnavailable
+                        } else {
+                            SaveOutcome::Failed(error)
+                        }
+                    }
+                }
             }
             // The append's payout-revision fence refused the share before any
             // write: a settlement moved the revision between the submit check

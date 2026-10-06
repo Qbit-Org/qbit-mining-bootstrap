@@ -66,6 +66,11 @@ pub(crate) struct MemoryLedger {
     pub commit_gate: StdMutex<Option<Arc<Gate>>>,
     /// Fails the next COMMIT with an indeterminate error.
     pub fail_commit: StdMutex<Option<FailCommit>>,
+    /// Refuses the next plain append at its pre-COMMIT hook as a closed gate
+    /// (#716). With `Some(closure)` that closure wins the gate first, as the
+    /// deadline or a lease fence does. With `None` the refusal records no
+    /// closure at all.
+    pub(super) refuse_commit: StdMutex<Option<Option<submit_ledger::GateClosure>>>,
     /// Appends dropped before they returned, as an aborted task is.
     pub cancelled: AtomicUsize,
     /// #657: block-bearing appends the revision fence captured instead:
@@ -151,6 +156,12 @@ impl MemoryLedger {
             ensure!(share == *old, "duplicate share_id payload mismatch");
         }
         // Model the production pre-commit hook: every statement has run.
+        if let Some(refusal) = self.refuse_commit.lock().unwrap().take() {
+            let Some(closure) = refusal else {
+                return Err(crate::ledger::CommitGateClosed.into());
+            };
+            commit.close_for_test(closure);
+        }
         if !commit.begin_commit() {
             if existing.is_some() && candidate.is_none() {
                 return Ok(Appended::Recorded);
