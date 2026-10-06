@@ -47,16 +47,24 @@ exact reconciliation of every offered, acknowledged and committed share, no
 durability finding, no shortfall in any phase, and the tip-delivery budgets.
 
 **A known resident-memory failure.** `rss_expected_failure` names an issue,
-or is `null`. `soak-weekly` names #600: its first run found a 400k-window
-frontend's resident set ratcheting up with block landings to about 3.3 GB,
-while every other gate passed. While the key is set, the resident-memory
-rows of every process are an expected failure as a group. A measured failure
-is reported as `expected failure (#600)` and does not fail the soak; a soak in
-which every resident-memory row passed fails with `#600 looks fixed`, so the
-key goes back to `null` and the gate is real again. It is the group, not each
-row, because one frontend's warm-up ratio can pass while its slope, or the
-other frontend's rows, fail. An unknown reading still fails, and no other
-gate is affected.
+or is `null`. While it names `<issue>`, the resident-memory rows of every
+process are an expected failure as a group. A measured failure is reported as
+`expected failure (<issue>)` and does not fail the soak. A soak in which
+every resident-memory row passed fails with `<issue> looks fixed`, so the key
+goes back to `null` and the gate is real again. It is the group, not each row,
+because one frontend's warm-up ratio can pass while its slope, or the other
+frontend's rows, fail. An unknown reading still fails, and no other gate is
+affected.
+
+Every checked-in soak now sets `null`. `soak-weekly` named #600 until #627:
+its first run found a 400k-window frontend's resident set ratcheting up with
+block landings to about 3.3 GB. With #627's post-landing `malloc_trim`, the
+5.5 h run of 2026-10-06 (at `c95febb3`) passed every resident-memory row:
+
+| Frontend | Peak vs warm-up peak | Window-peak slope |
+|---|---|---|
+| fe-0 | 1.17x | +8.65 MiB/h |
+| fe-1 | 1.13x | -15.75 MiB/h |
 
 Memory and descriptors are fitted only over *steady* samples, those taken
 outside rental churn, so the population being compared is the same from
@@ -158,8 +166,11 @@ pools) drifting by at most 2, `pg_wal` at most 2 GiB (the managed cluster's
 `max_wal_size` is PostgreSQL's 1 GB default, and the async standby's slot
 can hold more while it catches up). A leak of 1 KiB per accepted share at the
 soak's average of about 73 shares/s is about 128 MiB/h per frontend, eight
-times the slope bound. These bounds are a starting point: no 5.5 h run of
-this preset preceded them, and the first weekly runs are its calibration.
+times the slope bound. The first 5.5 h run (2026-10-06, above) stayed inside
+these bounds, but its +8.65 MiB/h slope leaves less than a 2x margin on one
+sample. Read a later slope failure against #628 and #629 (allocator, and
+per-cycle floors instead of landing-transient peaks) before calling it a
+regression.
 
 `soak-short` cannot be that sensitive. In its first twenty minutes a healthy
 server's resident set still grows, as its caches fill, by 0.6 to 0.9 GiB/h
