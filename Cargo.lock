@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-pool-builder"
-version = "3.0.0-rc.1"
+version = "3.0.0-rc.2"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism"
-version = "3.0.0-rc.1"
+version = "3.0.0-rc.2"
 dependencies = [
  "hex",
  "qbit-pool-builder",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism-load"
-version = "3.0.0-rc.1"
+version = "3.0.0-rc.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism-server"
-version = "3.0.0-rc.1"
+version = "3.0.0-rc.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism-test-gate"
-version = "3.0.0-rc.1"
+version = "3.0.0-rc.2"
 
 [[package]]
 name = "quinn"
