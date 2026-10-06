@@ -1895,7 +1895,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .await?;
         if plan.kind == crate::fault::PHASE {
             if let Some(tier) = read_tier.as_mut() {
-                tier.stop();
+                tier.stop_scraping();
             }
         }
         // The phase's bounds are when it started and stopped scheduling; a
@@ -1964,6 +1964,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 sampler.summarize(sampler.elapsed_of(started), sampler.elapsed_of(ended))
             })
             .collect();
+        // The read tier's scrapes still in flight at the fault phase's end
+        // finish now, after the phase's own end measurements above and
+        // before a later phase or the teardown stops a process they read:
+        // public-api here, the frontends at the run's end (#701).
+        if plan.kind == crate::fault::PHASE {
+            if let Some(tier) = read_tier.as_mut() {
+                tier.finish().await;
+            }
+        }
         runs.push(PhaseRun {
             plan: plan.clone(),
             completed: outcome.aborted.is_none(),
@@ -2526,6 +2535,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 "url": tier.url,
                 "reads": tier.reads,
                 "log": tier.log.display().to_string(),
+                // Scrapes still running when the tier gave up waiting and
+                // stopped public-api under them (#701); 0 when none.
+                "scrapes_cut_off": tier.cut_off,
             });
         }
         if let Some(error) = &read_tier_error {
