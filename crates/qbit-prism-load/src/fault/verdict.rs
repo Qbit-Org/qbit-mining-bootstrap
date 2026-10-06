@@ -344,17 +344,21 @@ impl FaultDriver {
                 // read under the lock is the one the hold keeps.
                 let current = work.last.as_ref().map(|reading| reading.payout_revision);
                 let locked = holder.as_ref().and_then(LockHolder::revision);
+                let revision = |revision: Option<i64>| {
+                    revision.map_or_else(|| "unknown".to_owned(), |revision| revision.to_string())
+                };
                 checks.push(check(
                     "the lock was taken on current work, with nothing left to settle",
                     work.current_at.is_some() && locked.is_some() && locked == current,
                     match work.current_at {
                         Some(at) => format!(
-                            "every frontend served revision {current:?}'s work, with no found \
-                             block unfinished and no settlement under way, {:.1} s after the \
-                             injection started (bound {} s); the lock was taken at revision \
-                             {locked:?}",
+                            "every frontend served revision {}'s work, with no found block \
+                             unfinished and no settlement under way, {:.1} s after the injection \
+                             started (bound {} s); the lock was taken at revision {}",
+                            revision(current),
                             at.saturating_duration_since(inject_start).as_secs_f64(),
-                            LOCK_WORK_WAIT.as_secs()
+                            LOCK_WORK_WAIT.as_secs(),
+                            revision(locked)
                         ),
                         None => format!(
                             "not within {} s of the injection starting, so the lock was taken on \
