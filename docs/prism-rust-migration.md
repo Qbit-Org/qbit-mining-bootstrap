@@ -751,10 +751,12 @@ bodies verify without sidecars.
 2.x wrote each audit-bundle.v2 body's `share_parts_digest_hex` over its share
 parts in insertion order; 3.x recomputes it with sorted keys. 3.x therefore
 refuses every such body, and `import-audits` stops on the first one with
-`window proof share_parts_digest_hex mismatch`. The body is intact. 2.x also
-wrote a canonical sidecar beside each v2 body, which import reads first, so
-only a v2 body whose sidecar is missing from the import root reaches the
-check. `scripts/prism_legacy_parts_digest_check.py` lists those rows without
+`window proof share_parts_digest_hex mismatch`. The body is intact. Import
+reads a canonical sidecar before the body, so only a v2 body without one in the
+import root reaches the check. 2.x has written a sidecar beside each new v2
+body only since #173 reached a deployment. Union's bodies from before
+2026-08-24, about 9,500 of them, have none.
+`scripts/prism_legacy_parts_digest_check.py` lists those rows without
 reading any slot, and `scripts/prism_legacy_range_sidecars_sharded.sh` writes
 their sidecars with `scripts/prism_legacy_range_sidecars.py` in parallel
 shards. With `legacy-rows.csv` exported and the canonicalizer built as in the
