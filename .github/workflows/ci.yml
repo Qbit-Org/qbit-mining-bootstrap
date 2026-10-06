@@ -167,11 +167,13 @@ jobs:
         # whose execution manifest proves it.
         run: cargo test --locked --workspace --all-targets
 
-      - name: Test the legacy range sidecar tool against the real canonicalizer
+      - name: Test the legacy audit sidecar tools against the real canonicalizer
         # cargo test built qbit-prism's executables for its integration tests.
         env:
           PRISM_AUDIT_CANONICALIZE_BIN: target/debug/qbit-prism-audit-canonicalize
-        run: python3 -m unittest -v tests.test_prism_legacy_range_sidecars
+        run: >-
+          python3 -m unittest -v tests.test_prism_legacy_range_sidecars
+          tests.test_prism_legacy_parts_digest_check
 
   rust-fmt:
     name: Rust formatting

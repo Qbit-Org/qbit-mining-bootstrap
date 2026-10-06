@@ -134,11 +134,11 @@ test-prism-postgres-throughput:
 test-prism-public-read-replica:
 	bash test/prism-native-tests.sh replica
 
-# The legacy range sidecar tool (#709) against the real 3.x canonicalizer.
+# The legacy audit sidecar tools (#709, #731) against the real 3.x canonicalizer.
 test-prism-legacy-range-sidecars:
 	cargo build --locked -p qbit-prism --bin qbit-prism-audit-canonicalize --bin qbit-prism-build-audit-bundle
 	PRISM_AUDIT_CANONICALIZE_BIN="$${CARGO_TARGET_DIR:-target}/debug/qbit-prism-audit-canonicalize" \
-	python3 -m unittest -v tests.test_prism_legacy_range_sidecars
+	python3 -m unittest -v tests.test_prism_legacy_range_sidecars tests.test_prism_legacy_parts_digest_check
 
 # The 2.x.x -> 3.x.x cutover rehearsal on an operator's pg_dump, in a private
 # PostgreSQL cluster (#575): make prism-cutover-rehearsal DUMP=... LEDGER_KEY=...
