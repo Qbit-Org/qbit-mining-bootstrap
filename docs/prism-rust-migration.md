@@ -670,6 +670,8 @@ well. Import failure is a reason to repair the missing/corrupt artifact before
 continuing; a matching hash without recoverable bytes is insufficient. A legacy
 body that fails only because a range digest was written as escaped JSON is
 intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
+So is a 2.x v2 body that fails with `window proof share_parts_digest_hex
+mismatch`; [list those rows and write their sidecars](#2x-v2-bodies-whose-window-proof-parts-digest-3x-recomputes-differently-731).
 
 `backfill-ctv` scans verified stored bundles and restores missing fanout records.
 Run import first. It is idempotent for matching existing records and replaces the
@@ -743,6 +745,64 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
 
 The post-GA follow-up is #709: 3.x accepting the escaped form, so that these
 bodies verify without sidecars.
+
+### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
+
+2.x wrote each audit-bundle.v2 body's `share_parts_digest_hex` over its share
+parts in insertion order; 3.x recomputes it with sorted keys. 3.x therefore
+refuses every such body, and `import-audits` stops on the first one with
+`window proof share_parts_digest_hex mismatch`. The body is intact. Import
+reads a canonical sidecar before the body, so only a v2 body without one in the
+import root reaches the check. 2.x has written a sidecar beside each new v2
+body only since #173 reached a deployment. Union's bodies from before
+2026-08-24, about 9,500 of them, have none.
+`scripts/prism_legacy_parts_digest_check.py` lists those rows without
+reading any slot, and `scripts/prism_legacy_range_sidecars_sharded.sh` writes
+their sidecars with `scripts/prism_legacy_range_sidecars.py` in parallel
+shards. With `legacy-rows.csv` exported and the canonicalizer built as in the
+previous section:
+
+```sh
+python3 scripts/prism_legacy_parts_digest_check.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --sidecar-dir /var/lib/qbit-prism/audit \
+  --affected-csv refused-rows.csv --jobs 8 > parts-digest.jsonl
+scripts/prism_legacy_range_sidecars_sharded.sh refused-rows.csv \
+  /var/lib/qbit-mining-pool/prism/audit /var/lib/qbit-prism/audit \
+  target/release/qbit-prism-audit-canonicalize scripts/prism_legacy_range_sidecars.py \
+  legacy-sidecar-shards 8
+python3 scripts/prism_legacy_parts_digest_check.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --sidecar-dir /var/lib/qbit-prism/audit --jobs 8 > /dev/null
+time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+```
+
+- The checker reads each body once. A row whose sidecar is in `--sidecar-dir`
+  is `has-sidecar` and its body is not read. That status means only that the
+  file is there: import verifies the sidecar's bytes and stops on a bad one.
+  The sidecar tool checks an existing sidecar (`sidecar-ok` or `sidecar-bad`)
+  for every row it is given. `2x-order-only` and `matches-neither` rows are
+  the ones import refuses for this digest: `--affected-csv` lists them in the
+  tool's `--rows` format, and stderr counts them as `import_refuses`.
+- The checker exits 0 only when no row is refused for this digest, no body is
+  missing or unreadable, and no v2 body is for another digest. Restore any
+  `body-missing`, `body-unreadable` or `body-digest-differs` evidence instead.
+  It checks nothing else: a body-ref or plain bundle is `no-window-proof`, and
+  rows that import refuses for other reasons, such as the escaped range
+  digests above, need the previous section's classification run.
+- The runner splits the rows round robin into shards, each with its own CSV,
+  work directory and report, and runs the tool with `--write` on each. Its
+  last argument is the number of shards, 8 by default. The output directory
+  must be new or empty and outside the import root. The run exits 0 only when
+  every shard exits 0 and no temporary file is left in the import root. A
+  rerun verifies the sidecars already written (`sidecar-ok`) instead of
+  rewriting them.
+- The bodies are immutable, so both steps can run ahead of the cutover
+  against a copy of the tree, writing into the directory import will read.
+  In the window, rerun them for the rows added since.
+
+The post-cutover follow-up is #731: 3.x recomputing the digest in 2.x's
+order, so that these bodies verify without sidecars.
 
 ### Migration 002's share-hash backfill, applied online
 
