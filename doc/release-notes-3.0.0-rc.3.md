@@ -17,22 +17,36 @@ below.
 
 - #711, fix B by #719: a share append holds the global ORDER_LOCK for 3
   statements plus COMMIT, down from 9 client round trips. There is no
-  migration. N2 measured it on the pair, on a build whose runtime is identical
-  to #719's head `82c80bb1`:
+  migration. N2 measured it on the pair, on a build whose runtime is #719's
+  head `82c80bb1`. That is rc.3 without #718's answer mapping, which doesn't
+  touch the lock hold:
   - the D1 peak-second gate now passes, with a window p99 of 898 ms against
-    1,000 ms (rc.1: 1,479 ms on the same shape);
+    the 1,000 ms gate. rc.1 measured 1,479 ms on the same shape: an empty
+    window, with the spike truly offered. An earlier rc.1 run, whose spike
+    was under-offered, measured 1,116 ms;
   - reconciliation is exact;
-  - the mean order-lock hold is 1.154 ms, against 1.473 ms;
-  - the ceiling is 750 shares/s in mode (b), flagged as 5% under 788;
-  - C4 run 1 passes, with zero acknowledged shares lost.
-- #712, by #721: `scripts/prism-recovery-evidence-parallel.py` exports the
-  recovery evidence in parallel, byte-identical to the serial export: 24 s
-  against 115 s with 8 jobs on a 6M-share copy. It is a script; no runtime
-  change.
+  - the mean time each share append holds the global ordering lock
+    (`qbit_prism_database_order_lock_hold_seconds{holder="append"}`) is
+    1.154 ms, against 1.473 ms on the rc.1 runtime in the same peak-shape run;
+  - the ceiling is 750 shares/s with the Stratum load balancer preferring the
+    primary's frontend (the pair's operating rule), flagged as 5% under 788;
+  - #291's failover drill under load, run 1, passes with zero acknowledged
+    shares lost. The run was an unplanned crash of the primary, then fencing,
+    promoting the standby and switching the writer, with 300 shares/s
+    through the real frontends.
+- #712, in part by #721: `scripts/prism-recovery-evidence-parallel.py` exports
+  the recovery evidence in parallel, byte-identical to the serial export: 24 s
+  against 115 s with 8 jobs on a 6M-share copy. #721 also moves a `\gset` in
+  `scripts/prism-recovery-evidence.sql`, which leaves the serial export's
+  output unchanged. These are scripts; no runtime change.
 
 ## Upgrading
 
 - **From 2.0.x:** as in the rc.2 notes. The schema is still migrations 2 to 25.
+  Export the recovery evidence with the
+  [parallel export](../scripts/prism-recovery-evidence-parallel.py), as the
+  [ledger runbook](../docs/prism-ledger-ops.md) describes, to shorten the
+  outage.
 - **From 3.0.0-rc.2:** no migration; replace the binary on every frontend.
 
 ## Verification
@@ -61,9 +75,16 @@ As in the rc.2 notes, with these changes:
   tip-change lease can be refused when its commit gate finds the publication
   authority busy. It is never credited, nothing is written and no ACKed
   share is lost. Since #718 it is answered `backend-rpc-unavailable`
-  (code 20). Seen once in rc.2's L3 (3-blocks r2: 1 of about 150k at 500/s)
-  and about once per 150k on the pair. The fix, a credit-preserving retry
-  (#716 fix B), comes after the candidates.
-- **Addressed since rc.2:**
-  - #711, by fix B in #719. The pair's measured ceiling is above;
-  - #712, by #721's parallel export.
+  (code 20). It was seen:
+  - 4 times in about 149k shares in N2's rc.1 D1 sustained run on the pair
+    (500/s for 300 s, 7 tips);
+  - once in about 121k in the peak run on #719's build;
+  - once in about 150k in rc.2's L3 (3-blocks r2).
+
+  The fix, a credit-preserving retry (#716 fix B), comes after the
+  candidates.
+- **#711:** improved by fix B (#719). The issue stays open for fix A, and the
+  pair's ceiling is still flagged under 788 shares/s.
+- **#712:** the parallel export (#721) shortens the evidence export. Taking
+  the source export off the critical path, and a parallel summarizer, are
+  still open. Both exports still sit inside the cutover outage.
