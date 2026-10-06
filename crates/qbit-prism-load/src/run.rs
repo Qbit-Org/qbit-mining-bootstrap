@@ -1962,6 +1962,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 sampler.summarize(sampler.elapsed_of(started), sampler.elapsed_of(ended))
             })
             .collect();
+        // The read tier's scrapes still in flight at the fault phase's end
+        // finish now, after the phase's own end measurements above and
+        // before a later phase or the teardown stops a process they read:
+        // public-api here, the frontends at the run's end (#701).
+        if plan.kind == crate::fault::PHASE {
+            if let Some(tier) = read_tier.as_mut() {
+                tier.finish().await;
+            }
+        }
         runs.push(PhaseRun {
             plan: plan.clone(),
             completed: outcome.aborted.is_none(),
@@ -2494,11 +2503,6 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .qbitd()
         .map(|real| real.observed_mints(crate::node::MintPurpose::Fault))
         .unwrap_or_default();
-    // The read tier's scrapes in flight at the phase's end finish before its
-    // samples are read and public-api is stopped (#701).
-    if let Some(tier) = read_tier.as_mut() {
-        tier.finish().await;
-    }
     let faults_report = fault_driver.as_ref().map(|driver| {
         let phase = runs.iter().find(|run| run.plan.kind == crate::fault::PHASE);
         let samples = read_tier
