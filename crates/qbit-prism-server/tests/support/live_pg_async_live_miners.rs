@@ -32,8 +32,9 @@
 //! inside the gap
 //! (including a session opened inside the gap, whose job was issued there):
 //! kept work is either resumed under its original authority or refused
-//! truthfully as stale. The block the gap session solved commits to the lost
-//! window, so it must be refused as stale or land paying only rows the
+//! truthfully as stale. A surviving share replayed, while its parent is still
+//! the tip, is a duplicate. The block the gap session solved commits to the
+//! lost window, so it must be refused as stale or land paying only rows the
 //! promoted ledger holds (#619; since #645 it is refused before its offer).
 //! A real block on work whose window the promoted
 //! ledger holds then lands, and its audit, verified against the node's
@@ -42,7 +43,7 @@
 //! promotion lost and no history a frontend cached before it. Then the lost
 //! acknowledged shares are replayed. Each answer must match the promoted
 //! ledger: accepted means credited exactly once, and a truthful stale
-//! refusal means not credited. A surviving share replayed is a duplicate.
+//! refusal means not credited.
 //! Once the final block has moved the tip, every surviving session receives
 //! work for it and a share on that work is credited exactly once.
 //! #466's replaced-history regression
@@ -848,6 +849,26 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     }
     let answer = gap_miner.submit_solved(gap_share.0, gap_share.1).await;
     after.push(("kept on a job issued in the gap", answer));
+    // The newest surviving acknowledgement, on the freshest job, replayed
+    // while its parent is still the tip: the server settles a stale parent
+    // before it looks for a duplicate, so once a block moved the tip and the
+    // stale grace ran out the same replay would read `stale-job`.
+    let survivor = records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.outcome == Outcome::Acknowledged && new_shares.contains(&record.share_id)
+        })
+        .context("no acknowledged share survived")?;
+    let (params, submitted) = survivor.replay();
+    let duplicate = sessions[survivor.miner]
+        .submit_solved(params, submitted)
+        .await;
+    ensure!(
+        duplicate.answer.reason_id() == Some("duplicate-share"),
+        "a surviving acknowledged share replayed after the promotion was answered {}",
+        duplicate.answer
+    );
 
     // The block on the gap-issued job, submitted while the tip is still the
     // one its job builds on: its coinbase was built from the lost window, so
@@ -869,6 +890,9 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
             None
         }
     };
+    // Its answer must match the promoted ledger like every other answer
+    // after the promotion: landed, it is credited once; refused, not at all.
+    after.push(("the block on the gap-issued job", stale_block.clone()));
 
     // A real block on work whose window the promoted ledger holds, by a new
     // session. A job on a window prepared inside the gap (#619's second
@@ -1015,23 +1039,6 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
             submitted.answer
         );
     }
-    // The newest surviving acknowledgement, on the freshest job.
-    let survivor = records
-        .iter()
-        .rev()
-        .find(|record| {
-            record.outcome == Outcome::Acknowledged && new_shares.contains(&record.share_id)
-        })
-        .context("no acknowledged share survived")?;
-    let (params, submitted) = survivor.replay();
-    let duplicate = sessions[survivor.miner]
-        .submit_solved(params, submitted)
-        .await;
-    ensure!(
-        duplicate.answer.reason_id() == Some("duplicate-share"),
-        "a surviving acknowledged share replayed after the promotion was answered {}",
-        duplicate.answer
-    );
 
     if let Some(stale_paid) = &stale_paid {
         let window = expected_window(f, &stale_block.share_id).await?;
