@@ -47,7 +47,7 @@ carries a banner with the same statement.
   submodules, `ledger/candidates.rs`, `ledger/jobs.rs`, `ledger/window.rs`,
   and `ledger/connect.rs`, with no behaviour change and no signature change,
   so parallel workstream pull requests stop colliding on one file.
-- One release identity per #284, currently `3.0.0-rc.3`, the third release
+- One release identity per #284, currently `3.0.0-rc.4`, the fourth release
   candidate of `3.0.0` (#557). The single source is
   `[workspace.package].version` in the root `Cargo.toml`, which every crate
   inherits with `version.workspace = true`, plus the `VERSION` file; bump the
@@ -120,10 +120,11 @@ they fixed or configured no longer exists on this line:
 - There is no production release of the Rust server. The Postgres-backed and
   live-regtest Rust suites need a PostgreSQL server and a `qbitd` binary; see
   `test/prism-native-tests.sh`. They are not part of this note's verification.
-- Final release notes are #291. The tree reads 3.0.0-rc.3, the third release
-  candidate ([its notes](release-notes-3.0.0-rc.3.md); the earlier ones are
-  [3.0.0-rc.1](release-notes-3.0.0-rc.1.md) and
-  [3.0.0-rc.2](release-notes-3.0.0-rc.2.md)), and nothing on this line has
+- Final release notes are #291. The tree reads 3.0.0-rc.4, the fourth release
+  candidate ([its notes](release-notes-3.0.0-rc.4.md); the earlier ones are
+  [3.0.0-rc.1](release-notes-3.0.0-rc.1.md),
+  [3.0.0-rc.2](release-notes-3.0.0-rc.2.md) and
+  [3.0.0-rc.3](release-notes-3.0.0-rc.3.md)), and nothing on this line has
   been released as 3.0.0; `doc/release-notes-3.0.0.md` currently
   records only the unreleased D5 recovery contract. #291 completes those
   notes and the rollout record.
