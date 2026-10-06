@@ -1272,6 +1272,26 @@ miner account; and the payout entries against every account. A marked block
 whose audit or manifest is missing is a finding by itself. Blocks landed before
 011 keep the sequential rule. `qbit_carry_forward_current_drift()` is unchanged.
 
+Since migration 025 (#708), the sequential rule follows each payout program's
+chain, as 2.x keeps it: `qbit_current_carry_forward_balances()` sums a
+program's rows whatever label they carry.
+- **One program, two labels.** Stratum keeps the address as the miner typed
+  it, and bech32 is case-insensitive, so one program can be paid under an
+  uppercase and a lowercase label.
+- **What 025 fixed.** On union, one program's balance runs across both
+  labels. Before 025, the rule partitioned by
+  `(miner_id, payout_order_key, p2mr_program)` and reported 5,506 false
+  mismatches there, which `self-check` and `fatal-state clear` refuse. Per
+  program it finds none over all 2,753,849 active rows.
+- **Labels are untouched.** The labels stay as written; the as-issued
+  manifests name them too.
+- **The recovery export.** The summarizer re-checks the legacy chain per
+  program from the exported active carry rows. It clears only the findings
+  2.x's per-label rule makes on a chain that holds, so a 2.x source and its
+  migrated copy summarize alike.
+- **Migration order.** 025 replaces the validator 011 defines, so `migrate`
+  runs 025 again whenever it runs 011.
+
 Coinbase maturity is 1,000 blocks: a height-H payout becomes mature only at tip
 height H+1,000 or later. An immature disconnected block is marked inactive, so
 its balances stop contributing; it can reactivate. Terminal reversal preserves
@@ -2344,8 +2364,11 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    CTV state in one read-only snapshot. The [streaming summarizer](../scripts/prism-recovery-evidence.py)
    records counts and digests and reproduces the legacy `audit_head_sha256`;
    compare that head to the mirrored pre-cutover report. It refuses incomplete
-   exports and carry mismatches/drift. Require `unfinished_candidates` zero. Protect
-   the evidence as accounting data and budget disk for the share export.
+   exports and carry mismatches/drift. It checks legacy carry rows per payout
+   program (#708): a finding of `2.x.x`'s per-label rule that the program's
+   chain clears is named in a `note:` on stderr and left out of the summary.
+   Require `unfinished_candidates` zero. Protect the evidence as accounting
+   data and budget disk for the share export.
    `FETCH_COUNT` makes psql print rows in batches instead of buffering each whole
    result, which took 63 GB and was OOM-killed at 65.9M shares (#705). The script
    defaults it to 10000 since #705; the flag covers copies from before that.

@@ -493,6 +493,92 @@ async fn clear_preserves_halt_on_integrity_failure_and_audit_insert_failure() ->
     db.close(vec![ledger]).await
 }
 
+/// #708: one payout program's legacy chain under two labels that differ only
+/// in case, as 2.x wrote it, passes the self-check's integrity gate and lets
+/// a fatal state clear. A real break under either label still stops both.
+#[tokio::test]
+async fn self_check_and_clear_accept_a_programs_legacy_chain_across_case_labels() -> Result<()> {
+    use super::case_labels;
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let (ledger, node, mut config) = setup(&db).await?;
+    // #535: `self-check` refuses a configuration without a pool fee.
+    config.payout_policy.pool_fee_policy = Some(super::pool_fee::zero_bps_policy());
+    sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint=$1")
+        .bind(config.fingerprint(&"00".repeat(32))?)
+        .execute(&ledger.pool)
+        .await?;
+    case_labels::seed(&ledger.pool).await?;
+    // The mature blocks are on the node's chain.
+    for (height, ..) in case_labels::ROWS {
+        node.set_reply(
+            "getblockhash",
+            json!([height]),
+            json!(case_labels::block_hash(height)),
+        );
+    }
+    let self_check = || async {
+        let output = cli_with_env(&db, &node, &["self-check"], &TOOL_ENV).await?;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("self-check report; stderr={stderr}"))?;
+        Ok::<_, anyhow::Error>((report, stderr))
+    };
+    // Past the gate: durability is read after it, and the check fails only
+    // on the audit API this fixture does not serve.
+    let (report, stderr) = self_check().await?;
+    assert_eq!(
+        report["carry_forward_integrity"]["mismatch_count"], 0,
+        "{report}"
+    );
+    assert!(report["durability"].is_array(), "{report}; {stderr}");
+    assert!(
+        !stderr.contains("carry-forward integrity failure"),
+        "{stderr}"
+    );
+    // A break under the lowercase label stops it at the gate.
+    case_labels::shift(&ledger.pool, case_labels::LAST_LOWER, 1).await?;
+    let (report, stderr) = self_check().await?;
+    assert_eq!(
+        report["carry_forward_integrity"]["mismatch_count"], 1,
+        "{report}"
+    );
+    assert!(report["durability"].is_null(), "{report}");
+    assert!(
+        stderr.contains("carry-forward integrity failure in mismatch_count"),
+        "{stderr}"
+    );
+    case_labels::shift(&ledger.pool, case_labels::LAST_LOWER, -1).await?;
+
+    halt(&ledger, "test halt").await?;
+    stopped(&ledger).await?;
+    let before = ledger.fatal_state().await?;
+    // A break under the uppercase label refuses the clear and keeps the halt.
+    case_labels::shift(&ledger.pool, case_labels::LAST_UPPER, 1).await?;
+    let error = ledger
+        .clear_fatal_state(&config, "investigated")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("fatal-state reconciliation failed mismatch_count"),
+        "{error}"
+    );
+    unchanged(&ledger, &before).await?;
+    case_labels::shift(&ledger.pool, case_labels::LAST_UPPER, -1).await?;
+    // The chain as 2.x wrote it clears.
+    let event = ledger.clear_fatal_state(&config, "investigated").await?;
+    assert_eq!(
+        event["reconciliation"]["integrity"]["mismatch_count"], 0,
+        "{event}"
+    );
+    assert_eq!(event["reconciliation"]["blocks_checked"], 7, "{event}");
+    assert_eq!(ledger.fatal_state().await?["halted"], false);
+    db.close(vec![ledger]).await
+}
+
 #[tokio::test]
 async fn migration_and_show_preserve_unknown_legacy_set_time_without_registration() -> Result<()> {
     let Some(db) = Database::open().await? else {

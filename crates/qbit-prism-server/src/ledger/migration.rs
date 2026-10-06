@@ -30,7 +30,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// has completed. A populated 2.x.x source records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -2224,6 +2224,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         24,
         include_str!("../../migrations/024_fanout_lane_index.sql"),
     ),
+    (
+        25,
+        include_str!("../../migrations/025_carry_forward_integrity_by_program.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3320,6 +3324,20 @@ pub(super) async fn migrate_schema(
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(23)")
             .execute(&mut **tx)
             .await?;
+    }
+    // #708: the legacy carry-forward rule follows each payout program's
+    // chain, as 2.x keeps it. A validator replacement changes no stored row,
+    // so an earlier frontend may keep running beside it. 011 defines the
+    // validator 025 replaces, so 025 runs again whenever 011 just ran.
+    if !versions.contains(&25) || !versions.contains(&11) {
+        sqlx::raw_sql(native_migration(25))
+            .execute(&mut **tx)
+            .await?;
+        if !versions.contains(&25) {
+            sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(25)")
+                .execute(&mut **tx)
+                .await?;
+        }
     }
     // Only a fresh or empty 2.x.x source reaches this DDL, with writers
     // excluded by the cutover locks. Existing native ledgers and populated

@@ -30,6 +30,10 @@ mod fake_qbitd;
 #[path = "support/fatal_state.rs"]
 mod fatal_state;
 
+#[path = "support/case_labels.rs"]
+#[allow(dead_code)]
+mod case_labels;
+
 #[path = "support/pool_fee.rs"]
 mod pool_fee;
 

@@ -1,10 +1,14 @@
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use qbit_prism_server::ledger::Ledger;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 
 #[path = "support/recovery.rs"]
 mod recovery;
+
+#[path = "support/case_labels.rs"]
+#[allow(dead_code)]
+mod case_labels;
 
 // #575: the cutover rehearsal, run per PR on a mainnet-shaped 2.x.x dump,
 // and its operator mode.
@@ -290,7 +294,7 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         // Comparing two exports alone would miss a consistently wrong head.
         ensure!(
             source_evidence["audit_head_sha256"]
-                == "848c67eafac5e3545df6d79ba68994a2fe1d98641ea28f131147e09c464a05f8"
+                == "7c0bb406caf81b0ba413ce7d4c6b9d7f70d0a53f14e31b4363d73025b752829e"
         );
         let archive = recovery::backup(&source, pg_bin).await?;
         let ledger = Ledger::connect_operator(&source.url, true).await?;
@@ -948,6 +952,88 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
     .await;
     source.close().await?;
     restored.close().await?;
+    result
+}
+
+/// #708 from a 2.x.x source: one program paid under two labels that differ
+/// only in case, one chain, as 2.x writes it. 2.x's validator sums each
+/// label apart and reports five of its seven rows; the recovery summary
+/// follows the program and passes the source. Once migrated, the validator
+/// reports nothing, the summary is the source's, and every balance and
+/// per-label summary row is unchanged. A real break under either label
+/// still fails the migrated validator and the summary.
+#[tokio::test]
+async fn a_2x_program_paid_under_case_labels_migrates_clean_and_summarizes_as_its_source(
+) -> Result<()> {
+    let Some(inputs) = gate::inputs(
+        gate::site!(),
+        &[gate::Input::DatabaseUrl, gate::Input::PgBinDir],
+    )?
+    else {
+        return Ok(());
+    };
+    let pg_bin = std::path::Path::new(&inputs[1]);
+    let source = recovery::Database::open(&inputs[0]).await?;
+    let result = async {
+        let artifacts_dir = tempfile::tempdir()?;
+        recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        case_labels::seed(&source.pool).await?;
+        let found = case_labels::findings(&source.pool).await?;
+        ensure!(
+            found == case_labels::label_rule_findings(),
+            "2.x's rule: {found:?}"
+        );
+        let report = case_labels::report(&source.pool).await?;
+        ensure!(report == (5, 0), "2.x's report: {report:?}");
+        let balances = case_labels::balances(&source.pool).await?;
+        let source_evidence = recovery::evidence(&source, pg_bin).await?;
+        ensure!(source_evidence["carry_forward_integrity"]["mismatch_count"] == 0);
+        ensure!(source_evidence["records"]["active_carry"]["count"] == 10);
+
+        let ledger = Ledger::connect_operator(&source.url, true).await?;
+        let migrated = async {
+            let report = case_labels::report(&source.pool).await?;
+            ensure!(report == (0, 0), "025's report: {report:?}");
+            ensure!(
+                recovery::evidence(&source, pg_bin).await? == source_evidence,
+                "the migrated summary differs from the source's"
+            );
+            ensure!(
+                case_labels::balances(&source.pool).await? == balances,
+                "a balance moved"
+            );
+            for height in [case_labels::LAST_LOWER, case_labels::LAST_UPPER] {
+                case_labels::shift(&source.pool, height, 1).await?;
+                let found = case_labels::findings(&source.pool).await?;
+                ensure!(
+                    found
+                        == [(
+                            height,
+                            case_labels::label(height).to_owned(),
+                            case_labels::ALL_FIELDS.to_owned()
+                        )],
+                    "a break at {height}: {found:?}"
+                );
+                let refused = recovery::evidence(&source, pg_bin)
+                    .await
+                    .err()
+                    .with_context(|| format!("the summary passed a break at {height}"))?;
+                ensure!(
+                    format!("{refused:#}")
+                        .contains("1 legacy row(s) break their payout program's chain"),
+                    "{refused:#}"
+                );
+                case_labels::shift(&source.pool, height, -1).await?;
+            }
+            ensure!(recovery::evidence(&source, pg_bin).await? == source_evidence);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        ledger.pool.close().await;
+        migrated
+    }
+    .await;
+    source.close().await?;
     result
 }
 

@@ -1,4 +1,5 @@
 """Fail closed on incomplete or inconsistent accounting reconciliation exports."""
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -21,6 +22,19 @@ def closing(**overrides):
     return [record("integrity", report), record("complete", True)]
 
 
+def carry(seq, height, label, program, *, gross, prior, onchain=0):
+    """An active carry row as the export writes it, consistent in itself."""
+    candidate = prior + gross
+    return {
+        "carry_forward_seq": seq, "block_hash": f"b{height}", "block_height": height,
+        "recipient_id": label, "order_key": label, "p2mr_program_hex": program,
+        "gross_amount_sats": gross, "prior_balance_sats": str(prior),
+        "candidate_balance_sats": str(candidate), "onchain_amount_sats": onchain,
+        "settlement_fee_sats": 0, "carry_forward_balance_sats": str(candidate - onchain),
+        "action": "onchain" if onchain else "accrued", "maturity_state": "mature",
+    }
+
+
 class RecoveryEvidenceTests(unittest.TestCase):
     def test_empty_history_has_legacy_zero_head(self):
         report = module.summarize(iter(closing()))
@@ -28,12 +42,114 @@ class RecoveryEvidenceTests(unittest.TestCase):
         self.assertEqual(report["accepted_shares"], 0)
 
     def test_legacy_head_keeps_ascii_escaping_for_unicode_recipients(self):
-        rows = [record("active_carry", {"recipient_id": "Zoë🔑", "prior_balance_sats": "123"})]
-        report = module.summarize(iter(rows + closing(checked_active_rows=1)))
-        # Pinned from the legacy escaped bytes, including the UTF-16 surrogate
-        # pair for the key emoji; emitting raw UTF-8 produces a different head.
+        row = carry(1, 1, "Zoë🔑", "aa", gross=123, prior=0)
+        report = module.summarize(iter([record("active_carry", row)] + closing(checked_active_rows=1)))
+        # The legacy escaped bytes, with the UTF-16 surrogate pair for the key
+        # emoji; emitting raw UTF-8 produces a different head.
+        legacy = (b'{"action":"accrued","block_hash":"b1","block_height":1,'
+                  b'"candidate_balance_sats":"123","carry_forward_balance_sats":"123",'
+                  b'"carry_forward_seq":1,"gross_amount_sats":123,"maturity_state":"mature",'
+                  b'"onchain_amount_sats":0,"order_key":"Zo\\u00eb\\ud83d\\udd11",'
+                  b'"p2mr_program_hex":"aa","prior_balance_sats":"0",'
+                  b'"recipient_id":"Zo\\u00eb\\ud83d\\udd11","settlement_fee_sats":0}')
         self.assertEqual(report["audit_head_sha256"],
-                         "a93f3b26140a6a5e39f4b67f5925b56767196b50aa9823eb4da178e5534c6925")
+                         hashlib.sha256(bytes(32) + legacy).hexdigest())
+        raw = legacy.replace(b"Zo\\u00eb\\ud83d\\udd11", "Zoë🔑".encode())
+        self.assertNotEqual(report["audit_head_sha256"],
+                            hashlib.sha256(bytes(32) + raw).hexdigest())
+
+    def test_legacy_chain_runs_per_payout_program_across_case_labels(self):
+        # Union's shape (#708): one program, an uppercase label carrying the
+        # balance a lowercase label accrued, interleaved by height, one row
+        # per program and block.
+        upper, lower = "QB1ZABC", "qb1zabc"
+        rows = [
+            carry(1, 10, lower, "aa", gross=100, prior=0, onchain=0),
+            carry(2, 11, upper, "aa", gross=50, prior=100, onchain=120),
+            carry(3, 12, lower, "aa", gross=7, prior=30, onchain=0),
+            carry(4, 13, upper, "aa", gross=0, prior=37, onchain=0),
+            carry(5, 13, "other", "bb", gross=9, prior=0, onchain=0),
+        ]
+        lines = [record("active_carry", row) for row in rows]
+        # A 2.x validator partitions by label, so it lists the three rows
+        # whose label partition sum differs; 025's program rule lists none.
+        label_rule = [{"carry_forward_seq": seq, "block_hash": f"b{height}"}
+                      for seq, height in ((2, 11), (3, 12), (4, 13))]
+        notes = []
+        source = module.summarize(iter(lines + closing(
+            checked_active_rows=5, mismatch_count=3, mismatches=label_rule)), notes)
+        migrated = module.summarize(iter(lines + closing(checked_active_rows=5)))
+        self.assertEqual(source, migrated)
+        self.assertEqual(source["carry_forward_integrity"]["mismatch_count"], 0)
+        self.assertEqual(source["carry_forward_integrity"]["mismatches"], [])
+        self.assertIn("#708", notes[0])
+        # A legacy finding the per-label rule does not make there is not
+        # cleared: the first row starts both chains at zero.
+        for unexplained in ({"carry_forward_seq": 1, "block_hash": "b10"},
+                            {"carry_forward_seq": 5, "block_hash": "b13"}):
+            with self.subTest(finding=unexplained), self.assertRaisesRegex(ValueError, "no chain rule"):
+                module.summarize(iter(lines + closing(
+                    checked_active_rows=5, mismatch_count=4, mismatches=label_rule + [unexplained])))
+
+    def test_a_clean_report_is_summarized_as_the_database_wrote_it(self):
+        report = {"schema": "qbit.prism.carry-forward-integrity.v1", "checked_active_rows": 1,
+                  "mismatch_count": 0, "current_drift_count": 0, "current_drift": [], "mismatches": []}
+        row = record("active_carry", carry(1, 10, "alice", "aa", gross=1, prior=0))
+        summary = module.summarize(iter([row, record("integrity", report), record("complete", True)]))
+        self.assertEqual(summary["carry_forward_integrity"], report)
+
+    def test_malformed_reports_and_amounts_fail_closed(self):
+        row = carry(1, 10, "alice", "aa", gross=1, prior=0)
+        for lines in (
+            [record("integrity", [0]), record("complete", True)],
+            [record("active_carry", row)] + closing(checked_active_rows=1, mismatch_count=1, mismatches=[1]),
+            [record("active_carry", row | {"prior_balance_sats": " 0"})] + closing(checked_active_rows=1),
+            [record("active_carry", row | {"carry_forward_balance_sats": "0_001"})]
+            + closing(checked_active_rows=1),
+        ):
+            with self.subTest(lines=lines), self.assertRaises(ValueError):
+                module.summarize(iter(lines))
+
+    def test_a_real_legacy_chain_break_fails_in_any_label(self):
+        for field, value in (("prior_balance_sats", "99"), ("candidate_balance_sats", "8"),
+                             ("carry_forward_balance_sats", "8")):
+            rows = [carry(1, 10, "qb1zabc", "aa", gross=100, prior=0),
+                    carry(2, 11, "QB1ZABC", "aa", gross=0, prior=100) | {field: value}]
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "payout program"):
+                module.summarize(iter([record("active_carry", row) for row in rows]
+                                      + closing(checked_active_rows=2)))
+
+    def test_as_issued_findings_still_fail(self):
+        marked = record("blocks", {"block_hash": "b11", "as_issued_audit_sha256": "ab" * 32})
+        row = record("active_carry", carry(1, 11, "alice", "aa", gross=5, prior=0))
+        for finding in ({"carry_forward_seq": 1, "block_hash": "b11"},
+                        {"carry_forward_seq": None, "block_hash": "b11"},
+                        {"carry_forward_seq": None, "block_hash": "unmarked"}):
+            with self.subTest(finding=finding), self.assertRaisesRegex(ValueError, "as-issued"):
+                module.summarize(iter([marked, row] + closing(
+                    checked_active_rows=1, mismatch_count=1, mismatches=[finding])))
+
+    def test_marked_rows_answer_to_their_manifest_not_the_running_chain(self):
+        # A divergent landing (#478) carries its manifest's prior, whatever
+        # the canonical balance was: the database's manifest rule judges it.
+        marked = record("blocks", {"block_hash": "b11", "as_issued_audit_sha256": "ab" * 32})
+        rows = [carry(1, 10, "alice", "aa", gross=100, prior=0),
+                carry(2, 11, "alice", "aa", gross=10, prior=40)]
+        lines = [marked] + [record("active_carry", row) for row in rows]
+        report = module.summarize(iter(lines + closing(checked_active_rows=2)))
+        self.assertEqual(report["records"]["active_carry"]["count"], 2)
+
+    def test_an_incomplete_mismatch_list_and_disordered_records_fail(self):
+        row = record("active_carry", carry(1, 10, "alice", "aa", gross=1, prior=0))
+        later = record("active_carry", carry(2, 11, "alice", "aa", gross=1, prior=1))
+        for lines in (
+            [row] + closing(checked_active_rows=1, mismatch_count=2,
+                            mismatches=[{"carry_forward_seq": 1, "block_hash": "b10"}]),
+            [later, row] + closing(checked_active_rows=2),
+            [row, record("blocks", {"block_hash": "b9"})] + closing(checked_active_rows=1),
+        ):
+            with self.subTest(lines=lines), self.assertRaises(ValueError):
+                module.summarize(iter(lines))
 
     def test_interrupted_exports_and_trailing_records_fail(self):
         for lines in ([], closing()[:-1], [record("complete", True)], closing() * 2):
