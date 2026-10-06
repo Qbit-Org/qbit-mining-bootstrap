@@ -18,7 +18,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 | L0 existing CI | `ci.yml`, every PR and every push to `main`, `1.x.x`, `2.x.x`, `3.x.x` | `pr` | running, required |
 | L1 E2E smoke | `ci.yml`'s `prism-native-postgres` shards | `pr` | running, required |
 | L2 nightly load | `prism-load-nightly.yml`: `run`, `bridging`, `live-nightly`, `stratum-fuzz`, `evidence` | `nightly`, `dispatch` | running; trend rows and a report-only regression rule with provisional thresholds (#551); repeats not yet (#549) |
-| L3 production-window matrix | #473's cells as manual presets, by dispatch only | `dispatch` | **not yet running** (#550) |
+| L3 production-window matrix | `prism-load-l3.yml`: `l3-full` on the version bump, the `release-candidate` label, a `v*` tag and dispatch; `l3-reduced` weekly | `L3` (and `dispatch` for the presets) | running on pull requests and tags; dispatch and the weekly run need the file on `main` |
 | L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#604, #622) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
 | L6 shipped images | `prism-load-nightly.yml`'s `shipped-images` job | `L6` | running |
@@ -26,8 +26,8 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 A GitHub schedule runs only from the default branch's copy of a workflow, and
 only a workflow whose file is on that branch can be dispatched. So each change
 to a lane lands on `3.x.x` first and is then mirrored to `main`. The schedules
-build and test `3.x.x`. None of the lanes in `prism-load-nightly.yml` is a
-required check.
+build and test `3.x.x`. None of the lanes in `prism-load-nightly.yml` or
+`prism-load-l3.yml` is a required check.
 
 ## L0: existing CI
 
@@ -271,12 +271,74 @@ run-to-run and VM-to-VM spread, and the runner class chosen for each lane.
 
 ## L3: production-window matrix
 
-**Not yet running; owner #550.** Today #473's other cells
-(`throughput-{200k,400k,500k}-window-*`, 16 vCPU) are `manual` presets, and
-only a dispatch runs them (manifest lane `dispatch`). #550 makes them a
-matrix. The full matrix runs on the version-bump PR, the `v*` tag and the
-`release-candidate` label; a reduced matrix runs weekly. Its correctness rows
-count toward #291. Its rates are not D1 verdicts.
+**Runs:** `prism-load-l3.yml` (#550). The suites are checked in at
+`crates/qbit-prism-load/presets/suites.toml`, separate from each preset's
+`schedule`, so a preset can be nightly and in L3 at once:
+
+| Suite | Presets | Repeats | Runner | When |
+|---|---|---|---|---|
+| `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, `throughput-400k-window-2fe-async-3-blocks`, `dense-cadence-400k-window-{1,2}fe-async`, 500k fe1/2/4 | 3 (33 jobs) | 32 vCPU | the version-bump PR, `release-candidate`, a `v*` tag, dispatch |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async | 1 | 32 vCPU | Monday 06:13 UTC on `3.x.x`, dispatch |
+
+The runner is the 32 vCPU class until #542 picks one per lane. The triggers:
+
+- **The version bump:** a PR into `3.x.x` or `main` that changes `VERSION`,
+  from this repository, on every push. The `changes` job checks the PR's file
+  list. A trigger-level `paths` filter would also swallow the label event.
+- **`release-candidate`:** a maintainer applying the label to a PR into
+  `3.x.x` or `main`, including a fork's. As with `run-load`, only the
+  `labeled` event starts it.
+- **A `v*` tag**, on either line. The tag first looks for the newest finished
+  same-repository PR run of `l3-full` whose verdict is complete for the tagged
+  commit's tree (`git rev-parse HEAD^{tree}`, recorded by the plan job). If it
+  finds one, it promotes it: it carries that run's tables and verdict, links
+  the run, and fails if that run failed. Otherwise it runs the full suite
+  (`scripts/prism_l3_promote.py`). A lookup that fails reruns the suite. A
+  tag reads the workflow file at the tagged commit, so a tag cut before this
+  file reached its line starts nothing.
+- **Dispatch:** `suite` and `ref`, or `tag_dry_run`, which acts as a tag push
+  on `ref` without pushing a tag. Like every dispatch, it needs the file on
+  `main`.
+- **Weekly:** `l3-reduced` on `3.x.x`. Like every schedule it runs from
+  `main`'s copy of the file.
+
+The workflow follows L2's pattern. The plan job pins one commit. One job
+builds the release binaries once. Each preset repeat runs in its own job,
+through `prism-load-run.sh` and held to its preset's gates, with at most eight
+jobs at once. Then the `collate` job runs `qbit-prism-load-compare --collate`
+(#511's summarizer) and writes #473's document tables to the job summary.
+They have one table per D1 phase, with a row per preset: its sessions,
+window, frontends, replication and plan, then #511's cells (n, target,
+achieved, shortfall, refused valid shares, unanswered submits, ACK p50 and
+p99 against the limit, `ORDER_LOCK` waiters, the D1 verdict). A table of each
+preset's own gates follows. The job also writes a verdict:
+
+- `complete`: every planned run reached its gate;
+- `passed`: every planned run passed it.
+
+A planned run whose job left no artifact, whose report names another commit,
+or which ran a preset file other than the checked-in one is listed and fails
+the suite. It is never dropped. A failed build lists every run as never run
+and writes no verdict. Concurrency is per PR and label (a new push cancels
+the older push's run), per tag, and one group for the weekly run. The
+workflow is never a required check. Cost: `l3-full` is about 660 runner-minutes
+(about $42) a release candidate, and `l3-reduced` about 60 runner-minutes a week.
+
+**Proves:** on one commit and one runner class, #447's production-window
+cells, including the found-block path at 400k and dense cadence, complete,
+reconcile exactly, lose no acknowledged share and hold their gates, with
+three repeats for each cell. Its correctness rows count toward #291. A tag
+has L3 evidence for exactly its tree.
+
+**Does not prove:**
+
+- **A D1 verdict** (#487 decision 5). The D1 column applies #473's rule on
+  the CI runner class, not on the rehearsal host.
+- **A regression.** Nothing compares against a baseline. The A/B release
+  benchmark on the reference host (#511, [prism-release-benchmark.md](prism-release-benchmark.md))
+  and #551's trend do that.
+- **#473's flush and build controls** and the 20k dense attempt (exit 6):
+  they are not presets.
 
 ## L4: real-node scenarios
 
@@ -402,6 +464,20 @@ To run the nightly set against a PR, apply the `run-load` label. A later push
 needs the label applied again. The runner probe is dispatched the same way
 (`gh workflow run prism-load-runner-probe.yml -f classes=8,16`).
 
+The production-window matrix is dispatched from its own workflow, once the
+file is on `main`:
+
+```sh
+# The full suite on a ref.
+gh workflow run prism-load-l3.yml -f suite=l3-full -f ref=my-branch
+
+# What a v* tag on this ref would do: promote a matching PR run, or run l3-full.
+gh workflow run prism-load-l3.yml -f ref=v3.0.0-rc1 -f tag_dry_run=true
+```
+
+To run `l3-full` on a PR, apply `release-candidate`. A PR that changes
+`VERSION` runs it on every push.
+
 ## Reading a job summary and `gate.md`
 
 A preset job's summary starts with `### <preset> on <runner>` and the commit.
@@ -447,6 +523,9 @@ defines each field.
 | `prism-load-bridging` | both runs' directories (`fake/`, `real/`) and `bridge-row.json` | 90 days | running |
 | `prism-live-nightly`, `prism-live-weekly`, `prism-stratum-fuzz`, `prism-shipped-images` | gate manifests and test logs; fuzz logs and crashing inputs; `l6-report.json` and the Compose logs | 30 days | running |
 | `prism-load-tested-commit` | the commit the last nightly carried to a verdict (the guard reads it) | 90 days | running |
+| `prism-l3-run-<preset>-r<repeat>` | one L3 run's directory, as `prism-load-<preset>` | 90 days | running |
+| `prism-l3-plan`, `prism-l3-collated` | the plan (commit, tree, matrix) and a tag's promotion decision; the collated tables, `verdict.json` and, on a promoted tag, `promotion.json` | 90 days | running |
+| `prism-l3-verdict-<tree>` | the verdict a tag's promotion looks up by tree | 90 days | running |
 | `prism-load-trend-<preset>` | the preset run's trend row (every event) | 7 days | running |
 | `prism-load-regression-verdict` | the regression rule's verdict JSON and summary | 90 days | running |
 | `ci-evidence` branch | `trend/<lane>/YYYY-MM.jsonl`: one JSON line per preset run, job outcome, missing preset or later promotion, from scheduled runs (and `v*` tag runs once L3's tag hook lands) | permanent | running (#551) |

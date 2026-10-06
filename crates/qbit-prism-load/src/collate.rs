@@ -427,6 +427,7 @@ pub fn collate(
                 reference: plan.reference.clone(),
                 commit: plan.commit.clone(),
                 dropped_legacy_flags: Vec::new(),
+                predates_report_fields: Vec::new(),
             };
             let mine: Vec<&LoadedRun> = runs
                 .iter()
