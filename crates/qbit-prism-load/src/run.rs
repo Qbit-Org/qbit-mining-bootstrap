@@ -1417,7 +1417,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     let mut frontends: Vec<Frontend> = Vec::new();
     let mut blocked: Vec<BlockedLog> = Vec::new();
     for index in 0..args.frontends {
-        let instance_id = format!("load-fe-{index}");
+        let instance_id = frontend_instance_id(index);
         let spec = FrontendSpec {
             index,
             database_url: with_application_name(&proxied_url, &instance_id),
@@ -1577,15 +1577,17 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // Every session must hold work before the first phase starts. This is
     // read per session, not as a count of connection events: a session that
     // dropped and reconnected while another was still in its handshake would
-    // otherwise satisfy the total on the other's behalf.
+    // otherwise satisfy the total on the other's behalf. The count it read is
+    // reported (`client.sessions_holding_work_at_start`), since
+    // `client.connects` counts reconnects and rentals too.
     let work_deadline = Instant::now() + Duration::from_secs(args.work_timeout);
-    loop {
+    let sessions_holding_work_at_start = loop {
         let connected = collected
             .lock()
             .expect("collector lock")
             .sessions_holding_work();
         if connected >= args.sessions {
-            break;
+            break connected;
         }
         if Instant::now() >= work_deadline {
             for child in &frontends {
@@ -1618,7 +1620,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
     // Every session has its first job, and with it the difficulty its
     // frontend advertised. A frontend that advertised something other than
     // the configured value has already contradicted the premise every later
@@ -2740,6 +2742,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "failures_note": "every failure is also in its phase's offer_accounting, which \
                               says what it does to that phase's dispatched count",
             "connects": collected.connects,
+            "sessions_holding_work_at_start": sessions_holding_work_at_start,
             "disconnects": collected.disconnects.len(),
         },
         "reconnects": reconnect_report(&collected),
@@ -3151,6 +3154,20 @@ pub async fn drive_phase(
     .await
 }
 
+/// The instance id the harness gives its `index`-th frontend, which names
+/// it in the side report.
+pub fn frontend_instance_id(index: usize) -> String {
+    format!("load-fe-{index}")
+}
+
+/// When the scheduled blocks of a phase that holds `count` of them are sent,
+/// in seconds from the phase's start: evenly spaced through its `seconds`.
+pub fn scheduled_block_offsets(seconds: f64, count: usize) -> Vec<f64> {
+    (0..count)
+        .map(|index| seconds * (index as f64 + 1.0) / (count as f64 + 1.0))
+        .collect()
+}
+
 /// Whether `plan` is the phase that holds the run's scheduled blocks: the
 /// tips plan's warm-up is its only phase, and every other plan lands them in
 /// `steady_state` (#547). The rule is on the phase's kind, so a soak's
@@ -3237,7 +3254,8 @@ pub async fn drive_phase_with_population(
     } else {
         None
     };
-    let restart_at = (plan.reconnects && plan.restart_frontend && args.frontends >= 2)
+    let restart_at = plan
+        .restarts_a_frontend(args.frontends)
         .then(|| duration.as_secs_f64() / 3.0);
     let mut next_reconnect = reconnect_interval.unwrap_or(f64::INFINITY);
     let mut reconnect_cursor = 0usize;
@@ -3254,10 +3272,7 @@ pub async fn drive_phase_with_population(
     let dense_run = args.cadence()?.is_dense();
     let block_times: Vec<f64> =
         if holds_scheduled_blocks(args, plan)? && !dense_run && *remaining_blocks > 0 {
-            let count = *remaining_blocks;
-            (0..count)
-                .map(|index| duration.as_secs_f64() * (index as f64 + 1.0) / (count as f64 + 1.0))
-                .collect()
+            scheduled_block_offsets(duration.as_secs_f64(), *remaining_blocks)
         } else {
             Vec::new()
         };

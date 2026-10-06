@@ -19,6 +19,12 @@ Freeze these inputs before building:
 - explicit qbit and Bitcoin payout addresses for every enabled mining lane
 - the PRISM Postgres, signing, audit, difficulty, and CTV policies
 
+Before tagging, run the PRISM release benchmark: the `throughput-20k-window-1fe` and
+`throughput-400k-window-1fe-async` presets, previous release against the candidate, on the
+reference host, with `scripts/prism_load_ab.py`. Attach both `comparison.md`
+files to the release PR, and do not tag on a FAIL without a written
+disposition ([`prism-release-benchmark.md`](prism-release-benchmark.md)).
+
 Every deployed container must be an immutable, digest-qualified release
 artifact. Set all of these to references of the form
 `registry.example/image@sha256:<64 lowercase hex characters>`:

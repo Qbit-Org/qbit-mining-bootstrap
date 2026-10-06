@@ -238,26 +238,7 @@ impl Preset {
     /// The preset's flags as command-line words: a `true` flag bare, a
     /// `false` or `null` one omitted, anything else as `--flag value`.
     pub fn argv(&self) -> Result<Vec<String>> {
-        let mut words = Vec::new();
-        for (flag, value) in &self.args {
-            match value {
-                Value::Bool(true) => words.push(flag.clone()),
-                Value::Bool(false) | Value::Null => {}
-                Value::String(text) => {
-                    words.push(flag.clone());
-                    words.push(text.clone());
-                }
-                Value::Number(number) => {
-                    words.push(flag.clone());
-                    words.push(number.to_string());
-                }
-                other => bail!(
-                    "preset {}: {flag} is {other}, not a string, number, boolean or null",
-                    self.name
-                ),
-            }
-        }
-        Ok(words)
+        argv_of(&self.name, &self.args)
     }
 
     /// Every result flag the harness has, pinned; nothing else.
@@ -328,6 +309,30 @@ impl Preset {
         }
         Ok(())
     }
+}
+
+/// A preset's flags as command-line words: a `true` flag bare, a `false` or
+/// `null` one omitted, anything else as `--flag value`.
+pub fn argv_of(name: &str, args: &BTreeMap<String, Value>) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    for (flag, value) in args {
+        match value {
+            Value::Bool(true) => words.push(flag.clone()),
+            Value::Bool(false) | Value::Null => {}
+            Value::String(text) => {
+                words.push(flag.clone());
+                words.push(text.clone());
+            }
+            Value::Number(number) => {
+                words.push(flag.clone());
+                words.push(number.to_string());
+            }
+            other => {
+                bail!("preset {name}: {flag} is {other}, not a string, number, boolean or null")
+            }
+        }
+    }
+    Ok(words)
 }
 
 /// Every long flag of [`crate::cli::Args`] that is not operational.
