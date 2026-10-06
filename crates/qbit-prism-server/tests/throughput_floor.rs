@@ -1189,6 +1189,12 @@ async fn seed_and_run(db: &Database, config: &Config, seed: &Ledger) -> Result<M
 
     for &appenders in &config.appenders {
         let result = measure_level(config.retry_below_floor, async |suffix| {
+            if !suffix.is_empty() {
+                println!(
+                    "throughput_floor: {appenders} appender(s): the first pass fell below the \
+                     floor; measuring the level once more"
+                );
+            }
             let mut ledgers = Vec::new();
             for index in 0..appenders {
                 let ledger = Ledger::connect(
@@ -1298,11 +1304,6 @@ async fn measure_level(
     if first.passed_minimum || !retry {
         return Ok(first);
     }
-    println!(
-        "throughput_floor: {} appender(s): {:.1} shares/s is below the floor; measuring the \
-         level once more",
-        first.appenders, first.shares_per_second
-    );
     let mut second = pass("-retry").await.with_context(|| {
         format!(
             "measuring the level of {} appender(s) a second time, after a first pass at {:.1} \
