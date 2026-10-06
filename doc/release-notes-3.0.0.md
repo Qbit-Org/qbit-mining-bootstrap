@@ -4,7 +4,8 @@
 migration decision required by #287. #291 must complete the release notes and
 rehearse the cutover and isolated restore on production-sized history, including
 restore and `import-audits` timings, before approving a production rollout.
-See [development-line status](release-notes-3.x.x-development-line.md).
+See [development-line status](release-notes-3.x.x-development-line.md) and
+the first release candidate's notes, [3.0.0-rc.1](release-notes-3.0.0-rc.1.md).
 
 ## Migration and recovery (D5)
 
