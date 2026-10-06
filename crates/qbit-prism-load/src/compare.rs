@@ -688,35 +688,53 @@ pub const SEED_SHARE_BYTES_TOLERANCE: f64 = 0.05;
 pub const AGREED_REPORT_FIELDS: &[(&str, &str)] =
     &[("--window-shares", "/window/ledger_window_shares_at_start")];
 
-/// Preset flags that set how many entries a report list holds, and the list:
-/// a counted run must report exactly the pinned count (every harness since
-/// #271 lists its external tips).
-pub const PINNED_REPORT_COUNTS: &[(&str, &str)] =
-    &[("--external-tips", "/time_to_usable_work/tips")];
+/// Preset flags that set how many entries a report list holds, the list, and
+/// the key that names each entry: a counted run must report exactly the
+/// pinned count, each entry naming a distinct one (every harness since #271
+/// lists its external tips by hash).
+pub const PINNED_REPORT_COUNTS: &[(&str, &str, &str)] =
+    &[("--external-tips", "/time_to_usable_work/tips", "tip")];
+
+/// How many distinct values of `key` the entries name, or `None` when an
+/// entry names none. A list padded with one entry repeated holds the planned
+/// number of entries but drove fewer, so an entry counts once, by its name.
+fn distinct_named<'a>(entries: impl IntoIterator<Item = &'a Value>, key: &str) -> Option<usize> {
+    let mut names = std::collections::BTreeSet::new();
+    for entry in entries {
+        names.insert(entry[key].as_str()?);
+    }
+    Some(names.len())
+}
 
 /// Why a counted run's list at `pointer` does not hold `flag`'s pinned
-/// number of entries, or `None` when every one does.
+/// number of entries, each naming a distinct `key`, or `None` when every one
+/// does.
 fn pinned_count_mismatch(
     runs: &[LoadedRun],
     flag: &str,
     pointer: &str,
+    key: &str,
     pinned: Option<&Value>,
 ) -> Option<String> {
     let wanted = pinned.and_then(Value::as_u64)?;
     for run in runs.iter().filter(|r| r.excluded.is_none()) {
-        let count = run
+        let list = run
             .report
             .as_ref()
             .and_then(|r| r.pointer(pointer))
-            .and_then(Value::as_array)
-            .map(Vec::len);
-        match count {
-            Some(count) if count as u64 == wanted => {}
-            Some(count) => {
+            .and_then(Value::as_array);
+        match list.map(|list| (list.len(), distinct_named(list, key))) {
+            Some((count, Some(distinct))) if count as u64 == wanted && distinct == count => {}
+            Some((count, distinct)) => {
                 return Some(format!(
                     "**the runs did not drive the pinned workload**: {} reports {count} entries \
-                     at `{pointer}`, not the pinned `{flag}` {wanted}",
-                    run.run.id
+                     at `{pointer}`{}, not the pinned `{flag}` {wanted}",
+                    run.run.id,
+                    match distinct {
+                        Some(distinct) if distinct == count => String::new(),
+                        Some(distinct) => format!(" naming {distinct} distinct `{key}`"),
+                        None => format!(", one naming no `{key}`"),
+                    }
                 ))
             }
             None => {
@@ -795,8 +813,9 @@ pub fn expected_phases(pinned: &BTreeMap<String, Value>) -> Result<Vec<crate::cl
 /// Why a counted run's report of `phase` does not match the preset's plan
 /// for it, or `None` when it does: the target rate and whether the phase is
 /// in the artifact exactly, the configured database delay (seen to be paid)
-/// and the frontend restarts exactly (with `frontends` running), and the
-/// length within [`DURATION_TOLERANCE`] of the planned seconds.
+/// and the frontend restarts exactly (with `frontends` running), the phase
+/// reported as completed, and the length within [`DURATION_TOLERANCE`] of
+/// the planned seconds.
 fn off_plan(
     id: &str,
     reported: &Value,
@@ -812,6 +831,16 @@ fn off_plan(
             "{id} ran `{name}` at {} shares/s, not the planned {}",
             number(target, None),
             number(plan.rate, None)
+        ));
+    }
+    // A phase an abort cut short says so (`completed: false`, in every
+    // harness since #271), and its figures cover only the part that ran. Cut
+    // in its last 5% it would still be within the length tolerance, and a
+    // run whose exit code missed the abort would still count.
+    if reported["completed"].as_bool() != Some(true) {
+        return Some(format!(
+            "{id} reports `{name}` as completed {}, so it ran only part of the planned phase",
+            reported["completed"]
         ));
     }
     let seconds = plan.seconds as f64;
@@ -1237,28 +1266,30 @@ fn churn_unrealised(
                 .and_then(|c| c.pointer(pointer))
                 .and_then(|v| v.as_u64().or_else(|| v.as_array().map(|a| a.len() as u64)))
         };
-        for (what, pointer, planned) in [
+        // Each churn tip counts once, by its hash: a list padded with one tip
+        // repeated holds the plan's length but delivered fewer.
+        let tips = churn
+            .and_then(|c| c.pointer("/tip_delivery/tips"))
+            .and_then(Value::as_array)
+            .and_then(|tips| distinct_named(tips, "tip"))
+            .map(|n| n as u64);
+        for (what, realised, planned) in [
             (
                 "rentals spawned",
-                "/realised/rentals_spawned",
+                count("/realised/rentals_spawned"),
                 plan.rentals.len(),
             ),
             (
                 "rentals departed",
-                "/realised/rentals_departed",
+                count("/realised/rentals_departed"),
                 plan.rentals
                     .iter()
                     .filter(|r| r.depart_at.is_some())
                     .count(),
             ),
-            ("storms", "/realised/storms", plan.storms.len()),
-            (
-                "churn tips delivered",
-                "/tip_delivery/tips",
-                plan.tips.len(),
-            ),
+            ("storms", count("/realised/storms"), plan.storms.len()),
+            ("distinct churn tips delivered", tips, plan.tips.len()),
         ] {
-            let realised = count(pointer);
             if realised != Some(planned as u64) {
                 return Ok(Some(format!(
                     "**the runs did not drive the pinned workload**: {} reports {} {what}, \
@@ -2081,24 +2112,38 @@ pub fn compare(
             break;
         }
     }
-    // Every pinned session connected: the harness starts no phase until each
-    // of `--sessions` holds work, and `client.connects` counts each of those
-    // connections, which reconnects and rentals only add to (every harness
-    // since #271). `topology.sessions` alone only echoes the flag.
+    // Every pinned session held work before the load began: the harness
+    // starts no phase until each of `--sessions` holds work at once, and
+    // reports the distinct count its gate read
+    // (`client.sessions_holding_work_at_start`). `client.connects` counts
+    // connection events, which reconnects and rentals add to, so a run of
+    // fewer sessions with reconnects could reach it. It stands in only for a
+    // harness older than the count (#511), whose reports carry `connects`
+    // alone (every harness since #271); `tests/load_smoke.rs` pins the count,
+    // so a newer harness cannot drop it unnoticed. `topology.sessions` alone
+    // only echoes the flag.
     if let Some(sessions) = pinned.get("--sessions").and_then(Value::as_u64) {
         for run in runs.iter().filter(|r| r.excluded.is_none()) {
-            let connects = run
-                .report
-                .as_ref()
-                .and_then(|r| r.pointer("/client/connects"))
-                .and_then(Value::as_u64);
-            if !connects.is_some_and(|n| n >= sessions) {
+            let client = run.report.as_ref().map(|r| &r["client"]);
+            let held = client.and_then(|c| c["sessions_holding_work_at_start"].as_u64());
+            let connects = client.and_then(|c| c["connects"].as_u64());
+            let why = match held {
+                Some(held) if held >= sessions => None,
+                Some(held) => Some(format!(
+                    "held work on {held} distinct sessions when its load began"
+                )),
+                None if connects.is_some_and(|n| n >= sessions) => None,
+                None => Some(format!(
+                    "made {} connections and reports no count of sessions holding work",
+                    connects.map_or("an unreported number of".into(), |n| n.to_string())
+                )),
+            };
+            if let Some(why) = why {
                 passed = false;
                 findings.push(format!(
-                    "**the runs did not drive the pinned workload**: {} made {} connections, \
-                     fewer than the pinned `--sessions` {sessions}",
-                    run.run.id,
-                    connects.map_or("an unreported number of".into(), |n| n.to_string())
+                    "**the runs did not drive the pinned workload**: {} {why}, fewer than the \
+                     pinned `--sessions` {sessions}",
+                    run.run.id
                 ));
                 break;
             }
@@ -2244,10 +2289,15 @@ pub fn compare(
             let budget = report
                 .and_then(|r| r.pointer("/dense_cadence/landing_budget"))
                 .and_then(Value::as_u64);
+            // Each accepted block counts once, by its hash: a node answers a
+            // block it already holds as a duplicate, never accepted again.
             let accepted = report
                 .and_then(|r| r.pointer("/node/submissions"))
                 .and_then(Value::as_array)
-                .map(|list| list.iter().filter(|s| s["accepted"] == true).count() as u64);
+                .and_then(|list| {
+                    distinct_named(list.iter().filter(|s| s["accepted"] == true), "block_hash")
+                })
+                .map(|n| n as u64);
             let count =
                 |n: Option<u64>| n.map_or("an unreported number of".into(), |n| n.to_string());
             let why = match slots {
@@ -2414,8 +2464,8 @@ pub fn compare(
             }
         }
     }
-    for (flag, pointer) in PINNED_REPORT_COUNTS {
-        if let Some(why) = pinned_count_mismatch(runs, flag, pointer, pinned.get(*flag)) {
+    for (flag, pointer, key) in PINNED_REPORT_COUNTS {
+        if let Some(why) = pinned_count_mismatch(runs, flag, pointer, key, pinned.get(*flag)) {
             passed = false;
             findings.push(why);
         }

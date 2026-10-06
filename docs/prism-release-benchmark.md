@@ -142,8 +142,8 @@ naming a revision other than its build's is refused rather than pooled.
 Every run is also held to the preset's own gates, as
 `qbit-prism-load-gate` holds a nightly run: reconciliation, durability, and
 any tip-delivery or churn budget the preset sets. Both builds must report the
-same target rate and, within 5%, the same phase length in every phase, and
-every counted run must report every phase any run reported and the
+same target rate and, within 5%, the same phase length in every phase, each
+planned phase reported as completed, and every counted run must report every phase any run reported and the
 preset's pinned frontends, sessions, submits in flight per session, plan,
 window size, replication (observed at entry and after the load) and ACK p99
 limit, with every frontend launched
@@ -159,15 +159,18 @@ fails the comparison rather than passing on less load. The same holds for
 the rest of the planned workload, even when every run agrees: each phase's
 database delay, seen to be paid, and frontend restarts (the reconnect phase's drained restart
 with two or more frontends, the mid-flight kill's relaunch, with submits in
-flight at the kill), the scheduled blocks, each accepted by the node between
-its slot and the next (under
+flight at the kill), the scheduled blocks, each a distinct block accepted by
+the node between its slot and the next (under
 the dense cadence, the pinned landing budget and the landings it schedules),
 each launched frontend by the harness's name for it, the seeded ledger's rows
 (a retargeting node's older history included) and
-average share size, a connection for every pinned session, an external database's endpoint and
+average share size, every pinned session holding work at once when the load
+began (the distinct count the harness's start-up gate read; a harness older
+than that count, a connection for each), an external database's endpoint and
 connection options,
 the completed reconnects,
-the memory floor (every check of it read), a durable database, the
+the memory floor (every check of it read), a durable database, the pinned
+external and churn tips (each a distinct tip), the
 template bits the fake node served after every tip it drove, and the samplers, each sampling at its pinned interval on
 every launched frontend.
 

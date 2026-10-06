@@ -63,6 +63,7 @@ fn plain_phase(
         "name": name,
         "target_rate_shares_per_second": target,
         "duration_seconds": 300.004,
+        "completed": true,
         "offered_rate_shares_per_second": achieved,
         "achieved_rate_shares_per_second": achieved,
         "shortfall": shortfall,
@@ -496,6 +497,78 @@ fn a_build_running_a_phase_for_less_time_fails_though_every_rate_matches() {
 }
 
 #[test]
+fn a_phase_an_abort_cut_short_fails_though_its_length_is_within_tolerance() {
+    let manifest = manifest(288.0);
+    // Aborted in its last 5%, from a run whose exit code missed the abort.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    let steady = &mut runs[1].report.as_mut().unwrap()["phases"][0];
+    steady["completed"] = json!(false);
+    steady["duration_seconds"] = json!(290.0);
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed, "{}", result.markdown);
+    assert!(
+        result
+            .markdown
+            .contains("reports `steady_state` as completed false, so it ran only part"),
+        "{}",
+        result.markdown
+    );
+    // A phase that does not say whether it completed is no better.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    runs[1].report.as_mut().unwrap()["phases"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("completed");
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("reports `warm_up` as completed null"),
+        "{}",
+        result.markdown
+    );
+}
+
+#[test]
+fn fewer_sessions_holding_work_than_pinned_fails_whatever_the_reconnects() {
+    let manifest = manifest(288.0);
+    let with_client = |client: Value| {
+        let mut runs = loaded(&manifest, |_, _| met_steady());
+        for run in runs.iter_mut().filter(|r| r.run.build == "candidate") {
+            run.report.as_mut().unwrap()["client"] = client.clone();
+        }
+        compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap()
+    };
+    // The distinct count decides, not the connection events.
+    let result = with_client(json!({"connects": 2012, "sessions_holding_work_at_start": 2000}));
+    assert!(result.passed, "{}", result.markdown);
+    // 1,988 sessions and the D1 plan's 12 reconnects make 2,000 connections.
+    let result = with_client(json!({"connects": 2000, "sessions_holding_work_at_start": 1988}));
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "held work on 1988 distinct sessions when its load began, fewer than the pinned \
+             `--sessions` 2000"
+        ),
+        "{}",
+        result.markdown
+    );
+    // A harness older than the count (the base's reports here) is held to
+    // its connections.
+    let result = with_client(json!({"connects": 1999}));
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "made 1999 connections and reports no count of sessions holding work, fewer than \
+             the pinned `--sessions` 2000"
+        ),
+        "{}",
+        result.markdown
+    );
+}
+
+#[test]
 fn a_build_held_to_a_limit_other_than_the_pinned_one_fails() {
     let manifest = manifest(288.0);
     let mut runs = loaded(&manifest, |_, _| met_steady());
@@ -646,6 +719,42 @@ fn fewer_tips_or_a_smaller_seeded_share_than_pinned_fails() {
     assert!(result
         .markdown
         .contains("ran `--seed-share-bytes` 100, not 581"));
+}
+
+#[test]
+fn one_tip_listed_as_many_as_pinned_counts_once() {
+    let manifest = manifest(288.0);
+    // One driven tip, among the node's changes, listed three times.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    runs[1].report.as_mut().unwrap()["time_to_usable_work"]["tips"] = json!([
+        {"tip": "e01", "all_sessions_milliseconds": 600.0},
+        {"tip": "e01", "all_sessions_milliseconds": 600.0},
+        {"tip": "e01", "all_sessions_milliseconds": 600.0},
+    ]);
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "reports 3 entries at `/time_to_usable_work/tips` naming 1 distinct `tip`, not the \
+             pinned `--external-tips` 3"
+        ),
+        "{}",
+        result.markdown
+    );
+    // An entry without its hash cannot be told apart from the others.
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    runs[1].report.as_mut().unwrap()["time_to_usable_work"]["tips"][2] =
+        json!({"all_sessions_milliseconds": 800.0});
+    let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
+    assert!(!result.passed);
+    assert!(
+        result.markdown.contains(
+            "reports 3 entries at `/time_to_usable_work/tips`, one naming no `tip`, not the \
+             pinned `--external-tips` 3"
+        ),
+        "{}",
+        result.markdown
+    );
 }
 
 #[test]
@@ -1106,7 +1215,7 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
             + chrono::Duration::milliseconds((seconds * 1000.0) as i64))
         .to_rfc3339()
     };
-    let landed = |accepted: [bool; 2], seconds: [f64; 2]| {
+    let landed_as = |hashes: [&str; 2], accepted: [bool; 2], seconds: [f64; 2]| {
         let mut runs = loaded(&manifest, |_, _| met_steady());
         for run in &mut runs {
             let report = run.report.as_mut().unwrap();
@@ -1115,9 +1224,9 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
             steady["started_at"] = json!(at(0.0));
             steady["ended_at"] = json!(at(300.004));
             report["node"]["submissions"] = json!([
-                {"block_hash": "p01", "accepted": accepted[0], "rejection": null,
+                {"block_hash": hashes[0], "accepted": accepted[0], "rejection": null,
                  "received_at": at(seconds[0])},
-                {"block_hash": "p02", "accepted": accepted[1], "rejection": "parent mismatch",
+                {"block_hash": hashes[1], "accepted": accepted[1], "rejection": "parent mismatch",
                  "received_at": at(seconds[1])},
             ]);
             report["node"]["tip_changes"] =
@@ -1125,9 +1234,21 @@ fn scheduled_blocks_are_held_to_the_pinned_count_even_when_every_run_agrees() {
         }
         compare::compare(&manifest, &runs, &d1_budgets(), &pinned).unwrap()
     };
+    let landed = |accepted, seconds| landed_as(["p01", "p02"], accepted, seconds);
     let result = landed([true, true], [103.3, 200.1]);
     assert!(result.passed, "{}", result.markdown);
     let result = landed([true, false], [103.3, 200.1]);
+    assert!(!result.passed);
+    assert!(
+        result
+            .markdown
+            .contains("landed 1 of its 2 scheduled own blocks"),
+        "{}",
+        result.markdown
+    );
+    // One block accepted twice is one landing: a node answers a block it
+    // already holds as a duplicate.
+    let result = landed_as(["p01", "p01"], [true, true], [103.3, 200.1]);
     assert!(!result.passed);
     assert!(
         result
@@ -1340,6 +1461,11 @@ fn a_churn_phase_that_spawned_fewer_rentals_than_planned_fails() {
         ("/churn/realised/reconnects_completed", json!(0)),
         ("/churn/realised/storms", json!([])),
         ("/churn/tip_delivery/tips", json!([{}])),
+        // The plan's two tips as one tip listed twice.
+        (
+            "/churn/tip_delivery/tips",
+            json!([{"tip": "c00"}, {"tip": "c00"}]),
+        ),
         ("/churn/realised/storms/0/dropped", json!(0)),
         ("/churn/realised/storms/0/dropped", json!(5)),
     ] {
@@ -1739,9 +1865,10 @@ fn fewer_connections_than_pinned_sessions_or_another_pool_fee_fails() {
     let result = compare::compare(&manifest, &runs, &d1_budgets(), &d1_args()).unwrap();
     assert!(!result.passed);
     assert!(
-        result
-            .markdown
-            .contains("made 1012 connections, fewer than the pinned `--sessions` 2000"),
+        result.markdown.contains(
+            "made 1012 connections and reports no count of sessions holding work, fewer than \
+             the pinned `--sessions` 2000"
+        ),
         "{}",
         result.markdown
     );

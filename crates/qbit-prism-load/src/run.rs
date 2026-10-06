@@ -1577,15 +1577,17 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
     // Every session must hold work before the first phase starts. This is
     // read per session, not as a count of connection events: a session that
     // dropped and reconnected while another was still in its handshake would
-    // otherwise satisfy the total on the other's behalf.
+    // otherwise satisfy the total on the other's behalf. The count it read is
+    // reported (`client.sessions_holding_work_at_start`), since
+    // `client.connects` counts reconnects and rentals too.
     let work_deadline = Instant::now() + Duration::from_secs(args.work_timeout);
-    loop {
+    let sessions_holding_work_at_start = loop {
         let connected = collected
             .lock()
             .expect("collector lock")
             .sessions_holding_work();
         if connected >= args.sessions {
-            break;
+            break connected;
         }
         if Instant::now() >= work_deadline {
             for child in &frontends {
@@ -1618,7 +1620,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             .await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
     // Every session has its first job, and with it the difficulty its
     // frontend advertised. A frontend that advertised something other than
     // the configured value has already contradicted the premise every later
@@ -2740,6 +2742,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "failures_note": "every failure is also in its phase's offer_accounting, which \
                               says what it does to that phase's dispatched count",
             "connects": collected.connects,
+            "sessions_holding_work_at_start": sessions_holding_work_at_start,
             "disconnects": collected.disconnects.len(),
         },
         "reconnects": reconnect_report(&collected),

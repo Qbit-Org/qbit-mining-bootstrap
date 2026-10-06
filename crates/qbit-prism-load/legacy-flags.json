@@ -67,6 +67,11 @@
       "introduced": "c99abdd8f60810cf5afc2224ef987126a8f74ac3",
       "why": "Read only by the churn phase."
     },
+    "--ctv-settlement": {
+      "equals": false,
+      "introduced": "3f1fba6bdf895c4dc1ca077726d67f4d9d555db8",
+      "why": "Before #548 the harness launched every frontend with PRISM_CTV_SETTLEMENT_ENABLED=0, so every block paid its miners directly in the coinbase and built no CTV fanout, as a run with the flag off still does."
+    },
     "--faults": {
       "equals": null,
       "introduced": "b7bbbbecf9dc898db8433cc94f4788b7cd40a3ec",

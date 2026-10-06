@@ -392,13 +392,22 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         churn["plan"]["tips_at_seconds"].as_array().map(Vec::len),
         "{churn}"
     );
-    for (flag, pointer) in compare::PINNED_REPORT_COUNTS {
+    for (flag, pointer, key) in compare::PINNED_REPORT_COUNTS {
         let pinned = loaded.args[*flag].as_u64().context("a pinned count")?;
         let listed = report
             .pointer(pointer)
             .and_then(|v| v.as_array())
-            .map(Vec::len);
-        assert_eq!(listed, Some(pinned as usize), "{pointer} for {flag}");
+            .context("a pinned list")?;
+        assert_eq!(listed.len(), pinned as usize, "{pointer} for {flag}");
+        let named: std::collections::BTreeSet<&str> = listed
+            .iter()
+            .filter_map(|entry| entry[*key].as_str())
+            .collect();
+        assert_eq!(
+            named.len(),
+            listed.len(),
+            "{pointer} names a distinct {key}"
+        );
     }
     for frontend in report["frontend_environment"]
         .as_array()
@@ -491,14 +500,20 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             "{change}"
         );
     }
-    // Every pinned session connected at least once.
+    // Every pinned session connected at least once, and all of them held
+    // work at once when the load began: the distinct count the comparator
+    // reads in place of the connection events.
+    let pinned_sessions = loaded.args["--sessions"]
+        .as_u64()
+        .context("pinned sessions")?;
     assert!(
-        report["client"]["connects"].as_u64()
-            >= Some(
-                loaded.args["--sessions"]
-                    .as_u64()
-                    .context("pinned sessions")?
-            ),
+        report["client"]["connects"].as_u64() >= Some(pinned_sessions),
+        "{}",
+        report["client"]
+    );
+    assert_eq!(
+        report["client"]["sessions_holding_work_at_start"].as_u64(),
+        Some(pinned_sessions),
         "{}",
         report["client"]
     );
