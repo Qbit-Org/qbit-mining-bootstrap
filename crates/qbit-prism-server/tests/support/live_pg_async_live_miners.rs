@@ -32,7 +32,10 @@
 //! inside the gap
 //! (including a session opened inside the gap, whose job was issued there):
 //! kept work is either resumed under its original authority or refused
-//! truthfully as stale. A real block on work whose window the promoted
+//! truthfully as stale. The block the gap session solved commits to the lost
+//! window, so it must be refused as stale or land paying only rows the
+//! promoted ledger holds (#619; since #645 it is refused before its offer).
+//! A real block on work whose window the promoted
 //! ledger holds then lands, and its audit, verified against the node's
 //! coinbase, pays exactly a window read independently from the promoted
 //! ledger, which holds sequence numbers lost shares had: no share the
@@ -41,10 +44,7 @@
 //! ledger: accepted means credited exactly once, and a truthful stale
 //! refusal means not credited. A surviving share replayed is a duplicate.
 //! Once the final block has moved the tip, every surviving session receives
-//! work for it and a share on that work is credited exactly once. A block
-//! solved on the gap-issued job commits to the lost window; submitting it is #619's opt-in case below,
-//! which asserts it is refused as stale or lands paying only promoted rows
-//! (today it is offered and never lands), so here it is kept.
+//! work for it and a share on that work is credited exactly once.
 //! #466's replaced-history regression
 //! (`ledger/window/snapshot_delta/tests/physical_failover.rs::
 //! physical_async_failover_replaced_history_matches_full_read`) covers the
@@ -58,31 +58,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn async_promotion_with_live_miners_accounts_for_every_share_and_lands_a_block() -> Result<()>
 {
-    drill(GapBlock::Kept).await
-}
-
-/// #619: the block solved on the gap-issued job, submitted after the
-/// promotion, must be refused as stale authority or land paying only rows
-/// the promoted ledger holds. Today it is accepted, offered and put on chain
-/// with a coinbase paying the lost window, and never lands in the pool
-/// (`window range incomplete`). Opt-in until #619 decides and fixes it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "#619: a block on a job issued in the replication gap is offered but never lands"]
-async fn issue_619_gap_issued_block_after_async_promotion_is_refused_or_pays_only_promoted_rows(
-) -> Result<()> {
-    drill(GapBlock::Submitted).await
-}
-
-/// What becomes of the block the gap miner solves on its gap-issued job.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GapBlock {
-    /// Solved and kept, never submitted (#619).
-    Kept,
-    /// Submitted after the promotion; the #619 assertion.
-    Submitted,
-}
-
-async fn drill(gap_block: GapBlock) -> Result<()> {
     let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
         return Ok(());
     };
@@ -98,7 +73,7 @@ async fn drill(gap_block: GapBlock) -> Result<()> {
         started: Instant::now(),
         events: Vec::new(),
     };
-    let result = promotion(&mut fixture, &mut pair, &mut timeline, gap_block).await;
+    let result = promotion(&mut fixture, &mut pair, &mut timeline).await;
     if result.is_err() {
         eprintln!("{}", fixture.diagnostics());
         eprintln!("{}", pair.diagnostics());
@@ -489,12 +464,7 @@ async fn landed(f: &Fixture, block: &str) -> Result<()> {
     Ok(())
 }
 
-async fn promotion(
-    f: &mut Fixture,
-    pair: &mut Pair,
-    timeline: &mut Timeline,
-    gap_block_disposition: GapBlock,
-) -> Result<()> {
+async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) -> Result<()> {
     let observer = |port: u16| format!("{}?application_name=b474-observer", pair.url(port));
     let primary = PgPool::connect(&observer(pair.primary.port)).await?;
     let standby = PgPool::connect(&observer(pair.standby.port)).await?;
@@ -825,7 +795,8 @@ async fn promotion(
     }
 
     // What a brand-new session is issued right after the move: observed
-    // only, since a window prepared inside the gap is #619's second mode.
+    // only. A window prepared inside the gap is #619's second mode, which
+    // #645 retires and its own gated tests hold.
     let mut first_jobs = Vec::new();
     for index in 0..2 {
         let mut probe = ShareClient::connect(
@@ -881,20 +852,16 @@ async fn promotion(
     // The block on the gap-issued job, submitted while the tip is still the
     // one its job builds on: its coinbase was built from the lost window, so
     // it must be refused as stale authority, or land paying only shares the
-    // promoted ledger holds (#619; submitted only in that opt-in case).
-    let stale_block = match gap_block_disposition {
-        GapBlock::Kept => None,
-        GapBlock::Submitted => Some(gap_miner.submit_solved(gap_block.0, gap_block.1).await),
-    };
-    let stale_paid = match stale_block.as_ref().map(|block| (block, &block.answer)) {
-        None => None,
-        Some((stale_block, Answer::Accepted)) => {
+    // promoted ledger holds (#619; since #645 it is refused before its offer).
+    let stale_block = gap_miner.submit_solved(gap_block.0, gap_block.1).await;
+    let stale_paid = match &stale_block.answer {
+        Answer::Accepted => {
             landed(f, &stale_block.hash).await.with_context(|| {
                 format!("the block on the gap-issued job (window through share {gap_window:?}, standby through {replicated}) was accepted")
             })?;
             Some(paid_shares(f, &stale_block.hash).await?)
         }
-        Some((_, answer)) => {
+        answer => {
             ensure!(
                 matches!(answer.reason_id(), Some("stale-job" | "unknown-job")),
                 "the block on the gap-issued job was answered {answer}"
@@ -904,11 +871,12 @@ async fn promotion(
     };
 
     // A real block on work whose window the promoted ledger holds, by a new
-    // session. A frontend can still issue new jobs from a window it prepared
-    // inside the gap (#619): the range's sequence numbers now belong to other
-    // shares, accepted after that window's anchor, so the landing's window
-    // predicate reads none of them. The session is replaced until its job's
-    // window reads whole under that same predicate.
+    // session. A job on a window prepared inside the gap (#619's second
+    // mode, retired since #645) would cover sequence numbers that now belong
+    // to other shares, accepted after that window's anchor, so the landing's
+    // window predicate would read none of them. Any such window is reported,
+    // and the session replaced until its job's window reads whole under that
+    // same predicate.
     // Its window must cover the shares just credited on the promoted
     // primary, which reuse sequence numbers lost shares had: server 1
     // re-anchors its prepared work every second.
@@ -1065,7 +1033,7 @@ async fn promotion(
         duplicate.answer
     );
 
-    if let (Some(stale_block), Some(stale_paid)) = (&stale_block, &stale_paid) {
+    if let Some(stale_paid) = &stale_paid {
         let window = expected_window(f, &stale_block.share_id).await?;
         ensure!(
             *stale_paid == window,
@@ -1147,10 +1115,9 @@ async fn promotion(
         acked_before_cut.len(),
         completed.len(),
         duplicate.answer,
-        match (&stale_block, &stale_paid) {
-            (None, _) => "kept, not submitted (#619)".to_owned(),
-            (Some(block), Some(paid)) => format!("{} landed paying {} shares", block.hash, paid.len()),
-            (Some(block), None) => format!("{} refused: {}", block.hash, block.answer),
+        match &stale_paid {
+            Some(paid) => format!("{} landed paying {} shares", stale_block.hash, paid.len()),
+            None => format!("{} refused: {}", stale_block.hash, stale_block.answer),
         },
         block.hash,
         paid.len(),

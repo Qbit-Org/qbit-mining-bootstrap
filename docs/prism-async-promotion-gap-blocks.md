@@ -92,8 +92,10 @@ Estimates are labelled as estimates.
   counts the range (`ledger/window/snapshot_delta.rs:157-196`). A changed
   timeline sends the refresh to the full scan
   (`ledger/window/snapshot_delta.rs:479-512`). This protects *new* work only.
-- **#474 slice B (PR #620)** found #619 with live miners and a real qbitd. The
-  reproducer there is `#[ignore]`d and needs qbitd.
+- **#474 slice B (PR #620)** found #619 with live miners and a real qbitd. Its
+  gated drill (`live_regtest … async_live_miners`) now submits the block on
+  the gap-issued job after the promotion and requires it to be refused as
+  stale or to pay only promoted rows; it needs qbitd.
 
 ## How the defect happens
 
@@ -259,7 +261,7 @@ reads whole, so #466 covers new work.
 
 **Not run on this host:**
 
-- #620's live reproducer (`live_regtest … issue_619`): there is no qbitd
+- #620's live drill (`live_regtest … async_live_miners`): there is no qbitd
   here.
 - Any CTV-settlement landing: the fixture runs with `ctv_enabled: false`.
 - Load.
