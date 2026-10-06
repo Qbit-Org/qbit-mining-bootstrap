@@ -762,13 +762,30 @@ impl Ledger {
         let _order = self
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Append)
             .await?;
-        writable(&mut tx).await?;
+        // Every client round trip from here to COMMIT is time ORDER_LOCK
+        // serializes every share behind (#711), so the append reads all it
+        // needs before its share_id probe in this one statement: the write
+        // guard, the payout revision (read `FOR SHARE` when fenced) and
+        // `APPEND_PROBE_SQL`. It must stay a statement of its own after the
+        // lock's: under READ COMMITTED a statement's snapshot is taken when
+        // it starts, so reads in the lock's own statement would predate the
+        // lock and miss the commit of the share appended just before it.
+        let header_hash = share_header_hash(&share.share_id);
+        let first = sqlx::query(&Self::append_first_read_sql(expected_revision.is_some()))
+            .bind(&header_hash)
+            .bind(&share.share_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        check_writable(&first)?;
+        let probe = AppendProbe::from_row(header_hash, &first)?;
         // The payout-revision fence: `Some((expected, observed))` when a
         // settlement moved the revision between the share's submit check and
-        // this read, and the append captures its block (#657).
+        // this read, and the append captures its block (#657). `FOR SHARE`
+        // waits out a revision writer holding the row and then returns the
+        // row it committed, so the revision compared is the latest one.
         let mut moved = None;
         if let Some(expected) = expected_revision {
-            let revision:i64=sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL FOR SHARE").fetch_one(&mut *tx).await?;
+            let revision: i64 = first.try_get("payout_revision")?;
             if revision != expected {
                 // A plain share, or a block-bearing one when capture is off,
                 // is refused here, before any write. A block-bearing share
@@ -823,7 +840,9 @@ impl Ledger {
                 }
             }
             _ => {
-                let result = self.append_in(&mut tx, share).await?;
+                let result = self
+                    .append_probed(&mut tx, validated_share(share)?, probe)
+                    .await?;
                 if let Some(prepared) = prepared {
                     self.persist_prepared_candidate(
                         &mut tx,
@@ -840,7 +859,7 @@ impl Ledger {
             if let Err(error) = tx.rollback().await {
                 tracing::debug!(%error, "rollback after a closed commit gate failed");
             }
-            // append_in returns inserted=false only after matching the entire
+            // append_probed returns inserted=false only after matching the entire
             // immutable, already-durable row, before any share/clock/hash write.
             // With no candidate write, rollback cannot undo that prior credit.
             if !result.inserted && prepared.is_none() {
@@ -861,107 +880,155 @@ impl Ledger {
         Ok(result)
     }
 
+    /// The share append's write path inside a transaction that already holds
+    /// `ORDER_LOCK`: the share's own checks, [`Self::APPEND_PROBE_SQL`], then
+    /// [`Self::append_probed`]. The settlement's deferred-share credit runs it
+    /// inside the settlement's transaction; the share append reads the probe
+    /// in its first statement instead (`append_prepared`, #711).
     pub(super) async fn append_in(
         &self,
         tx: &mut Transaction<'_, Postgres>,
-        mut share: AcceptedShare,
+        share: AcceptedShare,
     ) -> Result<AppendResult> {
-        ensure!(
-            share.share_difficulty > 0 && share.network_difficulty > 0,
-            "share difficulty must be positive"
-        );
-        ensure!(
-            share
-                .credit_policy
-                .as_deref()
-                .is_none_or(|p| p == "stale-grace"),
-            "invalid share credit policy"
-        );
-        let program = hex::decode(&share.p2mr_program_hex)?;
-        ensure!(program.len() == 32, "P2MR program must be 32 bytes");
-        share.p2mr_program_hex = hex::encode(program);
-        // The ledger is partitioned by share_seq (migration 017) and its
-        // share_id uniqueness is per leaf, so a share_id probe without a
-        // share_seq bound descends one index per attached partition.
-        // qbit_prism_share_hashes is the authority for accepted headers, but
-        // legacy rejected rows have no header mapping. Before a partition can
-        // leave, verification retains their exact IDs and sequences; imports
-        // register them on attachment. Unregistered rejected rows are in the
-        // release table below conversion_bound; native writers only insert
-        // accepted rows. Probe the newest partitions first, then a registered
-        // rejected sequence or the legacy range on an unmapped miss, so a new
-        // share never probes every retained leaf. A credited header needs the
-        // full-parent fallback, including legacy worker-scoped duplicates
-        // mapped to an earlier row.
-        // A credited row that has left the online ledger cannot be compared
-        // and is refused as the duplicate it is.
-        //
-        // The probe's share_seq bounds are read here, in the same statement
-        // and under the same ORDER_LOCK, and bound as parameters below. As a
-        // function call inside the probe's WHERE clause the floor was applied
-        // as a per-leaf filter and the executor descended every attached
-        // partition, the empty lead included; as bound values the executor
-        // prunes at startup to the leaves between them (the share append's
-        // transaction forces generic plans, see `APPEND_TRANSACTION_BEGIN`, so
-        // the probe is planned once per connection and pruned at run time
-        // rather than re-planned per share; the settlement's deferred-share
-        // credit runs this inside the settlement's transaction under the default mode,
-        // once per landed block, where a custom plan is fine). The ceiling is the next share_seq: every row
-        // that can exist is below it, because rows are appended under the
-        // lock this transaction holds and imported partitions carry sequences
-        // the ledger already handed out (archive attach refuses a partition
-        // holding a row at or above it). The two subqueries are the bodies of
-        // migration 016's `qbit_prism_share_probe_floor()` and
-        // `qbit_prism_share_next_seq()`, inlined because a SQL-language
-        // function is re-planned on every call; a test holds them equal.
+        let share = validated_share(share)?;
         let header_hash = share_header_hash(&share.share_id);
-        let (credited, rejected_seq, legacy_bound, floor, ceiling): (Option<String>, Option<i64>, i64, i64, i64) = sqlx::query_as(
-            "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1),\
-             (SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$2),conversion_bound,\
-             COALESCE((SELECT COALESCE(lower_seq,0) FROM qbit_prism_share_partitions \
-                WHERE state='attached' AND (lower_seq IS NULL OR lower_seq<=next_seq.value) \
-                ORDER BY upper_seq DESC OFFSET 2 LIMIT 1),0),next_seq.value \
-             FROM qbit_prism_share_partitioning, \
-             (SELECT CASE WHEN is_called THEN last_value+1 ELSE last_value END AS value \
-                FROM qbit_share_ledger_share_seq_seq) AS next_seq WHERE singleton",
+        let row = sqlx::query(Self::APPEND_PROBE_SQL)
+            .bind(&header_hash)
+            .bind(&share.share_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        let probe = AppendProbe::from_row(header_hash, &row)?;
+        self.append_probed(tx, share, probe).await
+    }
+
+    /// What the share append reads before it probes for the share_id, as
+    /// named columns. `$1` is the share's header hash and `$2` its share_id.
+    ///
+    /// The ledger is partitioned by share_seq (migration 017) and its
+    /// share_id uniqueness is per leaf, so a share_id probe without a
+    /// share_seq bound descends one index per attached partition.
+    /// qbit_prism_share_hashes is the authority for accepted headers, but
+    /// legacy rejected rows have no header mapping. Before a partition can
+    /// leave, verification retains their exact IDs and sequences; imports
+    /// register them on attachment. Unregistered rejected rows are in the
+    /// release table below conversion_bound; native writers only insert
+    /// accepted rows. So this reads the header's credited share_id
+    /// (`credited`), the share_id's retained rejected sequence
+    /// (`rejected_seq`), `conversion_bound`, and the probe's share_seq bounds
+    /// (`probe_floor`, `probe_ceiling`), which [`Self::append_probed`] binds
+    /// as parameters.
+    ///
+    /// The bounds are read in the same statement as the rest and under the
+    /// same ORDER_LOCK. As a function call inside the probe's WHERE clause
+    /// the floor was applied as a per-leaf filter and the executor descended
+    /// every attached partition, the empty lead included; as bound values
+    /// the executor prunes at startup to the leaves between them (the share
+    /// append's transaction forces generic plans, see
+    /// `APPEND_TRANSACTION_BEGIN`, so the probe is planned once per
+    /// connection and pruned at run time rather than re-planned per share;
+    /// the settlement's deferred-share credit runs this inside the
+    /// settlement's transaction under the default mode, once per landed
+    /// block, where a custom plan is fine). The ceiling is the next
+    /// share_seq: every row that can exist is below it, because rows are
+    /// appended under the lock this transaction holds and imported
+    /// partitions carry sequences the ledger already handed out (archive
+    /// attach refuses a partition holding a row at or above it). The two
+    /// subqueries are the bodies of migration 016's
+    /// `qbit_prism_share_probe_floor()` and `qbit_prism_share_next_seq()`,
+    /// inlined because a SQL-language function is re-planned on every call;
+    /// a test holds them equal.
+    const APPEND_PROBE_SQL: &str = "SELECT (SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1) AS credited,\
+         (SELECT share_seq FROM qbit_prism_rejected_share_ids WHERE share_id=$2) AS rejected_seq,conversion_bound,\
+         COALESCE((SELECT COALESCE(lower_seq,0) FROM qbit_prism_share_partitions \
+            WHERE state='attached' AND (lower_seq IS NULL OR lower_seq<=next_seq.value) \
+            ORDER BY upper_seq DESC OFFSET 2 LIMIT 1),0) AS probe_floor,next_seq.value AS probe_ceiling \
+         FROM qbit_prism_share_partitioning, \
+         (SELECT CASE WHEN is_called THEN last_value+1 ELSE last_value END AS value \
+            FROM qbit_share_ledger_share_seq_seq) AS next_seq WHERE singleton";
+
+    /// The share append's first statement under `ORDER_LOCK` (#711): the
+    /// write guard's columns ([`check_writable`] refuses on them), the
+    /// cluster row's `payout_revision`, and [`Self::APPEND_PROBE_SQL`]'s
+    /// columns, with its parameters. A fenced append reads the cluster row
+    /// `FOR SHARE`, as the separate fence statement did: a revision writer
+    /// holding the row is waited out and its committed row is the one
+    /// returned. The probe is a materialized CTE, so the lock and its
+    /// recheck involve the cluster row alone.
+    fn append_first_read_sql(fenced: bool) -> String {
+        format!(
+            "WITH probe AS MATERIALIZED ({}) SELECT {WRITABLE_COLUMNS},c.payout_revision,probe.* FROM qbit_prism_cluster c CROSS JOIN probe WHERE c.singleton{}",
+            Self::APPEND_PROBE_SQL,
+            if fenced { " FOR SHARE OF c" } else { "" }
         )
-        .bind(&header_hash)
-        .bind(&share.share_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        let mut existing = sqlx::query(&format!(
-            "{SELECT_SHARE} WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3"
-        ))
-        .bind(&share.share_id)
-        .bind(floor)
-        .bind(ceiling)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if existing.is_none() {
-            existing = if let Some(seq) = rejected_seq {
-                sqlx::query(&format!(
-                    "{SELECT_SHARE} WHERE share_id=$1 AND share_seq=$2"
-                ))
-                .bind(&share.share_id)
-                .bind(seq)
-                .fetch_optional(&mut **tx)
-                .await?
-            } else if credited.is_some() {
-                sqlx::query(&format!("{SELECT_SHARE} WHERE share_id=$1"))
-                    .bind(&share.share_id)
-                    .fetch_optional(&mut **tx)
-                    .await?
-            } else {
-                sqlx::query(&format!(
-                    "{SELECT_SHARE} WHERE share_id=$1 AND share_seq<$2"
-                ))
-                .bind(&share.share_id)
-                .bind(legacy_bound)
-                .fetch_optional(&mut **tx)
-                .await?
-            };
+    }
+
+    /// The share append's write (#711): the ledger clock, the share row and
+    /// its header mapping in one statement. The clock is the same `GREATEST`
+    /// as before, and the share's `accepted_at` the same expression of it.
+    /// A share whose job was issued after that clock inserts nothing:
+    /// `share_seq` comes back NULL and the caller refuses the share, which
+    /// rolls the clock back with the transaction, as when the check ran
+    /// between two statements. Nothing on these tables observes the
+    /// difference: no trigger fires on an INSERT into either table, the
+    /// cluster row's only trigger is on `fatal_error`, and
+    /// qbit_prism_share_hashes has no foreign key (migration 016 dropped
+    /// it). A missing partition still raises SQLSTATE 23514 from the ledger
+    /// INSERT, which fails the whole statement, and `append_checked` still
+    /// retries it.
+    const APPEND_WRITE_SQL: &str = "WITH clock AS (UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE singleton RETURNING ledger_clock_ms),\
+         appended AS (INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) \
+            SELECT $1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,to_timestamp($9::double precision/1000),$10,to_timestamp(clock.ledger_clock_ms::double precision/1000),$11,true,$12,0 \
+            FROM clock WHERE $9<=clock.ledger_clock_ms RETURNING share_seq),\
+         hashed AS (INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT $13,$1 FROM appended) \
+         SELECT clock.ledger_clock_ms AS accepted_at_ms,appended.share_seq FROM clock LEFT JOIN appended ON true";
+
+    /// The share append once `probe` has been read under `ORDER_LOCK`: one
+    /// share_id probe, then, for a new share, [`Self::APPEND_WRITE_SQL`].
+    ///
+    /// The probe tries the newest partitions first, between the bounds, then
+    /// a registered rejected sequence or the legacy range on an unmapped
+    /// miss, so a new share never probes every retained leaf. A credited
+    /// header needs the full-parent fallback, including legacy worker-scoped
+    /// duplicates mapped to an earlier row. A credited row that has left the
+    /// online ledger cannot be compared and is refused as the duplicate it
+    /// is. The bounded probe and the fallback are one statement (#711): the
+    /// bounded probe is a materialized CTE, and the fallback runs only when
+    /// the CTE is empty (`NOT EXISTS` over it is a one-time filter), so a
+    /// share found between the bounds never runs the fallback, as before.
+    /// The bounds stay bound parameters, so executor startup still prunes
+    /// the bounded probe to the leaves between them.
+    async fn append_probed(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        mut share: AcceptedShare,
+        probe: AppendProbe,
+    ) -> Result<AppendResult> {
+        let AppendProbe {
+            header_hash,
+            credited,
+            rejected_seq,
+            legacy_bound,
+            floor,
+            ceiling,
+        } = probe;
+        let (fallback, fallback_bound) = match (rejected_seq, &credited) {
+            (Some(seq), _) => (" AND share_seq=$4", Some(seq)),
+            (None, Some(_)) => ("", None),
+            (None, None) => (" AND share_seq<$4", Some(legacy_bound)),
+        };
+        let sql = format!(
+            "WITH recent AS MATERIALIZED ({SELECT_SHARE} WHERE share_id=$1 AND share_seq>=$2 AND share_seq<$3 LIMIT 1) \
+             SELECT * FROM recent UNION ALL \
+             ({SELECT_SHARE} WHERE share_id=$1{fallback} AND NOT EXISTS(SELECT 1 FROM recent) LIMIT 1)"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(&share.share_id)
+            .bind(floor)
+            .bind(ceiling);
+        if let Some(bound) = fallback_bound {
+            query = query.bind(bound);
         }
-        if let Some(row) = existing {
+        if let Some(row) = query.fetch_optional(&mut **tx).await? {
             let previous = share_from_row(&row)?;
             share.share_seq = previous.share_seq;
             share.accepted_at_ms = previous.accepted_at_ms;
@@ -983,21 +1050,27 @@ impl Ledger {
             );
             bail!("duplicate-share: header already credited globally, and its share is archived");
         }
-        let accepted_at_ms: i64 = sqlx::query_scalar("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE singleton RETURNING ledger_clock_ms").fetch_one(&mut **tx).await?;
+        let (accepted_at_ms, seq): (i64, Option<i64>) = sqlx::query_as(Self::APPEND_WRITE_SQL)
+            .bind(&share.share_id)
+            .bind(&share.miner_id)
+            .bind(&share.order_key)
+            .bind(&share.p2mr_program_hex)
+            .bind(share.share_difficulty.to_string())
+            .bind(share.network_difficulty.to_string())
+            .bind(i64::try_from(share.template_height)?)
+            .bind(&share.job_id)
+            .bind(share.job_issued_at_ms)
+            .bind(i64::from(share.ntime))
+            .bind(&share.credit_policy)
+            .bind(&self.instance_id)
+            .bind(header_hash)
+            .fetch_one(&mut **tx)
+            .await?;
         ensure!(
             share.job_issued_at_ms <= accepted_at_ms,
             "share references a job from the future"
         );
-        let seq: i64 = sqlx::query_scalar("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) VALUES($1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,to_timestamp($9::double precision/1000),$10,to_timestamp($11::double precision/1000),$12,true,$13,0) RETURNING share_seq")
-            .bind(&share.share_id).bind(&share.miner_id).bind(&share.order_key).bind(&share.p2mr_program_hex)
-            .bind(share.share_difficulty.to_string()).bind(share.network_difficulty.to_string()).bind(i64::try_from(share.template_height)?)
-            .bind(&share.job_id).bind(share.job_issued_at_ms).bind(i64::from(share.ntime)).bind(accepted_at_ms).bind(&share.credit_policy).bind(&self.instance_id)
-            .fetch_one(&mut **tx).await?;
-        sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,$2)")
-            .bind(header_hash)
-            .bind(&share.share_id)
-            .execute(&mut **tx)
-            .await?;
+        let seq = seq.context("the share ledger INSERT returned no share_seq")?;
         share.share_seq = u64::try_from(seq)?;
         share.accepted_at_ms = accepted_at_ms;
         Ok(AppendResult {
@@ -1738,6 +1811,50 @@ fn refused_for_want_of_a_partition(error: &anyhow::Error) -> bool {
                     && database.message().contains("no partition of relation")
             })
     })
+}
+
+/// What the share append reads before its share_id probe, from
+/// [`Ledger::APPEND_PROBE_SQL`]'s columns; see there.
+struct AppendProbe {
+    header_hash: String,
+    credited: Option<String>,
+    rejected_seq: Option<i64>,
+    legacy_bound: i64,
+    floor: i64,
+    ceiling: i64,
+}
+
+impl AppendProbe {
+    fn from_row(header_hash: String, row: &PgRow) -> Result<Self> {
+        Ok(Self {
+            header_hash,
+            credited: row.try_get("credited")?,
+            rejected_seq: row.try_get("rejected_seq")?,
+            legacy_bound: row.try_get("conversion_bound")?,
+            floor: row.try_get("probe_floor")?,
+            ceiling: row.try_get("probe_ceiling")?,
+        })
+    }
+}
+
+/// The share append's checks of a share's own fields, with its P2MR program
+/// in canonical hex.
+fn validated_share(mut share: AcceptedShare) -> Result<AcceptedShare> {
+    ensure!(
+        share.share_difficulty > 0 && share.network_difficulty > 0,
+        "share difficulty must be positive"
+    );
+    ensure!(
+        share
+            .credit_policy
+            .as_deref()
+            .is_none_or(|p| p == "stale-grace"),
+        "invalid share credit policy"
+    );
+    let program = hex::decode(&share.p2mr_program_hex)?;
+    ensure!(program.len() == 32, "P2MR program must be 32 bytes");
+    share.p2mr_program_hex = hex::encode(program);
+    Ok(share)
 }
 
 pub(super) fn share_header_hash(share_id: &str) -> String {
