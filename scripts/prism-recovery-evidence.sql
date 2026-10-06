@@ -1,15 +1,23 @@
 -- Read-only reconciliation evidence shared by both migration runbooks.
--- Run with psql -XqAt -v ON_ERROR_STOP=1; feed stdout to
+-- Run with psql -XqAt -v ON_ERROR_STOP=1 [-v FETCH_COUNT=<rows>]; feed stdout to
 -- scripts/prism-recovery-evidence.py. Works on frozen 2.x and native schemas.
 -- Writers must be stopped: the transaction gives this export one snapshot,
 -- but cannot make separately taken backups or exports contemporaneous.
--- Stream every result through a cursor. Without FETCH_COUNT psql buffers a
--- whole result before printing it, and the share history alone took 63 GB
--- at 65.9M shares (#705).
+-- Print each result in batches of FETCH_COUNT rows. Unset (0), psql buffers a
+-- whole result before printing it, and the share history alone took 63 GB at
+-- 65.9M shares (#705). A caller's -v FETCH_COUNT=<rows> is kept. psql 16 and
+-- older batch only statements that start with SELECT or VALUES, so keep every
+-- large export a plain SELECT, not WITH ... or TABLE.
+SELECT :'FETCH_COUNT'::int = 0 AS prism_fetch_unset \gset
+\if :prism_fetch_unset
 \set FETCH_COUNT 10000
+\endif
 BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL TIME ZONE 'UTC';
 SET LOCAL bytea_output = 'hex';
+-- psql 16 and older batch through a cursor: plan for the whole result, as for
+-- an ordinary query, not for its first rows.
+SET LOCAL cursor_tuple_fraction = 1.0;
 
 
 -- Match startup's source-resolution guard before any evidence query. A later
@@ -514,6 +522,10 @@ FROM (
 \if :has_audit_snapshots
 -- Imported legacy rows gain canonical bytes and normalized metadata, but no
 -- snapshot reference. Fingerprint native reconstruction inputs separately.
+-- Audit headers and inline share windows can be megabytes a row, so fetch
+-- them a few rows at a time.
+\set prism_fetch_rows :FETCH_COUNT
+\set FETCH_COUNT 16
 SELECT jsonb_build_object('kind', 'audit_bodies', 'row', jsonb_build_object(
     'block_hash', block_hash, 'audit_bundle', audit_bundle,
     'share_snapshot_sha256', share_snapshot_sha256))
@@ -525,6 +537,7 @@ SELECT jsonb_build_object('kind', 'audit_snapshots', 'row', jsonb_build_object(
     'first_share_seq', first_share_seq, 'last_share_seq', last_share_seq,
     'anchor_ms', anchor_ms, 'share_count', share_count, 'inline_shares', inline_shares))
 FROM qbit_prism_audit_snapshots ORDER BY snapshot_sha256 COLLATE "C";
+\set FETCH_COUNT :prism_fetch_rows
 \endif
 \if :has_cpfp_packages
 SELECT jsonb_build_object('kind', 'cpfp_packages', 'row', to_jsonb(p))

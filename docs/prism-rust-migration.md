@@ -1563,9 +1563,10 @@ backup, as for any other pre-ACK failure.
    python3 scripts/prism-recovery-evidence.py source.rows.jsonl > source.summary.json
    ```
 
-   `FETCH_COUNT` makes psql stream the rows through a cursor; the script also
-   sets it. Without it psql buffers each whole result before printing, which
-   took 63 GB and was OOM-killed at 65.9M shares (#705).
+   `FETCH_COUNT` makes psql print rows in batches instead of buffering each
+   whole result, which took 63 GB and was OOM-killed at 65.9M shares (#705).
+   The script defaults it to 10000 since #705; the flag covers copies from
+   before that.
 
    Keep the filesystem backup from the same drained boundary. Require
    `unfinished_candidates` zero and both integrity mismatch counts zero. The

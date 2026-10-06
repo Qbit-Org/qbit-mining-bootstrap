@@ -2346,9 +2346,9 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    compare that head to the mirrored pre-cutover report. It refuses incomplete
    exports and carry mismatches/drift. Require `unfinished_candidates` zero. Protect
    the evidence as accounting data and budget disk for the share export.
-   `FETCH_COUNT` makes psql stream the rows through a cursor; the script also sets
-   it. Without it psql buffers each whole result before printing, which took 63 GB
-   and was OOM-killed at 65.9M shares (#705).
+   `FETCH_COUNT` makes psql print rows in batches instead of buffering each whole
+   result, which took 63 GB and was OOM-killed at 65.9M shares (#705). The script
+   defaults it to 10000 since #705; the flag covers copies from before that.
 4. **Exercise the isolated pre-ACK restore.** Provision a separate empty
    database with compatible PostgreSQL, roles and extensions. Restore the full
    database and artifact backup, never over the current database:

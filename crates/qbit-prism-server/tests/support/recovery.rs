@@ -435,6 +435,21 @@ pub async fn evidence(db: &Database, pg_bin: &Path) -> Result<Value> {
 }
 
 pub async fn evidence_with_bytea(db: &Database, pg_bin: &Path, format: &str) -> Result<Value> {
+    evidence_with_options(db, pg_bin, format, None).await
+}
+
+/// The evidence with the caller's FETCH_COUNT instead of the script's default
+/// (#705). One row per fetch makes every result cross batch boundaries.
+pub async fn evidence_with_fetch_count(db: &Database, pg_bin: &Path, rows: u32) -> Result<Value> {
+    evidence_with_options(db, pg_bin, "hex", Some(rows)).await
+}
+
+async fn evidence_with_options(
+    db: &Database,
+    pg_bin: &Path,
+    format: &str,
+    fetch_count: Option<u32>,
+) -> Result<Value> {
     use std::io::{Seek, SeekFrom};
     ensure!(matches!(format, "hex" | "escape"));
     let mut input = tempfile::tempfile()?;
@@ -445,11 +460,16 @@ pub async fn evidence_with_bytea(db: &Database, pg_bin: &Path, format: &str) -> 
     ))?;
     input.seek(SeekFrom::Start(0))?;
     // The export goes straight to a file: at production size it is tens of
-    // gigabytes, and FETCH_COUNT keeps psql from buffering it too (#705).
-    // tokio's `output()` would pipe stdout whatever it was set to, so spawn.
+    // gigabytes, and the script's FETCH_COUNT keeps psql from buffering it
+    // too (#705). tokio's `output()` would pipe stdout whatever it was set
+    // to, so spawn.
     let records = tempfile::NamedTempFile::new()?;
-    let output = postgres_command(db, pg_bin, "psql")?
-        .args(["-XqAt", "-v", "ON_ERROR_STOP=1", "-v", "FETCH_COUNT=10000"])
+    let mut command = postgres_command(db, pg_bin, "psql")?;
+    command.args(["-XqAt", "-v", "ON_ERROR_STOP=1"]);
+    if let Some(rows) = fetch_count {
+        command.args(["-v", &format!("FETCH_COUNT={rows}")]);
+    }
+    let output = command
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(records.reopen()?))
         .stderr(Stdio::piped())
