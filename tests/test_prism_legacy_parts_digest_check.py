@@ -258,6 +258,31 @@ class PartsDigestCheckTests(unittest.TestCase):
         code, [row], _ = check(tree)
         self.assertEqual((code, row["status"]), (3, "2x-order-only"))
 
+    def test_an_empty_parts_digest_is_checked_as_3x_checks_it(self):
+        # 3.x reads "" as Some(""), compares it and refuses the body.
+        tree = Tree(self.dir)
+        tree.write_body(tree.blocks[0], "")
+        code, [row], summary = check(tree)
+        self.assertEqual((code, row["status"], summary["import_refuses"]), (3, "matches-neither", 1))
+
+    def test_a_body_ref_for_another_digest_is_a_body_problem(self):
+        tree = Tree(self.dir)
+        tree.write_body(tree.blocks[0], "00" * 32, schema=BODY_REF, digest="11" * 32)
+        code, [row], summary = check(tree)
+        self.assertEqual((code, row["status"], summary["import_refuses"]), (3, "body-digest-differs", 0))
+
+    def test_one_malformed_body_does_not_end_the_run(self):
+        tree = Tree(self.dir, blocks=2)
+        parts = [dict(tree.parts[0], kind=["segment_range"]), tree.parts[1]]
+        tree.write_body(tree.blocks[0], digest_as_2x_wrote_it(parts), parts=parts)
+        affected = self.dir / "affected.csv"
+        code, rows, summary = check(tree, "--affected-csv", affected)
+        self.assertEqual(code, 3)
+        self.assertEqual([row["status"] for row in rows], ["body-unreadable", "2x-order-only"])
+        self.assertIn("TypeError", rows[0]["error"])
+        self.assertEqual(summary["import_refuses"], 1)
+        self.assertEqual(len(affected.read_text().splitlines()), 2)
+
     def test_a_v2_body_without_the_digest_is_not_checked(self):
         tree = Tree(self.dir)
         tree.write_body(tree.blocks[0], None)
@@ -446,6 +471,10 @@ class ShardedRunnerTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("nothing to do", run.stdout)
         self.assertEqual(list((self.dir / "out").iterdir()), [])
+        for shards in ("0", "100", "x"):
+            run = self.run_shards(tree, self.dir / f"out-{shards}", shards=shards)
+            self.assertEqual(run.returncode, 2, shards)
+            self.assertIn("N must be 1 to 99", run.stderr)
         usage = subprocess.run(["bash", str(SHARDED), "rows.csv"], capture_output=True, text=True)
         self.assertEqual(usage.returncode, 2)
         self.assertIn("usage: prism_legacy_range_sidecars_sharded.sh", usage.stderr)

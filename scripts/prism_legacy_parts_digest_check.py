@@ -115,6 +115,10 @@ def classify_body(path: Path, digest: str | None) -> dict:
         result["status"] = "body-unreadable"
         result["error"] = f"{type(exc).__name__}: {exc}"[:200]
         return result
+    if (digest is not None and isinstance(body, dict) and "audit_bundle_sha256" in body
+            and str(body["audit_bundle_sha256"]).lower() != digest.lower()):
+        result["status"] = "body-digest-differs"
+        return result
     if not isinstance(body, dict) or body.get("schema") != V2_SCHEMA:
         result["status"] = "no-window-proof"
         result["schema"] = body.get("schema") if isinstance(body, dict) else None
@@ -128,10 +132,10 @@ def classify_body(path: Path, digest: str | None) -> dict:
         result["status"] = "body-unreadable"
         result["error"] = "share_window_proof.share_parts is not a list of objects"
         return result
-    expected = str(proof.get("share_parts_digest_hex") or "").lower()
-    if not expected:
+    if proof.get("share_parts_digest_hex") is None:
         result["status"] = "no-parts-digest"
         return result
+    expected = str(proof["share_parts_digest_hex"]).lower()
     result["parts"] = len(parts)
     result["has_inline"] = any(part.get("kind") == "inline" for part in parts)
     if digest_3x(parts) == expected:
@@ -159,7 +163,11 @@ def classify_row(job: tuple[dict, dict]) -> dict:
     else:
         path = map_uri(body_uri, options["uri_prefix"], options["audit_root"],
                        sidecar_dir or options["audit_root"])
-        result = classify_body(path, digest or None)
+        try:
+            result = classify_body(path, digest or None)
+        except Exception as exc:  # one malformed body must not end the run
+            result = {"body": str(path), "status": "body-unreadable",
+                      "error": f"{type(exc).__name__}: {exc}"[:200]}
     if block or digest:
         result = {"block_hash": block, "audit_bundle_sha256": digest, **result}
     return result

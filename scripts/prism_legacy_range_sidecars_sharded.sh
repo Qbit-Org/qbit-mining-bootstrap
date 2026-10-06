@@ -20,6 +20,7 @@ set -euo pipefail
 [ $# -ge 6 ] || { sed -n '5,11p' "$0" >&2; exit 2; }
 rows=$(realpath "$1"); tree=$(realpath "$2"); root=$(realpath "$3")
 canon=$(realpath "$4"); tool=$(realpath "$5"); out=$(realpath -m "$6"); n=${7:-8}
+[[ $n =~ ^[1-9][0-9]?$ ]] || { echo "N must be 1 to 99" >&2; exit 2; }
 case "$out/" in "$root"/*) echo "OUT_DIR must not be inside IMPORT_ROOT" >&2; exit 2;; esac
 mkdir -p "$out"
 [ -z "$(ls -A "$out")" ] || { echo "OUT_DIR $out is not empty" >&2; exit 2; }
@@ -28,10 +29,11 @@ total=$(( $(wc -l < "$rows") - 1 ))
 [ "$total" -gt 0 ] || { echo "no rows in $rows: nothing to do"; exit 0; }
 tail -n +2 "$rows" | split -e -n r/"$n" -d -a 2 - shard-
 for f in shard-??; do { head -1 "$rows"; cat "$f"; } > "$f.csv"; rm "$f"; done
-sharded=$(( $(cat shard-*.csv | wc -l) - $(ls shard-*.csv | wc -l) ))
+shards=(shard-*.csv)
+sharded=$(( $(cat "${shards[@]}" | wc -l) - ${#shards[@]} ))
 [ "$sharded" -eq "$total" ] || { echo "shard rows $sharded != input rows $total" >&2; exit 3; }
-echo "$(date -u +%H:%M:%SZ) $total rows in $(ls shard-*.csv | wc -l) shards; writing into $root"
-for f in shard-*.csv; do
+echo "$(date -u +%H:%M:%SZ) $total rows in ${#shards[@]} shards; writing into $root"
+for f in "${shards[@]}"; do
   i=${f#shard-}; i=${i%.csv}
   ( set +e
     python3 "$tool" --rows "$f" --audit-root "$tree" --canonicalizer "$canon" \
@@ -48,4 +50,5 @@ counts = collections.Counter(json.loads(line)["status"] for line in sys.stdin)
 print(json.dumps(dict(sorted(counts.items())), indent=1))'
 left=$(find "$root" -maxdepth 1 -name 'prism-audit-bundle-canonical-*.tmp-*' | wc -l)
 echo "temporary files left in IMPORT_ROOT: $left"
-! grep -qv '^0$' exit-* && [ "$left" -eq 0 ]
+exits=(exit-*)
+[ "${#exits[@]}" -eq "${#shards[@]}" ] && ! grep -qv '^0$' "${exits[@]}" && [ "$left" -eq 0 ]
