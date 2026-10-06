@@ -14,7 +14,10 @@ use std::{
     fs::File,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -67,6 +70,45 @@ pub struct ReadTier {
     samples: Arc<Mutex<Vec<ReadSample>>>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    in_flight: InFlight,
+}
+
+/// The scrapes in flight, so `stop` can let them finish before it kills
+/// public-api (#701).
+#[derive(Clone, Default)]
+struct InFlight(Arc<AtomicUsize>);
+
+/// One scrape in flight; dropped once its sample is recorded.
+struct Flight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn start(&self) -> Flight {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Flight(self.0.clone())
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait until no scrape is in flight, for at most `limit`; false if some
+    /// still were.
+    async fn drained(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while self.count() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for ReadTier {
@@ -131,6 +173,7 @@ impl ReadTier {
             samples: Arc::new(Mutex::new(Vec::new())),
             stop,
             task: None,
+            in_flight: InFlight::default(),
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut last_failure: String;
@@ -164,13 +207,26 @@ impl ReadTier {
             frontends,
             tier.samples.clone(),
             stop_rx,
+            tier.in_flight.clone(),
         )));
         Ok(tier)
     }
 
-    /// Stop scraping and the public process; the samples stay.
-    pub fn stop(&mut self) {
+    /// Stop scraping, let the scrapes in flight finish, then stop the public
+    /// process; the samples stay. Killing public-api under a scrape in flight
+    /// would fail that scrape, and its sample, timed from its start, would land
+    /// in the last fault's window, which runs to the phase's end (#701). Every
+    /// scrape ends within REQUEST_TIMEOUT, the client's total timeout, so the
+    /// wait is bounded.
+    pub async fn stop(&mut self) {
         self.stop.send_replace(true);
+        if let Some(task) = self.task.take() {
+            // The scrape loop returns on the stop, so it starts nothing more.
+            let _ = task.await;
+        }
+        self.in_flight
+            .drained(REQUEST_TIMEOUT + Duration::from_secs(1))
+            .await;
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
@@ -201,6 +257,7 @@ async fn scrape(
     frontends: Vec<(String, String)>,
     samples: Arc<Mutex<Vec<ReadSample>>>,
     mut stop: watch::Receiver<bool>,
+    in_flight: InFlight,
 ) {
     let mut public_tick = tokio::time::interval(PUBLIC_INTERVAL);
     public_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -217,14 +274,14 @@ async fn scrape(
                 // lower the offered rate: the tier is offered 5/s whatever
                 // it does with them.
                 tokio::spawn(one(client.clone(), "public-api".into(), format!("{public}{path}"),
-                    path.into(), samples.clone(), stop.clone()));
+                    path.into(), samples.clone(), in_flight.start()));
             }
             _ = metrics_tick.tick() => {
                 tokio::spawn(one(client.clone(), "public-api".into(),
-                    format!("{public}/metrics"), "/metrics".into(), samples.clone(), stop.clone()));
+                    format!("{public}/metrics"), "/metrics".into(), samples.clone(), in_flight.start()));
                 for (instance, url) in &frontends {
                     tokio::spawn(one(client.clone(), instance.clone(), url.clone(),
-                        "/metrics".into(), samples.clone(), stop.clone()));
+                        "/metrics".into(), samples.clone(), in_flight.start()));
                 }
             }
         }
@@ -237,7 +294,8 @@ async fn one(
     url: String,
     path: String,
     samples: Arc<Mutex<Vec<ReadSample>>>,
-    stop: watch::Receiver<bool>,
+    // Held until the sample is recorded, so `stop` waits for it.
+    _flight: Flight,
 ) {
     let at = Instant::now();
     let result = client.get(&url).send().await;
@@ -264,13 +322,6 @@ async fn one(
         }
         Err(error) => (None, Some(transport_failure(error))),
     };
-    // A request still in flight when the tier stops is cut off by the stop
-    // itself, which kills public-api next: its failure says nothing about the
-    // tier, and it would land in the last fault's window, which runs to the
-    // phase's end (#701). An answer that made it back is kept.
-    if status.is_none() && *stop.borrow() {
-        return;
-    }
     samples
         .lock()
         .expect("read tier samples lock")
@@ -486,14 +537,13 @@ mod tests {
             .build()
             .expect("a client");
         let samples = Arc::new(Mutex::new(Vec::new()));
-        let (_stop, stop_rx) = watch::channel(false);
         one(
             client,
             "public-api".into(),
             url.clone(),
             PUBLIC_PATHS[0].into(),
             samples.clone(),
-            stop_rx,
+            InFlight::default().start(),
         )
         .await;
         dropper.abort();
@@ -513,22 +563,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_the_stop_cuts_off_is_not_recorded() {
-        // A listener that holds every connection without answering until it
-        // is told to drop them, as public-api is killed under a request in
-        // flight when the tier stops.
+    async fn stop_lets_the_scrapes_in_flight_finish() {
+        // A public endpoint that answers each request after 600 ms, three
+        // scrape intervals, so scrapes are always in flight when the tier
+        // stops, as they were when #701's phase ended.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a listener");
-        let url = format!(
-            "http://{}/public/v1/pool-summary",
-            listener.local_addr().expect("its address")
-        );
-        let (kill, mut killed) = watch::channel(false);
-        let holder = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("the scrape connects");
-            let _ = killed.changed().await;
-            drop(stream);
+        let public = format!("http://{}", listener.local_addr().expect("its address"));
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
         });
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -536,26 +592,55 @@ mod tests {
             .build()
             .expect("a client");
         let samples = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = InFlight::default();
         let (stop, stop_rx) = watch::channel(false);
-        let request = tokio::spawn(one(
-            client,
-            "public-api".into(),
-            url,
-            PUBLIC_PATHS[0].into(),
-            samples.clone(),
-            stop_rx,
-        ));
-        // The tier stops, then the process goes: the request fails after the
-        // stop, so it is the stop's doing, not the tier's.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        stop.send_replace(true);
-        kill.send_replace(true);
-        request.await.expect("the scrape task");
-        holder.await.expect("the holder");
-        assert!(
-            samples.lock().expect("samples").is_empty(),
-            "a request the stop cut off was recorded"
-        );
+        let mut tier = ReadTier {
+            child: None,
+            url: public.clone(),
+            log: PathBuf::new(),
+            reads: "replica",
+            samples: samples.clone(),
+            stop,
+            task: Some(tokio::spawn(scrape(
+                client,
+                public,
+                Vec::new(),
+                samples.clone(),
+                stop_rx,
+                in_flight.clone(),
+            ))),
+            in_flight: in_flight.clone(),
+        };
+        // Wait until scrapes are in flight, rather than for a fixed time.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while in_flight.count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no scrapes in flight"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tier.stop().await;
+        assert_eq!(in_flight.count(), 0, "stop returned with scrapes in flight");
+        server.abort();
+        let samples = samples.lock().expect("samples");
+        assert!(samples.len() >= 2, "{} samples", samples.len());
+        // Every scrape the stop found in flight was answered, not cut off.
+        let failed: Vec<_> = samples
+            .iter()
+            .filter(|sample| !sample.ok())
+            .map(|sample| (&sample.path, sample.status, &sample.error))
+            .collect();
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[tokio::test]
+    async fn the_wait_for_scrapes_in_flight_is_bounded() {
+        let in_flight = InFlight::default();
+        let held = in_flight.start();
+        assert!(!in_flight.drained(Duration::from_millis(50)).await);
+        drop(held);
+        assert!(in_flight.drained(Duration::from_millis(50)).await);
     }
 
     #[test]

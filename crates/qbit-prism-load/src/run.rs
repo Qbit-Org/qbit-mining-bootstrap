@@ -1893,7 +1893,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .await?;
         if plan.kind == crate::fault::PHASE {
             if let Some(tier) = read_tier.as_mut() {
-                tier.stop();
+                tier.stop().await;
             }
         }
         // The phase's bounds are when it started and stopped scheduling; a
