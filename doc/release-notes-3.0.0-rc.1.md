@@ -7,7 +7,7 @@ This is the first release candidate of 3.0.0, the native Rust PRISM line. It
 is the tree that #291's go/no-go evaluates on the PRISM production pair: two
 frontends, each with its own `qbitd`, a PostgreSQL primary with one
 asynchronous standby, and a public-read replica. It is not a production
-release. Until #291 records a go, the production line stays 2.x.x.
+release. Until #291 records a go, the production line stays 2.x.x (2.0.2).
 
 A candidate runs in pre-production with block submission and broadcasting off,
 so it offers the network no found block and no transaction. A rehearsal uses
@@ -169,10 +169,20 @@ migration is one-way, with no down-migrations (decision D5, #287, #366):
   over 80 minutes for 65.5M shares) and the online steps of 013, 017 and 024,
   which can take hours. Earlier native builds are refused while the backfill is
   pending; never record migration 2 by hand (#582, #669).
-- [`check-config`](../docs/prism-configuration.md) and `run` name every
-  unsupported `PRISM_*` setting, which production mode refuses (#361, #462).
-  Production reads signing seeds from `_FILE` mounts, and every settlement
+- The 102 retired 2.x.x settings are listed in
+  [`retired-settings.txt`](../crates/qbit-prism-server/src/config/retired-settings.txt).
+  [`check-config`](../docs/prism-configuration.md) and `run` name any still
+  set, and production mode refuses them (#361, #462).
+- Production reads signing seeds from `_FILE` mounts, and every settlement
   mode needs a pool fee with one recipient, 0 bps allowed (#535).
+- Block totals, chart markers and the default `chain_state=active` view of
+  `/public/v1/blocks` count confirmed blocks only. Native block intents are
+  persisted before node acceptance and stay out of them until confirmed;
+  `chain_state=all` shows every candidate with its state.
+- This candidate requires every native schema migration through 024.
+  `migrate` applies them, and every start refuses a database missing one.
+- It is tested against qbit 1.0.0, the release
+  `.github/scripts/install-prism-qbit.sh` pins.
 - The coordinator listener on 3341 now also serves `/public/v1` (2.0.x
   answered 404); keep it private and send public traffic to `public-api` on
   3342, which needs no audit mount. Runbooks:
