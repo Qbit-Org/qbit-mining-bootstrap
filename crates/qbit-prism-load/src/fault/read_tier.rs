@@ -71,6 +71,9 @@ pub struct ReadTier {
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
     in_flight: InFlight,
+    /// Scrapes still running when `finish` gave up waiting and stopped
+    /// public-api under them, for the report (0 when every one finished).
+    pub cut_off: usize,
 }
 
 /// The scrapes in flight, so `stop` can let them finish before it kills
@@ -174,6 +177,7 @@ impl ReadTier {
             stop,
             task: None,
             in_flight: InFlight::default(),
+            cut_off: 0,
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut last_failure: String;
@@ -212,26 +216,40 @@ impl ReadTier {
         Ok(tier)
     }
 
-    /// Stop scraping, let the scrapes in flight finish, then stop the public
-    /// process; the samples stay. Killing public-api under a scrape in flight
-    /// would fail that scrape, and its sample, timed from its start, would land
-    /// in the last fault's window, which runs to the phase's end (#701). Every
-    /// scrape ends within REQUEST_TIMEOUT, the client's total timeout, so the
-    /// wait is bounded.
-    pub async fn stop(&mut self) {
+    /// Start no more scrapes, at the fault phase's end. The scrapes in flight
+    /// finish on their own; `finish` waits for them.
+    pub fn stop_scraping(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Wait for the scrape loop and every scrape in flight, then stop the
+    /// public process; the samples stay. Killing public-api under a scrape in
+    /// flight would fail that scrape, and its sample, timed from its start,
+    /// would land in the last fault's window, which runs to the phase's end
+    /// (#701). Each scrape ends within REQUEST_TIMEOUT, the client's total
+    /// timeout, once it has started; the wait allows twice that, and any
+    /// scrape still running after it is counted in `cut_off` and reported.
+    pub async fn finish(&mut self) {
         self.stop.send_replace(true);
         if let Some(task) = self.task.take() {
             // The scrape loop returns on the stop, so it starts nothing more.
             let _ = task.await;
         }
-        self.in_flight
-            .drained(REQUEST_TIMEOUT + Duration::from_secs(1))
-            .await;
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let limit = 2 * REQUEST_TIMEOUT;
+        if !self.in_flight.drained(limit).await {
+            self.cut_off = self.in_flight.count();
+            eprintln!(
+                "qbit-prism-load: read tier: {} scrape(s) still in flight after {limit:?}; \
+                 stopping public-api cuts them off",
+                self.cut_off
+            );
         }
-        self.child = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            // Reaped off the runtime's threads: a killed process can still take
+            // a moment to exit.
+            let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+        }
     }
 
     pub fn samples(&self) -> Vec<ReadSample> {
@@ -562,22 +580,53 @@ mod tests {
         assert!(cause.starts_with(": ") && cause.len() > 2, "{error}");
     }
 
+    /// Whether `pid` is a live process, not gone or a zombie.
+    fn alive(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| !rest.starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+
     #[tokio::test]
-    async fn stop_lets_the_scrapes_in_flight_finish() {
-        // A public endpoint that answers each request after 600 ms, three
-        // scrape intervals, so scrapes are always in flight when the tier
-        // stops, as they were when #701's phase ended.
+    async fn finish_lets_the_scrapes_in_flight_finish_before_it_stops_public_api() {
+        // A stand-in for public-api, which `finish` must stop only after the
+        // scrapes in flight have their answers (#701).
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("a stand-in process");
+        let pid = child.id();
+        // An endpoint that answers each request after 600 ms, three scrape
+        // intervals, so scrapes are in flight when the tier stops, as they
+        // were when #701's phase ended. Each answer notes whether the
+        // stand-in was still running when it was written.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a listener");
         let public = format!("http://{}", listener.local_addr().expect("its address"));
+        let alive_at_answer = Arc::new(Mutex::new(Vec::new()));
+        let answers = alive_at_answer.clone();
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let answers = answers.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut request = [0u8; 1024];
-                    let _ = stream.read(&mut request).await;
+                    // The whole request head, so no unread byte turns the
+                    // close into a reset.
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
                     tokio::time::sleep(Duration::from_millis(600)).await;
+                    answers.lock().expect("answers").push(alive(pid));
                     let _ = stream
                         .write_all(
                             b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
@@ -595,7 +644,7 @@ mod tests {
         let in_flight = InFlight::default();
         let (stop, stop_rx) = watch::channel(false);
         let mut tier = ReadTier {
-            child: None,
+            child: Some(child),
             url: public.clone(),
             log: PathBuf::new(),
             reads: "replica",
@@ -610,6 +659,7 @@ mod tests {
                 in_flight.clone(),
             ))),
             in_flight: in_flight.clone(),
+            cut_off: 0,
         };
         // Wait until scrapes are in flight, rather than for a fixed time.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -620,18 +670,29 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tier.stop().await;
-        assert_eq!(in_flight.count(), 0, "stop returned with scrapes in flight");
+        tier.stop_scraping();
+        tier.finish().await;
         server.abort();
+        assert_eq!(
+            in_flight.count(),
+            0,
+            "finish returned with scrapes in flight"
+        );
+        assert_eq!(tier.cut_off, 0);
+        assert!(!alive(pid), "finish left the public process running");
         let samples = samples.lock().expect("samples");
         assert!(samples.len() >= 2, "{} samples", samples.len());
-        // Every scrape the stop found in flight was answered, not cut off.
+        // Every scrape the stop found in flight was answered, not cut off...
         let failed: Vec<_> = samples
             .iter()
             .filter(|sample| !sample.ok())
             .map(|sample| (&sample.path, sample.status, &sample.error))
             .collect();
         assert!(failed.is_empty(), "{failed:?}");
+        // ...and answered while the public process still ran.
+        let answers = alive_at_answer.lock().expect("answers");
+        assert!(answers.len() >= samples.len(), "{answers:?}");
+        assert!(answers.iter().all(|alive| *alive), "{answers:?}");
     }
 
     #[tokio::test]

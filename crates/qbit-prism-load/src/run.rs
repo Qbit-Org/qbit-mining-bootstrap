@@ -1893,7 +1893,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .await?;
         if plan.kind == crate::fault::PHASE {
             if let Some(tier) = read_tier.as_mut() {
-                tier.stop().await;
+                tier.stop_scraping();
             }
         }
         // The phase's bounds are when it started and stopped scheduling; a
@@ -2494,6 +2494,11 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         .qbitd()
         .map(|real| real.observed_mints(crate::node::MintPurpose::Fault))
         .unwrap_or_default();
+    // The read tier's scrapes in flight at the phase's end finish before its
+    // samples are read and public-api is stopped (#701).
+    if let Some(tier) = read_tier.as_mut() {
+        tier.finish().await;
+    }
     let faults_report = fault_driver.as_ref().map(|driver| {
         let phase = runs.iter().find(|run| run.plan.kind == crate::fault::PHASE);
         let samples = read_tier
@@ -2524,6 +2529,9 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 "url": tier.url,
                 "reads": tier.reads,
                 "log": tier.log.display().to_string(),
+                // Scrapes still running when the tier gave up waiting and
+                // stopped public-api under them (#701); 0 when none.
+                "scrapes_cut_off": tier.cut_off,
             });
         }
         if let Some(error) = &read_tier_error {
