@@ -79,8 +79,8 @@ grep -E '^WARNING' <<<"$out" | sed 's/^/INFO  check-config /'
 #    only when the heartbeat read fails, and warns when HA is unknown or fewer than two
 #    frontends are live. Freshness is 3 health refreshes, at least 15 s.
 refresh=$(trim "${PRISM_HEALTH_REFRESH_SECONDS:-}")
-if [[ ${refresh:-2} =~ ^[0-9]+$ ]] && [ "${refresh:-2}" -ge 1 ]; then
-  fresh=$(( ${refresh:-2} * 3 > 15 ? ${refresh:-2} * 3 : 15 ))
+if [[ ${refresh:-2} =~ ^[0-9]+$ ]] && (( 10#${refresh:-2} >= 1 )); then
+  fresh=$(( 10#${refresh:-2} * 3 > 15 ? 10#${refresh:-2} * 3 : 15 ))
 else
   fresh=15
 fi
@@ -196,21 +196,26 @@ fi
 #    first difficulty it advertises is at least PRISM_STRATUM_HIGHDIFF_MIN_DIFF (default 500000).
 #    The probe authorizes as self-check does: PRISM_SELF_CHECK_ADDRESS, the username fallback
 #    (PRISM_USERNAME_FALLBACK_ADDRESS, or the built-in test-network address), the pool fee
-#    address, then the most recent miner.
+#    address, then the most recent miner. Like config::optional, a blank variable counts as
+#    unset and a set one is used verbatim.
 highdiff_port=$(trim "${PRISM_STRATUM_HIGHDIFF_PORT:-}")
 if [ -n "$highdiff_port" ]; then
-  user=$(trim "${PRISM_SELF_CHECK_ADDRESS:-}")
-  [ -n "$user" ] || user=$(trim "${PRISM_USERNAME_FALLBACK_ADDRESS:-}")
+  user=""
+  for name in PRISM_SELF_CHECK_ADDRESS PRISM_USERNAME_FALLBACK_ADDRESS; do
+    if [ -z "$user" ] && [ -n "$(trim "${!name:-}")" ]; then user=${!name}; fi
+  done
   if [ -z "$user" ]; then
     case "$(trim "${QBIT_CHAIN:-regtest}" | tr '[:upper:]' '[:lower:]')" in
       test | testnet | testnet3 | testnet4 | signet)
         user=tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3 ;;
     esac
   fi
-  [ -n "$user" ] || user=$(trim "${PRISM_POOL_FEE_ADDRESS:-}")
+  if [ -z "$user" ] && [ -n "$(trim "${PRISM_POOL_FEE_ADDRESS:-}")" ]; then
+    user=$PRISM_POOL_FEE_ADDRESS
+  fi
   [ -n "$user" ] || user=$(psqlq "SELECT miner_id FROM qbit_share_ledger ORDER BY share_seq DESC LIMIT 1")
-  bind=$(trim "${PRISM_STRATUM_HIGHDIFF_BIND:-}")
-  [ -n "$bind" ] || bind=${PRISM_STRATUM_BIND:-127.0.0.1}
+  bind=${PRISM_STRATUM_HIGHDIFF_BIND:-}
+  [ -n "$(trim "$bind")" ] || bind=${PRISM_STRATUM_BIND-127.0.0.1}
   floor=$(trim "${PRISM_STRATUM_HIGHDIFF_MIN_DIFF:-}")
   if [ -z "$user" ]; then
     bad "highdiff probe: set PRISM_SELF_CHECK_ADDRESS to a valid P2MR address to probe highdiff on an empty pool"

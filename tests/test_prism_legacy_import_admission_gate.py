@@ -241,6 +241,9 @@ class AdmissionGateTests(unittest.TestCase):
         run = self.run_gate(FAKE_CENSUS='2|0|0|1|[]')
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn("WARN  Unrecognized or future-dated heartbeats; HA is unknown", run.stdout)
+        run = self.run_gate(PRISM_HEALTH_REFRESH_SECONDS="09")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("(freshness 27s)", run.stdout)
         run = self.run_gate(PRISM_HEALTH_REFRESH_SECONDS="10")
         self.assertIn("(freshness 30s)", run.stdout)
         self.assertTrue(any(["-v", "fresh=30"] == call["argv"][i:i + 2]
@@ -339,6 +342,10 @@ class AdmissionGateTests(unittest.TestCase):
             ({"PRISM_POOL_FEE_ADDRESS": "qb1zfee"}, "qb1zfee"),
             ({"QBIT_CHAIN": "testnet4", "PRISM_POOL_FEE_ADDRESS": "qb1zfee"}, TESTNET_FALLBACK),
             ({}, "qb1zrecentminer"),
+            ({"PRISM_SELF_CHECK_ADDRESS": " qb1zspaced ", "PRISM_POOL_FEE_ADDRESS": "qb1zfee"},
+             " qb1zspaced "),
+            ({"PRISM_SELF_CHECK_ADDRESS": "   ", "PRISM_USERNAME_FALLBACK_ADDRESS": " "},
+             "qb1zrecentminer"),
         )
         for env, username in cases:
             with self.subTest(env=env):
