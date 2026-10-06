@@ -46,7 +46,9 @@ use backlog::CandidateBacklog;
 use database::{Exhauster, Exhaustion, LockHolder};
 use disk::WalDiskFull;
 use failover::{Failover, FailoverControl};
-use frontend::{FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain, WorkCurrentWait};
+use frontend::{
+    FrontendSigkill, ReconnectStorm, RollingRestart, SigtermDrain, WorkCurrentWait, WorkReading,
+};
 use plan::{FaultKind, FaultPlan, Scheduled};
 use rpc_relay::RpcFaultRelay;
 use serde::Serialize;
@@ -227,6 +229,9 @@ enum Action {
         /// lock is taken only then (#692).
         work: WorkCurrentWait,
         holder: Option<LockHolder>,
+        /// The work read once more once the lock is held, and what it found.
+        reading_under_lock: Option<Spawned<Result<WorkReading>>>,
+        under_lock: Option<Result<WorkReading, String>>,
         mint_at: Option<Instant>,
         minted: Option<Instant>,
         tip: Option<TipChange>,
@@ -273,6 +278,8 @@ impl Action {
             FaultKind::SettlementLock => Self::SettlementLock {
                 work: WorkCurrentWait::quiet(),
                 holder: None,
+                reading_under_lock: None,
+                under_lock: None,
                 mint_at: None,
                 minted: None,
                 tip: None,
@@ -490,8 +497,16 @@ impl FaultDriver {
         if let Some((mut run, _)) = self.current.take() {
             match &mut run.action {
                 Action::SlowDatabase { .. } => env.delay_proxy.set_delay_millis(0),
-                Action::SettlementLock { work, holder, .. } => {
+                Action::SettlementLock {
+                    work,
+                    holder,
+                    reading_under_lock,
+                    ..
+                } => {
                     work.abort();
+                    if let Some(read) = reading_under_lock {
+                        read.abort();
+                    }
                     if let Some(holder) = holder {
                         holder.release();
                     }
@@ -629,6 +644,8 @@ fn inject(
         Action::SettlementLock {
             work,
             holder,
+            reading_under_lock,
+            under_lock,
             mint_at,
             stall,
             ..
@@ -659,6 +676,25 @@ fn inject(
             match holder.poll_acquired() {
                 Ok(None) => Ok(false),
                 Ok(Some(at)) => {
+                    // The work once more, now that nothing can publish: a tip
+                    // that reached the frontends after the last reading
+                    // leaves the revision as it was, but not their work, and
+                    // the hold now blocks its rebuild. The verdict fails a
+                    // hold whose work was not current under the lock.
+                    if under_lock.is_none() {
+                        let read =
+                            reading_under_lock.get_or_insert_with(|| work.read_once(env, tools));
+                        let finished = read.poll().map(|result| match result {
+                            Ok(reading) => Ok(reading.clone()),
+                            Err(error) => Err(format!("{error:#}")),
+                        });
+                        *under_lock = Some(match finished {
+                            None if !read.lost() => return Ok(false),
+                            None => Err("the reading under the lock was lost".into()),
+                            Some(result) => result,
+                        });
+                        *reading_under_lock = None;
+                    }
                     run.injected_at = Some(at);
                     *mint_at = Some(at + Duration::from_secs(plan.hold_seconds) / 2);
                     *stall = Some(StallSampler::start(

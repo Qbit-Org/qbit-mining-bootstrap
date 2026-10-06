@@ -331,6 +331,7 @@ impl FaultDriver {
             Action::SettlementLock {
                 work,
                 holder,
+                under_lock,
                 minted,
                 tip,
                 stall,
@@ -340,53 +341,59 @@ impl FaultDriver {
                 // Every check below assumes retained work was current when
                 // the lock was taken (#692): a hold taken while a landing's
                 // revision bump was still unpublished blocks the publication
-                // too, and refuses every share on the old work. The revision
-                // read under the lock is the one the hold keeps, so it must
-                // be the one the last reading before the lock found every
-                // frontend serving.
-                let current = work
-                    .last
-                    .as_ref()
-                    .filter(|reading| reading.current())
-                    .map(|reading| reading.payout_revision);
+                // too, and refuses every share on the old work. Under the
+                // lock nothing can publish, so a reading taken then must
+                // find every frontend serving the revision the lock keeps.
                 let locked = holder.as_ref().and_then(LockHolder::revision);
-                let revision = |revision: Option<i64>| {
-                    revision.map_or_else(|| "unknown".to_owned(), |revision| revision.to_string())
-                };
-                let reading = match (work.current_at, &work.last) {
-                    (Some(at), _) => format!(
-                        "every frontend served revision {}'s work, with no settlement under way, \
-                         {:.1} s after the injection started",
-                        revision(current),
+                let before = match work.current_at {
+                    Some(at) => format!(
+                        "every frontend served current work with no settlement under way {:.1} s \
+                         after the injection started",
                         at.saturating_duration_since(inject_start).as_secs_f64()
                     ),
-                    (None, Some(last)) if last.current() => format!(
-                        "no reading within the {} s bound found the cluster quiet ({} settlements \
-                         under way at the last), so the lock was taken on revision {}'s current \
-                         work",
-                        LOCK_WORK_WAIT.as_secs(),
-                        last.settlements_in_progress,
-                        revision(current)
-                    ),
-                    (None, _) => format!(
-                        "no reading within the {} s bound found every frontend serving current \
-                         work; {}",
+                    None => format!(
+                        "no reading within the {} s bound found current work on a quiet cluster \
+                         ({})",
                         LOCK_WORK_WAIT.as_secs(),
                         work.last_read()
                     ),
                 };
-                checks.push(check(
-                    "the lock was taken on current work",
-                    current.is_some() && locked == current,
-                    format!(
-                        "{reading}; the lock was taken at revision {}{}",
-                        revision(locked),
-                        holder
-                            .as_ref()
-                            .and_then(LockHolder::revision_error)
-                            .map(|error| format!(" ({error})"))
-                            .unwrap_or_default()
+                let (pass, under) = match (locked, under_lock) {
+                    (Some(locked), Some(Ok(reading))) if reading.published_at(locked) => (
+                        true,
+                        format!(
+                            "the lock kept revision {locked}, and under it every frontend served \
+                             work at it"
+                        ),
                     ),
+                    (Some(locked), Some(Ok(reading))) => (
+                        false,
+                        format!("the lock kept revision {locked}, but under it {reading:?}"),
+                    ),
+                    (Some(locked), Some(Err(error))) => (
+                        false,
+                        format!("the lock kept revision {locked}, and the work under it was not read: {error}"),
+                    ),
+                    (Some(locked), None) => (
+                        false,
+                        format!("the lock kept revision {locked}, and the work under it was not read"),
+                    ),
+                    (None, _) => (
+                        false,
+                        format!(
+                            "the revision under the lock is unknown{}",
+                            holder
+                                .as_ref()
+                                .and_then(LockHolder::revision_error)
+                                .map(|error| format!(": {error}"))
+                                .unwrap_or_default()
+                        ),
+                    ),
+                };
+                checks.push(check(
+                    "every frontend served work at the revision the lock kept",
+                    pass,
+                    format!("{before}; {under}"),
                 ));
                 let hold = window_shares(inputs, injected, removed);
                 let before_tip = window_shares(inputs, injected, minted.unwrap_or(removed));
@@ -524,6 +531,10 @@ impl FaultDriver {
                     "work_before_the_lock": work.last,
                     "work_read_error": work.error,
                     "payout_revision_under_the_lock": locked,
+                    "work_under_the_lock": under_lock.as_ref().map(|read| match read {
+                        Ok(reading) => json!(reading),
+                        Err(error) => json!({ "error": error }),
+                    }),
                     "payout_revision_under_the_lock_error": holder
                         .as_ref()
                         .and_then(LockHolder::revision_error),

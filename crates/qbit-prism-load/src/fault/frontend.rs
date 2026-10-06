@@ -633,6 +633,34 @@ impl WorkReading {
     pub fn quiet(&self) -> bool {
         self.current() && self.settlements_in_progress == 0
     }
+
+    /// Every frontend ready and publishing work at `revision`, as a reading
+    /// taken under `SETTLEMENT_LOCK` must show for the lock to keep retained
+    /// work current. A session still waiting for its first job has nothing
+    /// to submit, so it is not counted.
+    pub fn published_at(&self, revision: i64) -> bool {
+        !self.frontends.is_empty()
+            && self.frontends.iter().all(|work| {
+                work.as_ref()
+                    .is_some_and(|work| work.ok && work.payout_state_generation == Some(revision))
+            })
+    }
+}
+
+/// A spawned [`WorkReading`] of every frontend.
+fn reading(
+    client: reqwest::Client,
+    env: &FaultEnv<'_>,
+    tools: &FaultTools,
+) -> Spawned<Result<WorkReading>> {
+    Spawned::spawn(WorkReading::read(
+        tools.side.clone(),
+        client,
+        env.frontends
+            .iter()
+            .map(|frontend| frontend.health_url())
+            .collect(),
+    ))
 }
 
 /// A wait, up to a deadline, for every frontend to serve current work, read
@@ -688,16 +716,28 @@ impl WorkCurrentWait {
     /// `true` once every frontend serves current work, or once `deadline`
     /// passed first.
     pub fn poll(&mut self, deadline: Instant, env: &FaultEnv<'_>, tools: &FaultTools) -> bool {
-        self.poll_with(deadline, |client| {
-            Spawned::spawn(WorkReading::read(
-                tools.side.clone(),
-                client,
-                env.frontends
-                    .iter()
-                    .map(|frontend| frontend.health_url())
-                    .collect(),
-            ))
-        })
+        self.poll_with(deadline, |client| reading(client, env, tools))
+    }
+
+    /// One more reading, outside the wait: the settlement-lock fault's
+    /// reading under the lock.
+    pub fn read_once(
+        &mut self,
+        env: &FaultEnv<'_>,
+        tools: &FaultTools,
+    ) -> Spawned<Result<WorkReading>> {
+        reading(self.client(), env, tools)
+    }
+
+    fn client(&mut self) -> reqwest::Client {
+        self.client
+            .get_or_insert_with(|| {
+                reqwest::Client::builder()
+                    .timeout(HEALTH_READ_TIMEOUT)
+                    .build()
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 
     /// [`Self::poll`], with each read started by `read`.
@@ -755,15 +795,7 @@ impl WorkCurrentWait {
         }
         if Instant::now() >= self.next_read {
             self.next_read = Instant::now() + SETTLE_READ_INTERVAL;
-            let client = self
-                .client
-                .get_or_insert_with(|| {
-                    reqwest::Client::builder()
-                        .timeout(HEALTH_READ_TIMEOUT)
-                        .build()
-                        .unwrap_or_default()
-                })
-                .clone();
+            let client = self.client();
             self.read = Some(read(client));
         }
         false
@@ -1413,6 +1445,28 @@ mod tests {
         assert_eq!(wait.last, Some(at_revision(7)), "kept for the verdict");
         assert!(wait.poll_with(Instant::now(), no_read));
         assert!(wait.last_read().contains("payout_revision: 7"));
+    }
+
+    #[test]
+    fn work_published_at_the_locked_revision_ignores_sessions_without_a_first_job() {
+        let reading = |frontends| WorkReading {
+            payout_revision: 7,
+            settlements_in_progress: 1,
+            frontends,
+        };
+        // Our own holder is the settlement under way, and a session that
+        // has just authorized waits for its first job behind it.
+        assert!(reading(vec![work(true, Some(7), Some(1))]).published_at(7));
+        // A tip that reached a frontend before the lock: unready, or still
+        // publishing the previous revision's work.
+        assert!(!reading(vec![
+            work(true, Some(7), Some(0)),
+            work(false, Some(7), Some(0))
+        ])
+        .published_at(7));
+        assert!(!reading(vec![work(true, Some(6), Some(0))]).published_at(7));
+        assert!(!reading(vec![None]).published_at(7));
+        assert!(!reading(Vec::new()).published_at(7));
     }
 
     #[test]
