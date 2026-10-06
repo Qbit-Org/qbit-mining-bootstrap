@@ -704,7 +704,7 @@ cargo build --release --locked -p qbit-prism --bin qbit-prism-audit-canonicalize
 PGSERVICE=prism-restore psql -Xq -v ON_ERROR_STOP=1 -c "COPY (
   SELECT block_hash, body_uri, audit_bundle_sha256 FROM qbit_pool_audit_bundles
   WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL
-    AND body_uri IS NOT NULL ORDER BY block_hash
+    AND audit_bundle IS NULL AND body_uri IS NOT NULL ORDER BY block_hash
 ) TO STDOUT WITH (FORMAT csv, HEADER)" > legacy-rows.csv
 python3 scripts/prism_legacy_range_sidecars.py --rows legacy-rows.csv \
   --audit-root /var/lib/qbit-mining-pool/prism/audit \
@@ -719,13 +719,15 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
 
 - `--sidecar-dir` must be the directory passed to `import-audits --root`;
   import looks for `prism-audit-bundle-canonical-<block>-<digest>.json.gz`
-  there. `--audit-root` is where the audit tree is mounted, and it replaces
-  the recorded `--uri-prefix`, by default
-  `/var/lib/qbit-mining-pool/prism/audit`, in body and slot URIs. Run the
-  tool where the tree is at its recorded paths, as above, so that only the
-  bodies import refuses get sidecars.
-- Every row goes through the canonicalizer, so when the affected heights are
-  known, narrow the export to them through `qbit_pool_blocks`.
+  there, and resolves a relative body URI against it, as the tool does.
+  `--audit-root` is where the audit tree is mounted, and it replaces the
+  recorded `--uri-prefix`, by default `/var/lib/qbit-mining-pool/prism/audit`,
+  in body and slot URIs. Run the tool where the tree is at its recorded
+  paths, as above, so that only the bodies import refuses get sidecars.
+- The export leaves out rows with an inline `audit_bundle`: import reads
+  those from the database, not from `body_uri`. Every exported row goes
+  through the canonicalizer, so when the affected heights are known, narrow
+  the export to them through `qbit_pool_blocks`.
 - Each run reports every row in `legacy-range-sidecars.jsonl`, and the first
   run writes nothing. A run exits 0 only when every row is `ok-in-3x` (it
   verifies as it is), `proven` (`sidecar-written` with `--write`) or
@@ -734,8 +736,10 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   that evidence instead.
 - The tool never replaces a sidecar. An existing one that does not hold the
   digest's bytes is reported as `sidecar-bad` and named on stderr; import
-  would stop on it too. Import re-verifies every sidecar against the digest,
-  the recorded coinbase and the trusted ledger key.
+  would stop on it too. A new sidecar is published by hard-linking a complete
+  file, so the sidecar directory's filesystem must support hard links; import
+  never sees a partial one. Import re-verifies every sidecar against the
+  digest, the recorded coinbase and the trusted ledger key.
 
 The post-GA follow-up is #709: 3.x accepting the escaped form, so that these
 bodies verify without sidecars.

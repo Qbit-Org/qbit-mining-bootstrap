@@ -22,10 +22,12 @@ For each row (`block_hash,body_uri,audit_bundle_sha256`) the tool:
    rewritten body-ref. The canonicalizer itself requires
    sha256(canonical bundle) == audit_bundle_sha256, so a zero exit proves the
    content is exactly what was committed;
-4. with `--write`, gzips the proven canonical bytes (level 9, mtime 0) to
-   `<sidecar-dir>/prism-audit-bundle-canonical-<block>-<digest>.json.gz`. An
-   existing file is never replaced. `import-audits` re-verifies the sidecar
-   against the digest, the coinbase and the ledger key.
+4. with `--write`, gzips the proven canonical bytes (level 9, mtime 0) and
+   hard-links the complete file to
+   `<sidecar-dir>/prism-audit-bundle-canonical-<block>-<digest>.json.gz`, so
+   an existing file is never replaced and a partial one never appears.
+   `import-audits` re-verifies the sidecar against the digest, the coinbase
+   and the ledger key.
 
 Without `--write` it only classifies. The exit status is 0 only when every row
 is `ok-in-3x`, `sidecar-ok`, `proven` or, with `--write`, `sidecar-written`;
@@ -65,6 +67,8 @@ SHARE_FIELDS = (
     "job_issued_at_ms", "accepted_at_ms", "ntime",
 )
 DIGEST_KEY = {"segment_range": "range_sha256", "segment_prefix": "prefix_sha256"}
+# Range parts whose digest 3.x does not reproduce; the rewrite inlines them.
+INLINED = ("python-escaped", "unexplained")
 CSV_COLUMNS = {"block_hash", "body_uri", "audit_bundle_sha256"}
 HEX64 = re.compile(r"[0-9a-f]{64}")
 OK_STATUSES = {"ok-in-3x", "sidecar-ok", "proven", "sidecar-written"}
@@ -114,7 +118,16 @@ def canonicalize(canonicalizer: str, body: Path) -> tuple[bytes | None, str]:
     return run.stdout, ""
 
 
-def probe_part(part: dict, prefix: str, root: Path, base: Path) -> dict:
+def slot_shares(slot: Path, slots: dict) -> list:
+    """A slot's shares, parsed once while consecutive parts read the same slot.
+    Only the latest slot is kept, which bounds memory to one slot."""
+    if slot not in slots:
+        slots.clear()
+        slots[slot] = json.loads(slot.read_bytes())["shares"]
+    return slots[slot]
+
+
+def probe_part(part: dict, prefix: str, root: Path, base: Path, slots: dict) -> dict:
     """Classify one share part by which serialization reproduces its digest."""
     kind = part.get("kind")
     probe = {"kind": kind, "first": part.get("first_share_seq"), "last": part.get("last_share_seq")}
@@ -128,9 +141,9 @@ def probe_part(part: dict, prefix: str, root: Path, base: Path) -> dict:
         return probe
     first, last = int(part["first_share_seq"]), int(part["last_share_seq"])
     try:
-        segment = json.loads(slot.read_bytes())
         selected = sorted(
-            (share for share in segment["shares"] if first <= int(share["share_seq"]) <= last),
+            (share for share in slot_shares(slot, slots)
+             if first <= int(share["share_seq"]) <= last),
             key=lambda share: int(share["share_seq"]),
         )
     except (OSError, KeyError, TypeError, ValueError) as exc:
@@ -154,7 +167,8 @@ def probe_part(part: dict, prefix: str, root: Path, base: Path) -> dict:
         for share in shares for key, value in share.items()
         if isinstance(value, str) and not value.isascii()
     ][:20]
-    probe["shares"] = shares
+    if probe["status"] in INLINED:
+        probe["shares"] = shares
     return probe
 
 
@@ -167,7 +181,7 @@ def rewrite(body: dict, digest: str, parts: list, probes: list, prefix: str, roo
     reward manifest included, so matching it proves the content as well."""
     new_parts = []
     for part, probe in zip(parts, probes):
-        if probe["status"] in ("python-escaped", "unexplained"):
+        if probe["status"] in INLINED:
             new_parts.append({
                 "kind": "inline",
                 "first_share_seq": part["first_share_seq"],
@@ -193,34 +207,26 @@ def rewrite(body: dict, digest: str, parts: list, probes: list, prefix: str, roo
 
 
 def write_sidecar(target: Path, canonical: bytes) -> str:
-    """Write the gzip sidecar without ever replacing an existing file."""
+    """Publish the gzip sidecar atomically, never replacing an existing file.
+
+    The complete file is synced under a temporary name and hard-linked to the
+    target, which refuses an existing one. Import stops on a partial sidecar,
+    so there is no fallback for a filesystem without hard links: its OSError
+    reaches the caller, and the temporary file is removed either way."""
     sink = io.BytesIO()
     with gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=9, mtime=0) as handle:
         handle.write(canonical)
-    payload = sink.getvalue()
     temp = target.with_name(target.name + f".tmp-{os.getpid()}")
-    with open(temp, "wb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
     try:
-        # A hard link publishes the complete file atomically and refuses an
-        # existing target.
+        with open(temp, "wb") as handle:
+            handle.write(sink.getvalue())
+            handle.flush()
+            os.fsync(handle.fileno())
         os.link(temp, target)
     except FileExistsError:
         return "sidecar-conflict"
-    except OSError:
-        # No hard links on this filesystem: exclusive create still refuses
-        # an existing target.
-        try:
-            with open(target, "xb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except FileExistsError:
-            return "sidecar-conflict"
     finally:
-        temp.unlink()
+        temp.unlink(missing_ok=True)
     return "sidecar-written"
 
 
@@ -228,12 +234,13 @@ def existing_sidecar_status(target: Path, digest: str) -> str:
     """`sidecar-ok` only for one complete gzip member, the form this tool
     writes, whose bytes hash to the digest. Import reads the first member and
     requires that hash, from a file that resolves inside its --root."""
-    if not target.resolve().is_relative_to(target.parent.resolve()):
-        return "sidecar-bad"
     try:
+        # Python before 3.13 raises RuntimeError on a symlink loop.
+        if not target.resolve().is_relative_to(target.parent.resolve()):
+            return "sidecar-bad"
         inflater = zlib.decompressobj(wbits=31)
         payload = inflater.decompress(target.read_bytes())
-    except (OSError, zlib.error):
+    except (OSError, RuntimeError, zlib.error):
         return "sidecar-bad"
     if not inflater.eof or inflater.unused_data:
         return "sidecar-bad"
@@ -262,10 +269,18 @@ def process(row: dict, args: argparse.Namespace) -> dict:
         result["sidecar"] = str(target)
         result["status"] = existing_sidecar_status(target, digest)
         return result
-    # Import loads the body from its canonical path, so relative slot URIs
-    # resolve against the real file's directory.
+    # A relative body URI resolves against import's --root, the sidecar
+    # directory. Import loads the body from its canonical path, so relative
+    # slot URIs resolve against the real file's directory.
     body_uri = (row.get("body_uri") or "").strip()
-    body_path = map_uri(body_uri, args.uri_prefix, args.audit_root, args.audit_root).resolve()
+    body_base = args.sidecar_dir or args.audit_root
+    try:
+        # Python before 3.13 raises RuntimeError on a symlink loop.
+        body_path = map_uri(body_uri, args.uri_prefix, args.audit_root, body_base).resolve()
+    except (OSError, RuntimeError) as exc:
+        result["status"] = "body-unreadable"
+        result["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return result
     result["body"] = str(body_path)
     if not body_uri or not body_path.is_file():
         result["status"] = "body-missing"
@@ -286,7 +301,10 @@ def process(row: dict, args: argparse.Namespace) -> dict:
         if str(body.get("audit_bundle_sha256", "")).lower() != digest:
             result["status"] = "body-digest-differs"
             return result
-        probes = [probe_part(part, args.uri_prefix, args.audit_root, base) for part in parts]
+        slots: dict = {}
+        probes = [probe_part(part, args.uri_prefix, args.audit_root, base, slots)
+                  for part in parts]
+        slots.clear()
         result["parts"] = [{k: v for k, v in probe.items() if k != "shares"} for probe in probes]
         if any(probe["status"].startswith("slot-") for probe in probes):
             result["status"] = "slot-incomplete"
@@ -298,9 +316,14 @@ def process(row: dict, args: argparse.Namespace) -> dict:
         result["status"] = "body-unreadable"
         result["error"] = f"{type(exc).__name__}: {exc}"[:200]
         return result
-    args.work_dir.mkdir(parents=True, exist_ok=True)
     rewritten_path = args.work_dir / f"rewritten-{block}.json"
-    rewritten_path.write_bytes(compact(rewritten, ascii_only=False))
+    try:
+        args.work_dir.mkdir(parents=True, exist_ok=True)
+        rewritten_path.write_bytes(compact(rewritten, ascii_only=False))
+    except OSError as exc:
+        result["status"] = "work-dir-unwritable"
+        result["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return result
     canonical, error = canonicalize(args.canonicalizer, rewritten_path)
     if canonical is None:
         result["status"] = "canonicalizer-refused"
@@ -313,7 +336,11 @@ def process(row: dict, args: argparse.Namespace) -> dict:
         result["status"] = "proven"
         return result
     result["sidecar"] = str(target)
-    result["status"] = write_sidecar(target, canonical)
+    try:
+        result["status"] = write_sidecar(target, canonical)
+    except OSError as exc:
+        result["status"] = "sidecar-write-failed"
+        result["error"] = f"{type(exc).__name__}: {exc}"[:200]
     return result
 
 
@@ -324,13 +351,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rows", required=True, type=Path,
                         help="CSV with header block_hash,body_uri,audit_bundle_sha256")
     parser.add_argument("--audit-root", required=True, type=Path,
-                        help="where the audit tree is mounted; relative body URIs resolve here")
+                        help="where the audit tree is mounted")
     parser.add_argument("--uri-prefix", default="/var/lib/qbit-mining-pool/prism/audit",
-                        help="body_uri prefix that --audit-root replaces")
+                        help="body and slot URI prefix that --audit-root replaces")
     parser.add_argument("--canonicalizer", required=True,
                         help="qbit-prism-audit-canonicalize built at the release pin")
     parser.add_argument("--sidecar-dir", type=Path,
-                        help="the import-audits --root directory; required with --write")
+                        help="the import-audits --root directory, against which relative "
+                             "body URIs resolve (else --audit-root); required with --write")
     parser.add_argument("--work-dir", type=Path, default=Path("legacy-range-sidecars-work"),
                         help="where rewritten body-refs are kept for review")
     parser.add_argument("--report", type=Path, default=Path("legacy-range-sidecars.jsonl"))
@@ -359,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = process(row, args)
                 totals[result["status"]] = totals.get(result["status"], 0) + 1
                 report.write(json.dumps(result, ensure_ascii=False) + "\n")
-                if result["status"] in ("sidecar-conflict", "sidecar-bad"):
+                if result["status"] in ("sidecar-conflict", "sidecar-bad", "sidecar-write-failed"):
                     print(f"{result['status']}: {result['sidecar']}", file=sys.stderr)
     print(json.dumps({"totals": totals, "report": str(args.report)}, sort_keys=True))
     return 0 if set(totals) <= OK_STATUSES else 3

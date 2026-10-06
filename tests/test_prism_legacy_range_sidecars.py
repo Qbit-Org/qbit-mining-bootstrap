@@ -1,5 +1,6 @@
 """Prove legacy bodies whose range digests use Python's escaped JSON (#709)."""
 import contextlib
+import errno
 import gzip
 import hashlib
 import importlib.util
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -56,7 +58,8 @@ STUB = textwrap.dedent("""\
         selected = [s for s in segment["shares"] if first <= s["share_seq"] <= last]
         payload = {"schema": "qbit.prism.audit-share-segment.v1", "first_share_seq": first,
                    "last_share_seq": last, "share_count": len(selected), "shares": selected}
-        if hashlib.sha256(serde(payload)).hexdigest() != part["range_sha256"]:
+        key = "range_sha256" if part["kind"] == "segment_range" else "prefix_sha256"
+        if hashlib.sha256(serde(payload)).hexdigest() != part[key]:
             sys.exit("qbit-prism-audit-canonicalize: audit body ref hash mismatch")
         shares += selected
     bundle = dict(body["bundle_without_shares"])
@@ -89,10 +92,12 @@ def range_digest(first, last, shares, ascii_only):
     return hashlib.sha256(compact(payload, ascii_only)).hexdigest()
 
 
-def escaped_range_part(first, last, shares, body_uri):
-    """A range part as 1.x and 2.x wrote it: the digest is Python's escaped JSON."""
-    return {"kind": "segment_range", "first_share_seq": first, "last_share_seq": last,
-            "share_count": len(shares), "range_sha256": range_digest(first, last, shares, True),
+def escaped_part(kind, first, last, shares, body_uri):
+    """A range or prefix part as 1.x and 2.x wrote it: the digest is Python's
+    escaped JSON."""
+    key = "range_sha256" if kind == "segment_range" else "prefix_sha256"
+    return {"kind": kind, "first_share_seq": first, "last_share_seq": last,
+            "share_count": len(shares), key: range_digest(first, last, shares, True),
             "body_uri": body_uri}
 
 
@@ -109,7 +114,8 @@ def parted_body(schema, digest, bundle_without_shares, share_count, parts):
 class Fixture:
     """A restored audit tree holding one 1.x-style parted body."""
 
-    def __init__(self, root, *, schema=BODY_REF, workers=None, absolute_slot_uri=True):
+    def __init__(self, root, *, schema=BODY_REF, workers=None, absolute_slot_uri=True,
+                 first_kind="segment_range"):
         self.root = Path(root)
         workers = workers or ["rig01", "rig02", "rig03", "Bjørn-rig", "rig05", "Bjørn-rig"]
         self.shares = [share(seq, worker) for seq, worker in enumerate(workers, start=1)]
@@ -126,10 +132,10 @@ class Fixture:
         self.slot = self.root / "segments/slot-1-10.json"
         self.slot.write_bytes(compact(slot, True))
         parts = [
-            escaped_range_part(1, 3, self.shares[:3], "../segments/slot-1-10.json"),
-            escaped_range_part(4, 6, self.shares[3:], (f"{PREFIX}/segments/slot-1-10.json"
-                                                       if absolute_slot_uri
-                                                       else "../segments/slot-1-10.json")),
+            escaped_part(first_kind, 1, 3, self.shares[:3], "../segments/slot-1-10.json"),
+            escaped_part("segment_range", 4, 6, self.shares[3:],
+                         (f"{PREFIX}/segments/slot-1-10.json" if absolute_slot_uri
+                          else "../segments/slot-1-10.json")),
         ]
         body = parted_body(schema, self.digest, self.bundle_without_shares, len(self.shares),
                            parts)
@@ -191,6 +197,15 @@ class LegacyRangeSidecarTests(unittest.TestCase):
         self.assertEqual((code, row["status"]), (0, "sidecar-written"))
         self.assertEqual(gzip.decompress(fx.sidecar.read_bytes()), fx.canonical)
 
+    def test_an_escaped_prefix_digest_is_proven_too(self):
+        fx = self.fixture(workers=["Bjørn-rig", "rig02", "rig03", "rig04", "rig05", "rig06"],
+                          first_kind="segment_prefix")
+        code, [row], _ = self.run_tool(fx, write=True)
+        self.assertEqual((code, row["status"]), (0, "sidecar-written"))
+        self.assertEqual([(part["kind"], part["status"]) for part in row["parts"]],
+                         [("segment_prefix", "python-escaped"), ("segment_range", "ok-in-3x")])
+        self.assertEqual(gzip.decompress(fx.sidecar.read_bytes()), fx.canonical)
+
     def test_dry_run_classifies_without_writing(self):
         fx = self.fixture()
         code, [row], _ = self.run_tool(fx, write=False)
@@ -218,9 +233,6 @@ class LegacyRangeSidecarTests(unittest.TestCase):
         # The second range keeps its slot, named by the production path; the
         # rewritten body-ref, read from the work directory, must still find it.
         fx = self.fixture(workers=["Bjørn-rig", "rig02", "rig03", "rig04", "rig05", "rig06"])
-        # A relative body_uri resolves against --audit-root, as import's does
-        # against --root.
-        fx.write_rows(f"bodies/{fx.block}.json")
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(self.tmp.name)
         code, [row], _ = self.run_tool(fx, write=True, paths={
@@ -229,6 +241,21 @@ class LegacyRangeSidecarTests(unittest.TestCase):
         self.assertEqual([part["status"] for part in row["parts"]],
                          ["python-escaped", "ok-in-3x"])
         self.assertEqual(gzip.decompress(fx.sidecar.read_bytes()), fx.canonical)
+
+    def test_a_relative_body_uri_resolves_against_the_import_root(self):
+        # Import resolves it against its --root, which is --sidecar-dir, even
+        # when the tree is mounted for the tool somewhere else.
+        fx = self.fixture(absolute_slot_uri=False)
+        fx.write_rows(f"bodies/{fx.block}.json")
+        elsewhere = Path(self.tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        code, [row], _ = self.run_tool(fx, write=True, paths={
+            "--audit-root": elsewhere, "--sidecar-dir": fx.root,
+            "--work-dir": Path(self.tmp.name) / "work"})
+        self.assertEqual((code, row["status"]), (0, "sidecar-written"))
+        self.assertEqual(row["body"], str(fx.body.resolve()))
+        sidecar = fx.root / fx.sidecar.name
+        self.assertEqual(gzip.decompress(sidecar.read_bytes()), fx.canonical)
 
     def test_a_valid_existing_sidecar_is_kept_and_counts_as_done(self):
         fx = self.fixture()
@@ -273,6 +300,24 @@ class LegacyRangeSidecarTests(unittest.TestCase):
         self.assertEqual(module.write_sidecar(target, b"second"), "sidecar-conflict")
         self.assertEqual(gzip.decompress(target.read_bytes()), b"first")
         self.assertEqual([path.name for path in fx.sidecar_dir.iterdir()], [target.name])
+
+    def test_a_sidecar_that_cannot_be_published_whole_is_not_published(self):
+        # Import stops on a partial sidecar, so publication is the atomic
+        # hard link or nothing, and the row is reported.
+        failures = {
+            "no hard links": mock.patch.object(
+                module.os, "link", side_effect=OSError(errno.EPERM, "no links")),
+            "disk full": mock.patch.object(
+                module.os, "fsync", side_effect=OSError(errno.ENOSPC, "disk full")),
+        }
+        for name, failure in failures.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                fx = Fixture(Path(tmp) / "audit")
+                with failure:
+                    code, [row], stderr = self.run_tool(fx, write=True)
+                self.assertEqual((code, row["status"]), (3, "sidecar-write-failed"))
+                self.assertIn(str(fx.sidecar), stderr)
+                self.assertEqual(list(fx.sidecar_dir.iterdir()), [])
 
     def test_a_corrupt_body_is_reported_and_gets_no_sidecar(self):
         fx = self.fixture()
@@ -350,8 +395,11 @@ class RealCanonicalizerTests(unittest.TestCase):
                 slot = {"schema": SEGMENT, "first_share_seq": 1, "last_share_seq": len(shares),
                         "share_count": len(shares), "shares": shares}
                 (root / "segments/slot.json").write_bytes(compact(slot, True))
-                parts = [escaped_range_part(1, 1, shares[:1], "segments/slot.json"),
-                         escaped_range_part(2, len(shares), shares[1:], "segments/slot.json")]
+                # The ASCII prefix is kept and checked by the real binary; the
+                # range holds the non-ASCII workers and is inlined.
+                parts = [escaped_part("segment_prefix", 1, 1, shares[:1], "segments/slot.json"),
+                         escaped_part("segment_range", 2, len(shares), shares[1:],
+                                      "segments/slot.json")]
                 body = parted_body(schema, digest, bundle, len(shares), parts)
                 (root / "body.json").write_bytes(compact(body, True))
                 refused, error = module.canonicalize(CANONICALIZE_BIN, root / "body.json")
