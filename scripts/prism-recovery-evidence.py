@@ -15,19 +15,21 @@ Carry integrity doesn't depend on which validator the database ran (#708):
 - The summary keeps the database's report, less the findings cleared, so a 2.x
   source and its migrated copy summarize alike.
 
-Parsing is parallel by default (--jobs, at most 8 by default): worker
-processes parse and canonicalize newline-aligned ranges of the file, and this
-process applies every check to their results in file order, so the summary,
-its notes and every refusal are byte for byte the serial summarizer's
-(--jobs 1). From a range a worker cannot read as a text-mode read does
-(invalid UTF-8, a read error) on, the file is read serially from its start,
-lines already checked included, so decoding fails exactly where it would.
+Parsing is parallel by default (--jobs, the CPUs this process may use, at
+most 8): worker processes parse and canonicalize newline-aligned ranges of
+the file, and this process applies every check to their results in file
+order, so the summary, its notes and every refusal are byte for byte the
+serial summarizer's (--jobs 1). From a range a worker cannot read as a
+text-mode read does (invalid UTF-8, a read error) on, the file is read
+serially from its start, lines already checked included, so decoding fails
+exactly where it would.
 """
 
 import argparse
 import codecs
 import collections
 import hashlib
+import io
 import itertools
 import json
 import multiprocessing
@@ -247,8 +249,10 @@ class _Summary:
         }
 
 
-def summarize(lines, notes=None):
-    summary = _Summary()
+def summarize(lines, notes=None, summary=None):
+    """Summarize `lines`, continuing `summary` if it already checked earlier ones."""
+    if summary is None:
+        summary = _Summary()
     for line in lines:
         summary.line(line)
     return summary.report(notes)
@@ -276,37 +280,47 @@ def _share_fields(row):
 
 
 class _Items:
-    """A worker's results for one range, in file order."""
+    """A worker's results for one range, in file order: runs of rows that are
+    only hashed and counted, as their canonical bytes, and every other row
+    whole. A share run also carries its first and last sequence and its
+    accepted sum; its sequences strictly increase."""
 
     def __init__(self):
         self.items = []
-        self.run = None
+        self.kind = None
+        self.blob = None
+        self.count = 0
+        self.first = self.last = None
+        self.accepted = 0
 
     def flush(self):
-        if self.run is not None:
-            kind, parts, first, last, accepted = self.run
-            if kind == "shares":
-                self.items.append(("shares", len(parts), b"".join(parts), first, last, accepted))
-            else:
-                self.items.append(("rows", kind, len(parts), b"".join(parts)))
-            self.run = None
+        if self.kind == "shares":
+            self.items.append(("shares", self.count, self.blob, self.first, self.last, self.accepted))
+        elif self.kind is not None:
+            self.items.append(("rows", self.kind, self.count, self.blob))
+        self.kind = None
+
+    def _append(self, kind, canonical):
+        if self.kind != kind:
+            self.flush()
+            self.kind, self.blob, self.count = kind, bytearray(), 0
+        self.blob += canonical
+        self.blob += b"\n"
+        self.count += 1
 
     def hashed(self, kind, canonical):
-        if self.run is None or self.run[0] != kind:
-            self.flush()
-            self.run = [kind, [], None, None, 0]
-        self.run[1].append(canonical + b"\n")
+        self._append(kind, canonical)
 
     def share(self, row, canonical):
-        sequence, accepted = row["share_seq"], row["accepted"]
-        run = self.run
-        if run is not None and run[0] == "shares" and sequence > run[3]:
-            run[1].append(canonical + b"\n")
-            run[3] = sequence
-            run[4] += int(accepted)
-            return
-        self.flush()
-        self.run = ["shares", [canonical + b"\n"], sequence, sequence, int(accepted)]
+        sequence = row["share_seq"]
+        if self.kind == "shares" and sequence <= self.last:
+            # Out of order: a new run, whose first sequence the summary refuses.
+            self.flush()
+        if self.kind != "shares":
+            self.first, self.accepted = sequence, 0
+        self._append("shares", canonical)
+        self.last = sequence
+        self.accepted += int(row["accepted"])
 
     def record(self, kind, row, canonical):
         self.flush()
@@ -325,21 +339,23 @@ SERIAL = [("serial",)]
 
 
 def _parse_range(path, start, end):
-    """Parse and canonicalize one newline-aligned byte range of the export.
+    """Parse and canonicalize one newline-aligned byte range of the export,
+    from `start` to `end`, or to the end of the file when `end` is None.
 
-    Returns how many lines the range holds and the items `_replay` feeds to
-    the summary in order. A range a worker cannot read exactly as a
-    text-mode read would (invalid UTF-8, a read error), or whose rows raise
-    something other than the summarizer's own refusals, is `SERIAL`: the
-    summary reads it, and everything after it, serially.
+    Returns where the range ended, how many lines it holds, and the items
+    `_replay` feeds to the summary in order. A range a worker cannot read
+    exactly as a text-mode read would (invalid UTF-8, a read error), or
+    whose rows raise something other than the summarizer's own refusals, is
+    `SERIAL`: the summary reads it, and everything after it, serially.
     """
     try:
         with open(path, "rb") as source:
             source.seek(start)
-            data = source.read(end - start)
+            data = source.read() if end is None else source.read(end - start)
         text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError):
-        return 0, SERIAL
+        return None, 0, SERIAL
+    end = start + len(data)
     del data
     if "\r" in text:
         # Universal newlines, as text mode reads them.
@@ -357,12 +373,13 @@ def _parse_range(path, start, end):
             try:
                 pickle.dumps(error)
             except Exception:
-                return lines, SERIAL
+                return end, lines, SERIAL
             results.flush()
             results.items.append(("error", error))
-            return lines, results.items
+            return end, lines, results.items
         except Exception:
-            return lines, SERIAL
+            # RecursionError, MemoryError: the serial reader raises it.
+            return end, lines, SERIAL
         if not hashed:
             results.record(kind, row, None)
             continue
@@ -371,36 +388,31 @@ def _parse_range(path, start, end):
         except Exception:
             # Never raised for json.loads output in practice; the serial
             # summarizer raises it at this row, so let it.
-            return lines, SERIAL
+            return end, lines, SERIAL
         if kind in ROW_KINDS:
             results.record(kind, row, canonical)
         elif kind == "shares":
             if _fast_share(row):
-                # A sequence at or below the run's last starts a new run,
-                # whose first sequence the summary then refuses.
                 results.share(row, canonical)
             else:
                 results.record(kind, _share_fields(row), canonical)
         else:
             results.hashed(kind, canonical)
     results.flush()
-    return lines, results.items
+    return end, lines, results.items
 
 
 def _ranges(source, chunk_bytes):
-    """Newline-aligned byte ranges of `source`, read up to its end."""
+    """Byte ranges of `source` that each end just after a newline, but the
+    last, which is open: its worker reads to the end of the file, so a line
+    still being written is never split between two ranges."""
     start = 0
     while True:
-        size = os.fstat(source.fileno()).st_size
-        if start >= size:
+        source.seek(start + chunk_bytes)
+        if not source.readline().endswith(b"\n"):
+            yield start, None
             return
-        target = start + chunk_bytes
-        if target >= size:
-            end = size
-        else:
-            source.seek(target)
-            source.readline()
-            end = source.tell()
+        end = source.tell()
         yield start, end
         start = end
 
@@ -430,17 +442,22 @@ def _replay(summary, items):
             raise _Serial()
 
 
-# A text-mode read decodes the file in blocks of at most this many bytes,
-# so before it reaches a line it has decoded at most this far past its end.
-_DECODE_LOOKAHEAD = 8192 + 4
+def _decode_lookahead():
+    """How far past a line's end a text-mode read may have decoded before it
+    yields the line: one read chunk (TextIOWrapper's _CHUNK_SIZE, 8 KiB in
+    CPython) and the bytes of a character split across it. The window is at
+    least 1 MiB whatever the interpreter: a wider one only sends a refusal
+    near an invalid byte through the serial reader."""
+    chunk = getattr(io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), "_CHUNK_SIZE", 0)
+    return max(1 << 20, 2 * chunk) + 4
 
 
 def _decodes(path, start):
-    """Whether the bytes a serial read may decode past `start` before it
-    yields the line ending there are valid UTF-8."""
+    """Whether every byte a serial read may decode past `start`, before it
+    yields the line ending there, is valid UTF-8."""
     with open(path, "rb") as source:
         source.seek(start)
-        data = source.read(_DECODE_LOOKAHEAD)
+        data = source.read(_decode_lookahead())
         final = not source.read(1)
     try:
         codecs.getincrementaldecoder("utf-8")().decode(data, final)
@@ -450,7 +467,14 @@ def _decodes(path, start):
 
 
 def default_jobs():
-    return max(1, min(os.cpu_count() or 1, MAX_DEFAULT_JOBS))
+    """The CPUs this process may run on (its affinity), at most 8."""
+    if hasattr(os, "process_cpu_count"):
+        cpus = os.process_cpu_count()
+    elif hasattr(os, "sched_getaffinity"):
+        cpus = len(os.sched_getaffinity(0))
+    else:
+        cpus = os.cpu_count()
+    return max(1, min(cpus or 1, MAX_DEFAULT_JOBS))
 
 
 def _workers_available():
@@ -465,55 +489,60 @@ def _workers_available():
 def summarize_file(path, notes=None, jobs=1, chunk_bytes=DEFAULT_CHUNK_BYTES):
     """Summarize the export at `path`, parsing in `jobs` worker processes.
 
-    The result, its notes and any refusal are the serial summarizer's; one
-    job, or a file that is not a regular file, is the serial summarizer.
+    The result, its notes and any refusal are the serial summarizer's. One
+    job, a file that is not a regular file, or a host that cannot start the
+    workers is the serial summarizer.
     """
+    summary, checked = None, 0
     if jobs > 1 and os.path.isfile(path) and _workers_available():
         summary = _Summary()
         try:
             with open(path, "rb") as source:
                 checked = _summarize_ranges(summary, path, source, jobs, chunk_bytes)
         except _FullySerial:
-            pass
-        else:
-            if checked is None:
-                return summary.report(notes)
-            # A range no worker could take: read the file as the serial
-            # summarizer does, from the start, so its decoding and any
-            # refusal are exactly the serial ones; lines the workers'
-            # ranges already checked are read but not checked again.
-            with open(path, encoding="utf-8") as source:
-                lines = iter(source)
-                collections.deque(itertools.islice(lines, checked), maxlen=0)
-                for line in lines:
-                    summary.line(line)
+            summary, checked = None, 0
+        if checked is None:
             return summary.report(notes)
+    # The serial summarizer; or, from a range the workers could not take on,
+    # the rest of the file. Either way the file is read as the serial
+    # summarizer reads it, from the start and through the same call, so its
+    # decoding, any refusal and even an uncaught error are the serial ones.
+    # Lines the workers' ranges already checked are read but not checked
+    # again.
     with open(path, encoding="utf-8") as source:
-        return summarize(source, notes)
+        lines = iter(source)
+        collections.deque(itertools.islice(lines, checked), maxlen=0)
+        return summarize(lines, notes, summary)
 
 
 def _summarize_ranges(summary, path, source, jobs, chunk_bytes):
     """Feed `summary` from parallel workers in file order. Returns None once
     the file is summarized, or the number of lines checked before a range
     the workers could not take."""
-    pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("fork"))
+    try:
+        pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("fork"))
+    except Exception:
+        # No process pool on this host (no POSIX semaphores, say).
+        return 0
     try:
         pending = collections.deque()
         ranges = _ranges(source, chunk_bytes)
-        exhausted = False
         checked = 0
         while True:
-            while not exhausted and len(pending) < jobs + 2:
+            while len(pending) < jobs + 2:
                 bounds = next(ranges, None)
                 if bounds is None:
-                    exhausted = True
-                else:
-                    pending.append((bounds[1], pool.submit(_parse_range, path, *bounds)))
+                    break
+                try:
+                    pending.append(pool.submit(_parse_range, path, *bounds))
+                except Exception:
+                    # A worker could not be started (the host is out of
+                    # processes or memory): read the rest serially.
+                    return checked
             if not pending:
                 return None
-            end, future = pending.popleft()
             try:
-                lines, items = future.result()
+                end, lines, items = pending.popleft().result()
             except Exception:
                 # A worker that failed outright (killed, out of memory):
                 # read this range, and the rest, serially.
@@ -537,7 +566,7 @@ def _summarize_ranges(summary, path, source, jobs, chunk_bytes):
 def _positive(value):
     number = int(value)
     if number < 1:
-        raise argparse.ArgumentTypeError(f"must be at least 1, not {value}")
+        raise argparse.ArgumentTypeError(f"{value} is not a positive integer")
     return number
 
 

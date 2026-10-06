@@ -516,14 +516,7 @@ async fn records_with_options(
 /// The summary of exported rows, as `scripts/prism-recovery-evidence.py`
 /// prints it.
 pub async fn summarize(records: &Path) -> Result<Value> {
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../scripts/prism-recovery-evidence.py"
-        ))
-        .arg(records)
-        .output()
-        .await?;
+    let output = summarize_with(records, &[]).await?;
     ensure!(
         output.status.success(),
         "recovery evidence summary failed: {}",

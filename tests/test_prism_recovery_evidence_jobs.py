@@ -8,6 +8,7 @@ every refusal.
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -284,16 +285,83 @@ class ParallelSummaryTests(unittest.TestCase):
         serial = module.summarize
         calls = []
 
-        def counted(lines, notes=None):
-            calls.append(1)
-            return serial(lines, notes)
+        def counted(lines, notes=None, summary=None):
+            calls.append(summary)
+            return serial(lines, notes, summary)
 
         module.summarize = counted
         try:
             module.summarize_file(path, [], jobs=1)
         finally:
             module.summarize = serial
-        self.assertEqual(calls, [1])
+        self.assertEqual(calls, [None])
+
+    def test_a_host_that_cannot_start_workers_summarizes_serially(self):
+        path = self.write(full_export())
+        with path.open(encoding="utf-8") as source:
+            expected = module.summarize(source)
+
+        class NoFork(module.ProcessPoolExecutor):
+            def submit(self, *args, **kwargs):
+                raise BlockingIOError(11, "Resource temporarily unavailable")
+
+        class NoPool:
+            def __init__(self, *args, **kwargs):
+                raise OSError(38, "Function not implemented")
+
+        pool = module.ProcessPoolExecutor
+        for broken in (NoFork, NoPool):
+            with self.subTest(broken=broken.__name__):
+                module.ProcessPoolExecutor = broken
+                try:
+                    self.assertEqual(module.summarize_file(path, [], jobs=3, chunk_bytes=50), expected)
+                finally:
+                    module.ProcessPoolExecutor = pool
+
+    def test_ranges_end_after_newlines_and_the_last_reads_to_the_end(self):
+        for content in (b"", b"a\n", b"a\nbb\nccc\n", b"a\nbb\nccc", b"\n\n\n", b"x" * 10):
+            path = self.write(content)
+            for chunk in (1, 2, 3, 5, 100):
+                with self.subTest(content=content, chunk=chunk), path.open("rb") as source:
+                    ranges = list(module._ranges(source, chunk))
+                    self.assertEqual(ranges[-1][1], None)
+                    self.assertEqual(ranges[0][0], 0)
+                    for (start, end), (following, _) in zip(ranges, ranges[1:]):
+                        self.assertEqual(end, following)
+                        self.assertGreater(end, start)
+                        self.assertEqual(content[end - 1:end], b"\n")
+        # A line still being written when the ranges are cut is never split:
+        # the open last range is read wherever the file ends by then.
+        path = self.write(b"a\nbb\n" + b"c" * 50)
+        with path.open("rb") as source:
+            ranges = list(module._ranges(source, 1))
+        with path.open("ab") as source:
+            source.write(b"c\n")
+        lines = []
+        for start, end in ranges:
+            _, count, _items = module._parse_range(str(path), start, end)
+            lines.append(count)
+        self.assertEqual(sum(lines), 3)
+
+    def test_an_uncaught_error_prints_the_serial_traceback(self):
+        # Python 3.14's stack-overflow message reports the C stack used, which
+        # depends on the process's argv and environment size: two serial runs
+        # with different arguments differ there. Every frame must not.
+        def masked(result):
+            code, stdout, stderr = result
+            return code, stdout, re.sub(rb"used \d+ kB", b"used N kB", stderr)
+
+        deep = '{"kind": "audit_bodies", "row": ' + "[" * 200000 + "]" * 200000 + "}\n"
+        lines = full_export()
+        path = self.write(lines[:20] + [deep] + lines[20:])
+        serial = masked(self.run_summary(path, "--jobs", "1"))
+        self.assertNotEqual(serial[0], 0)
+        self.assertIn(b"RecursionError", serial[2])
+        self.assertIn(b"in summarize", serial[2])
+        for jobs, chunk in PARALLEL:
+            with self.subTest(jobs=jobs, chunk=chunk):
+                self.assertEqual(
+                    masked(self.run_summary(path, "--jobs", str(jobs), "--chunk-bytes", str(chunk))), serial)
 
 
 if __name__ == "__main__":
