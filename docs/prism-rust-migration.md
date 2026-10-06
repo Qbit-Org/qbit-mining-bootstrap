@@ -667,7 +667,9 @@ without a shared filesystem.
 it does **not** rewrite an absolute URI to a different root. Mount old absolute
 paths at their recorded locations. Keep referenced segment paths readable as
 well. Import failure is a reason to repair the missing/corrupt artifact before
-continuing; a matching hash without recoverable bytes is insufficient.
+continuing; a matching hash without recoverable bytes is insufficient. A legacy
+body that fails only because a range digest was written as escaped JSON is
+intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
 
 `backfill-ctv` scans verified stored bundles and restores missing fanout records.
 Run import first. It is idempotent for matching existing records and replaces the
@@ -679,6 +681,68 @@ source and the halt refusal) and then write only the rows they repair, so a run
 leaves no `qbit_prism_instances` heartbeat for fatal-state recovery to refuse
 and never overwrites a running frontend's row. `self-check` and `broadcast-ctv`
 behave the same way.
+
+### Legacy bodies whose range digests use Python's escaped JSON (#709)
+
+`1.x` and `2.x` hashed each `segment_range` and `segment_prefix` share part
+over Python's `json.dumps`, which writes non-ASCII text as `\uXXXX` escapes;
+3.x recomputes that digest over raw UTF-8. A range whose shares carry
+non-ASCII text, usually a worker name in `miner_id`, therefore fails in 3.x
+although its content is intact, and `import-audits` stops on the body with
+`audit body ref hash mismatch`. When it stops this way,
+`scripts/prism_legacy_range_sidecars.py` proves such bodies and writes the
+canonical sidecars import reads before a body. For each row it inlines the
+failing ranges from their slot files and runs the 3.x canonicalizer on the
+result, which requires the canonical bundle to hash to the row's
+`audit_bundle_sha256`. In a checkout of the release that runs import, build
+the canonicalizer and export the rows import has not stored yet from the
+database it ran against (`prism-restore` in a rehearsal). Run the tool once to
+classify them and again with `--write`, then rerun import:
+
+```sh
+cargo build --release --locked -p qbit-prism --bin qbit-prism-audit-canonicalize
+PGSERVICE=prism-restore psql -Xq -v ON_ERROR_STOP=1 -c "COPY (
+  SELECT block_hash, body_uri, audit_bundle_sha256 FROM qbit_pool_audit_bundles
+  WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL
+    AND audit_bundle IS NULL AND body_uri IS NOT NULL ORDER BY block_hash
+) TO STDOUT WITH (FORMAT csv, HEADER)" > legacy-rows.csv
+python3 scripts/prism_legacy_range_sidecars.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --canonicalizer target/release/qbit-prism-audit-canonicalize \
+  --sidecar-dir /var/lib/qbit-prism/audit
+python3 scripts/prism_legacy_range_sidecars.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --canonicalizer target/release/qbit-prism-audit-canonicalize \
+  --sidecar-dir /var/lib/qbit-prism/audit --write
+time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+```
+
+- `--sidecar-dir` must be the directory passed to `import-audits --root`;
+  import looks for `prism-audit-bundle-canonical-<block>-<digest>.json.gz`
+  there, and resolves a relative body URI against it, as the tool does.
+  `--audit-root` is where the audit tree is mounted, and it replaces the
+  recorded `--uri-prefix`, by default `/var/lib/qbit-mining-pool/prism/audit`,
+  in body and slot URIs. Run the tool where the tree is at its recorded
+  paths, as above, so that only the bodies import refuses get sidecars.
+- The export leaves out rows with an inline `audit_bundle`: import reads
+  those from the database, not from `body_uri`. Every exported row goes
+  through the canonicalizer, so when the affected heights are known, narrow
+  the export to them through `qbit_pool_blocks`.
+- Each run reports every row in `legacy-range-sidecars.jsonl`, and the first
+  run writes nothing. A run exits 0 only when every row is `ok-in-3x` (it
+  verifies as it is), `proven` (`sidecar-written` with `--write`) or
+  `sidecar-ok` (an existing sidecar that holds the digest's bytes). Any other
+  status, such as a body the canonicalizer still refuses, exits 3: restore
+  that evidence instead.
+- The tool never replaces a sidecar. An existing one that does not hold the
+  digest's bytes is reported as `sidecar-bad` and named on stderr; import
+  would stop on it too. A new sidecar is published by hard-linking a complete
+  file, so the sidecar directory's filesystem must support hard links; import
+  never sees a partial one. Import re-verifies every sidecar against the
+  digest, the recorded coinbase and the trusted ledger key.
+
+The post-GA follow-up is #709: 3.x accepting the escaped form, so that these
+bodies verify without sidecars.
 
 ### Migration 002's share-hash backfill, applied online
 
