@@ -2394,7 +2394,11 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`; no signing seed is needed for import.
    Run `time qbit-prism-server migrate` then
    `time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit`.
-   Repeat the export as `migrated.rows.jsonl`/`migrated.summary.json` and require
+   If import stops on a legacy body with `audit body ref hash mismatch`
+   because a range's shares carry non-ASCII text,
+   [prove it and write its sidecar](prism-rust-migration.md#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709),
+   then rerun import. Repeat the export as
+   `migrated.rows.jsonl`/`migrated.summary.json` and require
    `cmp source.summary.json migrated.summary.json` to pass. Both import
    completeness counts must be zero. Native snapshot-backed audits count as
    canonical available without duplicating their share window as stored bytes.

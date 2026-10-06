@@ -92,7 +92,7 @@ if [ "$${missing}" -ne 0 ]; then \
 fi;
 endef
 
-.PHONY: doctor prism-self-check check-version-skew require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres test-prism-postgres-throughput test-prism-public-read-replica test-compose-prism-config prism-cutover-rehearsal prism-cutover-rehearsal-dump prism-cutover-rehearsal-generated up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
+.PHONY: doctor prism-self-check check-version-skew require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres test-prism-postgres-throughput test-prism-public-read-replica test-prism-legacy-range-sidecars test-compose-prism-config prism-cutover-rehearsal prism-cutover-rehearsal-dump prism-cutover-rehearsal-generated up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
 	@bash scripts/check-env.sh --require-lab
@@ -133,6 +133,12 @@ test-prism-postgres-throughput:
 
 test-prism-public-read-replica:
 	bash test/prism-native-tests.sh replica
+
+# The legacy range sidecar tool (#709) against the real 3.x canonicalizer.
+test-prism-legacy-range-sidecars:
+	cargo build --locked -p qbit-prism --bin qbit-prism-audit-canonicalize --bin qbit-prism-build-audit-bundle
+	PRISM_AUDIT_CANONICALIZE_BIN="$${CARGO_TARGET_DIR:-target}/debug/qbit-prism-audit-canonicalize" \
+	python3 -m unittest -v tests.test_prism_legacy_range_sidecars
 
 # The 2.x.x -> 3.x.x cutover rehearsal on an operator's pg_dump, in a private
 # PostgreSQL cluster (#575): make prism-cutover-rehearsal DUMP=... LEDGER_KEY=...
