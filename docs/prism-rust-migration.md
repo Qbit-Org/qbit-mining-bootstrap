@@ -1642,6 +1642,31 @@ backup, as for any other pre-ACK failure.
    The script defaults it to 10000 since #705; the flag covers copies from
    before that.
 
+   The serial export took 85 minutes at 65.9M shares (#712). The
+   [parallel export](../scripts/prism-recovery-evidence-parallel.py) prints the
+   same rows byte for byte, so the summaries and every `cmp` below are
+   unchanged. It can replace the `psql` line of any export in this procedure:
+
+   ```sh
+   umask 077
+   PGSERVICE=prism-source python3 scripts/prism-recovery-evidence-parallel.py \
+     --jobs 8 > source.rows.jsonl
+   ```
+
+   A coordinator session runs the script's checks and exports its snapshot.
+   `--jobs` sessions import that snapshot. They export the shares in
+   `share_seq` ranges, the share hashes in header-hash ranges, and the other
+   kinds as the script does. Each range's sort may use `--work-mem` (default
+   256MB) before it spills to disk. Size `--jobs` to the database host's idle
+   cores; the export opens one connection more. No session may prompt for a
+   password, so keep it in the service's password file. Parts wait in
+   `--work-dir` (default: the current directory) until they can be printed in
+   order, so budget the export's size there as well. If any session fails,
+   the output has no completion marker, so the summarizer refuses it. On a
+   6M-share copy (4.6 GB of rows, a shared 16-core host), 8 jobs took 24 s
+   against 115 s serially on the `2.x.x` source, and 12 s against 57 s once
+   migrated. The summarizer's single pass (about 55 s there) is unchanged.
+
    Keep the filesystem backup from the same drained boundary. Require
    `unfinished_candidates` zero and both integrity mismatch counts zero. The
    summary records ordered share counts/digests, accepted count and high-water

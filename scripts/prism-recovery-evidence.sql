@@ -3,6 +3,11 @@
 -- scripts/prism-recovery-evidence.py. Works on frozen 2.x and native schemas.
 -- Writers must be stopped: the transaction gives this export one snapshot,
 -- but cannot make separately taken backups or exports contemporaneous.
+-- scripts/prism-recovery-evidence-parallel.py prints the same bytes from
+-- sessions sharing this transaction's snapshot (#712). Each runs everything
+-- before the shares export, then one part of the rest. It splits the shares
+-- and share_hashes exports into ranges, so keep each a statement ending in
+-- its ORDER BY.
 -- Print each result in batches of FETCH_COUNT rows. Unset (0), psql buffers a
 -- whole result before printing it, and the share history alone took 63 GB at
 -- 65.9M shares (#705). A caller's -v FETCH_COUNT=<rows> is kept. psql 16 and
@@ -255,6 +260,30 @@ BEGIN
 END
 $metadata$;
 
+-- Frozen 2.x lacks these native tables. Skip absent tables before parsing
+-- their queries only without native migration history. A native marker
+-- requires the complete native evidence tables; loss must fail the export.
+-- Empty native tables still hash identically to frozen 2.x. Set before the
+-- first export: the parallel export runs everything above it in every
+-- session, and its share-hash and closing streams branch on these flags.
+SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cpfp_packages,
+       (to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cpfp_retired_funding,
+       (to_regclass('qbit_prism_deferred_shares') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_deferred_shares,
+       (to_regclass('qbit_prism_audit_snapshots') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_audit_snapshots,
+       (to_regclass('qbit_prism_share_hashes') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_native_share_hashes,
+       (to_regclass('qbit_prism_cluster') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cluster,
+       (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events,
+       (to_regclass('qbit_prism_policy_transitions') IS NOT NULL
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_policy_transitions
+\gset
+
 SELECT jsonb_build_object('kind', 'shares', 'row', to_jsonb(s))
 FROM qbit_share_ledger s ORDER BY share_seq;
 -- Rows alone do not preserve the next allocation, including gaps left by
@@ -480,27 +509,6 @@ ORDER BY fanout_txid COLLATE "C";
 SELECT jsonb_build_object('kind', 'ctv_broadcast_attempts', 'row', to_jsonb(a))
 FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
 
--- Frozen 2.x lacks these native tables. Skip absent tables before parsing
--- their queries only without native migration history. A native marker
--- requires the complete native evidence tables; loss must fail the export.
--- Empty native tables still hash identically to frozen 2.x.
-SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cpfp_packages,
-       (to_regclass('qbit_prism_cpfp_retired_funding') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cpfp_retired_funding,
-       (to_regclass('qbit_prism_deferred_shares') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_deferred_shares,
-       (to_regclass('qbit_prism_audit_snapshots') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_audit_snapshots,
-       (to_regclass('qbit_prism_share_hashes') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_native_share_hashes,
-       (to_regclass('qbit_prism_cluster') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cluster,
-       (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events,
-       (to_regclass('qbit_prism_policy_transitions') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_policy_transitions
-\gset
 -- Native replay protection must survive recovery. Frozen 2.x exports the
 -- exact mapping migration 002 will backfill, including its duplicate rule.
 -- Native migration history prevents a missing table from being synthesized.

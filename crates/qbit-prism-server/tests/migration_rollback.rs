@@ -1037,6 +1037,214 @@ async fn a_2x_program_paid_under_case_labels_migrates_clean_and_summarizes_as_it
     result
 }
 
+/// #712: the parallel export prints the serial export's bytes. On a frozen
+/// 2.x source, share hashes are derived from the whole ledger: one header
+/// under several IDs and cases maps to its earliest accepted share. Migrated,
+/// they are native, and appends spread the shares over three partitions. A
+/// part that fails leaves no completion marker, so the summary refuses it.
+#[tokio::test]
+async fn the_parallel_evidence_export_prints_the_serial_export_byte_for_byte() -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let Some(inputs) = gate::inputs(
+        gate::site!(),
+        &[gate::Input::DatabaseUrl, gate::Input::PgBinDir],
+    )?
+    else {
+        return Ok(());
+    };
+    let pg_bin = std::path::Path::new(&inputs[1]);
+    let source = recovery::Database::open(&inputs[0]).await?;
+    let result = async {
+        let artifacts_dir = tempfile::tempdir()?;
+        recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO qbit_share_ledger(
+                share_seq,share_id,miner_id,payout_order_key,p2mr_program,
+                share_difficulty,network_difficulty,template_height,job_id,
+                job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch)
+            SELECT g, CASE
+                    WHEN g % 11 = 0 THEN 'legacy-id-' || g
+                    WHEN g % 7 = 0 THEN 'upper' || g || ':' || upper(encode(sha256((g / 7)::text::bytea), 'hex'))
+                    WHEN g % 5 = 0 THEN 'twin' || g || ':' || encode(sha256((g / 5)::text::bytea), 'hex')
+                    ELSE 'w' || g % 3 || ':' || encode(sha256(g::text::bytea), 'hex') END,
+                s.miner_id,s.payout_order_key,s.p2mr_program,s.share_difficulty,
+                s.network_difficulty,s.template_height,s.job_id,s.job_issued_at,s.ntime,
+                s.accepted_at + g * interval '1 ms',g % 13 <> 0,
+                CASE WHEN g % 13 = 0 THEN 'stale-job' END,s.writer_id,s.writer_epoch
+            FROM qbit_share_ledger s CROSS JOIN generate_series(9, 400) g WHERE s.share_seq = 1;
+            SELECT setval('qbit_share_ledger_share_seq_seq', 500);
+            "#,
+        )
+        .execute(&source.pool)
+        .await?;
+        let legacy = assert_parallel_export_is_serial(&source, pg_bin).await?;
+        ensure!(legacy["records"]["shares"]["count"] == 395);
+        ensure!(legacy["records"]["share_hashes"]["count"].as_u64() > Some(250));
+
+        let ledger = Ledger::connect_operator(&source.url, true).await?;
+        let migrated = async {
+            let first_bound: i64 = sqlx::query_scalar(
+                "SELECT upper_seq FROM qbit_prism_share_partitions WHERE partition_name='qbit_share_ledger_p0'",
+            )
+            .fetch_one(&source.pool)
+            .await?;
+            let width: i64 = sqlx::query_scalar(
+                "SELECT partition_rows FROM qbit_prism_share_partitioning WHERE singleton",
+            )
+            .fetch_one(&source.pool)
+            .await?;
+            // Native shares in the first lead partition, and in one past the
+            // leads the conversion attached; some IDs end in no header.
+            for (next, ids) in [(first_bound, 0..40), (first_bound + 5 * width + 7, 40..80)] {
+                sqlx::query("SELECT setval('qbit_share_ledger_share_seq_seq',$1)")
+                    .bind(next - 1)
+                    .execute(&source.pool)
+                    .await?;
+                qbit_prism_server::partitions::ensure(&source.pool).await?;
+                for id in ids {
+                    let header = hex::encode(Sha256::digest(format!("native-{id}")));
+                    let mut share = recovery::share(id);
+                    share.share_seq = 0;
+                    share.job_issued_at_ms = 1;
+                    share.share_id = match id % 4 {
+                        0 => format!("native-{id}"),
+                        1 => format!("rig{id}:{}", header.to_uppercase()),
+                        _ => format!("rig{id}:{header}"),
+                    };
+                    ensure!(ledger.append(share, None).await?.inserted);
+                }
+            }
+            let leaves: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT tableoid::regclass::text FROM qbit_share_ledger ORDER BY 1",
+            )
+            .fetch_all(&source.pool)
+            .await?;
+            ensure!(leaves.len() == 3, "the shares are in {leaves:?}");
+            let native = assert_parallel_export_is_serial(&source, pg_bin).await?;
+            ensure!(native["records"]["shares"]["count"] == 475);
+            ensure!(native["records"]["share_hashes"]["count"].as_u64() > Some(300));
+
+            sqlx::query("ALTER FUNCTION qbit_carry_forward_integrity_report() RENAME TO lost_integrity_report")
+                .execute(&source.pool)
+                .await?;
+            let work_dir = tempfile::tempdir()?;
+            let (records, output) =
+                recovery::parallel_export(&source, pg_bin, work_dir.path(), &["--jobs", "3"]).await?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ensure!(!output.status.success(), "the export passed without its integrity report");
+            ensure!(stderr.contains("the kinds after share_hashes failed"), "{stderr}");
+            ensure!(
+                std::fs::read_dir(work_dir.path())?.next().is_none(),
+                "the failed export left its parts behind"
+            );
+            let refused = recovery::summarize(records.path())
+                .await
+                .err()
+                .context("the summary passed a failed export")?;
+            ensure!(format!("{refused:#}").contains("incomplete export"), "{refused:#}");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        ledger.pool.close().await;
+        migrated
+    }
+    .await;
+    source.close().await?;
+    result
+}
+
+/// Export `db` serially, then in parallel at several job counts and batch
+/// sizes. Each parallel export must print the serial rows byte for byte, in
+/// as many ranges as it was asked for, and leave none of its parts behind.
+/// So must the serial export with the has_* flags where they were before
+/// #712 moved them ahead of the shares. Returns the summary of the rows.
+async fn assert_parallel_export_is_serial(
+    db: &recovery::Database,
+    pg_bin: &std::path::Path,
+) -> Result<serde_json::Value> {
+    let serial = recovery::records(db, pg_bin, recovery::SCRIPT).await?;
+    let expected = std::fs::read(serial.path())?;
+    let before =
+        recovery::records(db, pg_bin, &flags_before_share_hashes(recovery::SCRIPT)?).await?;
+    ensure_same_rows(
+        &expected,
+        &std::fs::read(before.path())?,
+        "the pre-#712 flag layout",
+    )?;
+    for (jobs, fetch_count) in [(1, None), (3, None), (8, None), (2, Some("1"))] {
+        let jobs_arg = jobs.to_string();
+        let mut args = vec!["--jobs", jobs_arg.as_str()];
+        if let Some(rows) = fetch_count {
+            args.extend(["--fetch-count", rows]);
+        }
+        let work_dir = tempfile::tempdir()?;
+        let (records, output) =
+            recovery::parallel_export(db, pg_bin, work_dir.path(), &args).await?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.success(),
+            "the parallel export {args:?} failed: {stderr}"
+        );
+        ensure!(
+            std::fs::read_dir(work_dir.path())?.next().is_none(),
+            "the parallel export {args:?} left its parts behind"
+        );
+        let split = format!("shares in {} ranges, share_hashes in {jobs}\n", 4 * jobs);
+        ensure!(
+            stderr.contains(&split),
+            "the parallel export {args:?} did not split as asked: {stderr}"
+        );
+        ensure_same_rows(
+            &expected,
+            &std::fs::read(records.path())?,
+            &format!("the parallel export {args:?}"),
+        )?;
+    }
+    recovery::summarize(serial.path()).await
+}
+
+/// `script` with its has_* flags back just before the share-hash export,
+/// where they were until #712 moved them ahead of the shares.
+fn flags_before_share_hashes(script: &str) -> Result<String> {
+    let start = script
+        .find("SELECT (to_regclass('qbit_prism_cpfp_packages')")
+        .context("the script sets no has_* flags")?;
+    let end = start
+        + script[start..]
+            .find("\\gset\n")
+            .context("the has_* flags are not gset")?
+        + "\\gset\n".len();
+    let hashes = script
+        .find("-- Native replay protection must survive recovery.")
+        .context("the script has no share-hash export")?;
+    ensure!(end <= hashes, "the has_* flags already follow the shares");
+    Ok([
+        &script[..start],
+        &script[end..hashes],
+        &script[start..end],
+        &script[hashes..],
+    ]
+    .concat())
+}
+
+/// Fails at the first line where `printed` differs from the serial rows.
+fn ensure_same_rows(expected: &[u8], printed: &[u8], what: &str) -> Result<()> {
+    if printed != expected {
+        let line = expected
+            .split(|byte| *byte == b'\n')
+            .zip(printed.split(|byte| *byte == b'\n'))
+            .position(|(serial, other)| serial != other);
+        anyhow::bail!(
+            "{what} printed {} bytes, the serial export {}, first differing at line {line:?}",
+            printed.len(),
+            expected.len()
+        );
+    }
+    Ok(())
+}
+
 async fn assert_share_sequence_fingerprint(
     db: &recovery::Database,
     pg_bin: &std::path::Path,

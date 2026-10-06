@@ -278,9 +278,15 @@ pub async fn backup(db: &Database, pg_bin: &Path) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn postgres_command(db: &Database, pg_bin: &Path, program: &str) -> Result<Command> {
+    let mut command = Command::new(pg_bin.join(program));
+    connect(&mut command, db)?;
+    Ok(command)
+}
+
 // libpq expands a connection URI supplied as dbname, but not one inherited
 // through PGDATABASE. Keep passwords out of the process argument list.
-fn postgres_command(db: &Database, pg_bin: &Path, program: &str) -> Result<Command> {
+fn connect(command: &mut Command, db: &Database) -> Result<()> {
     let mut url = url::Url::parse(&db.url)?;
     let mut password = url
         .password()
@@ -304,12 +310,11 @@ fn postgres_command(db: &Database, pg_bin: &Path, program: &str) -> Result<Comma
         })
         .collect();
     url.query_pairs_mut().clear().extend_pairs(options);
-    let mut command = Command::new(pg_bin.join(program));
     command.arg("--dbname").arg(url.as_str());
     if let Some(password) = password {
         command.env("PGPASSWORD", password);
     }
-    Ok(command)
+    Ok(())
 }
 
 pub async fn restore(
@@ -453,14 +458,35 @@ async fn evidence_with_options(
     format: &str,
     fetch_count: Option<u32>,
 ) -> Result<Value> {
+    let records = records_with_options(db, pg_bin, SCRIPT, format, fetch_count).await?;
+    summarize(records.path()).await
+}
+
+/// The checked-in export script.
+pub const SCRIPT: &str = include_str!("../../../../scripts/prism-recovery-evidence.sql");
+
+/// The rows the serial export of `script` prints, as the runbooks save them.
+pub async fn records(
+    db: &Database,
+    pg_bin: &Path,
+    script: &str,
+) -> Result<tempfile::NamedTempFile> {
+    records_with_options(db, pg_bin, script, "hex", None).await
+}
+
+async fn records_with_options(
+    db: &Database,
+    pg_bin: &Path,
+    script: &str,
+    format: &str,
+    fetch_count: Option<u32>,
+) -> Result<tempfile::NamedTempFile> {
     use std::io::{Seek, SeekFrom};
     ensure!(matches!(format, "hex" | "escape"));
     let mut input = tempfile::tempfile()?;
     writeln!(input, "SET search_path TO {};", db.schema)?;
     writeln!(input, "SET bytea_output TO '{format}';")?;
-    input.write_all(include_bytes!(
-        "../../../../scripts/prism-recovery-evidence.sql"
-    ))?;
+    input.write_all(script.as_bytes())?;
     input.seek(SeekFrom::Start(0))?;
     // The export goes straight to a file: at production size it is tens of
     // gigabytes, and the script's FETCH_COUNT keeps psql from buffering it
@@ -484,12 +510,18 @@ async fn evidence_with_options(
         "recovery evidence SQL failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok(records)
+}
+
+/// The summary of exported rows, as `scripts/prism-recovery-evidence.py`
+/// prints it.
+pub async fn summarize(records: &Path) -> Result<Value> {
     let output = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/prism-recovery-evidence.py"
         ))
-        .arg(records.path())
+        .arg(records)
         .output()
         .await?;
     ensure!(
@@ -498,4 +530,34 @@ async fn evidence_with_options(
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Run the parallel export (#712) with `args`, its parts under `work_dir`:
+/// what it printed, and how it exited.
+pub async fn parallel_export(
+    db: &Database,
+    pg_bin: &Path,
+    work_dir: &Path,
+    args: &[&str],
+) -> Result<(tempfile::NamedTempFile, std::process::Output)> {
+    let records = tempfile::NamedTempFile::new()?;
+    let mut command = Command::new("python3");
+    command
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/prism-recovery-evidence-parallel.py"
+        ))
+        .arg("--psql")
+        .arg(pg_bin.join("psql"))
+        .arg("--work-dir")
+        .arg(work_dir)
+        .args(args);
+    connect(&mut command, db)?;
+    let output = command
+        .stdout(Stdio::from(records.reopen()?))
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?;
+    Ok((records, output))
 }
