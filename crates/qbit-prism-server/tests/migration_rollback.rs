@@ -1159,7 +1159,9 @@ async fn the_parallel_evidence_export_prints_the_serial_export_byte_for_byte() -
 /// sizes. Each parallel export must print the serial rows byte for byte, in
 /// as many ranges as it was asked for, and leave none of its parts behind.
 /// So must the serial export with the has_* flags where they were before
-/// #712 moved them ahead of the shares. Returns the summary of the rows.
+/// #712 moved them ahead of the shares. The parallel summary must print the
+/// serial summary byte for byte too, with a range boundary at every line and
+/// at a few kilobytes. Returns the summary of the rows.
 async fn assert_parallel_export_is_serial(
     db: &recovery::Database,
     pg_bin: &std::path::Path,
@@ -1202,7 +1204,26 @@ async fn assert_parallel_export_is_serial(
             &format!("the parallel export {args:?}"),
         )?;
     }
-    recovery::summarize(serial.path()).await
+    let summary = recovery::summarize_with(serial.path(), &["--jobs", "1"]).await?;
+    ensure!(
+        summary.status.success(),
+        "the serial summary failed: {}",
+        String::from_utf8_lossy(&summary.stderr)
+    );
+    for args in [
+        ["--jobs", "3", "--chunk-bytes", "1"],
+        ["--jobs", "2", "--chunk-bytes", "4096"],
+    ] {
+        let parallel = recovery::summarize_with(serial.path(), &args).await?;
+        ensure!(
+            parallel.status.code() == summary.status.code()
+                && parallel.stdout == summary.stdout
+                && parallel.stderr == summary.stderr,
+            "the summary with {args:?} differs from the serial summary: {}",
+            String::from_utf8_lossy(&parallel.stderr)
+        );
+    }
+    Ok(serde_json::from_slice(&summary.stdout)?)
 }
 
 /// `script` with its has_* flags back just before the share-hash export,

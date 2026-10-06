@@ -532,6 +532,20 @@ pub async fn summarize(records: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+/// `scripts/prism-recovery-evidence.py` with `args` over `records`: what it
+/// printed, and how it exited.
+pub async fn summarize_with(records: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/prism-recovery-evidence.py"
+        ))
+        .args(args)
+        .arg(records)
+        .output()
+        .await?)
+}
+
 /// Run the parallel export (#712) with `args`, its parts under `work_dir`:
 /// what it printed, and how it exited.
 pub async fn parallel_export(

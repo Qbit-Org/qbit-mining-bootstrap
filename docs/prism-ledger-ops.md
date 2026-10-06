@@ -2396,7 +2396,18 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    the output has no completion marker, so the summarizer refuses it. On a
    6M-share copy (4.6 GB of rows, a shared 16-core host), 8 jobs took 24 s
    against 115 s serially on the `2.x.x` source, and 12 s against 57 s once
-   migrated. The summarizer's single pass (about 55 s there) is unchanged.
+   migrated.
+
+   The summarizer parses in parallel as well: `--jobs` worker processes
+   (default: the CPU count, at most 8) parse and canonicalize newline-aligned
+   ranges of the rows, and one process applies every check in file order. Its
+   summary, notes and refusals are those of `--jobs 1`, the serial summarizer,
+   byte for byte. From a range a worker cannot read as a text-mode read does
+   (invalid UTF-8, a read error) on, it reads the rows serially from the start,
+   so even a decoding error is the serial one. Size `--jobs` to the host's
+   idle cores. The serial pass ran at about 29 MB/s on the 65.9M-share restore
+   (about 80 GB, so about 45 minutes). On 3.25 GB of share and header rows on
+   a 16-core host, 8 jobs took 5.7 s against 36 s serially, and 12 jobs 4.4 s.
 4. **Exercise the isolated pre-ACK restore.** Provision a separate empty
    database with compatible PostgreSQL, roles and extensions. Restore the full
    database and artifact backup, never over the current database:
