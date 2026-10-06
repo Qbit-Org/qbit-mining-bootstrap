@@ -3,8 +3,9 @@
 Release date: 2026-10-06 (release candidate; tag `v3.0.0-rc.2`, published as a
 GitHub pre-release).
 
-This is the second release candidate of 3.0.0: 3.0.0-rc.1 plus migration 025
-and the operator tooling for legacy audit bodies. It is the tree that #291's
+This is the second release candidate of 3.0.0: 3.0.0-rc.1 plus migration 025,
+the commit-gate answer fix for #716 and the operator tooling for legacy audit
+bodies. It is the tree that #291's
 go/no-go evaluates for production on the PRISM pair. It is not a production
 release. Until #291 records a go, the production line stays 2.x.x (2.0.2).
 
@@ -23,6 +24,13 @@ rehearsal, and how a candidate is verified), with the changes below.
   `scripts/prism-recovery-evidence.py`: the summarizer clears the old rule's
   per-label findings, so a 2.x source and its migrated copy summarize the
   same. Use this candidate's summarizer on both sides of a cutover.
+- #716, fix A by #718: a share refused at the commit gate because chain-state
+  authority was briefly unavailable at a tip change now answers
+  `backend-rpc-unavailable` ("current chain state is unavailable"), or
+  `backend-database-unavailable` when the ledger database is what failed,
+  instead of `ledger-confirmation-failed`. So `PrismShareAppendFailures` no
+  longer fires for it. Such a share is still never credited; the
+  credit-preserving retry is #716's follow-up.
 - Legacy audit bodies whose share-segment range digests were written with
   Python's escaped JSON (non-ASCII worker names; 339 on union, heights
   53313-57440) import through canonical sidecars from
@@ -61,10 +69,12 @@ rehearsal, and how a candidate is verified), with the changes below.
 
 ## Verification
 
-The only runtime change between rc.1 and this candidate is migration 025:
-its SQL, and its registration in `ledger/migration.rs`. That registration
-includes adding 25 to the versions every start requires. So the evidence is
-lean (#557):
+The runtime changes between rc.1 and this candidate are:
+- migration 025: its SQL, and its registration in `ledger/migration.rs`,
+  which adds 25 to the versions every start requires;
+- #718's commit-gate answer in `coordinator/miner_submit.rs`.
+
+So the evidence is lean (#557):
 - CI on the version-bump pull request, and dispatched on the tag;
 - the L3 production-window matrix on the version-bump pull request, which
   the tag promotes on a tree match (#608);
@@ -87,13 +97,13 @@ and #291 links to it.
 
 As in the rc.1 notes, with these changes:
 
-- **Fixed since rc.1:** #708, by 025; #701, by #702. #600 is closed: rc.1
-  already had #627's fix.
+- **Fixed since rc.1:**
+  - #708, by 025;
+  - #701, by #702;
+  - #716's reject reason and alert, by #718. The credit-preserving retry stays
+    open in #716.
+  - #600 is closed: rc.1 already had #627's fix.
 - **Open since rc.1, not fixed in this candidate:**
-  - #716: a share under a tip-change lease can be refused "commit gate
-    closed" (`ledger-confirmation-failed`), which can drop a valid share's
-    credit and fires `PrismShareAppendFailures`. Seen on the pair at rc.1:
-    4 shares in a 500/s, 300 s run with 7 tip changes.
   - #711: a share append holds the order lock across about nine client round
     trips, capping the cluster at about 890 shares/s locally and about 300/s
     from the remote frontend on the pair. See #695.
