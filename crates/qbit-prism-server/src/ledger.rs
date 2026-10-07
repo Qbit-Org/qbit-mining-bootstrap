@@ -53,7 +53,7 @@ pub use divergence::{
 mod fanout;
 pub use fanout::revoke_fanout_claims;
 mod fatal_state;
-pub use fatal_state::require_operator_reason;
+pub use fatal_state::{integrity_report_bounded, require_operator_reason, FATAL_STATE_CLEAR_BOUND};
 mod instances;
 mod policy_transition;
 mod signing_transition;

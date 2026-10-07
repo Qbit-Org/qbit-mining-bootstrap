@@ -1087,3 +1087,47 @@ async fn submission_hold_set_and_clear_refuse_a_blank_reason_before_reaching_the
         );
     }
 }
+
+/// #737: `fatal-state clear --timeout-seconds` takes 10 to 3600 and is
+/// checked before any configuration is read or connection opened: a value
+/// out of range is clap's usage error, while one in range gets as far as the
+/// configuration this environment lacks.
+#[tokio::test]
+async fn clear_timeout_flag_is_validated_before_connecting() {
+    for (value, valid) in [
+        ("5", false),
+        ("9", false),
+        ("10", true),
+        ("3600", true),
+        ("3601", false),
+        ("4000", false),
+        ("ten", false),
+    ] {
+        let output = configured_command_args(&[
+            "fatal-state",
+            "clear",
+            "--reason",
+            "reviewed",
+            "--timeout-seconds",
+            value,
+        ])
+        .await;
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{value}: {error}");
+        if valid {
+            assert_eq!(output.status.code(), Some(1), "{value}: {error}");
+            assert!(!error.contains("--timeout-seconds"), "{value}: {error}");
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{value}: clap's usage exit code; {error}"
+            );
+            assert!(
+                error.contains("invalid value") && error.contains("--timeout-seconds"),
+                "{value}: {error}"
+            );
+        }
+        assert!(!error.contains("test-only-password"), "{value}: {error}");
+    }
+}
