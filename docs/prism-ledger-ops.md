@@ -3393,8 +3393,8 @@ would leave answers read on the fork. It refuses, clearing nothing:
 Each of these refusals ends with `retry fatal-state clear`.
 
 Once its database connection is open, the recovery, its node calls and the
-integrity report included, must finish within `--timeout-seconds` (120 by
-default, 10 to 3600). The integrity report runs under a statement timeout of its
+integrity report included, must reach its commit within `--timeout-seconds`
+(120 by default, 10 to 3600). The integrity report runs under a statement timeout of its
 own, the time left in that bound less what is kept for the closing tip check and
 the commit, 5 s plus one node RPC timeout (`PRISM_RPC_TIMEOUT_SECONDS`, 15 s by
 default), whatever `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` gives the other
@@ -3405,8 +3405,10 @@ is cancelled by PostgreSQL before the bound ends, so no statement and no lock
 outlives the failed command. The closing tip check must itself end 5 s before
 the bound, however many headers a moved tip makes it walk on a slow node;
 otherwise the command refuses with nothing committed (`the closing tip check
-did not finish 5 s before the fatal-state recovery bound`), so the bound never
-ends inside the commit.
+did not finish 5 s before the fatal-state recovery bound`), so the `UPDATE` and
+the event `INSERT` keep their 5 s. The commit itself runs outside the bound:
+once it is sent, the command waits for its outcome, which under
+`synchronous_commit=remote_apply` includes a standby's replay.
 
 The clear and its audit `INSERT` commit in one transaction. Failures before
 commit roll both back and leave the cluster halted; a lost response during
@@ -3575,9 +3577,11 @@ reorganization recurs, investigate the chain first (step 3). A tip that only gre
 during the run does not refuse. When the integrity report did not finish in the
 time the bound left it, the command says to raise `--timeout-seconds`: rerun
 with a larger bound. When the command exceeded its bound (`fatal-state recovery
-exceeded <n> seconds`), or the connection drops around commit, the outcome is
-unknown: check `fatal-state show` and the event table before rerunning, with a
-larger `--timeout-seconds` if it ran out of time.
+exceeded <n> seconds before its commit`), nothing was committed and the halt
+stays: rerun, with a larger `--timeout-seconds` if it ran out of time. The commit
+runs outside the bound, so only a connection that drops during the commit leaves
+the outcome unknown: then check `fatal-state show` and the event table before
+rerunning.
 
 ### 5. Restart and verify
 

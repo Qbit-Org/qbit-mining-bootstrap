@@ -10,12 +10,12 @@ use std::time::Duration;
 /// `fatal-state clear`'s bound when the operator gives no `--timeout-seconds`.
 pub const FATAL_STATE_CLEAR_BOUND: Duration = Duration::from_secs(120);
 
-/// What the bound keeps back for the UPDATE, the event INSERT and the COMMIT.
-/// The closing tip check must end this long before the deadline, or the clear
-/// refuses with nothing committed, however many headers a moved tip makes it
-/// walk: the deadline can then never fall in the COMMIT, whose outcome would
-/// be unknown. The integrity report leaves one node RPC timeout on top, for
-/// the closing check's usual one or two node calls.
+/// What the bound keeps back for the UPDATE and the event INSERT. The closing
+/// tip check must end this long before the deadline, or the clear refuses
+/// with nothing committed, however many headers a moved tip makes it walk.
+/// The integrity report leaves one node RPC timeout on top, for the closing
+/// check's usual one or two node calls. The COMMIT runs outside the bound
+/// (see [`Ledger::clear_fatal_state_within`]).
 const COMMIT_HEADROOM: Duration = Duration::from_secs(5);
 
 /// The least time the integrity report is started with. With less of the
@@ -93,8 +93,9 @@ impl Ledger {
     }
 
     /// Reconcile a stopped or drained cluster and durably record why it was
-    /// cleared, all within `bound` (`fatal-state clear --timeout-seconds`,
-    /// #737). The integrity report's own statement ends by the same deadline.
+    /// cleared, all up to the COMMIT within `bound` (`fatal-state clear
+    /// --timeout-seconds`, #737). The integrity report's own statement ends by
+    /// the same deadline.
     pub async fn clear_fatal_state_within(
         &self,
         config: &Config,
@@ -102,15 +103,23 @@ impl Ledger {
         bound: Duration,
     ) -> Result<Value> {
         require_operator_reason(reason)?;
-        // Bound the whole operation, including cumulative RPC time while locks
-        // are held. Cancellation before COMMIT rolls back. Once COMMIT has
-        // been sent, a lost response must be resolved from the durable event.
+        // Bound everything up to the COMMIT, including cumulative RPC time
+        // while locks are held: a cancellation there rolls back. The COMMIT
+        // itself runs outside the bound. Once sent, its outcome is the
+        // server's, and a healthy one can wait on a standby's replay under
+        // synchronous_commit=remote_apply, so cancelling it would only leave
+        // the outcome unknown. A lost response must be resolved from the
+        // durable event.
         let deadline = tokio::time::Instant::now()
             .checked_add(bound)
             .context("fatal-state recovery bound is out of range")?;
-        tokio::time::timeout_at(deadline, self.clear_fatal_state_in(config, reason, deadline))
-            .await
-            .with_context(|| format!("fatal-state recovery exceeded {} seconds; inspect fatal-state show and recovery events before retrying", bound.as_secs()))?
+        let (tx, order, event) =
+            tokio::time::timeout_at(deadline, self.clear_fatal_state_in(config, reason, deadline))
+                .await
+                .with_context(|| format!("fatal-state recovery exceeded {} seconds before its commit; nothing was committed and the halt stays; retry fatal-state clear, or raise --timeout-seconds", bound.as_secs()))??;
+        tx.commit().await.context("fatal-state recovery commit failed; outcome may be unknown; inspect fatal-state show and recovery events before retrying")?;
+        drop(order);
+        Ok(event)
     }
 
     async fn clear_fatal_state_in(
@@ -118,10 +127,14 @@ impl Ledger {
         config: &Config,
         reason: &str,
         deadline: tokio::time::Instant,
-    ) -> Result<Value> {
+    ) -> Result<(
+        Transaction<'static, Postgres>,
+        super::connect::OrderHold<'_>,
+        Value,
+    )> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-        let _order = self
+        let order = self
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::FatalState)
             .await?;
         // Block heartbeat updates AND new registrations, not just existing
@@ -365,8 +378,8 @@ impl Ledger {
              VALUES($1,$2,$3,$4,$5) RETURNING to_jsonb(qbit_prism_fatal_state_events)",
         ).bind(reason).bind(fatal).bind(set_at).bind(json!(instances)).bind(reconciliation)
             .fetch_one(&mut *tx).await?;
-        tx.commit().await.context("fatal-state recovery commit failed; outcome may be unknown; inspect fatal-state show and recovery events before retrying")?;
-        Ok(event)
+        // The caller commits, outside the bound, and keeps `order` until then.
+        Ok((tx, order, event))
     }
 }
 

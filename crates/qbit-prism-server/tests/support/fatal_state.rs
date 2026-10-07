@@ -1414,6 +1414,42 @@ async fn clear_refuses_a_closing_tip_walk_that_would_run_into_the_commit() -> Re
     db.close(vec![ledger]).await
 }
 
+/// #737: the COMMIT runs outside the clear's bound. A commit that waits
+/// longer than the bound has left, as one under
+/// `synchronous_commit=remote_apply` waits on a standby's replay, is not
+/// cancelled into an unknown outcome: the clear waits for it and returns the
+/// event it committed.
+#[tokio::test]
+async fn clear_waits_for_a_commit_that_outlasts_its_bound() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let (ledger, _node, mut config) = setup(&db).await?;
+    config.rpc_timeout = Duration::from_secs(1);
+    halt(&ledger, "test halt").await?;
+    stopped(&ledger).await?;
+    // A deferred trigger stands in for the standby: it runs inside the COMMIT
+    // and holds it for 12 s, past the 10 s bound.
+    sqlx::raw_sql(
+        "CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+           BEGIN PERFORM pg_sleep(12); RETURN NULL; END $$; \
+         CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON qbit_prism_fatal_state_events \
+           DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_commit();",
+    )
+    .execute(&ledger.pool)
+    .await?;
+    let bound = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let event = ledger
+        .clear_fatal_state_within(&config, "reviewed", bound)
+        .await?;
+    assert!(started.elapsed() > bound, "the commit outlasted the bound");
+    assert_eq!(event["reason"], "reviewed", "{event}");
+    assert_eq!(ledger.fatal_state().await?["halted"], false);
+    assert_eq!(recovery_events(&ledger).await?, 1);
+    db.close(vec![ledger]).await
+}
+
 /// #737: the clear's integrity report ends in the server by the clear's own
 /// deadline, so a clear that gives up leaves no statement running behind it
 /// (and holding its locks) for the operator's retry to wait on. A bound that
