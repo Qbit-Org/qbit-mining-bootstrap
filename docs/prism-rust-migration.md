@@ -100,6 +100,28 @@ audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
 for an audit whose 2.x body can't be read on that host (#735), and the block's
 audit view answers 404.
 
+The gate's carry-forward integrity check runs the same report `self-check`
+runs. At production size that takes about a minute and holds one snapshot for
+as long. On a primary with live miners every share updates the cluster row, so
+a long snapshot there piles up dead row versions and slows the share append's
+lock (#738). Below about 200 shares/s that's harmless. Above it, set
+`PRISM_INTEGRITY_REPORT_DATABASE_URL` to a hot standby and the gate runs the
+report there. That standby must have `hot_standby_feedback` off, or the report
+holds back the writer all the same. Pause its replay first
+(`SELECT pg_wal_replay_pause();`, until `pg_get_wal_replay_pause_state()` reads
+`paused`; `pg_wal_replay_resume()` afterwards), or set
+`max_standby_streaming_delay` and `max_standby_archive_delay` to -1 there, so no
+recovery conflict cancels the report. Never pause a standby the writer waits on
+for apply (`synchronous_commit = remote_apply`): every commit would stall. The
+found-block offer standby (#529) waits only for flush, which a pause doesn't
+stop. The gate refuses a URL that isn't in recovery, has feedback on, or whose
+last replayed transaction is older than
+`PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS` (default 300), and it records both the
+standby's and the writer's WAL positions. Or set `PRISM_GATE_INTEGRITY=skip`:
+the gate says so in a WARN line, and you record the report from wherever it
+ran. Every query the gate runs has a 15 s statement timeout and a 5 s lock
+timeout; the report gets 120 s on the writer and 600 s on a standby.
+
 `migrate` applies the existing schema and additive native migration under a
 transaction lock. It preserves share sequence/history, balances, audit metadata,
 and settlement rows. New tables hold shared configuration/revision, instance

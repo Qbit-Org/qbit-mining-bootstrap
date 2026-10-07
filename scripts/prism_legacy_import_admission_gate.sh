@@ -17,9 +17,35 @@
 # transaction. psql is given the database URL without its password, which it reads from
 # PGPASSWORD, so no credential appears in a command line or in the output. Exit 0 only when
 # every check passes.
+#
+# Every query runs under statement_timeout 15 s and lock_timeout 5 s, except check 5's
+# carry-forward integrity report, which takes about a minute at production size: 120 s on the
+# writer, 600 s on a standby. The report holds a snapshot for that long, and on a primary with
+# live miners every share updates the cluster row, so a long snapshot there slows the share
+# append's lock (#738). Above about 200 shares/s, run the report elsewhere:
+#   PRISM_INTEGRITY_REPORT_DATABASE_URL  run check 5 on this hot standby instead, which must
+#       have hot_standby_feedback off (or the report holds back the writer anyway). Pause its
+#       replay first (SELECT pg_wal_replay_pause(); until pg_get_wal_replay_pause_state() is
+#       'paused'), or set max_standby_streaming_delay and max_standby_archive_delay to -1
+#       there, or a recovery conflict can cancel the report. Never use a standby the writer
+#       waits on for apply (synchronous_commit = remote_apply): pausing it stalls every commit.
+#       The found-block offer standby (#529) waits for flush, which a pause doesn't stop. The
+#       gate refuses a URL that is not in recovery, is not a replica of this writer's database
+#       (system identifier and database name), has hot_standby_feedback on, is stale (neither
+#       caught up with the writer nor replayed within PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS,
+#       default 300), or replicates a writer that waits for apply. It records both positions.
+#   PRISM_GATE_INTEGRITY=skip  skip check 5 and say so (WARN). Record the report from wherever
+#       it ran instead.
+# These limits are the gate's own. PRISM_DATABASE_STATEMENT_TIMEOUT_MS sets the frontends'
+# 15 s, which is too short for the report at production size (#737).
 set -uo pipefail
 : "${PRISM_DATABASE_URL:?export the frontend environment first}"
 fail=0
+skipped=""
+gate_tmp=$(mktemp -d) || exit 2
+trap 'rm -rf "$gate_tmp"' EXIT
+caller_pgpassword_set=${PGPASSWORD+x}
+caller_pgpassword=${PGPASSWORD-}
 pass() { printf 'PASS  %s\n' "$1"; }
 bad() { printf 'FAIL  %s\n' "$1"; fail=1; }
 info() { printf 'INFO  %s\n' "$1"; }
@@ -31,10 +57,11 @@ trim() {
 }
 
 # The URL without its password, and the password: from the user info or a `password` query
-# parameter, percent-decoded as libpq decodes them.
-if ! { IFS= read -r -d '' database && IFS= read -r -d '' password; } < <(python3 - <<'PY'
+# parameter, percent-decoded as libpq decodes them. split_url NAME reads the variable NAME.
+split_url() {
+  GATE_URL=${!1} python3 - <<'PY'
 import os, sys, urllib.parse
-parts = urllib.parse.urlsplit(os.environ["PRISM_DATABASE_URL"].strip())
+parts = urllib.parse.urlsplit(os.environ["GATE_URL"].strip())
 if parts.scheme not in ("postgres", "postgresql"):
     sys.exit(1)
 userinfo, at, hosts = parts.netloc.rpartition("@")
@@ -53,17 +80,63 @@ netloc = f"{user}@{hosts}" if at else hosts
 url = urllib.parse.urlunsplit(parts._replace(netloc=netloc, query="&".join(kept)))
 sys.stdout.write(url + "\0" + password + "\0")
 PY
-); then
+}
+if ! { IFS= read -r -d '' database && IFS= read -r -d '' password; } < <(split_url PRISM_DATABASE_URL); then
   echo "PRISM_DATABASE_URL must be a postgres:// or postgresql:// URL" >&2
   exit 2
 fi
+integrity_database=""
+integrity_password=""
+integrity_url=$(trim "${PRISM_INTEGRITY_REPORT_DATABASE_URL:-}")
+if [ -n "$integrity_url" ] && ! {
+  IFS= read -r -d '' integrity_database && IFS= read -r -d '' integrity_password
+} < <(split_url integrity_url); then
+  echo "PRISM_INTEGRITY_REPORT_DATABASE_URL must be a postgres:// or postgresql:// URL" >&2
+  exit 2
+fi
+max_age=$(trim "${PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS:-}")
+max_age=${max_age:-300}
+if ! [[ $max_age =~ ^[0-9]{1,9}$ ]] || (( 10#$max_age < 1 )); then
+  echo "PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS must be a whole number of seconds from 1 to 999999999" >&2
+  exit 2
+fi
+max_age=$(( 10#$max_age ))
 if [ -n "$password" ]; then export PGPASSWORD=$password; fi
 unset password
-psqlq() { # psqlq SQL [psql -v name=value ...]
+# psqlq SQL [psql -v name=value ...]: one read-only transaction against the frontend's
+# database, or, with q_target=integrity, against PRISM_INTEGRITY_REPORT_DATABASE_URL.
+# q_timeout overrides the 15 s statement timeout. psql's stderr is kept apart and only ever
+# classified by last_error: it can name the host and user.
+psqlq() {
   local sql=$1
   shift
-  printf 'SET default_transaction_read_only = on;\n%s;\n' "$sql" |
-    psql "$database" -XAtq -v ON_ERROR_STOP=1 "$@" 2>/dev/null
+  ( # A subshell, so the standby's credential stays in this process's environment, never argv.
+    target=$database
+    if [ "${q_target:-}" = integrity ]; then
+      target=$integrity_database
+      if [ -n "$integrity_password" ]; then
+        export PGPASSWORD=$integrity_password
+      elif [ -n "$caller_pgpassword_set" ]; then
+        export PGPASSWORD=$caller_pgpassword
+      else
+        unset PGPASSWORD
+      fi
+    fi
+    printf "SET default_transaction_read_only = on;\nSET statement_timeout = '%s';\nSET lock_timeout = '5s';\n%s;\n" \
+      "${q_timeout:-15s}" "$sql" |
+      psql "$target" -XAtq -v ON_ERROR_STOP=1 "$@" 2>"$gate_tmp/psql.err"
+  )
+}
+# Why the last psqlq failed, when psql said something recognizable, without echoing it.
+last_error() {
+  local error
+  error=$(cat "$gate_tmp/psql.err" 2>/dev/null)
+  case $error in
+    *"canceling statement due to statement timeout"*) printf ' (statement timeout)' ;;
+    *"conflict with recovery"*)
+      printf ' (cancelled by a recovery conflict: pause the standby'"'"'s replay or set max_standby_streaming_delay = -1 there)' ;;
+    *"lock timeout"*) printf ' (lock timeout)' ;;
+  esac
 }
 
 # 1. Configuration under production rules, the pool fee settling dust (#525) and the block
@@ -109,7 +182,7 @@ FROM heartbeats" -v fresh="$fresh"); then
     warn "Fewer than two live frontends observed; do not present this deployment as HA"
   fi
 else
-  bad "heartbeat census read failed"
+  bad "heartbeat census read failed$(last_error)"
 fi
 
 # 3. The cluster's block submission hold (#664): reported, never a failure.
@@ -144,26 +217,79 @@ if c=$(psqlq "SELECT count(*) FILTER (WHERE canonical_audit_bytes IS NULL AND sh
     fi
   fi
 else
-  bad "audit completeness read failed"
+  bad "audit completeness read failed$(last_error)"
 fi
 
-# 5. Carry-forward integrity: mismatch_count and current_drift_count are 0.
-if r=$(psqlq "SELECT (x->>'mismatch_count') || '|' || (x->>'current_drift_count') FROM (SELECT qbit_carry_forward_integrity_report() AS x) t"); then
-  IFS='|' read -r mismatch drift <<<"$r"
-  if [ "$mismatch" = 0 ] && [ "$drift" = 0 ]; then
-    pass "carry-forward integrity (mismatch 0, drift 0)"
+# 5. Carry-forward integrity: mismatch_count and current_drift_count are 0. On the writer by
+#    default; on a hot standby with PRISM_INTEGRITY_REPORT_DATABASE_URL; skipped, with a WARN,
+#    with PRISM_GATE_INTEGRITY=skip. See the header for the standby's requirements.
+integrity() { # integrity [q_target]
+  local r mismatch drift where="" limit=120s
+  if [ -n "${1:-}" ]; then where=" on the standby"; limit=600s; fi
+  if r=$(q_target=${1:-} q_timeout=$limit psqlq "SELECT (x->>'mismatch_count') || '|' || (x->>'current_drift_count') FROM (SELECT qbit_carry_forward_integrity_report() AS x) t"); then
+    IFS='|' read -r mismatch drift <<<"$r"
+    if [ "$mismatch" = 0 ] && [ "$drift" = 0 ]; then
+      pass "carry-forward integrity$where (mismatch 0, drift 0)"
+    else
+      bad "carry-forward integrity$where: mismatch_count=$mismatch current_drift_count=$drift"
+    fi
   else
-    bad "carry-forward integrity: mismatch_count=$mismatch current_drift_count=$drift"
+    bad "carry-forward integrity report failed$where$(last_error)"
+  fi
+}
+integrity_mode=$(trim "${PRISM_GATE_INTEGRITY:-}")
+identity_sql="(SELECT system_identifier FROM pg_control_system())::text || '|' || current_database()"
+if [ -n "$integrity_mode" ] && [ "$integrity_mode" != skip ]; then
+  bad "PRISM_GATE_INTEGRITY must be empty or skip"
+elif [ "$integrity_mode" = skip ]; then
+  warn "carry-forward integrity skipped (PRISM_GATE_INTEGRITY=skip): record the report from where it ran"
+  if [ -n "$integrity_database" ]; then
+    warn "PRISM_INTEGRITY_REPORT_DATABASE_URL is set but not used: PRISM_GATE_INTEGRITY=skip"
+  fi
+  skipped=" (carry-forward integrity skipped)"
+elif [ -n "$integrity_database" ]; then
+  if ! w=$(psqlq "SELECT current_setting('synchronous_commit') || '|' || current_setting('synchronous_standby_names') || '|' || pg_current_wal_lsn()::text || '|' || $identity_sql"); then
+    bad "writer position read failed$(last_error)"
+  else
+    IFS='|' read -r commit_mode sync_names writer_lsn writer_system writer_db <<<"$w"
+    # caught_up: replay has reached the writer position read just before, so the standby is
+    # current even when an idle writer leaves the last replayed transaction old. The age is
+    # clamped at 0 against clock skew between the hosts.
+    if ! r=$(q_target=integrity psqlq "SELECT pg_is_in_recovery()::text || '|' || coalesce(pg_last_wal_replay_lsn()::text, '-') || '|' || CASE WHEN pg_is_in_recovery() THEN pg_get_wal_replay_pause_state() ELSE '-' END || '|' || coalesce(greatest(0, round(extract(epoch FROM clock_timestamp() - pg_last_xact_replay_timestamp())))::text, '-') || '|' || coalesce((pg_last_wal_replay_lsn() >= :'writer_lsn'::pg_lsn)::text, 'false') || '|' || current_setting('hot_standby_feedback') || '|' || current_setting('max_standby_streaming_delay') || '|' || current_setting('max_standby_archive_delay') || '|' || $identity_sql" -v writer_lsn="$writer_lsn"); then
+      bad "integrity standby read failed$(last_error)"
+    else
+      IFS='|' read -r recovery lsn pause age caught_up feedback stream_delay archive_delay system db <<<"$r"
+      if [ "$recovery" != true ]; then
+        bad "PRISM_INTEGRITY_REPORT_DATABASE_URL is not a hot standby (in recovery: $recovery); unset it to run the report on the writer"
+      elif [ "$system" != "$writer_system" ] || [ "$db" != "$writer_db" ]; then
+        bad "the integrity standby is not a replica of this writer's database (its system identifier or database name differs)"
+      elif [ "$commit_mode" = remote_apply ] && [ -n "$sync_names" ]; then
+        bad "the writer waits for standby apply (synchronous_commit=remote_apply): pausing one of its synchronous standbys stalls every commit, so resume this standby's replay now (SELECT pg_wal_replay_resume();) and use an asynchronous standby, or skip"
+      elif [ "$feedback" = on ]; then
+        bad "the integrity standby has hot_standby_feedback on: its report would hold back the writer's horizon all the same (#738); turn it off there, or unset the URL"
+      elif [ "$caught_up" != true ] && ! [[ $age =~ ^[0-9]+$ ]]; then
+        bad "the integrity standby has replayed no transaction yet; let it catch up, then pause it and rerun"
+      elif [ "$caught_up" != true ] && (( age > max_age )); then
+        bad "the integrity standby's last replayed transaction is ${age}s old (limit ${max_age}s) and it is behind the writer: resume its replay until it catches up, then pause it and rerun"
+      else
+        if [[ $age =~ ^[0-9]+$ ]]; then age="${age}s ago"; else age=none; fi
+        info "integrity report on a standby: replayed to $lsn (writer at $writer_lsn), replay state '$pause', last replayed transaction $age"
+        if [ "$pause" != paused ] && ! { [ "$stream_delay" = -1 ] && [ "$archive_delay" = -1 ]; }; then
+          warn "the integrity standby's replay state is '$pause', not 'paused': a recovery conflict can cancel the report; pause it (SELECT pg_wal_replay_pause(); until pg_get_wal_replay_pause_state() is 'paused') or set max_standby_streaming_delay and max_standby_archive_delay to -1 there"
+        fi
+        integrity integrity
+      fi
+    fi
   fi
 else
-  bad "carry-forward integrity report failed"
+  integrity
 fi
 
 # 6. Durability: fsync, full_page_writes and synchronous_commit are not off.
 if d=$(psqlq "SELECT string_agg(name || '=' || setting, ' ' ORDER BY name) FROM pg_settings WHERE name IN ('fsync', 'full_page_writes', 'synchronous_commit')"); then
   if grep -q '=off' <<<"$d"; then bad "durability: $d"; else pass "durability: $d"; fi
 else
-  bad "durability read failed"
+  bad "durability read failed$(last_error)"
 fi
 
 # 7. The found-block offer's standby (#529), on when PRISM_OFFER_STANDBY_APPLICATION_NAME is set
@@ -279,7 +405,7 @@ else
 fi
 
 if [ "$fail" = 0 ]; then
-  echo "ADMISSION GATE: PASS (legacy audit import pending, reported above)"
+  echo "ADMISSION GATE: PASS (legacy audit import pending, reported above)$skipped"
 else
   echo "ADMISSION GATE: FAIL"
 fi
