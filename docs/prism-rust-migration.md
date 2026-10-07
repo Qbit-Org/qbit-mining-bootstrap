@@ -101,10 +101,12 @@ for an audit whose 2.x body can't be read on that host (#735), and the block's
 audit view answers 404.
 
 The gate's carry-forward integrity check runs the same report `self-check`
-runs. At production size that takes about a minute and holds one snapshot for
-as long. On a primary with live miners every share updates the cluster row, so
-a long snapshot there piles up dead row versions and slows the share append's
-lock (#738). Below about 200 shares/s that's harmless. Above it, set
+runs. At production size it took about a minute before migration 026 (#737).
+Since 026 it is estimated at about half a minute, the sum of its two checks'
+EXPLAIN ANALYZE times (20.29 s and 9.14 s), not a timed run. It holds one
+snapshot for as long. On a primary with live miners every share updates the
+cluster row, so a long snapshot there piles up dead row versions and slows
+the share append's lock (#738). Below about 200 shares/s that's harmless. Above it, set
 `PRISM_INTEGRITY_REPORT_DATABASE_URL` to a hot standby and the gate runs the
 report there. That standby must have `hot_standby_feedback` off, or the report
 holds back the writer all the same. Pause its replay first
@@ -572,9 +574,11 @@ the migrator never invents provenance for an already-migrated database.
 
 **Startup gate.** Every start reads `qbit_prism_schema_migrations` and
 `qbit_prism_schema_capabilities`, with or without
-`PRISM_POSTGRES_INIT_SCHEMA`. This release requires migrations 2 through 18,
-each checked on its own rather than as a high-water mark: a later migration
-being present never stands in for an earlier missing migration. Stop all
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires every native migration
+it ships, from 2 on (`REQUIRED_SCHEMA_VERSIONS` in
+`crates/qbit-prism-server/src/ledger/migration.rs` lists them), each checked
+on its own rather than as a high-water mark: a later migration being present
+never stands in for an earlier missing migration. Stop all
 older frontends before applying 011; it refuses live pre-upgrade claims and
 quarantines previously attempted candidates for reconciliation without
 another offer. See [the offer lifecycle upgrade procedure](prism-ledger-ops.md)
@@ -648,6 +652,20 @@ active rows. It changes no stored row and is applied in the migration
 transaction, with no capability and no shutdown proof: an earlier binary
 accepts the unknown migration with a warning and reads the corrected report.
 See [blocks, balances, and reorgs](prism-ledger-ops.md#blocks-balances-and-reorgs).
+Migration 026 replaces `qbit_carry_forward_integrity_report()` (#737) so
+that it runs `qbit_carry_forward_integrity_mismatches()` and
+`qbit_carry_forward_current_drift()` once each instead of twice. It keeps
+001's subqueries word for word, evaluates each once in 001's order, and
+takes each count from its listing. On union's ledger EXPLAIN ANALYZE put the
+two checks at 20.29 s and 9.14 s, and the report took about 57 s; once each
+is estimated at about 29 s, their sum, not a timed run. The report is
+evaluated the same way as 001's, by the same listing subqueries, so findings
+that tie on the listing's sort keys come out in the order those subqueries
+leave them, as in 001, whose own order for them is not fixed either.
+`migrate` runs 026 again whenever it runs 001, as it runs 025 again after
+011. Like 025, it changes no stored row and is applied in the migration
+transaction, with no capability and no shutdown proof: an earlier binary
+accepts the unknown migration with a warning and reads the same report.
 While a share-hash backfill that this release started is pending on a
 populated `2.x.x` source, the database declares
 `share_hash_backfill_pending = 1` (#669). It is declared with the backfill's
@@ -1961,7 +1979,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023` and `025`), 002's share-hash backfill, 013's and 024's
+(`001` and native `002` to `023`, `025` and `026`), 002's share-hash backfill, 013's and 024's
 concurrent index builds, and 017's prepare, validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
 whole length; the backfill's batches hold only ACCESS SHARE on it. The report

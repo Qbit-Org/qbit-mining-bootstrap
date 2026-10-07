@@ -81,11 +81,14 @@ const CHECKS_021: [&str; 2] = [
     "qbit_block_candidate_outbox_claim_lease_seconds_check",
     "qbit_block_candidate_outbox_claim_renewals_check",
 ];
-const ALL_VERSIONS: [i32; 24] = [
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+const ALL_VERSIONS: [i32; 25] = [
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
 ];
 /// 011 itself, for the one test that applies its SQL without the runner.
 const MIGRATION_011: &str = include_str!("../migrations/011_offer_before_landing.sql");
+/// 026, whose report the integrity tests compare with 001's.
+const MIGRATION_026: &str =
+    include_str!("../migrations/026_carry_forward_integrity_report_once.sql");
 /// The proof time the lifecycle test enqueues with, and the call time it
 /// records: wall clocks in UNIX milliseconds, far outside `i32`.
 const PROOF_MS: i64 = 1_700_000_000_123;
@@ -2112,6 +2115,349 @@ async fn migration_025_runs_again_after_011_runs() -> Result<()> {
     .await
 }
 
+/// 001's integrity report, cut from the frozen release file: the report
+/// every build before 026 ran, which runs the validator and the drift check
+/// twice each.
+fn report_001() -> &'static str {
+    let start = FROZEN_2X_001
+        .find("CREATE OR REPLACE FUNCTION qbit_carry_forward_integrity_report()")
+        .expect("001 defines the report");
+    let end = FROZEN_2X_001[start..]
+        .find("\n$$;")
+        .expect("the report body is dollar-quoted")
+        + start
+        + "\n$$;".len();
+    &FROZEN_2X_001[start..end]
+}
+
+/// What PostgreSQL stores as the body of a dollar-quoted definition.
+fn stored_body(definition: &str) -> &str {
+    let start = definition.find("AS $$").expect("a dollar-quoted body") + "AS $$".len();
+    let end = definition[start..]
+        .find("\n$$;")
+        .expect("its closing quote")
+        + start
+        + 1;
+    &definition[start..end]
+}
+
+/// The body of the report the database runs.
+async fn report_body(pool: &PgPool) -> Result<String> {
+    Ok(sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc WHERE oid='qbit_carry_forward_integrity_report()'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// `(checked_active_rows, mismatch_count, current_drift_count)` of a report.
+fn report_counts(report: &Value) -> Option<(u64, u64, u64)> {
+    Some((
+        report["checked_active_rows"].as_u64()?,
+        report["mismatch_count"].as_u64()?,
+        report["current_drift_count"].as_u64()?,
+    ))
+}
+
+/// 001's report, installed beside 026's as
+/// `qbit_carry_forward_integrity_report_001()`, against 026's: in one
+/// statement, so over one snapshot, and each evaluated once, which the CTE
+/// keeps (a subquery would be pulled up into each reference to it). They
+/// must be the same jsonb and the same text.
+async fn reports_agree<'e>(executor: impl sqlx::PgExecutor<'e>, label: &str) -> Result<Value> {
+    let (equal, old, new): (bool, String, String) = sqlx::query_as(
+        "WITH reports AS MATERIALIZED (SELECT qbit_carry_forward_integrity_report_001() AS old,qbit_carry_forward_integrity_report() AS new) SELECT old=new,old::text,new::text FROM reports",
+    )
+    .fetch_one(executor)
+    .await?;
+    ensure!(
+        equal && old == new,
+        "{label}: the reports differ {}",
+        divergence(&old, &new)
+    );
+    Ok(serde_json::from_str(&new)?)
+}
+
+/// Where two report texts part, for a failure message: a report can list
+/// thousands of findings.
+fn divergence(old: &str, new: &str) -> String {
+    let at = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let from = |text: &str| text.chars().skip(at).take(160).collect::<String>();
+    format!("from character {at}: 001 {}, 026 {}", from(old), from(new))
+}
+
+/// Wraps the validator and the drift check so that each call advances a
+/// sequence of its own: neither is inlined then, and a report's calls can be
+/// counted.
+const COUNT_REPORT_SETS: &str = r#"
+CREATE SEQUENCE report_mismatch_calls;
+CREATE SEQUENCE report_drift_calls;
+DO $wrap$
+DECLARE
+    wrapped record;
+BEGIN
+    FOR wrapped IN SELECT * FROM (VALUES
+        ('qbit_carry_forward_integrity_mismatches', 'report_mismatch_calls'),
+        ('qbit_carry_forward_current_drift', 'report_drift_calls')) AS f(name, counter)
+    LOOP
+        EXECUTE format('ALTER FUNCTION %I() RENAME TO %I', wrapped.name, 'counted_' || wrapped.name);
+        EXECUTE format(
+            'CREATE FUNCTION %I() RETURNS %s LANGUAGE plpgsql AS $body$ BEGIN PERFORM nextval(%L); RETURN QUERY SELECT * FROM %I(); END $body$',
+            wrapped.name,
+            pg_get_function_result(format('%I()', 'counted_' || wrapped.name)::regprocedure),
+            wrapped.counter,
+            'counted_' || wrapped.name);
+    END LOOP;
+END
+$wrap$;
+"#;
+
+/// Makes the validator and the drift check each raise an error that names
+/// it, so a report fails in whichever of the two it runs first.
+const FAIL_REPORT_SETS: &str = r#"
+DO $fail$
+DECLARE
+    failing record;
+BEGIN
+    FOR failing IN SELECT * FROM (VALUES
+        ('qbit_carry_forward_integrity_mismatches'),
+        ('qbit_carry_forward_current_drift')) AS f(name)
+    LOOP
+        EXECUTE format(
+            'CREATE OR REPLACE FUNCTION %I() RETURNS %s LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION %L; END $body$',
+            failing.name,
+            pg_get_function_result(format('%I()', failing.name)::regprocedure),
+            failing.name || ' failed');
+    END LOOP;
+END
+$fail$;
+"#;
+
+/// #737: 026's report is the jsonb 001's is, with 001's report beside it
+/// under another name, on: no carry rows; clean ones; legacy breaks, two of
+/// them at one height; an as-issued block's findings, four of which have no
+/// carry row and so tie on the listing's sort keys at that height; drift of
+/// each shape, a summary off by some sats, a summary row with no history
+/// and a program whose summary row is gone; and 2,000 findings tied at one
+/// height, at the default work_mem and at the smallest, where every sort of
+/// them spills to disk. Tied findings are listed in the order the
+/// validator's own sort leaves them, which another sort of them could
+/// change once it spills, so 026 aggregates them as 001 does. 026 runs each
+/// of the two sets once, where 001 runs each twice, and in 001's order: a
+/// report whose sets both fail fails in the validator, as 001's does.
+#[tokio::test]
+async fn integrity_report_026_equals_001_on_clean_mismatch_and_drift_fixtures() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let _ledger = db.ledger("report-026").await?;
+            let pool = &db.pool;
+            ensure!(
+                report_body(pool).await? == stored_body(MIGRATION_026),
+                "the migrated ledger does not run 026's report"
+            );
+            sqlx::raw_sql(&report_001().replacen(
+                "qbit_carry_forward_integrity_report()",
+                "qbit_carry_forward_integrity_report_001()",
+                1,
+            ))
+            .execute(pool)
+            .await?;
+            let report = reports_agree(pool, "no carry rows").await?;
+            ensure!(report_counts(&report) == Some((0, 0, 0)), "{report}");
+            case_labels::seed(pool).await?;
+            let report = reports_agree(pool, "clean").await?;
+            ensure!(report_counts(&report) == Some((7, 0, 0)), "{report}");
+
+            // Legacy breaks at 43, 44 and 47, and at 44 a second program's
+            // first row, which starts from a prior of 5.
+            for height in [43, 44, 47] {
+                case_labels::shift(pool, height, 1).await?;
+            }
+            sqlx::query("INSERT INTO qbit_payout_carry_forward(block_height,block_hash,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,carry_forward_balance_sats,action,maturity_state) VALUES(44,$1,'miner-d','d',decode(repeat('d6',32),'hex'),10,5,15,0,15,'accrued','mature')")
+                .bind(case_labels::block_hash(44)).execute(pool).await?;
+            let report = reports_agree(pool, "legacy breaks").await?;
+            ensure!(report_counts(&report) == Some((8, 4, 0)), "{report}");
+
+            // An as-issued block at 102: its carry row paid one sat its
+            // manifest does not (a finding on that row), and without a carry
+            // row, a fee account that does not add up, two payout entries the
+            // manifest does not name and a manifest height that is not the
+            // block's.
+            let marked = "4e".repeat(32);
+            let mut issued = manifest(102, 0, 100, 0, None);
+            issued["payout_policy_manifest"]["block_height"] = json!(103);
+            issued["payout_policy_manifest"]["accounts"][1]["gross_amount_sats"] = json!(9);
+            insert_block(pool, &marked, 102, Some(&issued), Amounts { prior: 0, gross: 100, onchain: 0, fee: 0 }).await?;
+            sqlx::query("UPDATE qbit_payout_carry_forward SET onchain_amount_sats=1 WHERE block_hash=$1")
+                .bind(&marked).execute(pool).await?;
+            sqlx::query("INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action) VALUES($1,102,'miner-y','y',decode(repeat('5d',32),'hex'),5,0,'onchain'),($1,102,'miner-z','z',decode(repeat('5e',32),'hex'),5,0,'onchain')")
+                .bind(&marked).execute(pool).await?;
+            let report = reports_agree(pool, "as-issued findings").await?;
+            ensure!(report_counts(&report) == Some((9, 9, 0)), "{report}");
+            let listed: Vec<(Option<i64>, bool)> = report["mismatches"]
+                .as_array()
+                .context("mismatches")?
+                .iter()
+                .map(|finding| (finding["block_height"].as_i64(), finding["carry_forward_seq"].is_null()))
+                .collect();
+            ensure!(
+                listed == [43, 44, 44, 47, 102, 102, 102, 102, 102]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, height)| (Some(*height), index > 4))
+                    .collect::<Vec<_>>(),
+                "{listed:?}"
+            );
+
+            // Drift: the program's per-label summary rows a sat high each,
+            // a summary row with no carry history, and the as-issued block's
+            // program with its summary row gone.
+            sqlx::query("UPDATE qbit_payout_carry_forward_current SET balance_sats=balance_sats+1 WHERE p2mr_program=decode($1,'hex')")
+                .bind(case_labels::program()).execute(pool).await?;
+            sqlx::raw_sql("INSERT INTO qbit_payout_carry_forward_current(miner_id,payout_order_key,p2mr_program,balance_sats,active_row_count) VALUES('miner-ghost','ghost',decode(repeat('ef',32),'hex'),42,1); DELETE FROM qbit_payout_carry_forward_current WHERE p2mr_program=decode(repeat('11',32),'hex')")
+                .execute(pool).await?;
+            let report = reports_agree(pool, "drift").await?;
+            ensure!(report_counts(&report) == Some((9, 9, 3)), "{report}");
+            let programs: Vec<&str> = report["current_drift"]
+                .as_array()
+                .context("current_drift")?
+                .iter()
+                .filter_map(|row| row["p2mr_program_hex"].as_str())
+                .collect();
+            ensure!(
+                programs == ["11".repeat(32), case_labels::program(), "ef".repeat(32)],
+                "{programs:?}"
+            );
+
+            // A marked block at 200 whose manifest names 1,000 miners and
+            // has none of their evidence: an evidence and a payout-entry
+            // finding for each, all without a carry row, so all tied at 200.
+            let crowded = "c8".repeat(32);
+            let digest = "c9".repeat(32);
+            sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state,as_issued_audit_sha256) VALUES($1,200,repeat('00',32),repeat('ab',32),repeat('ac',32),'confirmed',$2)")
+                .bind(&crowded).bind(&digest).execute(pool).await?;
+            sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex) SELECT $1,jsonb_build_object('payout_policy_manifest',jsonb_build_object('schema','qbit.prism.payout-policy-manifest.v1','block_height',200,'accounts',jsonb_agg(jsonb_build_object('recipient_id','miner-'||n,'order_key',lpad(n::text,4,'0'),'p2mr_program_hex',lpad(to_hex(n),64,'0'),'gross_amount_sats',10,'prior_balance_sats',0,'candidate_balance_sats',10,'onchain_amount_sats',0,'carry_forward_balance_sats',10,'action','accrued') ORDER BY n),'onchain_entitlements','[]'::jsonb)),$2,'00' FROM generate_series(1,1000) n")
+                .bind(&crowded).bind(&digest).execute(pool).await?;
+            let report = reports_agree(pool, "2,000 tied findings").await?;
+            let counts = report_counts(&report);
+            ensure!(counts == Some((9, 2_009, 3)), "{counts:?}");
+            let mut spilled = pool.begin().await?;
+            sqlx::query("SET LOCAL work_mem='64kB'").execute(&mut *spilled).await?;
+            reports_agree(&mut *spilled, "2,000 tied findings, every sort on disk").await?;
+            spilled.rollback().await?;
+
+            sqlx::raw_sql(COUNT_REPORT_SETS).execute(pool).await?;
+            let calls = || async {
+                Ok::<(i64, i64), anyhow::Error>(sqlx::query_as(
+                    "SELECT (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM report_mismatch_calls),(SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM report_drift_calls)",
+                )
+                .fetch_one(pool)
+                .await?)
+            };
+            reports_agree(pool, "counted").await?;
+            ensure!(calls().await? == (3, 3), "the two reports called each set {:?} times", calls().await?);
+            sqlx::query("SELECT qbit_carry_forward_integrity_report()").execute(pool).await?;
+            ensure!(calls().await? == (4, 4), "026 called each set {:?} times in all", calls().await?);
+
+            // A run that fails stops where 001's does: with both sets
+            // failing, both reports fail in the validator, which 001 runs
+            // first.
+            sqlx::raw_sql(FAIL_REPORT_SETS).execute(pool).await?;
+            for report in [
+                "qbit_carry_forward_integrity_report_001",
+                "qbit_carry_forward_integrity_report",
+            ] {
+                let failed = sqlx::query(&format!("SELECT {report}()"))
+                    .execute(pool)
+                    .await
+                    .err()
+                    .with_context(|| format!("{report} ran with both of its sets failing"))?;
+                ensure!(
+                    format!("{failed:#}").contains("qbit_carry_forward_integrity_mismatches failed"),
+                    "{report}: {failed:#}"
+                );
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// 026 replaces the report, which only 001 defines (#737), and 001 runs
+/// only on a database without 3. So 26 is recorded once, and the report it
+/// installed survives every later migrate: one that runs 011 and 025 again,
+/// on a record that lacks 11 as the #258 fixture leaves it, and one with
+/// nothing to do. A record without 26 over 001's report, as every earlier
+/// build left it, gets 026 at its next migrate, once. A record with 26 but
+/// not 3 is refused before any DDL, so 001 never runs over 026's report,
+/// and the report stays 026's.
+#[tokio::test]
+async fn migration_026_is_recorded_once_and_survives_remigrate() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let pool = &db.pool;
+            // 26's record and the report's catalog row: a migrate that applied
+            // 026 again would write a new row version.
+            let installed = || async {
+                Ok::<(i64, Option<String>, String, String), anyhow::Error>(sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM qbit_prism_schema_migrations WHERE version=26),(SELECT min(applied_at)::text FROM qbit_prism_schema_migrations WHERE version=26),xmin::text,prosrc FROM pg_proc WHERE oid='qbit_carry_forward_integrity_report()'::regprocedure",
+                )
+                .fetch_one(pool)
+                .await?)
+            };
+            db.apply_pre_011_from(Source::Applied258).await?;
+            let first = installed().await?;
+            ensure!(first.0 == 1 && first.3 == stored_body(MIGRATION_026), "{first:?}");
+            ensure!(!db.versions().await?.contains(&11));
+            let _rerun = db.ledger("rerun-011").await?;
+            ensure!(db.versions().await? == ALL_VERSIONS, "011 was not recorded");
+            ensure!(installed().await? == first, "running 011 and 025 again touched 026's report");
+            let _again = db.ledger("remigrate").await?;
+            ensure!(installed().await? == first, "a migrate with nothing to do touched 026's report");
+
+            // The record an earlier build left: 001's report, 26 not recorded.
+            sqlx::raw_sql(&format!(
+                "DELETE FROM qbit_prism_schema_migrations WHERE version=26; {}",
+                report_001()
+            ))
+            .execute(pool)
+            .await?;
+            ensure!(report_body(pool).await? == stored_body(report_001()));
+            let _upgraded = db.ledger("upgrade-026").await?;
+            ensure!(db.versions().await? == ALL_VERSIONS, "26 was not recorded");
+            let upgraded = installed().await?;
+            ensure!(upgraded.0 == 1 && upgraded.3 == stored_body(MIGRATION_026), "{upgraded:?}");
+            ensure!(upgraded.1 != first.1 && upgraded.2 != first.2, "{upgraded:?} {first:?}");
+            let _later = db.ledger("remigrate-026").await?;
+            ensure!(installed().await? == upgraded, "a later migrate touched 026's report");
+
+            // A record with 26 but not 3, edited by hand or restored in
+            // part: migrate refuses it before any DDL, so 001 never runs
+            // over 026's report, and the report stays 026's.
+            sqlx::query("DELETE FROM qbit_prism_schema_migrations WHERE version=3")
+                .execute(pool)
+                .await?;
+            let refused = Ledger::connect(&db.url, "without-3".to_owned(), 4, true)
+                .await
+                .err()
+                .context("migrate accepted a record with 26 but not 3")?;
+            ensure!(
+                format!("{refused:#}").contains("without migration 3"),
+                "{refused:#}"
+            );
+            let kept = installed().await?;
+            ensure!(kept.3 == stored_body(MIGRATION_026), "{kept:?}");
+            ensure!(kept == upgraded, "a refused migrate touched 026's report: {kept:?}");
+            Ok(())
+        })
+    })
+    .await
+}
+
 /// The fence is decided by the row's state as the database holds it under
 /// the claim lock, never by the claim's memory of it: the claim that was
 /// taken pending lands after its own reservation on moved balances.
@@ -2408,7 +2754,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                     );
                     if initialize {
                         ensure!(
-                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL"),
+                            text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 before any DDL"),
                             "{case}: {text}"
                         );
                     }
@@ -2445,11 +2791,11 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
                 .context("migrate applied 009 above a missing lifecycle declaration")?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );
-            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+            ensure!(db.versions().await? == [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
             ensure!(
                 schema_objects(&db.pool).await? == objects,
                 "a refused migrate changed the schema"
@@ -2486,7 +2832,7 @@ async fn migrated_database_without_its_offer_lifecycle_declaration_is_refused_at
             )?;
             let text = format!("{error:#}");
             ensure!(
-                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL")
+                text.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 before any DDL")
                     && text.contains("has no candidate_offer_lifecycle row"),
                 "{text}"
             );

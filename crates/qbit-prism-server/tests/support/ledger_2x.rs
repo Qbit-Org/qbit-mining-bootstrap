@@ -246,7 +246,10 @@ fn source_state_table_is_the_pinned_data() {
     );
     assert_eq!(
         REQUIRED_SCHEMA_VERSIONS,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        [
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            26
+        ]
     );
 }
 
@@ -2642,7 +2645,7 @@ async fn native_candidate_version_two_is_refused_without_claiming_or_migrating()
     assert!(error.contains("candidate_storage_version = 2"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
     );
     assert_eq!(schema_objects(&pool).await?, objects);
     assert_eq!(capability(&pool).await?, Some(2));
@@ -2716,7 +2719,10 @@ async fn native_capability_relation_must_be_an_ordinary_table() -> Result<()> {
         assert_eq!(schema_objects(&pool).await?, objects);
         assert_eq!(
             schema_versions(&pool).await?,
-            [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+            [
+                2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                25, 26
+            ]
         );
         assert_eq!(sqlx::query_scalar::<_,i32>("SELECT capability_value FROM operator_real_capabilities WHERE capability='candidate_storage_version'").fetch_one(&pool).await?, 2);
         sqlx::raw_sql(&format!("DROP {kind} qbit_prism_schema_capabilities; ALTER TABLE operator_real_capabilities RENAME TO qbit_prism_schema_capabilities"))
@@ -2736,7 +2742,10 @@ async fn native_capability_relation_must_be_an_ordinary_table() -> Result<()> {
         assert!(format!("{error:#}").contains("candidate_storage_version = 2"));
         assert_eq!(
             schema_versions(&pool).await?,
-            [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+            [
+                2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                25, 26
+            ]
         );
         pool.close().await;
         db.close(vec![earlier]).await?;
@@ -2898,7 +2907,7 @@ async fn native_capabilities_with_row_level_security_are_refused_before_writes()
     assert!(error.contains("row-level security"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
     );
     assert_eq!(schema_objects(&pool).await?, objects);
     assert_eq!(
@@ -2919,7 +2928,7 @@ async fn native_capabilities_with_row_level_security_are_refused_before_writes()
     assert!(error.contains("sealed_share_pages"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
     );
     sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability='sealed_share_pages'")
         .execute(&limited_pool)
@@ -3050,7 +3059,7 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
             assert!(error.contains(remedy), "{error}");
             if initialize {
                 assert!(
-                    error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL"),
+                    error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 before any DDL"),
                     "{error}"
                 );
             }
@@ -3084,13 +3093,13 @@ async fn migrated_database_without_its_capability_declaration_is_refused_at_conn
         .context("migrate applied 009 above a missing capability declaration")?
         .to_string();
     assert!(
-        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 before any DDL"),
+        error.contains("refusing to migrate a native database at schema migrations 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 before any DDL"),
         "{error}"
     );
     assert!(error.contains(row_gone), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
     );
     assert_eq!(schema_objects(&pool).await?, before);
     sqlx::raw_sql("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('candidate_storage_version',1)")
@@ -3219,7 +3228,7 @@ async fn migrated_database_without_readable_source_metadata_is_refused_before_la
                 .err()
                 .context("migrate applied 009 above invalid source metadata")?;
             let error = format!("{error:#}");
-            assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+            assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
             assert!(error.contains("qbit_prism_migration_source"), "{error}");
             assert!(error.contains("before any DDL"), "{error}");
             assert!(error.contains("Restore the full backup"), "{error}");
@@ -3251,7 +3260,7 @@ async fn undo_009(pool: &PgPool) -> Result<()> {
         .execute(pool).await?;
     assert_eq!(
         schema_versions(pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
     );
     Ok(())
 }
@@ -3293,14 +3302,14 @@ async fn startup_without_initialize_requires_the_current_schema_version() -> Res
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 9; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 and found 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+            "missing migration(s) 9; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 and found 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
         ),
         "{error}"
     );
     assert!(error.contains("qbit-prism-server migrate"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+        [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26],
         "a non-initializing start ran a migration"
     );
     // Initializing brings it forward again, without rewriting the source record.
@@ -3370,7 +3379,7 @@ async fn native_migration_gap_collisions_are_refused_before_any_ddl() -> Result<
         assert!(error.contains("migration 5"), "{error}");
         assert!(error.contains(object), "{error}");
         assert!(error.contains("before any DDL"), "{error}");
-        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+        assert_eq!(schema_versions(&pool).await?, [2, 3, 4, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
         assert_eq!(schema_objects(&pool).await?, before);
         assert_eq!(earlier.migration_source().await?, source);
         sqlx::raw_sql(remedy).execute(&pool).await?;
@@ -3493,7 +3502,7 @@ async fn startup_without_initialize_refuses_a_pre_006_native_schema_with_009() -
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 and found 2, 3, 4, 5, 7, 8, 9, 10"
+            "missing migration(s) 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 and found 2, 3, 4, 5, 7, 8, 9, 10"
         ),
         "{error}"
     );
@@ -3581,11 +3590,18 @@ async fn undo_006(earlier: &Ledger, pool: &PgPool, state: SourceState) -> Result
     // The historical fixture predates the offline policy journal, the
     // signing-key rotation journal, the payout-divergence evidence, the
     // observed claim leases of 021 and 022, the block submission hold of 023,
-    // 024's fanout lane index and 025's per-program carry rule too. undo_011
-    // below restores 001's validator over 025's.
-    sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=25")
-        .execute(pool)
-        .await?;
+    // 024's fanout lane index, 025's per-program carry rule and 026's
+    // integrity report, which runs each of its checks once, too. That build
+    // ran 001's report, which comes back here by hand: migrate runs 001, and
+    // 026 again after it, only on a record without 3, and this one keeps 3.
+    // The next migrate applies 026 because 26 is missing. undo_011 below
+    // restores 001's validator over 025's.
+    sqlx::raw_sql(&format!(
+        "DELETE FROM qbit_prism_schema_migrations WHERE version IN (25,26); {}",
+        function_001("qbit_carry_forward_integrity_report")
+    ))
+    .execute(pool)
+    .await?;
     sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=24; DROP INDEX qbit_ctv_fanout_artifacts_lane_idx")
         .execute(pool).await?;
     sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=23; DELETE FROM qbit_prism_schema_capabilities WHERE capability='block_submission_hold'; DROP TABLE qbit_prism_submission_hold_events; DROP FUNCTION qbit_prism_preserve_submission_hold_events(); DROP TABLE qbit_prism_submission_hold; DROP FUNCTION qbit_prism_keep_submission_hold()")
@@ -3647,20 +3663,23 @@ async fn undo_011(pool: &PgPool, state: SourceState) -> Result<()> {
         sqlx::raw_sql("ALTER TABLE qbit_block_candidate_outbox ADD CONSTRAINT qbit_block_candidate_outbox_dual_format_check CHECK ((state = 'pending' AND completed_at IS NULL AND ((storage_version = 1 AND candidate IS NOT NULL AND body_id IS NULL) OR (storage_version = 2 AND candidate IS NULL AND body_id IS NOT NULL))) OR (state IN ('submitted', 'abandoned') AND completed_at IS NOT NULL AND candidate IS NULL AND body_id IS NULL))")
             .execute(pool).await?;
     }
-    sqlx::raw_sql(validator_001()).execute(pool).await?;
+    sqlx::raw_sql(function_001("qbit_carry_forward_integrity_mismatches"))
+        .execute(pool)
+        .await?;
     assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 6, 7, 8, 9, 10]);
     Ok(())
 }
 
-/// The carry-forward validator exactly as 001 defines it, cut from the
-/// frozen release file: the definition every build before 011 ran.
-fn validator_001() -> &'static str {
+/// The function `name` exactly as 001 defines it, cut from the frozen
+/// release file: the carry-forward validator every build before 011 ran,
+/// or the integrity report every build before 026 ran.
+fn function_001(name: &str) -> &'static str {
     let start = FROZEN_2X_001
-        .find("CREATE OR REPLACE FUNCTION qbit_carry_forward_integrity_mismatches()")
-        .expect("001 defines the validator");
+        .find(&format!("CREATE OR REPLACE FUNCTION {name}()"))
+        .unwrap_or_else(|| panic!("001 defines {name}"));
     let end = FROZEN_2X_001[start..]
         .find("\n$$;")
-        .expect("the validator body is dollar-quoted")
+        .expect("the function body is dollar-quoted")
         + start
         + "\n$$;".len();
     &FROZEN_2X_001[start..end]
@@ -3986,7 +4005,7 @@ async fn native_record_with_3_and_not_2_is_refused_before_any_ddl_and_not_repair
         .to_string();
     assert!(
         error.contains(
-            "missing migration(s) 2, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25 and found 3, 4, 5, 7, 8, 9, 10"
+            "missing migration(s) 2, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26; this server requires 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26 and found 3, 4, 5, 7, 8, 9, 10"
         ),
         "{error}"
     );

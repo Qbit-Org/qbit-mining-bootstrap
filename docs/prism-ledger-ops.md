@@ -1292,6 +1292,21 @@ program's rows whatever label they carry.
 - **Migration order.** 025 replaces the validator 011 defines, so `migrate`
   runs 025 again whenever it runs 011.
 
+Since migration 026 (#737), `qbit_carry_forward_integrity_report()` runs the
+validator and `qbit_carry_forward_current_drift()` once each. Before 026 it
+ran each twice, once to count its rows and once to list them.
+- **The time.** On union's 2,753,849 active rows EXPLAIN ANALYZE put the
+  validator at 20.29 s and the drift check at 9.14 s, and the report took
+  about 57 s. Once each is estimated at about 29 s, their sum, not a timed
+  run. `self-check`, `fatal-state clear` and the import admission gate all
+  wait for it.
+- **The same report.** 026 keeps 001's subqueries word for word, runs them
+  in 001's order and takes each count from its listing, so the report is
+  evaluated the same way as 001's. Findings that tie on the listing's sort
+  keys come out in the order those subqueries leave them, as in 001: a
+  block's findings without a carry row share its height and a NULL
+  `carry_forward_seq`.
+
 Coinbase maturity is 1,000 blocks: a height-H payout becomes mature only at tip
 height H+1,000 or later. An immature disconnected block is marked inactive, so
 its balances stop contributing; it can reactivate. Terminal reversal preserves
