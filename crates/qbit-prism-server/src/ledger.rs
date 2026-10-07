@@ -73,8 +73,8 @@ pub use jobs::{
 };
 mod migration;
 pub use migration::{
-    schema_version_list, MigrationSource, SourceState, SourceStateRule, NOT_VALID_EXEMPT,
-    REQUIRED_SCHEMA_VERSIONS, SOURCE_STATES,
+    required_schema_versions, schema_version_list, MigrationSource, ShareHashBackfill, SourceState,
+    SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS, SOURCE_STATES,
 };
 mod window;
 pub use difficulty::WorkerDifficulty;

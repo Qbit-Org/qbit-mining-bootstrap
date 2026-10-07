@@ -13,6 +13,8 @@ mod online;
 mod partition;
 mod share_hashes;
 pub(super) use online::{apply_online_migration, OnlineMigration};
+pub use share_hashes::ShareHashBackfill;
+pub(super) use share_hashes::{refuse_departure_while_pending, refuse_restore_while_pending};
 
 /// The schema migrations every native start requires, each checked on its
 /// own. Add every new migration file here and to the `required_versions`
@@ -28,10 +30,25 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// ledgers apply 013, 017 and 024 online (`ONLINE_MIGRATIONS`) and record
 /// each after its last change, so a start refuses the database until that
 /// has completed. A populated 2.x.x source records 2 the same way, after its
-/// share-hash backfill (`share_hashes.rs`, #582).
+/// share-hash backfill (`share_hashes.rs`, #582); once
+/// `migrate --defer-share-hashes` has mapped the backfill's recent range
+/// and permitted serving, every start accepts the database without 2 until
+/// plain `migrate` records it.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
 ];
+
+/// The schema migrations a start requires: `REQUIRED_SCHEMA_VERSIONS`, but
+/// 2 while `serving_pending`, its share-hash backfill pending with serving
+/// permitted (`share_hashes.rs`): plain `migrate` records it once it has
+/// mapped the rest.
+pub fn required_schema_versions(serving_pending: bool) -> Vec<i32> {
+    REQUIRED_SCHEMA_VERSIONS
+        .iter()
+        .copied()
+        .filter(|version| !serving_pending || *version != share_hashes::VERSION)
+        .collect()
+}
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
 /// `none`.
@@ -90,8 +107,14 @@ const NATIVE_CAPABILITIES: &[(&str, i32)] = &[
     // binary without this entry, every build before #669, refuses the
     // database at connect and at migrate while it is declared, so none can
     // serve a ledger whose legacy headers are not all mapped, whatever the
-    // migration record says.
-    (share_hashes::PENDING_CAPABILITY, 1),
+    // migration record says. At 2 the backfill's recent range is mapped and
+    // this release serves with the rest pending; a binary that understands
+    // only 1, every build before it, refuses that value the same way, so
+    // none serves beside it or finishes the backfill under it.
+    (
+        share_hashes::PENDING_CAPABILITY,
+        share_hashes::FENCE_SERVING,
+    ),
 ];
 
 /// How many blocking outbox rows a drain refusal names.
@@ -2855,9 +2878,12 @@ async fn require_migration_history(connection: &mut sqlx::PgConnection) -> Resul
 /// only for fresh or empty 2.x.x sources under the cutover locks; existing
 /// native ledgers always return their changes for the caller to apply with
 /// `apply_online_migration` after the commit, and they are recorded then.
+/// `backfill_mode` is what a pending share-hash backfill gets: the caller's
+/// (`ShareHashBackfill`).
 pub(super) async fn migrate_schema(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: &str,
+    backfill_mode: ShareHashBackfill,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<Vec<OnlineMigration>> {
     lock(tx, MIGRATION_LOCK, metrics).await?;
@@ -2994,9 +3020,20 @@ pub(super) async fn migrate_schema(
             } else {
                 // The legacy shares are mapped after the commit, in batches,
                 // before 013, 017 and 024, and that run records 2 (#582).
+                // Deferred, only the recent range is mapped there, and
+                // serving is permitted with the rest pending. The fence this
+                // transaction declares below is 1 either way.
                 share_hashes::create_cursor(tx).await?;
                 cursor_created = true;
-                online.insert(0, OnlineMigration::ShareHashes);
+                if backfill_mode == ShareHashBackfill::Defer {
+                    // Claimed before anything is mapped, so a deferred run
+                    // that stops before its recent range leaves the backfill
+                    // to the operator's `migrate` (`share_hashes.rs`).
+                    share_hashes::declare_deferred(tx).await?;
+                    online.insert(0, OnlineMigration::ShareHashesRecent);
+                } else {
+                    online.insert(0, OnlineMigration::ShareHashes(backfill_mode));
+                }
             }
         }
         sqlx::raw_sql(native_migration(3))
@@ -3025,13 +3062,18 @@ pub(super) async fn migrate_schema(
         if backfill.is_none() {
             // A fence without its cursor: the cursor was dropped by hand, and
             // "3 without 2" would only suggest recording 2 by hand (#669).
-            // Only this release's value: at another, the name is a newer
+            // Only this release's values: at another, the name is a newer
             // release's declaration, refused below as any newer one is.
-            if inventory.capability(share_hashes::PENDING_CAPABILITY) == Some(1) {
+            if let Some(value) = inventory
+                .capability(share_hashes::PENDING_CAPABILITY)
+                .filter(|value| {
+                    (share_hashes::FENCE_PENDING..=share_hashes::FENCE_SERVING).contains(value)
+                })
+            {
                 bail!(
                     "refusing to migrate a native database at schema migrations {} before any DDL: {}",
                     schema_version_list(&versions),
-                    share_hashes::orphaned_fence_refusal()
+                    share_hashes::orphaned_fence_refusal(value)
                 );
             }
             refuse_inconsistent_native_record(&versions)?;
@@ -3081,12 +3123,65 @@ pub(super) async fn migrate_schema(
         };
         online.extend(require_no_native_gap_collisions(tx, &applied).await?);
         if let Some(progress) = backfill {
-            tracing::info!(
-                next_seq = progress.next_seq,
-                end_seq = progress.end_seq,
-                "resuming migration 2's share-hash backfill after the commit"
-            );
-            online.insert(0, OnlineMigration::ShareHashes);
+            // Newer values were refused above, as a newer release's.
+            match (
+                inventory.capability(share_hashes::PENDING_CAPABILITY),
+                backfill_mode,
+            ) {
+                // Serving is permitted, so only `migrate` maps the rest, and
+                // after 013, 017 and 024: serving needs them, and the recent
+                // range, which had to precede 013, is mapped.
+                (Some(share_hashes::FENCE_SERVING), ShareHashBackfill::Finish) => {
+                    tracing::info!(
+                        next_seq = progress.next_seq,
+                        end_seq = progress.end_seq,
+                        "finishing migration 2's share-hash backfill after the commit, while frontends may serve"
+                    );
+                    online.push(OnlineMigration::ShareHashes(ShareHashBackfill::Finish));
+                }
+                (Some(share_hashes::FENCE_SERVING), _) => tracing::info!(
+                    next_seq = progress.next_seq,
+                    end_seq = progress.end_seq,
+                    "migration 2's share-hash backfill permits serving; `qbit-prism-server migrate` maps the rest"
+                ),
+                (Some(share_hashes::FENCE_PENDING), ShareHashBackfill::Defer) => {
+                    // Claimed before anything is mapped, as on a fresh
+                    // source; a retry keeps the first claim.
+                    share_hashes::declare_deferred(tx).await?;
+                    tracing::info!(
+                        next_seq = progress.next_seq,
+                        end_seq = progress.end_seq,
+                        "mapping the recent range of migration 2's share-hash backfill after the commit"
+                    );
+                    online.insert(0, OnlineMigration::ShareHashesRecent);
+                }
+                // A deferred run claimed it and stopped before its recent
+                // range permitted serving. Only the operator's `migrate`, with
+                // the flag or without, takes it on from there: this connect
+                // refuses the database as every start does, changing nothing,
+                // and runs neither the whole backfill nor 013, which drops the
+                // index the range reads.
+                (Some(share_hashes::FENCE_PENDING), ShareHashBackfill::Initialize)
+                    if progress.deferred =>
+                {
+                    bail!("{}", progress.refusal(Some(share_hashes::FENCE_PENDING)))
+                }
+                // No fence: a build before #669 started it, and a resume never
+                // declares one (`share_hashes.rs`).
+                (None, ShareHashBackfill::Defer) => {
+                    bail!("{}", share_hashes::unfenced_defer_refusal(&progress))
+                }
+                // Plain `migrate` runs a claimed backfill at 1 to its end too:
+                // the operator chose it over the deferral.
+                (_, backfill_mode) => {
+                    tracing::info!(
+                        next_seq = progress.next_seq,
+                        end_seq = progress.end_seq,
+                        "resuming migration 2's share-hash backfill after the commit"
+                    );
+                    online.insert(0, OnlineMigration::ShareHashes(backfill_mode));
+                }
+            }
         }
     }
     if !versions.contains(&4) {
@@ -3460,7 +3555,10 @@ async fn refuse_unquiesced_outbox(tx: &mut Transaction<'_, Postgres>) -> Result<
 /// not know is accepted with a warning that names it, so frontends on the
 /// previous release keep starting while a rollout drains and replaces them
 /// one at a time; a format an older binary must not touch is declared as a
-/// capability instead.
+/// capability instead. One exception: 2, while its share-hash backfill is
+/// pending and permits serving (`share_hashes.rs`), which is warned about.
+/// The same gate serves every caller: frontends, tools and operator
+/// commands.
 pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     let recorded: bool =
         sqlx::query_scalar("SELECT to_regclass('qbit_prism_schema_migrations') IS NOT NULL")
@@ -3475,16 +3573,37 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
     require_migration_history(&mut connection).await?;
     // Named before the missing 2 it explains, and refused even with 2
     // recorded: while the table is there, legacy shares may be unmapped.
-    if let Some(progress) = share_hashes::progress(&mut connection).await? {
-        bail!("{}", progress.refusal());
-    }
+    // Not once the recent range is mapped (the fence at 2): a credited share
+    // can then repeat no legacy header that is not. The fence is read only
+    // beside a cursor, and through `read_capabilities`, which refuses a
+    // substituted capability relation before it reads a row.
+    let serving = match share_hashes::progress(&mut connection).await? {
+        None => None,
+        Some(progress) => {
+            let fence = read_capabilities(&mut *connection)
+                .await?
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(name, _)| name == share_hashes::PENDING_CAPABILITY)
+                .map(|(_, value)| value);
+            if fence == Some(share_hashes::FENCE_SERVING) {
+                Some(progress)
+            // The transaction that records 2 drops the cursor and the fence
+            // together, so a cursor read before it committed can meet a
+            // fence read after: the cursor is read again before refusing.
+            } else if share_hashes::progress(&mut connection).await?.is_none() {
+                None
+            } else {
+                bail!("{}", progress.refusal(fence));
+            }
+        }
+    };
     let applied: Vec<i32> =
         sqlx::query_scalar("SELECT version FROM qbit_prism_schema_migrations ORDER BY version")
             .fetch_all(&mut *connection)
             .await?;
-    let missing: Vec<i32> = REQUIRED_SCHEMA_VERSIONS
-        .iter()
-        .copied()
+    let missing: Vec<i32> = required_schema_versions(serving.is_some())
+        .into_iter()
         .filter(|version| !applied.contains(version))
         .collect();
     ensure!(
@@ -3504,6 +3623,14 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
             unknown_migrations = %schema_version_list(&unknown),
             required_migrations = %schema_version_list(REQUIRED_SCHEMA_VERSIONS),
             "database has schema migrations this server does not know; a later release applied them"
+        );
+    }
+    if let Some(progress) = serving {
+        tracing::warn!(
+            start_seq = progress.start_seq,
+            next_seq = progress.next_seq,
+            end_seq = progress.end_seq,
+            "serving with migration 2's share-hash backfill pending: its recent range is mapped, and the rest of the legacy shares from next_seq up to end_seq are not. Run `qbit-prism-server migrate`, which maps them while frontends serve and records 2; share-archive restore, and detach and drop of any partition, refuse until then"
         );
     }
     Ok(())
@@ -3534,15 +3661,24 @@ where
     require_declared_capabilities(rows.as_deref(), &versions)?;
     refuse_unknown_capabilities(rows.as_deref().unwrap_or_default(), NATIVE_CAPABILITIES)?;
     // A pending backfill's fence is removed only with its cursor, which
-    // `require_schema_version` refuses while it exists (#669).
-    if rows
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .any(|(name, value)| name == share_hashes::PENDING_CAPABILITY && *value == 1)
-        && share_hashes::progress(&mut connection).await?.is_none()
-    {
-        bail!("{}", share_hashes::orphaned_fence_refusal());
+    // `require_schema_version` refuses while it exists, unless the fence is
+    // at 2 (#669). Values past 2 were refused above as a newer release's.
+    let fence = |rows: Option<Vec<(String, i32)>>| {
+        rows.unwrap_or_default()
+            .into_iter()
+            .find(|(name, value)| {
+                name == share_hashes::PENDING_CAPABILITY
+                    && (share_hashes::FENCE_PENDING..=share_hashes::FENCE_SERVING).contains(value)
+            })
+            .map(|(_, value)| value)
+    };
+    if fence(rows).is_some() && share_hashes::progress(&mut connection).await?.is_none() {
+        // The transaction that records 2 removes the fence with the cursor:
+        // a fence read before it committed meets a cursor read after, so the
+        // fence is read again before it is called orphaned.
+        if let Some(value) = fence(read_capabilities(&mut *connection).await?) {
+            bail!("{}", share_hashes::orphaned_fence_refusal(value));
+        }
     }
     if versions.contains(&18) {
         let epoch: i64 = sqlx::query_scalar("SELECT chain_epoch FROM qbit_prism_cluster WHERE singleton")
@@ -3643,6 +3779,18 @@ impl Ledger {
     pub async fn migration_source(&self) -> Result<Option<MigrationSource>> {
         let mut connection = self.acquire().await?;
         read_migration_source_connection(&mut connection).await
+    }
+
+    /// Migration 2's share-hash backfill while it is pending, as `(next_seq,
+    /// end_seq)`: the legacy shares from the first up to the second are not
+    /// all mapped. `None` once 2 is recorded. A connected ledger passed the
+    /// start gate, so a backfill pending here permits serving, as `migrate
+    /// --defer-share-hashes` leaves it.
+    pub async fn pending_share_hash_backfill(&self) -> Result<Option<(i64, i64)>> {
+        let mut connection = self.acquire().await?;
+        Ok(share_hashes::progress(&mut connection)
+            .await?
+            .map(|progress| (progress.next_seq, progress.end_seq)))
     }
 
     pub async fn import_legacy_audits(
@@ -5655,6 +5803,51 @@ mod tests {
             "{error}"
         );
         refuse_unknown_capabilities(&declared, NATIVE_CAPABILITIES).unwrap();
+    }
+
+    /// Serving with the backfill pending declares the fence at 2, which no
+    /// build before this one understands: rc.4's table, which knows the
+    /// fence at 1 only, refuses it at connect and at migrate, so no rc.4
+    /// binary serves beside a pending backfill or finishes it. This build
+    /// understands 1 and 2, and refuses a newer release's 3.
+    #[test]
+    fn rc4_refuses_the_serving_fence_this_build_declares() {
+        let rc4: Vec<(&str, i32)> = NATIVE_CAPABILITIES
+            .iter()
+            .map(|&(name, value)| {
+                if name == share_hashes::PENDING_CAPABILITY {
+                    (name, 1)
+                } else {
+                    (name, value)
+                }
+            })
+            .collect();
+        let serving = [(
+            share_hashes::PENDING_CAPABILITY.to_owned(),
+            share_hashes::FENCE_SERVING,
+        )];
+        let error = refuse_unknown_capabilities(&serving, &rc4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("database declares share_hash_backfill_pending = 2, but this server understands share_hash_backfill_pending 1 to 1 only"),
+            "{error}"
+        );
+        let pending = [(
+            share_hashes::PENDING_CAPABILITY.to_owned(),
+            share_hashes::FENCE_PENDING,
+        )];
+        refuse_unknown_capabilities(&pending, &rc4).unwrap();
+        refuse_unknown_capabilities(&pending, NATIVE_CAPABILITIES).unwrap();
+        refuse_unknown_capabilities(&serving, NATIVE_CAPABILITIES).unwrap();
+        let newer = [(share_hashes::PENDING_CAPABILITY.to_owned(), 3)];
+        let error = refuse_unknown_capabilities(&newer, NATIVE_CAPABILITIES)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("database declares share_hash_backfill_pending = 3, but this server understands share_hash_backfill_pending 1 to 2 only"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -84,7 +84,15 @@ enum Command {
         bits: String,
     },
     /// Apply the additive PostgreSQL migration after stopping Python writers.
-    Migrate,
+    Migrate {
+        /// Map only migration 2's legacy share headers within 1000 template
+        /// heights of the highest, then let frontends serve with the rest
+        /// pending; a later `migrate` without this flag maps it and records 2.
+        /// A flag, never an environment setting: frontends started with
+        /// PRISM_POSTGRES_INIT_SCHEMA=1 migrate too.
+        #[arg(long)]
+        defer_share_hashes: bool,
+    },
     /// Import legacy filesystem audit bodies into shared PostgreSQL storage.
     ImportAudits {
         /// Audit root, defaulting to PRISM_AUDIT_DIR when nonempty.
@@ -406,10 +414,15 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             println!("{}", crate::codec::scaled_target_difficulty(&target)?);
             Ok(())
         }
-        Command::Migrate => {
+        Command::Migrate { defer_share_hashes } => {
             let config = config::DatabaseConfig::from_env()?;
+            let backfill = if defer_share_hashes {
+                crate::ledger::ShareHashBackfill::Defer
+            } else {
+                crate::ledger::ShareHashBackfill::Finish
+            };
             let ledger =
-                crate::ledger::Ledger::connect_operator(&config.database_url, true).await?;
+                crate::ledger::Ledger::connect_migrate(&config.database_url, backfill).await?;
             let source = ledger
                 .migration_source()
                 .await?
@@ -421,11 +434,22 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                     )
                 })
                 .unwrap_or_else(|| "unrecorded".to_owned());
-            println!(
-                "PRISM PostgreSQL schema migrations {} ready; database source: {source}",
-                crate::ledger::schema_version_list(crate::ledger::REQUIRED_SCHEMA_VERSIONS)
-            );
+            let pending = ledger.pending_share_hash_backfill().await;
             ledger.pool.close().await;
+            let pending = pending?;
+            // What the start gate required: only a backfill that permits
+            // serving passes it pending, without 2.
+            let ready = crate::ledger::schema_version_list(
+                &crate::ledger::required_schema_versions(pending.is_some()),
+            );
+            match pending {
+                None => println!(
+                    "PRISM PostgreSQL schema migrations {ready} ready; database source: {source}"
+                ),
+                Some((next_seq, end_seq)) => println!(
+                    "PRISM PostgreSQL schema migrations {ready} ready, and frontends may serve: migration 2's share-hash backfill is deferred with its recent range mapped, and the legacy shares from share_seq {next_seq} up to {end_seq} are not all mapped yet. Run `qbit-prism-server migrate` without --defer-share-hashes to map them while frontends serve and record 2; database source: {source}"
+                ),
+            }
             Ok(())
         }
         Command::ImportAudits { root } => {
@@ -2228,6 +2252,29 @@ mod configuration_tests {
             assert!(require_block_hash(bad).is_err(), "{bad}");
         }
         assert_eq!(MAX_RECOVERY_BLOCKS, 32);
+    }
+
+    /// `--defer-share-hashes` is `migrate`'s alone, and off unless given:
+    /// plain `migrate` finishes the backfill, as before.
+    #[test]
+    fn migrate_defers_share_hashes_only_when_asked() {
+        let parse = |args: &[&str]| {
+            let Some(Command::Migrate { defer_share_hashes }) =
+                Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("wrong command");
+            };
+            defer_share_hashes
+        };
+        assert!(!parse(&["prism", "migrate"]));
+        assert!(parse(&["prism", "migrate", "--defer-share-hashes"]));
+        for args in [
+            vec!["prism", "migrate", "--defer-share-hashes=false"],
+            vec!["prism", "self-check", "--defer-share-hashes"],
+            vec!["prism", "run", "--defer-share-hashes"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?} was accepted");
+        }
     }
 
     #[test]

@@ -903,7 +903,12 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
-    for subcommand in ["migrate", "import-audits", "backfill-ctv"] {
+    for subcommand in [
+        &["migrate"][..],
+        &["migrate", "--defer-share-hashes"],
+        &["import-audits"],
+        &["backfill-ctv"],
+    ] {
         // Stop at PostgreSQL startup, before any schema or data mutation. Reaching
         // this explicit server refusal proves the real CLI selected seedless config.
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -920,7 +925,7 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
             stream.write_all(fields).await.unwrap();
         });
         let output = timeout(Duration::from_secs(5), Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"))
-            .arg(subcommand).env_clear().kill_on_drop(true)
+            .args(subcommand).env_clear().kill_on_drop(true)
             .env("PRISM_RUNTIME_WORKERS", "2")
             .env("QBIT_PRODUCTION", "1")
             .env("PRISM_DATABASE_URL", format!("postgresql://operator:test-only-password@127.0.0.1:{port}/offline?sslmode=disable"))
@@ -932,7 +937,7 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
         assert!(!output.status.success());
         assert!(
             error.contains("seedless-command-reached-postgres"),
-            "{subcommand}: {error}"
+            "{subcommand:?}: {error}"
         );
         assert!(!error.contains("test-only-password"));
         timeout(Duration::from_secs(1), server)
@@ -1029,6 +1034,32 @@ async fn retired_inventory_covers_the_final_python_runtime_name() {
     let mut sorted = retired.clone();
     sorted.sort_unstable();
     assert_eq!(retired, sorted, "retired inventory is not sorted");
+}
+
+/// `--defer-share-hashes` is a switch of `migrate` alone, never a setting:
+/// compose frontends migrate too, with PRISM_POSTGRES_INIT_SCHEMA=1, and
+/// must never defer. Clap refuses it on any other command, and refuses a
+/// value, before anything connects; `migrate --help` documents it.
+#[tokio::test]
+async fn defer_share_hashes_is_a_switch_of_migrate_alone() {
+    for args in [
+        &["run", "--defer-share-hashes"][..],
+        &["self-check", "--defer-share-hashes"],
+        &["import-audits", "--defer-share-hashes"],
+        &["migrate", "--defer-share-hashes=true"],
+    ] {
+        let output = configured_command_args(args).await;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: clap's usage exit code"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("--defer-share-hashes"), "{args:?}: {error}");
+    }
+    let help = configured_command_args(&["migrate", "--help"]).await;
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--defer-share-hashes"));
 }
 
 /// #664: `submission-hold set` and `clear` check their reason before they

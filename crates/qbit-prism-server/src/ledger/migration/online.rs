@@ -48,7 +48,11 @@
 //! transaction like any other; only the mapping of the legacy shares is
 //! left for after the commit, in batches, and that run records 2. It runs
 //! before 013, 017 and 024, so every version is still recorded after the
-//! ones below it.
+//! ones below it. `migrate --defer-share-hashes` runs the backfill's recent
+//! range in that slot instead, before 013 drops the index that serves it,
+//! and 013, 017 and 024 follow with the backfill pending. Once serving is
+//! permitted, plain `migrate` maps the rest after them, and 2 is recorded
+//! last.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
@@ -62,8 +66,13 @@ pub(crate) enum OnlineMigration {
     Partitions(super::partition::PartitionMigration),
     /// 002's share-hash backfill on a populated 2.x.x source, in batches
     /// (`share_hashes.rs`, #582). Its file is applied in the transaction;
-    /// only the backfill runs here, and it records 2.
-    ShareHashes,
+    /// only the backfill runs here, and it records 2. Whose connect
+    /// scheduled it decides whether it maps a backfill that permits serving.
+    ShareHashes(super::ShareHashBackfill),
+    /// The recent range of 002's share-hash backfill, which permits serving
+    /// with the rest pending (`migrate --defer-share-hashes`). It records
+    /// nothing in the migration history.
+    ShareHashesRecent,
 }
 
 impl OnlineMigration {
@@ -71,7 +80,7 @@ impl OnlineMigration {
         match self {
             OnlineMigration::Indexes(migration) => migration.version,
             OnlineMigration::Partitions(migration) => migration.version,
-            OnlineMigration::ShareHashes => 2,
+            OnlineMigration::ShareHashes(_) | OnlineMigration::ShareHashesRecent => 2,
         }
     }
 }
@@ -156,7 +165,12 @@ pub(crate) async fn apply_online_migration(
         OnlineMigration::Partitions(migration) => {
             super::partition::apply(&mut connection, migration, metrics).await
         }
-        OnlineMigration::ShareHashes => super::share_hashes::apply(&mut connection, metrics).await,
+        OnlineMigration::ShareHashes(backfill) => {
+            super::share_hashes::apply(&mut connection, *backfill, metrics).await
+        }
+        OnlineMigration::ShareHashesRecent => {
+            super::share_hashes::map_recent(&mut connection, metrics).await
+        }
     };
     let closed = connection.close().await;
     outcome?;

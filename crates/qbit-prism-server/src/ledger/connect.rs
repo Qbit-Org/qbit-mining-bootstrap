@@ -228,6 +228,7 @@ impl Ledger {
             initialize,
             metrics,
             Registration::Frontend,
+            ShareHashBackfill::Initialize,
         )
         .await
     }
@@ -256,14 +257,37 @@ impl Ledger {
             initialize,
             metrics,
             Registration::Tool,
+            ShareHashBackfill::Initialize,
         )
         .await
     }
 
     /// Recovery and migration must be usable during a halt without
     /// registering a frontend. Ordinary ledger mutations still enforce the
-    /// write guard.
+    /// write guard. With `initialize`, a pending share-hash backfill that
+    /// permits serving is left to [`Ledger::connect_migrate`], as every
+    /// other connect leaves it.
     pub async fn connect_operator(url: &str, initialize: bool) -> Result<Self> {
+        Self::connect_as_operator(url, initialize, ShareHashBackfill::Initialize).await
+    }
+
+    /// `qbit-prism-server migrate`: [`Ledger::connect_operator`] with
+    /// `initialize`, whose share-hash backfill on a populated 2.x.x source
+    /// is `backfill`'s ([`ShareHashBackfill::Finish`] or, with
+    /// `--defer-share-hashes`, [`ShareHashBackfill::Defer`]). The operator's
+    /// `migrate` is the one connect that finishes a backfill that permits
+    /// serving.
+    pub async fn connect_migrate(url: &str, backfill: ShareHashBackfill) -> Result<Self> {
+        Self::connect_as_operator(url, true, backfill).await
+    }
+
+    /// The operator's connect, shared by [`Ledger::connect_operator`] and
+    /// [`Ledger::connect_migrate`].
+    async fn connect_as_operator(
+        url: &str,
+        initialize: bool,
+        backfill: ShareHashBackfill,
+    ) -> Result<Self> {
         Self::connect_inner(
             url,
             "fatal-state-operator".into(),
@@ -271,6 +295,7 @@ impl Ledger {
             initialize,
             None,
             Registration::Operator,
+            backfill,
         )
         .await
     }
@@ -282,6 +307,7 @@ impl Ledger {
         initialize: bool,
         metrics: Option<std::sync::Arc<Metrics>>,
         registration: Registration,
+        backfill: ShareHashBackfill,
     ) -> Result<Self> {
         ensure!(!instance_id.is_empty(), "instance ID must not be empty");
         let timeout_setting = |name: &str, default: u64| -> Result<String> {
@@ -324,14 +350,18 @@ impl Ledger {
         if initialize {
             let mut tx = begin(&pool, metrics.as_deref()).await?;
             let online =
-                migration::migrate_schema(&mut tx, &instance_id, metrics.as_deref()).await?;
+                migration::migrate_schema(&mut tx, &instance_id, backfill, metrics.as_deref())
+                    .await?;
             tx.commit().await?;
             // 002's share-hash backfill on a populated 2.x.x source, then the
             // index rebuilds and the partition conversion, run after the
             // commit, outside the migration transaction: the backfill in
             // bounded batches, the rebuilds with CONCURRENTLY so appends
             // continue. Each is recorded once it has completed, and the gate
-            // below refuses the database until then.
+            // below refuses the database until then. Deferred, the backfill
+            // maps its recent range there instead, and the gate serves the
+            // database with 2 unrecorded once that has permitted serving;
+            // the operator's plain `migrate` maps the rest after the others.
             for pending in &online {
                 migration::apply_online_migration(&pool, pending, metrics.as_deref()).await?;
             }
