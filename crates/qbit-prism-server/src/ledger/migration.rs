@@ -30,7 +30,7 @@ pub(super) use online::{apply_online_migration, OnlineMigration};
 /// has completed. A populated 2.x.x source records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582).
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
 ];
 
 /// Schema migration numbers as they appear in messages: `2, 3, 4`, or
@@ -2228,6 +2228,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         25,
         include_str!("../../migrations/025_carry_forward_integrity_by_program.sql"),
     ),
+    (
+        26,
+        include_str!("../../migrations/026_carry_forward_integrity_report_once.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3335,6 +3339,22 @@ pub(super) async fn migrate_schema(
             .await?;
         if !versions.contains(&25) {
             sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(25)")
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    // #737: the integrity report computes each of its two sets once. A
+    // report replacement changes no stored row, so an earlier frontend may
+    // keep running beside it. 001 defines the report 026 replaces, so 026
+    // runs again whenever 001 just ran, as 025 does after 011. 001 runs only
+    // without 3, and a recorded history without 3 is refused above, so for
+    // now that is a fresh or 2.x.x source, where 26 is missing anyway.
+    if !versions.contains(&26) || !versions.contains(&3) {
+        sqlx::raw_sql(native_migration(26))
+            .execute(&mut **tx)
+            .await?;
+        if !versions.contains(&26) {
+            sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(26)")
                 .execute(&mut **tx)
                 .await?;
         }
