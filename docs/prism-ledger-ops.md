@@ -1252,6 +1252,24 @@ and carry values against replay. The legacy operator report added
 calculate it. The recovery export below reproduces that exact head. Preserve it
 with independent release/recovery records.
 
+At production size the report takes about a minute, longer than the 15 s
+`PRISM_DATABASE_STATEMENT_TIMEOUT_MS` gives every ledger statement by default.
+`self-check` runs it in a read-only transaction under a statement timeout of its
+own, 300 s, and `fatal-state clear` under the time its bound leaves it
+([fatal-state recovery](#recovery-commands)), so neither needs that setting
+raised (#737). The `/audit/carry-forward-integrity` and `/audit/ledger-integrity`
+routes still run it under the setting.
+
+The report holds one snapshot for its whole run, about a minute at production
+size today. On a primary serving miners every share updates the cluster row, so
+at high share rates that snapshot piles up dead versions of the row and slows
+the share append (#738); below about 200 shares/s it's harmless. At higher
+rates, run the report on a hot standby with `hot_standby_feedback` off and its
+replay paused instead, as the admission gate's
+`PRISM_INTEGRITY_REPORT_DATABASE_URL` does (#740; see
+[drain and migrate](prism-rust-migration.md#drain-and-migrate)), or run
+`self-check` while the share rate is low.
+
 A landing writes the block's payout and carry rows from the immutable payout
 manifest of the audit its coinbase commits to, whatever the canonical balances
 are when it lands, and since migration 011 marks the block with that audit's
@@ -3323,7 +3341,7 @@ accounting, and claims that expired during the halt still require fresh claims.
 ```sh
 qbit-prism-server migrate
 qbit-prism-server fatal-state show
-qbit-prism-server fatal-state clear --reason "<nonblank explanation>"
+qbit-prism-server fatal-state clear --reason "<nonblank explanation>" [--timeout-seconds <10 to 3600>]
 ```
 
 Apply migration 010 with `migrate` before recovery. It adds the
@@ -3348,18 +3366,54 @@ the settlement, ordering, and instance locks it refuses unless:
 - every stored `qbit_prism_instances` row has `status.state` `stopped` or
   `drained`;
 - no live legacy writer lease exists;
-- the current chain is stable and still contains every mature pool block and
-  every deep confirmed fanout checkpoint; and
+- the node's chain still contains every mature pool block and every deep
+  confirmed fanout checkpoint, and still holds the tip the command captured
+  (below); and
 - normal block reconciliation leaves no unresolved disconnection and the
   carry-forward integrity report passes.
+
+Every check is made against the tip the command captures from the node when it
+starts. The chain may grow during the run, which takes about a minute at
+production size: blocks on top of the captured tip leave every block at or
+below its height as it was, so every observation stands, and the command goes
+on and records the new tip (#737). It accepts a moved tip only when the node's
+new best block leads back, header by header, to the captured tip at the
+captured height. When the tip has already moved by the time the block and
+fanout checks end, the command first repeats each of their node queries, since
+a chain that went over to a fork during them and came back onto a longer chain
+would leave answers read on the fork. It refuses, clearing nothing:
+
+- when the chain reorganized during the run: an answer asked again differs, or
+  the new best block descends from another block at the captured height, is
+  not above that height, or is unknown to the node;
+- when the tip moved while a pool block row lies above the captured height,
+  since a new block could be that one; and
+- when the tip moved more than 1,000 blocks.
+
+Each of these refusals ends with `retry fatal-state clear`.
+
+Once its database connection is open, the recovery, its node calls and the
+integrity report included, must finish within `--timeout-seconds` (120 by
+default, 10 to 3600). The integrity report runs under a statement timeout of its
+own, the time left in that bound less what is kept for the closing tip check and
+the commit, 5 s plus one node RPC timeout (`PRISM_RPC_TIMEOUT_SECONDS`, 15 s by
+default), whatever `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` gives the other
+statements, so that setting needs no override. With less than 6 s plus one RPC
+timeout of the bound left when the report would start (21 s by default), the
+command refuses with `raise --timeout-seconds`. A report that runs out of time
+is cancelled by PostgreSQL before the bound ends, so no statement and no lock
+outlives the failed command.
 
 The clear and its audit `INSERT` commit in one transaction. Failures before
 commit roll both back and leave the cluster halted; a lost response during
 commit requires checking the durable state before retrying. The event records `fatal_error`,
 `fatal_error_set_at`, `reason`, `operator_identity` (PostgreSQL `session_user`),
 `database_role` (`current_user`), `cleared_at`, the `instances` snapshot, and
-`reconciliation` (`genesis_hash`, `tip_hash`, `tip_height`, `blocks_checked`,
-`deep_fanouts_checked`, and `integrity`).
+`reconciliation`: `genesis_hash`; `tip_hash` and `tip_height`, the captured
+tip; `final_tip_hash`, the node's best block at the check just before the
+commit, which descends from the captured tip (its headers lead back to it), and
+`tip_extended`, whether that differs from the captured tip; `blocks_checked`,
+`deep_fanouts_checked`, and `integrity`.
 
 The event identifies a database login, not a person. Prefer an individual
 PostgreSQL login for `clear`. When a shared login is unavoidable, put the
@@ -3508,9 +3562,18 @@ LIMIT 5;
 ```
 
 A validation or reconciliation failure clears nothing and writes no event. Correct the reported blocker
-and rerun deliberately; do not loop. If the connection drops around commit, the
-outcome is unknown: check `fatal-state show` and the event table before
-rerunning.
+and rerun deliberately; do not loop. Three refusals report a chain that moved
+during the run rather than a blocker, and only ask for a rerun: `the chain
+reorganized during fatal-state recovery`, `the tip moved and a pool block lies
+above the captured height`, and `the node's tip moved <n> blocks during
+fatal-state recovery`. Rerun once the node's tip has settled; if a
+reorganization recurs, investigate the chain first (step 3). A tip that only grew
+during the run does not refuse. When the integrity report did not finish in the
+time the bound left it, the command says to raise `--timeout-seconds`: rerun
+with a larger bound. When the command exceeded its bound (`fatal-state recovery
+exceeded <n> seconds`), or the connection drops around commit, the outcome is
+unknown: check `fatal-state show` and the event table before rerunning, with a
+larger `--timeout-seconds` if it ran out of time.
 
 ### 5. Restart and verify
 

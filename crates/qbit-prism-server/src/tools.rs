@@ -217,6 +217,9 @@ enum FatalStateCommand {
     Clear {
         #[arg(long)]
         reason: String,
+        /// Seconds the whole clear may take, its node calls and integrity report included (10 to 3600).
+        #[arg(long, default_value_t = crate::ledger::FATAL_STATE_CLEAR_BOUND.as_secs(), value_parser = clap::value_parser!(u64).range(10..=3600))]
+        timeout_seconds: u64,
     },
 }
 
@@ -556,12 +559,17 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             );
             Ok(())
         }
-        FatalStateCommand::Clear { reason } => {
+        FatalStateCommand::Clear {
+            reason,
+            timeout_seconds,
+        } => {
             crate::ledger::require_operator_reason(&reason)?;
             let config = Config::from_env()?;
             let ledger =
                 crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
-            let result = ledger.clear_fatal_state(&config, &reason).await;
+            let result = ledger
+                .clear_fatal_state_within(&config, &reason, Duration::from_secs(timeout_seconds))
+                .await;
             ledger.pool.close().await;
             println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
@@ -1853,6 +1861,12 @@ async fn sample_audit_completeness(database_url: &str) -> Result<AuditCompletene
     }
 }
 
+/// The statement timeout `self-check` gives the carry-forward integrity report
+/// (#737), whatever PRISM_DATABASE_STATEMENT_TIMEOUT_MS gives its other
+/// statements: about five times the minute the report takes at production
+/// size. It holds no lock but its snapshot.
+const SELF_CHECK_REPORT_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Result<()> {
     // A diagnostic is not a frontend: it registers no heartbeat, so its exit
     // leaves nothing for fatal-state recovery to refuse and a live frontend
@@ -1863,9 +1877,15 @@ async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Resul
     )
     .await?;
     coordinator.refresh_once().await?;
-    let mut integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
-        .fetch_one(&coordinator.ledger.pool)
+    // #737: the report runs in a read-only transaction of its own, so its
+    // statement timeout is its own too and ends with it.
+    let mut tx = coordinator.ledger.pool.begin().await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
         .await?;
+    let mut integrity =
+        crate::ledger::integrity_report_bounded(&mut tx, SELF_CHECK_REPORT_TIMEOUT).await?;
+    tx.rollback().await?;
     // #478: the divergence line is reported, never a failure: its debt is an
     // accepted, bounded cost that exact accounting carries.
     integrity["payout_divergence"] =

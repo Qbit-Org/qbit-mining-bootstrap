@@ -328,7 +328,7 @@
     "tools.rs::run#1::audit_completeness(& ledger . pool)": [1,"operator"],
     "tools.rs::run#1::run(args)": [1,"non-database"],
     "tools.rs::sample_audit_completeness#1::audit_completeness(& mut connection)": [1,"operator"],
-    "tools.rs::self_check_local#1::fetch_one(& coordinator . ledger . pool)": [1,"operator"],
+    "tools.rs::self_check_local#1::coordinator . ledger . pool .begin()": [1,"operator"],
     "tools.rs::self_check_local#1::payout_divergence_line(& coordinator . ledger . pool)": [1,"operator"],
     "tools.rs::self_check_local#1::fetch_all(& coordinator . ledger . pool)": [1,"operator"],
     "tools.rs::self_check_local#1::fetch_optional(& coordinator . ledger . pool)": [1,"operator"]

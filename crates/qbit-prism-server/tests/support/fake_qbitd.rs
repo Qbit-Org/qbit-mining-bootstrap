@@ -234,6 +234,11 @@ async fn answer(
             state.accepted.insert(height, hash);
             Value::Null
         }
+        // The tip's header carries its height too, so a walk down a chain's
+        // headers from the tip (`fatal-state clear`, #737) knows where it is.
+        "getblockheader" if request["params"][0] == json!(state.tip) => json!({
+            "hash": state.tip, "height": state.height, "previousblockhash": state.tip_parent
+        }),
         "getblockheader" => json!({"previousblockhash": state.tip_parent}),
         "validateaddress" => {
             json!({"isvalid":true,"scriptPubKey":format!("5220{}","11".repeat(32))})

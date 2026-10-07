@@ -1,8 +1,29 @@
 //! Explicit operator recovery. The ordinary write guard never ignores a halt.
 use super::*;
-use crate::{config::Config, rpc::Rpc};
+use crate::{
+    config::Config,
+    rpc::{Rpc, RpcReplyError},
+};
 use serde_json::json;
 use std::time::Duration;
+
+/// `fatal-state clear`'s bound when the operator gives no `--timeout-seconds`.
+pub const FATAL_STATE_CLEAR_BOUND: Duration = Duration::from_secs(120);
+
+/// What the bound keeps back from the integrity report for the UPDATE, the
+/// event INSERT and the COMMIT. One node RPC timeout is kept on top, for the
+/// closing tip check's node calls, so that one slow call cannot push the
+/// deadline into the COMMIT, whose outcome would then be unknown.
+const COMMIT_HEADROOM: Duration = Duration::from_secs(5);
+
+/// The least time the integrity report is started with. With less of the
+/// bound left, the clear refuses instead of starting a report it must cancel.
+const MIN_REPORT_TIME: Duration = Duration::from_secs(1);
+
+/// How far above the captured height a new tip may stand for the clear to
+/// walk its ancestry back to the captured tip. A clear's bound lets the chain
+/// grow by a few dozen blocks at most; a node this far ahead was not caught up.
+const MAX_TIP_EXTENSION: u64 = 1_000;
 
 /// The rule every operator's `--reason` follows before it is journaled or
 /// written to a row: `fatal-state clear`, `candidates abandon` and
@@ -63,20 +84,39 @@ impl Ledger {
         Ok(state)
     }
 
+    /// [`Ledger::clear_fatal_state_within`] under the default 120 s bound.
     pub async fn clear_fatal_state(&self, config: &Config, reason: &str) -> Result<Value> {
+        self.clear_fatal_state_within(config, reason, FATAL_STATE_CLEAR_BOUND)
+            .await
+    }
+
+    /// Reconcile a stopped or drained cluster and durably record why it was
+    /// cleared, all within `bound` (`fatal-state clear --timeout-seconds`,
+    /// #737). The integrity report's own statement ends by the same deadline.
+    pub async fn clear_fatal_state_within(
+        &self,
+        config: &Config,
+        reason: &str,
+        bound: Duration,
+    ) -> Result<Value> {
         require_operator_reason(reason)?;
         // Bound the whole operation, including cumulative RPC time while locks
         // are held. Cancellation before COMMIT rolls back. Once COMMIT has
         // been sent, a lost response must be resolved from the durable event.
-        tokio::time::timeout(
-            Duration::from_secs(120),
-            self.clear_fatal_state_in(config, reason),
-        )
-        .await
-        .context("fatal-state recovery exceeded 120 seconds; inspect fatal-state show and recovery events before retrying")?
+        let deadline = tokio::time::Instant::now()
+            .checked_add(bound)
+            .context("fatal-state recovery bound is out of range")?;
+        tokio::time::timeout_at(deadline, self.clear_fatal_state_in(config, reason, deadline))
+            .await
+            .with_context(|| format!("fatal-state recovery exceeded {} seconds; inspect fatal-state show and recovery events before retrying", bound.as_secs()))?
     }
 
-    async fn clear_fatal_state_in(&self, config: &Config, reason: &str) -> Result<Value> {
+    async fn clear_fatal_state_in(
+        &self,
+        config: &Config,
+        reason: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value> {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         let _order = self
@@ -203,7 +243,14 @@ impl Ledger {
         // ordinary observer's incremental cache is deliberately not involved.
         let blocks = sqlx::query("SELECT block_hash,block_height,maturity_state FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND maturity_state IN ('immature','mature') ORDER BY block_height,block_hash")
             .fetch_all(&mut *tx).await?;
+        // The loop below calls every pool block above the captured height
+        // inactive without asking the node, which only the captured tip
+        // keeps true (see `tip_unchanged_or_extended`). Any maturity counts.
+        let pool_block_above: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_height>$1 AND chain_state IN ('prepared','confirmed','inactive'))")
+            .bind(i64::try_from(height)?)
+            .fetch_one(&mut *tx).await?;
         let mut observations = Vec::with_capacity(blocks.len());
+        let mut observed_heights = Vec::with_capacity(blocks.len());
         for block in &blocks {
             let hash: String = block.try_get("block_hash")?;
             let block_height = u64::try_from(block.try_get::<i64, _>("block_height")?)?;
@@ -214,6 +261,7 @@ impl Ledger {
             );
             let active = block_height <= height
                 && rpc.call("getblockhash", json!([block_height])).await? == json!(hash);
+            observed_heights.push(block_height);
             observations.push(BlockObservation {
                 block_hash: hash,
                 active,
@@ -221,6 +269,7 @@ impl Ledger {
         }
         let fanouts = sqlx::query("SELECT fanout_txid,confirmed_block_hash,confirmed_block_height FROM qbit_ctv_fanout_artifacts WHERE settlement_status='confirmed' AND confirmed_depth>=1000 ORDER BY fanout_txid")
             .fetch_all(&mut *tx).await?;
+        let mut deep_fanouts = Vec::with_capacity(fanouts.len());
         for fanout in &fanouts {
             let txid: String = fanout.try_get("fanout_txid")?;
             let hash: String = fanout
@@ -237,11 +286,18 @@ impl Ledger {
             );
             ensure!(rpc.call("getblockhash", json!([at])).await? == json!(hash),
                 "deep confirmed CTV fanout remains disconnected: {txid} at height {at}; reconcile before clearing");
+            deep_fanouts.push((txid, hash, at));
         }
-        ensure!(
-            rpc.call("getbestblockhash", json!([])).await? == json!(tip),
-            "tip changed during fatal-state reconciliation"
-        );
+        // #737: the first tip check. Once the tip has moved, every observation
+        // is asked again before the new tip is accepted, so a chain that went
+        // over to a fork during the loop and came back onto a longer chain
+        // leaves no stale one behind (see `tip_unchanged_or_extended`).
+        let observed = Observed {
+            heights: &observed_heights,
+            blocks: &observations,
+            fanouts: &deep_fanouts,
+        };
+        tip_unchanged_or_extended(&rpc, tip, height, pool_block_above, Some(observed)).await?;
         // Reuse precisely the normal accounting transitions in this same
         // transaction. A recurring fatal result is rolled back with the rest.
         let (reconcile_error, _) = self
@@ -250,20 +306,38 @@ impl Ledger {
         if let Some(error) = reconcile_error {
             bail!("reconciliation refused recovery: {error}");
         }
-        let integrity: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
-            .fetch_one(&mut *tx)
-            .await?;
+        // #737: the report runs under a statement timeout of its own, the
+        // bound's time left less the commit's headroom, whatever the
+        // session's: it neither fails at the operator connection's 15 s nor
+        // runs on in the server after this call has given up.
+        let headroom = COMMIT_HEADROOM.saturating_add(config.rpc_timeout);
+        let report_time = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .and_then(|left| left.checked_sub(headroom))
+            .filter(|time| *time >= MIN_REPORT_TIME)
+            .context("fatal-state recovery has less than a second of its bound left for the carry-forward integrity report; raise --timeout-seconds and retry")?;
+        let integrity = integrity_report_bounded(&mut tx, report_time)
+            .await
+            .map_err(|error| {
+                if statement_timed_out(&error) {
+                    error.context(format!("the carry-forward integrity report did not finish in the {:.1} s the fatal-state recovery bound left it; raise --timeout-seconds and retry", report_time.as_secs_f64()))
+                } else {
+                    error
+                }
+            })?;
         for field in ["mismatch_count", "current_drift_count"] {
             ensure!(
                 integrity[field].as_u64() == Some(0),
                 "fatal-state reconciliation failed {field}: {integrity}"
             );
         }
-        ensure!(
-            rpc.call("getbestblockhash", json!([])).await? == json!(tip),
-            "tip changed before fatal-state recovery commit"
-        );
+        // The check the recovery rests on: the chain still holds the captured
+        // tip as the commit begins. Nothing was observed since the first
+        // check, so a chain that flapped meanwhile left no stale observation.
+        let final_tip =
+            tip_unchanged_or_extended(&rpc, tip, height, pool_block_above, None).await?;
         let reconciliation = json!({"genesis_hash":genesis,"tip_hash":tip,"tip_height":height,
+            "final_tip_hash":final_tip.as_deref().unwrap_or(tip),"tip_extended":final_tip.is_some(),
             "blocks_checked":blocks.len(),"deep_fanouts_checked":fanouts.len(),"integrity":integrity});
         // Even a recovery with no changed payout rows invalidates old jobs and
         // chain observations collected before the operator's decision.
@@ -277,6 +351,214 @@ impl Ledger {
         tx.commit().await.context("fatal-state recovery commit failed; outcome may be unknown; inspect fatal-state show and recovery events before retrying")?;
         Ok(event)
     }
+}
+
+/// #737: whether the chain the clear observed is still the node's. The tip it
+/// captured, `tip` at `height`, is either still the best block (`None`), or
+/// the best block descends from it, the chain having only grown on top of
+/// it, and the best block is returned.
+///
+/// Why an extension needs no second look at the database: a block commits to
+/// its whole ancestry, so a best block whose headers lead back to `tip` at
+/// `height` stands on the very blocks at or below `height` that the capture
+/// saw. Every pool-block and deep-fanout observation the clear asked the node
+/// for is at or below `height`, so, as long as the node answered it from a
+/// chain through `tip` (below), it holds on the new chain, and so does the
+/// reconciliation built on them. Maturity was computed at the captured
+/// height, below the new tip, so it can only mature a block late, which the
+/// next frontend reconcile makes good, never early. The one observation the
+/// node was not asked for is "inactive" for a pool block above `height`, and
+/// the new blocks could hold one, so a moved tip refuses whenever such a row
+/// exists (`pool_block_above`).
+///
+/// The ancestry is walked by headers from the best block itself, not read
+/// from the active chain afterwards, so the block returned, which the event
+/// records, is one that descends from `tip`. A best block at or below
+/// `height`, a walk that reaches another block at `height` and a block the
+/// node does not know (RPC_INVALID_ADDRESS_OR_KEY, -5) refuse as a
+/// reorganization, and a best block more than `MAX_TIP_EXTENSION` blocks up
+/// refuses too. Any other failure to read a header propagates.
+///
+/// The chain can go over to a fork while the loop asks the node, though, and
+/// come back by the first check onto a longer chain through `tip`: the walk
+/// passes, and what the loop read on the fork is stale. So the first check,
+/// given the loop's observations as `observed`, asks the node for each of them
+/// again once the tip has moved, before the walk, and an answer that differs
+/// refuses as a reorganization. The check before the commit is given none:
+/// nothing is observed after the first check, so a flap after it leaves no
+/// stale observation, and its walk proves the chain holds `tip` as the commit
+/// begins. Two flaps still pass. The chain can leave `tip` during the loop
+/// and be back on exactly `tip` by the first check, which then finds the tip
+/// unchanged and asks nothing again, as the exact-tip check before #737 did;
+/// `tip` has less work than the fork, so it is the best block again only once
+/// the fork is invalidated. And the chain can flap again during the re-read
+/// itself, back onto the fork the loop saw, so that the re-read repeats the
+/// loop's stale answers.
+async fn tip_unchanged_or_extended(
+    rpc: &Rpc,
+    tip: &str,
+    height: u64,
+    pool_block_above: bool,
+    observed: Option<Observed<'_>>,
+) -> Result<Option<String>> {
+    let best = rpc.call("getbestblockhash", json!([])).await?;
+    let best = best.as_str().context("qbit best block hash missing")?;
+    if best == tip {
+        return Ok(None);
+    }
+    ensure!(
+        !pool_block_above,
+        "the tip moved and a pool block lies above the captured height {height}; retry fatal-state clear"
+    );
+    if let Some(observed) = observed {
+        observed.still_hold(rpc).await?;
+    }
+    let header = block_header(rpc, best).await?;
+    let best_height = header["height"]
+        .as_u64()
+        .context("qbit block header has no height")?;
+    ensure!(
+        best_height > height,
+        "the chain reorganized during fatal-state recovery: the node's tip {best} is at height {best_height}, not above the captured height {height}; retry fatal-state clear"
+    );
+    let moved = best_height - height;
+    ensure!(
+        moved <= MAX_TIP_EXTENSION,
+        "the node's tip moved {moved} blocks during fatal-state recovery; retry fatal-state clear"
+    );
+    let mut at_height = previous_block(&header)?;
+    for _ in 1..moved {
+        at_height = previous_block(&block_header(rpc, &at_height).await?)?;
+    }
+    ensure!(
+        at_height == tip,
+        "the chain reorganized during fatal-state recovery: the node's tip {best} descends from {at_height} at the captured height {height}, not from the captured tip {tip}; retry fatal-state clear"
+    );
+    tracing::info!(
+        captured_tip = tip,
+        captured_height = height,
+        best_block = best,
+        best_height,
+        "the tip grew on top of the captured tip during fatal-state recovery; every observation stands"
+    );
+    Ok(Some(best.to_owned()))
+}
+
+/// What the clear's observation loop asked the node, for the first tip check
+/// to ask again once the tip has moved (#737).
+struct Observed<'a> {
+    /// The height of each of `blocks`, in the same order.
+    heights: &'a [u64],
+    blocks: &'a [BlockObservation],
+    /// Each deep confirmed fanout's txid, confirming block and its height.
+    fanouts: &'a [(String, String, u64)],
+}
+
+impl Observed<'_> {
+    /// Ask the node for every observation again. An answer that differs
+    /// means the chain moved under the loop, and refuses as a reorganization.
+    async fn still_hold(&self, rpc: &Rpc) -> Result<()> {
+        let state = |active| if active { "active" } else { "inactive" };
+        for (block, at) in self.blocks.iter().zip(self.heights) {
+            let active = block_at(rpc, *at).await?.as_deref() == Some(block.block_hash.as_str());
+            ensure!(
+                active == block.active,
+                "the chain reorganized during fatal-state recovery: pool block {} at height {at} was {} when observed and is {} now; retry fatal-state clear",
+                block.block_hash,
+                state(block.active),
+                state(active)
+            );
+        }
+        for (txid, hash, at) in self.fanouts {
+            ensure!(
+                block_at(rpc, *at).await?.as_deref() == Some(hash.as_str()),
+                "the chain reorganized during fatal-state recovery: deep confirmed CTV fanout {txid} at height {at} is no longer connected; retry fatal-state clear"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The active chain's block at `height`, or `None` beyond its tip
+/// (RPC_INVALID_PARAMETER, -8).
+async fn block_at(rpc: &Rpc, height: u64) -> Result<Option<String>> {
+    match rpc.call("getblockhash", json!([height])).await {
+        Ok(hash) => Ok(Some(
+            hash.as_str().context("qbit block hash missing")?.to_owned(),
+        )),
+        Err(error) if reply_code(&error) == Some(-8) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// A block's header. A block the node does not know
+/// (RPC_INVALID_ADDRESS_OR_KEY, -5) refuses as a reorganization.
+async fn block_header(rpc: &Rpc, hash: &str) -> Result<Value> {
+    match rpc.call("getblockheader", json!([hash])).await {
+        Err(error) if reply_code(&error) == Some(-5) => bail!(
+            "the chain reorganized during fatal-state recovery: the node does not know block {hash}; retry fatal-state clear"
+        ),
+        header => header,
+    }
+}
+
+/// The block a header names as its parent.
+fn previous_block(header: &Value) -> Result<String> {
+    Ok(header["previousblockhash"]
+        .as_str()
+        .context("qbit block header has no previousblockhash")?
+        .to_owned())
+}
+
+/// The node's JSON-RPC error code, when the node answered with an error.
+fn reply_code(error: &anyhow::Error) -> Option<i64> {
+    error
+        .downcast_ref::<RpcReplyError>()
+        .and_then(RpcReplyError::code)
+}
+
+/// `qbit_carry_forward_integrity_report()` in `tx`, under a statement timeout
+/// of its own, `timeout`, whatever the session's (#737). At production size
+/// the report takes about a minute, against the 15 s every ledger session
+/// runs with: `fatal-state clear` gives it the time left in its bound, and
+/// `self-check` a fixed allowance. The timeout is set for the transaction
+/// only, and the session's value is put back for the statements after the
+/// report; `RESET` would leave them the server's default instead. A failed
+/// report leaves the transaction aborted, and its rollback restores the value.
+pub async fn integrity_report_bounded(
+    tx: &mut Transaction<'_, Postgres>,
+    timeout: Duration,
+) -> Result<Value> {
+    // A statement_timeout of 0 disables it, so a bound never rounds down to 0.
+    let millis = timeout.as_millis().clamp(1, i32::MAX as u128).to_string();
+    // One round trip: the select list is evaluated in order, so the value
+    // read is the session's, from before the set.
+    let (saved, _): (String, String) = sqlx::query_as(
+        "SELECT current_setting('statement_timeout'),set_config('statement_timeout',$1,true)",
+    )
+    .bind(millis)
+    .fetch_one(&mut **tx)
+    .await?;
+    let report = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
+        .fetch_one(&mut **tx)
+        .await?;
+    sqlx::query("SELECT set_config('statement_timeout',$1,true)")
+        .bind(saved)
+        .execute(&mut **tx)
+        .await?;
+    Ok(report)
+}
+
+/// Whether a statement was cancelled by its statement timeout. An operator's
+/// cancel request carries the same SQLSTATE and another message.
+fn statement_timed_out(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .is_some_and(|error| {
+            error.code().as_deref() == Some("57014")
+                && error.message().contains("statement timeout")
+        })
 }
 
 fn fatal_subject(message: Option<&str>) -> (Option<String>, Option<String>) {
