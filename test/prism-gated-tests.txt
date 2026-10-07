@@ -354,6 +354,7 @@ qbit-prism-server::ledger_postgres::fatal_state::clear_accepts_a_tip_extended_du
 qbit-prism-server::ledger_postgres::fatal_state::clear_and_self_check_run_the_report_under_their_own_timeout
 qbit-prism-server::ledger_postgres::fatal_state::clear_preserves_halt_on_integrity_failure_and_audit_insert_failure
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_a_chain_that_flapped_to_a_fork_during_its_observations
+qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_a_closing_tip_walk_that_would_run_into_the_commit
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_a_reorg_during_the_run
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_an_extension_with_a_pool_block_above_the_captured_height
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_live_starting_stale_and_unknown_instances

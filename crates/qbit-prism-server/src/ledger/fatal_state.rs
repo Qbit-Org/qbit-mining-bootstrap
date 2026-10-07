@@ -10,10 +10,12 @@ use std::time::Duration;
 /// `fatal-state clear`'s bound when the operator gives no `--timeout-seconds`.
 pub const FATAL_STATE_CLEAR_BOUND: Duration = Duration::from_secs(120);
 
-/// What the bound keeps back from the integrity report for the UPDATE, the
-/// event INSERT and the COMMIT. One node RPC timeout is kept on top, for the
-/// closing tip check's node calls, so that one slow call cannot push the
-/// deadline into the COMMIT, whose outcome would then be unknown.
+/// What the bound keeps back for the UPDATE, the event INSERT and the COMMIT.
+/// The closing tip check must end this long before the deadline, or the clear
+/// refuses with nothing committed, however many headers a moved tip makes it
+/// walk: the deadline can then never fall in the COMMIT, whose outcome would
+/// be unknown. The integrity report leaves one node RPC timeout on top, for
+/// the closing check's usual one or two node calls.
 const COMMIT_HEADROOM: Duration = Duration::from_secs(5);
 
 /// The least time the integrity report is started with. With less of the
@@ -334,8 +336,23 @@ impl Ledger {
         // The check the recovery rests on: the chain still holds the captured
         // tip as the commit begins. Nothing was observed since the first
         // check, so a chain that flapped meanwhile left no stale observation.
-        let final_tip =
-            tip_unchanged_or_extended(&rpc, tip, height, pool_block_above, None).await?;
+        // It ends by the commit's headroom before the deadline, whatever the
+        // node: a long walk on a slow node refuses here, with nothing
+        // committed, rather than run the deadline into the COMMIT.
+        let commit_by = deadline
+            .checked_sub(COMMIT_HEADROOM)
+            .context("fatal-state recovery bound is out of range")?;
+        let final_tip = tokio::time::timeout_at(
+            commit_by,
+            tip_unchanged_or_extended(&rpc, tip, height, pool_block_above, None),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the closing tip check did not finish {} s before the fatal-state recovery bound; nothing was committed; retry fatal-state clear, or raise --timeout-seconds",
+                COMMIT_HEADROOM.as_secs()
+            )
+        })??;
         let reconciliation = json!({"genesis_hash":genesis,"tip_hash":tip,"tip_height":height,
             "final_tip_hash":final_tip.as_deref().unwrap_or(tip),"tip_extended":final_tip.is_some(),
             "blocks_checked":blocks.len(),"deep_fanouts_checked":fanouts.len(),"integrity":integrity});

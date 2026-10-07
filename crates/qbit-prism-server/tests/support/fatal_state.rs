@@ -731,6 +731,10 @@ enum TipMove {
     /// fork while the clear's loop read it; by that check it is back, two
     /// blocks on top of the captured tip, as `Extend`.
     Flap,
+    /// A tip `CRAWL_BLOCKS` above the captured height, each of whose headers
+    /// the node answers after `CRAWL_DELAY`, well within the RPC timeout, so
+    /// walking it back to the captured tip takes about 25 s.
+    Crawl,
 }
 
 /// The best block `getbestblockhash` answers once the chain has moved.
@@ -746,6 +750,16 @@ fn fork_block() -> String {
 /// The lower of the two blocks `Extend` grows the chain by.
 fn extension_block() -> String {
     "9a".repeat(32)
+}
+
+/// How far above the captured height `Crawl` puts the tip, and how long the
+/// node takes over each header.
+const CRAWL_BLOCKS: u64 = 500;
+const CRAWL_DELAY: Duration = Duration::from_millis(50);
+
+/// `Crawl`'s block at `at`, above the captured height: its hash names it.
+fn crawl_block(at: u64) -> String {
+    format!("c7{at:062x}")
 }
 
 struct ProxyState {
@@ -793,6 +807,11 @@ impl ProxyState {
                     TipMove::Shorten => header(moved_tip(), height - 1, &"97".repeat(32)),
                     TipMove::Runaway => header(moved_tip(), height + 1_001, &"96".repeat(32)),
                     TipMove::Unknown => Err(json!({"code":-5,"message":"Block not found"})),
+                    TipMove::Crawl => header(
+                        moved_tip(),
+                        height + CRAWL_BLOCKS,
+                        &crawl_block(height + CRAWL_BLOCKS - 1),
+                    ),
                     _ => header(moved_tip(), height + 2, &extension_block()),
                 })
             }
@@ -800,6 +819,16 @@ impl ProxyState {
                 if moved && params[0] == json!(extension_block()) =>
             {
                 Some(header(extension_block(), height + 1, &tip))
+            }
+            (TipMove::Crawl, "getblockheader") if moved => {
+                let hash = params[0].as_str()?;
+                let at = u64::from_str_radix(hash.strip_prefix("c7")?, 16).ok()?;
+                let parent = if at - 1 == height {
+                    tip
+                } else {
+                    crawl_block(at - 1)
+                };
+                Some(header(hash.to_owned(), at, &parent))
             }
             (TipMove::Flap, "getblockhash") if !moved && at.is_some_and(|at| at <= height) => {
                 Some(Ok(json!(fork_block())))
@@ -862,6 +891,9 @@ impl RpcProxy {
                         if state.pause && method == "getblockchaininfo" {
                             state.entered.notify_one();
                             state.release.notified().await;
+                        }
+                        if state.tip_move == TipMove::Crawl && method == "getblockheader" {
+                            tokio::time::sleep(CRAWL_DELAY).await;
                         }
                         if let Some(answer) = state.moved_answer(method, &request["params"]) {
                             let (result, error) = match answer {
@@ -1339,6 +1371,46 @@ async fn clear_and_self_check_run_the_report_under_their_own_timeout() -> Result
         "{event}"
     );
     assert_eq!(ledger.fatal_state().await?["halted"], false);
+    db.close(vec![ledger]).await
+}
+
+/// #737: the closing tip check ends by the commit's headroom before the
+/// bound, whatever the node. A tip far above the captured one, on a node that
+/// answers each of its headers slowly but well within the RPC timeout, would
+/// walk into the 5 s the UPDATE, the INSERT and the COMMIT keep, so the clear
+/// refuses there with nothing committed, well before the bound, which can then
+/// never end inside the COMMIT. The halt stays.
+#[tokio::test]
+async fn clear_refuses_a_closing_tip_walk_that_would_run_into_the_commit() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let (ledger, node, mut config) = setup(&db).await?;
+    halt(&ledger, "test halt").await?;
+    stopped(&ledger).await?;
+    let before = ledger.fatal_state().await?;
+    // The first tip check still sees the captured tip; the closing one sees
+    // `Crawl`'s, about 25 s of headers away.
+    let crawling = RpcProxy::moving(&node, TipMove::Crawl, 1).await?;
+    config.rpc_url = crawling.url.clone();
+    config.rpc_timeout = Duration::from_secs(1);
+    let bound = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let error = ledger
+        .clear_fatal_state_within(&config, "reviewed", bound)
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("the closing tip check did not finish"),
+        "{message}"
+    );
+    // Refused at the bound less the commit's 5 s, not at the bound itself.
+    assert!(
+        started.elapsed() < bound - Duration::from_secs(3),
+        "{message}"
+    );
+    unchanged(&ledger, &before).await?;
     db.close(vec![ledger]).await
 }
 

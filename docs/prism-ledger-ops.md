@@ -3402,7 +3402,11 @@ statements, so that setting needs no override. With less than 6 s plus one RPC
 timeout of the bound left when the report would start (21 s by default), the
 command refuses with `raise --timeout-seconds`. A report that runs out of time
 is cancelled by PostgreSQL before the bound ends, so no statement and no lock
-outlives the failed command.
+outlives the failed command. The closing tip check must itself end 5 s before
+the bound, however many headers a moved tip makes it walk on a slow node;
+otherwise the command refuses with nothing committed (`the closing tip check
+did not finish 5 s before the fatal-state recovery bound`), so the bound never
+ends inside the commit.
 
 The clear and its audit `INSERT` commit in one transaction. Failures before
 commit roll both back and leave the cluster halted; a lost response during
