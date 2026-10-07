@@ -7,8 +7,9 @@ restore and `import-audits` timings, before approving a production rollout.
 See [development-line status](release-notes-3.x.x-development-line.md) and
 the release candidates' notes, [3.0.0-rc.1](release-notes-3.0.0-rc.1.md),
 [3.0.0-rc.2](release-notes-3.0.0-rc.2.md),
-[3.0.0-rc.3](release-notes-3.0.0-rc.3.md) and
-[3.0.0-rc.4](release-notes-3.0.0-rc.4.md).
+[3.0.0-rc.3](release-notes-3.0.0-rc.3.md),
+[3.0.0-rc.4](release-notes-3.0.0-rc.4.md) and
+[3.0.0-rc.5](release-notes-3.0.0-rc.5.md).
 
 ## Migration and recovery (D5)
 

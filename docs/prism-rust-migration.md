@@ -1172,9 +1172,14 @@ settlement and the broadcaster never do.
 | the cursor and `share_hash_backfill_pending = 2` | allowed without 2 recorded. Each start logs a warning naming `next_seq` and `end_seq` |
 | the fence at 1 or 2 without the cursor | refused: the cursor was dropped by hand |
 
-Every build before this release refuses `share_hash_backfill_pending = 2` at
-connect and at `migrate` (`understands share_hash_backfill_pending 1 to 1
-only`), so none serves beside the pending backfill or finishes it.
+No build before this release serves beside the pending backfill or finishes
+it. An earlier release candidate, rc.1 to rc.4, meets the cursor first at a
+start and refuses with the backfill's own message, `database is not ready:
+migration 2's share-hash backfill has not finished (#582) …`. That message's
+advice to run `migrate` holds only for this release: the earlier build's
+`migrate`, and its start with `PRISM_POSTGRES_INIT_SCHEMA=1`, refuse the fence
+before any DDL (`… understands share_hash_backfill_pending 1 to 1 only …`).
+Finish the backfill with this release, or go back to the pre-migrate backup.
 
 **Who finishes it: `backfill-share-hashes`, or plain `migrate`.** A frontend
 started with `PRISM_POSTGRES_INIT_SCHEMA=1`, a tool or an operator command
