@@ -458,6 +458,15 @@ jobs:
           python3 scripts/run_rust_test_shard.py \
             --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
             2>&1 | tee "${PRISM_TEST_LOG}"
+      # The Python shards run the import admission gate's hermetic tests. Its SQL against a
+      # schema `qbit-prism-server migrate` made needs this job's PostgreSQL and the server binary.
+      - name: Test the import admission gate's SQL against a migrated schema
+        if: matrix.shard == 3
+        run: |
+          set -euo pipefail
+          cargo build --locked -p qbit-prism-server --bin qbit-prism-server
+          PRISM_ADMISSION_GATE_SERVER_BIN="${GITHUB_WORKSPACE}/target/debug/qbit-prism-server" \
+            python3 -m unittest -v tests.test_prism_legacy_import_admission_gate.RealSchemaTests
       - name: Upload the shard gate manifest and test log
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
