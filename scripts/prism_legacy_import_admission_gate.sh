@@ -31,9 +31,12 @@
 #       waits on for apply (synchronous_commit = remote_apply): pausing it stalls every commit.
 #       The found-block offer standby (#529) waits for flush, which a pause doesn't stop. The
 #       gate refuses a URL that is not in recovery, is not a replica of this writer's database
-#       (system identifier and database name), has hot_standby_feedback on, is stale (neither
-#       caught up with the writer nor replayed within PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS,
-#       default 300), or replicates a writer that waits for apply. It records both positions.
+#       (system identifier and database name) on the writer's timeline, has hot_standby_feedback
+#       on, serves a writer that waits for apply, or is stale: its last replayed transaction is
+#       older than PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS (default 300). The live frontends'
+#       heartbeats keep the writer committing, so a following standby stays well inside that.
+#       Right after a failover a following standby can show its previous timeline until its
+#       next restartpoint; rerun then. The gate records both WAL positions.
 #   PRISM_GATE_INTEGRITY=skip  skip check 5 and say so (WARN). Record the report from wherever
 #       it ran instead.
 # These limits are the gate's own. PRISM_DATABASE_STATEMENT_TIMEOUT_MS sets the frontends'
@@ -248,32 +251,34 @@ elif [ "$integrity_mode" = skip ]; then
   fi
   skipped=" (carry-forward integrity skipped)"
 elif [ -n "$integrity_database" ]; then
-  if ! w=$(psqlq "SELECT current_setting('synchronous_commit') || '|' || current_setting('synchronous_standby_names') || '|' || pg_current_wal_lsn()::text || '|' || $identity_sql"); then
+  if ! w=$(psqlq "SELECT current_setting('synchronous_commit') || '|' || current_setting('synchronous_standby_names') || '|' || pg_current_wal_lsn()::text || '|' || $identity_sql || '|' || substring(pg_walfile_name(pg_current_wal_lsn()), 1, 8)"); then
     bad "writer position read failed$(last_error)"
   else
-    IFS='|' read -r commit_mode sync_names writer_lsn writer_system writer_db <<<"$w"
-    # caught_up: replay has reached the writer position read just before, so the standby is
-    # current even when an idle writer leaves the last replayed transaction old. The age is
+    IFS='|' read -r commit_mode sync_names writer_lsn writer_system writer_db writer_tli <<<"$w"
+    # The standby's timeline: the WAL receiver's, when this role may read it, else its last
+    # restartpoint's (which can trail a timeline switch until the next restartpoint). WAL
+    # positions on different timelines aren't comparable, so a mismatch refuses. The age is
     # clamped at 0 against clock skew between the hosts.
-    if ! r=$(q_target=integrity psqlq "SELECT pg_is_in_recovery()::text || '|' || coalesce(pg_last_wal_replay_lsn()::text, '-') || '|' || CASE WHEN pg_is_in_recovery() THEN pg_get_wal_replay_pause_state() ELSE '-' END || '|' || coalesce(greatest(0, round(extract(epoch FROM clock_timestamp() - pg_last_xact_replay_timestamp())))::text, '-') || '|' || coalesce((pg_last_wal_replay_lsn() >= :'writer_lsn'::pg_lsn)::text, 'false') || '|' || current_setting('hot_standby_feedback') || '|' || current_setting('max_standby_streaming_delay') || '|' || current_setting('max_standby_archive_delay') || '|' || $identity_sql" -v writer_lsn="$writer_lsn"); then
+    if ! r=$(q_target=integrity psqlq "SELECT pg_is_in_recovery()::text || '|' || coalesce(pg_last_wal_replay_lsn()::text, '-') || '|' || CASE WHEN pg_is_in_recovery() THEN pg_get_wal_replay_pause_state() ELSE '-' END || '|' || coalesce(greatest(0, round(extract(epoch FROM clock_timestamp() - pg_last_xact_replay_timestamp())))::text, '-') || '|' || current_setting('hot_standby_feedback') || '|' || current_setting('max_standby_streaming_delay') || '|' || current_setting('max_standby_archive_delay') || '|' || $identity_sql || '|' || lpad(upper(to_hex(coalesce((SELECT received_tli FROM pg_stat_wal_receiver), (SELECT timeline_id FROM pg_control_checkpoint())))), 8, '0')"); then
       bad "integrity standby read failed$(last_error)"
     else
-      IFS='|' read -r recovery lsn pause age caught_up feedback stream_delay archive_delay system db <<<"$r"
+      IFS='|' read -r recovery lsn pause age feedback stream_delay archive_delay system db tli <<<"$r"
       if [ "$recovery" != true ]; then
         bad "PRISM_INTEGRITY_REPORT_DATABASE_URL is not a hot standby (in recovery: $recovery); unset it to run the report on the writer"
       elif [ "$system" != "$writer_system" ] || [ "$db" != "$writer_db" ]; then
         bad "the integrity standby is not a replica of this writer's database (its system identifier or database name differs)"
+      elif [ "$tli" != "$writer_tli" ]; then
+        bad "the integrity standby is on timeline $tli but the writer is on $writer_tli: after a failover, let it follow the writer's timeline (a follower shows it from its next restartpoint), or unset the URL"
       elif [ "$commit_mode" = remote_apply ] && [ -n "$sync_names" ]; then
         bad "the writer waits for standby apply (synchronous_commit=remote_apply): pausing one of its synchronous standbys stalls every commit, so resume this standby's replay now (SELECT pg_wal_replay_resume();) and use an asynchronous standby, or skip"
       elif [ "$feedback" = on ]; then
         bad "the integrity standby has hot_standby_feedback on: its report would hold back the writer's horizon all the same (#738); turn it off there, or unset the URL"
-      elif [ "$caught_up" != true ] && ! [[ $age =~ ^[0-9]+$ ]]; then
+      elif ! [[ $age =~ ^[0-9]+$ ]]; then
         bad "the integrity standby has replayed no transaction yet; let it catch up, then pause it and rerun"
-      elif [ "$caught_up" != true ] && (( age > max_age )); then
-        bad "the integrity standby's last replayed transaction is ${age}s old (limit ${max_age}s) and it is behind the writer: resume its replay until it catches up, then pause it and rerun"
+      elif (( age > max_age )); then
+        bad "the integrity standby's last replayed transaction is ${age}s old (limit ${max_age}s): resume its replay until it catches up, then pause it and rerun"
       else
-        if [[ $age =~ ^[0-9]+$ ]]; then age="${age}s ago"; else age=none; fi
-        info "integrity report on a standby: replayed to $lsn (writer at $writer_lsn), replay state '$pause', last replayed transaction $age"
+        info "integrity report on a standby: replayed to $lsn on timeline $tli (writer at $writer_lsn), replay state '$pause', last replayed transaction ${age}s ago"
         if [ "$pause" != paused ] && ! { [ "$stream_delay" = -1 ] && [ "$archive_delay" = -1 ]; }; then
           warn "the integrity standby's replay state is '$pause', not 'paused': a recovery conflict can cancel the report; pause it (SELECT pg_wal_replay_pause(); until pg_get_wal_replay_pause_state() is 'paused') or set max_standby_streaming_delay and max_standby_archive_delay to -1 there"
         fi

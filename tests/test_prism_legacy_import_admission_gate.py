@@ -82,8 +82,9 @@ FAKE_PSQL = textwrap.dedent("""\
          "fsync=on full_page_writes=on synchronous_commit=on"),
         ("pg_stat_replication", "FAKE_STANDBY", "true|1|1"),
         ("FROM qbit_share_ledger", "FAKE_RECENT_MINER", "qb1zrecentminer"),
-        ("pg_is_in_recovery", "FAKE_RECOVERY", "true|0/3000148|paused|3|false|off|30s|30s|" + ID),
-        ("synchronous_standby_names", "FAKE_WRITER", "on||0/3000200|" + ID),
+        ("pg_is_in_recovery", "FAKE_RECOVERY",
+         "true|0/3000148|paused|3|off|30s|30s|" + ID + "|00000001"),
+        ("synchronous_standby_names", "FAKE_WRITER", "on||0/3000200|" + ID + "|00000001"),
     ]
     for needle, variable, default in answers:
         if needle in query:
@@ -340,9 +341,9 @@ class AdmissionGateTests(unittest.TestCase):
     def test_the_integrity_report_can_run_on_a_standby(self):
         run = self.standby_gate()
         self.assertEqual(run.returncode, 0, run.stdout)
-        self.assertIn("INFO  integrity report on a standby: replayed to 0/3000148 (writer at "
-                      "0/3000200), replay state 'paused', last replayed transaction 3s ago",
-                      run.stdout)
+        self.assertIn("INFO  integrity report on a standby: replayed to 0/3000148 on timeline "
+                      "00000001 (writer at 0/3000200), replay state 'paused', last replayed "
+                      "transaction 3s ago", run.stdout)
         self.assertIn("PASS  carry-forward integrity on the standby (mismatch 0, drift 0)",
                       run.stdout)
         self.assertFalse([line for line in run.stdout.splitlines() if line.startswith("WARN")])
@@ -367,43 +368,40 @@ class AdmissionGateTests(unittest.TestCase):
 
     def test_the_integrity_standby_must_be_fit_for_the_report(self):
         for recovery, line in (
-                ("false|-|-|-|false|off|30s|30s|" + ID,
+                ("false|-|-|-|off|30s|30s|" + ID + "|00000001",
                  "FAIL  PRISM_INTEGRITY_REPORT_DATABASE_URL is not a hot standby "
                  "(in recovery: false)"),
-                ("true|0/3000148|paused|3|false|off|30s|30s|7000000000000000002|prism",
+                ("true|0/3000148|paused|3|off|30s|30s|7000000000000000002|prism|00000001",
                  "FAIL  the integrity standby is not a replica of this writer's database"),
-                ("true|0/3000148|paused|3|false|off|30s|30s|7000000000000000001|staging",
+                ("true|0/3000148|paused|3|off|30s|30s|7000000000000000001|staging|00000001",
                  "FAIL  the integrity standby is not a replica of this writer's database"),
-                ("true|0/3000148|paused|3|false|on|30s|30s|" + ID,
+                ("true|0/3000148|paused|3|on|30s|30s|" + ID + "|00000001",
                  "FAIL  the integrity standby has hot_standby_feedback on"),
-                ("true|-|paused|-|false|off|30s|30s|" + ID,
+                ("true|-|paused|-|off|30s|30s|" + ID + "|00000001",
                  "FAIL  the integrity standby has replayed no transaction yet"),
-                ("true|0/3000148|paused|900|false|off|30s|30s|" + ID,
+                ("true|0/3000148|paused|900|off|30s|30s|" + ID + "|00000001",
                  "FAIL  the integrity standby's last replayed transaction is 900s old "
-                 "(limit 300s) and it is behind the writer")):
+                 "(limit 300s)")):
             with self.subTest(recovery=recovery):
                 self.log.unlink(missing_ok=True)
                 self.assert_fails_with(line, PRISM_INTEGRITY_REPORT_DATABASE_URL=STANDBY_DSN,
                                        FAKE_RECOVERY=recovery)
                 self.assertFalse(self.report_calls())
 
-    def test_a_caught_up_standby_of_an_idle_writer_is_fresh(self):
-        # Replay has reached the writer's position: an old last transaction only means an
-        # idle writer, and a caught-up standby that never replayed one is current too.
-        for recovery, shown in (("true|0/3000200|paused|900|true|off|30s|30s|" + ID, "900s ago"),
-                                ("true|0/3000200|paused|-|true|off|30s|30s|" + ID, "none")):
-            with self.subTest(shown=shown):
-                run = self.standby_gate(FAKE_RECOVERY=recovery)
-                self.assertEqual(run.returncode, 0, run.stdout)
-                self.assertIn(f"last replayed transaction {shown}", run.stdout)
-                self.assertIn("PASS  carry-forward integrity on the standby", run.stdout)
-        probe = [call for call in self.psql_calls() if "pg_is_in_recovery" in call["query"]]
-        self.assertTrue(probe)
-        self.assertIn("writer_lsn=0/3000200", probe[-1]["argv"])
+    def test_a_standby_on_another_timeline_is_refused(self):
+        # WAL positions on different timelines aren't comparable: after a failover, a standby
+        # left on the old timeline can even look ahead of the new writer.
+        self.assert_fails_with("FAIL  the integrity standby is on timeline 00000001 but the writer "
+                               "is on 00000002",
+                               PRISM_INTEGRITY_REPORT_DATABASE_URL=STANDBY_DSN,
+                               FAKE_WRITER="on||0/1000000|" + ID + "|00000002",
+                               FAKE_RECOVERY="true|0/9000000|paused|3|off|30s|30s|" + ID
+                                             + "|00000001")
+        self.assertFalse(self.report_calls())
 
     def test_the_age_limit_can_be_raised(self):
         run = self.standby_gate(
-            FAKE_RECOVERY="true|0/3000148|paused|900|false|off|30s|30s|" + ID,
+            FAKE_RECOVERY="true|0/3000148|paused|900|off|30s|30s|" + ID + "|00000001",
             PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS="1200")
         self.assertEqual(run.returncode, 0, run.stdout)
 
@@ -424,13 +422,14 @@ class AdmissionGateTests(unittest.TestCase):
         for state in ("not paused", "pause requested"):
             with self.subTest(state=state):
                 run = self.standby_gate(
-                    FAKE_RECOVERY=f"true|0/3000148|{state}|1|false|off|30s|30s|" + ID)
+                    FAKE_RECOVERY=f"true|0/3000148|{state}|1|off|30s|30s|" + ID + "|00000001")
                 self.assertEqual(run.returncode, 0, run.stdout)
                 self.assertIn(f"WARN  the integrity standby's replay state is '{state}', "
                               "not 'paused'", run.stdout)
                 self.assertIn("PASS  carry-forward integrity on the standby", run.stdout)
         # Infinite conflict delays are the documented alternative to a pause.
-        run = self.standby_gate(FAKE_RECOVERY="true|0/3000148|not paused|1|false|off|-1|-1|" + ID)
+        run = self.standby_gate(
+            FAKE_RECOVERY="true|0/3000148|not paused|1|off|-1|-1|" + ID + "|00000001")
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertFalse([line for line in run.stdout.splitlines() if line.startswith("WARN")])
 
@@ -438,10 +437,11 @@ class AdmissionGateTests(unittest.TestCase):
         self.assert_fails_with("FAIL  the writer waits for standby apply "
                                "(synchronous_commit=remote_apply)",
                                PRISM_INTEGRITY_REPORT_DATABASE_URL=STANDBY_DSN,
-                               FAKE_WRITER="remote_apply|FIRST 1 (prism_standby_1)|0/3000200|" + ID)
+                               FAKE_WRITER="remote_apply|FIRST 1 (prism_standby_1)|0/3000200|"
+                                           + ID + "|00000001")
         self.assertFalse(self.report_calls())
         # Without synchronous standbys, remote_apply waits for nothing.
-        run = self.standby_gate(FAKE_WRITER="remote_apply||0/3000200|" + ID)
+        run = self.standby_gate(FAKE_WRITER="remote_apply||0/3000200|" + ID + "|00000001")
         self.assertEqual(run.returncode, 0, run.stdout)
 
     def test_a_cancelled_report_is_named_without_the_server_details(self):
@@ -457,8 +457,8 @@ class AdmissionGateTests(unittest.TestCase):
                 run = self.standby_gate(FAKE_PSQL_FAIL="qbit_carry_forward_integrity_report",
                                         FAKE_PSQL_STDERR=stderr)
                 self.assertEqual(run.returncode, 1, run.stdout)
-                self.assertIn(f"FAIL  carry-forward integrity report failed on the standby {reason}",
-                              run.stdout)
+                self.assertIn("FAIL  carry-forward integrity report failed on the standby "
+                              + reason, run.stdout)
                 self.assertNotIn("standby.example.invalid", run.stdout + run.stderr)
         timeout = "ERROR:  canceling statement due to statement timeout"
         self.assert_fails_with("FAIL  carry-forward integrity report failed (statement timeout)",

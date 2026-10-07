@@ -114,10 +114,13 @@ holds back the writer all the same. Pause its replay first
 recovery conflict cancels the report. Never pause a standby the writer waits on
 for apply (`synchronous_commit = remote_apply`): every commit would stall. The
 found-block offer standby (#529) waits only for flush, which a pause doesn't
-stop. The gate refuses a URL that isn't in recovery, has feedback on, or whose
-last replayed transaction is older than
-`PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS` (default 300), and it records both the
-standby's and the writer's WAL positions. Or set `PRISM_GATE_INTEGRITY=skip`:
+stop. The gate refuses a URL that isn't in recovery, isn't a replica of this
+writer's database on the writer's timeline, has feedback on, serves a writer
+that waits for apply, or whose last replayed transaction is older than
+`PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS` (default 300; the frontends' heartbeats
+keep a live writer committing). It records both WAL positions. Finish every
+query on the standby before `pg_wal_replay_resume()`: after a long pause, the
+replayed backlog cancels queries running at the resume or just after it. Or set `PRISM_GATE_INTEGRITY=skip`:
 the gate says so in a WARN line, and you record the report from wherever it
 ran. Every query the gate runs has a 15 s statement timeout and a 5 s lock
 timeout; the report gets 120 s on the writer and 600 s on a standby.
