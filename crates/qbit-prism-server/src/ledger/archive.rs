@@ -2019,7 +2019,10 @@ async fn maintenance_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConne
 /// condition again, since the mark says nothing about who started the DDL.
 pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions) -> Result<Value> {
     check_partition_name(partition_name)?;
-    let _lifecycle = lifecycle_guard(ledger).await?;
+    let mut lifecycle = lifecycle_guard(ledger).await?;
+    // Migration 2's share-hash backfill reads the legacy shares online.
+    super::migration::refuse_departure_while_pending(&mut lifecycle, "detach", partition_name)
+        .await?;
     let report = plan(ledger, options).await?;
     let entry = report
         .partitions
@@ -2246,7 +2249,10 @@ async fn check_seal_off_parent(
 /// ever rewritten by this.
 pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
-    let _lifecycle = lifecycle_guard(ledger).await?;
+    let mut lifecycle = lifecycle_guard(ledger).await?;
+    // Migration 2's share-hash backfill reads the legacy shares online.
+    super::migration::refuse_departure_while_pending(&mut lifecycle, "drop", partition_name)
+        .await?;
     let (record, attachment) = {
         let mut connection = ledger.acquire().await?;
         let record = catalog_row(&mut connection, partition_name).await?;
@@ -2351,7 +2357,10 @@ pub async fn restore(
     root: &Path,
     attach: bool,
 ) -> Result<Value> {
-    let _lifecycle = lifecycle_guard(ledger).await?;
+    let mut lifecycle = lifecycle_guard(ledger).await?;
+    // Before anything is read: an attached restore maps the headers of the
+    // rows it restores, which waits for migration 2's share-hash backfill.
+    super::migration::refuse_restore_while_pending(&mut lifecycle).await?;
     let path = if manifest_path.is_absolute() || manifest_path.exists() {
         manifest_path.to_path_buf()
     } else {

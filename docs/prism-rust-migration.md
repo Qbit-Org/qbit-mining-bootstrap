@@ -137,7 +137,11 @@ transaction, including carry-forward summary repair, except 002's share-hash
 backfill and migrations 013, 017 and 024. On a ledger with rows, 002 maps the
 legacy shares' headers after the commit, in bounded batches, and records 2
 once every one is mapped
-([below](#migration-002s-share-hash-backfill-applied-online)).
+([below](#migration-002s-share-hash-backfill-applied-online)). With
+`migrate --defer-share-hashes`, only the legacy shares near the tip are mapped
+before the database serves, and a later plain `migrate` maps the rest while
+frontends serve
+([Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)).
 Migration 013, the share ledger index trim, builds its indexes after the
 commit with `CREATE INDEX CONCURRENTLY`
 ([below](#migration-013-the-share-ledger-index-trim-applied-online)), and
@@ -650,9 +654,11 @@ accepts the unknown migration with a warning and reads the corrected report.
 See [blocks, balances, and reorgs](prism-ledger-ops.md#blocks-balances-and-reorgs).
 While a share-hash backfill that this release started is pending on a
 populated `2.x.x` source, the database declares
-`share_hash_backfill_pending = 1` (#669). It is declared with the backfill's
-cursor and removed with it when 2 is recorded, so every earlier build that
-checks capabilities is refused until then. A backfill that a #582 build
+`share_hash_backfill_pending = 1` (#669), raised to 2 once
+`migrate --defer-share-hashes` has permitted serving. It is declared with the
+backfill's cursor and removed with it when 2 is recorded, so every earlier
+build that checks capabilities is refused until then, and every build before
+this release refuses 2. A backfill that a #582 build
 started carries no declaration (see
 [the backfill](#migration-002s-share-hash-backfill-applied-online)).
 A database missing any required migration is refused
@@ -885,8 +891,11 @@ that holds it. A later copy, in a later batch, meets `ON CONFLICT DO NOTHING`.
 The batches also skip the per-row foreign-key check the single statement paid:
 016 has dropped that key by the time they run.
 
-**Readiness: the server does not serve during the backfill.** Until 2 is
-recorded, every start refuses the database. That is this release's start and
+**Readiness: the server does not serve during the backfill**, unless
+`migrate --defer-share-hashes` has mapped its recent range and permitted
+serving, as
+[Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)
+describes. Otherwise, until 2 is recorded, every start refuses the database. That is this release's start and
 every earlier native build's, since each requires 2. The `2.x.x` writer is
 fenced by 002's lease trigger, which committed with the transaction. So no share
 can be appended, and none credited against a legacy header not yet mapped. The
@@ -899,9 +908,17 @@ database is not ready: migration 2's share-hash backfill has not finished (#582)
 The legacy shares from share_seq 1 up to 30001 are mapped in
 qbit_prism_share_hashes and those from 30001 up to 4129153 are not, and until
 every one is mapped a share could be credited twice. Run `qbit-prism-server
-migrate` to resume it from there; every start refuses the database until it has
-finished and recorded migration 2
+migrate` to resume it from there, or `qbit-prism-server migrate
+--defer-share-hashes` to map only the legacy shares within 1000 template
+heights of the highest one and serve while a later `migrate` maps the rest;
+every start refuses the database until one of them has finished
 ```
+
+A backfill that a build before #669 started is refused the same way, but its
+remedy names plain `migrate` alone: `--defer-share-hashes` refuses it. One
+that a `--defer-share-hashes` run claimed and left before its recent range
+was mapped is refused naming that run's retry first
+([Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)).
 
 They refuse the same way while the cursor table exists, even if 2 has been
 recorded by hand, and so does the recovery evidence export
@@ -919,9 +936,12 @@ unmapped. So the database also declares the capability
 - the transaction that records 2 removes it with the cursor. It is the one
   capability native code removes, because it describes a state, not a format.
   That transaction first reads the declaration again under the migration lock.
-  At a value other than 1, a newer release declared it while the runner mapped
-  between holds of that lock, and the runner stops: the cursor, the
-  declaration and the record are that release's to finish.
+  At a value other than 1 or 2, a newer release declared it while the runner
+  mapped between holds of that lock, and the runner stops: the cursor, the
+  declaration and the record are that release's to finish;
+- between the two, `migrate --defer-share-hashes` raises it to 2 when it
+  permits serving, which this release's starts accept and every earlier
+  build refuses.
 
 An earlier build cannot remove the fence, so the fence must never coexist
 with an earlier build's runner, and that is why it is declared only with a new
@@ -1000,8 +1020,8 @@ boundary.
 | `refusing to continue migration 2: its share-hash backfill's cursor is no longer at share_seq <a>, where this run, which holds the runner lock, left it; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
 | `a <kind> named qbit_prism_share_hash_backfill holds the name of migration 2's share-hash backfill progress table; check what it holds, then rename or move it aside` | on a native database, a relation that is not the cursor table holds its name; move it aside, then start or migrate again |
 | `qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup` | the cursor table was edited; restore the full backup |
-| `database declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again, or, once qbit_prism_share_hashes is verified to map every accepted share whose ID ends in 64 hex digits (...), remove the declaration with DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending' and migrate again` | from `migrate`, and from a start once every migration is recorded: the cursor was dropped by hand while the backfill was pending. Restore the full pre-migration backup, or verify the mapping with the query above and remove the declaration |
-| `refusing to record migration 2: while its share-hash backfill ran, a newer PRISM release declared share_hash_backfill_pending = <n>, but this server understands share_hash_backfill_pending 1 to 1 only. That release finishes the backfill; upgrade the server before starting or migrating here` | a newer release's `migrate` ran while this release's runner was mapping. Upgrade the server and migrate with the newer release |
+| `database declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again, or, once qbit_prism_share_hashes is verified to map every accepted share whose ID ends in 64 hex digits (...), remove the declaration with DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending' and migrate again` | from `migrate`, and from a start once every migration is recorded: the cursor was dropped by hand while the backfill was pending. Restore the full pre-migration backup, or verify the mapping with the query above and remove the declaration. At `= 2` frontends may have served since, so the message offers no backup: verify the mapping |
+| `refusing to record migration 2: while its share-hash backfill ran, a newer PRISM release declared share_hash_backfill_pending = <n>, but this server understands share_hash_backfill_pending 1 to 2 only. That release finishes the backfill; upgrade the server before starting or migrating here` | a newer release's `migrate` ran while this release's runner was mapping. Upgrade the server and migrate with the newer release |
 | `refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup` | the cursor table was dropped by hand during a run; restore the full backup |
 
 **Plan for the backfill on a large ledger.** The backfill writes every legacy
@@ -1029,6 +1049,180 @@ larger settings for the cutover window: `shared_buffers` a quarter of memory,
 for the WAL. Restore them afterwards if they are not the server's normal ones.
 `make prism-cutover-rehearsal` runs its private cluster at the defaults, so
 the time it reports for the backfill is the pessimistic one.
+
+#### Serving with the backfill pending (fence 2)
+
+On a production-sized ledger the backfill is most of `migrate`'s time, as
+**Plan for the backfill on a large ledger** above estimates. Run
+`qbit-prism-server migrate --defer-share-hashes` to take it out of the
+cutover's outage. The flag is `migrate`'s alone, never an environment setting:
+compose starts frontends with `PRISM_POSTGRES_INIT_SCHEMA=1`, and they run the
+same migration at their start. Plain `migrate` behaves exactly as above.
+
+**What the deferred run does.**
+
+1. The migration transaction creates the cursor and declares
+   `share_hash_backfill_pending = 1`, as plain `migrate`'s does. It also
+   claims the backfill for the deferral before anything is mapped: it sets the
+   cursor's `deferred_at`, a column the code adds. On a cursor that an earlier
+   run left at fence 1, the claim is set the same way, and a retry keeps the
+   first claim's time.
+2. After the commit, in the slot the backfill takes otherwise, it maps the
+   *recent range*: every accepted legacy share whose template height is
+   within 1,000, the coinbase maturity, of the highest one.
+   - The range's lowest height is `H_min`, the highest template height of an
+     accepted legacy share less 1,000, and at least 0.
+   - Its first share is `S_min`, the first `share_seq` of an accepted share
+     at or above `H_min`.
+   - It runs 002's batches over `[S_min, end_seq)`, restricted to
+     `template_height >= H_min`, in ascending `share_seq`. 2.x's
+     `qbit_share_ledger_template_height_idx` serves the bounds, so the range
+     is mapped before 013 drops that index.
+3. One transaction then records `recent_min_height` (`H_min`) and
+   `recent_start_seq` (`S_min`, NULL when the ledger has no accepted share)
+   beside the cursor, and raises the fence to
+   `share_hash_backfill_pending = 2`. It refuses if the ledger holds a row past
+   `end_seq`: nothing should have appended.
+   - The same transaction keeps every native share at or above `end_seq`.
+     Native shares draw their `share_seq` from the sequence that
+     `qbit_share_ledger.share_seq` owns, found by that column. If the
+     sequence's next value would be below `end_seq`, it is moved to hand out
+     `end_seq` next (`setval(<sequence>, end_seq - 1, true)`), and an INFO
+     line names its old and new `last_value` and `is_called`. A sequence can
+     lag behind the rows after explicit inserts, or after a restore that left
+     it uncalled. A sequence that does not lag is not written to, so its
+     `last_value` and `is_called` stay exactly as the source had them. A
+     promoted physical copy is ahead already.
+4. 013, 017 and 024 follow as usual, with the cursor present.
+5. `migrate` returns and says that 2 is deferred, naming `next_seq` and
+   `end_seq`. The cursor has not moved, and 2 is not recorded.
+
+The range is about 40,000 to 60,000 shares at the ledger's rate, so this takes
+seconds. A rerun of `--defer-share-hashes` after an interruption maps the
+range again, or, once the fence is 2, applies only what else is pending.
+
+**A deferred run that stops before serving is permitted** leaves the cursor
+at fence 1 with its claim. From there, only the operator's `migrate` maps
+anything:
+
+- `qbit-prism-server migrate --defer-share-hashes` again maps the range and
+  permits serving, as a first run does;
+- plain `qbit-prism-server migrate`, chosen explicitly, maps the whole backfill
+  and records 2 before anything serves, as without the flag.
+
+Every other connect that migrates refuses the database, as every start does,
+and changes nothing. That includes a frontend that compose starts with
+`PRISM_POSTGRES_INIT_SCHEMA=1`, a tool and an operator command. Such a
+connect runs neither the whole backfill, which would take hours while the
+operator's retry waited for the runners' lock, nor 013, which would drop the
+index that the range reads. A connect that planned the backfill before the
+claim, and then waited for the runners' lock, reads the claim again once it
+holds the lock, and refuses the same way. Without a claim, a backfill at
+fence 1 is run to its end by every connect, as before.
+
+**Why serving is safe with the rest unmapped.** A native share is credited
+only on a job this cluster issued, whose parent is the current tip or, within
+stale grace, the tip's parent. Its ID ends in the block hash, which commits to
+that parent. Every copy of a legacy header has the same parent, so the same
+template height. A credited native share can therefore repeat only a legacy
+header whose parent can be the tip at or after the cutover: one in the recent
+range, unless the chain reorganized more than 1,000 blocks below the legacy
+tip, which coinbase maturity does not survive either. Every such header is
+mapped before anything serves, so the append's header check refuses a repeat
+exactly as it would with the whole mapping. Each header in the range maps to
+its earliest copy: the range holds all of a header's copies. Nothing but that
+check reads `qbit_prism_share_hashes` at runtime; the window, balances,
+settlement and the broadcaster never do.
+
+**Which starts are allowed.**
+
+| The database holds | A start, `self-check`, `import-audits` and operator commands |
+| --- | --- |
+| the cursor and `share_hash_backfill_pending = 1` | refused, naming the cursor and both remedies |
+| the cursor, `share_hash_backfill_pending = 1` and a deferred run's claim | refused, naming the deferred run that stopped and its retry, `migrate --defer-share-hashes`; a connect that migrates maps nothing |
+| the cursor and no fence (a backfill a build before #669 started) | refused; `--defer-share-hashes` refuses it too, and plain `migrate` finishes it |
+| the cursor and `share_hash_backfill_pending = 2` | allowed without 2 recorded. Each start logs a warning naming `next_seq` and `end_seq` |
+| the fence at 1 or 2 without the cursor | refused: the cursor was dropped by hand |
+
+Every build before this release refuses `share_hash_backfill_pending = 2` at
+connect and at `migrate` (`understands share_hash_backfill_pending 1 to 1
+only`), so none serves beside the pending backfill or finishes it.
+
+**Who finishes it: plain `migrate`, and nothing else.** A frontend started
+with `PRISM_POSTGRES_INIT_SCHEMA=1`, a tool or an operator command migrates at
+its start, but leaves a backfill at fence 2 as it is. Run
+`qbit-prism-server migrate`, without the flag, once frontends serve. It:
+
+- applies whatever else is pending first, such as 013, 017 or 024 after a
+  deferred run that stopped early. A plain `migrate` that planned the backfill
+  at fence 1, ahead of 017, can find the fence at 2 once it holds the runners'
+  lock: a deferred run raised it while this one waited. Recording 2 at fence 2
+  needs 017's conversion bound. If 017 has not recorded it, the run refuses
+  before it maps anything, rather than refuse at the record after hours of
+  batches; rerun `migrate`, which then applies 017 first;
+- maps `[next_seq, end_seq)` in the usual batches while frontends serve. Each
+  batch is one statement under the pool's timeouts. A native share whose
+  header a batch in flight is mapping, which the argument above rules out,
+  waits for that batch and then fails on the header's uniqueness, uncredited
+  (`ledger-confirmation-failed`); a resubmission is refused as already
+  credited;
+- **never extends the end.** Every row at or above the cursor's `end_seq` is a
+  native share, which mapped its own header in the transaction that appended
+  it. The end is never read again from `max(share_seq)`. Under the migration
+  lock, the record step checks that `end_seq` is at or below
+  `qbit_prism_share_partitioning.conversion_bound`, under which the release
+  table holds the legacy shares. Native shares go into that table too, until
+  the sequence passes the bound;
+- **refuses a double credit before it records 2.** It looks for a native share
+  that repeats the header of an accepted legacy share below `end_seq`. Such a
+  share was credited while its header was not yet mapped, and the batch that
+  reached the legacy copy met the native mapping and said nothing. `migrate`
+  then refuses, naming the share, and leaves the cursor, the fence and the
+  missing record of 2 as they are. The mapping is complete by then, so no
+  later share can repeat a legacy header, and frontends keep serving. The
+  check probes 2.x's `qbit_share_ledger_accepted_block_suffix_idx` for each
+  native share, and the share ID index for a bare 64-digit legacy ID in lower
+  or upper case; a bare ID in mixed case is the one form it does not find.
+  It reads the native shares from `end_seq` up to the highest `share_seq` at
+  its start, in chunks of consecutive `share_seq` sized like the backfill's
+  batches. Each chunk is one short statement in a transaction of its own,
+  under the pool's statement timeout and before the migration lock, so it
+  holds no long snapshot on the serving primary. A chunk that outlasts the
+  timeout is read again at half its size, as a batch is. Shares appended after
+  the check starts need no reading: every legacy header is mapped by then, so
+  the append refuses a repeat as already credited;
+- drops the cursor and the fence and records 2, as before.
+
+An interrupted run resumes at `next_seq`. `migrate --defer-share-hashes` on a
+backfill at fence 2 leaves it as it is.
+
+**Share archive is refused while pending.** `share-archive restore` refuses
+while the cursor exists, at any fence: an attached restore maps the headers of
+the rows it restores. So do `share-archive detach` and `drop` of a partition
+that starts below the cursor's `end_seq`, which the release table
+`qbit_share_ledger_p0` always does: the backfill reads the legacy shares
+online. Lead partitions above `end_seq` are unaffected. Each refusal names
+plain `migrate` as the remedy.
+
+**Progress.** The cursor query above reads the same while the rest is pending;
+`recent_min_height` and `recent_start_seq` say what the recent range covered,
+and `deferred_at` when a deferred run first claimed the backfill. The
+double-credit check logs a progress line every ten seconds, and its end.
+
+**Refusals.**
+
+| Refusal | What to do |
+| --- | --- |
+| `refusing to defer migration 2's share-hash backfill: a build before #669 started it, so the database declares no share_hash_backfill_pending fence, ...` | the backfill carries no fence, and a resume never declares one. Run plain `migrate`, which finishes it before anything serves |
+| `refusing to permit serving with migration 2's share-hash backfill pending: the share ledger's end is share_seq <a>, not the end <b> the backfill was planned to, ...` | a writer appended around every gate before serving was permitted. Nothing serves. Run plain `migrate`, which maps every row and records 2 |
+| `database is not ready: migration 2's share-hash backfill has not finished (#582). ...`, saying that `qbit-prism-server migrate --defer-share-hashes` claimed it and stopped before its recent range was mapped | a deferred run stopped before it permitted serving; every start and every other connect that migrates refuses until the operator's `migrate` has run. Run `migrate --defer-share-hashes` again, or plain `migrate` to map everything before anything serves |
+| `refusing to permit serving with migration 2's share-hash backfill pending: the share_seq sequence <s> hands out <n> next, below the backfill's end <e>, ...` | moving the sequence up to the end did not hold. Nothing serves. Run `migrate --defer-share-hashes` again |
+| `refusing to permit serving with migration 2's share-hash backfill pending: no sequence is owned by qbit_share_ledger.share_seq, ...` | the ledger's `share_seq` column lost its sequence. Nothing serves. Run plain `migrate`, which maps every row and records 2 |
+| `refusing to finish migration 2's share-hash backfill before mapping anything: it permits serving now, ... The share-hash fence changed while this run waited for the runner lock. ...` | a deferred run raised the fence to 2 while this `migrate` waited, and stopped before 017. Nothing was mapped. Rerun `migrate`, which applies 017 before it finishes the backfill |
+| `migration 2: checking the native shares from share_seq <a> to <b> for a header an accepted legacy share holds, before recording 2. ...` | a chunk of the double-credit check failed, at its smallest size if it timed out. Every batch committed and 2 is not recorded. Migrate again |
+| `refusing to record migration 2: native share <id>, at share_seq <n>, repeats header <h> of an accepted legacy share below share_seq <end>, so that header was credited twice. ...` | the safety argument above failed for that header. Frontends may keep serving. Report it, and reconcile the double credit before anything records 2; never record 2 by hand over it |
+| `refusing to record migration 2: its share-hash backfill's end, share_seq <a>, lies above the conversion bound <b> ...` | the cursor or the partitioning catalog was edited. Restore the full backup |
+| `refusing to restore a share archive while migration 2's share-hash backfill is pending: ...`, `refusing to detach <partition> while migration 2's share-hash backfill is pending: ...`, `refusing to drop <partition> ...` | run plain `migrate` to finish the backfill, then the archive step |
 
 ### Migration 013: the share ledger index trim, applied online
 
@@ -1704,11 +1898,15 @@ compare the complete evidence and retain the latest database. Prefer forward
 repair or a compatible native image preserving all durable history.
 
 An interrupted `migrate` is before this boundary as long as migration 2 is not
-recorded. On a populated source, 2 is recorded only after
+recorded and `share_hash_backfill_pending` is not 2. On a populated source, 2 is
+recorded only after
 [002's share-hash backfill](#migration-002s-share-hash-backfill-applied-online),
 and every start refuses the database until then, so no native share can have
 been acknowledged. Resume it with `migrate`, or restore the pre-migration
-backup, as for any other pre-ACK failure.
+backup, as for any other pre-ACK failure. Once `migrate --defer-share-hashes`
+has raised the fence to 2, frontends may serve with 2 unrecorded, and the
+boundary is their first ACK, as on any served database
+([Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)).
 
 1. **Establish isolation and retain evidence.** Stop every native frontend,
    public service, candidate worker and CTV broadcaster, and confirm no old
