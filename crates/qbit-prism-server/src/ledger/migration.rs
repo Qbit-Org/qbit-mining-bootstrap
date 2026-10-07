@@ -3610,7 +3610,7 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
             start_seq = progress.start_seq,
             next_seq = progress.next_seq,
             end_seq = progress.end_seq,
-            "serving with migration 2's share-hash backfill pending: its recent range is mapped, and the rest of the legacy shares from next_seq up to end_seq are not. Run `qbit-prism-server migrate`, which maps them while frontends serve and records 2; share-archive restore, and detach and drop of the release table, refuse until then"
+            "serving with migration 2's share-hash backfill pending: its recent range is mapped, and the rest of the legacy shares from next_seq up to end_seq are not. Run `qbit-prism-server migrate`, which maps them while frontends serve and records 2; share-archive restore, and detach and drop of any partition, refuse until then"
         );
     }
     Ok(())

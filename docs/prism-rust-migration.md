@@ -1198,11 +1198,14 @@ backfill at fence 2 leaves it as it is.
 
 **Share archive is refused while pending.** `share-archive restore` refuses
 while the cursor exists, at any fence: an attached restore maps the headers of
-the rows it restores. So do `share-archive detach` and `drop` of a partition
-that starts below the cursor's `end_seq`, which the release table
-`qbit_share_ledger_p0` always does: the backfill reads the legacy shares
-online. Lead partitions above `end_seq` are unaffected. Each refusal names
-plain `migrate` as the remedy.
+the rows it restores. So do `share-archive detach` and `drop` of every
+partition, whatever its bounds. The backfill reads the legacy shares below
+`end_seq` from the attached ledger, and before it records 2 the double-credit
+check reads every native share from `end_seq` up through the attached ledger
+too: a native partition that left the ledger would hide its shares from that
+check. Each refusal names plain `migrate` as the remedy; archive the partition
+once 2 is recorded. `share-archive plan`, `seal`, `archive` and `verify` are
+unaffected.
 
 **Progress.** The cursor query above reads the same while the rest is pending;
 `recent_min_height` and `recent_start_seq` say what the recent range covered,

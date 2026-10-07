@@ -1053,34 +1053,27 @@ pub(crate) async fn refuse_restore_while_pending(connection: &mut PgConnection) 
     Ok(())
 }
 
-/// Refuse to detach or drop a partition while a backfill is pending, at any
-/// fence, if its lower bound lies below the cursor's end (MINVALUE does, on
-/// the release table): legacy shares the backfill has still to read could
-/// be in it, and gone from the ledger they would never be mapped. A
-/// partition the catalog does not record is left for `step`'s own checks.
-/// Checked under the lifecycle lock, before the step reads anything else.
+/// Refuse to detach or drop any share-ledger partition while a backfill is
+/// pending, at any fence. The backfill maps the legacy shares below the
+/// cursor's end from the attached ledger, and before it records 2 the
+/// double-credit check reads every native share from that end up through
+/// the attached parent too (`refuse_double_credit`). A partition gone from
+/// the parent would hide legacy shares from the one, which would never be
+/// mapped, or native shares from the other, so 2 could be recorded over a
+/// header credited twice. So every partition stays attached until 2 is
+/// recorded, the release table and the native ones alike, whatever its
+/// bounds. Checked under the lifecycle lock, before the step reads
+/// anything else.
 pub(crate) async fn refuse_departure_while_pending(
     connection: &mut PgConnection,
     step: &str,
     partition_name: &str,
 ) -> Result<()> {
-    let Some(progress) = progress(connection).await? else {
-        return Ok(());
-    };
-    let lower: Option<Option<i64>> = sqlx::query_scalar(
-        "SELECT lower_seq FROM qbit_prism_share_partitions WHERE partition_name=$1",
-    )
-    .bind(partition_name)
-    .fetch_optional(&mut *connection)
-    .await?;
-    if let Some(lower) = lower {
-        if lower.is_none_or(|lower| lower < progress.end_seq) {
-            bail!(
-                "refusing to {step} {partition_name} while migration 2's share-hash backfill is pending: the partition starts at share_seq {}, below the backfill's end {}, so it may hold legacy shares the backfill has still to map, and they must stay online until it has. Run `qbit-prism-server migrate` to finish the backfill and record 2, then {step} it. Nothing was changed",
-                lower.map_or("MINVALUE".to_owned(), |lower| lower.to_string()),
-                progress.end_seq
-            );
-        }
+    if let Some(progress) = progress(connection).await? {
+        bail!(
+            "refusing to {step} {partition_name} while migration 2's share-hash backfill is pending: the backfill maps the legacy shares below share_seq {end} from the attached share ledger, and before it records 2 it checks every native share from there up, through the attached ledger too, for a header a legacy share holds, so every partition stays attached until 2 is recorded. Run `qbit-prism-server migrate` to finish the backfill and record 2, then {step} it. Nothing was changed",
+            end = progress.end_seq
+        );
     }
     Ok(())
 }

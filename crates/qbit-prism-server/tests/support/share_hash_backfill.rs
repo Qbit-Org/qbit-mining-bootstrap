@@ -1357,9 +1357,10 @@ async fn migrate_refuses_to_record_2_over_a_native_share_repeating_a_legacy_head
 
 /// Share-archive restore, detach and drop refuse while a backfill is
 /// pending, here with serving permitted: a restore maps its rows' headers,
-/// and the release table holds legacy shares the backfill has still to
-/// map. A lead partition, above the backfill's end, is not refused for it,
-/// and once 2 is recorded nothing is.
+/// the release table holds legacy shares the backfill has still to map,
+/// and a lead partition, above the backfill's end, holds native shares the
+/// double-credit check reads through the parent, so it is refused too.
+/// Once 2 is recorded nothing is refused for the backfill.
 #[tokio::test]
 async fn share_archive_restore_detach_and_drop_refuse_while_a_backfill_is_pending() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -1406,7 +1407,7 @@ async fn share_archive_restore_detach_and_drop_refuse_while_a_backfill_is_pendin
     ensure!(
         error.contains(&format!(
             "refusing to detach qbit_share_ledger_p0 {PENDING}"
-        )) && error.contains("starts at share_seq MINVALUE"),
+        )) && error.contains("so every partition stays attached until 2 is recorded"),
         "{error}"
     );
     let error = archive::drop_partition(&operator, "qbit_share_ledger_p0", root.path())
@@ -1418,11 +1419,17 @@ async fn share_archive_restore_detach_and_drop_refuse_while_a_backfill_is_pendin
         error.contains(&format!("refusing to drop qbit_share_ledger_p0 {PENDING}")),
         "{error}"
     );
-    // A lead partition holds no legacy share: detach refuses it for its own
-    // reasons, never for the backfill.
-    if let Err(error) = archive::detach(&operator, &lead, &options()).await {
-        ensure!(!error.to_string().contains(PENDING), "{lead}: {error}");
-    }
+    // A lead partition holds no legacy share, but the double-credit check
+    // reads its native shares through the parent: refused too.
+    let error = archive::detach(&operator, &lead, &options())
+        .await
+        .err()
+        .context("a lead partition was detached while the backfill was pending")?
+        .to_string();
+    ensure!(
+        error.contains(&format!("refusing to detach {lead} {PENDING}")),
+        "{error}"
+    );
     // Recorded, nothing refuses for the backfill.
     let finished = Ledger::connect_migrate(&db.url, ShareHashBackfill::Finish).await?;
     assert_eq!(cursor(&pool).await?, None);
@@ -1436,6 +1443,9 @@ async fn share_archive_restore_detach_and_drop_refuse_while_a_backfill_is_pendin
         .err()
         .context("an unsealed release table was detached")?;
     ensure!(!format!("{error:#}").contains(PENDING), "{error:#}");
+    if let Err(error) = archive::detach(&operator, &lead, &options()).await {
+        ensure!(!format!("{error:#}").contains(PENDING), "{lead}: {error:#}");
+    }
     db.close(vec![migrated, operator, finished]).await
 }
 
@@ -2007,4 +2017,148 @@ async fn migrate_defer_share_hashes_leaves_a_share_seq_sequence_at_or_past_the_e
         db.close(vec![migrated]).await?;
     }
     Ok(())
+}
+
+/// A partition's bounds as the catalog records them, `(lower_seq,
+/// upper_seq)`; the release table's lower bound is MINVALUE, NULL.
+async fn partition_bounds(pool: &PgPool, partition: &str) -> Result<(Option<i64>, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT lower_seq,upper_seq FROM qbit_prism_share_partitions WHERE partition_name=$1",
+    )
+    .bind(partition)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Native-shaped shares at `[first, last]`, written straight into the
+/// ledger as the archive tests place them: accepted, recent, at
+/// `difficulty`, with IDs that end in no legacy share's header.
+async fn insert_native_rows(pool: &PgPool, first: i64, last: i64, difficulty: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) \
+         SELECT i,'native:'||i,'miner-0','miner-0',decode(repeat('11',32),'hex'),$3::text::numeric,100,3001,'job',statement_timestamp(),1,statement_timestamp(),true,'native-test',0 \
+         FROM generate_series($1::bigint,$2::bigint) g(i)",
+    )
+    .bind(first)
+    .bind(last)
+    .bind(difficulty.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A native partition above the backfill's end that is ready to leave the
+/// ledger in every other respect (archived after the release table,
+/// sealed, verified, below the online horizon) stays attached while the
+/// backfill is pending: the double-credit check reads native shares
+/// through the parent, and a partition that left would hide its shares
+/// from it. Detach is refused, and so is drop, the step that cannot be
+/// undone, of the partition taken off the parent by hand all the same.
+/// Once plain `migrate` has recorded 2, the same partition is detached and
+/// dropped.
+#[tokio::test]
+async fn an_archive_ready_native_partition_stays_attached_until_2_is_recorded() -> Result<()> {
+    const P0: &str = "qbit_share_ledger_p0";
+    const P1: &str = "qbit_share_ledger_p1";
+    const P2: &str = "qbit_share_ledger_p2";
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let (p1_lower, p1_upper) = partition_bounds(&pool, P1).await?;
+    let p1_lower = p1_lower.context("p1 has no lower bound")?;
+    let p2_lower = partition_bounds(&pool, P2)
+        .await?
+        .0
+        .context("p2 has no lower bound")?;
+    assert!(p1_lower >= end, "p1 starts below the backfill's end");
+    // Native shares in p1, and later ones in p2 that hold the payout window,
+    // the sequence past p1 and every share folded into the rollups: p1 lies
+    // below the online horizon.
+    insert_native_rows(&pool, p1_lower, p1_lower + 4, 5).await?;
+    insert_native_rows(&pool, p2_lower, p2_lower + 4, 1_000_000).await?;
+    sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),$1)")
+        .bind(p2_lower + 4)
+        .execute(&pool)
+        .await?;
+    while qbit_prism_server::rollups::advance(&pool, 50_000)
+        .await?
+        .scanned
+        > 0
+    {}
+    let root = tempfile::tempdir()?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    // The archive chain starts at the release table.
+    archive::archive(&operator, P0, root.path(), false, "operator").await?;
+    archive::verify(&operator, P0, root.path()).await?;
+    archive::archive(&operator, P1, root.path(), false, "operator").await?;
+    archive::seal(&operator, P1).await?;
+    archive::verify(&operator, P1, root.path()).await?;
+    let options = archive::PlanOptions {
+        network_difficulty: "100".into(),
+        retention_days: 0,
+        window_multiple: 4,
+        check_duplicates: false,
+    };
+    let report = archive::plan(&operator, &options).await?;
+    let blockers = &report
+        .partitions
+        .iter()
+        .find(|entry| entry.record.partition_name == P1)
+        .context("p1 is not in the plan")?
+        .blockers;
+    ensure!(
+        blockers.is_empty(),
+        "{P1} is not ready to leave in its own right: {blockers:?}"
+    );
+    let refused = |step: &str, error: Option<anyhow::Error>| -> Result<()> {
+        let text = format!(
+            "{:#}",
+            error.with_context(|| format!(
+                "{step} took {P1} off the ledger while the backfill was pending"
+            ))?
+        );
+        ensure!(
+            text.contains(&format!(
+                "refusing to {step} {P1} while migration 2's share-hash backfill is pending"
+            )) && text.contains("so every partition stays attached until 2 is recorded")
+                && text.contains("Run `qbit-prism-server migrate`"),
+            "{text}"
+        );
+        Ok(())
+    };
+    refused(
+        "detach",
+        archive::detach(&operator, P1, &options).await.err(),
+    )?;
+    // Taken off the parent by hand all the same, it is not dropped either,
+    // and is put back.
+    sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger DETACH PARTITION {P1}; UPDATE qbit_prism_share_partitions SET state='detached',detached_at=clock_timestamp() WHERE partition_name='{P1}'"))
+        .execute(&pool)
+        .await?;
+    refused(
+        "drop",
+        archive::drop_partition(&operator, P1, root.path())
+            .await
+            .err(),
+    )?;
+    let kept: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(P1)
+        .fetch_one(&pool)
+        .await?;
+    assert!(kept, "the refused drop removed {P1}");
+    sqlx::raw_sql(&format!("ALTER TABLE qbit_share_ledger ATTACH PARTITION {P1} FOR VALUES FROM ({p1_lower}) TO ({p1_upper}); UPDATE qbit_prism_share_partitions SET state='attached',detached_at=NULL WHERE partition_name='{P1}'"))
+        .execute(&pool)
+        .await?;
+
+    // Recorded, the same partition leaves.
+    let finished = Ledger::connect_migrate(&db.url, ShareHashBackfill::Finish).await?;
+    assert_eq!(cursor(&pool).await?, None);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    let detached = archive::detach(&operator, P1, &options).await?;
+    ensure!(detached["action"] == "detached", "{detached}");
+    let dropped = archive::drop_partition(&operator, P1, root.path()).await?;
+    ensure!(dropped["relation_dropped"] == true, "{dropped}");
+    db.close(vec![migrated, operator, finished]).await
 }

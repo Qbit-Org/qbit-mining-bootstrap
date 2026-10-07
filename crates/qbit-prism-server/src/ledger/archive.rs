@@ -2020,7 +2020,9 @@ async fn maintenance_connection(ledger: &Ledger) -> Result<sqlx::pool::PoolConne
 pub async fn detach(ledger: &Ledger, partition_name: &str, options: &PlanOptions) -> Result<Value> {
     check_partition_name(partition_name)?;
     let mut lifecycle = lifecycle_guard(ledger).await?;
-    // Migration 2's share-hash backfill reads the legacy shares online.
+    // While migration 2's share-hash backfill is pending, every partition
+    // stays attached: it maps the legacy shares, and its double-credit check
+    // reads the native ones, through the parent.
     super::migration::refuse_departure_while_pending(&mut lifecycle, "detach", partition_name)
         .await?;
     let report = plan(ledger, options).await?;
@@ -2250,7 +2252,9 @@ async fn check_seal_off_parent(
 pub async fn drop_partition(ledger: &Ledger, partition_name: &str, root: &Path) -> Result<Value> {
     check_partition_name(partition_name)?;
     let mut lifecycle = lifecycle_guard(ledger).await?;
-    // Migration 2's share-hash backfill reads the legacy shares online.
+    // While migration 2's share-hash backfill is pending, every partition
+    // stays attached: it maps the legacy shares, and its double-credit check
+    // reads the native ones, through the parent.
     super::migration::refuse_departure_while_pending(&mut lifecycle, "drop", partition_name)
         .await?;
     let (record, attachment) = {
