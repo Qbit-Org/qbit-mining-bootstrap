@@ -1160,7 +1160,7 @@ as in the second and fourth rows. The survey took under 6 ms in the same
 runs.
 
 **Upgrade.** 024 is additive, as 019 and 020 are: no capability and no
-shutdown proof, and it is not applied offline. A binary that does not know
+shutdown proof, and it needs no frontend stopped. A binary that does not know
 the index never reads it. It is applied online, as 013 is: on an existing
 ledger `migrate` (or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds the
 index with `CREATE INDEX CONCURRENTLY` after the migration transaction
@@ -1174,7 +1174,10 @@ cache, against 0.2 s for a plain `CREATE INDEX`. Until 24 is recorded every star
 of a 024 binary refuses the database, as for any missing migration. An
 interrupted build leaves an invalid index that the next run drops and
 builds again. A fresh or empty source applies 024 inside the migration
-transaction.
+transaction. With every frontend and tool stopped,
+`migrate --offline-indexes` builds it with a plain `CREATE INDEX` in one
+transaction instead, as it builds 013's
+([migration 013](prism-rust-migration.md#migration-013-the-share-ledger-index-trim-applied-online)).
 
 ## Chain observation epoch upgrade (018)
 
@@ -2461,8 +2464,11 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
 5. **Repair forward and enforce import.** Verify `PRISM_DATABASE_URL` targets
    the isolated restore and set the original trusted
    `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`; no signing seed is needed for import.
-   Run `time qbit-prism-server migrate` then
+   Run `time qbit-prism-server migrate --offline-indexes` then
    `time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit`.
+   Nothing else runs against the isolated restore, so `--offline-indexes`
+   builds 013's and 024's indexes with a plain `CREATE INDEX`
+   ([migration 013](prism-rust-migration.md#migration-013-the-share-ledger-index-trim-applied-online)).
    If import stops on a legacy body with `audit body ref hash mismatch`
    because a range's shares carry non-ASCII text,
    [prove it and write its sidecar](prism-rust-migration.md#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709),

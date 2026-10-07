@@ -43,7 +43,7 @@ use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
 mod connect;
 pub(crate) use connect::shielded_begin;
 use connect::{check_writable, require_revision, writable, writable_unless_held, WRITABLE_COLUMNS};
-pub use connect::{SessionAllocationExhausted, SessionId};
+pub use connect::{MigrateOptions, SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod divergence;
 pub use divergence::{
@@ -73,8 +73,9 @@ pub use jobs::{
 };
 mod migration;
 pub use migration::{
-    required_schema_versions, schema_version_list, MigrationSource, ShareHashBackfill, SourceState,
-    SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS, SOURCE_STATES,
+    required_schema_versions, schema_version_list, IndexBuildMode, MigrationSource,
+    ShareHashBackfill, SourceState, SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS,
+    SOURCE_STATES,
 };
 mod window;
 pub use difficulty::WorkerDifficulty;

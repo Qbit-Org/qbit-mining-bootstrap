@@ -12,6 +12,7 @@ mod block_solvers;
 mod online;
 mod partition;
 mod share_hashes;
+pub use online::IndexBuildMode;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 pub use share_hashes::ShareHashBackfill;
 pub(super) use share_hashes::{refuse_departure_while_pending, refuse_restore_while_pending};
@@ -2280,6 +2281,9 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// version order, and 016 is transactional. 002 is not listed: its file is
 /// always transactional, and only its share-hash backfill on a populated
 /// 2.x.x source runs after the commit, ahead of these (`share_hashes.rs`).
+/// `migrate --offline-indexes` builds 013's and 024's indexes plainly
+/// instead, each migration's in one transaction, once no instance is live
+/// (`IndexBuildMode::Offline`).
 pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 24];
 
 /// The online migration a version declares, from the scratch apply's
@@ -2934,19 +2938,7 @@ pub(super) async fn migrate_schema(
         // this transaction, once, at schema initialization.
         lock(tx, SETTLEMENT_LOCK, metrics).await?;
         lock(tx, ORDER_LOCK, metrics).await?;
-        let lease_exists: bool =
-            sqlx::query_scalar("SELECT to_regclass('qbit_ledger_writer_lease') IS NOT NULL")
-                .fetch_one(&mut **tx)
-                .await?;
-        if lease_exists {
-            // The table lock also closes the race with a legacy process
-            // trying to reacquire its lease during the cutover.
-            sqlx::query("LOCK TABLE qbit_ledger_writer_lease IN ACCESS EXCLUSIVE MODE")
-                .execute(&mut **tx)
-                .await?;
-            let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at > clock_timestamp())").fetch_one(&mut **tx).await?;
-            ensure!(!live, "live legacy Python writer lease: stop the Python deployment and release or wait for its lease before Rust migration");
-        }
+        refuse_live_legacy_lease(tx).await?;
         let inventory = inspect_source_schema(tx).await?;
         let state = match classify_source(&inventory) {
             SourceVerdict::Accept(state) => state,
@@ -3499,6 +3491,25 @@ async fn refuse_unquiesced_instances(
          An empty outbox or an expired heartbeat does not prove shutdown; nothing was changed",
         named_objects(&instances)
     );
+    Ok(())
+}
+
+/// Refuse a live legacy Python writer lease, keeping the lease table
+/// locked until the caller's transaction ends.
+async fn refuse_live_legacy_lease(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let lease_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('qbit_ledger_writer_lease') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if lease_exists {
+        // The table lock also closes the race with a legacy process
+        // trying to reacquire its lease during the cutover.
+        sqlx::query("LOCK TABLE qbit_ledger_writer_lease IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut **tx)
+            .await?;
+        let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_ledger_writer_lease WHERE lease_expires_at > clock_timestamp())").fetch_one(&mut **tx).await?;
+        ensure!(!live, "live legacy Python writer lease: stop the Python deployment and release or wait for its lease before Rust migration");
+    }
     Ok(())
 }
 

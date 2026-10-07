@@ -157,6 +157,44 @@ impl Registration {
     }
 }
 
+/// What the operator's `qbit-prism-server migrate` asks of the migration
+/// beyond what every connect with `initialize` applies
+/// ([`Ledger::connect_migrate`]). Every other connect takes the default,
+/// a frontend's with `PRISM_POSTGRES_INIT_SCHEMA=1` included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrateOptions {
+    /// What a pending share-hash backfill gets: every connect's
+    /// [`ShareHashBackfill::Initialize`], or for `migrate`
+    /// [`ShareHashBackfill::Finish`] or, with `--defer-share-hashes`,
+    /// [`ShareHashBackfill::Defer`].
+    pub share_hashes: ShareHashBackfill,
+    /// How 013's and 024's indexes are built: concurrently, or for
+    /// `migrate --offline-indexes` plainly in one transaction, which
+    /// refuses a live instance.
+    pub index_build: IndexBuildMode,
+}
+
+impl Default for MigrateOptions {
+    /// Every connect's but the operator's `migrate`.
+    fn default() -> Self {
+        Self {
+            share_hashes: ShareHashBackfill::Initialize,
+            index_build: IndexBuildMode::Concurrent,
+        }
+    }
+}
+
+impl From<ShareHashBackfill> for MigrateOptions {
+    /// `migrate` with that backfill mode and concurrent index builds, as
+    /// before `--offline-indexes`.
+    fn from(share_hashes: ShareHashBackfill) -> Self {
+        Self {
+            share_hashes,
+            ..Self::default()
+        }
+    }
+}
+
 impl Ledger {
     #[cfg(test)]
     pub(crate) fn offline_for_tests(pool: PgPool, instance_id: String) -> Self {
@@ -228,7 +266,7 @@ impl Ledger {
             initialize,
             metrics,
             Registration::Frontend,
-            ShareHashBackfill::Initialize,
+            MigrateOptions::default(),
         )
         .await
     }
@@ -257,7 +295,7 @@ impl Ledger {
             initialize,
             metrics,
             Registration::Tool,
-            ShareHashBackfill::Initialize,
+            MigrateOptions::default(),
         )
         .await
     }
@@ -268,17 +306,20 @@ impl Ledger {
     /// permits serving is left to [`Ledger::connect_migrate`], as every
     /// other connect leaves it.
     pub async fn connect_operator(url: &str, initialize: bool) -> Result<Self> {
-        Self::connect_as_operator(url, initialize, ShareHashBackfill::Initialize).await
+        Self::connect_as_operator(url, initialize, MigrateOptions::default()).await
     }
 
     /// `qbit-prism-server migrate`: [`Ledger::connect_operator`] with
-    /// `initialize`, whose share-hash backfill on a populated 2.x.x source
-    /// is `backfill`'s ([`ShareHashBackfill::Finish`] or, with
-    /// `--defer-share-hashes`, [`ShareHashBackfill::Defer`]). The operator's
-    /// `migrate` is the one connect that finishes a backfill that permits
-    /// serving.
-    pub async fn connect_migrate(url: &str, backfill: ShareHashBackfill) -> Result<Self> {
-        Self::connect_as_operator(url, true, backfill).await
+    /// `initialize`, applying the migration as `options` asks. The
+    /// operator's `migrate` is the one connect whose options may differ
+    /// from the default: its share-hash backfill on a populated 2.x.x source
+    /// is `options.share_hashes`'s ([`ShareHashBackfill::Finish`] or, with
+    /// `--defer-share-hashes`, [`ShareHashBackfill::Defer`]), so it is the
+    /// one connect that finishes a backfill that permits serving, and with
+    /// `--offline-indexes` it builds 013's and 024's indexes plainly, once
+    /// no instance is live.
+    pub async fn connect_migrate(url: &str, options: impl Into<MigrateOptions>) -> Result<Self> {
+        Self::connect_as_operator(url, true, options.into()).await
     }
 
     /// The operator's connect, shared by [`Ledger::connect_operator`] and
@@ -286,7 +327,7 @@ impl Ledger {
     async fn connect_as_operator(
         url: &str,
         initialize: bool,
-        backfill: ShareHashBackfill,
+        options: MigrateOptions,
     ) -> Result<Self> {
         Self::connect_inner(
             url,
@@ -295,7 +336,7 @@ impl Ledger {
             initialize,
             None,
             Registration::Operator,
-            backfill,
+            options,
         )
         .await
     }
@@ -307,7 +348,7 @@ impl Ledger {
         initialize: bool,
         metrics: Option<std::sync::Arc<Metrics>>,
         registration: Registration,
-        backfill: ShareHashBackfill,
+        options: MigrateOptions,
     ) -> Result<Self> {
         ensure!(!instance_id.is_empty(), "instance ID must not be empty");
         let timeout_setting = |name: &str, default: u64| -> Result<String> {
@@ -349,9 +390,13 @@ impl Ledger {
             .await?;
         if initialize {
             let mut tx = begin(&pool, metrics.as_deref()).await?;
-            let online =
-                migration::migrate_schema(&mut tx, &instance_id, backfill, metrics.as_deref())
-                    .await?;
+            let online = migration::migrate_schema(
+                &mut tx,
+                &instance_id,
+                options.share_hashes,
+                metrics.as_deref(),
+            )
+            .await?;
             tx.commit().await?;
             // 002's share-hash backfill on a populated 2.x.x source, then the
             // index rebuilds and the partition conversion, run after the
@@ -363,7 +408,15 @@ impl Ledger {
             // database with 2 unrecorded once that has permitted serving;
             // the operator's plain `migrate` maps the rest after the others.
             for pending in &online {
-                migration::apply_online_migration(&pool, pending, metrics.as_deref()).await?;
+                // 013 and 024 build concurrently unless `migrate
+                // --offline-indexes` asked for plain builds (`connect_migrate`).
+                migration::apply_online_migration(
+                    &pool,
+                    pending,
+                    options.index_build,
+                    metrics.as_deref(),
+                )
+                .await?;
             }
         }
         // The startup gate. Every start, with or without `initialize`, reads

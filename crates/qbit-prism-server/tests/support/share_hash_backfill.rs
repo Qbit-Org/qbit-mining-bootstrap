@@ -12,7 +12,9 @@
 //! the database serves, and plain `migrate` maps the rest while frontends
 //! append; the last tests here hold that to the same rule.
 use super::*;
-use qbit_prism_server::ledger::{archive, ShareHashBackfill, REQUIRED_SCHEMA_VERSIONS};
+use qbit_prism_server::ledger::{
+    archive, IndexBuildMode, MigrateOptions, ShareHashBackfill, REQUIRED_SCHEMA_VERSIONS,
+};
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -1501,6 +1503,49 @@ async fn migrations_13_17_and_24_run_with_a_deferred_backfill_pending() -> Resul
     let recorded = Ledger::connect_migrate(&db.url, ShareHashBackfill::Finish).await?;
     db.close(vec![migrated, again, frontend, finished, recorded])
         .await
+}
+
+/// The W1 cutover's migrate step, `migrate --defer-share-hashes
+/// --offline-indexes`, in one run on a populated 2.x.x source. The recent
+/// range is mapped and serving permitted, with the rest pending where it was
+/// planned; 013 and 024 then build offline with the cursor present, each in
+/// the transaction that records it and nothing concurrent; and the start
+/// gate admits a frontend that migrates at its start, which leaves the
+/// backfill alone and serves.
+#[tokio::test]
+async fn migrate_defer_share_hashes_with_offline_indexes_permits_serving_in_one_run() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed_heights(&pool).await?;
+    let (first, end): (i64, i64) =
+        sqlx::query_as("SELECT min(share_seq),max(share_seq)+1 FROM qbit_share_ledger")
+            .fetch_one(&pool)
+            .await?;
+    let expected = expected_recent_mapping(&pool, RECENT_MIN_HEIGHT).await?;
+    super::index_trim::install_probe(&pool, &db.schema).await?;
+    let options = MigrateOptions {
+        share_hashes: ShareHashBackfill::Defer,
+        index_build: IndexBuildMode::Offline {
+            workers: 2,
+            memory_kb: None,
+        },
+    };
+    let migrated = Ledger::connect_migrate(&db.url, options).await?;
+    assert_eq!(mapping(&pool).await?, expected);
+    assert_eq!(fence_value(&pool).await?, Some(2));
+    assert_eq!(cursor(&pool).await?, Some((first, end)));
+    assert_eq!(recent_range(&pool).await?.0, Some(RECENT_MIN_HEIGHT));
+    assert_eq!(schema_versions(&pool).await?, all_but_2());
+    super::index_trim::assert_built_offline(&pool).await?;
+    let frontend = db.ledger("frontend").await?;
+    assert!(frontend.append(share(1_000_000), None).await?.inserted);
+    assert_eq!(cursor(&pool).await?, Some((first, end)));
+    assert_eq!(schema_versions(&pool).await?, all_but_2());
+    db.close(vec![migrated, frontend]).await
 }
 
 /// A backfill a build before #669 started declares no fence, and this

@@ -906,6 +906,15 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
     for subcommand in [
         &["migrate"][..],
         &["migrate", "--defer-share-hashes"],
+        &["migrate", "--offline-indexes", "--index-build-workers", "8"],
+        &[
+            "migrate",
+            "--offline-indexes",
+            "--index-build-memory",
+            "1.5GB",
+        ],
+        // The W1 cutover's migrate step: both modes in one run.
+        &["migrate", "--defer-share-hashes", "--offline-indexes"],
         &["import-audits"],
         &["backfill-ctv"],
     ] {
@@ -1130,4 +1139,94 @@ async fn clear_timeout_flag_is_validated_before_connecting() {
         }
         assert!(!error.contains("test-only-password"), "{value}: {error}");
     }
+}
+
+/// `--offline-indexes` is a switch of `migrate` alone, never a setting:
+/// compose frontends migrate too, with PRISM_POSTGRES_INIT_SCHEMA=1, and
+/// must always build concurrently. `--index-build-workers` sizes only an
+/// offline build, so it is refused without the switch, and so is a count
+/// above PostgreSQL's limit. Clap refuses each before anything connects;
+/// `migrate --help` documents both. That `migrate --offline-indexes`
+/// parses is `database_only_cli_commands_reach_postgres_without_reading_seeds`.
+#[tokio::test]
+async fn offline_indexes_is_a_switch_of_migrate_alone() {
+    for (args, named) in [
+        (&["run", "--offline-indexes"][..], "--offline-indexes"),
+        (&["self-check", "--offline-indexes"], "--offline-indexes"),
+        (&["migrate", "--offline-indexes=true"], "--offline-indexes"),
+        (
+            &["migrate", "--index-build-workers", "8"],
+            "--offline-indexes",
+        ),
+        (
+            &[
+                "migrate",
+                "--offline-indexes",
+                "--index-build-workers",
+                "1025",
+            ],
+            "--index-build-workers",
+        ),
+    ] {
+        let output = configured_command_args(args).await;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: clap's usage exit code"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(named), "{args:?}: {error}");
+    }
+    let help = configured_command_args(&["migrate", "--help"]).await;
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    for flag in ["--offline-indexes", "--index-build-workers"] {
+        assert!(help.contains(flag), "{help}");
+    }
+}
+
+/// `--index-build-memory` is an offline build's maintenance_work_mem, as
+/// PostgreSQL writes one: clap refuses it without `--offline-indexes` and
+/// refuses a size PostgreSQL would refuse, before anything connects, and
+/// `migrate --help` documents it. That a good size parses is
+/// `database_only_cli_commands_reach_postgres_without_reading_seeds`.
+#[tokio::test]
+async fn index_build_memory_is_checked_before_connecting() {
+    for (args, named) in [
+        (
+            &["migrate", "--index-build-memory", "512MB"][..],
+            "--offline-indexes",
+        ),
+        (
+            &[
+                "migrate",
+                "--offline-indexes",
+                "--index-build-memory",
+                "2gb",
+            ],
+            "case-sensitive",
+        ),
+        (
+            &[
+                "migrate",
+                "--offline-indexes",
+                "--index-build-memory",
+                "512kB",
+            ],
+            "between 1MB and 2147483647kB",
+        ),
+    ] {
+        let output = configured_command_args(args).await;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: clap's usage exit code"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(named), "{args:?}: {error}");
+    }
+    let help = configured_command_args(&["migrate", "--help"]).await;
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--index-build-memory"), "{help}");
 }
