@@ -835,24 +835,27 @@ async fn map_batches(
 /// it as it is, and refuses one a deferred `migrate` claimed at fence 1.
 /// `reconnect` opens a connection like `connection`, from the same URL and
 /// settings, to read on should that one be lost while it records 2
-/// (`record_while_serving`). The result says whether it was: the caller
-/// then drops `connection` rather than close it.
+/// (`record_while_serving`), which then marks `run_connection` lost, on
+/// success and failure alike: the caller drops a lost connection rather
+/// than close it (`close_unless_lost`).
 pub(super) async fn apply(
     connection: &mut PgConnection,
     reconnect: &PgConnectOptions,
     backfill: ShareHashBackfill,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<RunConnection> {
+    run_connection: &mut RunConnection,
+) -> Result<()> {
     acquire_runner_lock(connection).await?;
-    let (_, run_connection) = run_to_end(
+    run_to_end(
         connection,
         reconnect,
         backfill,
         &Throttle::default(),
         metrics,
+        run_connection,
     )
     .await?;
-    Ok(run_connection)
+    Ok(())
 }
 
 /// `qbit-prism-server backfill-share-hashes`: finish a backfill that
@@ -864,14 +867,14 @@ pub(super) async fn apply(
 /// the run says so and succeeds, so a retry after a lost reply is safe. It
 /// holds the runners' lock to its end, hours on a production ledger, so a
 /// `migrate` started meanwhile waits for it; an interrupted run resumes at
-/// the cursor. `reconnect`, and whether the run lost `connection`, are as
-/// for `apply`.
+/// the cursor. `reconnect` and `run_connection` are as for `apply`.
 pub(super) async fn finish(
     connection: &mut PgConnection,
     reconnect: &PgConnectOptions,
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<(Finished, RunConnection)> {
+    run_connection: &mut RunConnection,
+) -> Result<Finished> {
     let started = Instant::now();
     tracing::info!(
         version = VERSION,
@@ -888,19 +891,20 @@ pub(super) async fn finish(
             version = VERSION,
             "migration 2's share-hash backfill has finished and 2 is recorded: nothing to map"
         );
-        return Ok((already_complete(), RunConnection::Kept));
+        return Ok(already_complete());
     }
     // Nothing else changes the cursor or the fence while the lock is held:
     // a cursor gone by now went with 2's record.
-    let (finished, run_connection) = run_to_end(
+    Ok(run_to_end(
         connection,
         reconnect,
         ShareHashBackfill::Finish,
         throttle,
         metrics,
+        run_connection,
     )
-    .await?;
-    Ok((finished.unwrap_or_else(already_complete), run_connection))
+    .await?
+    .unwrap_or_else(already_complete))
 }
 
 /// Under the runners' lock, whether the database holds a backfill that
@@ -943,7 +947,8 @@ async fn run_to_end(
     backfill: ShareHashBackfill,
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<(Option<Finished>, RunConnection)> {
+    run_connection: &mut RunConnection,
+) -> Result<Option<Finished>> {
     // The pool's statement and lock timeouts stay in force for the batches:
     // each is one bounded statement, under the throttle's own timeout while
     // frontends serve.
@@ -953,7 +958,7 @@ async fn run_to_end(
             "refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup"
         );
         tracing::info!(version = VERSION, "share-hash backfill already complete");
-        return Ok((None, RunConnection::Kept));
+        return Ok(None);
     };
     // Read under the runners' lock, which the recent range's run holds
     // while it raises the fence to 2, so this run's answer holds until it
@@ -972,7 +977,7 @@ async fn run_to_end(
                 end_seq = progress.end_seq,
                 "migration 2's share-hash backfill permits serving; `qbit-prism-server backfill-share-hashes` maps the rest"
             );
-            return Ok((None, RunConnection::Kept));
+            return Ok(None);
         }
         // Claimed meanwhile: the deferred run's recent range comes first,
         // before 013 drops the index that serves it, so this connect stops
@@ -1008,7 +1013,7 @@ async fn run_to_end(
         }
     );
     let mut mapped: u64 = 0;
-    let run_connection = loop {
+    loop {
         mapped += map_batches(
             connection,
             Pass::Backfill,
@@ -1026,8 +1031,16 @@ async fn run_to_end(
             // batches do, and before the migration lock, which a starting
             // frontend's migration waits for under its lock timeout.
             refuse_double_credit(connection, progress.end_seq, throttle).await?;
-            break record_while_serving(connection, reconnect, &progress, throttle, metrics)
-                .await?;
+            record_while_serving(
+                connection,
+                reconnect,
+                &progress,
+                throttle,
+                metrics,
+                run_connection,
+            )
+            .await?;
+            break;
         }
         // Nothing serves before 2 is recorded at fence 1. Record 2 once the
         // cursor has passed every legacy row, under the migration lock. Like
@@ -1071,8 +1084,8 @@ async fn run_to_end(
         }
         record_2(&mut tx).await?;
         tx.commit().await?;
-        break RunConnection::Kept;
-    };
+        break;
+    }
     tracing::info!(
         version = VERSION,
         mapped,
@@ -1080,14 +1093,11 @@ async fn run_to_end(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "share-hash backfill complete; migration 2 recorded"
     );
-    Ok((
-        Some(Finished {
-            mapped,
-            range: Some((first_seq, progress.next_seq)),
-            elapsed: started.elapsed(),
-        }),
-        run_connection,
-    ))
+    Ok(Some(Finished {
+        mapped,
+        range: Some((first_seq, progress.next_seq)),
+        elapsed: started.elapsed(),
+    }))
 }
 
 /// The fence the database declares under the migration lock, refusing a
@@ -1152,22 +1162,25 @@ async fn record_2(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 /// lock again and redoing the checks made under it, the fence's, the
 /// frozen end's and the double-credit check, which is what a rerun does.
 /// Only an attempt whose own connection answered the read is tried again.
-/// The result says whether the connection was lost, which its caller then
-/// drops rather than closes, and never replaces.
+/// A lost connection is marked so in `run_connection` the moment it is
+/// found lost, whatever the run then comes to, and its caller drops it
+/// rather than close it (`close_unless_lost`), and never replaces it.
 async fn record_while_serving(
     connection: &mut PgConnection,
     reconnect: &PgConnectOptions,
     progress: &Progress,
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<RunConnection> {
+    run_connection: &mut RunConnection,
+) -> Result<()> {
     let mut attempt = 1;
     loop {
         let error = match attempt_record(connection, progress, throttle, metrics).await {
-            Ok(()) => return Ok(RunConnection::Kept),
+            Ok(()) => return Ok(()),
             Err(error) => error,
         };
-        let (state, checked) = check_attempt(connection, reconnect, throttle, &error).await?;
+        let (state, checked) =
+            check_attempt(connection, reconnect, throttle, &error, run_connection).await?;
         let recorded = match recorded_after_all(state) {
             Ok(recorded) => recorded,
             // The refusal, then the failure it followed.
@@ -1182,7 +1195,7 @@ async fn record_while_serving(
                     error = %format!("{error:#}"),
                     "an attempt to record migration 2 failed after its COMMIT: its reply was lost or cancelled, but 2 is recorded and the share-hash cursor is gone, so the backfill is done"
                 );
-                return Ok(checked.run_connection());
+                return Ok(());
             }
             (false, Checked::AttemptLost) => {
                 return Err(error.context(format!(
@@ -1224,14 +1237,33 @@ async fn record_while_serving(
 /// what to run.
 const LOST_LOCK: &str = "The runners' lock went with the lost connection, so this run stops rather than record 2 without it. A COMMIT still in flight there, waiting for a synchronous standby say, can land moments later. Run `qbit-prism-server backfill-share-hashes` again: it takes the lock, then finds 2 recorded and says so, or goes straight to the double-credit check and the record";
 
-/// Whether the run's own connection outlived its record of 2.
+/// Whether the run's own connection outlived its record of 2: marked lost
+/// the moment an attempt, or the read after it, lost it, whether the run
+/// then succeeds or stops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RunConnection {
     /// It answered to the end, and holds the runners' lock.
     Kept,
     /// A record attempt lost it, or got no reply on it within its
-    /// deadline: its close would fail or hang, so the caller drops it.
+    /// deadline: its close could fail, or wait on TCP, so the caller drops
+    /// it (`close_unless_lost`).
     Lost,
+}
+
+/// Close the run's connection, unless the record of 2 lost it: a lost one
+/// is dropped without a word to the server, as its close could fail, or,
+/// half-open, wait on TCP (#750). On success and failure alike.
+pub(super) async fn close_unless_lost(
+    connection: PgConnection,
+    run_connection: RunConnection,
+) -> Result<(), sqlx::Error> {
+    match run_connection {
+        RunConnection::Kept => connection.close().await,
+        RunConnection::Lost => {
+            drop(connection);
+            Ok(())
+        }
+    }
 }
 
 /// Where the read after a failed attempt ran (`check_attempt`).
@@ -1251,25 +1283,18 @@ impl Checked {
     fn lost(&self) -> bool {
         !matches!(self, Self::Kept)
     }
-
-    fn run_connection(&self) -> RunConnection {
-        if self.lost() {
-            RunConnection::Lost
-        } else {
-            RunConnection::Kept
-        }
-    }
 }
 
 /// What the failed `attempt` left, and where it was read: on the attempt's
 /// own connection unless that is lost, else on a fresh one
-/// (`record_state_afresh`). Fails with the refusal to try again when it
-/// cannot tell.
+/// (`record_state_afresh`), with `run_connection` marked lost first. Fails
+/// with the refusal to try again when it cannot tell.
 async fn check_attempt(
     connection: &mut PgConnection,
     reconnect: &PgConnectOptions,
     throttle: &Throttle,
     attempt: &anyhow::Error,
+    run_connection: &mut RunConnection,
 ) -> Result<(RecordState, Checked)> {
     let checked = if connection_lost(attempt) {
         Checked::AttemptLost
@@ -1286,6 +1311,8 @@ async fn check_attempt(
             }
         }
     };
+    // Lost from here on, whatever the fresh read finds.
+    *run_connection = RunConnection::Lost;
     match record_state_afresh(reconnect, throttle).await {
         Ok(state) => Ok((state, checked)),
         Err(fresh) => {
@@ -1327,6 +1354,10 @@ async fn attempt_record(
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
     let deadline = throttle.record_attempt_deadline();
+    #[cfg(test)]
+    let deadline = faults::record_attempt_deadline(connection)
+        .await
+        .unwrap_or(deadline);
     match tokio::time::timeout(
         deadline,
         record_serving_once(connection, progress, throttle, metrics),
@@ -2075,6 +2106,38 @@ pub(crate) mod faults {
     }
 
     static FAULTS: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
+    static ATTEMPT_DEADLINES: Mutex<Vec<(String, std::time::Duration)>> = Mutex::new(Vec::new());
+
+    /// Every record attempt in `schema` gets `deadline` on the client's side
+    /// instead of its own: a test that holds an attempt open inside its
+    /// transaction holds the database's migration lock that long, which the
+    /// other tests in the binary need to migrate their schemas.
+    pub(crate) fn shorten_record_attempts(schema: &str, deadline: std::time::Duration) {
+        ATTEMPT_DEADLINES
+            .lock()
+            .unwrap()
+            .push((schema.to_owned(), deadline));
+    }
+
+    /// The deadline `shorten_record_attempts` set for the connection's
+    /// schema, if any.
+    pub(super) async fn record_attempt_deadline(
+        connection: &mut PgConnection,
+    ) -> Option<std::time::Duration> {
+        if ATTEMPT_DEADLINES.lock().unwrap().is_empty() {
+            return None;
+        }
+        let schema = sqlx::query_scalar::<_, String>("SELECT current_schema()::text")
+            .fetch_one(&mut *connection)
+            .await
+            .ok()?;
+        ATTEMPT_DEADLINES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(shortened, _)| *shortened == schema)
+            .map(|(_, deadline)| *deadline)
+    }
 
     /// Arm `fault` for `schema`.
     pub(crate) fn inject(schema: &str, fault: Fault) {

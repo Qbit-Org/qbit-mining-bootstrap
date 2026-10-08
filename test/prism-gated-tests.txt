@@ -743,6 +743,7 @@ qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_cursor_dropped_after_its_look_up_reads_as_nothing_pending
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_fresh_read_connects_again_while_the_server_turns_it_away
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_attempt_that_committed_before_it_failed_finishes_the_backfill
+qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_unanswered_before_its_commit_stops_at_once_and_never_closes_its_connection
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_commit_reply_never_comes_is_read_afresh_at_its_deadline
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_connection_drops_after_its_commit_is_read_on_a_fresh_connection
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_connection_drops_before_its_commit_stops_for_a_rerun

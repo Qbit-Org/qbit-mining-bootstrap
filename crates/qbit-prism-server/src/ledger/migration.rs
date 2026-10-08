@@ -3822,29 +3822,21 @@ impl Ledger {
         // lock is session-level and ends with it, as the online runners' do.
         let mut connection = self.acquire().await?.detach();
         let reconnect = self.pool.connect_options();
+        let mut run_connection = share_hashes::RunConnection::Kept;
         let outcome = share_hashes::finish(
             &mut connection,
             &reconnect,
             throttle,
             self.metrics.as_deref(),
+            &mut run_connection,
         )
         .await;
-        match outcome {
-            // A record attempt lost the connection, whose close would fail
-            // or hang: dropped, quietly. Its record of 2 was read afresh.
-            Ok((finished, share_hashes::RunConnection::Lost)) => {
-                drop(connection);
-                Ok(finished)
-            }
-            outcome => {
-                let closed = sqlx::Connection::close(connection).await;
-                let (finished, _) = outcome?;
-                closed.context(
-                    "closing the connection that finished migration 2's share-hash backfill",
-                )?;
-                Ok(finished)
-            }
-        }
+        // A connection the record of 2 lost is dropped, not closed, whether
+        // the run finished or stopped.
+        let closed = share_hashes::close_unless_lost(connection, run_connection).await;
+        let finished = outcome?;
+        closed.context("closing the connection that finished migration 2's share-hash backfill")?;
+        Ok(finished)
     }
 
     /// Migration 2's share-hash backfill while it is pending, as

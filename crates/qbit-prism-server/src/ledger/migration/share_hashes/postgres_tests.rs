@@ -97,10 +97,18 @@ async fn a_record_attempt_that_committed_before_it_failed_finishes_the_backfill(
         faults::inject(&db.schema, Fault::LoseRecordCommitReply);
         let throttle = Throttle::default().with_record_attempts(3, Duration::from_millis(100))?;
         let reconnect: PgConnectOptions = db.url.parse()?;
-        let finished = finish(&mut connection, &reconnect, &throttle, None).await;
+        let mut run_connection = RunConnection::Kept;
+        let finished = finish(
+            &mut connection,
+            &reconnect,
+            &throttle,
+            None,
+            &mut run_connection,
+        )
+        .await;
         let fired = !faults::armed(&db.schema);
         connection.close().await?;
-        let (finished, run_connection) = finished?;
+        let finished = finished?;
         ensure!(fired, "the injected failure never fired");
         // Its own connection answered the read, and keeps the runners' lock.
         ensure!(run_connection == RunConnection::Kept, "{run_connection:?}");
@@ -149,10 +157,13 @@ async fn a_connection_lost_while_checking_a_failed_attempt_keeps_both_errors() -
         faults::inject(&db.schema, Fault::LoseConnectionBeforeCheck);
         let throttle = Throttle::default().with_record_attempts(3, Duration::from_millis(100))?;
         let reconnect: PgConnectOptions = db.url.parse()?;
-        let stopped = finish(&mut connection, &reconnect, &throttle, None).await;
+        let mut run_connection = RunConnection::Kept;
+        let stopped = finish(&mut connection, &reconnect, &throttle, None, &mut run_connection).await;
         let fired = !faults::armed(&db.schema);
         drop(connection);
         ensure!(fired, "an injected failure never fired");
+        // Lost to the read: its caller drops it, failed run or not.
+        ensure!(run_connection == RunConnection::Lost, "{run_connection:?}");
         let text = format!(
             "{:#}",
             stopped
@@ -250,7 +261,13 @@ enum Wire {
     /// Hold the reply to that COMMIT, which the server has committed, with
     /// both sockets open: a connection gone half-open.
     Hold,
+    /// Hold the reply to the DELETE itself, before any COMMIT, with both
+    /// sockets open: half-open with 2 unrecorded.
+    HoldBeforeCommit,
 }
+
+/// The record's DELETE of the fence, as `record_2` sends it.
+const RECORD_DELETE: &str = "DELETE FROM qbit_prism_schema_capabilities WHERE capability=$1";
 
 /// A run of `backfill-share-hashes` through the proxy, done: what it came
 /// to, how long it took, and what the test still holds.
@@ -261,6 +278,8 @@ struct Run {
     hold: Option<proxy::CommitPause>,
     finished: Result<Finished>,
     took: Duration,
+    /// From the moment the proxy began holding a reply to the run's end.
+    held: Option<Duration>,
 }
 
 impl Run {
@@ -332,10 +351,27 @@ async fn record_over(
             None
         }
         Wire::Hold => Some(proxy.pause_after_commit("qbit_prism_schema_capabilities", "DELETE")?),
+        Wire::HoldBeforeCommit => Some(proxy.pause_statement(RECORD_DELETE)?),
     };
     let started = std::time::Instant::now();
-    let finished = tokio::time::timeout(bound, operator.backfill_share_hashes(throttle))
-        .await
+    // When the proxy began holding, watched beside the run.
+    let (finished, held_at, ended) = {
+        let mut run = std::pin::pin!(tokio::time::timeout(
+            bound,
+            operator.backfill_share_hashes(throttle)
+        ));
+        let mut held_at = None;
+        let finished = loop {
+            tokio::select! {
+                finished = &mut run => break finished,
+                () = holding(hold.as_ref()), if held_at.is_none() => {
+                    held_at = Some(std::time::Instant::now());
+                }
+            }
+        };
+        (finished, held_at, std::time::Instant::now())
+    };
+    let finished = finished
         .with_context(|| format!("the run outlived its {} s bound", bound.as_secs()))
         .and_then(|finished| finished);
     Ok(Run {
@@ -344,8 +380,19 @@ async fn record_over(
         refusal,
         hold,
         finished,
-        took: started.elapsed(),
+        took: ended - started,
+        held: held_at.map(|at| ended - at),
     })
+}
+
+/// Once `hold` holds a reply; never without one.
+async fn holding(hold: Option<&proxy::CommitPause>) {
+    match hold {
+        Some(hold) => {
+            hold.entered().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// The address `database_url` names.
@@ -694,6 +741,83 @@ async fn a_record_whose_connection_drops_before_its_commit_stops_for_a_rerun() -
         let (recorded_2, cursor, declared) = recorded_state(&db).await?;
         ensure!(
             recorded_2 && cursor.is_none() && declared.is_none(),
+            "2 recorded: {recorded_2}, cursor: {cursor:?}, fence: {declared:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let closed = db.close().await;
+    match (result, closed) {
+        (Ok(()), closed) => closed,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(closed)) => {
+            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
+        }
+    }
+}
+
+/// The record's DELETE gets no reply, the connection left half-open before
+/// any COMMIT, so 2 is not recorded (Codex on #750). The attempt is
+/// abandoned at its client-side deadline, the fresh read finds 2
+/// unrecorded, and the run stops with the rerun instruction within a few
+/// seconds of that deadline: the lost connection is dropped, never closed,
+/// as its close could wait on TCP, so the proxy sees no Terminate on it.
+/// The held attempt holds the migration lock, the database's, so its
+/// deadline is shortened to 3 s for this schema: the other tests in this
+/// binary wait at most 5 s for that lock to migrate theirs.
+#[tokio::test]
+async fn a_record_unanswered_before_its_commit_stops_at_once_and_never_closes_its_connection(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let throttle = patient(Duration::from_millis(300))?;
+        let deadline = Duration::from_secs(3);
+        faults::shorten_record_attempts(&db.schema, deadline);
+        let bound = deadline + throttle.fresh_read_deadline() + Duration::from_secs(60);
+        let run = record_over(&db, Wire::HoldBeforeCommit, None, &throttle, bound).await?;
+        let held = run.held.context("the proxy never held the record's DELETE")?;
+        // The connection that carried the held DELETE, once its relay ends.
+        let lost = run
+            .proxy
+            .executions_since(0)?
+            .into_iter()
+            .find(|execution| execution.sql == RECORD_DELETE)
+            .context("no record DELETE went through the proxy")?
+            .connection;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !run.proxy.ended(lost) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("the lost connection's relay never ended")?;
+        let terminated = run.proxy.terminated(lost);
+        let stopped = run.close().await?;
+        ensure!(
+            held < deadline + Duration::from_secs(3),
+            "the run stopped {held:?} after its DELETE was held, past its attempt's deadline {deadline:?} and a few seconds"
+        );
+        ensure!(
+            !terminated,
+            "the lost connection was closed with a Terminate, not dropped"
+        );
+        let text = format!(
+            "{:#}",
+            stopped
+                .err()
+                .context("recorded 2 over a DELETE that got no reply")?
+        );
+        ensure!(
+            text.contains("refusing to try recording migration 2 again: an attempt lost its connection, and on a fresh one 2 was not recorded when checked")
+                && text.contains("got no reply within")
+                && text.contains("Run `qbit-prism-server backfill-share-hashes` again: it takes the lock"),
+            "{text}"
+        );
+        let (recorded_2, cursor, declared) = recorded_state(&db).await?;
+        ensure!(
+            !recorded_2 && cursor.as_deref() == Some("r") && declared == Some(FENCE_SERVING),
             "2 recorded: {recorded_2}, cursor: {cursor:?}, fence: {declared:?}"
         );
         Ok::<_, anyhow::Error>(())
