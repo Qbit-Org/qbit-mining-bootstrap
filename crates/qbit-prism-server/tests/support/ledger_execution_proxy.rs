@@ -331,6 +331,10 @@ struct State {
     pause_plan: Option<PausePlan>,
     pause_armed: Option<u64>,
     statement_pause: Option<StatementPausePlan>,
+    /// Connections whose client sent `Terminate`, a graceful close.
+    terminated: HashSet<u64>,
+    /// Connections whose relay has ended, both sockets closed.
+    ended: HashSet<u64>,
 }
 
 struct Shared {
@@ -515,6 +519,28 @@ impl ExecutionProxy {
         Ok(CommitPause(control))
     }
 
+    /// Whether the client of connection `id` (an [`Execution::connection`])
+    /// sent `Terminate`, closing it gracefully, rather than only dropping
+    /// the socket. Final once [`Self::ended`] says so.
+    pub fn terminated(&self, id: u64) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("proxy state")
+            .terminated
+            .contains(&id)
+    }
+
+    /// Whether connection `id`'s relay has ended, both its sockets closed.
+    pub fn ended(&self, id: u64) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("proxy state")
+            .ended
+            .contains(&id)
+    }
+
     /// Sequence number of the execution whose acknowledgement the last
     /// planned fault withheld, once it has fired.
     pub fn fired(&self) -> Option<u64> {
@@ -689,7 +715,7 @@ async fn serve(
     let connection = Arc::new(Mutex::new(Connection::default()));
     // Whichever direction ends first (client EOF, server EOF, or a fault)
     // drops both sockets; the server then aborts any open transaction.
-    relay(
+    let relayed = relay(
         pump_client(
             client_read,
             server_write,
@@ -697,9 +723,11 @@ async fn serve(
             shared.clone(),
             id,
         ),
-        pump_server(server_read, client_write, connection, shared, id),
+        pump_server(server_read, client_write, connection, shared.clone(), id),
     )
-    .await
+    .await;
+    shared.state.lock().expect("proxy state").ended.insert(id);
+    relayed
 }
 
 async fn relay(
@@ -860,7 +888,15 @@ async fn pump_client(
                     _ => {}
                 }
             }
-            b'X' => ensure!(body.is_empty(), "invalid Terminate frame"),
+            b'X' => {
+                ensure!(body.is_empty(), "invalid Terminate frame");
+                shared
+                    .state
+                    .lock()
+                    .expect("proxy state")
+                    .terminated
+                    .insert(id);
+            }
             // Other messages used by authentication, extended queries and
             // COPY do not start a separately counted execution. Unknown kinds
             // (including unobserved FunctionCall execution) must not become
@@ -1070,6 +1106,8 @@ fn complete(
         pause_plan,
         pause_armed,
         statement_pause,
+        terminated: _,
+        ended: _,
     } = &mut *state;
     let execution = &mut executions[index];
     if let Some(count) = tag.strip_prefix("SELECT ") {

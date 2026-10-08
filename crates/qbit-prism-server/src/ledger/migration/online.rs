@@ -203,6 +203,7 @@ pub(crate) async fn apply_online_migration(
     let mut connection = crate::metrics::time_pool_acquire(metrics, pool.acquire())
         .await?
         .detach();
+    let mut run_connection = super::share_hashes::RunConnection::Kept;
     let outcome = match migration {
         OnlineMigration::Indexes(migration) => {
             apply(&mut connection, migration, index_build, metrics).await
@@ -211,13 +212,22 @@ pub(crate) async fn apply_online_migration(
             super::partition::apply(&mut connection, migration, metrics).await
         }
         OnlineMigration::ShareHashes(backfill) => {
-            super::share_hashes::apply(&mut connection, *backfill, metrics).await
+            super::share_hashes::apply(
+                &mut connection,
+                &pool.connect_options(),
+                *backfill,
+                metrics,
+                &mut run_connection,
+            )
+            .await
         }
         OnlineMigration::ShareHashesRecent => {
             super::share_hashes::map_recent(&mut connection, metrics).await
         }
     };
-    let closed = connection.close().await;
+    // A connection the share-hash record lost is dropped, not closed,
+    // whether the migration finished or stopped.
+    let closed = super::share_hashes::close_unless_lost(connection, run_connection).await;
     outcome?;
     closed.with_context(|| format!("closing the connection that applied migration {version}"))?;
     Ok(())
