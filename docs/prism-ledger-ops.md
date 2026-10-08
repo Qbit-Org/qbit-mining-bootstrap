@@ -2582,7 +2582,8 @@ unaffected). Finish it once frontends serve, at a time of ordinary load.
    the cursor table's lock, and is tried again after a backoff for about ten
    minutes; a refusal that something held either through every attempt leaves
    2 unrecorded, and a rerun once it is released goes straight to the check
-   and the record. It prints one JSON object with `"recorded": true`. A rerun
+   and the record. An attempt that recorded 2 but lost its reply ends the run
+   as a success: the run reads that 2 is recorded before it would try again. It prints one JSON object with `"recorded": true`. A rerun
    on a database whose backfill finished already prints `"already_complete":
    true` and succeeds. If it refuses with `native share <id> ...
    repeats header <h> ... so that header was credited twice`, frontends may

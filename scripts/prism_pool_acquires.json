@@ -289,7 +289,7 @@
     "ledger/migration/share_hashes.rs::map_batches#1::connection .begin()": [1,"transaction"],
     "ledger/migration/share_hashes.rs::throttled#1::connection .begin()": [1,"transaction"],
     "ledger/migration/share_hashes.rs::run_to_end#1::connection .begin()": [1,"transaction"],
-    "ledger/migration/share_hashes.rs::record_serving_once#1::connection .begin()": [1,"transaction"],
+    "ledger/migration/share_hashes.rs::record_transaction#1::connection .begin()": [1,"transaction"],
     "ledger/migration/share_hashes.rs::map_recent#1::connection .begin()": [1,"transaction"],
     "ledger/policy_transition.rs::transition_policy_in#1::self .begin()": [1,"ledger"],
     "ledger/signing_transition.rs::transition_signing_in#1::self .begin()": [1,"ledger"],

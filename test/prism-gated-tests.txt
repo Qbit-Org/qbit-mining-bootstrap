@@ -739,6 +739,7 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::po
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse
+qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::record_tests::a_record_attempt_that_committed_before_it_failed_finishes_the_backfill
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::a_snapshot_reads_its_writer_timeline_in_the_transaction_that_reads_its_rows
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancellation_and_sql_timeout_release_probe_connection
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancelled_hash_keeps_build_admission_until_blocking_cleanup_finishes

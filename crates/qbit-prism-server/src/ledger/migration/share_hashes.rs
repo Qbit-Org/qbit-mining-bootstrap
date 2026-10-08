@@ -1066,6 +1066,13 @@ async fn record_2(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 /// check and the record. Without the bound the transaction would hold a
 /// snapshot, then an xid, on the serving primary for as long as anything
 /// held either lock (#738).
+///
+/// A failed attempt may have committed all the same: its COMMIT's reply
+/// lost with the connection, or cut short after the commit was written. So
+/// after every failure, before anything else, the run reads what the
+/// attempt left (`record_state`). With 2 recorded and the cursor gone the
+/// backfill is done, and the run says so and succeeds. A retry would meet
+/// the dropped cursor and report a finished backfill as failed.
 async fn record_while_serving(
     connection: &mut PgConnection,
     progress: &Progress,
@@ -1076,9 +1083,33 @@ async fn record_while_serving(
     loop {
         let error = match record_serving_once(connection, progress, throttle, metrics).await {
             Ok(()) => return Ok(()),
-            Err(error) if waited_too_long(&error) => error,
-            Err(error) => return Err(error),
+            Err(error) => error,
         };
+        let state = match record_state(connection, throttle).await {
+            Ok(state) => state,
+            Err(read) => {
+                return Err(read.context(format!(
+                    "refusing to try recording migration 2 again: an attempt failed ({error:#}), and so did reading whether it had recorded 2 all the same. Run `qbit-prism-server backfill-share-hashes` again: it finds 2 recorded and says so, or goes straight to the double-credit check and the record"
+                )))
+            }
+        };
+        let recorded = match recorded_after_all(state) {
+            Ok(recorded) => recorded,
+            // The refusal, then the failure it followed.
+            Err(refusal) => return Err(error.context(refusal.to_string())),
+        };
+        if recorded {
+            tracing::warn!(
+                version = VERSION,
+                attempt,
+                error = %format!("{error:#}"),
+                "an attempt to record migration 2 failed after its COMMIT: its reply was lost or cancelled, but 2 is recorded and the share-hash cursor is gone, so the backfill is done"
+            );
+            return Ok(());
+        }
+        if !waited_too_long(&error) {
+            return Err(error);
+        }
         if attempt == throttle.record_attempts {
             return Err(error.context(format!(
                 "refusing to wait any longer to record migration 2: something held MIGRATION_LOCK or the share-hash cursor through {attempt} attempts over about {}. Every batch committed and no native share repeats a legacy header; 2 is not recorded, and the cursor and the fence stay as they are. Run `qbit-prism-server backfill-share-hashes` again once it is released, which goes straight to that check and the record. Migrating starts hold the lock, and readers of the cursor its table, only briefly; a transaction left open can hold either",
@@ -1114,16 +1145,7 @@ async fn record_serving_once(
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
-    let mut tx = connection.begin().await?;
-    // For this transaction alone. lock_timeout covers the advisory lock
-    // too, which waits in the lock manager as every heavyweight lock does.
-    sqlx::query(
-        "SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$2,true)",
-    )
-    .bind(throttle.statement_timeout_setting())
-    .bind(RECORD_LOCK_TIMEOUT.as_millis().to_string())
-    .execute(&mut *tx)
-    .await?;
+    let mut tx = record_transaction(connection, throttle).await?;
     lock(&mut tx, MIGRATION_LOCK, metrics).await?;
     refuse_newer_fence(&mut tx).await?;
     // Frontends serve: every row at or above the planned end is a native
@@ -1132,7 +1154,74 @@ async fn record_serving_once(
     check_frozen_end(&mut tx, progress).await?;
     record_2(&mut tx).await?;
     tx.commit().await?;
+    #[cfg(test)]
+    faults::after_record_commit(connection).await?;
     Ok(())
+}
+
+/// A transaction of the record's, while frontends serve, under its own
+/// timeouts: the throttle's statement timeout, and `RECORD_LOCK_TIMEOUT`
+/// for any lock, the advisory lock included, which waits in the lock
+/// manager as every heavyweight lock does.
+///
+/// The statement timeout covers the COMMIT too. Under synchronous
+/// replication a COMMIT waits for the standby with its xid still running
+/// and its locks held, which #738 rules out for long. Cancelling that wait
+/// leaves the commit local: PostgreSQL then reports the COMMIT done, with a
+/// warning that the standby may not have it yet, and a failover before the
+/// standby applies it leaves 2 unrecorded there with the cursor at its end,
+/// which a rerun records. Any way an attempt can fail after its commit, a
+/// reply lost with the connection among them, is caught by the read that
+/// follows every failed attempt (`record_while_serving`).
+async fn record_transaction<'c>(
+    connection: &'c mut PgConnection,
+    throttle: &Throttle,
+) -> Result<Transaction<'c, Postgres>> {
+    let mut tx = connection.begin().await?;
+    sqlx::query(
+        "SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$2,true)",
+    )
+    .bind(throttle.statement_timeout_setting())
+    .bind(RECORD_LOCK_TIMEOUT.as_millis().to_string())
+    .execute(&mut *tx)
+    .await?;
+    Ok(tx)
+}
+
+/// What a failed record attempt left: whether 2 is recorded and whether
+/// the cursor table exists, read in one statement of a fresh record
+/// transaction.
+async fn record_state(connection: &mut PgConnection, throttle: &Throttle) -> Result<RecordState> {
+    let mut tx = record_transaction(connection, throttle).await?;
+    let (recorded, cursor): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM qbit_prism_schema_migrations WHERE version=$1),EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=current_schema()::regnamespace AND relname='qbit_prism_share_hash_backfill')",
+    )
+    .bind(VERSION)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(RecordState { recorded, cursor })
+}
+
+/// Whether 2 is recorded, and whether the cursor table exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordState {
+    recorded: bool,
+    cursor: bool,
+}
+
+/// Whether a failed attempt recorded 2 after all: 2 recorded and the cursor
+/// gone. An attempt that committed nothing leaves 2 unrecorded and the
+/// cursor in place. The one transaction that records 2 drops the cursor in
+/// the same commit, so any other state was made by hand meanwhile, and is
+/// refused rather than retried.
+fn recorded_after_all(state: RecordState) -> Result<bool> {
+    match (state.recorded, state.cursor) {
+        (true, false) => Ok(true),
+        (false, true) => Ok(false),
+        (true, true) => bail!("refusing to record migration 2: after an attempt to record it failed, 2 is recorded, but its share-hash backfill's cursor qbit_prism_share_hash_backfill still exists. Only the transaction that records 2 drops the cursor, in the same commit, so 2 was recorded by hand, or the cursor restored, meanwhile. Every start refuses the database while the cursor exists; find out which before changing anything"),
+        (false, false) => bail!("refusing to record migration 2: after an attempt to record it failed, its share-hash backfill's cursor qbit_prism_share_hash_backfill is gone, but 2 is not recorded. Only the transaction that records 2 drops the cursor, in the same commit, so it was dropped by hand meanwhile. Restore the full backup"),
+    }
 }
 
 /// Whether an attempt failed only because it waited too long: on a lock,
@@ -1640,6 +1729,63 @@ pub(crate) async fn refuse_departure_while_pending(
     Ok(())
 }
 
+/// Faults a test injects into the record of 2, keyed by the schema the
+/// record runs in, so that the other tests in the binary never meet them.
+/// Each fires once.
+#[cfg(test)]
+pub(crate) mod faults {
+    use sqlx::PgConnection;
+    use std::sync::Mutex;
+
+    static LOST_COMMIT_REPLIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// The next record attempt in `schema` commits, then fails with the
+    /// statement timeout's 57014, as an attempt whose COMMIT reply was cut
+    /// short after the commit would.
+    pub(crate) fn lose_record_commit_reply(schema: &str) {
+        LOST_COMMIT_REPLIES.lock().unwrap().push(schema.to_owned());
+    }
+
+    /// Whether `schema`'s injected failure has yet to fire.
+    pub(crate) fn armed(schema: &str) -> bool {
+        LOST_COMMIT_REPLIES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|armed| armed == schema)
+    }
+
+    /// After a record attempt's COMMIT: the failure injected for the
+    /// connection's schema, if any, as PostgreSQL's own error from a
+    /// statement of its own.
+    pub(super) async fn after_record_commit(connection: &mut PgConnection) -> anyhow::Result<()> {
+        let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+            .fetch_one(&mut *connection)
+            .await?;
+        let fired = {
+            let mut armed = LOST_COMMIT_REPLIES.lock().unwrap();
+            armed
+                .iter()
+                .position(|armed| *armed == schema)
+                .map(|at| armed.remove(at))
+        };
+        if fired.is_none() {
+            return Ok(());
+        }
+        match sqlx::raw_sql("DO $$BEGIN RAISE EXCEPTION 'canceling statement due to statement timeout' USING ERRCODE = 'query_canceled'; END$$")
+            .execute(&mut *connection)
+            .await
+        {
+            Ok(_) => anyhow::bail!("the injected statement timeout raised nothing"),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "share_hashes/record_tests.rs"]
+mod record_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1763,6 +1909,32 @@ mod tests {
         assert!(throttle
             .with_record_attempts(3, Duration::from_secs(31))
             .is_err());
+    }
+
+    /// After a failed record attempt, the backfill is done only with 2
+    /// recorded and the cursor gone, and is tried again only with 2
+    /// unrecorded and the cursor in place; either other state is refused,
+    /// never retried.
+    #[test]
+    fn a_failed_record_attempt_recorded_2_only_with_the_cursor_gone() {
+        let state = |recorded, cursor| RecordState { recorded, cursor };
+        assert!(recorded_after_all(state(true, false)).unwrap());
+        assert!(!recorded_after_all(state(false, true)).unwrap());
+        let both = recorded_after_all(state(true, true))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            both.contains("2 is recorded, but its share-hash backfill's cursor qbit_prism_share_hash_backfill still exists"),
+            "{both}"
+        );
+        let neither = recorded_after_all(state(false, false))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            neither
+                .contains("cursor qbit_prism_share_hash_backfill is gone, but 2 is not recorded"),
+            "{neither}"
+        );
     }
 
     #[test]
