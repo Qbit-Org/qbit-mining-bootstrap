@@ -422,6 +422,22 @@ async fn job_window(f: &Fixture, job_id: &str) -> Result<Option<PreparedWindow>>
     .await?)
 }
 
+/// The last share of the prepared window behind issued job `job_id`, read in
+/// `schema` through `pool`: `None` when the job's issued row or its prepared
+/// record is absent there, `Some(None)` for a window without shares.
+async fn prepared_last_share(
+    pool: &PgPool,
+    schema: &str,
+    job_id: &str,
+) -> Result<Option<Option<i64>>> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(&format!(
+        "SELECT p.window_last_share_seq FROM {schema}.qbit_prism_jobs j JOIN {schema}.qbit_prism_jobs p ON p.job_id=j.payload->>'prepared_key' WHERE j.job_id=$1"
+    ))
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// Until `block` is confirmed on the promoted primary; a timeout names the
 /// candidate's state and last error.
 async fn landed(f: &Fixture, block: &str) -> Result<()> {
@@ -552,7 +568,7 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
         },
     )
     .await?;
-    // A session opened inside the gap, once server 0 has prepared work over
+    // A session opened inside the gap, on work server 0 has published over
     // it (it re-anchors every second): its job, and the payout its coinbase
     // commits to, come from a window the promotion will lose.
     let replicated: i64 = sqlx::query_scalar(&format!(
@@ -569,20 +585,66 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
         .await?)
     })
     .await?;
-    let mut gap_miner =
-        ShareClient::connect(f.stratum[0], &format!("{}.b474-gap", address(f).await?)).await?;
+    // The saved row is not yet the work a new session is issued: server 0
+    // commits it, checks the node and the ledger again, and only then
+    // publishes the work (#724). A session opened in between is issued the
+    // work published before, whose window can end before the cut. So the
+    // gap session is opened again, for up to a few reanchor intervals while
+    // the miners keep submitting in the gap, until its first job's window
+    // reaches past the replicated share. A replaced session solves and
+    // submits nothing, so the book, which holds the four miners'
+    // submissions and kept work, never sees it; the replaced sessions'
+    // windows are reported with the result. Issuance saves a job and its
+    // prepared record before it announces the job, so a first job without
+    // them is a fault, not older work.
+    let gap_username = format!("{}.b474-gap", address(f).await?);
+    let bound = Duration::from_secs(5);
+    let opening = Instant::now();
+    let mut older = Vec::new();
+    let (mut gap_miner, gap_job, gap_window) = loop {
+        let left = bound.saturating_sub(opening.elapsed());
+        ensure!(
+            !left.is_zero(),
+            "the gap-issued job's window does not reach past the replicated share {replicated}: in the {:.1?} after server 0 saved work over the gap, it issued {} new session(s) only older work (their windows' last shares: {older:?})",
+            opening.elapsed(),
+            older.len()
+        );
+        let pass = tokio::time::timeout(left, async {
+            let session = ShareClient::connect(f.stratum[0], &gap_username).await?;
+            let job = session
+                .job_id()
+                .context("the gap session's first job has no id")?
+                .to_owned();
+            let window = prepared_last_share(&primary, &schema, &job).await?;
+            Ok::<_, anyhow::Error>((session, job, window))
+        })
+        .await;
+        let Ok(pass) = pass else {
+            bail!(
+                "no gap session had a first job and its window within {bound:?} after server 0 saved work over the gap ({:.1?} elapsed); {} earlier session(s) were issued only older work (their windows' last shares: {older:?})",
+                opening.elapsed(),
+                older.len()
+            );
+        };
+        let (session, job, window) = pass?;
+        match window {
+            Some(Some(last)) if last > replicated => break (session, job, last),
+            Some(last) => older.push(last),
+            None => bail!(
+                "server 0 issued gap session job {job}, but the old primary holds no issued row or prepared record for it, which issuance saves before it announces a job"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    timeline.mark("gap session opened on published work");
     let gap_share = gap_miner.solve(Proof::Share).await?;
     let gap_block = gap_miner.solve(Proof::Block).await?;
-    let gap_window: Option<i64> = sqlx::query_scalar(&format!(
-        "SELECT p.window_last_share_seq FROM {schema}.qbit_prism_jobs j JOIN {schema}.qbit_prism_jobs p ON p.job_id=j.payload->>'prepared_key' WHERE j.job_id=$1"
-    ))
-    .bind(gap_block.0[1].as_str().context("gap job id missing")?)
-    .fetch_optional(&primary)
-    .await?
-    .flatten();
     ensure!(
-        gap_window.is_some_and(|last| last > replicated),
-        "the gap-issued job's window (last share {gap_window:?}) does not reach past the replicated share {replicated}"
+        gap_share.0[1].as_str() == Some(gap_job.as_str())
+            && gap_block.0[1].as_str() == Some(gap_job.as_str()),
+        "the gap share and block were solved on jobs {} and {}, not on the gap session's first job {gap_job}, whose window reaches past the replicated share {replicated}",
+        gap_share.0[1],
+        gap_block.0[1]
     );
 
     // Fence the old writer with COMMITs in flight.
@@ -1109,7 +1171,7 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
         "live async promotion with live miners: {} shares offered by {MINERS} miners on 2 frontends: {} acknowledged, {} rejected {rejected:?}, {} unknown {unknown:?}; \
          {} in flight at the fence, answered {:?}; {} committed before the cut, {} lost in the gap ({gap_bytes} WAL bytes), of which {} acknowledged: {acked_missing:?} ({} of them answered before the cut flag: {acked_before_cut:?}); \
          the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, {on_new_tip} surviving session(s) credited on work for the new tip, a surviving share replayed: {}; \
-         the gap-issued block: {}; the final block {} paid {} shares, a full read of the promoted window (sessions replaced first for a stale window: {stale_windows:?}; new sessions right after the move: {first_jobs:?}) (of which sequence numbers a lost share had: {paid_reused:?}); {} lost sequence number(s) since reused: {replaced:?}; timeline: {}",
+         the gap-issued block: {} (gap sessions replaced first for older work, their windows' last shares: {older:?}); the final block {} paid {} shares, a full read of the promoted window (sessions replaced first for a stale window: {stale_windows:?}; new sessions right after the move: {first_jobs:?}) (of which sequence numbers a lost share had: {paid_reused:?}); {} lost sequence number(s) since reused: {replaced:?}; timeline: {}",
         records.len(),
         count(|outcome| *outcome == Outcome::Acknowledged),
         count(|outcome| matches!(outcome, Outcome::Rejected(_))),

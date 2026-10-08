@@ -538,6 +538,15 @@ impl ShareClient {
         self.session.work_on(parent, limit).await
     }
 
+    /// The id of the latest job read so far, the one [`ShareClient::solve`]
+    /// solves next; reads nothing more from the server.
+    pub(crate) fn job_id(&self) -> Option<&str> {
+        self.session
+            .notify
+            .as_ref()
+            .and_then(|notify| notify["params"][0].as_str())
+    }
+
     /// Solve the latest job for `proof`, submit it, and wait for the answer.
     /// An error means nothing was submitted; a failure after the submission
     /// is [`Answer::TimedOut`] or [`Answer::Lost`].
