@@ -2971,7 +2971,9 @@ async fn plain_migrate_at_the_default_throttle(options: MigrateOptions) -> Resul
 /// warns that `backfill-share-hashes` has still to run, without failing on
 /// it: here it fails on the node it cannot reach, and only on that. Once 2
 /// is recorded, the field and the warning are gone. One it cannot read is
-/// `unknown`, with why, never taken for done.
+/// `unknown`, with why, never taken for done: a cursor beside a missing
+/// capability table, which holds the fence, or a view under the cursor's
+/// name.
 #[tokio::test]
 async fn self_check_reports_a_deferred_backfill_without_failing_on_it() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -3027,6 +3029,27 @@ async fn self_check_reports_a_deferred_backfill_without_failing_on_it() -> Resul
         stderr.contains(&format!("WARNING: migration 2's share-hash backfill is pending (share_hash_backfill_pending = 2): the legacy shares from share_seq {first} up to {end}"))
             && stderr.contains("Run `qbit-prism-server backfill-share-hashes` while frontends serve")
             && stderr.contains("qbit RPC getblockhash transport failed"),
+        "{stderr}"
+    );
+    // The read misses the capability table, not the cursor: that is no
+    // finished backfill, and the error is reported (Codex on #746).
+    sqlx::raw_sql("ALTER TABLE qbit_prism_schema_capabilities RENAME TO test_capabilities_aside")
+        .execute(&pool)
+        .await?;
+    let missing = self_check().await;
+    sqlx::raw_sql("ALTER TABLE test_capabilities_aside RENAME TO qbit_prism_schema_capabilities")
+        .execute(&pool)
+        .await?;
+    let (ok, report, stderr) = missing?;
+    let backfill = &report["share_hash_backfill"];
+    ensure!(
+        !ok && backfill["state"] == "unknown"
+            && backfill["error"].as_str().is_some_and(|error| error
+                .contains("relation \"qbit_prism_schema_capabilities\" does not exist")),
+        "{report}"
+    );
+    ensure!(
+        stderr.contains("WARNING: migration 2's share-hash backfill could not be read"),
         "{stderr}"
     );
     let operator = Ledger::connect_operator(&db.url, false).await?;

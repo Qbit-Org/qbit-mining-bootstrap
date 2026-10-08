@@ -565,14 +565,24 @@ async fn cursor_row(connection: &mut PgConnection, select: &str) -> Result<Optio
             super::online::relation_kind(kind)
         ),
     }
+    #[cfg(test)]
+    faults::before_cursor_read(connection).await?;
     let row = match sqlx::query(select).fetch_optional(&mut *connection).await {
         Ok(row) => row,
         // Dropped since the look-up by the transaction that records 2, as a
-        // start or a self-check that takes no migration lock can see. Every
-        // other caller holds a lock that transaction needs, so this is
-        // outside any transaction it could leave aborted.
+        // start or a self-check that takes no migration lock can see:
+        // nothing is pending. Only if the cursor is gone, though. The read
+        // can miss another relation it needs, as `pending` does when the
+        // capability table it reads the fence from is gone, and that is
+        // damage to report, never a finished backfill. Every other caller holds a
+        // lock that transaction needs, so this is outside any transaction
+        // it could leave aborted, and the look-up can run again.
         Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
-            return Ok(None)
+            if let Ok(None) = cursor_relation(connection).await {
+                return Ok(None);
+            }
+            return Err(anyhow::Error::from(sqlx::Error::Database(error))
+                .context("reading migration 2's share-hash backfill cursor"));
         }
         Err(error) => return Err(error.into()),
     };
@@ -1729,47 +1739,66 @@ pub(crate) async fn refuse_departure_while_pending(
     Ok(())
 }
 
-/// Faults a test injects into the record of 2, keyed by the schema the
-/// record runs in, so that the other tests in the binary never meet them.
-/// Each fires once.
+/// Faults a test injects into the backfill's reads and its record of 2,
+/// keyed by the schema they run in, so that the other tests in the binary
+/// never meet them. Each fires once.
 #[cfg(test)]
 pub(crate) mod faults {
     use sqlx::PgConnection;
     use std::sync::Mutex;
 
-    static LOST_COMMIT_REPLIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    /// The next record attempt in `schema` commits, then fails with the
-    /// statement timeout's 57014, as an attempt whose COMMIT reply was cut
-    /// short after the commit would.
-    pub(crate) fn lose_record_commit_reply(schema: &str) {
-        LOST_COMMIT_REPLIES.lock().unwrap().push(schema.to_owned());
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        /// The record attempt commits, then fails with the statement
+        /// timeout's 57014, as an attempt whose COMMIT reply was cut short
+        /// after the commit would.
+        LoseRecordCommitReply,
+        /// A read of the cursor first runs this SQL, after the look-up that
+        /// found the cursor: what another session can do between the two.
+        BeforeCursorRead(String),
     }
 
-    /// Whether `schema`'s injected failure has yet to fire.
+    static FAULTS: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
+
+    /// Arm `fault` for `schema`.
+    pub(crate) fn inject(schema: &str, fault: Fault) {
+        FAULTS.lock().unwrap().push((schema.to_owned(), fault));
+    }
+
+    /// Whether a fault for `schema` has yet to fire.
     pub(crate) fn armed(schema: &str) -> bool {
-        LOST_COMMIT_REPLIES
+        FAULTS
             .lock()
             .unwrap()
             .iter()
-            .any(|armed| armed == schema)
+            .any(|(armed, _)| armed == schema)
     }
 
-    /// After a record attempt's COMMIT: the failure injected for the
-    /// connection's schema, if any, as PostgreSQL's own error from a
-    /// statement of its own.
-    pub(super) async fn after_record_commit(connection: &mut PgConnection) -> anyhow::Result<()> {
+    /// The fault `wanted` picks for the connection's schema, disarmed.
+    async fn take(
+        connection: &mut PgConnection,
+        wanted: impl Fn(&Fault) -> bool,
+    ) -> anyhow::Result<Option<Fault>> {
+        if FAULTS.lock().unwrap().is_empty() {
+            return Ok(None);
+        }
         let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
             .fetch_one(&mut *connection)
             .await?;
-        let fired = {
-            let mut armed = LOST_COMMIT_REPLIES.lock().unwrap();
-            armed
-                .iter()
-                .position(|armed| *armed == schema)
-                .map(|at| armed.remove(at))
-        };
-        if fired.is_none() {
+        let mut faults = FAULTS.lock().unwrap();
+        Ok(faults
+            .iter()
+            .position(|(armed, fault)| *armed == schema && wanted(fault))
+            .map(|at| faults.remove(at).1))
+    }
+
+    /// After a record attempt's COMMIT: `LoseRecordCommitReply`, as
+    /// PostgreSQL's own error from a statement of its own.
+    pub(super) async fn after_record_commit(connection: &mut PgConnection) -> anyhow::Result<()> {
+        if take(connection, |fault| *fault == Fault::LoseRecordCommitReply)
+            .await?
+            .is_none()
+        {
             return Ok(());
         }
         match sqlx::raw_sql("DO $$BEGIN RAISE EXCEPTION 'canceling statement due to statement timeout' USING ERRCODE = 'query_canceled'; END$$")
@@ -1780,11 +1809,23 @@ pub(crate) mod faults {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Between the cursor's look-up and its read: `BeforeCursorRead`.
+    pub(super) async fn before_cursor_read(connection: &mut PgConnection) -> anyhow::Result<()> {
+        if let Some(Fault::BeforeCursorRead(sql)) = take(connection, |fault| {
+            matches!(fault, Fault::BeforeCursorRead(_))
+        })
+        .await?
+        {
+            sqlx::raw_sql(&sql).execute(&mut *connection).await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-#[path = "share_hashes/record_tests.rs"]
-mod record_tests;
+#[path = "share_hashes/postgres_tests.rs"]
+mod postgres_tests;
 
 #[cfg(test)]
 mod tests {

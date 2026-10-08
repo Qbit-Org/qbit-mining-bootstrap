@@ -1,9 +1,11 @@
-//! The record of 2 while frontends serve, against a real PostgreSQL. An
-//! attempt whose COMMIT committed, but whose reply was then lost or cut
-//! short, has finished the backfill: the run reports it done, and never
-//! retries into the cursor that commit dropped (Codex on #746). Faults are
-//! keyed by schema, so the other tests in this binary never meet them.
-use super::faults;
+//! The share-hash backfill's seams that only an injected fault reaches,
+//! against a real PostgreSQL (Codex on #746). An attempt to record 2 whose
+//! COMMIT committed, but whose reply was then lost or cut short, has
+//! finished the backfill: the run reports it done, and never retries into
+//! the cursor that commit dropped. A cursor dropped between its look-up
+//! and its read reads as nothing pending. Faults are keyed by schema, so
+//! the other tests in this binary never meet them.
+use super::faults::{self, Fault};
 use super::*;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
@@ -88,7 +90,7 @@ async fn a_record_attempt_that_committed_before_it_failed_finishes_the_backfill(
     let result = async {
         let mut connection = PgConnection::connect(&db.url).await?;
         pending_at_its_end(&mut connection).await?;
-        faults::lose_record_commit_reply(&db.schema);
+        faults::inject(&db.schema, Fault::LoseRecordCommitReply);
         let throttle = Throttle::default().with_record_attempts(3, Duration::from_millis(100))?;
         let finished = finish(&mut connection, &throttle, None).await;
         let fired = !faults::armed(&db.schema);
@@ -110,6 +112,48 @@ async fn a_record_attempt_that_committed_before_it_failed_finishes_the_backfill(
             recorded_2 && cursor.is_none() && declared.is_none(),
             "2 recorded: {recorded_2}, cursor: {cursor:?}, fence: {declared:?}"
         );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let closed = db.close().await;
+    match (result, closed) {
+        (Ok(()), closed) => closed,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(closed)) => {
+            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
+        }
+    }
+}
+
+/// A cursor dropped after the look-up that found it, as the transaction
+/// that records 2 drops it under a reader that takes no migration lock,
+/// reads as nothing pending, through either reader of the cursor: the
+/// read's 42P01 is the cursor's own, and it is gone when looked up again.
+/// The read's 42P01 for any other relation is an error (`self-check`'s
+/// test in `ledger_postgres` holds that).
+#[tokio::test]
+async fn a_cursor_dropped_after_its_look_up_reads_as_nothing_pending() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let drop_cursor =
+        || Fault::BeforeCursorRead("DROP TABLE qbit_prism_share_hash_backfill".into());
+    let result = async {
+        let mut connection = PgConnection::connect(&db.url).await?;
+        pending_at_its_end(&mut connection).await?;
+        faults::inject(&db.schema, drop_cursor());
+        let read = pending(&mut connection).await;
+        ensure!(!faults::armed(&db.schema), "the injected drop never ran");
+        ensure!(read?.is_none(), "a dropped cursor read as pending");
+        let mut tx = connection.begin().await?;
+        create_cursor(&mut tx).await?;
+        tx.commit().await?;
+        faults::inject(&db.schema, drop_cursor());
+        let read = progress(&mut connection).await;
+        ensure!(!faults::armed(&db.schema), "the injected drop never ran");
+        ensure!(read?.is_none(), "a dropped cursor read as pending");
+        ensure!(cursor_relation(&mut connection).await?.is_none());
+        connection.close().await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
