@@ -10,13 +10,15 @@
 //! index definitions it declares as this server's PostgreSQL renders them;
 //! nothing here parses SQL. After the migration transaction has committed, the
 //! runner below builds each new index with `CREATE INDEX CONCURRENTLY`, drops
-//! each replaced one with `DROP INDEX CONCURRENTLY`, and records the version
-//! last, on a dedicated connection with no statement or lock timeout, under a
-//! session-level advisory lock keyed by the ledger's schema, so two starting
-//! frontends never build the same index twice. Existing native ledgers always
-//! use this runner, even without visible shares: writers do not take the
-//! migration lock. Only fresh or empty 2.x.x sources apply the file inside
-//! `migrate_schema`'s transaction, while its cutover locks exclude writers.
+//! each replaced one with `DROP INDEX CONCURRENTLY` (with plain statements in
+//! one transaction instead under `migrate --offline-indexes`, below), and
+//! records the version last, on a dedicated connection with no statement or
+//! lock timeout, under a session-level advisory lock keyed by the ledger's
+//! schema, so two starting frontends never build the same index twice.
+//! Existing native ledgers always use this runner, even without visible
+//! shares: writers do not take the migration lock. Only fresh or empty 2.x.x
+//! sources apply the file inside `migrate_schema`'s transaction, while its
+//! cutover locks exclude writers.
 //!
 //! The runner is resumable. An interrupted build leaves an invalid index
 //! behind, still maintained by every insert; the next run drops it and
@@ -43,6 +45,22 @@
 //! before the version is recorded. The next start plans afresh from what
 //! it finds and keeps that.
 //!
+//! `migrate --offline-indexes` (`IndexBuildMode::Offline`) builds 013's and
+//! 024's indexes the other way, for a migrate with no instance live, such as
+//! a cutover's (`apply_offline`). One transaction takes the migration lock,
+//! refuses an instance that has not reported drained or stopped and a live
+//! legacy writer lease before any DDL, and locks the tables ACCESS EXCLUSIVE
+//! with a 5 s lock timeout. It runs the same plan with a plain, parallel
+//! `CREATE INDEX` of the rendered definition and a plain `DROP INDEX`,
+//! verifies the declared set and records the version as it commits. A plain
+//! build reads the table once and waits for no other transaction, where a
+//! concurrent one reads it twice and waits for every transaction that could
+//! use the index. An interrupted migration rolls back whole, leaving no
+//! invalid index and no partial drop, while the migrations the run recorded
+//! before it stay recorded, and a rerun without the flag builds
+//! concurrently. Frontends never build offline: they run this loop too, with
+//! `PRISM_POSTGRES_INIT_SCHEMA=1`.
+//!
 //! The same entry point runs 002's share-hash backfill on a populated 2.x.x
 //! source (`share_hashes.rs`, #582). 002's file is applied in the migration
 //! transaction like any other; only the mapping of the legacy shares is
@@ -60,7 +78,9 @@ use std::time::{Duration, Instant};
 /// One migration applied after the commit, by the runner its kind names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OnlineMigration {
-    /// Index creates and drops, applied with `CONCURRENTLY` (013, 024).
+    /// Index creates and drops, applied with `CONCURRENTLY` (013, 024), or
+    /// with plain statements in one transaction under
+    /// `migrate --offline-indexes` (`IndexBuildMode`).
     Indexes(IndexMigration),
     /// The share ledger partition conversion (017, `partition.rs`).
     Partitions(super::partition::PartitionMigration),
@@ -146,12 +166,35 @@ pub(super) fn derive(
     })
 }
 
+/// How an index migration's builds and drops reach the source (013, 024).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndexBuildMode {
+    /// `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY`, statement
+    /// by statement, while appends continue: every connect's, a frontend's
+    /// with `PRISM_POSTGRES_INIT_SCHEMA=1` included.
+    #[default]
+    Concurrent,
+    /// A plain `CREATE INDEX` and `DROP INDEX` in the transaction that
+    /// records the version, each build with up to `workers` parallel
+    /// maintenance workers, once no instance is live
+    /// (`migrate --offline-indexes`, `apply_offline`).
+    Offline {
+        workers: u16,
+        /// maintenance_work_mem for the transaction, in kilobytes
+        /// (`--index-build-memory`). `None` takes 2GB, or the server's
+        /// setting when that is higher.
+        memory_kb: Option<u32>,
+    },
+}
+
 /// Apply one online migration to the source and record it. Idempotent:
 /// what an earlier run built or dropped is kept, and a version another
-/// instance recorded meanwhile is not applied again.
+/// instance recorded meanwhile is not applied again. `index_build` is how
+/// an index migration builds; the other runners ignore it.
 pub(crate) async fn apply_online_migration(
     pool: &PgPool,
     migration: &OnlineMigration,
+    index_build: IndexBuildMode,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
     let version = migration.version();
@@ -161,7 +204,9 @@ pub(crate) async fn apply_online_migration(
         .await?
         .detach();
     let outcome = match migration {
-        OnlineMigration::Indexes(migration) => apply(&mut connection, migration, metrics).await,
+        OnlineMigration::Indexes(migration) => {
+            apply(&mut connection, migration, index_build, metrics).await
+        }
         OnlineMigration::Partitions(migration) => {
             super::partition::apply(&mut connection, migration, metrics).await
         }
@@ -200,12 +245,14 @@ pub(super) async fn acquire_runner_lock(connection: &mut PgConnection) -> Result
 async fn apply(
     connection: &mut PgConnection,
     migration: &IndexMigration,
+    index_build: IndexBuildMode,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
     let version = migration.version;
     // A build on a large ledger runs for hours, and CONCURRENTLY waits for
     // every transaction that could use the index; the pool's per-statement
     // and lock timeouts would abort it. Session-level, on this connection.
+    // An offline run sets its own lock timeout, for its transaction.
     sqlx::query(
         "SELECT set_config('statement_timeout','0',false),set_config('lock_timeout','0',false)",
     )
@@ -216,6 +263,20 @@ async fn apply(
         tracing::info!(version, "online migration already recorded");
         return Ok(());
     }
+    match index_build {
+        IndexBuildMode::Concurrent => apply_concurrently(connection, migration, metrics).await,
+        IndexBuildMode::Offline { workers, memory_kb } => {
+            apply_offline(connection, migration, workers, memory_kb, metrics).await
+        }
+    }
+}
+
+/// The plan for `migration`, from what each name it reserves holds now.
+async fn plan<'a>(
+    connection: &mut PgConnection,
+    migration: &'a IndexMigration,
+) -> Result<Vec<Step<'a>>> {
+    let version = migration.version;
     // Every reserved name is inspected before any DDL, so a refusal leaves
     // the database as it was: an index built before a refusal would be
     // adopted on the next run, but the operator is told that nothing
@@ -266,7 +327,159 @@ async fn apply(
             ),
         }
     }
+    Ok(plan)
+}
+
+/// Run the plan statement by statement with `CONCURRENTLY`, appends
+/// continuing, then record the version.
+async fn apply_concurrently(
+    connection: &mut PgConnection,
+    migration: &IndexMigration,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<()> {
+    let plan = plan(connection, migration).await?;
     let mut progress = Progress::default();
+    run_plan(
+        connection,
+        migration.version,
+        plan,
+        IndexBuildMode::Concurrent,
+        &mut progress,
+    )
+    .await?;
+    let mut tx = connection.begin().await?;
+    lock(&mut tx, MIGRATION_LOCK, metrics).await?;
+    record(tx, migration, &progress).await
+}
+
+/// `migrate --offline-indexes`: the plan run in one transaction that
+/// records the version, with a plain `CREATE INDEX` of each rendered
+/// definition and a plain `DROP INDEX`, once no instance is live (`apply`
+/// has set the session up, taken the runner lock and found the version
+/// unrecorded). Every append and read of the tables waits for the build,
+/// so before any DDL the transaction refuses an instance that has not
+/// reported drained or stopped and a live legacy writer lease, keeping
+/// the instance and lease tables locked until it commits so that none
+/// registers meanwhile, and it takes the tables' locks with a 5 s lock
+/// timeout: a writer or reader still open on them, or one that slipped
+/// past the instance check, ends the run there instead of queuing every
+/// later statement behind it.
+///
+/// Anything that ends the transaction before its commit, a refusal, an
+/// error or an interruption, rolls this migration back whole: no invalid
+/// index stays behind, nothing is dropped and the version is not recorded,
+/// so every refusal says the migration changed nothing. The migrations
+/// this `migrate` recorded before it stay recorded. A rerun without the
+/// flag builds concurrently.
+async fn apply_offline(
+    connection: &mut PgConnection,
+    migration: &IndexMigration,
+    workers: u16,
+    memory_kb: Option<u32>,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<()> {
+    let version = migration.version;
+    let mode = IndexBuildMode::Offline { workers, memory_kb };
+    let mut tx = connection.begin().await?;
+    lock(&mut tx, MIGRATION_LOCK, metrics).await?;
+    // For this transaction only. A parallel build divides
+    // maintenance_work_mem among its leader and workers: the operator's
+    // `--index-build-memory`, or at least 2GB unless the server's is higher.
+    let memory = memory_kb.map(|kb| format!("{kb}kB"));
+    sqlx::query("SELECT set_config('lock_timeout','5s',true),set_config('max_parallel_maintenance_workers',$1,true),set_config('maintenance_work_mem',COALESCE($2,CASE WHEN pg_size_bytes(current_setting('maintenance_work_mem'))<pg_size_bytes('2GB') THEN '2GB' ELSE current_setting('maintenance_work_mem') END),true)")
+        .bind(workers.to_string())
+        .bind(&memory)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "PostgreSQL refused migration {version}'s offline build settings ({workers} workers, maintenance_work_mem {}); pass --index-build-workers and --index-build-memory values it accepts",
+                memory.as_deref().unwrap_or("2GB or the server's")
+            )
+        })?;
+    // Only the guards' own refusals name a live instance or writer. An
+    // error from their statements, such as a lock timeout behind a
+    // heartbeat, is reported as itself.
+    let guarded = |outcome: Result<()>| -> Result<()> {
+        outcome.map_err(|error| {
+            if error.downcast_ref::<sqlx::Error>().is_some() {
+                error.context(format!("could not check for live instances and legacy writers before migration {version}'s offline index build"))
+            } else {
+                error.context(format!("refusing to build migration {version}'s indexes offline, before any DDL: --offline-indexes holds their tables for the whole build, so no instance or legacy writer may be live. The migration is not recorded and nothing was changed by it. Stop every frontend and legacy writer and migrate again, or run plain `qbit-prism-server migrate`, which builds CONCURRENTLY and records without stopping frontends"))
+            }
+        })
+    };
+    guarded(refuse_unquiesced_instances(&mut tx, version).await)?;
+    guarded(refuse_live_legacy_lease(&mut tx).await)?;
+    let tables: BTreeSet<&str> = migration
+        .creates
+        .values()
+        .chain(migration.drops.values())
+        .map(|index| index.table.as_str())
+        .collect();
+    let quoted: Vec<String> = tables.iter().map(|table| quote_identifier(table)).collect();
+    let names = tables.iter().copied().collect::<Vec<_>>().join(", ");
+    sqlx::raw_sql(&format!(
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        quoted.join(",")
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        let context = lock_failure(
+            version,
+            &names,
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+        );
+        anyhow::Error::new(error).context(context)
+    })?;
+    // A build takes its workers out of these two, or builds with fewer.
+    let (maintenance_work_mem, max_parallel_workers, max_worker_processes): (String, String, String) =
+        sqlx::query_as("SELECT current_setting('maintenance_work_mem'),current_setting('max_parallel_workers'),current_setting('max_worker_processes')")
+            .fetch_one(&mut *tx)
+            .await?;
+    tracing::info!(
+        version,
+        workers,
+        max_parallel_workers,
+        max_worker_processes,
+        maintenance_work_mem,
+        "building the migration's indexes offline: no instance is live, and its tables stay locked until the migration is recorded"
+    );
+    let plan = plan(&mut tx, migration).await?;
+    let mut progress = Progress::default();
+    run_plan(&mut tx, version, plan, mode, &mut progress).await?;
+    record(tx, migration, &progress).await
+}
+
+/// The context of an offline run's failed `LOCK TABLE`. Only a lock
+/// timeout (55P03) means a transaction still holds a table, which the run
+/// refuses to wait behind; any other failure, a deadlock, a cancel, a
+/// missing table, is reported as itself.
+fn lock_failure(version: i32, tables: &str, code: Option<&str>) -> String {
+    if code == Some("55P03") {
+        format!("refusing to build migration {version}'s indexes offline, before any DDL: could not lock {tables} within the run's 5 s lock timeout. A transaction still uses the table (an open writer, a running export or another reader), or a frontend is starting. The migration is not recorded and nothing was changed by it. Let it finish or stop it and migrate again, or run plain `qbit-prism-server migrate`, which builds CONCURRENTLY and records without stopping frontends")
+    } else {
+        format!("could not lock {tables} for migration {version}'s offline index build")
+    }
+}
+
+/// Run the plan's steps in order, each built or dropped as `mode` says,
+/// and keep in `progress` what a concurrent step changed: that stays when
+/// a later step refuses, while an offline step's change rolls back with
+/// the migration's transaction, so an offline refusal says nothing was
+/// changed.
+async fn run_plan<'a>(
+    connection: &mut PgConnection,
+    version: i32,
+    plan: Vec<Step<'a>>,
+    mode: IndexBuildMode,
+    progress: &mut Progress<'a>,
+) -> Result<()> {
+    let lasting = mode == IndexBuildMode::Concurrent;
     for step in plan {
         match step {
             Step::Keep(name) => tracing::info!(
@@ -275,8 +488,10 @@ async fn apply(
                 "index already built with the declared definition; keeping it"
             ),
             Step::Build(name, expected) => {
-                build(connection, version, name, expected).await?;
-                progress.built.push(name);
+                build(connection, version, name, expected, mode).await?;
+                if lasting {
+                    progress.built.push(name);
+                }
             }
             Step::Rebuild(name, expected) => {
                 drop_planned(
@@ -285,7 +500,8 @@ async fn apply(
                     name,
                     expected,
                     Planned::InvalidBuild,
-                    &progress,
+                    progress,
+                    mode,
                 )
                 .await?;
                 tracing::warn!(
@@ -293,8 +509,10 @@ async fn apply(
                     index = %name,
                     "dropped the invalid index an interrupted build left; building again"
                 );
-                build(connection, version, name, expected).await?;
-                progress.built.push(name);
+                build(connection, version, name, expected, mode).await?;
+                if lasting {
+                    progress.built.push(name);
+                }
             }
             Step::Drop(name, expected) => {
                 drop_planned(
@@ -303,18 +521,30 @@ async fn apply(
                     name,
                     expected,
                     Planned::Release,
-                    &progress,
+                    progress,
+                    mode,
                 )
                 .await?;
-                progress.dropped.push(name);
+                if lasting {
+                    progress.dropped.push(name);
+                }
                 tracing::info!(version, index = %name, table = %expected.table, "dropped replaced index");
             }
             Step::Dropped(name) => tracing::info!(version, index = %name, "index already dropped"),
         }
     }
-    let mut tx = connection.begin().await?;
-    lock(&mut tx, MIGRATION_LOCK, metrics).await?;
-    verify_declared(&mut tx, migration, &progress).await?;
+    Ok(())
+}
+
+/// Verify the declared set once more and record the version in `tx`,
+/// which holds the migration lock, then commit.
+async fn record(
+    mut tx: sqlx::Transaction<'_, Postgres>,
+    migration: &IndexMigration,
+    progress: &Progress<'_>,
+) -> Result<()> {
+    let version = migration.version;
+    verify_declared(&mut tx, migration, progress).await?;
     sqlx::query(
         "INSERT INTO qbit_prism_schema_migrations(version) VALUES($1) ON CONFLICT (version) DO NOTHING",
     )
@@ -408,20 +638,33 @@ async fn build(
     version: i32,
     name: &str,
     expected: &IndexDefinition,
+    mode: IndexBuildMode,
 ) -> Result<()> {
-    let statement = concurrent_create(&expected.definition)
+    let statement = create_statement(&expected.definition, mode)
         .with_context(|| format!("migration {version}, index {name}"))?;
-    tracing::info!(
-        version,
-        index = %name,
-        table = %expected.table,
-        "building index concurrently; appends continue, and on a large ledger this takes about two table scans"
-    );
+    match mode {
+        IndexBuildMode::Concurrent => tracing::info!(
+            version,
+            index = %name,
+            table = %expected.table,
+            "building index concurrently; appends continue, and on a large ledger this takes about two table scans"
+        ),
+        IndexBuildMode::Offline { workers, .. } => tracing::info!(
+            version,
+            index = %name,
+            table = %expected.table,
+            workers,
+            "building index offline; appends wait for the migration's commit, and on a large ledger this takes one table scan"
+        ),
+    }
     let started = Instant::now();
     sqlx::raw_sql(&statement)
         .execute(&mut *connection)
         .await
-        .with_context(|| format!("building index {name} for migration {version}; if the build was interrupted the index is invalid, and the next migrate drops and rebuilds it"))?;
+        .with_context(|| match mode {
+            IndexBuildMode::Concurrent => format!("building index {name} for migration {version}; if the build was interrupted the index is invalid, and the next migrate drops and rebuilds it"),
+            IndexBuildMode::Offline { .. } => format!("building index {name} for migration {version} offline; this migration's changes roll back with its transaction, the migrations this run recorded before it stay recorded, and the next migrate plans afresh"),
+        })?;
     match live_relation(connection, name).await? {
         LiveRelation::Index {
             valid: true,
@@ -450,12 +693,34 @@ async fn build(
 /// this server, so it is complete DDL and needs no parsing beyond the
 /// leading keywords.
 fn concurrent_create(definition: &str) -> Result<String> {
-    for prefix in ["CREATE UNIQUE INDEX ", "CREATE INDEX "] {
+    for prefix in CREATE_INDEX {
         if let Some(rest) = definition.strip_prefix(prefix) {
             return Ok(format!("{prefix}CONCURRENTLY {rest}"));
         }
     }
     bail!("index definition does not start with CREATE INDEX: {definition}")
+}
+
+/// How a `pg_get_indexdef` rendering starts.
+const CREATE_INDEX: [&str; 2] = ["CREATE UNIQUE INDEX ", "CREATE INDEX "];
+
+/// The statement a build runs in `mode`: the concurrent build, or offline
+/// the rendering itself, verbatim, a plain build inside the transaction
+/// that records the version. Either way the rendering must be a
+/// `CREATE INDEX`.
+fn create_statement(definition: &str, mode: IndexBuildMode) -> Result<String> {
+    match mode {
+        IndexBuildMode::Concurrent => concurrent_create(definition),
+        IndexBuildMode::Offline { .. } => {
+            ensure!(
+                CREATE_INDEX
+                    .iter()
+                    .any(|prefix| definition.starts_with(prefix)),
+                "index definition does not start with CREATE INDEX: {definition}"
+            );
+            Ok(definition.to_owned())
+        }
+    }
 }
 
 /// What the plan saw under a name it is about to drop.
@@ -509,7 +774,9 @@ impl Progress<'_> {
 /// refuses a transaction block, so a change that lands between them is
 /// not caught; PostgreSQL offers nothing here to close that, and what the
 /// check leaves open is the round trip between two statements, not the
-/// hours of a build.
+/// hours of a build. Offline, both run in the build's transaction, whose
+/// table lock does not cover a rename either, so the same round trip
+/// stays open.
 async fn drop_planned(
     connection: &mut PgConnection,
     version: i32,
@@ -517,6 +784,7 @@ async fn drop_planned(
     expected: &IndexDefinition,
     planned: Planned,
     progress: &Progress<'_>,
+    mode: IndexBuildMode,
 ) -> Result<()> {
     let found = match live_relation(connection, name).await? {
         LiveRelation::Index {
@@ -527,7 +795,7 @@ async fn drop_planned(
             && definition == expected.definition
             && (!valid || matches!(planned, Planned::Release)) =>
         {
-            return drop_concurrently(connection, name).await;
+            return drop_index(connection, name, mode).await;
         }
         other => other.describe(name),
     };
@@ -603,15 +871,25 @@ async fn verify_declared(
     Ok(())
 }
 
-async fn drop_concurrently(connection: &mut PgConnection, name: &str) -> Result<()> {
-    sqlx::raw_sql(&format!(
-        "DROP INDEX CONCURRENTLY {}",
-        quote_identifier(name)
-    ))
-    .execute(&mut *connection)
-    .await
-    .with_context(|| format!("dropping index {name} concurrently"))?;
+async fn drop_index(connection: &mut PgConnection, name: &str, mode: IndexBuildMode) -> Result<()> {
+    sqlx::raw_sql(&drop_statement(name, mode))
+        .execute(&mut *connection)
+        .await
+        .with_context(|| match mode {
+            IndexBuildMode::Concurrent => format!("dropping index {name} concurrently"),
+            IndexBuildMode::Offline { .. } => format!("dropping index {name} offline"),
+        })?;
     Ok(())
+}
+
+/// The statement a drop runs in `mode`: `DROP INDEX CONCURRENTLY`, or
+/// offline a plain `DROP INDEX` inside the transaction that records the
+/// version.
+fn drop_statement(name: &str, mode: IndexBuildMode) -> String {
+    match mode {
+        IndexBuildMode::Concurrent => format!("DROP INDEX CONCURRENTLY {}", quote_identifier(name)),
+        IndexBuildMode::Offline { .. } => format!("DROP INDEX {}", quote_identifier(name)),
+    }
 }
 
 fn quote_identifier(name: &str) -> String {
@@ -656,6 +934,70 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not start with CREATE INDEX"));
+    }
+
+    /// `migrate --offline-indexes` runs the rendering as it is, a plain
+    /// build, and drops plainly; every other connect keeps CONCURRENTLY.
+    #[test]
+    fn an_offline_build_runs_the_rendered_definition_verbatim() {
+        let offline = IndexBuildMode::Offline {
+            workers: 4,
+            memory_kb: None,
+        };
+        for definition in [
+            "CREATE INDEX a ON t USING btree (x DESC) INCLUDE (y) WHERE accepted",
+            "CREATE UNIQUE INDEX a ON t USING btree (x)",
+        ] {
+            assert_eq!(create_statement(definition, offline).unwrap(), definition);
+            assert_eq!(
+                create_statement(definition, IndexBuildMode::Concurrent).unwrap(),
+                concurrent_create(definition).unwrap()
+            );
+        }
+        for mode in [offline, IndexBuildMode::Concurrent] {
+            assert!(create_statement("ALTER TABLE t ADD COLUMN c int", mode)
+                .unwrap_err()
+                .to_string()
+                .contains("does not start with CREATE INDEX"));
+        }
+        assert_eq!(
+            drop_statement("odd\"name", offline),
+            "DROP INDEX \"odd\"\"name\""
+        );
+        assert_eq!(
+            drop_statement("plain_idx", IndexBuildMode::Concurrent),
+            "DROP INDEX CONCURRENTLY \"plain_idx\""
+        );
+        assert_eq!(
+            MigrateOptions::default().index_build,
+            IndexBuildMode::Concurrent
+        );
+    }
+
+    /// Only a lock timeout reads as a transaction still holding the table;
+    /// a deadlock, a cancel, a termination or a missing table keeps its own
+    /// error under a neutral context.
+    #[test]
+    fn only_a_lock_timeout_reads_as_a_transaction_holding_the_table() {
+        let timeout = lock_failure(13, "qbit_share_ledger", Some("55P03"));
+        assert!(
+            timeout.starts_with("refusing to build migration 13's indexes offline, before any DDL: could not lock qbit_share_ledger within the run's 5 s lock timeout."),
+            "{timeout}"
+        );
+        assert!(timeout.contains("nothing was changed"), "{timeout}");
+        for code in [
+            Some("40P01"),
+            Some("57014"),
+            Some("57P01"),
+            Some("42P01"),
+            None,
+        ] {
+            assert_eq!(
+                lock_failure(13, "qbit_share_ledger", code),
+                "could not lock qbit_share_ledger for migration 13's offline index build",
+                "{code:?}"
+            );
+        }
     }
 
     #[test]

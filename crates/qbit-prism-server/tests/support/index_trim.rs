@@ -16,13 +16,27 @@
 //! the plain table), the trimmed set is asserted on the parent and on that
 //! partition, and every successful migrate here ends with 017 applied
 //! again through its online runner.
+//!
+//! `migrate --offline-indexes` builds the same set with a plain `CREATE
+//! INDEX` and `DROP INDEX`, in the transaction that records the version,
+//! when no instance is live. The last tests watch such a run through
+//! event triggers: that it runs the rendered definitions verbatim in that
+//! one transaction while appends wait, that it refuses a live instance, a
+//! live legacy writer lease and a transaction still open on the ledger
+//! before any DDL, and that an interrupted run leaves nothing behind.
 use super::*;
-use qbit_prism_server::{ledger::REQUIRED_SCHEMA_VERSIONS, metrics::Metrics};
+use qbit_prism_server::{
+    ledger::{
+        HeartbeatStatus, IndexBuildMode, MigrateOptions, ShareHashBackfill,
+        REQUIRED_SCHEMA_VERSIONS,
+    },
+    metrics::Metrics,
+};
 use sqlx::Row;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 
 const SEQ_WALK: &str = "qbit_share_ledger_accepted_seq_walk_idx";
@@ -964,4 +978,595 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
         "the built index was rebuilt"
     );
     db.close(vec![first, resumed]).await
+}
+
+/// `migrate --offline-indexes --index-build-workers <workers>`, as the
+/// CLI asks it of `Ledger::connect_migrate`.
+fn offline(workers: u16) -> MigrateOptions {
+    MigrateOptions {
+        share_hashes: ShareHashBackfill::Finish,
+        index_build: IndexBuildMode::Offline {
+            workers,
+            memory_kb: None,
+        },
+    }
+}
+
+/// Install the probe the offline tests watch a run through: two event
+/// triggers in this fixture's database that record each index `schema`
+/// gains or loses, with the statement that did it and the build settings
+/// in force, in `offline_probe.ddl`, whose rows commit or roll back with
+/// that statement's transaction. A statement whose index
+/// `offline_probe.hold` names, unreleased, waits inside its transaction,
+/// with its locks, until the test releases it.
+pub(super) async fn install_probe(pool: &PgPool, schema: &str) -> Result<()> {
+    sqlx::raw_sql(&format!(
+        r#"
+CREATE SCHEMA offline_probe;
+CREATE TABLE offline_probe.ddl(seq bigserial PRIMARY KEY, tag text NOT NULL, index_name text NOT NULL, statement text NOT NULL, settings text NOT NULL);
+CREATE TABLE offline_probe.hold(index_name text PRIMARY KEY, released boolean NOT NULL DEFAULT false);
+CREATE FUNCTION offline_probe.saw(tag text, index_name text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO offline_probe.ddl(tag, index_name, statement, settings)
+    VALUES (saw.tag, saw.index_name, current_query(), concat_ws(' ', current_setting('lock_timeout'), current_setting('max_parallel_maintenance_workers'), current_setting('maintenance_work_mem')));
+    WHILE EXISTS (SELECT 1 FROM offline_probe.hold h WHERE h.index_name = saw.index_name AND NOT h.released) LOOP
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+END $$;
+CREATE FUNCTION offline_probe.created() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM offline_probe.saw(tg_tag, c.object_identity) FROM pg_event_trigger_ddl_commands() c WHERE c.object_type = 'index' AND c.schema_name = '{schema}';
+END $$;
+CREATE FUNCTION offline_probe.dropped() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM offline_probe.saw(tg_tag, d.object_identity) FROM pg_event_trigger_dropped_objects() d WHERE d.object_type = 'index' AND d.schema_name = '{schema}';
+END $$;
+CREATE EVENT TRIGGER offline_probe_created ON ddl_command_end WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION offline_probe.created();
+CREATE EVENT TRIGGER offline_probe_dropped ON sql_drop WHEN TAG IN ('DROP INDEX') EXECUTE FUNCTION offline_probe.dropped();
+"#
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What the probe saw of an offline run that found the release indexes in
+/// place and no build of its own: 013's two builds, its rendered
+/// definitions verbatim, and its four plain drops, all in the transaction
+/// that recorded 13; 024's one build in the transaction that recorded 24;
+/// and no concurrent build or drop anywhere.
+pub(super) async fn assert_built_offline(pool: &PgPool) -> Result<()> {
+    const LANE: &str = "qbit_ctv_fanout_artifacts_lane_idx";
+    let steps = |version: i32| async move {
+        sqlx::query_as::<_, (String, String, String)>("SELECT d.tag,split_part(d.index_name,'.',2),d.statement FROM offline_probe.ddl d JOIN qbit_prism_schema_migrations m ON m.xmin=d.xmin WHERE m.version=$1 ORDER BY d.seq")
+            .bind(version)
+            .fetch_all(pool)
+            .await
+    };
+    let step =
+        |tag: &str, index: &str, statement: String| (tag.to_owned(), index.to_owned(), statement);
+    let mut replaced: Vec<&str> = REPLACED.iter().map(|(name, _)| *name).collect();
+    replaced.sort_unstable();
+    let mut thirteen = vec![
+        step(
+            "CREATE INDEX",
+            MINER_HISTORY,
+            MINER_HISTORY_DEFINITION.to_owned(),
+        ),
+        step("CREATE INDEX", SEQ_WALK, SEQ_WALK_DEFINITION.to_owned()),
+    ];
+    thirteen.extend(
+        replaced
+            .into_iter()
+            .map(|name| step("DROP INDEX", name, format!("DROP INDEX \"{name}\""))),
+    );
+    assert_eq!(steps(13).await?, thirteen, "migration 13");
+    let lane: String = sqlx::query_scalar("SELECT replace(pg_get_indexdef(x.indexrelid),current_schema()||'.','') FROM pg_index x WHERE x.indexrelid=to_regclass($1) AND x.indisvalid")
+        .bind(LANE)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(
+        steps(24).await?,
+        vec![step("CREATE INDEX", LANE, lane)],
+        "migration 24"
+    );
+    let concurrent: Vec<String> = sqlx::query_scalar(
+        "SELECT statement FROM offline_probe.ddl WHERE statement ~* '^\\s*(CREATE|DROP)\\s+INDEX\\s+CONCURRENTLY'",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert!(concurrent.is_empty(), "{concurrent:?}");
+    Ok(())
+}
+
+/// Hold every statement that creates or drops `index` of `schema` inside
+/// its transaction until `release_holds`.
+async fn hold_at(pool: &PgPool, schema: &str, index: &str) -> Result<()> {
+    sqlx::query("INSERT INTO offline_probe.hold(index_name) VALUES($1)")
+        .bind(format!("{schema}.{index}"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn release_holds(pool: &PgPool) -> Result<()> {
+    sqlx::query("UPDATE offline_probe.hold SET released=true")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Wait until the run `migrate` drives is held by the probe inside
+/// `statement`, and return its backend's PID.
+async fn held(
+    pool: &PgPool,
+    migrate: Pin<&mut impl Future<Output = Result<Ledger>>>,
+    statement: &str,
+) -> Result<i32> {
+    let waiting = timeout(Duration::from_secs(60), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND query=$1 AND wait_event='PgSleep'")
+                .bind(statement)
+                .fetch_optional(pool)
+                .await?;
+            if let Some(pid) = pid {
+                return Ok::<_, anyhow::Error>(pid);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+    tokio::select! {
+        result = migrate => match result {
+            Ok(_) => anyhow::bail!("the offline run finished without reaching {statement}"),
+            Err(error) => Err(error).with_context(|| format!("the offline run failed before it reached {statement}")),
+        },
+        result = waiting => result.with_context(|| format!("the offline run never reached {statement}"))?,
+    }
+}
+
+/// Leave the invalid index an interrupted concurrent build of SEQ_WALK
+/// leaves: the build times out behind an open writer, which rolls back.
+async fn leave_invalid_seq_walk(pool: &PgPool) -> Result<()> {
+    let mut writer = pool.begin().await?;
+    insert_share(&mut *writer, 1_000, "alice").await?;
+    let mut builder = pool.acquire().await?;
+    sqlx::query("SET statement_timeout='500ms'")
+        .execute(&mut *builder)
+        .await?;
+    sqlx::raw_sql(&SEQ_WALK_DEFINITION.replacen("CREATE INDEX ", "CREATE INDEX CONCURRENTLY ", 1))
+        .execute(&mut *builder)
+        .await
+        .expect_err("the concurrent build must time out behind the writer");
+    sqlx::query("SET statement_timeout=0")
+        .execute(&mut *builder)
+        .await?;
+    drop(builder);
+    writer.rollback().await?;
+    let leftover = ledger_indexes(pool)
+        .await?
+        .into_iter()
+        .find(|(name, ..)| name == SEQ_WALK)
+        .context("the failed build left no index")?;
+    ensure!(!leftover.2, "the failed build's index must be invalid");
+    Ok(())
+}
+
+/// `migrate --offline-indexes` with every instance stopped. 013 builds its
+/// replacements by running their rendered definitions as they are,
+/// rebuilds an interrupted build's invalid index and drops the replaced
+/// indexes, every statement in the transaction that records 13, with the
+/// run's lock timeout, workers and sort memory; 024 builds its index the
+/// same way in its own. Meanwhile the run holds the share ledger ACCESS
+/// EXCLUSIVE, so an append waits for it, and it leaves the index set the
+/// concurrent runner leaves.
+#[tokio::test]
+async fn migration_013_offline_builds_plain_indexes_in_one_transaction_with_every_instance_stopped(
+) -> Result<()> {
+    const LANE: &str = "qbit_ctv_fanout_artifacts_lane_idx";
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    insert_share(&pool, 2, "bob").await?;
+    undo_013(&pool).await?;
+    sqlx::raw_sql(&format!(
+        "DELETE FROM qbit_prism_schema_migrations WHERE version=24; DROP INDEX {LANE}"
+    ))
+    .execute(&pool)
+    .await?;
+    leave_invalid_seq_walk(&pool).await?;
+    first.heartbeat(HeartbeatStatus::Stopped).await?;
+    install_probe(&pool, &db.schema).await?;
+    hold_at(&pool, &db.schema, MINER_HISTORY).await?;
+    let mut migrate = Box::pin(Ledger::connect_migrate(&db.url, offline(3)));
+    // The sampler finds the run inside its first build: the rendered
+    // definition itself, with the share ledger locked.
+    let run = held(&pool, migrate.as_mut(), MINER_HISTORY_DEFINITION).await?;
+    let locked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='relation' AND relation='qbit_share_ledger'::regclass AND mode='AccessExclusiveLock' AND granted)")
+        .bind(run)
+        .fetch_one(&pool)
+        .await?;
+    assert!(locked, "the offline build does not hold the share ledger");
+    // An append waits for the run.
+    let append = tokio::spawn({
+        let pool = pool.clone();
+        async move { insert_share(&pool, 3, "carol").await }
+    });
+    timeout(Duration::from_secs(30), async {
+        while !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE a.datname=current_database() AND a.query LIKE 'INSERT INTO qbit_share_ledger%' AND a.wait_event_type='Lock' AND $1=ANY(pg_blocking_pids(a.pid)))")
+            .bind(run)
+            .fetch_one(&pool)
+            .await?
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("no append waited for the offline build")??;
+    assert!(
+        futures_util::poll!(&mut migrate).is_pending(),
+        "the offline run finished while the probe held it"
+    );
+    assert!(!append.is_finished(), "an append landed during the build");
+    release_holds(&pool).await?;
+    let migrated = timeout(Duration::from_secs(60), migrate).await??;
+    timeout(Duration::from_secs(30), append).await???;
+    assert_trimmed(&pool).await?;
+    assert_eq!(share_count(&pool).await?, 3);
+    let lane: String = sqlx::query_scalar("SELECT replace(pg_get_indexdef(x.indexrelid),current_schema()||'.','') FROM pg_index x WHERE x.indexrelid=to_regclass($1) AND x.indisvalid")
+        .bind(LANE)
+        .fetch_one(&pool)
+        .await?;
+    // What every build of the run saw: its 5 s lock timeout, its three
+    // workers and at least 2GB of sort memory.
+    let settings: String = sqlx::query_scalar("SELECT concat_ws(' ','5s','3',CASE WHEN pg_size_bytes(current_setting('maintenance_work_mem'))<pg_size_bytes('2GB') THEN '2GB' ELSE current_setting('maintenance_work_mem') END)")
+        .fetch_one(&pool)
+        .await?;
+    let step = |tag: &str, index: &str, statement: String| {
+        (
+            tag.to_owned(),
+            format!("{}.{index}", db.schema),
+            statement,
+            settings.clone(),
+        )
+    };
+    let dropped = |index: &str| step("DROP INDEX", index, format!("DROP INDEX \"{index}\""));
+    let mut replaced: Vec<&str> = REPLACED.iter().map(|(name, _)| *name).collect();
+    replaced.sort_unstable();
+    let mut thirteen = vec![
+        step(
+            "CREATE INDEX",
+            MINER_HISTORY,
+            MINER_HISTORY_DEFINITION.to_owned(),
+        ),
+        dropped(SEQ_WALK),
+        step("CREATE INDEX", SEQ_WALK, SEQ_WALK_DEFINITION.to_owned()),
+    ];
+    thirteen.extend(replaced.into_iter().map(dropped));
+    for (version, expected) in [(13, thirteen), (24, vec![step("CREATE INDEX", LANE, lane)])] {
+        let logged: Vec<(String, String, String, String)> = sqlx::query_as("SELECT d.tag,d.index_name,d.statement,d.settings FROM offline_probe.ddl d JOIN qbit_prism_schema_migrations m ON m.xmin=d.xmin WHERE m.version=$1 ORDER BY d.seq")
+            .bind(version)
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(logged, expected, "migration {version}");
+    }
+    // 017's conversion, between the two, is the only other index DDL the
+    // probe saw, and none of it was concurrent either.
+    let concurrent: Vec<String> = sqlx::query_scalar(
+        "SELECT statement FROM offline_probe.ddl WHERE statement ILIKE '%concurrently%'",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert!(concurrent.is_empty(), "{concurrent:?}");
+    db.close(vec![first, migrated]).await
+}
+
+/// `migrate --offline-indexes` refuses an instance that has not reported
+/// drained or stopped, then a live legacy writer lease, before any DDL
+/// and before it would wait for the share ledger's lock behind an open
+/// writer: a plain build would hold every append of a live writer.
+/// Nothing is built, dropped or recorded, and once both are gone the same
+/// run goes through.
+#[tokio::test]
+async fn migration_013_offline_refuses_a_live_instance_or_legacy_lease_before_any_ddl() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    insert_share(&pool, 2, "alice").await?;
+    undo_013(&pool).await?;
+    let before = ledger_indexes(&pool).await?;
+    let versions = schema_versions(&pool).await?;
+    // A run that took the table's lock first would wait for this writer
+    // and fail on its lock timeout instead.
+    let mut writer = pool.begin().await?;
+    insert_share(&mut *writer, 3, "alice").await?;
+    for live in [
+        "migration 013 requires every earlier instance to report drained or stopped; offending instances: first",
+        "live legacy Python writer lease",
+    ] {
+        if live.starts_with("live legacy") {
+            first.heartbeat(HeartbeatStatus::Stopped).await?;
+            sqlx::raw_sql("ALTER TABLE qbit_ledger_writer_lease DISABLE TRIGGER qbit_prism_no_legacy_writer; INSERT INTO qbit_ledger_writer_lease(singleton,writer_id,writer_epoch,writer_session_token,lease_expires_at) VALUES(true,'python',1,'session',clock_timestamp()+interval '1 hour'); ALTER TABLE qbit_ledger_writer_lease ENABLE TRIGGER qbit_prism_no_legacy_writer")
+                .execute(&pool)
+                .await?;
+        }
+        let error = timeout(
+            Duration::from_secs(60),
+            Ledger::connect_migrate(&db.url, offline(2)),
+        )
+        .await?
+        .err()
+        .with_context(|| format!("the offline run went ahead beside: {live}"))?;
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(
+                "refusing to build migration 13's indexes offline, before any DDL: --offline-indexes holds their tables for the whole build, so no instance or legacy writer may be live. The migration is not recorded and nothing was changed by it."
+            ),
+            "{text}"
+        );
+        assert!(text.contains(live), "{text}");
+        assert_eq!(ledger_indexes(&pool).await?, before);
+        assert_eq!(schema_versions(&pool).await?, versions);
+    }
+    writer.rollback().await?;
+    sqlx::query("DELETE FROM qbit_ledger_writer_lease")
+        .execute(&pool)
+        .await?;
+    let migrated = Ledger::connect_migrate(&db.url, offline(2)).await?;
+    assert_trimmed(&pool).await?;
+    assert_eq!(share_count(&pool).await?, 2);
+    db.close(vec![first, migrated]).await
+}
+
+/// `migrate --offline-indexes` behind a transaction still open on the
+/// share ledger, a missed writer or an export's read: the run gives up on
+/// the table's lock at its 5 s lock timeout, with 55P03, instead of waiting
+/// for the transaction. That is before any DDL, so the indexes and the
+/// record are as they were, and the writer commits as if the run never
+/// happened. Once nothing holds the table, the same run goes through.
+#[tokio::test]
+async fn migration_013_offline_fails_fast_behind_an_open_writer_and_changes_nothing() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    insert_share(&pool, 2, "alice").await?;
+    undo_013(&pool).await?;
+    first.heartbeat(HeartbeatStatus::Stopped).await?;
+    let before = ledger_indexes(&pool).await?;
+    let versions = schema_versions(&pool).await?;
+    for reader in [false, true] {
+        let mut open = pool.begin().await?;
+        if reader {
+            sqlx::query("SELECT count(*) FROM qbit_share_ledger")
+                .execute(&mut *open)
+                .await?;
+        } else {
+            insert_share(&mut *open, 3, "alice").await?;
+        }
+        let started = Instant::now();
+        let error = timeout(
+            Duration::from_secs(60),
+            Ledger::connect_migrate(&db.url, offline(2)),
+        )
+        .await
+        .context("the offline run waited for the open transaction past its lock timeout")?
+        .err()
+        .context("the offline run went ahead behind an open transaction")?;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error
+                .downcast_ref::<sqlx::Error>()
+                .and_then(sqlx::Error::as_database_error)
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("55P03"),
+            "{error:#}"
+        );
+        assert!(elapsed >= Duration::from_secs(5), "{elapsed:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("refusing to build migration 13's indexes offline, before any DDL: could not lock qbit_share_ledger within the run's 5 s lock timeout."),
+            "{text}"
+        );
+        assert!(text.contains("nothing was changed"), "{text}");
+        assert_eq!(ledger_indexes(&pool).await?, before);
+        assert_eq!(schema_versions(&pool).await?, versions);
+        open.commit().await?;
+    }
+    assert_eq!(share_count(&pool).await?, 3);
+    let migrated = Ledger::connect_migrate(&db.url, offline(2)).await?;
+    assert_trimmed(&pool).await?;
+    assert_eq!(share_count(&pool).await?, 3);
+    db.close(vec![first, migrated]).await
+}
+
+/// An offline run interrupted halfway, its backend terminated once both
+/// replacements are built and two release indexes dropped: the
+/// transaction rolls back whole, so no invalid index is left, the release
+/// indexes are the very ones there before, 13 is not recorded, and even
+/// the probe's record of the run is gone. A start without the flag then
+/// builds concurrently, as any frontend does.
+#[tokio::test]
+async fn migration_013_offline_rolls_back_a_partial_run_whole() -> Result<()> {
+    const MINER_RECENT: &str = "qbit_share_ledger_accepted_miner_recent_idx";
+    const SEQ_WINDOW: &str = "qbit_share_ledger_accepted_seq_window_idx";
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    insert_share(&pool, 2, "alice").await?;
+    undo_013(&pool).await?;
+    first.heartbeat(HeartbeatStatus::Stopped).await?;
+    let before = ledger_indexes(&pool).await?;
+    let versions = schema_versions(&pool).await?;
+    install_probe(&pool, &db.schema).await?;
+    hold_at(&pool, &db.schema, SEQ_WINDOW).await?;
+    let mut migrate = Box::pin(Ledger::connect_migrate(&db.url, offline(2)));
+    let run = held(
+        &pool,
+        migrate.as_mut(),
+        &format!("DROP INDEX \"{SEQ_WINDOW}\""),
+    )
+    .await?;
+    // The first drop is done, in the run's open transaction.
+    let miner_recent = before
+        .iter()
+        .find(|(name, ..)| name == MINER_RECENT)
+        .map(|(.., oid)| oid.clone())
+        .context("the release index is missing")?;
+    let dropped: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='relation' AND relation=$2::oid AND mode='AccessExclusiveLock' AND granted)")
+        .bind(run)
+        .bind(&miner_recent)
+        .fetch_one(&pool)
+        .await?;
+    assert!(dropped, "the run had not dropped {MINER_RECENT} yet");
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(run)
+        .fetch_one(&pool)
+        .await?;
+    assert!(terminated);
+    let error = timeout(Duration::from_secs(30), migrate)
+        .await?
+        .err()
+        .context("the terminated offline run succeeded")?;
+    assert_eq!(
+        ledger_indexes(&pool).await?,
+        before,
+        "the interrupted run ({error:#}) left a change behind"
+    );
+    assert_eq!(schema_versions(&pool).await?, versions);
+    assert_eq!(share_count(&pool).await?, 2);
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_probe.ddl")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(seen, 0, "the interrupted run's statements outlived it");
+    release_holds(&pool).await?;
+    let rerun = db.ledger("rerun").await?;
+    assert_trimmed(&pool).await?;
+    let built: Vec<String> = sqlx::query_scalar("SELECT statement FROM offline_probe.ddl WHERE tag='CREATE INDEX' AND statement LIKE 'CREATE INDEX%' ORDER BY seq")
+        .fetch_all(&pool)
+        .await?;
+    assert_eq!(
+        built,
+        [MINER_HISTORY_DEFINITION, SEQ_WALK_DEFINITION].map(|definition| definition.replacen(
+            "CREATE INDEX ",
+            "CREATE INDEX CONCURRENTLY ",
+            1
+        ))
+    );
+    db.close(vec![first, rerun]).await
+}
+
+/// `--index-build-memory` is each build's maintenance_work_mem, even below
+/// the server's setting. Without it the run takes 2GB, or the server's
+/// setting when that is higher, as the probe sees in 13's recording
+/// transaction.
+#[tokio::test]
+async fn migration_013_offline_takes_the_operators_build_memory_and_otherwise_never_lowers_the_servers(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    first.heartbeat(HeartbeatStatus::Stopped).await?;
+    install_probe(&pool, &db.schema).await?;
+    // Every later session of this database starts above 2GB.
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await?;
+    sqlx::raw_sql(&format!(
+        "ALTER DATABASE \"{database}\" SET maintenance_work_mem = '3GB'"
+    ))
+    .execute(&pool)
+    .await?;
+    let mut ledgers = vec![first];
+    for (memory_kb, expected) in [(None, "3GB"), (Some(64 * 1024), "64MB")] {
+        undo_013(&pool).await?;
+        let options = MigrateOptions {
+            share_hashes: ShareHashBackfill::Finish,
+            index_build: IndexBuildMode::Offline {
+                workers: 2,
+                memory_kb,
+            },
+        };
+        ledgers.push(Ledger::connect_migrate(&db.url, options).await?);
+        assert_trimmed(&pool).await?;
+        let seen: Vec<String> = sqlx::query_scalar("SELECT DISTINCT d.settings FROM offline_probe.ddl d JOIN qbit_prism_schema_migrations m ON m.xmin=d.xmin WHERE m.version=13")
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(
+            seen,
+            [format!("5s 2 {expected}")],
+            "--index-build-memory {memory_kb:?}"
+        );
+    }
+    db.close(ledgers).await
+}
+
+/// A transaction holding the instance table, a heartbeat in flight, ends
+/// the offline run at its 5 s lock timeout in the guard that locks that
+/// table. The run reports the lock timeout as itself, never as a live
+/// instance, changes nothing, and goes through once that transaction ends.
+#[tokio::test]
+async fn migration_013_offline_reports_a_lock_timeout_in_its_guards_as_itself() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let first = db.ledger("first").await?;
+    insert_share(&pool, 1, "alice").await?;
+    undo_013(&pool).await?;
+    first.heartbeat(HeartbeatStatus::Stopped).await?;
+    let before = ledger_indexes(&pool).await?;
+    let versions = schema_versions(&pool).await?;
+    let mut heartbeat = pool.begin().await?;
+    sqlx::query(
+        "UPDATE qbit_prism_instances SET heartbeat_at=heartbeat_at WHERE instance_id='first'",
+    )
+    .execute(&mut *heartbeat)
+    .await?;
+    let error = timeout(
+        Duration::from_secs(60),
+        Ledger::connect_migrate(&db.url, offline(2)),
+    )
+    .await
+    .context("the offline run waited for the heartbeat past its lock timeout")?
+    .err()
+    .context("the offline run went ahead behind a heartbeat in flight")?;
+    assert_eq!(
+        error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55P03"),
+        "{error:#}"
+    );
+    let text = format!("{error:#}");
+    assert!(
+        text.starts_with("could not check for live instances and legacy writers before migration 13's offline index build: "),
+        "{text}"
+    );
+    assert!(!text.contains("may be live"), "{text}");
+    assert_eq!(ledger_indexes(&pool).await?, before);
+    assert_eq!(schema_versions(&pool).await?, versions);
+    heartbeat.rollback().await?;
+    let migrated = Ledger::connect_migrate(&db.url, offline(2)).await?;
+    assert_trimmed(&pool).await?;
+    db.close(vec![first, migrated]).await
 }

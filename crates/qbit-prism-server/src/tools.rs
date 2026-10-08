@@ -92,6 +92,34 @@ enum Command {
         /// PRISM_POSTGRES_INIT_SCHEMA=1 migrate too.
         #[arg(long)]
         defer_share_hashes: bool,
+        /// Build the indexes of migrations 13 and 24 with a plain, parallel
+        /// CREATE INDEX in one transaction instead of CONCURRENTLY: quicker,
+        /// but appends and reads wait for it, so stop every frontend and tool
+        /// first. An instance that has not reported drained or stopped is
+        /// refused. A flag, never an environment setting: frontends started
+        /// with PRISM_POSTGRES_INIT_SCHEMA=1 migrate too.
+        #[arg(long)]
+        offline_indexes: bool,
+        /// Parallel workers each offline index build may use, as the server's
+        /// worker slots and maintenance_work_mem allow.
+        #[arg(
+            long,
+            default_value_t = 4,
+            requires = "offline_indexes",
+            value_parser = clap::value_parser!(u16).range(..=1024)
+        )]
+        index_build_workers: u16,
+        /// maintenance_work_mem for each offline index build, as PostgreSQL
+        /// writes it (512MB, 2GB). A build's sort uses about this much in all,
+        /// divided among its leader and workers, at least 32MB each or fewer
+        /// workers. Without it the run takes 2GB, or the server's setting when
+        /// that is higher.
+        #[arg(
+            long,
+            requires = "offline_indexes",
+            value_parser = parse_index_build_memory
+        )]
+        index_build_memory: Option<u32>,
     },
     /// Import legacy filesystem audit bodies into shared PostgreSQL storage.
     ImportAudits {
@@ -116,6 +144,38 @@ enum Command {
         #[arg(long)]
         output_json: Option<PathBuf>,
     },
+}
+
+/// What `--index-build-memory` takes: a size as PostgreSQL writes one.
+const INDEX_BUILD_MEMORY_SYNTAX: &str = "not a size PostgreSQL accepts: give a number and optionally one of the units B, kB, MB, GB or TB, which are case-sensitive, such as 512MB or 2GB";
+
+/// `--index-build-memory` as maintenance_work_mem takes it, in kilobytes:
+/// a number, whole or not, then optionally a unit (kB without one), rounded
+/// to whole kilobytes and bounded to 1MB..2147483647kB, as PostgreSQL
+/// parses and bounds that setting, so `migrate` refuses a size before it
+/// connects instead of after the migrations ahead of the build.
+fn parse_index_build_memory(value: &str) -> std::result::Result<u32, String> {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let multiplier = match unit.trim_start() {
+        "" | "kB" => 1.0,
+        "B" => 1.0 / 1024.0,
+        "MB" => 1024.0,
+        "GB" => 1024.0 * 1024.0,
+        "TB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(INDEX_BUILD_MEMORY_SYNTAX.to_owned()),
+    };
+    let number: f64 = number
+        .parse()
+        .map_err(|_| INDEX_BUILD_MEMORY_SYNTAX.to_owned())?;
+    let kilobytes = (number * multiplier).round_ties_even();
+    if !(1024.0..=f64::from(i32::MAX)).contains(&kilobytes) {
+        return Err("maintenance_work_mem must be between 1MB and 2147483647kB".to_owned());
+    }
+    Ok(kilobytes as u32)
 }
 
 /// The retention rules shared by every command that evaluates eligibility.
@@ -417,15 +477,30 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             println!("{}", crate::codec::scaled_target_difficulty(&target)?);
             Ok(())
         }
-        Command::Migrate { defer_share_hashes } => {
+        Command::Migrate {
+            defer_share_hashes,
+            offline_indexes,
+            index_build_workers,
+            index_build_memory,
+        } => {
             let config = config::DatabaseConfig::from_env()?;
-            let backfill = if defer_share_hashes {
-                crate::ledger::ShareHashBackfill::Defer
-            } else {
-                crate::ledger::ShareHashBackfill::Finish
+            let options = crate::ledger::MigrateOptions {
+                share_hashes: if defer_share_hashes {
+                    crate::ledger::ShareHashBackfill::Defer
+                } else {
+                    crate::ledger::ShareHashBackfill::Finish
+                },
+                index_build: if offline_indexes {
+                    crate::ledger::IndexBuildMode::Offline {
+                        workers: index_build_workers,
+                        memory_kb: index_build_memory,
+                    }
+                } else {
+                    crate::ledger::IndexBuildMode::Concurrent
+                },
             };
             let ledger =
-                crate::ledger::Ledger::connect_migrate(&config.database_url, backfill).await?;
+                crate::ledger::Ledger::connect_migrate(&config.database_url, options).await?;
             let source = ledger
                 .migration_source()
                 .await?
@@ -2279,8 +2354,9 @@ mod configuration_tests {
     #[test]
     fn migrate_defers_share_hashes_only_when_asked() {
         let parse = |args: &[&str]| {
-            let Some(Command::Migrate { defer_share_hashes }) =
-                Cli::try_parse_from(args).unwrap().command
+            let Some(Command::Migrate {
+                defer_share_hashes, ..
+            }) = Cli::try_parse_from(args).unwrap().command
             else {
                 panic!("wrong command");
             };
@@ -2295,6 +2371,36 @@ mod configuration_tests {
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?} was accepted");
         }
+    }
+
+    /// The W1 cutover's migrate step, `migrate --defer-share-hashes
+    /// --offline-indexes`, takes both modes in one run.
+    #[test]
+    fn migrate_takes_the_deferred_backfill_and_the_offline_indexes_together() {
+        let Some(Command::Migrate {
+            defer_share_hashes,
+            offline_indexes,
+            index_build_workers,
+            index_build_memory,
+        }) = Cli::try_parse_from([
+            "prism",
+            "migrate",
+            "--defer-share-hashes",
+            "--offline-indexes",
+            "--index-build-workers",
+            "6",
+            "--index-build-memory",
+            "1GB",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command");
+        };
+        assert!(defer_share_hashes);
+        assert!(offline_indexes);
+        assert_eq!(index_build_workers, 6);
+        assert_eq!(index_build_memory, Some(1024 * 1024));
     }
 
     #[test]
@@ -2342,6 +2448,40 @@ mod configuration_tests {
                 "{case}: {}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// `--index-build-memory` takes maintenance_work_mem as PostgreSQL
+    /// writes it, in kilobytes, and refuses what PostgreSQL would refuse.
+    #[test]
+    fn index_build_memory_is_parsed_and_bounded_as_postgres_does() {
+        for (value, kilobytes) in [
+            ("2GB", 2 * 1024 * 1024),
+            ("512MB", 512 * 1024),
+            (" 64 MB ", 64 * 1024),
+            ("1.5GB", 1536 * 1024),
+            ("1048576", 1024 * 1024),
+            ("1048576kB", 1024 * 1024),
+            ("1048576B", 1024),
+            ("1TB", 1024 * 1024 * 1024),
+            ("2147483647kB", 2_147_483_647),
+        ] {
+            assert_eq!(parse_index_build_memory(value), Ok(kilobytes), "{value}");
+        }
+        for value in ["2gb", "2 G", "2GiB", "", "MB", "-1GB", "2.5.1GB"] {
+            assert_eq!(
+                parse_index_build_memory(value),
+                Err(INDEX_BUILD_MEMORY_SYNTAX.to_owned()),
+                "{value}"
+            );
+        }
+        for value in ["1023kB", "512kB", "2TB", "3000000000"] {
+            assert!(
+                parse_index_build_memory(value)
+                    .unwrap_err()
+                    .contains("between 1MB and 2147483647kB"),
+                "{value}"
             );
         }
     }

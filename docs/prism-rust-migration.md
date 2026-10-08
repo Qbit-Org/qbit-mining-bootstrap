@@ -148,6 +148,9 @@ Migration 013, the share ledger index trim, builds its indexes after the
 commit with `CREATE INDEX CONCURRENTLY`
 ([below](#migration-013-the-share-ledger-index-trim-applied-online)), and
 migration 024 builds the CTV fanout claim lane's index the same way (#668).
+With every frontend and tool stopped, `migrate --offline-indexes` builds both
+with a plain `CREATE INDEX` in one transaction instead, which reads each table
+once and waits for no other transaction.
 Migration 017, the share ledger partition conversion, validates its bound and
 swaps the table after the commit on a dedicated connection
 ([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
@@ -1111,7 +1114,10 @@ same migration at their start. Plain `migrate` behaves exactly as above.
      it uncalled. A sequence that does not lag is not written to, so its
      `last_value` and `is_called` stay exactly as the source had them. A
      promoted physical copy is ahead already.
-4. 013, 017 and 024 follow as usual, with the cursor present.
+4. 013, 017 and 024 follow as usual, with the cursor present. With
+   `--offline-indexes` beside the flag, as a cutover's migrate step can run
+   them, 013 and 024 build offline
+   ([migration 013](#migration-013-the-share-ledger-index-trim-applied-online)).
 5. `migrate` returns and says that 2 is deferred, naming `next_seq` and
    `end_seq`. The cursor has not moved, and 2 is not recorded.
 
@@ -1307,6 +1313,43 @@ keep that headroom free. A concurrent build reads the table twice. Run
 relying on a starting frontend, whose readiness stays down until the build
 completes. Then run `ANALYZE qbit_share_ledger` and take the measurements the
 inventory lists before scheduling #144.
+
+When nothing else runs against the database, as in the cutover's migrate step
+or on an isolated restore, `qbit-prism-server migrate --offline-indexes` builds
+013's indexes, and 024's, with a plain `CREATE INDEX` instead. It runs the same
+plan in one transaction per migration. Before any DDL it takes the migration
+lock and then, waiting at most 5 s for any other lock, refuses any instance
+that has not reported `drained` or `stopped` and a live legacy writer lease,
+and locks the table `ACCESS EXCLUSIVE`. Then it builds each index from its
+definition as this PostgreSQL renders it, drops the replaced ones with a plain
+`DROP INDEX`, checks the declared set and records 13 as it commits. A plain
+build reads the table once, may use parallel workers and waits for no other
+transaction. Every append and read of the table waits for the whole run, so
+start frontends only after `migrate` returns: one that starts during the run
+fails its startup. A transaction still open on the table, a missed writer or a
+running export, makes the migration fail at the lock timeout before it changes
+anything. An interrupted migration rolls back whole, leaving no invalid index
+and nothing dropped; the migrations the run recorded before it stay recorded.
+Plain `migrate` then builds concurrently and records without stopping
+frontends, which is also the way to finish a migration whose indexes an earlier
+run left built but unrecorded while frontends serve. The flag is `migrate`'s
+alone: a frontend started with `PRISM_POSTGRES_INIT_SCHEMA=1` always builds
+concurrently. Nothing after 013 depends on how its indexes were built: 017's
+conversion looks only for each index on the table, and PostgreSQL renders a
+plain build's definition exactly as a concurrent one's.
+
+`--index-build-workers` (default 4) caps the parallel workers of each build.
+They come out of the server's `max_worker_processes` and
+`max_parallel_workers`. A build's sort takes about `maintenance_work_mem` in
+all: PostgreSQL treats it as the limit of the whole build and divides it among
+the leader and the workers, at least 32 MB each, or launches fewer workers.
+The run sets it for its transaction to `--index-build-memory`, a size as
+PostgreSQL writes it (`512MB`, `2GB`), or without that flag to 2GB unless the
+server's setting is higher. Size it to the memory the database host has free
+beside the server's own. Without free slots or memory a build uses fewer
+workers, or none, which is slower but no less correct. Before it builds, the
+run logs the workers it asked for and those settings, and each build's
+`index built` line gives its time.
 
 ### Migration 016: the partition catalog and solver attribution
 
@@ -2028,7 +2071,7 @@ boundary is their first ACK, as on any served database
    `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`. The import does not need signing seeds:
 
    ```sh
-   time qbit-prism-server migrate
+   time qbit-prism-server migrate --offline-indexes
    time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
    PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
      -f scripts/prism-recovery-evidence.sql > migrated.rows.jsonl
