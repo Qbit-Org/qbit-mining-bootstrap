@@ -538,6 +538,11 @@ impl ShareClient {
         self.session.work_on(parent, limit).await
     }
 
+    /// Until a job other than the latest one read so far arrives.
+    pub(crate) async fn newer_work(&mut self) -> Result<()> {
+        self.session.newer_work().await
+    }
+
     /// The id of the latest job read so far, the one [`ShareClient::solve`]
     /// solves next; reads nothing more from the server.
     pub(crate) fn job_id(&self) -> Option<&str> {
