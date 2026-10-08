@@ -25,16 +25,34 @@ WITH bounds AS (
     WHERE miner_id=$4 AND (SELECT ready FROM watermark)
       AND grain_seconds=$1 AND bucket_epoch<grid.current_bucket
       AND (grid.first_full_bucket IS NULL OR bucket_epoch>=grid.first_full_bucket)
-), boundary AS (
-    SELECT floor(extract(epoch FROM ledger.accepted_at)/$1::bigint)::bigint*$1::bigint AS bucket_epoch,
-           count(*) AS accepted_share_count,sum(ledger.share_difficulty) AS accepted_share_difficulty
+), boundary_rows AS (
+    -- The current bucket and the leading partial one, as two disjoint
+    -- accepted_at ranges bounded at both ends. An OR of the two, or a NULL
+    -- guard on the range start, bounds no index range: the planner then
+    -- walks every share at or below the watermark.
+    SELECT ledger.accepted_at,ledger.share_difficulty
     FROM qbit_share_ledger ledger,grid
     WHERE (SELECT ready FROM watermark) AND ledger.accepted
       AND ledger.share_seq<=(SELECT last_share_seq FROM watermark)
+      AND ledger.accepted_at>=to_timestamp(grid.current_bucket)
       AND ledger.accepted_at<=grid.ended_at
       AND (grid.started_at IS NULL OR ledger.accepted_at>=grid.started_at)
-      AND (ledger.accepted_at>=to_timestamp(grid.current_bucket) OR ledger.accepted_at<to_timestamp(grid.first_full_bucket))
       AND ($4::text IS NULL OR ledger.miner_id=$4)
+    UNION ALL
+    SELECT ledger.accepted_at,ledger.share_difficulty
+    FROM qbit_share_ledger ledger,grid
+    WHERE (SELECT ready FROM watermark) AND ledger.accepted
+      AND ledger.share_seq<=(SELECT last_share_seq FROM watermark)
+      AND grid.started_at IS NOT NULL
+      AND ledger.accepted_at>=grid.started_at
+      AND ledger.accepted_at<to_timestamp(grid.first_full_bucket)
+      AND ledger.accepted_at<to_timestamp(grid.current_bucket)
+      AND ledger.accepted_at<=grid.ended_at
+      AND ($4::text IS NULL OR ledger.miner_id=$4)
+), boundary AS (
+    SELECT floor(extract(epoch FROM accepted_at)/$1::bigint)::bigint*$1::bigint AS bucket_epoch,
+           count(*) AS accepted_share_count,sum(share_difficulty) AS accepted_share_difficulty
+    FROM boundary_rows
     GROUP BY bucket_epoch
 ), tail AS (
     SELECT floor(extract(epoch FROM ledger.accepted_at)/$1::bigint)::bigint*$1::bigint AS bucket_epoch,
