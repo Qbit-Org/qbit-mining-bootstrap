@@ -478,21 +478,25 @@ fn passed_over(
     tip: &str,
     superseded: &[(usize, String, i64, i64)],
     unrecorded: &[(usize, String)],
+    retired: &[(usize, String)],
 ) -> String {
     let stale: Vec<(&str, i64, i64)> = superseded
         .iter()
         .filter(|entry| entry.0 == miner)
         .map(|(_, job, work, ledger)| (job.as_str(), *work, *ledger))
         .collect();
-    let missing: Vec<&str> = unrecorded
-        .iter()
-        .filter(|entry| entry.0 == miner)
-        .map(|(_, job)| job.as_str())
-        .collect();
-    if stale.is_empty() && missing.is_empty() {
+    let jobs = |entries: &[(usize, String)]| -> Vec<String> {
+        entries
+            .iter()
+            .filter(|entry| entry.0 == miner)
+            .map(|(_, job)| job.clone())
+            .collect()
+    };
+    let (missing, pruned) = (jobs(unrecorded), jobs(retired));
+    if stale.is_empty() && missing.is_empty() && pruned.is_empty() {
         format!("miner {miner}'s surviving session got no work on the new tip {tip}")
     } else {
-        format!("miner {miner}'s surviving session got work on the new tip {tip} only at a superseded payout revision, or without its issued row or prepared record, before the phase's deadline: it passed over (job, work revision, ledger revision) {stale:?} and jobs without a record {missing:?}")
+        format!("miner {miner}'s surviving session got work on the new tip {tip} only at a superseded payout revision, without its issued row or prepared record, or retired past retention, before the phase's deadline: it passed over (job, work revision, ledger revision) {stale:?}, jobs without a record {missing:?} and jobs answered unknown-job {pruned:?}")
     }
 }
 
@@ -1184,10 +1188,12 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     // and submits on that. A share refused because the revision moved after
     // that check is waited out the same way. A job without its issued row
     // or prepared record is passed over too, as the final block's loop
-    // passes over a window the promoted ledger lacks (#619). The first job
-    // on superseded work the drill meets also gets one share, which must be
-    // refused stale-job and leave no ledger row: the original symptom, kept
-    // as a check. One deadline bounds the whole phase.
+    // passes over a window the promoted ledger lacks (#619), and so is a job
+    // whose share is answered unknown-job, the server having pruned it past
+    // its retention. The first job on superseded work the drill meets also
+    // gets one share, which must be refused, stale-job or, pruned,
+    // unknown-job, and leave no ledger row: the original symptom, kept as a
+    // check. One deadline bounds the whole phase.
     let tip = f.rpc("getbestblockhash", json!([])).await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1198,14 +1204,18 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     let mut superseded: Vec<(usize, String, i64, i64)> = Vec::new();
     // Every job passed over without its issued row or prepared record.
     let mut unrecorded: Vec<(usize, String)> = Vec::new();
-    // The share kept as the original symptom's check: (miner, job, share).
+    // Every job whose share was answered unknown-job, the server having
+    // pruned it past its retention: (miner, job).
+    let mut retired: Vec<(usize, String)> = Vec::new();
+    // The share kept as the original symptom's check: (miner, job, share,
+    // answer).
     let mut refused_on_superseded = None;
     for (miner, session) in sessions.iter_mut().enumerate() {
         let share = loop {
             session
                 .work_on(&tip, left())
                 .await
-                .with_context(|| passed_over(miner, &tip, &superseded, &unrecorded))?;
+                .with_context(|| passed_over(miner, &tip, &superseded, &unrecorded, &retired))?;
             let job = session
                 .job_id()
                 .context("a surviving session's job on the new tip has no id")?
@@ -1217,17 +1227,23 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                     if share.answer.accepted() {
                         break share;
                     }
-                    // Refused: only a revision that moved past this job's
-                    // work after the check is waited out.
-                    match work_revision(f, &job).await? {
-                        Some((work, ledger))
-                            if work != ledger && share.answer.reason_id() == Some("stale-job") =>
-                        {
+                    // Refused. Two answers are waited out: stale-job for a
+                    // revision that moved past this job's work after the
+                    // check, and unknown-job for a job the server pruned,
+                    // retired past its retention before this session read
+                    // the job that replaced it.
+                    match (share.answer.reason_id(), work_revision(f, &job).await?) {
+                        (Some("stale-job"), Some((work, ledger))) if work != ledger => {
                             ensure_no_ledger_row(f, miner, &job, &share).await?;
                             superseded.push((miner, job.clone(), work, ledger));
                             after.push(("on new-tip work a later revision move superseded", share));
                         }
-                        now => bail!(
+                        (Some("unknown-job"), _) => {
+                            ensure_no_ledger_row(f, miner, &job, &share).await?;
+                            retired.push((miner, job.clone()));
+                            after.push(("on new-tip work retired past retention", share));
+                        }
+                        (_, now) => bail!(
                             "miner {miner}'s share on work for the new tip was answered {} (job {job}; its work and the ledger's payout revisions {revisions:?} before the share, {now:?} after it)",
                             share.answer
                         ),
@@ -1235,14 +1251,24 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                 }
                 Some((work, ledger)) => {
                     if refused_on_superseded.is_none() {
+                        // Refused stale-job for its revision, or unknown-job:
+                        // the server retires a job when it delivers the next
+                        // one, read or not, and prunes it once retired past
+                        // its retention (30 s by default), which a slow run
+                        // can outlast before it reads this session.
                         let share = session.submit(Proof::Share).await?;
                         ensure!(
-                            share.answer.reason_id() == Some("stale-job"),
-                            "miner {miner}'s share on job {job}, new-tip work at payout revision {work} that the ledger's {ledger} superseded, was answered {}",
+                            matches!(share.answer.reason_id(), Some("stale-job" | "unknown-job")),
+                            "miner {miner}'s share on job {job}, new-tip work at payout revision {work} that the ledger's {ledger} superseded, was answered {}, not stale-job or, for a job retired past retention, unknown-job",
                             share.answer
                         );
                         ensure_no_ledger_row(f, miner, &job, &share).await?;
-                        refused_on_superseded = Some((miner, job.clone(), share.share_id.clone()));
+                        refused_on_superseded = Some((
+                            miner,
+                            job.clone(),
+                            share.share_id.clone(),
+                            share.answer.to_string(),
+                        ));
                         after.push(("on new-tip work the confirmation superseded", share));
                     }
                     superseded.push((miner, job.clone(), work, ledger));
@@ -1266,13 +1292,13 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                 stale.len() <= 1,
                 "miner {miner}'s surviving session met new-tip work on {} superseded payout revisions {stale:?}, but the final block supersedes its new-tip work once (#752): {}",
                 stale.len(),
-                passed_over(miner, &tip, &superseded, &unrecorded)
+                passed_over(miner, &tip, &superseded, &unrecorded, &retired)
             );
             // The next job, unless an answer above already brought it.
             if session.job_id() == Some(job.as_str()) {
                 tokio::time::timeout(left(), session.newer_work())
                     .await
-                    .map_err(|_| anyhow::anyhow!(passed_over(miner, &tip, &superseded, &unrecorded)))?
+                    .map_err(|_| anyhow::anyhow!(passed_over(miner, &tip, &superseded, &unrecorded, &retired)))?
                     .with_context(|| {
                         format!("miner {miner}'s surviving session, waiting for a job after {job} (its work and the ledger's payout revisions: {revisions:?})")
                     })?;
@@ -1317,7 +1343,7 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     eprintln!(
         "live async promotion with live miners: {} shares offered by {MINERS} miners on 2 frontends: {} acknowledged, {} rejected {rejected:?}, {} unknown {unknown:?}; \
          {} in flight at the fence, answered {:?}; {} committed before the cut, {} lost in the gap ({gap_bytes} WAL bytes), of which {} acknowledged: {acked_missing:?} ({} of them answered before the cut flag: {acked_before_cut:?}); \
-         the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, {on_new_tip} surviving session(s) credited on work for the new tip (jobs passed over on superseded work, as (miner, job, work revision, ledger revision): {superseded:?}; without an issued row or prepared record, as (miner, job): {unrecorded:?}; a share on superseded work refused stale-job without a ledger row, as (miner, job, share): {refused_on_superseded:?}), a surviving share replayed: {}; \
+         the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, {on_new_tip} surviving session(s) credited on work for the new tip (jobs passed over on superseded work, as (miner, job, work revision, ledger revision): {superseded:?}; without an issued row or prepared record, as (miner, job): {unrecorded:?}; jobs answered unknown-job, retired past retention, as (miner, job): {retired:?}; a share on superseded work refused without a ledger row, as (miner, job, share, answer): {refused_on_superseded:?}), a surviving share replayed: {}; \
          the gap-issued block: {} (gap sessions replaced first for older work, their windows' last shares: {older:?}); the final block {} paid {} shares, a full read of the promoted window (sessions replaced first for a stale window: {stale_windows:?}; new sessions right after the move: {first_jobs:?}) (of which sequence numbers a lost share had: {paid_reused:?}); {} lost sequence number(s) since reused: {replaced:?}; timeline: {}",
         records.len(),
         count(|outcome| *outcome == Outcome::Acknowledged),
