@@ -2583,9 +2583,15 @@ unaffected). Finish it once frontends serve, at a time of ordinary load.
    minutes; a refusal that something held either through every attempt leaves
    2 unrecorded, and a rerun once it is released goes straight to the check
    and the record. An attempt that recorded 2 but lost its reply ends the run
-   as a success: the run reads that 2 is recorded before it would try again. It prints one JSON object with `"recorded": true`. A rerun
-   on a database whose backfill finished already prints `"already_complete":
-   true` and succeeds. If it refuses with `native share <id> ...
+   as a success: the run reads that 2 is recorded before it would try again,
+   on a fresh connection if the attempt's own one was lost. If the lost
+   connection shows 2 unrecorded when checked, the run stops, as the runners'
+   lock went with that connection: run it again. A COMMIT still in flight
+   there, waiting for a synchronous standby say, can land moments later, and
+   the rerun then finds 2 recorded; otherwise it records 2.
+   A run that records 2 prints one JSON object with `"recorded": true`. A
+   rerun on a database whose backfill finished already prints
+   `"already_complete": true` and succeeds. If it refuses with `native share <id> ...
    repeats header <h> ... so that header was credited twice`, frontends may
    keep serving: report the double credit and reconcile it before anything
    records 2, and never record 2 by hand. Its other refusals are in

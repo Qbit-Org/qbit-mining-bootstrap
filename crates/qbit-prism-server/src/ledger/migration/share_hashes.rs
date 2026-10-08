@@ -112,7 +112,7 @@
 //! reported, not recorded over.
 use super::online::{acquire_runner_lock, recorded};
 use super::*;
-use sqlx::{Connection, PgConnection};
+use sqlx::{postgres::PgConnectOptions, Connection, PgConnection};
 use std::time::{Duration, Instant};
 
 /// The migration the backfill completes, recorded once every legacy share
@@ -331,6 +331,25 @@ impl Throttle {
             .sum::<Duration>()
             + (RECORD_LOCK_TIMEOUT + self.statement_timeout) * self.record_attempts
     }
+
+    /// How long one attempt to record 2 may take on the client's side
+    /// (`attempt_record`): the throttle's statement timeout and
+    /// `RECORD_LOCK_TIMEOUT` for each of its `RECORD_STATEMENTS`
+    /// statements, and `RECORD_ATTEMPT_SLACK` for their round trips. The
+    /// server's timeouts end each statement of a healthy attempt within the
+    /// first alone, so past this the connection itself is gone.
+    fn record_attempt_deadline(&self) -> Duration {
+        (self.statement_timeout + RECORD_LOCK_TIMEOUT) * RECORD_STATEMENTS + RECORD_ATTEMPT_SLACK
+    }
+
+    /// How long the read on a fresh connection may take in all
+    /// (`record_state_afresh`): the throttle's statement timeout plus
+    /// `RECORD_LOCK_TIMEOUT`, which bound the read itself, plus
+    /// `FRESH_CONNECT_ALLOWANCE` for connecting, the backoff between
+    /// connects included.
+    fn fresh_read_deadline(&self) -> Duration {
+        self.statement_timeout + RECORD_LOCK_TIMEOUT + FRESH_CONNECT_ALLOWANCE
+    }
 }
 
 impl Default for Throttle {
@@ -352,6 +371,24 @@ impl Default for Throttle {
 const RECORD_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest backoff between two record attempts.
 const RECORD_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// The statements one attempt to record 2 sends (`record_serving_once`):
+/// BEGIN and its timeouts, the migration lock, the fence, the frozen end
+/// and the conversion bound, the cursor's DROP, the fence's DELETE, the
+/// history's INSERT, and COMMIT.
+const RECORD_STATEMENTS: u32 = 10;
+/// What an attempt to record 2 allows its round trips, beyond its
+/// statements' own timeouts (`Throttle::record_attempt_deadline`).
+const RECORD_ATTEMPT_SLACK: Duration = Duration::from_secs(5);
+/// What a read on a fresh connection allows for connecting, the backoff
+/// between connects included (`Throttle::fresh_read_deadline`): 250 ms,
+/// 500 ms, 1 s and 2 s, and then 2 s at a time, at least five connects.
+const FRESH_CONNECT_ALLOWANCE: Duration = Duration::from_secs(10);
+/// The first wait before connecting afresh again after a lost session.
+const FRESH_CONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// The longest wait between two fresh connects.
+const FRESH_CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// How long a fresh connection's close may take before it is dropped.
+const FRESH_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What a run of `backfill-share-hashes` did: the rows it mapped, the
 /// `share_seq` values `[next_seq, end_seq)` it covered, and how long it
@@ -796,14 +833,26 @@ async fn map_batches(
 /// while frontends serve, so at the default `Throttle`, exactly as
 /// `backfill-share-hashes` maps it (`finish`); every other connect leaves
 /// it as it is, and refuses one a deferred `migrate` claimed at fence 1.
+/// `reconnect` opens a connection like `connection`, from the same URL and
+/// settings, to read on should that one be lost while it records 2
+/// (`record_while_serving`). The result says whether it was: the caller
+/// then drops `connection` rather than close it.
 pub(super) async fn apply(
     connection: &mut PgConnection,
+    reconnect: &PgConnectOptions,
     backfill: ShareHashBackfill,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<()> {
+) -> Result<RunConnection> {
     acquire_runner_lock(connection).await?;
-    run_to_end(connection, backfill, &Throttle::default(), metrics).await?;
-    Ok(())
+    let (_, run_connection) = run_to_end(
+        connection,
+        reconnect,
+        backfill,
+        &Throttle::default(),
+        metrics,
+    )
+    .await?;
+    Ok(run_connection)
 }
 
 /// `qbit-prism-server backfill-share-hashes`: finish a backfill that
@@ -815,12 +864,14 @@ pub(super) async fn apply(
 /// the run says so and succeeds, so a retry after a lost reply is safe. It
 /// holds the runners' lock to its end, hours on a production ledger, so a
 /// `migrate` started meanwhile waits for it; an interrupted run resumes at
-/// the cursor.
+/// the cursor. `reconnect`, and whether the run lost `connection`, are as
+/// for `apply`.
 pub(super) async fn finish(
     connection: &mut PgConnection,
+    reconnect: &PgConnectOptions,
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<Finished> {
+) -> Result<(Finished, RunConnection)> {
     let started = Instant::now();
     tracing::info!(
         version = VERSION,
@@ -837,15 +888,19 @@ pub(super) async fn finish(
             version = VERSION,
             "migration 2's share-hash backfill has finished and 2 is recorded: nothing to map"
         );
-        return Ok(already_complete());
+        return Ok((already_complete(), RunConnection::Kept));
     }
     // Nothing else changes the cursor or the fence while the lock is held:
     // a cursor gone by now went with 2's record.
-    Ok(
-        run_to_end(connection, ShareHashBackfill::Finish, throttle, metrics)
-            .await?
-            .unwrap_or_else(already_complete),
+    let (finished, run_connection) = run_to_end(
+        connection,
+        reconnect,
+        ShareHashBackfill::Finish,
+        throttle,
+        metrics,
     )
+    .await?;
+    Ok((finished.unwrap_or_else(already_complete), run_connection))
 }
 
 /// Under the runners' lock, whether the database holds a backfill that
@@ -884,10 +939,11 @@ async fn serving_or_finished(connection: &mut PgConnection) -> Result<bool> {
 /// connect leaves the backfill to `migrate`.
 async fn run_to_end(
     connection: &mut PgConnection,
+    reconnect: &PgConnectOptions,
     backfill: ShareHashBackfill,
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<Option<Finished>> {
+) -> Result<(Option<Finished>, RunConnection)> {
     // The pool's statement and lock timeouts stay in force for the batches:
     // each is one bounded statement, under the throttle's own timeout while
     // frontends serve.
@@ -897,7 +953,7 @@ async fn run_to_end(
             "refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup"
         );
         tracing::info!(version = VERSION, "share-hash backfill already complete");
-        return Ok(None);
+        return Ok((None, RunConnection::Kept));
     };
     // Read under the runners' lock, which the recent range's run holds
     // while it raises the fence to 2, so this run's answer holds until it
@@ -916,7 +972,7 @@ async fn run_to_end(
                 end_seq = progress.end_seq,
                 "migration 2's share-hash backfill permits serving; `qbit-prism-server backfill-share-hashes` maps the rest"
             );
-            return Ok(None);
+            return Ok((None, RunConnection::Kept));
         }
         // Claimed meanwhile: the deferred run's recent range comes first,
         // before 013 drops the index that serves it, so this connect stops
@@ -952,7 +1008,7 @@ async fn run_to_end(
         }
     );
     let mut mapped: u64 = 0;
-    loop {
+    let run_connection = loop {
         mapped += map_batches(
             connection,
             Pass::Backfill,
@@ -970,8 +1026,8 @@ async fn run_to_end(
             // batches do, and before the migration lock, which a starting
             // frontend's migration waits for under its lock timeout.
             refuse_double_credit(connection, progress.end_seq, throttle).await?;
-            record_while_serving(connection, &progress, throttle, metrics).await?;
-            break;
+            break record_while_serving(connection, reconnect, &progress, throttle, metrics)
+                .await?;
         }
         // Nothing serves before 2 is recorded at fence 1. Record 2 once the
         // cursor has passed every legacy row, under the migration lock. Like
@@ -1015,8 +1071,8 @@ async fn run_to_end(
         }
         record_2(&mut tx).await?;
         tx.commit().await?;
-        break;
-    }
+        break RunConnection::Kept;
+    };
     tracing::info!(
         version = VERSION,
         mapped,
@@ -1024,11 +1080,14 @@ async fn run_to_end(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "share-hash backfill complete; migration 2 recorded"
     );
-    Ok(Some(Finished {
-        mapped,
-        range: Some((first_seq, progress.next_seq)),
-        elapsed: started.elapsed(),
-    }))
+    Ok((
+        Some(Finished {
+            mapped,
+            range: Some((first_seq, progress.next_seq)),
+            elapsed: started.elapsed(),
+        }),
+        run_connection,
+    ))
 }
 
 /// The fence the database declares under the migration lock, refusing a
@@ -1080,42 +1139,63 @@ async fn record_2(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 /// A failed attempt may have committed all the same: its COMMIT's reply
 /// lost with the connection, or cut short after the commit was written. So
 /// after every failure, before anything else, the run reads what the
-/// attempt left (`record_state`). With 2 recorded and the cursor gone the
+/// attempt left (`check_attempt`). With 2 recorded and the cursor gone the
 /// backfill is done, and the run says so and succeeds. A retry would meet
 /// the dropped cursor and report a finished backfill as failed.
+///
+/// That read runs on the attempt's own connection, unless the attempt lost
+/// it, or the read does, or the attempt got no reply within its deadline
+/// (#748): then on a fresh connection, which it closes again. A lost
+/// connection that had recorded nothing stops the run rather than retry:
+/// the runners' lock, a session lock on that connection, went with it, and
+/// another runner may have taken it since. Retrying would mean taking the
+/// lock again and redoing the checks made under it, the fence's, the
+/// frozen end's and the double-credit check, which is what a rerun does.
+/// Only an attempt whose own connection answered the read is tried again.
+/// The result says whether the connection was lost, which its caller then
+/// drops rather than closes, and never replaces.
 async fn record_while_serving(
     connection: &mut PgConnection,
+    reconnect: &PgConnectOptions,
     progress: &Progress,
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
-) -> Result<()> {
+) -> Result<RunConnection> {
     let mut attempt = 1;
     loop {
-        let error = match record_serving_once(connection, progress, throttle, metrics).await {
-            Ok(()) => return Ok(()),
+        let error = match attempt_record(connection, progress, throttle, metrics).await {
+            Ok(()) => return Ok(RunConnection::Kept),
             Err(error) => error,
         };
-        let state = match record_state(connection, throttle).await {
-            Ok(state) => state,
-            Err(read) => {
-                return Err(read.context(format!(
-                    "refusing to try recording migration 2 again: an attempt failed ({error:#}), and so did reading whether it had recorded 2 all the same. Run `qbit-prism-server backfill-share-hashes` again: it finds 2 recorded and says so, or goes straight to the double-credit check and the record"
-                )))
-            }
-        };
+        let (state, checked) = check_attempt(connection, reconnect, throttle, &error).await?;
         let recorded = match recorded_after_all(state) {
             Ok(recorded) => recorded,
             // The refusal, then the failure it followed.
             Err(refusal) => return Err(error.context(refusal.to_string())),
         };
-        if recorded {
-            tracing::warn!(
-                version = VERSION,
-                attempt,
-                error = %format!("{error:#}"),
-                "an attempt to record migration 2 failed after its COMMIT: its reply was lost or cancelled, but 2 is recorded and the share-hash cursor is gone, so the backfill is done"
-            );
-            return Ok(());
+        match (recorded, checked) {
+            (true, checked) => {
+                tracing::warn!(
+                    version = VERSION,
+                    attempt,
+                    fresh_connection = checked.lost(),
+                    error = %format!("{error:#}"),
+                    "an attempt to record migration 2 failed after its COMMIT: its reply was lost or cancelled, but 2 is recorded and the share-hash cursor is gone, so the backfill is done"
+                );
+                return Ok(checked.run_connection());
+            }
+            (false, Checked::AttemptLost) => {
+                return Err(error.context(format!(
+                    "refusing to try recording migration 2 again: an attempt lost its connection, and on a fresh one 2 was not recorded when checked. {LOST_LOCK}"
+                )))
+            }
+            (false, Checked::CheckLost(read)) => {
+                return Err(error.context(format!(
+                    "refusing to try recording migration 2 again: an attempt failed, and the connection was lost while checking whether it had recorded 2 ({read:#}); on a fresh one 2 was not recorded when checked. {LOST_LOCK}"
+                )))
+            }
+            // Its own connection answered: the runners' lock is still held.
+            (false, Checked::Kept) => {}
         }
         if !waited_too_long(&error) {
             return Err(error);
@@ -1140,6 +1220,91 @@ async fn record_while_serving(
     }
 }
 
+/// Why a run that lost its connection before 2 was recorded stops, and
+/// what to run.
+const LOST_LOCK: &str = "The runners' lock went with the lost connection, so this run stops rather than record 2 without it. A COMMIT still in flight there, waiting for a synchronous standby say, can land moments later. Run `qbit-prism-server backfill-share-hashes` again: it takes the lock, then finds 2 recorded and says so, or goes straight to the double-credit check and the record";
+
+/// Whether the run's own connection outlived its record of 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RunConnection {
+    /// It answered to the end, and holds the runners' lock.
+    Kept,
+    /// A record attempt lost it, or got no reply on it within its
+    /// deadline: its close would fail or hang, so the caller drops it.
+    Lost,
+}
+
+/// Where the read after a failed attempt ran (`check_attempt`).
+#[derive(Debug)]
+enum Checked {
+    /// On the attempt's own connection, which answered it.
+    Kept,
+    /// On a fresh connection: the attempt lost its own, or got no reply on
+    /// it within its deadline.
+    AttemptLost,
+    /// On a fresh connection: the read lost the attempt's own connection,
+    /// with this error, after an attempt that failed otherwise.
+    CheckLost(anyhow::Error),
+}
+
+impl Checked {
+    fn lost(&self) -> bool {
+        !matches!(self, Self::Kept)
+    }
+
+    fn run_connection(&self) -> RunConnection {
+        if self.lost() {
+            RunConnection::Lost
+        } else {
+            RunConnection::Kept
+        }
+    }
+}
+
+/// What the failed `attempt` left, and where it was read: on the attempt's
+/// own connection unless that is lost, else on a fresh one
+/// (`record_state_afresh`). Fails with the refusal to try again when it
+/// cannot tell.
+async fn check_attempt(
+    connection: &mut PgConnection,
+    reconnect: &PgConnectOptions,
+    throttle: &Throttle,
+    attempt: &anyhow::Error,
+) -> Result<(RecordState, Checked)> {
+    let checked = if connection_lost(attempt) {
+        Checked::AttemptLost
+    } else {
+        #[cfg(test)]
+        faults::before_record_check(connection).await?;
+        match record_state(connection, throttle).await {
+            Ok(state) => return Ok((state, Checked::Kept)),
+            Err(read) if connection_lost(&read) => Checked::CheckLost(read),
+            Err(read) => {
+                return Err(read.context(format!(
+                    "refusing to try recording migration 2 again: an attempt failed ({attempt:#}), and so did reading whether it had recorded 2 all the same. {RERUN}"
+                )))
+            }
+        }
+    };
+    match record_state_afresh(reconnect, throttle).await {
+        Ok(state) => Ok((state, checked)),
+        Err(fresh) => {
+            let lost = match &checked {
+                Checked::CheckLost(read) => format!(
+                    "; the connection was lost while checking whether it had recorded 2 ({read:#})"
+                ),
+                _ => String::new(),
+            };
+            Err(fresh.context(format!(
+                "refusing to try recording migration 2 again: an attempt failed ({attempt:#}){lost}, and reading whether it had recorded 2 on a fresh connection failed too. {RERUN}"
+            )))
+        }
+    }
+}
+
+/// What to run when the run cannot tell whether an attempt recorded 2.
+const RERUN: &str = "Run `qbit-prism-server backfill-share-hashes` again: it finds 2 recorded and says so, or goes straight to the double-credit check and the record";
+
 /// `wait` for a person: whole seconds below two minutes, minutes above.
 fn about(wait: Duration) -> String {
     match wait.as_secs() {
@@ -1148,6 +1313,48 @@ fn about(wait: Duration) -> String {
     }
 }
 
+/// One attempt of `record_while_serving`, bounded on this side too, by
+/// `Throttle::record_attempt_deadline`. The server's timeouts end every
+/// statement of a healthy attempt well within it. An attempt still without
+/// a reply then is on a connection gone half-open, a partition say, whose
+/// COMMIT would otherwise wait out TCP's retransmissions, some 15 minutes:
+/// it is abandoned mid-statement, and its connection taken for lost
+/// (`AttemptUnanswered`).
+async fn attempt_record(
+    connection: &mut PgConnection,
+    progress: &Progress,
+    throttle: &Throttle,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<()> {
+    let deadline = throttle.record_attempt_deadline();
+    match tokio::time::timeout(
+        deadline,
+        record_serving_once(connection, progress, throttle, metrics),
+    )
+    .await
+    {
+        Ok(attempt) => attempt,
+        Err(_) => Err(AttemptUnanswered(deadline).into()),
+    }
+}
+
+/// A record attempt with no reply within its deadline: its connection,
+/// left mid-statement, is lost to the run (`connection_lost`).
+#[derive(Debug)]
+struct AttemptUnanswered(Duration);
+
+impl std::fmt::Display for AttemptUnanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "an attempt to record migration 2 got no reply within {} ms, its statements' timeouts and a margin, so its connection is taken for lost",
+            self.0.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for AttemptUnanswered {}
+
 /// One attempt of `record_while_serving`.
 async fn record_serving_once(
     connection: &mut PgConnection,
@@ -1155,6 +1362,8 @@ async fn record_serving_once(
     throttle: &Throttle,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
+    #[cfg(test)]
+    faults::before_record_attempt(connection).await?;
     let mut tx = record_transaction(connection, throttle).await?;
     lock(&mut tx, MIGRATION_LOCK, metrics).await?;
     refuse_newer_fence(&mut tx).await?;
@@ -1232,6 +1441,107 @@ fn recorded_after_all(state: RecordState) -> Result<bool> {
         (true, true) => bail!("refusing to record migration 2: after an attempt to record it failed, 2 is recorded, but its share-hash backfill's cursor qbit_prism_share_hash_backfill still exists. Only the transaction that records 2 drops the cursor, in the same commit, so 2 was recorded by hand, or the cursor restored, meanwhile. Every start refuses the database while the cursor exists; find out which before changing anything"),
         (false, false) => bail!("refusing to record migration 2: after an attempt to record it failed, its share-hash backfill's cursor qbit_prism_share_hash_backfill is gone, but 2 is not recorded. Only the transaction that records 2 drops the cursor, in the same commit, so it was dropped by hand meanwhile. Restore the full backup"),
     }
+}
+
+/// `record_state` on a fresh connection from `reconnect`, the attempt's
+/// own being lost, within `Throttle::fresh_read_deadline`. A lost session
+/// is most often a restart, a crash or a failover, where a connect at once
+/// meets "the database system is starting up" (57P03) or a refused
+/// connection: a connect or a read that fails so (`connection_lost`) is
+/// tried again after `FRESH_CONNECT_BACKOFF`, doubling up to
+/// `FRESH_CONNECT_BACKOFF_MAX`, while the deadline allows. Any other
+/// failure ends it at once. Each fresh connection is closed again, whatever
+/// its read came to (`read_afresh`).
+async fn record_state_afresh(
+    reconnect: &PgConnectOptions,
+    throttle: &Throttle,
+) -> Result<RecordState> {
+    let started = Instant::now();
+    let deadline = started + throttle.fresh_read_deadline();
+    let mut backoff = FRESH_CONNECT_BACKOFF;
+    let mut tries = 1;
+    loop {
+        let error = match read_afresh(reconnect, throttle, deadline).await {
+            Ok(state) => return Ok(state),
+            Err(error) if connection_lost(&error) => error,
+            Err(error) => return Err(error),
+        };
+        if Instant::now() + backoff >= deadline {
+            return Err(error.context(format!(
+                "reading whether migration 2 was recorded on a fresh connection failed {tries} times in {} ms",
+                started.elapsed().as_millis()
+            )));
+        }
+        tracing::warn!(
+            version = VERSION,
+            tries,
+            backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            error = %format!("{error:#}"),
+            "reading whether migration 2 was recorded on a fresh connection met a lost session; connecting again after a backoff"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(FRESH_CONNECT_BACKOFF_MAX);
+        tries += 1;
+    }
+}
+
+/// One fresh connection's read, by `deadline`: connect, `record_state`,
+/// and close, on every path, within `FRESH_CLOSE_TIMEOUT`, or else drop.
+/// A failed close is said quietly: the read is what counts.
+async fn read_afresh(
+    reconnect: &PgConnectOptions,
+    throttle: &Throttle,
+    deadline: Instant,
+) -> Result<RecordState> {
+    let past = || {
+        anyhow::anyhow!(
+            "reading whether migration 2 was recorded on a fresh connection took more than {} ms",
+            throttle.fresh_read_deadline().as_millis()
+        )
+    };
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let mut fresh = tokio::time::timeout(left(), PgConnection::connect_with(reconnect))
+        .await
+        .map_err(|_| past())??;
+    let read = tokio::time::timeout(left(), record_state(&mut fresh, throttle)).await;
+    match tokio::time::timeout(FRESH_CLOSE_TIMEOUT, fresh.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, "closing a fresh connection failed after its read")
+        }
+        Err(_) => {
+            tracing::debug!("closing a fresh connection took too long after its read; dropped")
+        }
+    }
+    read.map_err(|_| past())?
+}
+
+/// Whether `error` says the connection itself is lost to the run, so
+/// nothing more can be read on it: its transport or its protocol failed,
+/// the server ended the session (SQLSTATE class 08; 57P01 to 57P03, a
+/// termination, a crash or a shutdown; 57P04, its database dropped; 57P05
+/// and 25P03, an idle session's or an idle transaction's timeout), or an
+/// attempt got no reply on it within its deadline (`AttemptUnanswered`).
+fn connection_lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<AttemptUnanswered>()
+            || match cause.downcast_ref::<sqlx::Error>() {
+                Some(
+                    sqlx::Error::Io(_)
+                    | sqlx::Error::Tls(_)
+                    | sqlx::Error::Protocol(_)
+                    | sqlx::Error::WorkerCrashed,
+                ) => true,
+                Some(sqlx::Error::Database(error)) => error.code().is_some_and(|code| {
+                    code.starts_with("08")
+                        || matches!(
+                            &*code,
+                            "57P01" | "57P02" | "57P03" | "57P04" | "57P05" | "25P03"
+                        )
+                }),
+                _ => false,
+            }
+    })
 }
 
 /// Whether an attempt failed only because it waited too long: on a lock,
@@ -1756,6 +2066,12 @@ pub(crate) mod faults {
         /// A read of the cursor first runs this SQL, after the look-up that
         /// found the cursor: what another session can do between the two.
         BeforeCursorRead(String),
+        /// The record attempt fails before its first statement with a lock
+        /// timeout's 55P03, as one that met a held migration lock would.
+        FailRecordAttempt,
+        /// The read after a failed attempt finds its connection terminated,
+        /// as a crash or a failover between the two would leave it.
+        LoseConnectionBeforeCheck,
     }
 
     static FAULTS: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
@@ -1774,7 +2090,9 @@ pub(crate) mod faults {
             .any(|(armed, _)| armed == schema)
     }
 
-    /// The fault `wanted` picks for the connection's schema, disarmed.
+    /// The fault `wanted` picks for the connection's schema, disarmed. A
+    /// connection that cannot say its schema has none: the code under test
+    /// meets its failure next, as it would without the hook.
     async fn take(
         connection: &mut PgConnection,
         wanted: impl Fn(&Fault) -> bool,
@@ -1782,9 +2100,12 @@ pub(crate) mod faults {
         if FAULTS.lock().unwrap().is_empty() {
             return Ok(None);
         }
-        let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+        let Ok(schema) = sqlx::query_scalar::<_, String>("SELECT current_schema()::text")
             .fetch_one(&mut *connection)
-            .await?;
+            .await
+        else {
+            return Ok(None);
+        };
         let mut faults = FAULTS.lock().unwrap();
         Ok(faults
             .iter()
@@ -1808,6 +2129,41 @@ pub(crate) mod faults {
             Ok(_) => anyhow::bail!("the injected statement timeout raised nothing"),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Before a record attempt's first statement: `FailRecordAttempt`, as
+    /// PostgreSQL's own error from a statement of its own.
+    pub(super) async fn before_record_attempt(connection: &mut PgConnection) -> anyhow::Result<()> {
+        if take(connection, |fault| *fault == Fault::FailRecordAttempt)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        match sqlx::raw_sql("DO $$BEGIN RAISE EXCEPTION 'canceling statement due to lock timeout' USING ERRCODE = 'lock_not_available'; END$$")
+            .execute(&mut *connection)
+            .await
+        {
+            Ok(_) => anyhow::bail!("the injected lock timeout raised nothing"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Before the read on a failed attempt's own connection:
+    /// `LoseConnectionBeforeCheck`, the connection's backend terminated.
+    pub(super) async fn before_record_check(connection: &mut PgConnection) -> anyhow::Result<()> {
+        if take(connection, |fault| {
+            *fault == Fault::LoseConnectionBeforeCheck
+        })
+        .await?
+        .is_some()
+        {
+            // The session ends with this statement, whose error says so.
+            let _ = sqlx::query("SELECT pg_terminate_backend(pg_backend_pid())")
+                .execute(&mut *connection)
+                .await;
+        }
+        Ok(())
     }
 
     /// Between the cursor's look-up and its read: `BeforeCursorRead`.
@@ -1950,6 +2306,111 @@ mod tests {
         assert!(throttle
             .with_record_attempts(3, Duration::from_secs(31))
             .is_err());
+    }
+
+    /// A database error carrying `0`'s SQLSTATE alone, as a server sends
+    /// one.
+    #[derive(Debug)]
+    struct Sqlstate(&'static str);
+
+    impl std::fmt::Display for Sqlstate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SQLSTATE {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Sqlstate {}
+
+    impl sqlx::error::DatabaseError for Sqlstate {
+        fn message(&self) -> &str {
+            "a test's"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// The connection is lost to the run on a failed transport or
+    /// protocol, on a session the server ended, whatever its SQLSTATE says
+    /// ended it, and on an attempt without a reply within its deadline,
+    /// whatever context the error gained on its way up. A lock or statement
+    /// timeout, a deadlock, a missing relation or row, a pool timeout and a
+    /// refusal leave it usable.
+    #[test]
+    fn a_lost_connection_is_a_failed_transport_an_ended_session_or_no_reply() {
+        let lost = |error: sqlx::Error| {
+            connection_lost(&anyhow::Error::from(error).context("recording migration 2"))
+        };
+        let database = |code: &'static str| sqlx::Error::Database(Box::new(Sqlstate(code)));
+        assert!(lost(sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof
+        ))));
+        assert!(lost(sqlx::Error::Protocol("unexpected message".into())));
+        assert!(lost(sqlx::Error::WorkerCrashed));
+        for code in [
+            "08000", "08003", "08006", "08001", "08004", "08P01", "57P01", "57P02", "57P03",
+            "57P04", "57P05", "25P03",
+        ] {
+            assert!(lost(database(code)), "{code} kept the connection");
+        }
+        for code in ["55P03", "57014", "40P01", "42P01", "23505", "25P02"] {
+            assert!(!lost(database(code)), "{code} lost the connection");
+        }
+        assert!(!lost(sqlx::Error::RowNotFound));
+        assert!(!lost(sqlx::Error::PoolTimedOut));
+        assert!(!connection_lost(&anyhow::anyhow!(
+            "refusing to record migration 2"
+        )));
+        assert!(connection_lost(
+            &anyhow::Error::from(AttemptUnanswered(Duration::from_secs(45)))
+                .context("recording migration 2")
+        ));
+    }
+
+    /// An attempt to record 2 may take, on the client's side, its ten
+    /// statements' statement and lock timeouts and five seconds more; a
+    /// read on a fresh connection its statement and lock timeouts and ten
+    /// seconds to connect, which the backoff between connects fits.
+    #[test]
+    fn the_record_s_client_side_deadlines_follow_its_server_side_timeouts() {
+        let default = Throttle::default();
+        assert_eq!(default.record_attempt_deadline(), Duration::from_secs(45));
+        assert_eq!(default.fresh_read_deadline(), Duration::from_secs(14));
+        let capped = Throttle::new(
+            Throttle::DEFAULT_MAX_BATCH,
+            Duration::from_millis(Throttle::MAX_STATEMENT_TIMEOUT_MS),
+            Throttle::DEFAULT_DUTY_CYCLE,
+        )
+        .unwrap();
+        assert_eq!(capped.record_attempt_deadline(), Duration::from_secs(75));
+        assert_eq!(capped.fresh_read_deadline(), Duration::from_secs(17));
+        let backoffs = std::iter::successors(Some(FRESH_CONNECT_BACKOFF), |backoff| {
+            Some((*backoff * 2).min(FRESH_CONNECT_BACKOFF_MAX))
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            backoffs,
+            [250, 500, 1_000, 2_000].map(Duration::from_millis)
+        );
+        assert!(backoffs.iter().sum::<Duration>() < FRESH_CONNECT_ALLOWANCE);
     }
 
     /// After a failed record attempt, the backfill is done only with 2

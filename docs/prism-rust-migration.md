@@ -1241,7 +1241,17 @@ is pending. Either:
   unrecorded, and a rerun goes straight to the double-credit check and the
   record. After any failed attempt the run first reads whether the attempt
   recorded 2 all the same, its COMMIT's reply lost: with 2 recorded and the
-  cursor gone the backfill is done, and the run says so and succeeds.
+  cursor gone the backfill is done, and the run says so and succeeds. It
+  reads on the attempt's own connection, unless that connection is lost:
+  dropped or reset, ended by the server (a restart, a crash, a failover, an
+  idle timeout), or silent past the attempt's own deadline, its statements'
+  timeouts and a few seconds, as a partition leaves it. Then it reads on a
+  fresh connection from the same URL under the same short timeouts,
+  connecting again after a backoff from 250 ms while the server turns it
+  away, and closes that connection again. A lost connection that showed 2
+  unrecorded stops the run instead of a retry: the runners' lock, which the
+  run holds on its connection, went with it, and a rerun takes it again and
+  goes straight to the double-credit check and the record.
 
 An interrupted run resumes at `next_seq`. `migrate --defer-share-hashes` on a
 backfill at fence 2 leaves it as it is.
@@ -1276,7 +1286,8 @@ logs its progress
 | `refusing to finish migration 2's share-hash backfill before mapping anything: it permits serving now, ... The share-hash fence changed while this run waited for the runner lock. ...` | a deferred run raised the fence to 2 while this run waited, and stopped before 017. Nothing was mapped. Rerun `migrate`, which applies 017 before it finishes the backfill |
 | `migration 2: backfilling qbit_prism_share_hashes for share_seq <a> to <b> while frontends serve; every earlier batch committed. Resume from share_seq <a> with qbit-prism-server backfill-share-hashes` | a throttled batch failed, from `backfill-share-hashes` or plain `migrate`: a lost connection or a cancel, or, with `even a batch of <n> share_seq, the smallest, outlasted its <ms> ms statement timeout`, a batch that kept timing out down to the smallest size. Run `backfill-share-hashes`, for the latter with a smaller `--max-batch`, or else a larger `--statement-timeout-ms`, at most 5000 (the snapshot rule below); `migrate` takes no throttle flags |
 | `refusing to wait any longer to record migration 2: something held MIGRATION_LOCK or the share-hash cursor through <n> attempts over about <t>. ...` | every batch is done and no native share repeats a legacy header, but something held the migration lock, or a transaction that read the cursor stayed open, through every attempt. 2 is not recorded and frontends keep serving. Find the holder in `pg_locks`, then run `backfill-share-hashes` again, which goes straight to the check and the record |
-| `refusing to try recording migration 2 again: an attempt failed (...), and so did reading whether it had recorded 2 all the same. ...` | an attempt failed, and the connection was lost or the database could not be read before the run could tell whether the attempt committed. Run `backfill-share-hashes` again: it finds 2 recorded and says so, or goes straight to the check and the record |
+| `refusing to try recording migration 2 again: an attempt failed (...), and so did reading whether it had recorded 2 all the same. ...` or `... an attempt failed (...)[; the connection was lost while checking whether it had recorded 2 (...)], and reading whether it had recorded 2 on a fresh connection failed too. ...` | an attempt failed, and the database could not be read, on a fresh connection either when the attempt's own one was lost, before the run could tell whether the attempt committed. Run `backfill-share-hashes` again: it finds 2 recorded and says so, or goes straight to the check and the record |
+| `refusing to try recording migration 2 again: an attempt lost its connection, and on a fresh one 2 was not recorded when checked. ...` or `... an attempt failed, and the connection was lost while checking whether it had recorded 2 (...); on a fresh one 2 was not recorded when checked. ...` | the attempt's connection was lost, by the attempt or by the read after it, and the runners' lock went with it. 2 was not recorded when the run checked, and frontends keep serving. A COMMIT still in flight on the lost connection, waiting for a synchronous standby say, can land moments later. Run `backfill-share-hashes` again: it takes the lock, then finds 2 recorded and says so, or goes straight to the check and the record |
 | `refusing to record migration 2: after an attempt to record it failed, 2 is recorded, but its share-hash backfill's cursor ... still exists` or `... the cursor ... is gone, but 2 is not recorded` | only the transaction that records 2 drops the cursor, in the same commit, so the migration history or the cursor was edited while the run recorded 2. Find out which before changing anything; for a cursor dropped by hand, restore the full backup |
 | `migration 2: finding the last native share, ...` or `migration 2: checking the native shares from share_seq <a> to <b> for a header an accepted legacy share holds, before recording 2. ...` | a statement of the double-credit check failed, a chunk at its smallest size if it timed out. Every batch committed and 2 is not recorded. Run `backfill-share-hashes` again, which goes straight to the check |
 | `refusing to record migration 2: native share <id>, at share_seq <n>, repeats header <h> of an accepted legacy share below share_seq <end>, so that header was credited twice. ...` | the safety argument above failed for that header. Frontends may keep serving. Report it, and reconcile the double credit before anything records 2; never record 2 by hand over it |

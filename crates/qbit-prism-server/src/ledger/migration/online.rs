@@ -203,23 +203,40 @@ pub(crate) async fn apply_online_migration(
     let mut connection = crate::metrics::time_pool_acquire(metrics, pool.acquire())
         .await?
         .detach();
+    use super::share_hashes::RunConnection;
     let outcome = match migration {
         OnlineMigration::Indexes(migration) => {
-            apply(&mut connection, migration, index_build, metrics).await
+            apply(&mut connection, migration, index_build, metrics)
+                .await
+                .map(|()| RunConnection::Kept)
         }
         OnlineMigration::Partitions(migration) => {
-            super::partition::apply(&mut connection, migration, metrics).await
+            super::partition::apply(&mut connection, migration, metrics)
+                .await
+                .map(|()| RunConnection::Kept)
         }
         OnlineMigration::ShareHashes(backfill) => {
-            super::share_hashes::apply(&mut connection, *backfill, metrics).await
+            super::share_hashes::apply(&mut connection, &pool.connect_options(), *backfill, metrics)
+                .await
         }
         OnlineMigration::ShareHashesRecent => {
-            super::share_hashes::map_recent(&mut connection, metrics).await
+            super::share_hashes::map_recent(&mut connection, metrics)
+                .await
+                .map(|()| RunConnection::Kept)
         }
     };
-    let closed = connection.close().await;
-    outcome?;
-    closed.with_context(|| format!("closing the connection that applied migration {version}"))?;
+    match outcome {
+        // The share-hash record lost the connection, whose close would fail
+        // or hang: dropped, quietly. Its record of 2 was read afresh.
+        Ok(RunConnection::Lost) => drop(connection),
+        outcome => {
+            let closed = connection.close().await;
+            outcome?;
+            closed.with_context(|| {
+                format!("closing the connection that applied migration {version}")
+            })?;
+        }
+    }
     Ok(())
 }
 
