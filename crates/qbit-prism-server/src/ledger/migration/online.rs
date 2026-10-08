@@ -69,8 +69,8 @@
 //! ones below it. `migrate --defer-share-hashes` runs the backfill's recent
 //! range in that slot instead, before 013 drops the index that serves it,
 //! and 013, 017 and 024 follow with the backfill pending. Once serving is
-//! permitted, plain `migrate` maps the rest after them, and 2 is recorded
-//! last.
+//! permitted, plain `migrate` maps the rest after them, throttled as
+//! `backfill-share-hashes` maps it, and 2 is recorded last.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};

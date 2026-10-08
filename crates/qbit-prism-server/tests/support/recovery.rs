@@ -465,6 +465,29 @@ async fn evidence_with_options(
 /// The checked-in export script.
 pub const SCRIPT: &str = include_str!("../../../../scripts/prism-recovery-evidence.sql");
 
+/// Where the parallel exporter and the summarizer read the export script.
+const SCRIPT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/prism-recovery-evidence.sql"
+);
+
+/// Fails unless the export script on disk is still [`SCRIPT`]. The serial
+/// export runs the copy built into this binary, while the parallel exporter
+/// and the summarizer read the scripts from disk as they run. A script edited
+/// after the build would make their outputs differ by the edit, which no
+/// export could cause: a deferred export once differed from its serial
+/// export at the share-hash cursor's line, because an edit moved that line
+/// while a suite built before it ran.
+fn ensure_script_as_built() -> Result<()> {
+    let on_disk =
+        std::fs::read_to_string(SCRIPT_PATH).with_context(|| format!("reading {SCRIPT_PATH}"))?;
+    ensure!(
+        on_disk == SCRIPT,
+        "scripts/prism-recovery-evidence.sql changed after this test binary was built: the serial export runs the copy built in, the parallel exporter and the summarizer the file. Rebuild and rerun"
+    );
+    Ok(())
+}
+
 /// The rows the serial export of `script` prints, as the runbooks save them.
 pub async fn records(
     db: &Database,
@@ -528,6 +551,7 @@ pub async fn summarize(records: &Path) -> Result<Value> {
 /// `scripts/prism-recovery-evidence.py` with `args` over `records`: what it
 /// printed, and how it exited.
 pub async fn summarize_with(records: &Path, args: &[&str]) -> Result<std::process::Output> {
+    ensure_script_as_built()?;
     Ok(Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -547,6 +571,7 @@ pub async fn parallel_export(
     work_dir: &Path,
     args: &[&str],
 ) -> Result<(tempfile::NamedTempFile, std::process::Output)> {
+    ensure_script_as_built()?;
     let records = tempfile::NamedTempFile::new()?;
     let mut command = Command::new("python3");
     command

@@ -135,6 +135,27 @@ class ParallelSummaryTests(unittest.TestCase):
         self.assertEqual(report["unfinished_candidates"], 2)
         self.assertIn(b"note: the database's per-label legacy carry rule reported 2 finding(s)", stderr)
 
+    def test_a_deferred_export_summarizes_identically_and_its_refusals_are_the_serial_ones(self):
+        # While the share-hash backfill is pending at fence 2 the export has
+        # the cursor in place of every share_hashes row.
+        cursor = record("share_hashes_deferred", {"start_seq": 1, "next_seq": 40, "end_seq": 102,
+                                                  "recent_min_height": None, "recent_start_seq": None})
+        lines = [line for line in full_export() if '"kind": "share_hashes"' not in line]
+        # The export reads the cursor last, between the integrity report and
+        # the completion marker.
+        deferred = lines[:-1] + [cursor] + lines[-1:]
+        code, stdout, stderr = self.assert_same(deferred)
+        self.assertEqual(code, 0, stderr)
+        share_hashes = json.loads(stdout)["records"]["share_hashes"]
+        self.assertEqual(share_hashes["count"], 0)
+        self.assertEqual(share_hashes["deferred"]["next_seq"], 40)
+        self.assertIn(b"note: share_hashes deferred", stderr)
+        for bad in (deferred[:3] + [cursor] + deferred[3:],
+                    deferred[:3] + [record("share_hashes", {"header_hash": "ab", "share_id": "s1"})] + deferred[3:]):
+            with self.subTest(bad=bad[3]):
+                code, _, stderr = self.assert_same(bad)
+                self.assertEqual(code, 1, stderr)
+
     def test_line_endings_and_a_missing_final_newline_are_read_as_text_mode_reads_them(self):
         lines = full_export()
         text = "".join(lines)

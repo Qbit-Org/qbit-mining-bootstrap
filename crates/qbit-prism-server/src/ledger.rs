@@ -77,6 +77,7 @@ pub use migration::{
     ShareHashBackfill, SourceState, SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS,
     SOURCE_STATES,
 };
+pub use migration::{ShareHashBackfillFinished, ShareHashBackfillPending, ShareHashThrottle};
 mod window;
 pub use difficulty::WorkerDifficulty;
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};

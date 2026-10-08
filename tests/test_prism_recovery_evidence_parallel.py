@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,7 @@ for line in source:
     elif any(skipped):
         pass
     elif "pg_export_snapshot()" in line:
-        print("00000003-0000000F-1|t", flush=True)
+        print("00000003-0000000F-1|t|" + ("t" if os.environ.get("FAKE_PSQL_DEFERRED") else "f"), flush=True)
     elif "percentile_disc(" in line:
         print("{{10,20,30}}" if "ORDER BY share_seq" in line else "{{4,8,c}}", flush=True)
     elif stripped == "SELECT NULL;":
@@ -72,8 +73,19 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(script.preamble + module.SHARES + script.middle + script.hashes + script.tail, SQL)
         self.assertEqual(script.preamble.count(module.BEGIN), 1)
         # Every flag a later part branches on is set before the first export.
-        for flag in ("has_native_share_hashes", "has_audit_snapshots", "has_policy_transitions"):
+        for flag in ("has_native_share_hashes", "share_hashes_deferred", "has_audit_snapshots",
+                     "has_policy_transitions"):
             self.assertIn(f"AS {flag}", script.preamble)
+        # A pending backfill's cursor is exported once, last, by the part that
+        # commits the closing kinds: no other session reads the cursor table,
+        # and none of the share-hash parts exports a row meanwhile.
+        deferred = script.tail.index("\\if :share_hashes_deferred\n")
+        self.assertGreater(deferred, script.tail.index("'kind', 'integrity'"))
+        self.assertLess(deferred, script.tail.index("'kind', 'complete'"))
+        self.assertIn("SELECT jsonb_build_object('kind', 'share_hashes_deferred'", script.tail[deferred:])
+        cursor = re.compile(r"\bFROM qbit_prism_share_hash_backfill\b")
+        self.assertIsNone(cursor.search(script.preamble + script.middle + script.hashes))
+        self.assertIn("WHERE NOT :'share_hashes_deferred'::boolean\n", script.hashes)
         self.assertTrue(script.tail.endswith(module.COMMIT))
         self.assertNotIn(module.COMMIT, script.preamble + script.middle + script.hashes)
 
@@ -158,17 +170,20 @@ class ExportTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.directory.cleanup()
 
-    def export(self, *args, fail="", stdout=subprocess.PIPE):
+    def export(self, *args, fail="", stdout=subprocess.PIPE, deferred=False):
         with tempfile.TemporaryDirectory() as work:
+            env = dict(os.environ, FAKE_PSQL_FAIL=fail)
+            env.pop("FAKE_PSQL_DEFERRED", None)
+            if deferred:
+                env["FAKE_PSQL_DEFERRED"] = "1"
             result = subprocess.run(
                 [sys.executable, str(DRIVER), "--psql", str(self.fake), "--work-dir", work, *args],
-                stdout=stdout, stderr=subprocess.PIPE, text=True, timeout=120,
-                env=dict(os.environ, FAKE_PSQL_FAIL=fail))
+                stdout=stdout, stderr=subprocess.PIPE, text=True, timeout=120, env=env)
             return result, os.listdir(work)
 
     def test_parts_are_printed_in_the_serial_order_whenever_they_finish(self):
         self.assertEqual(self.serial[0], "shares")
-        self.assertEqual(self.serial[-2:], ["integrity", "complete"])
+        self.assertEqual(self.serial[-3:], ["integrity", "share_hashes_deferred", "complete"])
         share_ranges = [["share_seq < 10"], ["share_seq >= 10 AND share_seq < 20"],
                         ["share_seq >= 20 AND share_seq < 30"], ["(share_seq >= 30 OR share_seq IS NULL)"]]
         key = 'header_hash COLLATE "C"'
@@ -187,6 +202,19 @@ class ExportTests(unittest.TestCase):
                     self.assertEqual([row["where"] for row in rows if row["kind"] == "shares"], share_ranges)
                     self.assertEqual([row["where"] for row in rows if row["kind"] == "share_hashes"],
                                      hash_ranges)
+
+    def test_a_pending_share_hash_backfill_exports_its_cursor_once_and_the_hashes_in_one_part(self):
+        self.assertEqual(self.serial.count("share_hashes_deferred"), 1)
+        self.assertGreater(self.serial.index("share_hashes_deferred"), self.serial.index("integrity"))
+        for jobs in ("1", "3"):
+            with self.subTest(jobs=jobs):
+                result, leftovers = self.export("--jobs", jobs, deferred=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(leftovers, [])
+                self.assertIn("share_hashes in 1 (deferred: the share-hash backfill is pending)", result.stderr)
+                rows = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual(collapse([row["kind"] for row in rows]), self.serial)
+                self.assertEqual([row["where"] for row in rows if row["kind"] == "share_hashes"], [["true"]])
 
     def test_a_failed_session_fails_the_export_without_a_completion_marker(self):
         for fail, reason in (

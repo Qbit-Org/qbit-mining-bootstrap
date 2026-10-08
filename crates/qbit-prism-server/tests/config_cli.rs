@@ -915,6 +915,7 @@ async fn database_only_cli_commands_reach_postgres_without_reading_seeds() {
         ],
         // The W1 cutover's migrate step: both modes in one run.
         &["migrate", "--defer-share-hashes", "--offline-indexes"],
+        &["backfill-share-hashes"],
         &["import-audits"],
         &["backfill-ctv"],
     ] {
@@ -1069,6 +1070,68 @@ async fn defer_share_hashes_is_a_switch_of_migrate_alone() {
     let help = configured_command_args(&["migrate", "--help"]).await;
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("--defer-share-hashes"));
+}
+
+/// `backfill-share-hashes` refuses a throttle the runner would not take
+/// before anything connects, with clap's usage exit code, and documents its
+/// three knobs and their defaults.
+#[tokio::test]
+async fn backfill_share_hashes_refuses_a_bad_throttle_before_connecting() {
+    for (args, flag) in [
+        (
+            &["backfill-share-hashes", "--max-batch", "0"][..],
+            "--max-batch",
+        ),
+        (
+            &["backfill-share-hashes", "--max-batch", "50001"],
+            "--max-batch",
+        ),
+        (
+            &["backfill-share-hashes", "--statement-timeout-ms", "0"],
+            "--statement-timeout-ms",
+        ),
+        // #738: nothing holds a snapshot on the serving primary past 5 s.
+        (
+            &["backfill-share-hashes", "--statement-timeout-ms", "5001"],
+            "1 to 5000 milliseconds",
+        ),
+        (
+            &["backfill-share-hashes", "--duty-cycle", "0"],
+            "--duty-cycle",
+        ),
+        (
+            &["backfill-share-hashes", "--duty-cycle", "2"],
+            "--duty-cycle",
+        ),
+        (
+            &["backfill-share-hashes", "--duty-cycle", "NaN"],
+            "--duty-cycle",
+        ),
+        (&["migrate", "--duty-cycle", "0.5"], "--duty-cycle"),
+    ] {
+        let output = configured_command_args(args).await;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: clap's usage exit code"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(flag), "{args:?}: {error}");
+        assert!(!error.contains("test-only-password"), "{args:?}: {error}");
+    }
+    let help = configured_command_args(&["backfill-share-hashes", "--help"]).await;
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    for knob in [
+        "--max-batch <MAX_BATCH>",
+        "[default: 5000]",
+        "--statement-timeout-ms <STATEMENT_TIMEOUT_MS>",
+        "[default: 2000]",
+        "--duty-cycle <DUTY_CYCLE>",
+        "[default: 0.5]",
+    ] {
+        assert!(help.contains(knob), "{knob}: {help}");
+    }
 }
 
 /// #664: `submission-hold set` and `clear` check their reason before they

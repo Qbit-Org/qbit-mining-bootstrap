@@ -1155,6 +1155,161 @@ async fn the_parallel_evidence_export_prints_the_serial_export_byte_for_byte() -
     result
 }
 
+/// While migration 2's share-hash backfill is pending at fence 2, the
+/// database serves, and the evidence export reads it as startup does: it
+/// exports the backfill's cursor and none of the partial mapping, and the
+/// summary marks the share_hashes kind deferred with that cursor. Every
+/// other record is the source's, serially and in parallel. At fence 1 the
+/// export still refuses the cursor, as startup does. Once
+/// `backfill-share-hashes` has recorded 2, the summary is the source's
+/// whole.
+#[tokio::test]
+async fn the_evidence_export_defers_share_hashes_while_the_backfill_permits_serving() -> Result<()>
+{
+    use qbit_prism_server::ledger::{ShareHashBackfill, ShareHashThrottle};
+
+    let Some(inputs) = gate::inputs(
+        gate::site!(),
+        &[gate::Input::DatabaseUrl, gate::Input::PgBinDir],
+    )?
+    else {
+        return Ok(());
+    };
+    let pg_bin = std::path::Path::new(&inputs[1]);
+    let source = recovery::Database::open(&inputs[0]).await?;
+    let result = async {
+        let artifacts_dir = tempfile::tempdir()?;
+        recovery::seed_legacy(&source.pool, artifacts_dir.path()).await?;
+        // Template heights from 90 to 4,000, so the recent range, 3,000 and
+        // above, holds a quarter of the ledger. Every copy of a header has
+        // its height, as a header commits to its parent: an `upper` row
+        // repeats the header of the row a seventh of its own.
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO qbit_share_ledger(
+                share_seq,share_id,miner_id,payout_order_key,p2mr_program,
+                share_difficulty,network_difficulty,template_height,job_id,
+                job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch)
+            SELECT g, CASE
+                    WHEN g % 11 = 0 THEN 'legacy-id-' || g
+                    WHEN g % 7 = 0 THEN 'upper' || g || ':' || upper(encode(sha256((g / 7)::text::bytea), 'hex'))
+                    ELSE 'w' || g % 3 || ':' || encode(sha256(g::text::bytea), 'hex') END,
+                s.miner_id,s.payout_order_key,s.p2mr_program,s.share_difficulty,
+                s.network_difficulty,CASE WHEN g % 7 = 0 AND g % 11 <> 0 THEN g / 7 ELSE g END * 10,
+                s.job_id,s.job_issued_at,s.ntime,
+                s.accepted_at + g * interval '1 ms',g % 13 <> 0,
+                CASE WHEN g % 13 = 0 THEN 'stale-job' END,s.writer_id,s.writer_epoch
+            FROM qbit_share_ledger s CROSS JOIN generate_series(9, 400) g WHERE s.share_seq = 1;
+            SELECT setval('qbit_share_ledger_share_seq_seq', 500);
+            "#,
+        )
+        .execute(&source.pool)
+        .await?;
+        let source_evidence = recovery::evidence(&source, pg_bin).await?;
+        ensure!(source_evidence["records"]["share_hashes"]["count"].as_u64() > Some(250));
+
+        let ledger = Ledger::connect_migrate(&source.url, ShareHashBackfill::Defer).await?;
+        let deferred = async {
+            let (next_seq, end_seq, recent_start_seq): (i64, i64, i64) = sqlx::query_as(
+                "SELECT next_seq,end_seq,recent_start_seq FROM qbit_prism_share_hash_backfill",
+            )
+            .fetch_one(&source.pool)
+            .await?;
+            let partial: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes")
+                .fetch_one(&source.pool)
+                .await?;
+            ensure!(
+                partial > 0 && Some(partial as u64) < source_evidence["records"]["share_hashes"]["count"].as_u64(),
+                "the recent range mapped {partial} headers"
+            );
+            let serial = recovery::records(&source, pg_bin, recovery::SCRIPT).await?;
+            let rows = std::fs::read(serial.path())?;
+            let work_dir = tempfile::tempdir()?;
+            let (parallel, output) =
+                recovery::parallel_export(&source, pg_bin, work_dir.path(), &["--jobs", "3"]).await?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ensure!(output.status.success(), "the parallel export failed: {stderr}");
+            ensure!(
+                stderr.contains("share_hashes in 1 (deferred: the share-hash backfill is pending)\n"),
+                "{stderr}"
+            );
+            ensure_same_rows(&rows, &std::fs::read(parallel.path())?, "the deferred parallel export")?;
+            let summary = recovery::summarize_with(serial.path(), &[]).await?;
+            let notes = String::from_utf8_lossy(&summary.stderr);
+            ensure!(summary.status.success(), "the deferred summary failed: {notes}");
+            ensure!(notes.contains("note: share_hashes deferred"), "{notes}");
+            let mut evidence: serde_json::Value = serde_json::from_slice(&summary.stdout)?;
+            ensure!(
+                evidence["records"]["share_hashes"]
+                    == serde_json::json!({
+                        "count": 0,
+                        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        "deferred": {
+                            "start_seq": 1, "next_seq": next_seq, "end_seq": end_seq,
+                            "recent_min_height": 3000, "recent_start_seq": recent_start_seq,
+                        },
+                    }),
+                "{}",
+                evidence["records"]["share_hashes"]
+            );
+            ensure!((next_seq, end_seq) == (1, 401));
+            evidence["records"]["share_hashes"] = source_evidence["records"]["share_hashes"].clone();
+            ensure!(
+                evidence == source_evidence,
+                "the deferred summary differs from the source's beyond share_hashes"
+            );
+            // At fence 1 startup refuses the cursor, and so does the export,
+            // naming both of fence 1's remedies; without a fence, a backfill
+            // a build before #669 started, plain `migrate` alone.
+            sqlx::query("UPDATE qbit_prism_schema_capabilities SET capability_value=1 WHERE capability='share_hash_backfill_pending'")
+                .execute(&source.pool)
+                .await?;
+            let refused = recovery::evidence(&source, pg_bin).await;
+            sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'")
+                .execute(&source.pool)
+                .await?;
+            let unfenced = recovery::evidence(&source, pg_bin).await;
+            sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('share_hash_backfill_pending',2)")
+                .execute(&source.pool)
+                .await?;
+            let refused = format!(
+                "{:#}",
+                refused.err().context("a backfill at fence 1 was exported")?
+            );
+            ensure!(
+                refused.contains("share-hash backfill has not finished")
+                    && refused.contains("Run qbit-prism-server migrate --defer-share-hashes to permit serving with it pending, or plain qbit-prism-server migrate to finish it"),
+                "{refused}"
+            );
+            let unfenced = format!(
+                "{:#}",
+                unfenced.err().context("a backfill without a fence was exported")?
+            );
+            ensure!(
+                unfenced.contains("a build before #669 started it")
+                    && unfenced.contains("Run plain qbit-prism-server migrate, which finishes the backfill before anything serves")
+                    && !unfenced.contains("--defer-share-hashes"),
+                "{unfenced}"
+            );
+            let finished = ledger
+                .backfill_share_hashes(&ShareHashThrottle::default())
+                .await?;
+            ensure!(finished.range == Some((1, 401)));
+            ensure!(
+                recovery::evidence(&source, pg_bin).await? == source_evidence,
+                "the summary once 2 is recorded differs from the source's"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        ledger.pool.close().await;
+        deferred
+    }
+    .await;
+    source.close().await?;
+    result
+}
+
 /// Export `db` serially, then in parallel at several job counts and batch
 /// sizes. Each parallel export must print the serial rows byte for byte, in
 /// as many ranges as it was asked for, and leave none of its parts behind.
@@ -1253,15 +1408,31 @@ fn flags_before_share_hashes(script: &str) -> Result<String> {
 /// Fails at the first line where `printed` differs from the serial rows.
 fn ensure_same_rows(expected: &[u8], printed: &[u8], what: &str) -> Result<()> {
     if printed != expected {
-        let line = expected
+        let differing = expected
             .split(|byte| *byte == b'\n')
             .zip(printed.split(|byte| *byte == b'\n'))
-            .position(|(serial, other)| serial != other);
-        anyhow::bail!(
-            "{what} printed {} bytes, the serial export {}, first differing at line {line:?}",
-            printed.len(),
-            expected.len()
-        );
+            .enumerate()
+            .find(|(_, (serial, other))| serial != other);
+        // The line itself, from both, so a failure says what differs.
+        let shown = |line: &[u8]| {
+            let line = String::from_utf8_lossy(line);
+            line.chars().take(600).collect::<String>()
+        };
+        match differing {
+            Some((index, (serial, other))) => anyhow::bail!(
+                "{what} printed {} bytes, the serial export {}, first differing at line {}:\n  serial:   {}\n  {what}: {}",
+                printed.len(),
+                expected.len(),
+                index + 1,
+                shown(serial),
+                shown(other)
+            ),
+            None => anyhow::bail!(
+                "{what} printed {} bytes, the serial export {}: one is a prefix of the other",
+                printed.len(),
+                expected.len()
+            ),
+        }
     }
     Ok(())
 }

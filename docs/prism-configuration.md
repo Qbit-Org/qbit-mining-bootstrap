@@ -66,7 +66,8 @@ The key rotation rehearsal required before cutover is tracked by #291.
 `migrate`, `import-audits`, and `backfill-ctv` load database configuration
 without reading either signing seed. They still require
 `PRISM_DATABASE_URL`; connection and instance budgets use the same validation
-as the server. Audit import and CTV backfill additionally require the public
+as the server. `backfill-share-hashes`, which finishes a deferred share-hash
+backfill after go-live, reads `PRISM_DATABASE_URL` alone. Audit import and CTV backfill additionally require the public
 trust pin `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX` to verify stored artifacts.
 Commands that build or sign work continue to require signing configuration.
 

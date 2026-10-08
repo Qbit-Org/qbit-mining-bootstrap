@@ -18,7 +18,9 @@ a password, so keep it in a password file (or PGPASSWORD).
 - Range boundaries are sampled from the tables, and only balance the work:
   the first and last ranges are open, so every row is in exactly one range,
   whatever the boundaries. Each share-hash range reads the whole table, so
-  there are --jobs of them, and four times as many share ranges.
+  there are --jobs of them, and four times as many share ranges. While
+  migration 2's share-hash backfill is pending, the script exports no share
+  hashes, so they are one part.
 - The range parts sort under SET LOCAL work_mem (--work-mem).
 - Parts wait under --work-dir and are copied to stdout in the script's order.
   The last, which ends with the completion marker the summarizer requires,
@@ -265,13 +267,19 @@ def export(args, out):
     work = Path(tempfile.mkdtemp(prefix=".prism-recovery-evidence-", dir=args.work_dir))
     try:
         coordinator = Coordinator(sessions, script)
-        exported = coordinator.ask("SELECT pg_export_snapshot(), :'has_native_share_hashes'::boolean;\n")
-        snapshot, _, native = exported.partition("|")
-        if not SNAPSHOT.fullmatch(snapshot) or native not in ("t", "f"):
+        exported = coordinator.ask(
+            "SELECT pg_export_snapshot(), :'has_native_share_hashes'::boolean, :'share_hashes_deferred'::boolean;\n")
+        snapshot, native, deferred = (exported.split("|") + ["", ""])[:3]
+        if (not SNAPSHOT.fullmatch(snapshot) or native not in ("t", "f") or deferred not in ("t", "f")
+                or exported.count("|") != 2):
             raise ExportError(f"unexpected snapshot export {exported!r}")
         share_bounds = sorted({int(bound) for bound in bounds(coordinator.ask(
             sample("qbit_share_ledger", "share_seq", 4 * args.jobs)), SHARE_BOUND)})
-        if native == "t":
+        if deferred == "t":
+            # Pending at fence 2: the script exports none of the partial
+            # mapping, so splitting it would only run empty parts.
+            hash_sample = sample("qbit_prism_share_hashes", 'header_hash COLLATE "C"', 1)
+        elif native == "t":
             hash_sample = sample("qbit_prism_share_hashes", 'header_hash COLLATE "C"', args.jobs)
         else:
             # The mapping the script derives from 2.x, which migration 002 backfills.
@@ -279,7 +287,8 @@ def export(args, out):
                                  f" WHERE accepted AND {LEGACY_MATCH}")
         hash_bounds = sorted(set(bounds(coordinator.ask(hash_sample), HASH_BOUND)))
         print(f"note: exporting snapshot {snapshot} in {args.jobs} sessions: shares in "
-              f"{len(share_bounds) + 1} ranges, share_hashes in {len(hash_bounds) + 1}",
+              f"{len(share_bounds) + 1} ranges, share_hashes in {len(hash_bounds) + 1}"
+              f"{' (deferred: the share-hash backfill is pending)' if deferred == 't' else ''}",
               file=sys.stderr, flush=True)
         parts = script.parts(snapshot, share_bounds, hash_bounds, args.work_mem)
         paths = [work / f"{index:05}.jsonl" for index in range(len(parts))]
