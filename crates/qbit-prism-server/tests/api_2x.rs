@@ -298,15 +298,18 @@ async fn chart_rollups_match_raw_for_every_range_bucket_and_watermark() -> Resul
     .await;
     f.close(result).await
 }
-/// Ledger shares a plan node produced or filtered out, over every loop. Row
-/// counts are per-loop averages, fractional from PostgreSQL 18.
+/// Ledger shares a plan node produced or dropped (by its filter, or on a
+/// lossy bitmap's recheck), over every loop. Row counts are per-loop
+/// averages, fractional from PostgreSQL 18.
 fn ledger_tuples(node: &Value) -> f64 {
     let own = if node["Relation Name"]
         .as_str()
         .is_some_and(|name| name.starts_with("qbit_share_ledger"))
     {
         let count = |key: &str| node[key].as_f64().unwrap_or(0.0);
-        (count("Actual Rows") + count("Rows Removed by Filter"))
+        (count("Actual Rows")
+            + count("Rows Removed by Filter")
+            + count("Rows Removed by Index Recheck"))
             * node["Actual Loops"].as_f64().unwrap_or(1.0)
     } else {
         0.0
@@ -384,8 +387,9 @@ async fn chart_rollups_read_only_the_partial_buckets_under_any_plan() -> Result<
         ensure!(progress.scanned==20_000,"{progress:?}");
         sqlx::raw_sql("VACUUM (ANALYZE) qbit_share_ledger").execute(&f.pool).await?;
         let sql=include_str!("../src/api/queries/dashboard_hashrate_rollups.sql");
-        // Its own connection, closed when dropped: the statement and plan mode
-        // set below never return to the pool, whatever the outcome.
+        // Its own connection, never returned to the pool, so the statement and
+        // plan mode set below reach no other query; the fixture's DROP
+        // DATABASE ... WITH (FORCE) ends it, whatever the outcome.
         let mut conn=f.pool.acquire().await?.detach();
         sqlx::raw_sql(&format!("PREPARE chart(bigint,bigint,double precision,text) AS {sql}")).execute(&mut conn).await?;
         // The default pool request and a 7-day one, both without an anchor; a
@@ -394,16 +398,24 @@ async fn chart_rollups_read_only_the_partial_buckets_under_any_plan() -> Result<
         // miner with half the shares.
         let requests=["3600,2592000,NULL,NULL".to_owned(),"3600,604800,NULL,NULL".to_owned(),format!("300,606600,{epoch},NULL"),"3600,2592000,NULL,'miner-7'".to_owned(),"3600,2592000,NULL,'whale'".to_owned()];
         let mut walks=Vec::new();
-        for cost in ["4","1.1"] {
-            for mode in ["force_custom_plan","force_generic_plan"] {
-                sqlx::raw_sql(&format!("SET random_page_cost={cost}; SET plan_cache_mode={mode}")).execute(&mut conn).await?;
-                for request in &requests {
-                    let plan:Value=sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE chart({request})")).fetch_one(&mut conn).await?;
-                    let read=ledger_tuples(&plan[0]["Plan"]).round();
-                    if read>1_000.0 {walks.push(format!("random_page_cost {cost}, {mode}, chart({request}): read {read} of 20000 ledger shares"));}
-                    let mut scans=Vec::new();
-                    one_sided_ledger_scans(&plan[0]["Plan"],false,&mut scans);
-                    walks.extend(scans.into_iter().map(|scan|format!("random_page_cost {cost}, {mode}, chart({request}): {scan}")));
+        // First with the rollups current, so the tail is empty; then with 300
+        // shares past the watermark, half the big miner's, which the tail must
+        // read and nothing else: its cost follows the rollup lag.
+        for (phase,lag) in [("current watermark",0.0),("300 shares past the watermark",300.0)] {
+            if lag>0.0 {
+                sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) SELECT 'lag-'||g,m,m,decode(repeat('1',64),'hex'),1000000,1000000,100,'job',to_timestamp($1-g*120),0,to_timestamp($1-g*120),'test',1 FROM generate_series(1,300) g, LATERAL (SELECT CASE WHEN g%2=0 THEN 'whale' ELSE 'miner-7' END AS m) miner").bind(epoch as f64).execute(&f.pool).await?;
+            }
+            for cost in ["4","1.1"] {
+                for mode in ["force_custom_plan","force_generic_plan"] {
+                    sqlx::raw_sql(&format!("SET random_page_cost={cost}; SET plan_cache_mode={mode}")).execute(&mut conn).await?;
+                    for request in &requests {
+                        let plan:Value=sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE chart({request})")).fetch_one(&mut conn).await?;
+                        let read=ledger_tuples(&plan[0]["Plan"]).round();
+                        if read>1_000.0+lag {walks.push(format!("{phase}, random_page_cost {cost}, {mode}, chart({request}): read {read} ledger shares"));}
+                        let mut scans=Vec::new();
+                        one_sided_ledger_scans(&plan[0]["Plan"],false,&mut scans);
+                        walks.extend(scans.into_iter().map(|scan|format!("{phase}, random_page_cost {cost}, {mode}, chart({request}): {scan}")));
+                    }
                 }
             }
         }
