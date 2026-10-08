@@ -181,6 +181,49 @@ class RecoveryEvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.summarize(iter([record("future_format", {})] + closing()))
 
+    def test_a_pending_share_hash_backfill_marks_share_hashes_deferred_with_its_cursor(self):
+        # Fence 2 (`migrate --defer-share-hashes`): no share_hashes rows, and
+        # the cursor in their place, which only that kind's summary carries.
+        cursor = {"start_seq": 1, "next_seq": 1, "end_seq": 4129153,
+                  "recent_min_height": 2000, "recent_start_seq": 30001}
+        shares = [record("shares", {"share_seq": seq, "accepted": True}) for seq in (1, 2)]
+        baseline = module.summarize(iter(shares + closing()))
+        self.assertNotIn("deferred", baseline["records"]["share_hashes"])
+        notes = []
+        # The export reads the cursor last, after the integrity report.
+        deferred = module.summarize(iter(shares + closing()[:1] + [record("share_hashes_deferred", cursor)]
+                                         + closing()[1:]), notes)
+        self.assertEqual(deferred["records"]["share_hashes"], {
+            "count": 0, "sha256": hashlib.sha256().hexdigest(), "deferred": cursor})
+        self.assertEqual(deferred | {"records": baseline["records"]}, baseline)
+        for kind in baseline["records"]:
+            if kind != "share_hashes":
+                self.assertEqual(deferred["records"][kind], baseline["records"][kind])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("share_hashes deferred", notes[0])
+        self.assertIn("from share_seq 1 up to 4129153", notes[0])
+        # A cursor further on is different evidence.
+        moved = module.summarize(iter(shares + [record("share_hashes_deferred", cursor | {"next_seq": 9})]
+                                      + closing()))
+        self.assertNotEqual(moved, deferred)
+        # Before the integrity report it summarizes alike.
+        self.assertEqual(module.summarize(iter(shares + [record("share_hashes_deferred", cursor)] + closing())),
+                         deferred)
+
+    def test_a_share_hash_deferral_is_refused_beside_rows_twice_or_after_completion(self):
+        cursor = {"start_seq": 1, "next_seq": 1, "end_seq": 3}
+        row = record("share_hashes", {"header_hash": "ab", "share_id": "first"})
+        deferral = record("share_hashes_deferred", cursor)
+        for lines, message in (
+            ([row, deferral] + closing(), "beside their deferral"),
+            ([deferral, row] + closing(), "beside their deferral"),
+            ([deferral, deferral] + closing(), "duplicate share_hashes deferral"),
+            ([record("share_hashes_deferred", [1, 3])] + closing(), "not an object"),
+            (closing() + [deferral], "follow completion marker"),
+        ):
+            with self.subTest(lines=lines), self.assertRaisesRegex(ValueError, message):
+                module.summarize(iter(lines))
+
     def test_offered_or_unknown_candidates_cannot_look_drained(self):
         for state in ("offer_reserved", "offered", "reconciliation", "future_state"):
             with self.subTest(state=state):

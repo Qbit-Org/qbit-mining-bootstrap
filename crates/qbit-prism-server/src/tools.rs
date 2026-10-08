@@ -87,7 +87,8 @@ enum Command {
     Migrate {
         /// Map only migration 2's legacy share headers within 1000 template
         /// heights of the highest, then let frontends serve with the rest
-        /// pending; a later `migrate` without this flag maps it and records 2.
+        /// pending; `backfill-share-hashes` (or a later `migrate` without this
+        /// flag) maps it while they serve and records 2.
         /// A flag, never an environment setting: frontends started with
         /// PRISM_POSTGRES_INIT_SCHEMA=1 migrate too.
         #[arg(long)]
@@ -120,6 +121,25 @@ enum Command {
             value_parser = parse_index_build_memory
         )]
         index_build_memory: Option<u32>,
+    },
+    /// Map the rest of migration 2's share-hash backfill while frontends serve, after
+    /// `migrate --defer-share-hashes`, in throttled batches, and record migration 2.
+    BackfillShareHashes {
+        /// The most share_seq values one batch maps. Each batch is one statement in a
+        /// transaction of its own.
+        #[arg(long, default_value_t = crate::ledger::ShareHashThrottle::DEFAULT_MAX_BATCH,
+              value_parser = throttle_flag(crate::ledger::ShareHashThrottle::check_max_batch))]
+        max_batch: i64,
+        /// Each batch statement's timeout, at most 5000. A batch that outlasts it is retried at half
+        /// the size, so no statement holds a snapshot on the primary longer than this.
+        #[arg(long, default_value_t = crate::ledger::ShareHashThrottle::DEFAULT_STATEMENT_TIMEOUT_MS,
+              value_parser = throttle_flag(crate::ledger::ShareHashThrottle::check_statement_timeout_ms))]
+        statement_timeout_ms: u64,
+        /// The share of the time batches may take: after a batch that took t, the backfill rests
+        /// t * (1 - duty cycle) / duty cycle. From 0.01 to 1.
+        #[arg(long, default_value_t = crate::ledger::ShareHashThrottle::DEFAULT_DUTY_CYCLE,
+              value_parser = throttle_flag(crate::ledger::ShareHashThrottle::check_duty_cycle))]
+        duty_cycle: f64,
     },
     /// Import legacy filesystem audit bodies into shared PostgreSQL storage.
     ImportAudits {
@@ -358,6 +378,23 @@ enum CandidatesCommand {
 /// "recover everything".
 const MAX_RECOVERY_BLOCKS: usize = 32;
 
+/// A `backfill-share-hashes` throttle flag, parsed and then held to the
+/// throttle's own `check`, before anything connects: each bound lives
+/// there, once.
+fn throttle_flag<T>(
+    check: fn(T) -> Result<T>,
+) -> impl Fn(&str) -> std::result::Result<T, String> + Clone + Send + Sync + 'static
+where
+    T: std::str::FromStr + 'static,
+{
+    move |value: &str| {
+        let parsed = value
+            .parse()
+            .map_err(|_| format!("{value:?} is not a number"))?;
+        check(parsed).map_err(|error| error.to_string())
+    }
+}
+
 /// The format the outbox row itself uses: `candidate_sha256 ~ '^[0-9a-f]{64}$'`.
 fn require_block_hash(hash: &str) -> Result<()> {
     ensure!(
@@ -525,9 +562,43 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                     "PRISM PostgreSQL schema migrations {ready} ready; database source: {source}"
                 ),
                 Some((next_seq, end_seq)) => println!(
-                    "PRISM PostgreSQL schema migrations {ready} ready, and frontends may serve: migration 2's share-hash backfill is deferred with its recent range mapped, and the legacy shares from share_seq {next_seq} up to {end_seq} are not all mapped yet. Run `qbit-prism-server migrate` without --defer-share-hashes to map them while frontends serve and record 2; database source: {source}"
+                    "PRISM PostgreSQL schema migrations {ready} ready, and frontends may serve: migration 2's share-hash backfill is deferred with its recent range mapped, and the legacy shares from share_seq {next_seq} up to {end_seq} are not all mapped yet. Once frontends serve, run `qbit-prism-server backfill-share-hashes`, which maps them in throttled batches and records 2; database source: {source}"
                 ),
             }
+            Ok(())
+        }
+        Command::BackfillShareHashes {
+            max_batch,
+            statement_timeout_ms,
+            duty_cycle,
+        } => {
+            let throttle = crate::ledger::ShareHashThrottle::new(
+                max_batch,
+                Duration::from_millis(statement_timeout_ms),
+                duty_cycle,
+            )?;
+            let database_url = config::DatabaseConfig::url_from_env()?;
+            // The start gate, as `migrate` passes it: a backfill that does not
+            // permit serving is refused there, naming what to run instead.
+            let ledger = crate::ledger::Ledger::connect_operator(&database_url, false).await?;
+            let finished = ledger.backfill_share_hashes(&throttle).await;
+            ledger.pool.close().await;
+            let finished = finished?;
+            // A database whose backfill finished already is a success too: a
+            // retry after a lost reply finds 2 recorded.
+            let (next_seq, end_seq) = finished.range.unzip();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "mapped": finished.mapped,
+                    "next_seq": next_seq,
+                    "end_seq": end_seq,
+                    "seqs": finished.range.map_or(0, |(next, end)| end - next),
+                    "elapsed_ms": u64::try_from(finished.elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "recorded": true,
+                    "already_complete": finished.already_complete(),
+                }))?
+            );
             Ok(())
         }
         Command::ImportAudits { root } => {
@@ -1853,6 +1924,13 @@ struct SelfCheckReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     offer_standby: Option<crate::ledger::OfferStandbyReport>,
     audit_completeness: Option<AuditCompleteness>,
+    /// Migration 2's share-hash backfill while `migrate --defer-share-hashes`
+    /// has left it pending, and `backfill-share-hashes` has still to map the
+    /// rest: its fence and cursor, or `unknown` when the database could not
+    /// be read. Reported, never a failure; absent only when the read found
+    /// nothing pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    share_hash_backfill: Option<ShareHashBackfillReport>,
     live_instances: LiveInstancesReport,
 }
 
@@ -1868,6 +1946,7 @@ async fn self_check() -> Result<()> {
         durability: None,
         offer_standby: None,
         audit_completeness: None,
+        share_hash_backfill: None,
         live_instances: unavailable_live_instances(
             "unknown",
             "Heartbeat not sampled because configuration is unavailable; HA is unknown",
@@ -1887,12 +1966,44 @@ async fn self_check() -> Result<()> {
         // Both samples are read-only and independent of the local startup
         // below: a node startup or refresh failure must hide neither the
         // cluster's heartbeats nor an unfinished historical import.
-        let (instances, completeness, hold) = tokio::join!(
+        let (instances, completeness, hold, backfill) = tokio::join!(
             live_instances(&config.database_url, freshness),
             sample_audit_completeness(&config.database_url),
             sample_submission_hold(&config.database_url),
+            sample_share_hash_backfill(&config.database_url),
         );
         report.live_instances = instances;
+        if let Some(ShareHashBackfillReport::Unknown { error }) = &backfill {
+            eprintln!(
+                "WARNING: migration 2's share-hash backfill could not be read ({error}), so \
+                 self-check cannot tell whether it is pending. Read the cursor with `SELECT \
+                 next_seq, end_seq FROM qbit_prism_share_hash_backfill`: the table exists only \
+                 while the backfill is pending"
+            );
+        }
+        if let Some(ShareHashBackfillReport::Pending(pending)) = &backfill {
+            // Only a backfill that permits serving passes the start gate; any
+            // other is refused below, and its refusal names the remedy.
+            let remedy = if pending.permits_serving() {
+                "Run `qbit-prism-server backfill-share-hashes` while frontends serve to map them \
+                 and record migration 2; share-archive restore, detach and drop refuse until then"
+            } else {
+                "Every start refuses the database meanwhile, naming what to run"
+            };
+            eprintln!(
+                "WARNING: migration 2's share-hash backfill is pending (share_hash_backfill_pending \
+                 = {}): the legacy shares from share_seq {} up to {} ({} share_seq values) are \
+                 not all mapped, and its cursor last moved at {}. {remedy}",
+                pending
+                    .fence
+                    .map_or_else(|| "none".to_owned(), |fence| fence.to_string()),
+                pending.next_seq,
+                pending.end_seq,
+                pending.remaining_seqs,
+                pending.updated_at.to_rfc3339()
+            );
+        }
+        report.share_hash_backfill = backfill;
         if let Some(hold) = hold.as_ref().filter(|hold| hold["held"] == true) {
             eprintln!(
                 "WARNING: the cluster holds block submission, set by {} at {}: {}; no frontend \
@@ -1939,6 +2050,42 @@ async fn sample_submission_hold(database_url: &str) -> Option<Value> {
     .await
     .ok()?
     .ok()
+}
+
+/// self-check's view of migration 2's share-hash backfill: pending, with
+/// its fence and cursor, or unknown, with why it could not be read.
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ShareHashBackfillReport {
+    Pending(crate::ledger::ShareHashBackfillPending),
+    Unknown { error: String },
+}
+
+/// Migration 2's share-hash backfill while it is pending, read-only and
+/// bounded by its read's own deadline; `None` only when the read found
+/// nothing pending. A failed read is reported as unknown, never as done.
+async fn sample_share_hash_backfill(database_url: &str) -> Option<ShareHashBackfillReport> {
+    match crate::ledger::Ledger::inspect_share_hash_backfill(database_url).await {
+        Ok(pending) => pending.map(ShareHashBackfillReport::Pending),
+        Err(error) => Some(ShareHashBackfillReport::Unknown {
+            error: reportable_error(&error),
+        }),
+    }
+}
+
+/// An error's text for an operator report, unless it is a connection or a
+/// protocol failure, whose text can carry the database URL's parts.
+fn reportable_error(error: &anyhow::Error) -> String {
+    let unreported = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(|error| !matches!(error, sqlx::Error::Database(_)))
+    });
+    if unreported {
+        "the database could not be read".to_owned()
+    } else {
+        format!("{error:#}")
+    }
 }
 
 async fn sample_audit_completeness(database_url: &str) -> Result<AuditCompleteness> {
@@ -2401,6 +2548,79 @@ mod configuration_tests {
         assert!(offline_indexes);
         assert_eq!(index_build_workers, 6);
         assert_eq!(index_build_memory, Some(1024 * 1024));
+    }
+
+    /// `backfill-share-hashes` throttles at 5,000 `share_seq`, 2 s and half
+    /// the time unless told otherwise, and refuses a throttle the runner
+    /// would not accept before anything connects.
+    #[test]
+    fn backfill_share_hashes_parses_its_throttle() {
+        let parse = |args: &[&str]| {
+            let Some(Command::BackfillShareHashes {
+                max_batch,
+                statement_timeout_ms,
+                duty_cycle,
+            }) = Cli::try_parse_from(args).unwrap().command
+            else {
+                panic!("wrong command");
+            };
+            (max_batch, statement_timeout_ms, duty_cycle)
+        };
+        assert_eq!(
+            parse(&["prism", "backfill-share-hashes"]),
+            (5_000, 2_000, 0.5)
+        );
+        assert_eq!(
+            parse(&[
+                "prism",
+                "backfill-share-hashes",
+                "--max-batch",
+                "50000",
+                "--statement-timeout-ms",
+                "250",
+                "--duty-cycle",
+                "1",
+            ]),
+            (50_000, 250, 1.0)
+        );
+        assert_eq!(
+            parse(&["prism", "backfill-share-hashes", "--duty-cycle", "0.01"]).2,
+            0.01
+        );
+        assert_eq!(
+            parse(&[
+                "prism",
+                "backfill-share-hashes",
+                "--statement-timeout-ms",
+                "5000"
+            ])
+            .1,
+            5_000
+        );
+        for args in [
+            vec!["prism", "backfill-share-hashes", "--max-batch", "0"],
+            vec!["prism", "backfill-share-hashes", "--max-batch", "50001"],
+            vec![
+                "prism",
+                "backfill-share-hashes",
+                "--statement-timeout-ms",
+                "0",
+            ],
+            vec![
+                "prism",
+                "backfill-share-hashes",
+                "--statement-timeout-ms",
+                "5001",
+            ],
+            vec!["prism", "backfill-share-hashes", "--duty-cycle", "0"],
+            vec!["prism", "backfill-share-hashes", "--duty-cycle", "0.009"],
+            vec!["prism", "backfill-share-hashes", "--duty-cycle", "1.5"],
+            vec!["prism", "backfill-share-hashes", "--duty-cycle", "NaN"],
+            vec!["prism", "backfill-share-hashes", "--duty-cycle", "half"],
+            vec!["prism", "migrate", "--max-batch", "10"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?} was accepted");
+        }
     }
 
     #[test]

@@ -75,7 +75,11 @@ DECLARE
     lease_declared boolean := false;
     fanout_lease_declared boolean := false;
     hold_declared boolean := false;
-    backfill_fence_declared boolean := false;
+    -- Each capability startup understands (ledger::NATIVE_CAPABILITIES), to
+    -- the highest value it accepts: a migration unit test compares the two.
+    understood constant jsonb := '{"candidate_storage_version": 1, "candidate_offer_lifecycle": 1, "instance_offer_startup": 1, "candidate_orphan_disposition": 1, "chain_observation_epoch": 1, "candidate_claim_observed_lease": 1, "fanout_claim_observed_lease": 1, "block_submission_hold": 1, "share_hash_backfill_pending": 2}';
+    backfill_fence integer;
+    backfill_cursor text;
     epoch_state record;
     source record;
     source_rows bigint;
@@ -144,22 +148,19 @@ BEGIN
     -- unit test compares the two, and the recovery regression removes each
     -- version declared by the server in turn.
     EXECUTE format('SELECT array_agg(version ORDER BY version) FROM %s', history) INTO applied;
+    -- Migration 2's share-hash backfill (#582) has not finished while its
+    -- cursor table exists, even with 2 recorded by hand. Its fence is read
+    -- with the other capabilities below, and decides: startup serves the
+    -- database with 2 unrecorded only at share_hash_backfill_pending = 2.
+    SELECT c.relkind::text INTO backfill_cursor FROM pg_catalog.pg_class c
+    WHERE c.relnamespace = current_schema()::regnamespace
+      AND c.relname = 'qbit_prism_share_hash_backfill';
     SELECT array_agg(version ORDER BY version) INTO missing
     FROM unnest(required_versions) AS required(version)
-    WHERE NOT version = ANY(COALESCE(applied, ARRAY[]::integer[]));
+    WHERE NOT version = ANY(COALESCE(applied, ARRAY[]::integer[]))
+      AND NOT (version = 2 AND backfill_cursor IS NOT NULL);
     IF missing IS NOT NULL THEN
         RAISE EXCEPTION 'missing required native migrations % (found %)', missing, applied USING HINT = hint;
-    END IF;
-    -- Migration 2's share-hash backfill (#582) has not finished while its
-    -- cursor table exists, even with 2 recorded by hand, and startup refuses
-    -- the database: qbit_prism_share_hashes would be exported partial.
-    IF EXISTS (
-        SELECT 1 FROM pg_catalog.pg_class c
-        WHERE c.relnamespace = current_schema()::regnamespace
-          AND c.relname = 'qbit_prism_share_hash_backfill'
-    ) THEN
-        RAISE EXCEPTION 'migration 2''s share-hash backfill has not finished: qbit_prism_share_hash_backfill exists in the current schema %', current_schema()
-            USING HINT = 'Startup refuses this database. Run qbit-prism-server migrate to finish the backfill, then export again.';
     END IF;
     FOREACH metadata IN ARRAY ARRAY['qbit_prism_schema_capabilities', 'qbit_prism_migration_source'] LOOP
         SELECT n.nspname IS NOT DISTINCT FROM current_schema() AS in_current_schema,
@@ -188,17 +189,17 @@ BEGIN
     -- orphan disposition 1 (015), chain observation epoch 1 (018),
     -- candidate claim observed lease 1 (021), fanout claim observed lease 1
     -- (022), block submission hold 1 (023), and the share-hash backfill
-    -- fence 1 (#669), which a database declares only while 2's backfill is
-    -- pending.
+    -- fence 1 or 2 (#669), which a database declares only while 2's
+    -- backfill is pending: `understood` above.
     -- Every format declaration is required on this native schema; a missing row is never repaired.
     FOR capability IN EXECUTE format('SELECT capability, capability_value, pg_typeof(capability)::text AS name_type, pg_typeof(capability_value)::text AS value_type FROM %s ORDER BY capability DESC', capability_table) LOOP
         IF capability.name_type <> 'text' OR capability.value_type <> 'integer'
            OR capability.capability IS NULL OR capability.capability_value IS NULL THEN
             RAISE EXCEPTION 'qbit_prism_schema_capabilities has an unreadable row: capability % (%), capability_value % (%)', capability.capability, capability.name_type, capability.capability_value, capability.value_type USING HINT = hint;
-        ELSIF capability.capability NOT IN ('candidate_storage_version', 'candidate_offer_lifecycle', 'instance_offer_startup', 'candidate_orphan_disposition', 'chain_observation_epoch', 'candidate_claim_observed_lease', 'fanout_claim_observed_lease', 'block_submission_hold', 'share_hash_backfill_pending') THEN
+        ELSIF NOT understood ? capability.capability THEN
             RAISE EXCEPTION 'database declares capability % = %, which this server does not understand', capability.capability, capability.capability_value USING HINT = hint;
-        ELSIF capability.capability_value <> 1 THEN
-            RAISE EXCEPTION 'database declares % = %, but this server understands % 1 to 1 only', capability.capability, capability.capability_value, capability.capability USING HINT = hint;
+        ELSIF capability.capability_value NOT BETWEEN 1 AND (understood ->> capability.capability)::integer THEN
+            RAISE EXCEPTION 'database declares % = %, but this server understands % 1 to % only', capability.capability, capability.capability_value, capability.capability, understood ->> capability.capability USING HINT = hint;
         END IF;
         declared := declared OR capability.capability = 'candidate_storage_version';
         offer_declared := offer_declared OR capability.capability = 'candidate_offer_lifecycle';
@@ -208,14 +209,35 @@ BEGIN
         lease_declared := lease_declared OR capability.capability = 'candidate_claim_observed_lease';
         fanout_lease_declared := fanout_lease_declared OR capability.capability = 'fanout_claim_observed_lease';
         hold_declared := hold_declared OR capability.capability = 'block_submission_hold';
-        backfill_fence_declared := backfill_fence_declared OR capability.capability = 'share_hash_backfill_pending';
+        IF capability.capability = 'share_hash_backfill_pending' THEN
+            backfill_fence := capability.capability_value;
+        END IF;
     END LOOP;
-    -- A pending share-hash backfill declares share_hash_backfill_pending = 1
+    -- A pending share-hash backfill declares share_hash_backfill_pending
     -- beside its cursor, and the transaction that records 2 removes both
-    -- (#669). A pending cursor was refused above, so a declaration here has
-    -- lost its cursor, which startup refuses too.
-    IF backfill_fence_declared THEN
-        RAISE EXCEPTION 'database declares share_hash_backfill_pending = 1, but migration 2''s share-hash backfill cursor qbit_prism_share_hash_backfill is gone, so legacy shares may be unmapped' USING HINT = hint;
+    -- (#669). At 1 startup refuses the cursor, and so does this export:
+    -- qbit_prism_share_hashes would be exported partial. At 2 the recent
+    -- range is mapped and startup serves the database while the rest is
+    -- mapped (`migrate --defer-share-hashes`), so the export reads it too: it
+    -- exports the cursor, and no share_hashes row, at its end. Only the
+    -- catalog is read here, never the cursor table: every session of the
+    -- parallel export runs this block, and a lock on the cursor held by one
+    -- that waits for the others would stall the transaction that records 2.
+    -- A declaration without its cursor has lost it, which startup refuses
+    -- too.
+    IF backfill_cursor IS NOT NULL THEN
+        IF backfill_cursor <> 'r' THEN
+            RAISE EXCEPTION 'a relation of kind % named qbit_prism_share_hash_backfill holds the name of migration 2''s share-hash backfill progress table in the current schema %', backfill_cursor, current_schema()
+                USING HINT = 'Startup refuses this database. Check what it holds, then rename or move it aside and export again.';
+        ELSIF backfill_fence IS NULL THEN
+            RAISE EXCEPTION 'migration 2''s share-hash backfill has not finished: qbit_prism_share_hash_backfill exists in the current schema %, and a build before #669 started it', current_schema()
+                USING HINT = 'Startup refuses this database. Run plain qbit-prism-server migrate, which finishes the backfill before anything serves, then export again.';
+        ELSIF backfill_fence <> 2 THEN
+            RAISE EXCEPTION 'migration 2''s share-hash backfill has not finished: qbit_prism_share_hash_backfill exists in the current schema %', current_schema()
+                USING HINT = 'Startup refuses this database. Run qbit-prism-server migrate --defer-share-hashes to permit serving with it pending, or plain qbit-prism-server migrate to finish it, then export again.';
+        END IF;
+    ELSIF backfill_fence IS NOT NULL THEN
+        RAISE EXCEPTION 'database declares share_hash_backfill_pending = %, but migration 2''s share-hash backfill cursor qbit_prism_share_hash_backfill is gone, so legacy shares may be unmapped', backfill_fence USING HINT = hint;
     END IF;
     IF NOT declared THEN
         RAISE EXCEPTION 'database is at schema migration 6 but qbit_prism_schema_capabilities has no candidate_storage_version row' USING HINT = hint;
@@ -276,6 +298,11 @@ SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_audit_snapshots,
        (to_regclass('qbit_prism_share_hashes') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_native_share_hashes,
+       -- Checked above: a native cursor is a backfill at fence 2.
+       (to_regclass('qbit_prism_schema_migrations') IS NOT NULL
+        AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                    WHERE c.relnamespace = current_schema()::regnamespace
+                      AND c.relname = 'qbit_prism_share_hash_backfill')) AS share_hashes_deferred,
        (to_regclass('qbit_prism_cluster') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_cluster,
        (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
@@ -512,10 +539,15 @@ FROM qbit_ctv_fanout_broadcast_attempts a ORDER BY attempt_seq;
 -- Native replay protection must survive recovery. Frozen 2.x exports the
 -- exact mapping migration 002 will backfill, including its duplicate rule.
 -- Native migration history prevents a missing table from being synthesized.
+-- While 2's backfill is pending, at fence 2, the mapping holds only what is
+-- mapped so far, so none of it is exported: share_hashes_deferred at the
+-- end exports the cursor instead.
 \if :has_native_share_hashes
 SELECT jsonb_build_object('kind', 'share_hashes', 'row', jsonb_build_object(
     'header_hash', header_hash, 'share_id', share_id))
-FROM qbit_prism_share_hashes ORDER BY header_hash COLLATE "C";
+FROM (SELECT header_hash, share_id FROM qbit_prism_share_hashes
+      WHERE NOT :'share_hashes_deferred'::boolean
+) mapping ORDER BY header_hash COLLATE "C";
 \else
 SELECT jsonb_build_object('kind', 'share_hashes', 'row', jsonb_build_object(
     'header_hash', header_hash, 'share_id', share_id))
@@ -638,6 +670,29 @@ WHERE ledger.maturity_state <> 'reversed' AND block.chain_state = 'confirmed'
 ORDER BY ledger.block_height, ledger.carry_forward_seq;
 
 SELECT jsonb_build_object('kind', 'integrity', 'row', qbit_carry_forward_integrity_report());
+-- The pending backfill's cursor: the legacy shares from next_seq up to
+-- end_seq are not all mapped yet. scripts/prism-recovery-evidence.py marks
+-- the share_hashes kind deferred with it; compare that kind once 2 is
+-- recorded. Read last, in the export's snapshot, so that the cursor table's
+-- lock is held only until the commit right after it, and the transaction
+-- that records 2 never waits long for an export. One that recorded 2 since
+-- the snapshot has dropped the table, which fails the export: export again.
+-- The recent range's columns are read through the row.
+\if :share_hashes_deferred
+DO $deferred$
+BEGIN
+    IF (SELECT count(*) FROM qbit_prism_share_hash_backfill WHERE singleton) <> 1 THEN
+        RAISE EXCEPTION 'qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively'
+            USING HINT = 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
+    END IF;
+END
+$deferred$;
+SELECT jsonb_build_object('kind', 'share_hashes_deferred', 'row', jsonb_build_object(
+    'start_seq', start_seq, 'next_seq', next_seq, 'end_seq', end_seq,
+    'recent_min_height', to_jsonb(b)->'recent_min_height',
+    'recent_start_seq', to_jsonb(b)->'recent_start_seq'))
+FROM qbit_prism_share_hash_backfill b WHERE singleton;
+\endif
 -- A final marker makes an interrupted/failed psql export fail closed.
 SELECT jsonb_build_object('kind', 'complete', 'row', true);
 COMMIT;

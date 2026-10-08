@@ -13,7 +13,8 @@
 //! append; the last tests here hold that to the same rule.
 use super::*;
 use qbit_prism_server::ledger::{
-    archive, IndexBuildMode, MigrateOptions, ShareHashBackfill, REQUIRED_SCHEMA_VERSIONS,
+    archive, IndexBuildMode, MigrateOptions, ShareHashBackfill, ShareHashThrottle,
+    REQUIRED_SCHEMA_VERSIONS,
 };
 use std::collections::HashSet;
 use std::time::Duration;
@@ -1916,8 +1917,9 @@ async fn plain_migrate_refuses_before_mapping_when_the_fence_reached_2_while_it_
 /// The double-credit check reads the native shares in chunks of
 /// `share_seq`, from the backfill's end up to the last share appended
 /// before it starts, each chunk a short statement of its own. Here the
-/// native shares span a million `share_seq`, twenty times the check's
-/// largest chunk, and only the last one repeats a legacy header: plain
+/// native shares span a million `share_seq`, two hundred times the largest
+/// chunk at the default throttle, and only the last one repeats a legacy
+/// header: plain
 /// `migrate` still refuses to record 2, naming it, and leaves the cursor
 /// and the fence as they are.
 #[tokio::test]
@@ -2168,7 +2170,7 @@ async fn an_archive_ready_native_partition_stays_attached_until_2_is_recorded() 
             text.contains(&format!(
                 "refusing to {step} {P1} while migration 2's share-hash backfill is pending"
             )) && text.contains("so every partition stays attached until 2 is recorded")
-                && text.contains("Run `qbit-prism-server migrate`"),
+                && text.contains("Run `qbit-prism-server backfill-share-hashes`, or plain `qbit-prism-server migrate`, to finish the backfill"),
             "{text}"
         );
         Ok(())
@@ -2206,4 +2208,857 @@ async fn an_archive_ready_native_partition_stays_attached_until_2_is_recorded() 
     let dropped = archive::drop_partition(&operator, P1, root.path()).await?;
     ensure!(dropped["relation_dropped"] == true, "{dropped}");
     db.close(vec![migrated, operator, finished]).await
+}
+
+/// `qbit-prism-server backfill-share-hashes` with `args`, against `db`
+/// alone: no setting of the test runner's reaches it, but `env`.
+async fn backfill_cli(
+    db: &Database,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    for (key, _) in std::env::vars().filter(|(key, _)| {
+        key.starts_with("PRISM_") || key.starts_with("QBIT_") || key == "RUST_LOG"
+    }) {
+        command.env_remove(key);
+    }
+    command
+        .arg("backfill-share-hashes")
+        .args(args)
+        .kill_on_drop(true)
+        .env("PRISM_DATABASE_URL", &db.url)
+        .env("PRISM_RUNTIME_WORKERS", "2")
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .envs(env.iter().copied());
+    Ok(timeout(Duration::from_secs(300), command.output()).await??)
+}
+
+/// Log every batch the backfill commits: the cursor's move, the statement
+/// timeout the batch ran under, and when it moved. A test's own trigger on
+/// the cursor table, which goes with the table when 2 is recorded.
+async fn log_batches(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql(
+        "CREATE TABLE test_share_hash_batches(from_seq bigint NOT NULL, to_seq bigint NOT NULL, statement_timeout text NOT NULL, at timestamptz NOT NULL); \
+         CREATE FUNCTION test_log_share_hash_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             INSERT INTO test_share_hash_batches VALUES (OLD.next_seq, NEW.next_seq, current_setting('statement_timeout'), clock_timestamp()); RETURN NEW; END $$; \
+         CREATE TRIGGER test_log_share_hash_batch AFTER UPDATE ON qbit_prism_share_hash_backfill FOR EACH ROW EXECUTE FUNCTION test_log_share_hash_batch();",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The batches `log_batches` logged, in order: `[from, to)`, the
+/// statement timeout, and the seconds since the first.
+async fn logged_batches(pool: &PgPool) -> Result<Vec<(i64, i64, String, f64)>> {
+    Ok(sqlx::query_as(
+        "SELECT from_seq,to_seq,statement_timeout,extract(epoch FROM at - min(at) OVER ())::float8 FROM test_share_hash_batches ORDER BY at",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Make every statement that maps headers, a batch's or an append's, run
+/// `body` first: a statement trigger of the test's own on the mapping.
+async fn slow_mapping(pool: &PgPool, body: &str) -> Result<()> {
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION test_slow_share_hashes() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} RETURN NULL; END $$; \
+         CREATE OR REPLACE TRIGGER test_slow_share_hashes BEFORE INSERT ON qbit_prism_share_hashes FOR EACH STATEMENT EXECUTE FUNCTION test_slow_share_hashes();"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn drop_slow_mapping(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql("DROP TRIGGER test_slow_share_hashes ON qbit_prism_share_hashes; DROP FUNCTION test_slow_share_hashes();")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `backfill-share-hashes` maps the rest of a deferred backfill while a
+/// frontend appends, up to the end the cursor was planned to, and records
+/// 2: the legacy mapping is the whole backfill's, the native shares, before
+/// and during the run, keep the headers they mapped themselves, and the
+/// cursor and the fence are gone. It prints what it did. A second run has
+/// nothing left to map, and says so as a success, changing nothing.
+#[tokio::test]
+async fn backfill_share_hashes_maps_the_rest_while_frontends_append_and_records_2() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let (first, _) = cursor(&pool)
+        .await?
+        .context("the deferred backfill has no cursor")?;
+    let pending = Ledger::inspect_share_hash_backfill(&db.url)
+        .await?
+        .context("self-check's read found no pending backfill")?;
+    assert_eq!(
+        (
+            pending.fence,
+            pending.start_seq,
+            pending.next_seq,
+            pending.end_seq,
+            pending.remaining_seqs,
+            pending.recent_min_height
+        ),
+        (
+            Some(2),
+            first,
+            first,
+            end,
+            end - first,
+            Some(RECENT_MIN_HEIGHT)
+        )
+    );
+    let frontend = db.ledger("frontend").await?;
+    let mut native = Vec::new();
+    for id in 1_000_000..1_000_003 {
+        native.push(frontend.append(share(id), None).await?.share);
+    }
+    // A legacy header below the recent range, held open so the run waits in
+    // the batch that reaches it while the frontend appends.
+    let mut blocker = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,'blocker:'||$1)",
+    )
+    .bind(format!("{:064x}", 30_001_u64))
+    .execute(&mut *blocker)
+    .await?;
+    // The batch that reaches it waits under the throttle's cap, 5 s, which
+    // outlasts the appends below; a batch cut there would be tried again at
+    // half its size. The pool's lock timeout, also 5 s, must not cut it
+    // first: a lock timeout stops a batch rather than halving it.
+    let mut run = Box::pin(backfill_cli(
+        &db,
+        &[
+            "--max-batch",
+            "2000",
+            "--statement-timeout-ms",
+            "5000",
+            "--duty-cycle",
+            "0.5",
+        ],
+        &[("PRISM_DATABASE_LOCK_TIMEOUT_MS", "60000")],
+    ));
+    tokio::select! {
+        output = &mut run => bail!("backfill-share-hashes ended before its batch reached the held header: {:?}", output?),
+        waiting = batch_waiting(&pool) => { waiting?; }
+    }
+    for id in 2_000_000..2_000_003 {
+        native.push(frontend.append(share(id), None).await?.share);
+    }
+    let (next, planned) = cursor(&pool).await?.context("the cursor is gone mid-run")?;
+    assert_eq!(planned, end, "the run moved its planned end");
+    assert!(next > first && next <= 30_001, "cursor {next}");
+    blocker.rollback().await?;
+    let output = run.await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        output.status.success(),
+        "backfill-share-hashes failed: {stderr}"
+    );
+    ensure!(
+        stderr.contains("share-hash backfill batches throttled")
+            && stderr.contains("duty_cycle=0.5"),
+        "{stderr}"
+    );
+    let printed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(printed["recorded"], true);
+    assert_eq!(printed["already_complete"], false);
+    assert_eq!(printed["next_seq"], first);
+    assert_eq!(printed["end_seq"], end);
+    assert_eq!(printed["seqs"], end - first);
+    assert!(printed["mapped"].as_u64() > Some(0), "{printed}");
+
+    assert_eq!(cursor(&pool).await?, None);
+    assert_eq!(fence_value(&pool).await?, None);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(Ledger::inspect_share_hash_backfill(&db.url).await?, None);
+    let legacy = expected_mapping(&pool, end).await?;
+    assert_eq!(legacy_mapping(&pool, end).await?, legacy);
+    for share in &native {
+        assert!(share.share_seq as i64 >= end);
+        let holder: Option<String> =
+            sqlx::query_scalar("SELECT share_id FROM qbit_prism_share_hashes WHERE header_hash=$1")
+                .bind(&share.share_id[share.share_id.len() - 64..])
+                .fetch_optional(&pool)
+                .await?;
+        assert_eq!(holder.as_deref(), Some(share.share_id.as_str()));
+    }
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_share_hashes")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(total, (legacy.len() + native.len()) as i64);
+    // A legacy header below the recent range is credited to its legacy share.
+    let error = frontend
+        .append(share(1_005), None)
+        .await
+        .err()
+        .context("a native share repeating a legacy header was credited")?;
+    assert!(
+        format!("{error:#}").contains("header already credited globally"),
+        "{error:#}"
+    );
+
+    // A retry, say after a lost reply, finds 2 recorded: nothing to map, and
+    // a success.
+    let again = backfill_cli(&db, &[], &[]).await?;
+    ensure!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let printed: serde_json::Value = serde_json::from_slice(&again.stdout)?;
+    assert_eq!(
+        (
+            &printed["recorded"],
+            &printed["already_complete"],
+            &printed["mapped"],
+            &printed["seqs"]
+        ),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(true),
+            &serde_json::json!(0),
+            &serde_json::json!(0)
+        ),
+        "{printed}"
+    );
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    db.close(vec![migrated, frontend]).await
+}
+
+/// A native share that repeats a legacy header below the recent range was
+/// credited twice, which `backfill-share-hashes` refuses to record 2 over,
+/// as plain `migrate` does: every legacy share is mapped, the cursor stands
+/// at its end, the fence stays at 2 and 2 unrecorded.
+#[tokio::test]
+async fn backfill_share_hashes_refuses_to_record_2_over_a_native_share_repeating_a_legacy_header(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let frontend = db.ledger("frontend").await?;
+    let repeated = frontend.append(share(1_005), None).await?;
+    assert!(
+        repeated.inserted,
+        "the header below the recent range was refused"
+    );
+    let output = backfill_cli(&db, &[], &[]).await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success()
+            && stderr.contains(&format!(
+                "refusing to record migration 2: native share {}, at share_seq {}, repeats header {:064x}",
+                repeated.share.share_id, repeated.share.share_seq, 1_005
+            ))
+            && stderr.contains("so that header was credited twice"),
+        "{stderr}"
+    );
+    assert_eq!(cursor(&pool).await?, Some((end, end)));
+    assert_eq!(fence_value(&pool).await?, Some(2));
+    assert_eq!(schema_versions(&pool).await?, all_but_2());
+    db.close(vec![migrated, frontend]).await
+}
+
+/// `backfill-share-hashes` maps only a backfill that permits serving. At
+/// fence 1 every start refuses the database, the command's included, and
+/// says what to run instead; nothing is mapped. Under the runners' lock it
+/// checks again, so a fence that changed after the start gate is refused
+/// too, naming what to run: at 1, without a fence (a backfill a build
+/// before #669 started), and at a newer release's value. So is a backfill
+/// whose record could not be written, 017's conversion bound missing, as
+/// plain `migrate` refuses it: before any batch. A database whose backfill
+/// has finished has nothing to map, which is a success.
+#[tokio::test]
+async fn backfill_share_hashes_refuses_a_backfill_that_does_not_permit_serving() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    two_x::apply_frozen_2x_schema(&pool, SourceState::Pre258).await?;
+    seed_heights(&pool).await?;
+    assert_eq!(Ledger::inspect_share_hash_backfill(&db.url).await?, None);
+    let runners = pending_backfill(&db, &pool).await?;
+    runners.close().await?;
+    let pending = cursor(&pool).await?.context("the progress table is gone")?;
+    assert_eq!(fence_value(&pool).await?, Some(1));
+    let output = backfill_cli(&db, &[], &[]).await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        !output.status.success()
+            && stderr.contains(
+                "database is not ready: migration 2's share-hash backfill has not finished"
+            )
+            && stderr.contains("Run `qbit-prism-server migrate`")
+            && stderr.contains("`qbit-prism-server migrate --defer-share-hashes`"),
+        "{stderr}"
+    );
+    assert_eq!(cursor(&pool).await?, Some(pending));
+    assert!(mapping(&pool).await?.is_empty(), "a refused run mapped");
+
+    let deferred = Ledger::connect_migrate(&db.url, ShareHashBackfill::Defer).await?;
+    let pending = cursor(&pool).await?.context("the progress table is gone")?;
+    let mapped = mapping(&pool).await?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    for (value, refusal) in [
+        (Some(1), "refusing to backfill share hashes: migration 2's share-hash backfill does not permit serving (share_hash_backfill_pending = 1)"),
+        (None, "refusing to backfill share hashes: a build before #669 started migration 2's share-hash backfill"),
+        (Some(3), "refusing to backfill share hashes: a newer PRISM release declared share_hash_backfill_pending = 3, but this server understands share_hash_backfill_pending 1 to 2 only"),
+    ] {
+        match value {
+            Some(value) => set_fence(&pool, value).await?,
+            None => {
+                sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending'")
+                    .execute(&pool)
+                    .await?;
+            }
+        }
+        let error = operator
+            .backfill_share_hashes(&ShareHashThrottle::default())
+            .await
+            .err()
+            .with_context(|| format!("backfill-share-hashes mapped at fence {value:?}"))?
+            .to_string();
+        ensure!(error.contains(refusal), "{value:?}: {error}");
+        assert_eq!(cursor(&pool).await?, Some(pending), "{value:?}");
+        assert_eq!(mapping(&pool).await?, mapped, "{value:?}");
+        assert_eq!(schema_versions(&pool).await?, all_but_2(), "{value:?}");
+        if value.is_none() {
+            sqlx::query("INSERT INTO qbit_prism_schema_capabilities(capability,capability_value) VALUES('share_hash_backfill_pending',2)")
+                .execute(&pool)
+                .await?;
+        } else {
+            set_fence(&pool, 2).await?;
+        }
+    }
+    let bound: i64 = sqlx::query_scalar(
+        "SELECT conversion_bound FROM qbit_prism_share_partitioning WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("UPDATE qbit_prism_share_partitioning SET conversion_bound=NULL WHERE singleton")
+        .execute(&pool)
+        .await?;
+    let error = operator
+        .backfill_share_hashes(&ShareHashThrottle::default())
+        .await
+        .err()
+        .context("backfill-share-hashes mapped without 017's conversion bound")?
+        .to_string();
+    ensure!(
+        error.contains(
+            "refusing to finish migration 2's share-hash backfill before mapping anything"
+        ),
+        "{error}"
+    );
+    assert_eq!(cursor(&pool).await?, Some(pending));
+    assert_eq!(mapping(&pool).await?, mapped);
+    sqlx::query("UPDATE qbit_prism_share_partitioning SET conversion_bound=$1 WHERE singleton")
+        .bind(bound)
+        .execute(&pool)
+        .await?;
+    let finished = operator
+        .backfill_share_hashes(&ShareHashThrottle::default())
+        .await?;
+    assert_eq!(finished.range, Some(pending));
+    assert!(!finished.already_complete());
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    // Finished, there is nothing to map: a success, not a refusal.
+    let again = operator
+        .backfill_share_hashes(&ShareHashThrottle::default())
+        .await?;
+    assert!(again.already_complete(), "{again:?}");
+    assert_eq!((again.mapped, again.range), (0, None));
+    db.close(vec![deferred, operator]).await
+}
+
+/// While frontends serve, every batch is one statement in its own
+/// transaction under the throttle's statement timeout, and the run rests
+/// between batches so that they take at most the duty cycle's share of the
+/// time: at a duty cycle of 0.25, three times as long as each batch took.
+/// A test trigger makes each batch's statement take 150 ms, so batches are
+/// at least 600 ms apart. Without the rest they would be about 150 ms apart,
+/// and without the per-batch timeout each would run under the pool's.
+#[tokio::test]
+async fn backfill_share_hashes_runs_each_batch_under_its_statement_timeout_and_rests_between_batches(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let (first, _) = cursor(&pool).await?.context("no cursor")?;
+    log_batches(&pool).await?;
+    slow_mapping(&pool, "PERFORM pg_sleep(0.15);").await?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    let throttle = ShareHashThrottle::new(5_000, Duration::from_millis(1_500), 0.25)?;
+    let finished = operator.backfill_share_hashes(&throttle).await?;
+    drop_slow_mapping(&pool).await?;
+    assert_eq!(finished.range, Some((first, end)));
+    let batches = logged_batches(&pool).await?;
+    ensure!(batches.len() >= 10, "{batches:?}");
+    assert_eq!(batches.first().map(|batch| batch.0), Some(first));
+    assert_eq!(batches.last().map(|batch| batch.1), Some(end));
+    for (index, (from, to, statement_timeout, _)) in batches.iter().enumerate() {
+        ensure!(
+            statement_timeout == "1500ms",
+            "batch {index} ran under statement_timeout {statement_timeout}"
+        );
+        ensure!(
+            to - from <= 5_000,
+            "batch {index} covered {} share_seq",
+            to - from
+        );
+        if index > 0 {
+            ensure!(*from == batches[index - 1].1, "{batches:?}");
+        }
+    }
+    for pair in batches.windows(2) {
+        let apart = pair[1].3 - pair[0].3;
+        ensure!(
+            apart >= 0.5,
+            "batches {apart:.3} s apart: no rest of three times a 150 ms batch: {batches:?}"
+        );
+    }
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(
+        mapping(&pool).await?,
+        expected_mapping(&pool, i64::MAX).await?
+    );
+    db.close(vec![migrated, operator]).await
+}
+
+/// A batch that outlasts the throttle's statement timeout is rolled back and
+/// tried again at half its size, down to the smallest batch, which fails the
+/// run instead, every earlier batch kept and the remedy named. A test
+/// trigger holds the mapping statement for a second: always, then for the
+/// first two attempts only, so the run's first batch commits at 1,000
+/// `share_seq`, a quarter of 4,000, and no batch exceeds 4,000.
+#[tokio::test]
+async fn a_batch_past_the_throttles_statement_timeout_is_retried_at_half_its_size() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let (first, _) = cursor(&pool).await?.context("no cursor")?;
+    log_batches(&pool).await?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    let throttle = ShareHashThrottle::new(4_000, Duration::from_millis(300), 1.0)?;
+    slow_mapping(&pool, "PERFORM pg_sleep(1);").await?;
+    let error = operator
+        .backfill_share_hashes(&throttle)
+        .await
+        .err()
+        .context("a run whose every batch outlasted its timeout succeeded")?;
+    let text = format!("{error:#}");
+    ensure!(
+        text.contains(&format!("Resume from share_seq {first} with `qbit-prism-server backfill-share-hashes`"))
+            && text.contains("even a batch of 1000 share_seq, the smallest, outlasted its 300 ms statement timeout, so run it with a smaller --max-batch, or else a larger --statement-timeout-ms, at most 5000")
+            && text.contains("canceling statement due to statement timeout"),
+        "{text}"
+    );
+    assert_eq!(cursor(&pool).await?, Some((first, end)));
+    assert!(logged_batches(&pool).await?.is_empty());
+    sqlx::raw_sql("CREATE SEQUENCE test_slow_attempts")
+        .execute(&pool)
+        .await?;
+    slow_mapping(
+        &pool,
+        "IF nextval('test_slow_attempts') <= 2 THEN PERFORM pg_sleep(1); END IF;",
+    )
+    .await?;
+    let finished = operator.backfill_share_hashes(&throttle).await?;
+    drop_slow_mapping(&pool).await?;
+    assert_eq!(finished.range, Some((first, end)));
+    let sizes: Vec<i64> = logged_batches(&pool)
+        .await?
+        .iter()
+        .map(|(from, to, _, _)| to - from)
+        .collect();
+    // Halved twice, from 4,000 to the smallest batch; then it grows as
+    // batches run fast, within the throttle's size.
+    ensure!(sizes.first() == Some(&1_000), "{sizes:?}");
+    ensure!(sizes.iter().all(|size| *size <= 4_000), "{sizes:?}");
+    assert_eq!(sizes.iter().sum::<i64>(), end - first);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    db.close(vec![migrated, operator]).await
+}
+
+/// The double-credit check reads the native shares on the serving primary
+/// too, so it keeps to the backfill's throttle as the batches do: each of
+/// its statements in a transaction of its own under the throttle's
+/// timeout. Here every batch is done and a table lock holds the check's
+/// first read: it is cancelled at the throttle's 300 ms, as a statement
+/// timeout, not after the pool's 5 s lock timeout, and the run stops before
+/// recording 2, naming what to run.
+#[tokio::test]
+async fn the_double_credit_check_runs_under_the_throttles_statement_timeout() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let frontend = db.ledger("frontend").await?;
+    assert!(frontend.append(share(1_000_000), None).await?.inserted);
+    // Every batch done: the run goes straight to the check.
+    sqlx::query("UPDATE qbit_prism_share_hash_backfill SET next_seq=end_seq WHERE singleton")
+        .execute(&pool)
+        .await?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    let mut holder = pool.begin().await?;
+    sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await?;
+    let throttle = ShareHashThrottle::new(5_000, Duration::from_millis(300), 0.5)?;
+    let started = std::time::Instant::now();
+    let error = operator.backfill_share_hashes(&throttle).await.err();
+    let took = started.elapsed();
+    holder.rollback().await?;
+    let text = format!(
+        "{:#}",
+        error.context("the check read the ledger through a table lock")?
+    );
+    ensure!(
+        text.contains("finding the last native share")
+            && text.contains("run `qbit-prism-server backfill-share-hashes` again")
+            && text.contains("canceling statement due to statement timeout"),
+        "{text}"
+    );
+    ensure!(
+        took < Duration::from_secs(4),
+        "the check waited {took:?} for the lock: not the throttle's 300 ms"
+    );
+    assert_eq!(cursor(&pool).await?, Some((end, end)));
+    assert_eq!(fence_value(&pool).await?, Some(2));
+    assert_eq!(schema_versions(&pool).await?, all_but_2());
+    db.close(vec![migrated, frontend, operator]).await
+}
+
+/// The migration lock's key (`ledger::MIGRATION_LOCK`), a transaction-scoped
+/// advisory lock in the ledger's database.
+const MIGRATION_LOCK: i64 = 0x5052_4953_4d00_0001;
+
+/// The default throttle but for its statement timeout, the cap, 5 s, which
+/// outlasts the record's 2 s lock timeout: each lock wait is then cut by the
+/// lock timeout alone. At the defaults both are 2 s, and either may cut it.
+fn record_throttle(attempts: u32, backoff: Duration) -> Result<ShareHashThrottle> {
+    ShareHashThrottle::new(
+        ShareHashThrottle::DEFAULT_MAX_BATCH,
+        Duration::from_millis(ShareHashThrottle::MAX_STATEMENT_TIMEOUT_MS),
+        ShareHashThrottle::DEFAULT_DUTY_CYCLE,
+    )?
+    .with_record_attempts(attempts, backoff)
+}
+
+/// Every attempt of the transaction that records 2 that is waiting on a
+/// lock, as `(backend, its statement's start)`, polled until `until`
+/// resolves: what tells one attempt from the next.
+async fn record_attempts_waiting(pool: &PgPool, statement: &str) -> Result<Vec<(i32, f64)>> {
+    Ok(sqlx::query_as(
+        "SELECT pid,extract(epoch FROM query_start)::float8 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE $1",
+    )
+    .bind(format!("{statement}%"))
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Poll `statement`'s lock waits until `attempts` distinct ones were seen,
+/// and return the longest any of them had waited when seen: an attempt
+/// that waits at most its lock timeout is seen again and again, each time
+/// with a new start.
+async fn watch_record_attempts(
+    pool: &PgPool,
+    statement: &str,
+    attempts: usize,
+) -> Result<std::time::Duration> {
+    let mut starts = std::collections::BTreeSet::new();
+    let mut longest = 0.0_f64;
+    timeout(Duration::from_secs(60), async {
+        while starts.len() < attempts {
+            let now: f64 = sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::float8")
+                .fetch_one(pool)
+                .await?;
+            for (_, started) in record_attempts_waiting(pool, statement).await? {
+                starts.insert(started.to_bits());
+                longest = longest.max(now - started);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "saw {} attempts of `{statement}` waiting, not {attempts}: one that waits without a lock timeout is never seen again",
+            starts.len()
+        )
+    })??;
+    Ok(Duration::from_secs_f64(longest))
+}
+
+/// The transaction that records 2 while frontends serve never waits long
+/// for a lock (#738). A recovery evidence export reads the cursor table in
+/// its snapshot and holds that lock until it commits; here an open
+/// transaction that read the cursor stands in for one. The record's `DROP
+/// TABLE` waits at most its two-second lock timeout, rolls back, holding
+/// nothing, and is tried again after a backoff; once the reader commits,
+/// the next attempt records 2. Nothing hangs. The statement timeout is the
+/// cap, so that only the lock timeout can cut a wait under 4 s.
+#[tokio::test]
+async fn the_record_of_2_waits_out_a_reader_of_the_cursor_in_short_attempts() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let mut reader = pool.begin().await?;
+    sqlx::query("SELECT count(*) FROM qbit_prism_share_hash_backfill")
+        .execute(&mut *reader)
+        .await?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    let throttle = record_throttle(20, Duration::from_millis(200))?;
+    let mut run = Box::pin(operator.backfill_share_hashes(&throttle));
+    let longest = tokio::select! {
+        finished = &mut run => bail!("recorded 2 through a reader of the cursor: {finished:?}"),
+        watched = watch_record_attempts(&pool, "DROP TABLE qbit_prism_share_hash_backfill", 2) => watched?,
+    };
+    ensure!(
+        longest < Duration::from_secs(4),
+        "an attempt waited {longest:?} for the cursor's lock"
+    );
+    assert_eq!(cursor(&pool).await?, Some((end, end)));
+    assert_eq!(schema_versions(&pool).await?, all_but_2());
+    reader.commit().await?;
+    let finished = timeout(Duration::from_secs(60), run).await??;
+    assert_eq!(finished.range.map(|(_, to)| to), Some(end));
+    assert_eq!(cursor(&pool).await?, None);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    db.close(vec![migrated, operator]).await
+}
+
+/// The same for the migration lock, which every migrating start takes: the
+/// record waits at most its lock timeout an attempt for it too, the
+/// advisory lock's wait included. Held through every attempt, the run stops
+/// cleanly, naming what held it and what to run, with every batch done, the
+/// cursor at its end, the fence at 2 and 2 unrecorded. A rerun waits again,
+/// and records 2 once the lock is released. Under the cap's statement
+/// timeout, as above.
+#[tokio::test]
+async fn the_record_of_2_stops_cleanly_behind_a_held_migration_lock_and_records_once_released(
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let mut holder = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(MIGRATION_LOCK)
+        .execute(&mut *holder)
+        .await?;
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    let impatient = record_throttle(3, Duration::from_millis(100))?;
+    let started = std::time::Instant::now();
+    let error = timeout(
+        Duration::from_secs(60),
+        operator.backfill_share_hashes(&impatient),
+    )
+    .await
+    .context("the record waited for the migration lock without a bound")?
+    .err()
+    .context("recorded 2 under a held migration lock")?;
+    let took = started.elapsed();
+    let text = format!("{error:#}");
+    ensure!(
+        text.contains("refusing to wait any longer to record migration 2: something held MIGRATION_LOCK or the share-hash cursor through 3 attempts")
+            && text.contains("Run `qbit-prism-server backfill-share-hashes` again once it is released")
+            && text.contains("canceling statement due to lock timeout"),
+        "{text}"
+    );
+    // Three attempts of two seconds each, and their backoffs.
+    ensure!(took >= Duration::from_secs(6), "stopped after {took:?}");
+    assert_eq!(cursor(&pool).await?, Some((end, end)));
+    assert_eq!(fence_value(&pool).await?, Some(2));
+    assert_eq!(schema_versions(&pool).await?, all_but_2());
+
+    let patient = record_throttle(20, Duration::from_millis(200))?;
+    let mut run = Box::pin(operator.backfill_share_hashes(&patient));
+    let longest = tokio::select! {
+        finished = &mut run => bail!("recorded 2 under a held migration lock: {finished:?}"),
+        watched = watch_record_attempts(&pool, "SELECT pg_advisory_xact_lock", 2) => watched?,
+    };
+    ensure!(
+        longest < Duration::from_secs(4),
+        "an attempt waited {longest:?} for the migration lock"
+    );
+    holder.rollback().await?;
+    let finished = timeout(Duration::from_secs(60), run).await??;
+    assert!(!finished.already_complete());
+    assert_eq!(cursor(&pool).await?, None);
+    assert_eq!(fence_value(&pool).await?, None);
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    db.close(vec![migrated, operator]).await
+}
+
+/// Plain `migrate` maps the rest of a backfill that permits serving at the
+/// default throttle, by `backfill-share-hashes`'s path: batches of at most
+/// 5,000 `share_seq`, each under a 2 s statement timeout, resting as long as
+/// each took. Never rc.4's batches, which double to 50,000 under the pool's
+/// timeout, back to back (#738). The same with `--offline-indexes`, which
+/// changes only how 013 and 024 build (#745).
+#[tokio::test]
+async fn plain_migrate_maps_a_deferred_backfill_at_the_default_throttle() -> Result<()> {
+    for index_build in [
+        IndexBuildMode::Concurrent,
+        IndexBuildMode::Offline {
+            workers: 2,
+            memory_kb: None,
+        },
+    ] {
+        plain_migrate_at_the_default_throttle(MigrateOptions {
+            share_hashes: ShareHashBackfill::Finish,
+            index_build,
+        })
+        .await
+        .with_context(|| format!("plain migrate with {index_build:?} index builds"))?;
+    }
+    Ok(())
+}
+
+async fn plain_migrate_at_the_default_throttle(options: MigrateOptions) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    log_batches(&pool).await?;
+    slow_mapping(&pool, "PERFORM pg_sleep(0.15);").await?;
+    let finished = Ledger::connect_migrate(&db.url, options).await?;
+    drop_slow_mapping(&pool).await?;
+    let batches = logged_batches(&pool).await?;
+    ensure!(batches.len() >= 10, "{batches:?}");
+    assert_eq!(batches.last().map(|batch| batch.1), Some(end));
+    for (index, (from, to, statement_timeout, _)) in batches.iter().enumerate() {
+        ensure!(
+            statement_timeout == "2s" && to - from <= 5_000,
+            "batch {index}: {} share_seq under statement_timeout {statement_timeout}",
+            to - from
+        );
+    }
+    for pair in batches.windows(2) {
+        let apart = pair[1].3 - pair[0].3;
+        ensure!(
+            apart >= 0.25,
+            "batches {apart:.3} s apart: no rest as long as a 150 ms batch: {batches:?}"
+        );
+    }
+    assert_eq!(schema_versions(&pool).await?, REQUIRED_SCHEMA_VERSIONS);
+    assert_eq!(cursor(&pool).await?, None);
+    db.close(vec![migrated, finished]).await
+}
+
+/// `self-check` reports a deferred backfill, its fence and its cursor, and
+/// warns that `backfill-share-hashes` has still to run, without failing on
+/// it: here it fails on the node it cannot reach, and only on that. Once 2
+/// is recorded, the field and the warning are gone. One it cannot read is
+/// `unknown`, with why, never taken for done.
+#[tokio::test]
+async fn self_check_reports_a_deferred_backfill_without_failing_on_it() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&db.url).await?;
+    let (migrated, end) = deferred(&db, &pool).await?;
+    let (first, _) = cursor(&pool).await?.context("no cursor")?;
+    let self_check = || async {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+        for (key, _) in std::env::vars().filter(|(key, _)| {
+            key.starts_with("PRISM_") || key.starts_with("QBIT_") || key == "RUST_LOG"
+        }) {
+            command.env_remove(key);
+        }
+        command
+            .arg("self-check")
+            .kill_on_drop(true)
+            .env("PRISM_RUNTIME_WORKERS", "2")
+            .env("PRISM_INSTANCE_ID", "self-check-backfill")
+            .env("PRISM_DATABASE_URL", &db.url)
+            .env("QBIT_RPC_URL", "http://127.0.0.1:0/")
+            .env("PRISM_RPC_TIMEOUT_SECONDS", "1")
+            .env("QBIT_CHAIN", "regtest")
+            .env("PRISM_ALLOW_TEST_SIGNING_SEEDS", "1");
+        for (name, value) in pool_fee::ZERO_BPS_POOL_FEE {
+            command.env(name, value);
+        }
+        let output = timeout(Duration::from_secs(60), command.output()).await??;
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .with_context(|| String::from_utf8_lossy(&output.stderr).into_owned())?;
+        Ok::<_, anyhow::Error>((
+            output.status.success(),
+            report,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    };
+    let (ok, report, stderr) = self_check().await?;
+    let backfill = &report["share_hash_backfill"];
+    ensure!(
+        !ok && report["ok"] == false
+            && backfill["state"] == "pending"
+            && backfill["fence"] == 2
+            && backfill["start_seq"] == first
+            && backfill["next_seq"] == first
+            && backfill["end_seq"] == end
+            && backfill["remaining_seqs"] == end - first
+            && backfill["recent_min_height"] == RECENT_MIN_HEIGHT
+            && backfill["updated_at"].is_string(),
+        "{report}"
+    );
+    ensure!(
+        stderr.contains(&format!("WARNING: migration 2's share-hash backfill is pending (share_hash_backfill_pending = 2): the legacy shares from share_seq {first} up to {end}"))
+            && stderr.contains("Run `qbit-prism-server backfill-share-hashes` while frontends serve")
+            && stderr.contains("qbit RPC getblockhash transport failed"),
+        "{stderr}"
+    );
+    let operator = Ledger::connect_operator(&db.url, false).await?;
+    operator
+        .backfill_share_hashes(&ShareHashThrottle::default())
+        .await?;
+    let (_, report, stderr) = self_check().await?;
+    ensure!(report.get("share_hash_backfill").is_none(), "{report}");
+    ensure!(
+        !stderr.contains("share-hash backfill is pending"),
+        "{stderr}"
+    );
+    // A backfill self-check cannot read is never reported as done: here a
+    // view holds the cursor's name, which every start refuses too.
+    sqlx::raw_sql("CREATE VIEW qbit_prism_share_hash_backfill AS SELECT 1 AS singleton")
+        .execute(&pool)
+        .await?;
+    let (ok, report, stderr) = self_check().await?;
+    sqlx::raw_sql("DROP VIEW qbit_prism_share_hash_backfill")
+        .execute(&pool)
+        .await?;
+    let backfill = &report["share_hash_backfill"];
+    ensure!(
+        !ok && backfill["state"] == "unknown"
+            && backfill["error"].as_str().is_some_and(|error| error
+                .contains("a view named qbit_prism_share_hash_backfill holds the name")),
+        "{report}"
+    );
+    ensure!(
+        stderr.contains("WARNING: migration 2's share-hash backfill could not be read")
+            && stderr.contains("self-check cannot tell whether it is pending"),
+        "{stderr}"
+    );
+    db.close(vec![migrated, operator]).await
 }

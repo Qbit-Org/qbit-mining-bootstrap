@@ -16,6 +16,10 @@ pub use online::IndexBuildMode;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 pub use share_hashes::ShareHashBackfill;
 pub(super) use share_hashes::{refuse_departure_while_pending, refuse_restore_while_pending};
+pub use share_hashes::{
+    Finished as ShareHashBackfillFinished, Pending as ShareHashBackfillPending,
+    Throttle as ShareHashThrottle,
+};
 
 /// The schema migrations every native start requires, each checked on its
 /// own. Add every new migration file here and to the `required_versions`
@@ -3120,9 +3124,10 @@ pub(super) async fn migrate_schema(
                 inventory.capability(share_hashes::PENDING_CAPABILITY),
                 backfill_mode,
             ) {
-                // Serving is permitted, so only `migrate` maps the rest, and
-                // after 013, 017 and 024: serving needs them, and the recent
-                // range, which had to precede 013, is mapped.
+                // Serving is permitted, so of the connects only `migrate`
+                // maps the rest, as `backfill-share-hashes` does, throttled,
+                // and after 013, 017 and 024: serving needs them, and the
+                // recent range, which had to precede 013, is mapped.
                 (Some(share_hashes::FENCE_SERVING), ShareHashBackfill::Finish) => {
                     tracing::info!(
                         next_seq = progress.next_seq,
@@ -3134,7 +3139,7 @@ pub(super) async fn migrate_schema(
                 (Some(share_hashes::FENCE_SERVING), _) => tracing::info!(
                     next_seq = progress.next_seq,
                     end_seq = progress.end_seq,
-                    "migration 2's share-hash backfill permits serving; `qbit-prism-server migrate` maps the rest"
+                    "migration 2's share-hash backfill permits serving; `qbit-prism-server backfill-share-hashes` maps the rest"
                 ),
                 (Some(share_hashes::FENCE_PENDING), ShareHashBackfill::Defer) => {
                     // Claimed before anything is mapped, as on a fresh
@@ -3641,7 +3646,7 @@ pub(super) async fn require_schema_version(pool: &PgPool) -> Result<()> {
             start_seq = progress.start_seq,
             next_seq = progress.next_seq,
             end_seq = progress.end_seq,
-            "serving with migration 2's share-hash backfill pending: its recent range is mapped, and the rest of the legacy shares from next_seq up to end_seq are not. Run `qbit-prism-server migrate`, which maps them while frontends serve and records 2; share-archive restore, and detach and drop of any partition, refuse until then"
+            "serving with migration 2's share-hash backfill pending: its recent range is mapped, and the rest of the legacy shares from next_seq up to end_seq are not. Run `qbit-prism-server backfill-share-hashes`, which maps them in throttled batches while frontends serve and records 2; share-archive restore, and detach and drop of any partition, refuse until then"
         );
     }
     Ok(())
@@ -3802,6 +3807,60 @@ impl Ledger {
         Ok(share_hashes::progress(&mut connection)
             .await?
             .map(|progress| (progress.next_seq, progress.end_seq)))
+    }
+
+    /// `qbit-prism-server backfill-share-hashes`: map the rest of a backfill
+    /// that permits serving while frontends serve, in `throttle`'s batches,
+    /// and record 2 (`share_hashes::finish`). Refuses a backfill that does
+    /// not permit serving; a database whose backfill has finished has
+    /// nothing to map, which the result says.
+    pub async fn backfill_share_hashes(
+        &self,
+        throttle: &ShareHashThrottle,
+    ) -> Result<ShareHashBackfillFinished> {
+        // A connection of its own, never returned to the pool: the runners'
+        // lock is session-level and ends with it, as the online runners' do.
+        let mut connection = self.acquire().await?.detach();
+        let outcome =
+            share_hashes::finish(&mut connection, throttle, self.metrics.as_deref()).await;
+        let closed = sqlx::Connection::close(connection).await;
+        let finished = outcome?;
+        closed.context("closing the connection that finished migration 2's share-hash backfill")?;
+        Ok(finished)
+    }
+
+    /// Migration 2's share-hash backfill while it is pending, as
+    /// `self-check` reports it, or `None` once 2 is recorded: read-only, on
+    /// one connection of its own that needs only the database URL. One
+    /// deadline bounds the whole read, the connection included, and the
+    /// server's statement and lock timeouts are the same, so neither end
+    /// outlives it. Reads a database before migration too, which has no
+    /// backfill.
+    pub async fn inspect_share_hash_backfill(
+        url: &str,
+    ) -> Result<Option<ShareHashBackfillPending>> {
+        use sqlx::Connection;
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        tokio::time::timeout(DEADLINE, async {
+            let mut connection = sqlx::PgConnection::connect(url).await?;
+            let pending = async {
+                sqlx::query("SELECT set_config('default_transaction_read_only','on',false),set_config('statement_timeout',$1,false),set_config('lock_timeout',$1,false)")
+                    .bind(DEADLINE.as_millis().to_string())
+                    .execute(&mut connection)
+                    .await?;
+                share_hashes::pending(&mut connection).await
+            }
+            .await;
+            let _ = connection.close().await;
+            pending
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "reading migration 2's share-hash backfill took more than {} seconds",
+                DEADLINE.as_secs()
+            )
+        })?
     }
 
     pub async fn import_legacy_audits(
@@ -5768,30 +5827,36 @@ mod tests {
         assert_eq!(versions, REQUIRED_SCHEMA_VERSIONS);
     }
 
-    /// The export refuses the capabilities startup refuses, so its list of
-    /// understood ones must be startup's, the backfill fence among them.
+    /// The export refuses the capabilities startup refuses, so what it
+    /// understands must be startup's: every name, and the highest value
+    /// each accepts, the backfill fence's 2 among them, which permits
+    /// serving with 2's backfill pending.
     #[test]
     fn recovery_evidence_understands_the_capabilities_startup_understands() {
         let script = include_str!("../../../../scripts/prism-recovery-evidence.sql");
-        let lists: Vec<&str> = script
+        let maps: Vec<&str> = script
             .lines()
             .filter_map(|line| {
                 line.trim()
-                    .strip_prefix("ELSIF capability.capability NOT IN (")
-                    .and_then(|rest| rest.strip_suffix(") THEN"))
+                    .strip_prefix("understood constant jsonb := '")
+                    .and_then(|rest| rest.strip_suffix("';"))
             })
             .collect();
-        let [list] = lists[..] else {
-            panic!("expected one list of understood capabilities, found {lists:?}");
+        let [map] = maps[..] else {
+            panic!("expected one map of understood capabilities, found {maps:?}");
         };
-        let mut understood: Vec<&str> = list
-            .split(',')
-            .map(|name| name.trim().trim_matches('\''))
+        let understood: BTreeMap<String, i32> = serde_json::from_str(map)
+            .unwrap_or_else(|error| panic!("understood capabilities {map:?}: {error}"));
+        let native: BTreeMap<String, i32> = NATIVE_CAPABILITIES
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), *value))
             .collect();
-        let mut native: Vec<&str> = NATIVE_CAPABILITIES.iter().map(|(name, _)| *name).collect();
-        understood.sort_unstable();
-        native.sort_unstable();
         assert_eq!(understood, native);
+        assert_eq!(understood.get(share_hashes::PENDING_CAPABILITY), Some(&2));
+        // The export checks names and values against that map alone.
+        assert!(script.contains("ELSIF NOT understood ? capability.capability THEN"));
+        assert!(script.contains("ELSIF capability.capability_value NOT BETWEEN 1 AND (understood ->> capability.capability)::integer THEN"));
+        assert!(!script.contains("capability.capability NOT IN ("));
     }
 
     /// While 2's backfill is pending the database declares a capability no

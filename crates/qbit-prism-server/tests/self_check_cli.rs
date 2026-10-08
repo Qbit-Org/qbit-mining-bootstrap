@@ -95,6 +95,16 @@ fn unavailable_report(instance_id: Option<&str>, status: &str, warning: &str) ->
     })
 }
 
+/// `report` as self-check prints it when it cannot read the database at
+/// all: migration 2's share-hash backfill is unknown, never taken for done.
+fn with_unreadable_backfill(mut report: Value) -> Value {
+    report["share_hash_backfill"] = json!({
+        "state": "unknown",
+        "error": "the database could not be read"
+    });
+    report
+}
+
 #[tokio::test]
 async fn invalid_configuration_emits_complete_unknown_report_and_fails() {
     let output = self_check(&[("QBIT_CHAIN", "invalid")], Duration::from_secs(3)).await;
@@ -116,11 +126,11 @@ async fn unreachable_database_emits_complete_failed_report_without_zero_count() 
     let output = self_check(&[], Duration::from_secs(8)).await;
     assert_eq!(
         failed_report(&output),
-        unavailable_report(
+        with_unreadable_backfill(unavailable_report(
             Some("self-check-cli"),
             "failed",
             "Heartbeat read failed or exceeded 5 seconds; HA is unknown"
-        )
+        ))
     );
     // The RPC diagnostic proves a failed heartbeat sample did not suppress
     // the remaining local checks or get replaced with an empty-cluster report.
@@ -146,11 +156,11 @@ async fn disabled_block_submission_is_reported_when_the_services_are_unavailable
     let disabled = "block submission is disabled by PRISM_BLOCK_SUBMIT_ENABLED: found blocks \
                     stay pending in the candidate outbox and are never sent to the node's \
                     submitblock, and no CTV fanout is broadcast";
-    let mut expected = unavailable_report(
+    let mut expected = with_unreadable_backfill(unavailable_report(
         Some("self-check-cli"),
         "failed",
         "Heartbeat read failed or exceeded 5 seconds; HA is unknown",
-    );
+    ));
     expected["block_submission"] = json!({
         "enabled": false,
         "ctv_broadcaster": "held",
@@ -168,11 +178,11 @@ async fn slow_health_cadence_is_reported_even_when_the_database_is_unavailable()
         Duration::from_secs(8),
     )
     .await;
-    let mut expected = unavailable_report(
+    let mut expected = with_unreadable_backfill(unavailable_report(
         Some("self-check-cli"),
         "failed",
         "Heartbeat read failed or exceeded 5 seconds; HA is unknown",
-    );
+    ));
     expected["live_instances"]["freshness_seconds"] = json!(60.0);
     assert_eq!(failed_report(&output), expected);
 }

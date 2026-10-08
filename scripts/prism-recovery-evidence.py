@@ -15,6 +15,13 @@ Carry integrity doesn't depend on which validator the database ran (#708):
 - The summary keeps the database's report, less the findings cleared, so a 2.x
   source and its migrated copy summarize alike.
 
+While migration 2's share-hash backfill is pending at fence 2 (`migrate
+--defer-share-hashes`), the export holds no share_hashes rows and one
+share_hashes_deferred record, the backfill's cursor, read last, after the
+integrity report. The summary marks that kind deferred with it, in
+records.share_hashes.deferred, and a note says so: compare share_hashes only
+once 2 is recorded.
+
 Parsing is parallel by default (--jobs, the CPUs this process may use, at
 most 8): worker processes parse and canonicalize newline-aligned ranges of
 the file, and this process applies every check to their results in file
@@ -108,6 +115,9 @@ class _Summary:
         self.by_label = {}
         self.legacy_breaks = 0
         self.label_breaks = set()
+        # The pending share-hash backfill's cursor, when the export defers
+        # the share_hashes kind.
+        self.deferred = None
 
     def line(self, line):
         self.start()
@@ -172,6 +182,17 @@ class _Summary:
                 # Unknown states must not make a drained-work check pass.
                 # `orphaned` (migration 015) is terminal and keeps its evidence.
                 self.unfinished += int(row["state"] not in ("submitted", "abandoned", "orphaned"))
+        elif kind == "share_hashes_deferred":
+            # Migration 2's share-hash backfill is pending: the export holds
+            # none of its partial mapping, and this is its cursor. Not an
+            # accounting record: the export reads it last, after the
+            # integrity report, to hold the cursor's lock as briefly as it
+            # can.
+            if self.deferred is not None:
+                raise ValueError("duplicate share_hashes deferral")
+            if not isinstance(row, dict):
+                raise ValueError("share_hashes deferral is not an object")
+            self.deferred = row
         else:
             raise ValueError(f"unknown evidence kind: {kind}")
 
@@ -233,10 +254,20 @@ class _Summary:
             notes.append(
                 f"the database's per-label legacy carry rule reported {len(mismatches)} finding(s) that each "
                 "payout program's chain clears: a program paid under more than one label (#708)")
+        records = {kind: {"count": self.counts[kind], "sha256": self.hashes[kind].hexdigest()}
+                   for kind in KINDS}
+        if self.deferred is not None:
+            if self.counts["share_hashes"]:
+                raise ValueError("share_hashes rows were exported beside their deferral")
+            records["share_hashes"]["deferred"] = self.deferred
+            if notes is not None:
+                notes.append(
+                    "share_hashes deferred: migration 2's share-hash backfill is pending, so the export holds "
+                    f"none of its mapping; the legacy shares from share_seq {self.deferred.get('next_seq')} up to "
+                    f"{self.deferred.get('end_seq')} are not all mapped. Compare share_hashes once 2 is recorded")
         return {
             "schema": "qbit.prism.recovery-evidence.v1",
-            "records": {kind: {"count": self.counts[kind], "sha256": self.hashes[kind].hexdigest()}
-                        for kind in KINDS},
+            "records": records,
             "accepted_shares": self.accepted,
             "last_share_seq": self.last_share_seq,
             "pending_candidates": self.pending,

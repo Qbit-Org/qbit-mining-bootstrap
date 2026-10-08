@@ -2479,7 +2479,12 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    canonical available without duplicating their share window as stored bytes.
    Availability counts do not replace digest/signature verification. Run
    `backfill-ctv` only after this comparison and explain any intentional CTV
-   repair delta in later evidence.
+   repair delta in later evidence. With `migrate --defer-share-hashes`, the
+   migrated summary marks `share_hashes` deferred: compare every other record
+   with `jq 'del(.records.share_hashes)'` on both summaries, and the share
+   hashes once
+   [`backfill-share-hashes` has recorded 2 after go-live](#finish-a-deferred-share-hash-backfill-after-go-live)
+   ([Recovery evidence while the backfill is pending](prism-rust-migration.md#recovery-evidence-while-the-backfill-is-pending)).
 6. **Reconcile all post-ACK differences.** Export `prism-current` using the same
    SQL to `current.rows.jsonl`/`current.summary.json`. Compare against the
    restored summary and inspect the ordered rows for every changed digest.
@@ -2513,6 +2518,84 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    row count, comparison, artifact sample and image digest. #291 rehearses this
    on production-sized history and retains the exact data-loss boundary when
    completing the 3.0.0 release notes before approving rollout.
+
+## Finish a deferred share-hash backfill after go-live
+
+`qbit-prism-server migrate --defer-share-hashes` takes migration 2's
+share-hash backfill out of the cutover's outage: it maps the legacy shares
+within 1,000 template heights of the tip, permits serving at
+`share_hash_backfill_pending = 2`, and leaves the rest of the legacy ledger
+unmapped
+([Serving with the backfill pending](prism-rust-migration.md#serving-with-the-backfill-pending-fence-2)).
+Until the rest is mapped and 2 recorded, `self-check` warns, and
+`share-archive restore`, and `detach` and `drop` of every partition, refuse:
+archiving waits for 2 (`plan`, `seal`, `archive` and `verify` are
+unaffected). Finish it once frontends serve, at a time of ordinary load.
+
+1. **Check the state.** `self-check` reports `share_hash_backfill` with
+   `"state": "pending"`, `fence` 2, the cursor (`next_seq`, `end_seq`,
+   `remaining_seqs`) and the recent range. `"state": "unknown"` means it
+   could not read the backfill: the `error` says why. Without the field there
+   is nothing to do.
+2. **Choose the throttle.** The defaults suit a primary taking up to a few
+   hundred shares a second: batches of at most 5,000 `share_seq`, each
+   statement cancelled after 2 s and retried at half its size, and a rest as
+   long as each batch took. Every native share updates the cluster row inside
+   `ORDER_LOCK`, and a snapshot held on the primary keeps that row's dead
+   versions, so `ORDER_LOCK` saturates after 18 to 20 seconds of held horizon
+   at about 400 shares a second (#738). Each of the backfill's statements,
+   its double-credit check's and its record's included, runs in a transaction
+   of its own and is cancelled at the statement timeout, which is at most 5 s.
+   If even the smallest batch times out, rerun with a smaller `--max-batch`
+   first, and only then a larger `--statement-timeout-ms`. Lower `--duty-cycle` (down to 0.01) to
+   spare the primary more; the run takes longer in proportion.
+3. **Run it** where it survives a disconnect, with the cutover's
+   `PRISM_DATABASE_URL`:
+
+   ```sh
+   RUST_LOG=info qbit-prism-server backfill-share-hashes \
+     --max-batch 5000 --statement-timeout-ms 2000 --duty-cycle 0.5 \
+     2>backfill-share-hashes.log
+   ```
+
+   At the defaults expect about 5,500 `share_seq` a second at the measured
+   cost per row, three to four hours for 65.9M shares. A `migrate` started
+   meanwhile waits for it on the runners' lock: run none.
+4. **Watch it.**
+   - `share-hash backfill progress` every ten seconds in its log: `next_seq`,
+     `end_seq`, `mapped`, `percent`, `seqs_per_second` and `remaining_s`.
+   - The cursor, from any session:
+     `SELECT next_seq, end_seq, updated_at FROM qbit_prism_share_hash_backfill;`
+   - On the primary, `qbit_prism_database_order_lock_hold_seconds{holder="append"}`
+     and the percentiles of `qbit_prism_share_ack_seconds{result="accepted"}`,
+     against the same hour without it, and the run's own backend in
+     `pg_stat_activity`: its `xact_start` within a few seconds of now, and its
+     `backend_xmin` moving on with every batch, the attempts to record 2
+     included.
+   - If `ORDER_LOCK` holds or share acknowledgements climb, stop it (Ctrl-C or
+     SIGTERM). Each batch committed with the cursor, so only the batch in
+     flight is lost. Run it again later, or with a lower `--duty-cycle`; it
+     resumes at `next_seq`.
+5. **It ends** by checking every native share for a header an accepted legacy
+   share holds, throttled the same way, and recording 2 in one short
+   transaction. That transaction waits at most 2 s for the migration lock or
+   the cursor table's lock, and is tried again after a backoff for about ten
+   minutes; a refusal that something held either through every attempt leaves
+   2 unrecorded, and a rerun once it is released goes straight to the check
+   and the record. It prints one JSON object with `"recorded": true`. A rerun
+   on a database whose backfill finished already prints `"already_complete":
+   true` and succeeds. If it refuses with `native share <id> ...
+   repeats header <h> ... so that header was credited twice`, frontends may
+   keep serving: report the double credit and reconcile it before anything
+   records 2, and never record 2 by hand. Its other refusals are in
+   [the refusal table](prism-rust-migration.md#serving-with-the-backfill-pending-fence-2).
+6. **Afterwards** `self-check` no longer reports the field, the archive steps
+   work again, and the share hashes can be compared with the source's
+   ([Recovery evidence while the backfill is pending](prism-rust-migration.md#recovery-evidence-while-the-backfill-is-pending)),
+   on a standby with replay paused, never on the primary.
+
+Plain `qbit-prism-server migrate` at fence 2 runs the same backfill at the
+default throttle, after any other pending migration.
 
 ## Share ledger indexes
 
