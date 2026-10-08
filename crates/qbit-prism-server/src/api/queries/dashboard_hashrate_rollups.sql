@@ -54,11 +54,20 @@ WITH bounds AS (
     FROM boundary_rows
     GROUP BY bucket_epoch
 ), tail AS (
+    -- The shares past the watermark, found by share_seq alone. Bounded on
+    -- both sides, the walk covers only them, and behind OFFSET 0 no time or
+    -- miner predicate can turn it into a walk over every share a range or a
+    -- miner holds. The time and miner tests filter the stream.
     SELECT floor(extract(epoch FROM ledger.accepted_at)/$1::bigint)::bigint*$1::bigint AS bucket_epoch,
            count(*) AS accepted_share_count,sum(ledger.share_difficulty) AS accepted_share_difficulty
-    FROM qbit_share_ledger ledger,grid
-    WHERE ledger.accepted AND ledger.share_seq>(SELECT last_share_seq FROM watermark)
-      AND ledger.accepted_at<=grid.ended_at
+    FROM (
+        SELECT accepted_at,miner_id,share_difficulty
+        FROM qbit_share_ledger
+        WHERE accepted AND share_seq>(SELECT last_share_seq FROM watermark)
+          AND share_seq<=(SELECT max(share_seq) FROM qbit_share_ledger)
+        OFFSET 0
+    ) ledger,grid
+    WHERE ledger.accepted_at<=grid.ended_at
       AND (grid.started_at IS NULL OR ledger.accepted_at>=grid.started_at)
       AND ($4::text IS NULL OR ledger.miner_id=$4)
     GROUP BY bucket_epoch

@@ -315,18 +315,71 @@ fn ledger_tuples(node: &Value) -> f64 {
         .as_array()
         .map_or(0.0, |plans| plans.iter().map(ledger_tuples).sum())
 }
+/// Ledger scans that bound no column from both sides, outside a Limit's
+/// single probe: at production scale each walks an index from one end, or the
+/// whole partition, even where a small fixture's run read nothing.
+fn one_sided_ledger_scans(node: &Value, under_limit: bool, found: &mut Vec<String>) {
+    let ledger = |key: &str| {
+        node[key]
+            .as_str()
+            .is_some_and(|name| name.starts_with("qbit_share_ledger"))
+    };
+    let kind = node["Node Type"].as_str().unwrap_or("");
+    if !under_limit && (ledger("Relation Name") || ledger("Index Name")) {
+        let cond = node["Index Cond"].as_str().unwrap_or("");
+        let tokens: Vec<&str> = cond
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+            .filter(|token| !token.is_empty())
+            .collect();
+        let bounded = |ops: &[&str]| -> std::collections::HashSet<&str> {
+            tokens
+                .windows(2)
+                .filter(|pair| ops.contains(&pair[1]))
+                .map(|pair| pair[0])
+                .collect()
+        };
+        let two_sided = !bounded(&[">", ">="]).is_disjoint(&bounded(&["<", "<="]));
+        let examined = node["Actual Rows"].as_f64().unwrap_or(0.0)
+            + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0);
+        let walks = match kind {
+            "Seq Scan" => examined > 0.0,
+            "Index Scan" | "Index Only Scan" | "Bitmap Index Scan" => !two_sided,
+            _ => false,
+        };
+        if walks {
+            found.push(format!(
+                "{kind} on {}: {}",
+                node["Index Name"]
+                    .as_str()
+                    .or(node["Relation Name"].as_str())
+                    .unwrap_or("?"),
+                if cond.is_empty() {
+                    "no index condition"
+                } else {
+                    cond
+                }
+            ));
+        }
+    }
+    for plan in node["Plans"].as_array().into_iter().flatten() {
+        one_sided_ledger_scans(plan, under_limit || kind == "Limit", found);
+    }
+}
 #[tokio::test]
-async fn chart_rollup_boundary_reads_only_its_partial_buckets() -> Result<()> {
+async fn chart_rollups_read_only_the_partial_buckets_under_any_plan() -> Result<()> {
     let Some(f) = Fixture::open().await? else {
         return Ok(());
     };
     let result=async {
-        // 20,000 rolled-up shares over 60 days; the default pool chart's two
-        // partial buckets hold a few dozen of them. A boundary whose
-        // accepted_at bounds no index range walks every share at or below
-        // the watermark instead: about 21 s on a 66M-share ledger.
+        // 20,000 rolled-up shares over 60 days, half of them one miner's; a
+        // chart's two partial buckets hold a few dozen. A boundary or tail
+        // whose bounds the planner can't use walks a whole index instead:
+        // 17-27 s on a 66M-share ledger. Which index it walks depends on the
+        // plan mode and the cost settings, so the test tries both modes under
+        // PostgreSQL's default random_page_cost and under 1.1, the SSD value
+        // a production planner chose the walk under.
         let epoch=chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) SELECT 'plan-'||g,'miner-'||g%50,'miner-'||g%50,decode(repeat('1',64),'hex'),1000000,1000000,100,'job',to_timestamp($1-(20001-g)*259),0,to_timestamp($1-(20001-g)*259),'test',1 FROM generate_series(1,20000) g").bind(epoch as f64).execute(&f.pool).await?;
+        sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) SELECT 'plan-'||g,m,m,decode(repeat('1',64),'hex'),1000000,1000000,100,'job',to_timestamp($1-(20001-g)*259),0,to_timestamp($1-(20001-g)*259),'test',1 FROM generate_series(1,20000) g, LATERAL (SELECT CASE WHEN g%2=0 THEN 'whale' ELSE 'miner-'||g%50 END AS m) miner").bind(epoch as f64).execute(&f.pool).await?;
         let progress=qbit_prism_server::rollups::advance(&f.pool,100_000).await?;
         ensure!(progress.scanned==20_000,"{progress:?}");
         sqlx::raw_sql("VACUUM (ANALYZE) qbit_share_ledger").execute(&f.pool).await?;
@@ -335,17 +388,26 @@ async fn chart_rollup_boundary_reads_only_its_partial_buckets() -> Result<()> {
         // set below never return to the pool, whatever the outcome.
         let mut conn=f.pool.acquire().await?.detach();
         sqlx::raw_sql(&format!("PREPARE chart(bigint,bigint,double precision,text) AS {sql}")).execute(&mut conn).await?;
-        // The default pool request; a 5-minute one, whose smoothing context
-        // widens the range and binds the anchor; and a miner's default one.
-        let requests=["3600,2592000,NULL,NULL".to_owned(),format!("300,606600,{epoch},NULL"),"3600,2592000,NULL,'miner-7'".to_owned()];
-        for mode in ["force_custom_plan","force_generic_plan"] {
-            sqlx::raw_sql(&format!("SET plan_cache_mode={mode}")).execute(&mut conn).await?;
-            for request in &requests {
-                let plan:Value=sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE chart({request})")).fetch_one(&mut conn).await?;
-                let read=ledger_tuples(&plan[0]["Plan"]).round();
-                ensure!(read<=1_000.0,"{mode} chart({request}): the boundary read {read} of 20000 ledger shares: {plan}");
+        // The default pool request and a 7-day one, both without an anchor; a
+        // 5-minute one, whose smoothing context widens the range and binds
+        // the anchor; and the default request for a small miner and for the
+        // miner with half the shares.
+        let requests=["3600,2592000,NULL,NULL".to_owned(),"3600,604800,NULL,NULL".to_owned(),format!("300,606600,{epoch},NULL"),"3600,2592000,NULL,'miner-7'".to_owned(),"3600,2592000,NULL,'whale'".to_owned()];
+        let mut walks=Vec::new();
+        for cost in ["4","1.1"] {
+            for mode in ["force_custom_plan","force_generic_plan"] {
+                sqlx::raw_sql(&format!("SET random_page_cost={cost}; SET plan_cache_mode={mode}")).execute(&mut conn).await?;
+                for request in &requests {
+                    let plan:Value=sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE chart({request})")).fetch_one(&mut conn).await?;
+                    let read=ledger_tuples(&plan[0]["Plan"]).round();
+                    if read>1_000.0 {walks.push(format!("random_page_cost {cost}, {mode}, chart({request}): read {read} of 20000 ledger shares"));}
+                    let mut scans=Vec::new();
+                    one_sided_ledger_scans(&plan[0]["Plan"],false,&mut scans);
+                    walks.extend(scans.into_iter().map(|scan|format!("random_page_cost {cost}, {mode}, chart({request}): {scan}")));
+                }
             }
         }
+        ensure!(walks.is_empty(),"the chart plans walk the ledger:\n{}",walks.join("\n"));
         Ok::<_,anyhow::Error>(())
     }.await;
     f.close(result).await
