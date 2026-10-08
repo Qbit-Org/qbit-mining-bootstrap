@@ -500,6 +500,46 @@ fn passed_over(
     }
 }
 
+/// The one deadline of the drill's new-tip phase. Every step in the phase
+/// is bounded by what is left of it, share submissions included (Codex on
+/// #753), and an expiry names the phase, what was waiting and how long the
+/// phase had run.
+struct PhaseDeadline {
+    started: Instant,
+    deadline: Instant,
+}
+
+impl PhaseDeadline {
+    fn start(limit: Duration) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            deadline: started + limit,
+        }
+    }
+
+    fn left(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// `step` within what is left of the phase; `waiting` says what was
+    /// waiting if the deadline passes first.
+    async fn bound<T>(
+        &self,
+        waiting: impl FnOnce() -> String,
+        step: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match tokio::time::timeout(self.left(), step).await {
+            Ok(result) => result,
+            Err(_) => bail!(
+                "the new-tip phase's deadline passed {:.1?} into the phase while {}",
+                self.started.elapsed(),
+                waiting()
+            ),
+        }
+    }
+}
+
 /// Until `block` is confirmed on the promoted primary; a timeout names the
 /// candidate's state and last error.
 async fn landed(f: &Fixture, block: &str) -> Result<()> {
@@ -1193,11 +1233,17 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     // its retention. The first job on superseded work the drill meets also
     // gets one share, which must be refused, stale-job or, pruned,
     // unknown-job, and leave no ledger row: the original symptom, kept as a
-    // check. One deadline bounds the whole phase.
-    let tip = f.rpc("getbestblockhash", json!([])).await?;
+    // check. One deadline bounds the whole phase: every step in it, share
+    // submissions and ledger reads included, so a slow answer to one miner
+    // cannot run the phase past it (Codex on #753).
+    let phase = PhaseDeadline::start(Duration::from_secs(30));
+    let tip = phase
+        .bound(
+            || "the node was asked for its best block".into(),
+            f.rpc("getbestblockhash", json!([])),
+        )
+        .await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let left = || deadline.saturating_duration_since(Instant::now());
     let mut on_new_tip = 0;
     // Every job passed over on superseded work, or refused after a later
     // revision move: (miner, job, work revision, ledger revision).
@@ -1212,18 +1258,31 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     let mut refused_on_superseded = None;
     for (miner, session) in sessions.iter_mut().enumerate() {
         let share = loop {
-            session
-                .work_on(&tip, left())
-                .await
-                .with_context(|| passed_over(miner, &tip, &superseded, &unrecorded, &retired))?;
+            session.work_on(&tip, phase.left()).await.with_context(|| {
+                format!(
+                    "{}, {:.1?} into the new-tip phase",
+                    passed_over(miner, &tip, &superseded, &unrecorded, &retired),
+                    phase.started.elapsed()
+                )
+            })?;
             let job = session
                 .job_id()
                 .context("a surviving session's job on the new tip has no id")?
                 .to_owned();
-            let revisions = work_revision(f, &job).await?;
+            let revisions = phase
+                .bound(
+                    || format!("miner {miner}'s job {job} had its payout revisions read"),
+                    work_revision(f, &job),
+                )
+                .await?;
             match revisions {
                 Some((work, ledger)) if work == ledger => {
-                    let share = session.submit(Proof::Share).await?;
+                    let share = phase
+                        .bound(
+                            || format!("miner {miner}'s surviving session waited for the answer to its share on job {job}"),
+                            session.submit(Proof::Share),
+                        )
+                        .await?;
                     if share.answer.accepted() {
                         break share;
                     }
@@ -1232,14 +1291,30 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                     // check, and unknown-job for a job the server pruned,
                     // retired past its retention before this session read
                     // the job that replaced it.
-                    match (share.answer.reason_id(), work_revision(f, &job).await?) {
+                    let now = phase
+                        .bound(
+                            || format!("miner {miner}'s job {job} had its payout revisions read after its share was answered {}", share.answer),
+                            work_revision(f, &job),
+                        )
+                        .await?;
+                    match (share.answer.reason_id(), now) {
                         (Some("stale-job"), Some((work, ledger))) if work != ledger => {
-                            ensure_no_ledger_row(f, miner, &job, &share).await?;
+                            phase
+                                .bound(
+                                    || format!("miner {miner}'s refused share on job {job} was looked up in the ledger"),
+                                    ensure_no_ledger_row(f, miner, &job, &share),
+                                )
+                                .await?;
                             superseded.push((miner, job.clone(), work, ledger));
                             after.push(("on new-tip work a later revision move superseded", share));
                         }
                         (Some("unknown-job"), _) => {
-                            ensure_no_ledger_row(f, miner, &job, &share).await?;
+                            phase
+                                .bound(
+                                    || format!("miner {miner}'s refused share on job {job} was looked up in the ledger"),
+                                    ensure_no_ledger_row(f, miner, &job, &share),
+                                )
+                                .await?;
                             retired.push((miner, job.clone()));
                             after.push(("on new-tip work retired past retention", share));
                         }
@@ -1256,13 +1331,23 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                         // one, read or not, and prunes it once retired past
                         // its retention (30 s by default), which a slow run
                         // can outlast before it reads this session.
-                        let share = session.submit(Proof::Share).await?;
+                        let share = phase
+                            .bound(
+                                || format!("miner {miner}'s surviving session waited for the answer to its share on job {job}, superseded work at payout revision {work}"),
+                                session.submit(Proof::Share),
+                            )
+                            .await?;
                         ensure!(
                             matches!(share.answer.reason_id(), Some("stale-job" | "unknown-job")),
                             "miner {miner}'s share on job {job}, new-tip work at payout revision {work} that the ledger's {ledger} superseded, was answered {}, not stale-job or, for a job retired past retention, unknown-job",
                             share.answer
                         );
-                        ensure_no_ledger_row(f, miner, &job, &share).await?;
+                        phase
+                            .bound(
+                                || format!("miner {miner}'s refused share on job {job} was looked up in the ledger"),
+                                ensure_no_ledger_row(f, miner, &job, &share),
+                            )
+                            .await?;
                         refused_on_superseded = Some((
                             miner,
                             job.clone(),
@@ -1296,20 +1381,40 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
             );
             // The next job, unless an answer above already brought it.
             if session.job_id() == Some(job.as_str()) {
-                tokio::time::timeout(left(), session.newer_work())
+                phase
+                    .bound(
+                        || {
+                            format!(
+                                "miner {miner}'s surviving session waited for a job after {job}: {}",
+                                passed_over(miner, &tip, &superseded, &unrecorded, &retired)
+                            )
+                        },
+                        session.newer_work(),
+                    )
                     .await
-                    .map_err(|_| anyhow::anyhow!(passed_over(miner, &tip, &superseded, &unrecorded, &retired)))?
                     .with_context(|| {
                         format!("miner {miner}'s surviving session, waiting for a job after {job} (its work and the ledger's payout revisions: {revisions:?})")
                     })?;
             }
         };
-        let credits: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_id=$1",
-        )
-        .bind(&share.share_id)
-        .fetch_one(&f.pool)
-        .await?;
+        let credits: i64 = phase
+            .bound(
+                || {
+                    format!(
+                        "miner {miner}'s accepted share {} was counted in the ledger",
+                        share.share_id
+                    )
+                },
+                async {
+                    Ok(sqlx::query_scalar(
+                        "SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_id=$1",
+                    )
+                    .bind(&share.share_id)
+                    .fetch_one(&f.pool)
+                    .await?)
+                },
+            )
+            .await?;
         ensure!(
             credits == 1,
             "miner {miner}'s share on the new tip is credited {credits} time(s)"
