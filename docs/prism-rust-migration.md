@@ -679,7 +679,7 @@ populated `2.x.x` source, the database declares
 `migrate --defer-share-hashes` has permitted serving. It is declared with the
 backfill's cursor and removed with it when 2 is recorded, so every earlier
 build that checks capabilities is refused until then, and every build before
-this release refuses 2. A backfill that a #582 build
+rc.5 refuses 2. A backfill that a #582 build
 started carries no declaration (see
 [the backfill](#migration-002s-share-hash-backfill-applied-online)).
 A database missing any required migration is refused
@@ -965,8 +965,8 @@ unmapped. So the database also declares the capability
   mapped between holds of that lock, and the runner stops: the cursor, the
   declaration and the record are that release's to finish;
 - between the two, `migrate --defer-share-hashes` raises it to 2 when it
-  permits serving, which this release's starts accept and every earlier
-  build refuses.
+  permits serving, which the starts of rc.5 and later accept and every
+  earlier build refuses.
 
 An earlier build cannot remove the fence, so the fence must never coexist
 with an earlier build's runner, and that is why it is declared only with a new
@@ -1172,14 +1172,14 @@ settlement and the broadcaster never do.
 | the cursor and `share_hash_backfill_pending = 2` | allowed without 2 recorded. Each start logs a warning naming `next_seq` and `end_seq` |
 | the fence at 1 or 2 without the cursor | refused: the cursor was dropped by hand |
 
-No build before this release serves beside the pending backfill or finishes
-it. An earlier release candidate, rc.1 to rc.4, meets the cursor first at a
-start and refuses with the backfill's own message, `database is not ready:
+No build before rc.5 serves beside the pending backfill or finishes it. An
+earlier release candidate, rc.1 to rc.4, meets the cursor first at a start
+and refuses with the backfill's own message, `database is not ready:
 migration 2's share-hash backfill has not finished (#582) …`. That message's
-advice to run `migrate` holds only for this release: the earlier build's
+advice to run `migrate` holds only for rc.5 and later: the earlier build's
 `migrate`, and its start with `PRISM_POSTGRES_INIT_SCHEMA=1`, refuse the fence
 before any DDL (`… understands share_hash_backfill_pending 1 to 1 only …`).
-Finish the backfill with this release, or go back to the pre-migrate backup.
+Finish the backfill with rc.5 or later, or go back to the pre-migrate backup.
 
 **Who finishes it: `backfill-share-hashes`, or plain `migrate`.** A frontend
 started with `PRISM_POSTGRES_INIT_SCHEMA=1`, a tool or an operator command
