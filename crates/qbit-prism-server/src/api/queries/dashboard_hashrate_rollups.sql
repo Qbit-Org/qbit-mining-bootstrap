@@ -27,27 +27,26 @@ WITH bounds AS (
       AND (grid.first_full_bucket IS NULL OR bucket_epoch>=grid.first_full_bucket)
 ), boundary_rows AS (
     -- The current bucket and the leading partial one, as two disjoint
-    -- accepted_at ranges bounded at both ends. An OR of the two, or a NULL
-    -- guard on the range start, bounds no index range: the planner then
-    -- walks every share at or below the watermark.
+    -- accepted_at ranges bounded at both ends. Written as an OR of the two,
+    -- or with an IS NULL test on the range start, they bound no index range,
+    -- and the planner walks every share at or below the watermark instead.
+    -- GREATEST and LEAST skip a NULL start or first full bucket.
     SELECT ledger.accepted_at,ledger.share_difficulty
     FROM qbit_share_ledger ledger,grid
     WHERE (SELECT ready FROM watermark) AND ledger.accepted
       AND ledger.share_seq<=(SELECT last_share_seq FROM watermark)
-      AND ledger.accepted_at>=to_timestamp(grid.current_bucket)
+      AND ledger.accepted_at>=GREATEST(to_timestamp(grid.current_bucket),grid.started_at)
       AND ledger.accepted_at<=grid.ended_at
-      AND (grid.started_at IS NULL OR ledger.accepted_at>=grid.started_at)
       AND ($4::text IS NULL OR ledger.miner_id=$4)
     UNION ALL
+    -- Without a range start this slice is empty: accepted_at>=NULL holds for
+    -- no row.
     SELECT ledger.accepted_at,ledger.share_difficulty
     FROM qbit_share_ledger ledger,grid
     WHERE (SELECT ready FROM watermark) AND ledger.accepted
       AND ledger.share_seq<=(SELECT last_share_seq FROM watermark)
-      AND grid.started_at IS NOT NULL
       AND ledger.accepted_at>=grid.started_at
-      AND ledger.accepted_at<to_timestamp(grid.first_full_bucket)
-      AND ledger.accepted_at<to_timestamp(grid.current_bucket)
-      AND ledger.accepted_at<=grid.ended_at
+      AND ledger.accepted_at<LEAST(to_timestamp(grid.first_full_bucket),to_timestamp(grid.current_bucket))
       AND ($4::text IS NULL OR ledger.miner_id=$4)
 ), boundary AS (
     SELECT floor(extract(epoch FROM accepted_at)/$1::bigint)::bigint*$1::bigint AS bucket_epoch,

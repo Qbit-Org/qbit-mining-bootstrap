@@ -285,7 +285,7 @@ async fn chart_rollups_match_raw_for_every_range_bucket_and_watermark() -> Resul
         );
         rollups_match_raw(&f.pool, epoch, "current watermark").await?;
         // Shares past the watermark, one dated into an already rolled bucket.
-        for (n, t) in [epoch - 30, epoch - 5 * 86400, epoch - 7 * 86400 + 5]
+        for (n, t) in [epoch - 30, epoch - 5 * 86400, epoch - 6 * 86400]
             .iter()
             .enumerate()
         {
@@ -298,22 +298,22 @@ async fn chart_rollups_match_raw_for_every_range_bucket_and_watermark() -> Resul
     .await;
     f.close(result).await
 }
-/// Ledger shares a plan node produced or filtered out, over every loop.
-fn ledger_tuples(node: &Value) -> i64 {
+/// Ledger shares a plan node produced or filtered out, over every loop. Row
+/// counts are per-loop averages, fractional from PostgreSQL 18.
+fn ledger_tuples(node: &Value) -> f64 {
     let own = if node["Relation Name"]
         .as_str()
         .is_some_and(|name| name.starts_with("qbit_share_ledger"))
     {
-        let loops = node["Actual Loops"].as_i64().unwrap_or(1);
-        (node["Actual Rows"].as_i64().unwrap_or(0)
-            + node["Rows Removed by Filter"].as_i64().unwrap_or(0))
-            * loops
+        let count = |key: &str| node[key].as_f64().unwrap_or(0.0);
+        (count("Actual Rows") + count("Rows Removed by Filter"))
+            * node["Actual Loops"].as_f64().unwrap_or(1.0)
     } else {
-        0
+        0.0
     };
     own + node["Plans"]
         .as_array()
-        .map_or(0, |plans| plans.iter().map(ledger_tuples).sum())
+        .map_or(0.0, |plans| plans.iter().map(ledger_tuples).sum())
 }
 #[tokio::test]
 async fn chart_rollup_boundary_reads_only_its_partial_buckets() -> Result<()> {
@@ -331,15 +331,21 @@ async fn chart_rollup_boundary_reads_only_its_partial_buckets() -> Result<()> {
         ensure!(progress.scanned==20_000,"{progress:?}");
         sqlx::raw_sql("VACUUM (ANALYZE) qbit_share_ledger").execute(&f.pool).await?;
         let sql=include_str!("../src/api/queries/dashboard_hashrate_rollups.sql");
-        let mut conn=f.pool.acquire().await?;
-        sqlx::raw_sql(&format!("PREPARE chart(bigint,bigint,double precision,text) AS {sql}")).execute(&mut *conn).await?;
+        // Its own connection, closed when dropped: the statement and plan mode
+        // set below never return to the pool, whatever the outcome.
+        let mut conn=f.pool.acquire().await?.detach();
+        sqlx::raw_sql(&format!("PREPARE chart(bigint,bigint,double precision,text) AS {sql}")).execute(&mut conn).await?;
+        // The default pool request; a 5-minute one, whose smoothing context
+        // widens the range and binds the anchor; and a miner's default one.
+        let requests=["3600,2592000,NULL,NULL".to_owned(),format!("300,606600,{epoch},NULL"),"3600,2592000,NULL,'miner-7'".to_owned()];
         for mode in ["force_custom_plan","force_generic_plan"] {
-            sqlx::raw_sql(&format!("SET plan_cache_mode={mode}")).execute(&mut *conn).await?;
-            let plan:Value=sqlx::query_scalar("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE chart(3600,2592000,NULL,NULL)").fetch_one(&mut *conn).await?;
-            let read=ledger_tuples(&plan[0]["Plan"]);
-            ensure!(read<=1_000,"{mode}: the pool chart read {read} of 20000 ledger shares: {plan}");
+            sqlx::raw_sql(&format!("SET plan_cache_mode={mode}")).execute(&mut conn).await?;
+            for request in &requests {
+                let plan:Value=sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE chart({request})")).fetch_one(&mut conn).await?;
+                let read=ledger_tuples(&plan[0]["Plan"]).round();
+                ensure!(read<=1_000.0,"{mode} chart({request}): the boundary read {read} of 20000 ledger shares: {plan}");
+            }
         }
-        sqlx::raw_sql("DEALLOCATE chart; RESET plan_cache_mode").execute(&mut *conn).await?;
         Ok::<_,anyhow::Error>(())
     }.await;
     f.close(result).await
