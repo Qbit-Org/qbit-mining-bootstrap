@@ -15,6 +15,8 @@ qbit-prism-load::real_node::real_node_smoke_reconciles_against_postgres_and_the_
 qbit-prism-load::soak_sampling::soak_samples_a_prism_database_and_a_process_rolls_over_and_gates
 qbit-prism-server::api_2x::block_views_markers_and_network_estimate_keep_2x_contracts
 qbit-prism-server::api_2x::chart_rollups_match_raw_boundaries_tail_and_missing_progress
+qbit-prism-server::api_2x::chart_rollups_match_raw_for_every_range_bucket_and_watermark
+qbit-prism-server::api_2x::chart_rollups_read_only_the_partial_buckets_under_any_plan
 qbit-prism-server::api_2x::content_addressed_bytes_and_legacy_fallback_headers_are_exact
 qbit-prism-server::api_2x::fixture_migrations_do_not_share_advisory_locks
 qbit-prism-server::api_2x::public_service_is_read_only_and_bounds_http_database_work
