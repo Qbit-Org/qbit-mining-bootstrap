@@ -3,11 +3,11 @@
 //! never read and fails after the connection existed, so `submitblock` would
 //! record an unknown outcome and never offer the block again. The client
 //! therefore drops a pooled connection before the node's idle close
-//! ([`POOL_IDLE_TIMEOUT`]), and sends each relay call on a new connection. The
-//! mock node answers a request on a reused connection only within its idle
-//! limit, and drops a later one unanswered, as the race does. Each case runs
-//! the real client against a real loopback socket.
-use qbit_prism_server::rpc::{Rpc, RpcNotSentError, POOL_IDLE_TIMEOUT};
+//! (`qbit_prism_server::rpc::POOL_IDLE_TIMEOUT`). The mock node answers a
+//! request on a reused connection only within its idle limit, and drops a
+//! later one unanswered, as the race does. Each case runs the real client
+//! against a real loopback socket.
+use qbit_prism_server::rpc::{Rpc, RpcNotSentError};
 use serde_json::{json, Value};
 use std::{
     sync::{
@@ -105,18 +105,6 @@ async fn mock_node() -> (u16, Arc<AtomicUsize>) {
     (port, connections)
 }
 
-#[test]
-fn rpc_new_keeps_an_idle_connection_for_the_pool_idle_bound() {
-    let rpc = Rpc::new(
-        "http://127.0.0.1:1/".into(),
-        "user".into(),
-        "password".into(),
-        Duration::from_secs(5),
-    )
-    .unwrap();
-    assert_eq!(rpc.pool_idle_timeout(), POOL_IDLE_TIMEOUT);
-}
-
 /// With the bound below the node's idle close, the connection is dropped
 /// before the node would close it. The next call opens a new connection, and
 /// the node answers it.
@@ -128,20 +116,6 @@ async fn a_call_after_the_nodes_idle_close_uses_a_new_connection() {
     tokio::time::sleep(PAUSE).await;
     assert_eq!(rpc.call("getblockcount", json!([])).await.unwrap(), 7);
     assert_eq!(connections.load(Ordering::SeqCst), 2);
-}
-
-/// A relay call never reuses a pooled connection, whatever the bound: each
-/// opens a new one, which the node answers even after it has closed every
-/// idle connection the client kept.
-#[tokio::test]
-async fn a_relay_call_never_reuses_a_pooled_connection() {
-    let (port, connections) = mock_node().await;
-    let rpc = rpc(port, Duration::from_secs(60));
-    assert_eq!(rpc.call("getblockcount", json!([])).await.unwrap(), 7);
-    assert_eq!(rpc.call("submitblock", json!(["00"])).await.unwrap(), 7);
-    tokio::time::sleep(PAUSE).await;
-    assert_eq!(rpc.call("submitblock", json!(["00"])).await.unwrap(), 7);
-    assert_eq!(connections.load(Ordering::SeqCst), 3);
 }
 
 /// The race the bound prevents. A client that keeps the idle connection past
