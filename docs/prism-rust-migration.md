@@ -1918,6 +1918,11 @@ initial block download, matching block/header heights, and at least
 closes mining readiness until a fresh valid poll succeeds.
 
 General node and wallet RPCs use `PRISM_RPC_TIMEOUT_SECONDS` (15 seconds).
+The client keeps an idle node connection for at most 20 seconds (#759). Keep
+qbitd's `-rpcservertimeout`, and the idle timeout of any proxy in front of the
+node, above 20 seconds; qbitd's default is 30. Otherwise a call can be written
+into the idle close and fail after the connection existed, which `submitblock`
+records as an unknown outcome.
 `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
 ambiguous submission results retain the durable candidate for reconciliation.
 Candidate claims renew throughout processing, including waits for build workers.

@@ -379,7 +379,8 @@ impl ApiState {
             registry,
             latest_evidence: Arc::new(RwLock::new(None)),
             health_published_at: Arc::new(RwLock::new(Instant::now())),
-            client: reqwest::Client::builder()
+            // Idle node connections are dropped before the node's idle close (#759).
+            client: crate::rpc::node_client_builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("HTTP client"),
