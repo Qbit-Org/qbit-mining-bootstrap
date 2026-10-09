@@ -771,7 +771,8 @@ impl Qbitd {
             root: Some(root.clone()),
             keep,
         };
-        let client = reqwest::Client::builder()
+        // Idle connections are dropped before qbitd's idle close (#759).
+        let client = qbit_prism_server::rpc::node_client_builder()
             .tcp_nodelay(true)
             .build()
             .context("building the qbitd RPC client")?;

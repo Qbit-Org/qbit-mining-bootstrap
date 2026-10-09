@@ -120,7 +120,9 @@ impl RpcFaultRelay {
     /// One port per frontend, each forwarding to `upstream` (the node URL
     /// the frontends would otherwise have been given).
     pub async fn open(upstream: &str, frontends: usize) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        // Idle upstream connections are dropped before qbitd's idle close, or a
+        // forwarded call written into it fails as no fault plan said (#759).
+        let client = qbit_prism_server::rpc::node_client_builder()
             .pool_max_idle_per_host(8)
             .build()
             .context("building the fault relay's HTTP client")?;

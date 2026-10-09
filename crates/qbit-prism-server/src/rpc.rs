@@ -111,11 +111,40 @@ pub struct RpcRelayRefused {
     pub method: String,
 }
 
+/// qbitd's default `-rpcservertimeout`: how long the node keeps an idle,
+/// kept-alive connection open before it closes it.
+pub const QBITD_DEFAULT_RPCSERVERTIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the client keeps an idle connection to the node for reuse (#759).
+/// It stays below the node's own idle close, [`QBITD_DEFAULT_RPCSERVERTIMEOUT`]
+/// unless the node sets another. A request written into a connection just as
+/// the node closes it is never read, and fails after the connection existed.
+/// With the bound below the node's, the client always drops an idle
+/// connection first. [`RELAY_METHODS`] calls never reuse a connection at all
+/// (see [`Rpc`]).
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const _: () = assert!(POOL_IDLE_TIMEOUT.as_secs() < QBITD_DEFAULT_RPCSERVERTIMEOUT.as_secs());
+
+/// An HTTP client builder for a node's RPC endpoint, keeping idle connections
+/// for at most [`POOL_IDLE_TIMEOUT`]. The public API's node client is built
+/// from it.
+pub fn node_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().pool_idle_timeout(POOL_IDLE_TIMEOUT)
+}
+
 /// Reusable, deadline-bound HTTP connections. Mutating calls are never retried
 /// blindly: callers reconcile their durable outbox against chain state first.
 #[derive(Clone)]
 pub struct Rpc {
     client: reqwest::Client,
+    /// The client for [`RELAY_METHODS`], which keeps no idle connection, so
+    /// every relay opens a new one (#759). A relay written into a reused
+    /// connection that the node, or anything between, was closing fails after
+    /// the connection existed, and `submitblock` never offers that block
+    /// again. A new connection costs one connect on a rare path. It leaves only
+    /// a connect failure, which is provably unsent (#522), or a real unknown.
+    fresh: reqwest::Client,
+    pool_idle_timeout: Duration,
     url: String,
     user: String,
     password: String,
@@ -155,25 +184,48 @@ impl Rpc {
         Ok(rpc)
     }
     pub fn new(url: String, user: String, password: String, timeout: Duration) -> Result<Self> {
+        Self::with_pool_idle_timeout(url, user, password, timeout, POOL_IDLE_TIMEOUT)
+    }
+
+    /// [`Rpc::new`] with another bound on how long an idle pooled connection
+    /// is kept: for a node whose idle close is shorter than qbitd's default,
+    /// and for tests. Keep it below the node's idle close (#759).
+    pub fn with_pool_idle_timeout(
+        url: String,
+        user: String,
+        password: String,
+        timeout: Duration,
+        pool_idle_timeout: Duration,
+    ) -> Result<Self> {
         let parsed = url::Url::parse(&url).context("invalid QBIT RPC URL")?;
         anyhow::ensure!(
             matches!(parsed.scheme(), "http" | "https"),
             "QBIT RPC URL must use http(s)"
         );
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(timeout)
-            .pool_idle_timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let build = |max_idle: usize| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(timeout)
+                .pool_idle_timeout(pool_idle_timeout)
+                .pool_max_idle_per_host(max_idle)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+        };
         Ok(Self {
-            client,
+            client: build(usize::MAX)?,
+            fresh: build(0)?,
+            pool_idle_timeout,
             url,
             user,
             password,
             next_id: Arc::new(AtomicU64::new(1)),
             relay: true,
         })
+    }
+
+    /// How long an idle pooled connection is kept for reuse.
+    pub fn pool_idle_timeout(&self) -> Duration {
+        self.pool_idle_timeout
     }
 
     /// This client, and every wallet client made from it, refusing each
@@ -201,8 +253,12 @@ impl Rpc {
             .into());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut request = self
-            .client
+        let client = if RELAY_METHODS.contains(&method) {
+            &self.fresh
+        } else {
+            &self.client
+        };
+        let mut request = client
             .post(&self.url)
             .basic_auth(&self.user, Some(&self.password))
             .json(&json!({"jsonrpc":"1.0","id":id,"method":method,"params":params}));
