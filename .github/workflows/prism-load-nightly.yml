@@ -778,7 +778,9 @@ jobs:
   # Stratum load), injects its fault and checks the payout invariants; a
   # failing scenario does not stop the others. The matrix summary goes to the
   # job summary, and every report and log to the prism-dual-writer-nightly
-  # artifact. About 3 minutes a scenario on this runner.
+  # artifact. About 3 minutes a scenario on this runner, so the 22 the stack
+  # runs take about 70; the limit leaves room for scenarios that fail slowly,
+  # waiting out their bounds.
   #
   # Before anything of the 3.1 stack merges, the matrix must have run on it,
   # and a schedule or a dispatch runs only from the default branch. So
@@ -794,7 +796,7 @@ jobs:
       || (needs.guard.result == 'success' && needs.guard.outputs.skip != 'true'
           && (github.event.schedule == '17 2 * * *' || inputs.dual_writer))) }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 90
+    timeout-minutes: 150
     # #551: the commit and the attempt a trend row names for this job.
     outputs:
       commit: ${{ steps.head.outputs.commit }}
