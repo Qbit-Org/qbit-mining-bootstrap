@@ -111,6 +111,11 @@ pub(crate) struct SnapshotCapture {
     /// snapshot read (`window/cut.rs`), which the refresh probe compares; `None`
     /// for a single writer. Runtime-only.
     pub peer_mark: Option<i64>,
+    /// In dual-writer mode, whether an accepted peer row at or below that
+    /// mark waits above the cut's peer entry for a later anchor (a peer clock
+    /// running ahead, [`super::cut::PeerCut::pending`]); `false` for a single
+    /// writer. Runtime-only.
+    pub peer_pending: bool,
 }
 
 impl std::ops::Deref for SnapshotCapture {
