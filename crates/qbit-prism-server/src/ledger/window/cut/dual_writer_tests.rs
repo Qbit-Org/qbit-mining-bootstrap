@@ -117,11 +117,11 @@ async fn insert(ledger: &Ledger, rows: &[Row]) -> Result<()> {
 }
 
 /// Where the peer sync stands for `peer`'s shares: every peer row at or
-/// below `through` is here.
+/// below `through` is here, and the pull refused none.
 async fn mark(ledger: &Ledger, peer: i16, through: i64) -> Result<()> {
     sqlx::query(
-        "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) VALUES('shares',$1,$2,$2)
-         ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through,ingested_through=EXCLUDED.ingested_through",
+        "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) VALUES('shares',$1,$2)
+         ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through",
     )
     .bind(peer)
     .bind(through)
@@ -317,6 +317,9 @@ async fn a_peer_clock_running_ahead_only_delays_its_newest_rows() -> Result<()> 
             // The peer's entry stops below its first row stamped after the anchor,
             // so the anchor rule never removes a row the cut admits.
             assert_eq!(built.cut, Some(WindowCut::new(Some(20), Some(9))?));
+            // Those rows wait for a later anchor, which admits them with no new
+            // row and no move of the mark: the refresh must not reuse this window.
+            assert!(built.peer_pending, "the rows stamped ahead are not pending");
             assert!(built
                 .shares
                 .iter()
@@ -356,7 +359,24 @@ async fn a_peer_clock_running_ahead_only_delays_its_newest_rows() -> Result<()> 
             let later = capture(ledger, 4).await?;
             assert_eq!(later.cut, Some(WindowCut::new(Some(20), Some(13))?));
             assert!(seqs(&later.shares).contains(&13));
+            assert!(
+                !later.peer_pending,
+                "nothing waits once the clock has passed"
+            );
             prove(ledger, &built, 4).await?;
+            // A rejected peer row above the entry never joins a window, so the
+            // snapshot does not report it pending either.
+            sqlx::query(
+                "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch,origin_node)
+                 VALUES(15,'n1:15','miner-0','miner',decode(repeat('11',32),'hex'),1,1,1,'job',to_timestamp($1::double precision/1000),1,to_timestamp($1::double precision/1000),false,'stale-job','fixture',0,1)",
+            )
+            .bind(PAST_MS + 15)
+            .execute(&ledger.pool)
+            .await?;
+            mark(ledger, 1, 15).await?;
+            let rejected = capture(ledger, 4).await?;
+            assert_eq!(rejected.cut, Some(WindowCut::new(Some(20), Some(13))?));
+            assert!(!rejected.peer_pending, "a rejected row is pending");
             Ok(())
         })
     })

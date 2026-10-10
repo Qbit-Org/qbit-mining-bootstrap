@@ -97,37 +97,56 @@ pub struct CoinbaseView {
 /// could double-pay.
 #[derive(Clone, Debug)]
 pub struct PoolRecognizer {
-    pub tag: Vec<u8>,
-    /// The P2MR scriptPubKey of the pool-fee program, `OP_2 <32 bytes>`.
-    pub fee_script: Option<Vec<u8>>,
+    /// Coinbase tags, the current one first.
+    pub tags: Vec<Vec<u8>>,
+    /// P2MR scriptPubKeys of pool-fee programs, `OP_2 <32 bytes>`.
+    pub fee_scripts: Vec<Vec<u8>>,
 }
 
 impl PoolRecognizer {
+    /// The pool's current markers: its coinbase tag and pool-fee program.
     pub fn new(tag: &str, fee_program_hex: Option<&str>) -> Result<Self> {
-        ensure!(!tag.is_empty(), "the coinbase tag is empty");
-        let fee_script = match fee_program_hex.filter(|hex| !hex.is_empty()) {
-            Some(hex) => {
-                let program = hex::decode(hex).context("the pool-fee program is not hex")?;
-                ensure!(program.len() == 32, "the pool-fee program is not 32 bytes");
-                Some([&[0x52, 0x20][..], &program].concat())
-            }
-            None => None,
-        };
-        Ok(Self {
-            tag: tag.as_bytes().to_vec(),
-            fee_script,
-        })
+        Self {
+            tags: Vec::new(),
+            fee_scripts: Vec::new(),
+        }
+        .also(
+            &[tag.to_owned()],
+            fee_program_hex
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+    }
+
+    /// Also the markers the pool used before (`carry-owner transfer
+    /// --also-tag` and `--also-fee-program`): blocks found under an earlier
+    /// tag or fee recipient are pool blocks too.
+    pub fn also(mut self, tags: &[String], fee_programs_hex: &[String]) -> Result<Self> {
+        for tag in tags {
+            ensure!(!tag.is_empty(), "a coinbase tag is empty");
+            self.tags.push(tag.as_bytes().to_vec());
+        }
+        for hex in fee_programs_hex.iter().filter(|hex| !hex.is_empty()) {
+            let program = hex::decode(hex).context("a pool-fee program is not hex")?;
+            ensure!(program.len() == 32, "a pool-fee program is not 32 bytes");
+            self.fee_scripts
+                .push([&[0x52, 0x20][..], &program].concat());
+        }
+        Ok(self)
     }
 
     pub fn is_pool_block(&self, coinbase: &CoinbaseView) -> bool {
-        coinbase
-            .script_sig
-            .windows(self.tag.len())
-            .any(|window| window == self.tag.as_slice())
-            || self
-                .fee_script
-                .as_ref()
-                .is_some_and(|fee| coinbase.output_scripts.iter().any(|script| script == fee))
+        self.tags.iter().any(|tag| {
+            coinbase
+                .script_sig
+                .windows(tag.len())
+                .any(|window| window == tag.as_slice())
+        }) || self
+            .fee_scripts
+            .iter()
+            .any(|fee| coinbase.output_scripts.iter().any(|script| script == fee))
     }
 }
 
@@ -472,7 +491,7 @@ pub fn transfer_checks(facts: &TransferFacts) -> Vec<Check> {
         PeerRead::Failed => checks.push(check(
             "peer_answered",
             false,
-            "the peer's journal could not be read, so it may still act as owner",
+            "the peer's journal could not be read over PRISM_PEER_DATABASE_URL (transfer never reads the fallback), so it may still act as owner",
         )),
         PeerRead::Answered { peer, own_at_peer } => {
             checks.push(check(
@@ -621,11 +640,25 @@ fn scan_start(facts: &TransferFacts) -> Check {
         );
     }
     let Some(claim) = &facts.peer_claim else {
-        return check(
-            "scan_start",
-            true,
-            "the peer never claimed ownership, so it found no carry-paying block",
-        );
+        // A release follows a claim: without one in sight, nothing bounds the
+        // scan.
+        let released = [facts.peer_read.peer_live(), facts.peer_synced.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|row| row.action == "release");
+        return if released {
+            check(
+                "scan_start",
+                false,
+                "the peer released ownership, but no claim of it can be read, so nothing bounds the scan",
+            )
+        } else {
+            check(
+                "scan_start",
+                true,
+                "the peer never claimed ownership, so it found no carry-paying block",
+            )
+        };
     };
     match claim.tip_height() {
         Some(bound) => check(
@@ -696,11 +729,21 @@ async fn observe(
     peer: &PeerJournal,
     report: &mut Report,
 ) -> Result<PeerRead> {
+    let peer_read = peer.read(settings.node_index).await;
+    observe_with(ledger, settings, peer_read, report).await
+}
+
+/// [`observe`], with the peer's journal already read.
+async fn observe_with(
+    ledger: &Ledger,
+    settings: &CarryOwnerSettings,
+    peer_read: PeerRead,
+    report: &mut Report,
+) -> Result<PeerRead> {
     let mut connection = ledger.acquire().await?;
     report.database_node = read_node_identity(&mut connection).await?;
     report.local = read_latest_roles(&mut connection, settings.node_index).await?;
     drop(connection);
-    let peer_read = peer.read(settings.node_index).await;
     report.peer = match &peer_read {
         PeerRead::Answered { peer, own_at_peer } => Some(LatestRoles {
             own: own_at_peer.clone(),
@@ -822,20 +865,33 @@ pub async fn transfer<C: ChainSource>(
     confirm: bool,
 ) -> Result<Report> {
     let release_depth = release_depth.max(MIN_RELEASE_DEPTH);
-    let peer = PeerJournal::new(&settings.peer_urls, settings.peer_timeout)?;
+    // Over PRISM_PEER_DATABASE_URL only. The fallback path may reach a copy
+    // of the peer's database that lags its journal, where an older `release`
+    // would pass every check while the peer itself claims again.
+    let primary = settings
+        .peer_urls
+        .first()
+        .context("no peer database URL is set")?;
+    let peer = PeerJournal::new(std::slice::from_ref(primary), settings.peer_timeout)?;
     let mut report = Report::new("transfer", settings);
-    let peer_read = observe(ledger, settings, &peer, &mut report).await?;
+    // The peer's latest rows and its latest claim, from one snapshot.
+    let view = peer.view(settings.node_index).await;
+    let peer_read = match &view {
+        Some(view) => PeerRead::Answered {
+            peer: view.latest.peer.clone(),
+            own_at_peer: view.latest.own.clone(),
+        },
+        None => PeerRead::Failed,
+    };
+    let peer_read = observe_with(ledger, settings, peer_read, &mut report).await?;
     let peer_node = peer_index(settings.node_index);
     let synced_claim = {
         let mut connection = ledger.acquire().await?;
         read_latest_claim(&mut connection, peer_node).await?
     };
-    let live_claim = match peer_read {
-        PeerRead::Answered { .. } => peer.latest_claim(peer_node).await,
-        PeerRead::Failed => None,
-    };
-    let peer_claim_read = live_claim.is_some();
-    let peer_claim = [live_claim.flatten(), synced_claim]
+    let peer_claim_read = view.is_some();
+    let live_claim = view.and_then(|view| view.peer_claim);
+    let peer_claim = [live_claim, synced_claim]
         .into_iter()
         .flatten()
         .max_by_key(|row| row.epoch);
@@ -985,7 +1041,8 @@ mod tests {
                 own_at_peer: Some(role(1, 10, false, "seed", None)),
             },
             peer_synced: None,
-            peer_claim: None,
+            // The claim before the peer's release, recorded at height 100.
+            peer_claim: Some(role(0, 5, true, "acquire", Some(100))),
             peer_claim_read: true,
             tip_height: 200,
             release_depth: 6,
@@ -1116,13 +1173,62 @@ mod tests {
         );
         assert!(starting_at(0, Some(seeded.clone()), Some(190)).is_empty());
         assert_eq!(starting_at(0, Some(seeded), None), ["release_depth"]);
-        // A peer that never claimed ownership bounds nothing.
-        assert!(starting_at(199, None, Some(190)).is_empty());
+        // A peer that never claimed ownership, its only row a non-owner
+        // seed, bounds nothing.
+        let mut never = facts(Some(role(0, 11, false, "seed", None)));
+        never.scan.from_height = 199;
+        never.peer_claim = None;
+        assert!(failed(&transfer_checks(&never)).is_empty());
         // Claims the peer's live journal did not answer for bound nothing
         // either way.
         let mut unread = facts(Some(role(0, 12, false, "release", Some(190))));
         unread.peer_claim_read = false;
         assert_eq!(failed(&transfer_checks(&unread)), ["scan_start"]);
+    }
+
+    #[test]
+    fn earlier_tags_and_fee_programs_recognise_earlier_pool_blocks() {
+        let old_program = "cd".repeat(32);
+        let current = PoolRecognizer::new("/PRISM/", None).unwrap();
+        let with_history = PoolRecognizer::new("/PRISM/", None)
+            .unwrap()
+            .also(
+                &["/OLDPOOL/".to_owned()],
+                std::slice::from_ref(&old_program),
+            )
+            .unwrap();
+        let tagged = CoinbaseView {
+            block_hash: "h".into(),
+            script_sig: [&[0x03, 0x01, 0x02, 0x03][..], b"/OLDPOOL/", &[0; 12]].concat(),
+            output_scripts: vec![vec![0x00, 0x14]],
+        };
+        assert!(!current.is_pool_block(&tagged));
+        assert!(with_history.is_pool_block(&tagged));
+        let paid = CoinbaseView {
+            script_sig: vec![0x03, 0x01, 0x02, 0x03],
+            output_scripts: vec![[&[0x52, 0x20][..], &hex::decode(&old_program).unwrap()].concat()],
+            ..tagged
+        };
+        assert!(!current.is_pool_block(&paid));
+        assert!(with_history.is_pool_block(&paid));
+        assert!(PoolRecognizer::new("/PRISM/", None)
+            .unwrap()
+            .also(&[], &["ab".to_owned()])
+            .is_err());
+    }
+
+    #[test]
+    fn a_release_without_a_readable_claim_leaves_the_scan_unbounded() {
+        // The peer's latest row is a release, but no claim of ownership of its
+        // was read, live or synced (a lagging path answered): refused.
+        let mut released = facts(Some(role(0, 12, false, "release", Some(190))));
+        released.peer_claim = None;
+        assert_eq!(failed(&transfer_checks(&released)), ["scan_start"]);
+        // A peer that never claimed and never released bounds nothing.
+        assert!(failed(&transfer_checks(&facts(Some(role(
+            0, 11, false, "seed", None
+        )))))
+        .is_empty());
     }
 
     #[test]

@@ -451,3 +451,36 @@ async fn an_empty_window_is_replaced_once_the_peer_mark_moves_and_a_full_one_kee
         &full
     ));
 }
+
+/// 3.1 dual writer: a peer row stamped after a window's anchor, by a peer
+/// clock running ahead, joins a later anchor's window with no new row and no
+/// move of the mark. A new template does not reuse a window while such a row
+/// is pending, and reuses one taken once none is.
+#[tokio::test]
+async fn a_new_template_does_not_reuse_a_window_with_a_peer_row_pending() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    *f.store.peer_mark.lock().unwrap() = Some(9);
+    *f.store.peer_pending.lock().unwrap() = true;
+    {
+        let mut slot = f.store.snapshot.lock().unwrap();
+        let snapshot = slot.as_mut().unwrap();
+        snapshot.cut = Some(qbit_prism::WindowCut::new(Some(snapshot.share_seq), None).unwrap());
+    }
+    f.coordinator.refresh_once().await.unwrap();
+    f.node.lock().unwrap().parents.insert(hash(4), hash(3));
+    let snapshots = || f.store.snapshots.lock().unwrap().len();
+    // Each tip is one a peer already recorded, so the revision stays and the
+    // window's reuse alone decides whether a snapshot is read. The window
+    // taken at tip 2 still had the row pending; the one taken at tip 3 did
+    // not, and tip 4 reuses it.
+    for (tip, pending, reads) in [(2, true, 1), (3, false, 1), (4, false, 0)] {
+        *f.store.peer_pending.lock().unwrap() = pending;
+        *f.store.tip.lock().unwrap() = Some(hash(tip));
+        let taken = snapshots();
+        f.detect(tip).await;
+        f.coordinator.refresh_once().await.unwrap();
+        assert_eq!(snapshots(), taken + reads, "tip {tip}");
+        let published = f.coordinator.prepared.read().await.clone().unwrap();
+        assert_eq!(published.template["previousblockhash"], hash(tip));
+    }
+}

@@ -103,12 +103,47 @@ pub struct TableRows {
 
 /// A `qbit_prism_peer_sync_cursors` row: how far this node has pulled one
 /// stream of the peer's rows, in the stream's key on the peer.
+/// For shares and prepared jobs, `ingested_through` is the highest peer row
+/// this node refused as a conflict, quarantined for good (NULL while none
+/// was); it holds every peer row it scanned above it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PeerSyncCursor {
     pub stream: String,
     pub peer_node: NodeIndex,
     pub scanned_through: i64,
     pub ingested_through: Option<i64>,
+}
+
+/// The system identifier and WAL timeline of the server behind `url`, read
+/// in one statement on a connection of its own, all within 10 seconds: the
+/// peer's, for `node-identity repersonalise`, which must not run on it.
+pub async fn server_lineage_evidence(url: &str) -> Result<LineageEvidence> {
+    use sqlx::Connection;
+    let read = async {
+        let mut connection = sqlx::PgConnection::connect(url).await?;
+        let (system_identifier, timeline): (i64, i32) = sqlx::query_as(LINEAGE_EVIDENCE_SQL)
+            .fetch_one(&mut connection)
+            .await?;
+        let _ = connection.close().await;
+        anyhow::Ok(LineageEvidence {
+            system_identifier,
+            timeline,
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .context("reading it timed out")?
+}
+
+/// What `node-identity repersonalise` knows beyond the copy it changes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RepersonaliseGuard {
+    /// The operator says this is the promoted copy although the copied
+    /// lineage carries no own-log verification (`--unverified-copy`).
+    pub unverified_copy: bool,
+    /// The system identifier and WAL timeline of the server behind
+    /// `PRISM_PEER_DATABASE_URL`, read before the change.
+    pub peer_server: Option<LineageEvidence>,
 }
 
 /// What `node-identity repersonalise` made of a physical copy of the peer's
@@ -370,6 +405,7 @@ impl Ledger {
         &self,
         node: NodeIndex,
         recorded_by: &str,
+        guard: &RepersonaliseGuard,
     ) -> Result<Repersonalisation> {
         let peer = node.peer();
         let mut tx = self.begin().await?;
@@ -482,15 +518,29 @@ impl Ledger {
             system_identifier,
             timeline,
         };
-        if let Some((verified, at)) = &peer_lineage.verified {
-            if *verified == here {
-                refusals.push(format!(
-                    "this is the server node {peer} last proved its own log on (system identifier \
-                     {system_identifier}, timeline {timeline}, at {at}): node {peer}'s own \
-                     database, not a copy promoted for node {node}. Repersonalise only the rebuilt \
-                     node's database, once it is promoted"
-                ));
-            }
+        match &peer_lineage.verified {
+            Some((verified, at)) if *verified == here => refusals.push(format!(
+                "this is the server node {peer} last proved its own log on (system identifier \
+                 {system_identifier}, timeline {timeline}, at {at}): node {peer}'s own \
+                 database, not a copy promoted for node {node}. Repersonalise only the rebuilt \
+                 node's database, once it is promoted"
+            )),
+            Some(_) => {}
+            // Nothing to tell node A's own database from a promoted copy by:
+            // a fresh node, or one whose recovery forgot its verification.
+            None if !guard.unverified_copy => refusals.push(format!(
+                "the copy carries no own-log verification of node {peer}'s, so nothing tells \
+                 node {peer}'s own database from a copy promoted for node {node}; make sure this \
+                 is the promoted copy, then run again with --unverified-copy"
+            )),
+            None => {}
+        }
+        if guard.peer_server == Some(here) {
+            refusals.push(format!(
+                "the server behind PRISM_PEER_DATABASE_URL reports this database's system \
+                 identifier {system_identifier} and timeline {timeline}: this is node {peer}'s \
+                 own database, not a copy promoted for node {node}"
+            ));
         }
         ensure!(
             refusals.is_empty(),
@@ -619,7 +669,7 @@ impl Ledger {
                 scanned_through: peer_shares.map_or(peer_lineage.share_seq_floor, |held| {
                     held.max(peer_lineage.share_seq_floor)
                 }),
-                ingested_through: peer_shares,
+                ingested_through: None,
             },
             PeerSyncCursor {
                 stream: "blocks".into(),

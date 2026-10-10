@@ -147,10 +147,9 @@ CREATE TABLE IF NOT EXISTS qbit_prism_node_identity (
 --    peer_tail_lost_at is an operator's declaration, during a long peer
 --    outage, that the peer's rows this node has not pulled are lost and the
 --    peer will be rebuilt from this node (docs/prism-ledger-ops.md). Until it
---    is set, the hashrate rollups and the share archive stop at the safe peer
---    mark (6), since a peer row can still arrive above it; while it is set
---    they do not. Local state, never copied; the peer's sync role reads the
---    floors.
+--    is set, the share archive stops at the safe peer mark (6), since a peer
+--    row can still arrive above it; while it is set it does not. Local
+--    state, never copied; the peer's sync role reads the floors.
 CREATE TABLE IF NOT EXISTS qbit_prism_node_lineage (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     share_seq_floor bigint NOT NULL,
@@ -165,11 +164,14 @@ CREATE TABLE IF NOT EXISTS qbit_prism_node_lineage (
 
 -- 6. How far this node has pulled each stream of the peer's rows: the
 --    position scanned through, in the stream's key on the peer (share_seq
---    for 'shares', sync_seq for 'blocks' and 'prepared'), and the highest
---    peer-originated key inserted. Written in the transaction that inserts
---    the rows, so a restore rewinds both together and the pull repeats what
---    the restore lost. Local state, never copied; the peer's sync role reads
---    it when the peer recovers its own log.
+--    for 'shares', sync_seq for 'blocks' and 'prepared'), and, for shares
+--    and prepared jobs, the highest peer row a pull refused as a conflict,
+--    quarantined for good (NULL while none was): every peer row scanned
+--    above it is held here. Written in the transaction that inserts the
+--    rows, so a restore rewinds both together and the pull repeats what the
+--    restore lost. Local state, never copied; the peer's sync role reads it
+--    when the peer recovers its own log, and before it offers a found
+--    block.
 CREATE TABLE IF NOT EXISTS qbit_prism_peer_sync_cursors (
     stream text PRIMARY KEY CHECK (stream IN ('shares', 'blocks', 'prepared')),
     peer_node smallint NOT NULL CHECK (peer_node IN (0, 1)),
