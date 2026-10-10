@@ -78,6 +78,55 @@ pub async fn run(config: Config) -> Result<()> {
         move || stats.accepted_submissions()
     });
     let coordinator = Coordinator::new(config, registry.clone()).await?;
+    // 3.1 dual writer. A frontend never personalises its database
+    // (`node-identity set` does, CONTRACT D-9): it checks it. A database
+    // personalised as this node whose defaults or key sequences have been
+    // changed since would write rows under the wrong identity, so it is
+    // refused. One not personalised, or personalised as the other node, is
+    // reported: the frontend runs, but the peer sync refuses to start and the
+    // frontend never becomes ready. A single writer refuses a database that
+    // has run as a dual-writer node, unless the rollback says so (D-12).
+    match &coordinator.config.dual_writer {
+        Some(dual) => {
+            let node = dual.identity.node;
+            match coordinator.ledger.check_node_identity(node).await? {
+                crate::ledger::IdentityCheck::Ready(record) => tracing::info!(
+                    node = %record.node,
+                    carry_owner = dual.identity.carry_owner,
+                    recorded_at = %record.recorded_at,
+                    "dual-writer node identity"
+                ),
+                crate::ledger::IdentityCheck::Drifted(record, drift) => anyhow::bail!(
+                    "this database is dual-writer node {}, but {} changed since it was \
+                     personalised; run `qbit-prism-server node-identity set --index {}` again \
+                     before starting",
+                    record.node,
+                    drift.join(", "),
+                    node.index()
+                ),
+                crate::ledger::IdentityCheck::Unidentified => tracing::error!(
+                    node = %node,
+                    "ALERT: this database has no dual-writer node identity: run \
+                     `qbit-prism-server node-identity set --index {}` on it; until then the peer \
+                     sync does not run and this frontend admits no miners",
+                    node.index()
+                ),
+                crate::ledger::IdentityCheck::OtherNode(record) => tracing::error!(
+                    node = %node,
+                    database_node = %record.node,
+                    "ALERT: PRISM_DATABASE_URL names dual-writer node {}'s database, not this \
+                     node's; the peer sync does not run and this frontend admits no miners",
+                    record.node
+                ),
+            }
+        }
+        None => {
+            coordinator
+                .ledger
+                .refuse_single_writer_on_dual_ledger(config::dual_writer_downgrade()?)
+                .await?;
+        }
+    }
     coordinator.landing_trim.set_enabled(landing_trim);
     tracing::info!(
         enabled = landing_trim,

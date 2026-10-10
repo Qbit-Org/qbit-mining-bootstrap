@@ -222,6 +222,41 @@ it, whatever this setting says: `qbit-prism-server submission-hold set
 so it only says so; `submission-hold show` and `self-check` report the hold.
 See [holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664).
 
+## Dual writer (3.1)
+
+PRISM 3.1 can run two nodes, A and B, each with its own writable PostgreSQL.
+Each node's frontend writes only to its local database and pulls the rows the
+other node originated. `PRISM_DUAL_WRITER` (boolean, default `0`) turns this
+on. While it is off, no setting below is read and a frontend behaves exactly as
+3.0 does, whatever the others hold. With it on:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PRISM_NODE_INDEX` | required | `0` on node A, `1` on node B |
+| `PRISM_CARRY_OWNER` | required | `1` on the one node that pays down carried balances (normally A), `0` on the other |
+| `PRISM_PEER_DATABASE_URL` | required | the peer's PostgreSQL, as its read-only sync role |
+| `PRISM_PEER_DATABASE_URL_FALLBACK` | unset | a second network path to the same database, tried when the first fails |
+| `PRISM_PEER_SYNC_INTERVAL_MS` | `250` | wait between pulls that found nothing new, 10 to 60000 |
+| `PRISM_PEER_SYNC_BATCH_ROWS` | `5000` | most rows of one stream a pull reads and inserts at once, 1 to 100000 |
+
+Each error names its setting and never prints a value: the peer DSNs carry the
+sync role's credentials. A peer DSN must use `postgres` or `postgresql`, name
+a host, and not name this node's own database (`PRISM_DATABASE_URL`'s host,
+port and database). The fallback must differ from the first DSN. In production
+neither may carry the shipped `change-this` credential. These settings are per
+node and not part of the cluster fingerprint: each node's database is its own
+cluster, and the two nodes' identities differ by design. Migration 027 adds
+the columns and tables the dual writer needs, and
+`qbit-prism-server node-identity set --index N` personalises each database
+before its first dual-writer start; see
+[dual-writer node identity](prism-ledger-ops.md#dual-writer-node-identity-027).
+
+`PRISM_DUAL_WRITER_DOWNGRADE` (boolean, default `0`) belongs to the rollback
+to one writer. A single-writer frontend refuses a database that has run as a
+dual-writer node (its carry-owner journal `qbit_prism_node_roles` holds rows),
+because it would pay carried balances beside the carry owner. Set to `1`, the
+frontend starts anyway, with a warning. Only the deliberate rollback sets it.
+
 ## Preventing stale guidance
 
 CI runs `python3 scripts/check_prism_settings.py`. It checks the native name

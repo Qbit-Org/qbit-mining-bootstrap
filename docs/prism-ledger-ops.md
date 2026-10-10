@@ -3717,6 +3717,76 @@ rerunning.
 If a frontend reports `cluster halted` again, a new fatal state was recorded.
 Start again from evidence collection.
 
+## Dual-writer node identity (027)
+
+PRISM 3.1 can run two nodes, A (`0`) and B (`1`), each writing only to its own
+PostgreSQL and pulling the rows the other originated
+([settings](prism-configuration.md#dual-writer-31)). Migration 027 prepares
+every ledger for it, whether or not the dual writer is ever turned on:
+
+- `origin_node smallint NOT NULL DEFAULT 0` on each table the peer sync
+  copies: `qbit_share_ledger` (and every partition), `qbit_prism_share_hashes`,
+  `qbit_pool_blocks`, `qbit_prism_audit_snapshots`, `qbit_pool_audit_bundles`,
+  `qbit_pool_payout_entries`, `qbit_payout_carry_forward`,
+  `qbit_ctv_fanout_sets`, `qbit_ctv_fanout_artifacts`, `qbit_prism_templates`,
+  `qbit_prism_balance_snapshots`, `qbit_prism_jobs` and
+  `qbit_prism_node_roles`. Every row from before 3.1 is node 0. No `CHECK`
+  constrains it on the existing tables: on the share ledger one would scan
+  every partition under the migration's lock.
+- `sync_seq` on `qbit_pool_blocks` and `qbit_prism_jobs`, drawn by
+  `qbit_prism_next_sync_seq()` from `qbit_prism_sync_seq` after the inserting
+  transaction has taken its xid. It orders the two streams that are not shares
+  (landed blocks, and prepared jobs). Rows from before 027 keep `NULL` and are
+  never pulled.
+- `qbit_prism_node_roles`, the append-only carry-owner journal: which node
+  pays down carried balances, as each node last recorded it. It is copied like
+  the tables above, and the carry-owner guard writes it.
+- `qbit_prism_node_identity`, which node this database is, and
+  `qbit_prism_node_lineage`, where this node's own rows start and when its own
+  log was last proved complete. Both are empty until the database is
+  personalised.
+- `qbit_prism_peer_sync_cursors`, how far this node has pulled each stream of
+  the peer's rows, with `qbit_prism_peer_share_mark()`, the safe peer mark:
+  every peer share row at or below it is committed here, and none below it can
+  arrive later. `qbit_prism_peer_sync_conflicts` holds rows the peer sync found
+  under an identity this node already holds with other content.
+
+The identity, lineage, cursors and conflicts are local state and never copied.
+With `PRISM_DUAL_WRITER` off nothing reads or writes any of this except the
+defaults, which leave every existing statement's result unchanged, and one
+startup read: a single-writer frontend refuses a database whose carry-owner
+journal holds rows, unless `PRISM_DUAL_WRITER_DOWNGRADE=1` marks the deliberate
+rollback to one writer.
+
+### Personalising a database
+
+`qbit-prism-server node-identity set --index N` makes a database node A's
+(`0`) or node B's (`1`). The bootstrap and cutover steps run it once per
+database, before the node's first dual-writer start; a frontend never does. It
+needs only `PRISM_DATABASE_URL`, takes `SETTLEMENT_LOCK` and `ORDER_LOCK`, and
+in one transaction:
+
+- sets every copied table's `origin_node` default to `N`, so every row the
+  node writes carries its index without any statement naming it;
+- gives `share_seq`, `payout_entry_seq` and `carry_forward_seq` the node's
+  parity: they step by 2, node A on even values and node B on odd, continuing
+  above every value the database holds, so keys two nodes allocate never
+  collide;
+- confines the session sequence to the node's half of the extranonce1 space,
+  `[1, 2^31-1]` for A and `[2^31, 2^32-1]` for B, cycling within it, where
+  migration 009's reservations still keep a wrapped value from being reused;
+- records the identity and the floors of the node's own rows.
+
+Run again on a database that is already node `N`'s, it restores anything lost
+since and changes nothing else. A database that is the other node's is
+refused. `node-identity show` prints the identity and lineage as JSON.
+
+A dual-writer frontend checks its database at start. If a default, a key
+sequence's parity or the session range was changed after personalisation, it
+refuses to start, naming each, until `node-identity set` runs again. A
+database with no identity, or the other node's, is reported: the frontend runs,
+but the peer sync does not, and the frontend admits no miners.
+
 ## Health, diagnostics, and validation
 
 `/healthz` returns 200 only when the process has fresh work for its observed tip

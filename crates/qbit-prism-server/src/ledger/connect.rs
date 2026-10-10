@@ -204,6 +204,7 @@ impl Ledger {
             session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
             metrics: None,
             config_fingerprint: std::sync::Arc::default(),
+            dual_writer_identity: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
             compact_decode_hook: Default::default(),
@@ -437,6 +438,7 @@ impl Ledger {
             }),
             metrics,
             config_fingerprint: std::sync::Arc::default(),
+            dual_writer_identity: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
             #[cfg(test)]
@@ -510,6 +512,28 @@ impl Ledger {
         // for job persistence) against this value.
         let _ = self.config_fingerprint.set(fingerprint.to_owned());
         Ok(())
+    }
+
+    /// Record this frontend's dual-writer identity, from `PRISM_NODE_INDEX`
+    /// and `PRISM_CARRY_OWNER`, before any task uses this ledger. Every clone
+    /// sees it. A second call with another identity is refused.
+    pub fn set_dual_writer_identity(
+        &self,
+        identity: crate::node_identity::NodeIdentity,
+    ) -> Result<()> {
+        let recorded = self.dual_writer_identity.get_or_init(|| identity);
+        ensure!(
+            *recorded == identity,
+            "this ledger already serves dual-writer node {}",
+            recorded.node
+        );
+        Ok(())
+    }
+
+    /// The dual-writer identity this frontend runs as; `None` for a single
+    /// writer, whose behaviour is 3.0's.
+    pub fn dual_writer_identity(&self) -> Option<crate::node_identity::NodeIdentity> {
+        self.dual_writer_identity.get().copied()
     }
 
     /// The cluster fingerprint this frontend pinned or verified in

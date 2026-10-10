@@ -71,6 +71,8 @@ pub use jobs::{
     CompactPrepared, CompactRepair, IssuedJobSave, PreparedAuditHashes, PreparedDependency,
     PreparedTemplate, StoredCompactPrepared,
 };
+mod node_identity;
+pub use node_identity::{IdentityCheck, LineageEvidence, NodeIdentityRecord, NodeLineage};
 mod migration;
 pub use migration::{
     required_schema_versions, schema_version_list, IndexBuildMode, MigrationSource,
@@ -121,6 +123,11 @@ pub struct Ledger {
     /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
     /// SHARE` in its own transaction and compares it against this.
     config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// This frontend's dual-writer identity (`PRISM_NODE_INDEX`,
+    /// `PRISM_CARRY_OWNER`), set once at startup by
+    /// [`Ledger::set_dual_writer_identity`]; unset for a single writer. Shared
+    /// across clones, like the fingerprint.
+    dual_writer_identity: std::sync::Arc<std::sync::OnceLock<crate::node_identity::NodeIdentity>>,
     /// The candidate claims this frontend has watched, each timed on its own
     /// monotonic clock (#581). Shared across clones: one process, one clock
     /// per claim.

@@ -673,6 +673,18 @@ leave them, as in 001, whose own order for them is not fixed either.
 011. Like 025, it changes no stored row and is applied in the migration
 transaction, with no capability and no shutdown proof: an earlier binary
 accepts the unknown migration with a warning and reads the same report.
+Migration 027 adds what the 3.1 dual writer needs: `origin_node smallint
+NOT NULL DEFAULT 0` on every table the peer sync copies, the share ledger and
+its partitions included, a `sync_seq` pull order on `qbit_pool_blocks` and
+`qbit_prism_jobs`, the carry-owner journal (`qbit_prism_node_roles`), the
+node identity and lineage, and the peer sync's cursor and conflict tables.
+Every new column has a constant default or none, so no table is rewritten and
+no constraint is validated by a scan; each `ALTER` holds its table's lock only
+for the catalog change, until the migration commits. It is additive and
+applied in the migration transaction, with no capability and no shutdown
+proof: an earlier binary accepts the unknown migration with a warning, and
+its inserts take the defaults. See
+[dual-writer node identity](prism-ledger-ops.md#dual-writer-node-identity-027).
 While a share-hash backfill that this release started is pending on a
 populated `2.x.x` source, the database declares
 `share_hash_backfill_pending = 1` (#669), raised to 2 once
@@ -2429,7 +2441,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`, `025` and `026`), 002's share-hash backfill, 013's and 024's
+(`001` and native `002` to `023`, and `025` to `027`), 002's share-hash backfill, 013's and 024's
 concurrent index builds, and 017's prepare, validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
 whole length; the backfill's batches hold only ACCESS SHARE on it. The report

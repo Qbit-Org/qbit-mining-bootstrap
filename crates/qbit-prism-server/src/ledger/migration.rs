@@ -40,7 +40,7 @@ pub use share_hashes::{
 /// and permitted serving, every start accepts the database without 2 until
 /// plain `migrate` records it.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
 ];
 
 /// The schema migrations a start requires: `REQUIRED_SCHEMA_VERSIONS`, but
@@ -2260,6 +2260,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         26,
         include_str!("../../migrations/026_carry_forward_integrity_report_once.sql"),
     ),
+    (
+        27,
+        include_str!("../../migrations/027_dual_writer_identity.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3450,6 +3454,20 @@ pub(super) async fn migrate_schema(
                 .execute(&mut **tx)
                 .await?;
         }
+    }
+    if !versions.contains(&27) {
+        // 3.1 dual writer (D1): origin_node on every copied table, the
+        // non-share streams' pull order, the node-role row and the peer
+        // sync's cursors and conflicts. Additive only: no capability and no
+        // shutdown proof. Every new column has a constant default or none,
+        // so no table is rewritten; an earlier binary never names them, and
+        // inserts it makes take the defaults.
+        sqlx::raw_sql(native_migration(27))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(27)")
+            .execute(&mut **tx)
+            .await?;
     }
     // Only a fresh or empty 2.x.x source reaches this DDL, with writers
     // excluded by the cutover locks. Existing native ledgers and populated

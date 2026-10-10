@@ -953,6 +953,9 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
+        if let Some(dual) = &config.dual_writer {
+            ledger.set_dual_writer_identity(dual.identity)?;
+        }
         // Keep a frontend's initial heartbeat non-quiescent if configuration
         // fails. Another live incarnation may share this instance ID, so this
         // rejected startup cannot safely publish `stopped` for the shared row.

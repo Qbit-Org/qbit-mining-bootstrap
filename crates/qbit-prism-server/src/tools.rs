@@ -68,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         command: SubmissionHoldCommand,
     },
+    /// Show or set which 3.1 dual-writer node this database is (bootstrap and cutover steps).
+    NodeIdentity {
+        #[command(subcommand)]
+        command: NodeIdentityCommand,
+    },
     /// Seal, archive, verify, detach, drop and restore share ledger partitions.
     ShareArchive {
         #[command(subcommand)]
@@ -333,6 +338,20 @@ enum SubmissionHoldCommand {
     },
 }
 
+/// 3.1 dual writer: which node a database is (CONTRACT D-9). Only the
+/// bootstrap and cutover steps set it; a frontend never writes it.
+#[derive(Subcommand)]
+enum NodeIdentityCommand {
+    /// Print the database's node identity and lineage as JSON. Needs only PRISM_DATABASE_URL.
+    Show,
+    /// Make this database node A's (0) or node B's (1), once, before its first dual-writer start.
+    Set {
+        /// 0 for node A, 1 for node B.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
+        index: u8,
+    },
+}
+
 #[derive(Subcommand)]
 enum CandidatesCommand {
     /// Print unfinished candidates up to --limit, oldest due first; warn if truncated.
@@ -506,6 +525,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         Command::SigningTransition { confirm } => signing_transition(confirm).await,
         Command::FatalState { command } => fatal_state(command).await,
         Command::SubmissionHold { command } => submission_hold(command).await,
+        Command::NodeIdentity { command } => node_identity(command).await,
         Command::ShareArchive { command } => share_archive(command).await,
         Command::Candidates { command } => candidates(command).await,
         Command::HeaderDifficulty { bits } => {
@@ -745,6 +765,35 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 3.1 dual writer (CONTRACT D-9): reads only the database URL, so it runs
+/// before any dual-writer setting exists. `set` personalises the database as
+/// the given node (`Ledger::set_node_identity`) on the operator connection,
+/// which writes no heartbeat; run again on the same node it restores only what
+/// the database lost, and it refuses a database that is the other node's.
+/// Both print the identity and lineage that result as JSON.
+async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
+    let url = config::DatabaseConfig::url_from_env()?;
+    let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+    let result = async {
+        if let NodeIdentityCommand::Set { index } = command {
+            let node = crate::node_identity::NodeIndex::from_index(index.into())
+                .context("--index must be 0 (node A) or 1 (node B)")?;
+            ledger
+                .set_node_identity(node, "qbit-prism-server node-identity set")
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(json!({
+            "schema": "qbit.prism.node-identity.v1",
+            "identity": ledger.recorded_node_identity().await?,
+            "lineage": ledger.node_lineage().await?,
+        }))
+    }
+    .await;
+    ledger.pool.close().await;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
 }
 
 /// #664: every subcommand reads only the database URL, so a frontend-only

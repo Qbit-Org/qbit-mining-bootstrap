@@ -312,7 +312,7 @@ pub fn expected(populated: bool) -> Census {
     );
     let holders = labels(
         "holder",
-        "append,candidate_insert,first_confirmation,settlement,reconcile,orphan,prepared,cleanup,fatal_state,operator",
+        "append,candidate_insert,first_confirmation,settlement,reconcile,orphan,prepared,cleanup,fatal_state,operator,peer_sync",
     );
     result.family(
         "database_order_lock_hold_seconds",

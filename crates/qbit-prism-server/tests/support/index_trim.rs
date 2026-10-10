@@ -534,7 +534,10 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
         assert_eq!(ledger_indexes(&pool).await?, before);
         assert_eq!(
             schema_versions(&pool).await?,
-            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+            [
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+                27
+            ]
         );
         sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
             .execute(&pool)
@@ -612,7 +615,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     assert_eq!(ledger_indexes(&pool).await?, before);
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     // The declared definition under the reserved name is an earlier build
     // of the migration's own: kept as it is, not rebuilt.
@@ -777,7 +780,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     }
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     assert_eq!(share_count(&pool).await?, 2);
     // The operator puts the name back; the next start keeps both builds
@@ -857,7 +860,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     );
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     sqlx::raw_sql(&format!(
         "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
@@ -935,7 +938,7 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
     assert!(error.contains("migrate again"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     let after_refusal = ledger_indexes(&pool).await?;
     let mut expected: Vec<&str> = KEPT.to_vec();
