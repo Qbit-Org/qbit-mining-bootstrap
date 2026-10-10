@@ -83,11 +83,15 @@ work.
 
 A cut link either resets every connection (a host that is gone) or becomes a
 blackhole (a dead switch: nothing forwarded, nothing closed, and the held
-bytes delivered on heal as TCP would). The relays are user-space, so a
-blackhole is silence at the application layer; TCP keepalives between each
-endpoint and its relay still succeed.
+bytes delivered on heal as TCP would). A link can also discard: every byte is
+read and thrown away and no close is passed on, so a server's replies to a
+dead client drain instead of blocking on a full window (S2's puller death).
+The relays are user-space, so a blackhole is silence at the application
+layer; TCP keepalives between each endpoint and its relay still succeed.
 
-Restoring an older base backup and replacing a disk are scenario steps.
+Restoring an older base backup and replacing a disk are scenario steps, as are
+the locks held and grants revoked on a database (S4's transient apply, S6's
+unreadable peer).
 
 ## Invariants (CONTRACT.md §4)
 
@@ -163,18 +167,21 @@ What each one does:
   thaws (a frozen peer must never stall the survivor's writes).
 - **S2, mid-pull:** both nodes take miners; A's frontend is frozen 20 times
   for 1 to 4 s, each timed where possible to a moment its puller has a query,
-  a transaction or an advisory lock open on B's database. During each freeze a
-  new tip arrives and B must record jobs on it within 15 s; every fifth freeze
-  B also finds a block, which must land. D1's sync barrier, held by a frozen
+  a transaction or an advisory lock open on B's database. During each freeze
+  B must keep writing: in 16 of them a new tip arrives and B must record jobs
+  on it within 15 s; in every fifth, B lands a block solved on work handed out
+  before the freeze and must build work on it. D1's sync barrier, held by a frozen
   puller, would stall exactly these writes. The schedule's seed and every
   round are in `freezes.json`.
 - **S2, puller death** (D1 engine review, P1 2): both nodes take miners at
   250 shares/s. For 20 s, B is sampled every 10 ms and must never show A's
-  peer backend idle in transaction. Then A's database link is blackholed, so
-  B never sees the close (as when A's host dies; a plain kill -9 sends a FIN),
-  and A's frontend is killed while its puller is busy on B. A's backends on B
-  must hold no snapshot or transaction beyond 10 s, and B's share answer
-  latency must stay flat (late p95 at most twice the early p95, plus 50 ms).
+  peer backend idle in transaction. Then A's database link discards (B's
+  replies drain and no close reaches it, as when A's host dies; a plain kill -9
+  sends a FIN), and A's frontend is killed while its puller is busy on B. A's
+  backends on B must hold no snapshot or transaction beyond 10 s, B must take
+  every miner, and its share answer latency must stay flat (p95 45 to 60 s
+  after the death at most twice the p95 5 to 20 s after A's mark-down, plus
+  50 ms).
 - **S3:** B's host dies (frontend and PostgreSQL); A's miners see no gap above
   2 s, and B catches up on return.
 - **S4:** the databases' link blackholed with both nodes up: no gap at the cut
@@ -185,8 +192,9 @@ What each one does:
   up.
 - **S4, transient apply** (D1 engine review, P1 3): A holds EXCLUSIVE on its
   audit bundles (landing inserts time out at 5 s, reads go on) while B lands a
-  block, and for 12 s more. Once the lock clears, the block must land and
-  confirm on A, with no sync conflict recorded for it: retried, never skipped.
+  block, and for 12 s more; at least one of A's applies must be seen waiting on
+  the lock. Once the lock clears, the block must land and confirm on A, with no
+  sync conflict recorded for it: retried, never skipped.
 - **S5:** round-robin routing, both nodes write; four interleaved blocks land
   on both nodes, each window complete on arrival, B's blocks carry-free.
 - **S6:** a plain PostgreSQL restart with the peer unreachable serves (D-17); a

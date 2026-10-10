@@ -977,7 +977,7 @@ id = "dual-writer-s02-a-frozen-during-pulls"
 title = "S2, frozen mid-pull: A's frontend frozen 20 times while its puller works on B's database; B never stalls"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, each timed where possible to a moment its puller has a query, a transaction or an advisory lock open on B's database. During every freeze a new tip arrives and B records jobs on it within 15 s, and every fifth freeze B finds a block that lands. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
+criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, each timed where possible to a moment its puller has a query, a transaction or an advisory lock open on B's database. During each of 16 freezes a new tip arrives and B records jobs on it within 15 s; during every fifth, B instead lands a block solved on work handed out before the freeze and builds work on it. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
 runs = false
 reason = "Needs the 3.1 stack: peer sync (D1, pushed) and readiness for the balancer's checks (D4)."
 
@@ -986,7 +986,7 @@ id = "dual-writer-s02-a-puller-dies-mid-read"
 title = "S2, A's puller dies mid-read unseen by B: no snapshot left on B, and B's share appends stay flat"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "Both nodes take miners at 250 offered shares/s. Sampled every 10 ms for 20 s, B never shows A's peer backend idle in transaction (no pull holds a transaction across a round trip). A's database link is blackholed so B never sees the close, and A's frontend is killed while its puller is busy on B: A's backends on B hold no snapshot or transaction beyond 10 s, and the p95 answer latency of B's shares 45 to 60 s after the death is at most twice that 10 to 25 s after it, plus 50 ms. A then restarts and catches up; invariants 1 to 4 hold."
+criteria = "Both nodes take miners at 250 offered shares/s. Sampled every 10 ms for 20 s, B never shows A's peer backend idle in transaction (no pull holds a transaction across a round trip). A's database link discards (B's replies drain and no close reaches it, as when A's host dies), and A's frontend is killed while its puller is busy on B: A's backends on B hold no snapshot or transaction beyond 10 s; B takes every miner, and the p95 answer latency of B's shares 45 to 60 s after the death is at most twice that 5 to 20 s after A was marked down, plus 50 ms. A then restarts and catches up; invariants 1 to 4 hold."
 runs = false
 reason = "Needs the 3.1 stack: D1's single-statement peer reads (its engine review, P1 2) and readiness for the balancer's checks (D4)."
 
@@ -995,7 +995,7 @@ id = "dual-writer-s04-transient-apply-failure"
 title = "S4, a transient failure while A applies B's block: retried until the block lands on A, never skipped"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "A holds EXCLUSIVE on its audit bundles, so landing inserts fail at A's 5 s lock_timeout while reads go on. B lands a block, and the lock is held 12 s more: the block is not on A meanwhile. Once the lock clears, the block lands and confirms on A within the catch-up bound, and A records no sync conflict for it (D-10 skips only a block whose held facts differ). Invariants 1 to 4 hold."
+criteria = "A holds EXCLUSIVE on its audit bundles, so landing inserts fail at A's 5 s lock_timeout while reads go on. B lands a block, and the lock is held 12 s more: at least one of A's applies is seen waiting on the lock, and the block is not on A meanwhile. Once the lock clears, the block lands and confirms on A within the catch-up bound, and A records no sync conflict for it (D-10 skips only a block whose held facts differ). Invariants 1 to 4 hold."
 runs = false
 reason = "Needs the 3.1 stack: D1's retry of a failed peer block (its engine review, P1 3) and readiness for the balancer's checks (D4)."
 

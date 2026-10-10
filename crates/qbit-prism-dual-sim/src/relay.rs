@@ -15,6 +15,12 @@
 //!   own timeouts or keepalives (the #761 §1.1 lock-wedge class). Healing
 //!   resumes every held connection where it stopped, as TCP retransmission
 //!   does once a path returns, unless an endpoint gave up meanwhile.
+//! - **Discard:** every byte either side sends is read and thrown away, and
+//!   nothing is closed, not even when one side closes. A new connection is
+//!   held as when blackholed. This is a dead host as its peer's database
+//!   server sees it: its replies drain and it never hears a close, so only
+//!   its own session timeouts end the session. (Blackholed, a server still
+//!   sending a result would block on a full window instead.)
 //!
 //! Adapted from the `Relay` of
 //! `crates/qbit-prism-server/tests/support/live_pg_failover.rs`, which
@@ -43,6 +49,7 @@ pub enum LinkState {
     Open,
     Reset,
     Blackholed,
+    Discard,
 }
 
 /// Counts for the scenario report.
@@ -162,7 +169,7 @@ async fn opened(state: &mut watch::Receiver<LinkState>) -> bool {
         match *state.borrow_and_update() {
             LinkState::Open => return true,
             LinkState::Reset => return false,
-            LinkState::Blackholed => {}
+            LinkState::Blackholed | LinkState::Discard => {}
         }
         if state.changed().await.is_err() {
             return false;
@@ -226,10 +233,27 @@ async fn connection(
     }
 }
 
+/// Wait until bytes move: `Some(false)` when the link is open, `Some(true)`
+/// when it discards, `None` when it is reset (or the relay is gone).
+async fn moving(state: &mut watch::Receiver<LinkState>) -> Option<bool> {
+    loop {
+        match *state.borrow_and_update() {
+            LinkState::Open => return Some(false),
+            LinkState::Discard => return Some(true),
+            LinkState::Reset => return None,
+            LinkState::Blackholed => {}
+        }
+        if state.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
 /// Copy `from` to `to` while the link is open. Blackholed, it stops reading,
 /// so the sender's window fills as it would against a dead path, and it
-/// writes nothing it already holds until the link opens again. It ends on
-/// EOF, an error, or a reset, and hands both halves back.
+/// writes nothing it already holds until the link opens again. Discarding,
+/// it reads and drops, and passes on no close. It ends on EOF, an error, or
+/// a reset, and hands both halves back.
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
@@ -237,9 +261,9 @@ async fn pump(
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
-        if !opened(&mut state).await {
+        let Some(discarding) = moving(&mut state).await else {
             return (from, to);
-        }
+        };
         let read = tokio::select! {
             read = from.read(&mut buffer) => read,
             // Re-check the state: a blackhole stops the read here.
@@ -252,11 +276,16 @@ async fn pump(
         };
         let count = match read {
             Ok(0) | Err(_) => {
-                let _ = to.shutdown().await;
+                if !discarding {
+                    let _ = to.shutdown().await;
+                }
                 return (from, to);
             }
             Ok(count) => count,
         };
+        if discarding {
+            continue;
+        }
         // Bytes read before a blackhole wait for the link, as unacknowledged
         // segments wait for a path.
         if !opened(&mut state).await {
@@ -362,6 +391,29 @@ mod tests {
         let mut five = [0u8; 5];
         timeout(Duration::from_secs(5), held.read_exact(&mut five)).await??;
         assert_eq!(&five, b"three");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_discarding_link_drains_both_ways_and_passes_on_no_close() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
+        let (mut server, _) = timeout(Duration::from_secs(5), listener.accept()).await??;
+        relay.set(LinkState::Discard);
+        client.write_all(b"lost").await?;
+        drop(client);
+        // A reply far larger than any window drains instead of blocking, as
+        // a blackhole would make it.
+        let reply = vec![7u8; 4 * 1024 * 1024];
+        timeout(Duration::from_secs(10), server.write_all(&reply)).await??;
+        let mut buffer = [0u8; 4];
+        assert!(
+            timeout(Duration::from_millis(500), server.read(&mut buffer))
+                .await
+                .is_err(),
+            "neither the client's bytes nor its close reach the server"
+        );
         Ok(())
     }
 }
