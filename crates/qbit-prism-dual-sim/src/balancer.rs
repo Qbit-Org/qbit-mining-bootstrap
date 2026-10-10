@@ -153,7 +153,9 @@ pub struct BalancerReport {
     pub transitions: Vec<Transition>,
     /// Every failed check, in order.
     pub failed_checks: Vec<FailedCheck>,
-    /// Every session routed, in order.
+    /// Every session routed, in order. Kept out of the written report: S2
+    /// reads it, and a run's reconnects make it long.
+    #[serde(skip)]
     pub routings: Vec<RoutedSession>,
     /// Sessions routed to each node over the run.
     pub routed: BTreeMap<String, u64>,
@@ -487,8 +489,8 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
                 failures = 0;
                 passes += 1;
                 if !up && passes >= shared.config.rise {
-                    // Recorded first, so whoever sees the node up finds the
-                    // mark that made it so.
+                    // Recorded before the state is published, so whoever sees
+                    // the node up finds the mark that made it so.
                     shared.transition(&backend.target.name, true);
                     backend.up.send_replace(true);
                     shared.event(format!(
@@ -502,8 +504,11 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
                 failures += 1;
                 shared.failed_check(&backend.target.name, up, &reason);
                 if up && failures >= shared.config.fall {
-                    shared.transition(&backend.target.name, false);
+                    // Recorded after the state is published, so every session
+                    // routed to the node is dated before its mark-down (a
+                    // routing is dated before it reads the state).
                     backend.up.send_replace(false);
+                    shared.transition(&backend.target.name, false);
                     let closed = close_all(backend);
                     shared.event(format!(
                         "{} marked down after {failures} failed checks ({reason}); closed {closed} sessions",
@@ -533,6 +538,9 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     let mut turn = 0usize;
     while let Ok((client, _)) = listener.accept().await {
         let _ = client.set_nodelay(true);
+        // Dated before the state is read: a session routed to a node is then
+        // always dated before that node's mark-down.
+        let at_ms = shared.now_ms();
         let up: Vec<usize> = shared
             .backends
             .iter()
@@ -553,9 +561,6 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             crate::relay::reset(client);
             continue;
         };
-        // Recorded when the node is chosen, not when its connection is up,
-        // so a session is dated by the routing state it saw.
-        let at_ms = shared.now_ms();
         if let Ok(mut routings) = shared.routings.lock() {
             routings.push(RoutedSession {
                 at_ms,

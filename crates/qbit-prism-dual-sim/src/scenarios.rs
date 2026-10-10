@@ -1599,13 +1599,19 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         .iter()
         .find(|t| t.backend == "a" && !t.up && t.at_ms >= cut_at)
         .map(|t| t.at_ms);
-    // No session may be routed to dead A once it is marked down. A choice
-    // within 100 ms of the mark read the state the mark was about to change.
+    // No session may be routed to dead A from its mark-down until it is
+    // marked up again (each routing is dated before the state it read, each
+    // mark-down after it is published, so the comparison is exact).
     let routed_after_down = marked_down.map(|down| {
+        let back_up = report
+            .transitions
+            .iter()
+            .find(|t| t.backend == "a" && t.up && t.at_ms > down)
+            .map_or(u64::MAX, |t| t.at_ms);
         report
             .routings
             .iter()
-            .filter(|r| r.backend == "a" && r.at_ms > down + 100)
+            .filter(|r| r.backend == "a" && r.at_ms > down && r.at_ms < back_up)
             .count()
     });
     let records = sim.load()?.records();
@@ -1835,8 +1841,10 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
     sqlx::query("LOCK TABLE qbit_pool_audit_bundles IN EXCLUSIVE MODE")
         .execute(&mut *lock)
         .await?;
-    let locked_at = db_now(&a).await?;
     sim.mark("A's audit bundles locked: landing inserts wait until lock_timeout, reads go on");
+    let since = sim
+        .dual_since
+        .context("the transient apply runs on a dual-writer pair")?;
     // Whatever happens while the lock is held, it is released before an
     // error is raised.
     let held = async {
@@ -1876,27 +1884,23 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
         .bind(&block)
         .fetch_one(&a)
         .await?;
-        // The attempts are B's block's apply only if A landed nothing of its
-        // own meanwhile: its own landing would insert into the table too.
+        // The attempts are B's block's apply only if A has no candidate of
+        // its own: its own landing would insert into the table too. A finds
+        // no block in this scenario, so it has none since dual mode began.
         let own: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM qbit_block_candidate_outbox WHERE created_at >= $1",
         )
-        .bind(locked_at)
+        .bind(since)
         .fetch_one(&a)
         .await?;
-        anyhow::ensure!(
-            own == 0,
-            "A found {own} blocks of its own while its audit bundles were locked, so the \
-             waiting inserts cannot be told apart from B's block's apply"
-        );
-        anyhow::Ok((block, attempts, on_a))
+        anyhow::Ok((block, attempts, on_a, own))
     }
     .await;
     let unlocked = lock.rollback().await;
     if unlocked.is_ok() {
         sim.mark("A's audit bundles unlocked");
     }
-    let (block, attempts, held_while_locked) = match (held, unlocked) {
+    let (block, attempts, held_while_locked, own) = match (held, unlocked) {
         (Ok(held), Ok(())) => held,
         (held, unlocked) => {
             // Closing the pool ends a connection whose rollback failed, and
@@ -1923,10 +1927,15 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
     a.close().await;
     body.expect(
         "B's block, which A failed to apply while locked, lands on A once the lock clears",
-        !attempts.is_empty() && !held_while_locked && landed.is_ok() && conflicts.is_empty(),
+        own == 0
+            && !attempts.is_empty()
+            && !held_while_locked
+            && landed.is_ok()
+            && conflicts.is_empty(),
         format!(
             "{} inserts of A's frontend waited on the lock during the {} s hold (at least one \
-             must, or the retry was never exercised): {attempts:?}; on A while locked: \
+             must, or the retry was never exercised; A's own candidates, which would insert \
+             there too: {own}, and there must be none): {attempts:?}; on A while locked: \
              {held_while_locked} (the lock must keep it out); confirmed on A after the release: \
              {}; sync conflicts recorded for it: {conflicts:?}",
             attempts.len(),
