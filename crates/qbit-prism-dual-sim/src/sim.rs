@@ -769,11 +769,13 @@ impl Sim {
     /// load the two databases are never equal at one instant, so this waits
     /// for the first reading's rows to arrive, not for equal counts. It says
     /// nothing about a node's own rows (a restored node pulling its own rows
-    /// back is S6's and S7's check). A read that fails is retried until the
-    /// bound; a timeout names each node's sync conflicts, since a row the peer
-    /// refuses never arrives.
+    /// back is S6's and S7's check). Every read is retried, and capped by the
+    /// time left, until the bound; a timeout names the sync conflicts each
+    /// node recorded during the wait, since a row the peer refuses never
+    /// arrives.
     pub async fn wait_synced(&self, limit: Duration) -> Result<()> {
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + limit;
         let mut pools = BTreeMap::new();
         for node in Node::BOTH {
             match self.pool(node).await {
@@ -788,17 +790,44 @@ impl Sim {
                 }
             }
         }
-        let result = async {
-            // What each node had originated, as its own database holds it.
-            let mut target = BTreeMap::new();
+        // One read, capped by what is left of the bound.
+        async fn capped<T>(
+            deadline: tokio::time::Instant,
+            read: impl std::future::Future<Output = Result<T>>,
+        ) -> Result<T> {
+            tokio::time::timeout_at(deadline, read)
+                .await
+                .map_err(|_| anyhow::anyhow!("the read outlived the bound"))?
+        }
+        let mut since = BTreeMap::new();
+        let mut target: BTreeMap<Node, (i64, i64)> = BTreeMap::new();
+        let mut last = String::new();
+        let result = loop {
+            // What each node had originated, as its own database holds it,
+            // and the database's clock, read once each.
             for node in Node::BOTH {
-                target.insert(node, origin_counts(&pools[&node], node).await?);
+                if let std::collections::btree_map::Entry::Vacant(slot) = since.entry(node) {
+                    match capped(deadline, db_clock(&pools[&node])).await {
+                        Ok(at) => {
+                            slot.insert(at);
+                        }
+                        Err(error) => last = format!("reading node {node:?}'s clock: {error:#}"),
+                    }
+                }
+                if let std::collections::btree_map::Entry::Vacant(slot) = target.entry(node) {
+                    match capped(deadline, origin_counts(&pools[&node], node)).await {
+                        Ok(counts) => {
+                            slot.insert(counts);
+                        }
+                        Err(error) => last = format!("reading node {node:?}'s own rows: {error:#}"),
+                    }
+                }
             }
-            loop {
+            if target.len() == 2 {
                 let mut behind = Vec::new();
                 for node in Node::BOTH {
                     let peer = node.peer();
-                    match origin_counts(&pools[&peer], node).await {
+                    match capped(deadline, origin_counts(&pools[&peer], node)).await {
                         Ok(held) if held.0 >= target[&node].0 && held.1 >= target[&node].1 => {}
                         Ok(held) => behind.push(format!(
                             "node {peer:?} holds {held:?} of node {node:?}'s (shares, blocks), \
@@ -809,28 +838,37 @@ impl Sim {
                     }
                 }
                 if behind.is_empty() {
-                    return Ok(());
+                    break Ok(());
                 }
-                if started.elapsed() >= limit {
-                    let mut conflicts = Vec::new();
-                    for (node, pool) in &pools {
-                        let count: Result<i64, _> = sqlx::query_scalar(
-                            "SELECT count(*) FROM qbit_prism_peer_sync_conflicts",
-                        )
-                        .fetch_one(pool)
-                        .await;
-                        conflicts.push(format!("node {node:?}: {count:?}"));
-                    }
-                    anyhow::bail!(
-                        "the sync did not catch up within {limit:?}: {}; sync conflicts {}",
-                        behind.join("; "),
-                        conflicts.join(", ")
-                    );
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                last = behind.join("; ");
             }
-        }
-        .await;
+            if started.elapsed() >= limit {
+                let mut conflicts = Vec::new();
+                for (node, pool) in &pools {
+                    let count = match since.get(node) {
+                        Some(at) => tokio::time::timeout(
+                            Duration::from_secs(5),
+                            sqlx::query_scalar::<_, i64>(
+                                "SELECT count(*) FROM qbit_prism_peer_sync_conflicts \
+                                 WHERE last_seen_at >= $1",
+                            )
+                            .bind(*at)
+                            .fetch_one(pool),
+                        )
+                        .await
+                        .map_or_else(|_| "unread".to_owned(), |count| format!("{count:?}")),
+                        None => "unread".to_owned(),
+                    };
+                    conflicts.push(format!("node {node:?}: {count}"));
+                }
+                break Err(anyhow::anyhow!(
+                    "the sync did not catch up within {limit:?}: {last}; sync conflicts recorded \
+                     during the wait: {}",
+                    conflicts.join(", ")
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
         for pool in pools.into_values() {
             pool.close().await;
         }
@@ -985,6 +1023,13 @@ impl Sim {
             "balancer_port": self.balancer.port(),
         })
     }
+}
+
+/// A database's clock now.
+async fn db_clock(pool: &PgPool) -> Result<chrono::DateTime<chrono::Utc>> {
+    Ok(sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await?)
 }
 
 /// How many shares and blocks `origin` originated, as `pool`'s database
