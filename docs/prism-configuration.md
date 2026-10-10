@@ -285,7 +285,9 @@ public address (decision D-7); off unless `PRISM_READINESS_PORT` is set.
 `GET /readyz` answers `200` while the frontend admits miners, `503` while it
 does not, `401` without the token and `404` for anything else. In dual-writer
 mode the Stratum listeners also accept connections only while it admits. With
-the port unset and `PRISM_DUAL_WRITER` off, nothing changes from 3.0. See
+the port unset and `PRISM_DUAL_WRITER` off, nothing changes from 3.0. In
+dual-writer mode `qbit-prism-server healthcheck` reports liveness, not
+readiness, and needs the operator listener. See
 [dual-writer readiness](prism-dual-writer-readiness.md).
 
 ## Preventing stale guidance

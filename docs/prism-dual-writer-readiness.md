@@ -145,6 +145,31 @@ same condition as public Stratum, with the Hashbalancer's health token; both
 nodes serve it before the Hashbalancer's PRISM routes switch to HTTP checks
 (the deploy order of decision D-7).
 
+## The container healthcheck (dual mode)
+
+Routing reads readiness from `/readyz`. The container healthcheck,
+`qbit-prism-server healthcheck`, is about liveness in dual mode, so a
+converge that waits for a healthy container does not time out while a node
+catches up on its own log after a restart, restore or rebuild. Given a
+`/healthz` body that carries `dual_writer`, it passes while the frontend is
+ready, while its own log is behind (the D-8 catch-up), or while its admission
+is inside the grace. It fails on a fault:
+
+- no answer within 3 s, as when the process has exited (a cluster halted
+  before the start refuses the frontend's start);
+- a stale snapshot or a stalled runtime (the body's `error`), or
+  `job-delivery-stalled`;
+- a `writer_path` other than `local`: the database unreachable, read-only,
+  never personalised or the peer's;
+- readiness lost for longer than the grace, or not yet gained after the
+  catch-up. A cluster halted at runtime shows this way: its payout revision
+  is no longer served, so the frontend withdraws once the grace has run out.
+
+It reads `/healthz` on the operator listener. With `PRISM_AUDIT_PORT=0` in
+dual mode it fails instead of probing Stratum, whose gated listeners refuse
+connections while the frontend does not admit miners. A single writer's
+healthcheck, and `self-check` in either mode, keep 3.0's readiness rule.
+
 ## The balancer
 
 The Hashbalancer's `readiness` route policy (SwapLabsInc/qbit-tools,
@@ -181,7 +206,11 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
 
 - Unit: the admission state machine, the signal's freshness, the endpoint's
   token and answers, the reserved address, the writer-path classification,
-  the metrics.
+  the metrics, and the healthcheck's liveness rule.
+- `tests/healthcheck_cli.rs`: the healthcheck binary against canned
+  `/healthz` answers: a dual-writer body catching up passes and one with a
+  remote writer fails, a single writer keeps 3.0's rule, and dual mode
+  without the operator listener refuses to probe Stratum.
 - `tests/stratum_admission_gate.rs`: a gated listener refuses at the socket
   until admitted, refuses again after a withdrawal while an established
   session is still served, and closes when its decision goes stale.
@@ -193,4 +222,7 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
   listens from startup and answers `200`; five payout revision bumps under
   readiness polling never turn the endpoint from `200`, and a rebuild held
   open dips readiness into the grace, keeps `200` for the whole default
-  grace, turns `503` only after it, and is readmitted once rebuilt.
+  grace, turns `503` only after it, and is readmitted once rebuilt. The
+  healthcheck passes for the dual-mode frontend catching up and fails for one
+  on the other node's database; a single writer's passes once ready and fails
+  inside the grace, as in 3.0.

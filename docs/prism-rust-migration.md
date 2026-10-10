@@ -1871,7 +1871,10 @@ frontend, whose readiness stays down until the build completes.
 
 ## Bring up native instances
 
-Start one instance first and verify readiness before admitting controlled miners:
+Start one instance first and verify readiness before admitting controlled miners
+(for a 3.1 dual-writer frontend, `healthcheck` reports liveness and `self-check`
+still requires readiness; see
+[the container healthcheck](prism-dual-writer-readiness.md#the-container-healthcheck-dual-mode)):
 
 ```sh
 qbit-prism-server run

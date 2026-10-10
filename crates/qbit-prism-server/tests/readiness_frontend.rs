@@ -8,6 +8,9 @@
 //! its endpoint answers 200 once it is ready. A rebuild after a payout
 //! revision bump leaves the endpoint at 200 for the whole admission grace,
 //! and one held past it withdraws the frontend until its work is rebuilt.
+//! The `healthcheck` subcommand is liveness for a dual-writer frontend (it
+//! passes while the frontend catches up, and fails when it writes to the
+//! other node's database) and 3.0's readiness rule for a single writer.
 //!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
@@ -242,6 +245,33 @@ async fn polling_readiness<T>(
     Ok((output?, refusals))
 }
 
+/// `qbit-prism-server healthcheck` against this frontend's operator
+/// `/healthz`, in an environment of its own: whether it passed, and its
+/// stderr.
+async fn healthcheck(ports: &Ports) -> Result<(bool, String)> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
+    for (key, _) in
+        std::env::vars().filter(|(key, _)| key.starts_with("PRISM_") || key.starts_with("QBIT_"))
+    {
+        command.env_remove(key);
+    }
+    let url = format!("http://127.0.0.1:{}/healthz", ports.audit);
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        command
+            .args(["healthcheck", "--url", &url])
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .context("the healthcheck hung")??;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
 async fn with_server(
     database_url: &str,
     dual_writer: bool,
@@ -301,6 +331,12 @@ async fn a_dual_writer_frontend_that_is_not_ready_refuses_stratum_and_answers_no
             ensure!(health["dual_writer"]["writer_path"] == "local", "{health}");
             ensure!(health["admission"]["admitting"] == false, "{health}");
             ensure!(health["admission"]["state"] == "starting", "{health}");
+            // Catching up on its own log is expected: the container is healthy.
+            let (healthy, stderr) = healthcheck(ports).await?;
+            ensure!(
+                healthy,
+                "a dual-writer frontend catching up failed its healthcheck: {stderr}"
+            );
 
             // No Stratum handshake completes, however often a miner tries.
             for _ in 0..10 {
@@ -370,6 +406,49 @@ async fn a_dual_writer_frontend_that_is_not_ready_refuses_stratum_and_answers_no
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dual_writer_frontend_on_the_other_nodes_database_fails_its_healthcheck() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_frontend_remote_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "d4-frontend-fixture".into(),
+        2,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let outcome = async {
+        // Node A's database behind a frontend configured as node B: a DSN
+        // left pointing at the peer.
+        ledger.set_node_identity(NodeIndex::A, "d4-test").await?;
+        with_server(&database.url, true, async |client, ports, server, _| {
+            let health = health_until(client, ports, server, "the remote writer", |health| {
+                health["dual_writer"]["writer_path"] == "remote"
+            })
+            .await?;
+            ensure!(health["ok"] == false, "{health}");
+            let (healthy, stderr) = healthcheck(ports).await?;
+            ensure!(
+                !healthy,
+                "a frontend writing to the other node's database passed its healthcheck"
+            );
+            ensure!(stderr.contains("writer_path"), "{stderr}");
+            Ok(())
+        })
+        .await
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_writer_frontend_listens_from_startup_and_its_endpoint_answers_ready() -> Result<()>
 {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -424,6 +503,11 @@ async fn a_single_writer_frontend_listens_from_startup_and_its_endpoint_answers_
         .await?;
         ensure!(health.get("dual_writer").is_none(), "{health}");
         ensure!(health["admission"]["state"] == "admitting", "{health}");
+        let (healthy, stderr) = healthcheck(ports).await?;
+        ensure!(
+            healthy,
+            "a ready single writer failed its healthcheck: {stderr}"
+        );
         let metrics = format!("http://127.0.0.1:{}/metrics", ports.audit);
         let (_, body) = get(client, &metrics, None).await?;
         ensure!(sample(&body, "qbit_prism_admission_admitting") == Some(1.));
@@ -514,6 +598,15 @@ async fn a_rebuild_inside_the_grace_keeps_the_endpoint_ready_and_a_longer_one_wi
                 let (_, body) = get(client, &healthz, None).await?;
                 let health: Value = serde_json::from_str(&body)?;
                 dipped = health["ok"] == false && health["admission"]["state"] == "grace";
+                if dipped {
+                    // A single writer's healthcheck is 3.0's readiness rule:
+                    // the grace that keeps /readyz at 200 never passes it.
+                    let (healthy, stderr) = healthcheck(ports).await?;
+                    ensure!(
+                        !healthy && stderr.contains("PRISM is unhealthy (HTTP 503"),
+                        "a single writer inside the grace: healthy {healthy}, {stderr}"
+                    );
+                }
             }
             ensure!(
                 bumped.elapsed() < DEADLINE,

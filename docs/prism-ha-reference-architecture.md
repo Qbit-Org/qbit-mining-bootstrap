@@ -558,9 +558,15 @@ needed for these probes:
   `status` and `snapshot_age_seconds`.
 - Local equivalent: `qbit-prism-server healthcheck` exits 0 only for success.
   `--url http://.../healthz` selects a remote HTTP target; its internal HTTP timeout
-  is 3 seconds. Do not pass `--public-api` for mining routing.
+  is 3 seconds. Do not pass `--public-api` for mining routing. A 3.1
+  dual-writer frontend's healthcheck is liveness instead, which also passes
+  while the frontend catches up on its own log or rides out a dip inside its
+  admission grace: route a dual-writer pair on its readiness endpoint, never on
+  this ([the container healthcheck](prism-dual-writer-readiness.md#the-container-healthcheck-dual-mode)).
 - When the audit listener is disabled (`PRISM_AUDIT_PORT=0`), the subcommand uses
-  Stratum instead: send `{"id":1,"method":"mining.get_health","params":[]}\n` to
+  Stratum instead (a single writer only; in dual-writer mode it fails, since
+  gated listeners refuse connections while the frontend does not admit miners):
+  send `{"id":1,"method":"mining.get_health","params":[]}\n` to
   that frontend's enabled listener, without subscribe/authorize. Require one
   newline-terminated JSON frame at most 4096 bytes, matching `id=1`, null `error`
   and `result.ready=true`, within 3 seconds. HTTP is preferred for the shipped

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub mod admission;
 pub mod dual_writer;
 pub mod endpoint;
+pub mod liveness;
 
 /// The same check without a registry, for callers that own no metrics.
 pub async fn chain_info(rpc: &Rpc, chain: &str, min_peers: u64) -> Result<Value> {

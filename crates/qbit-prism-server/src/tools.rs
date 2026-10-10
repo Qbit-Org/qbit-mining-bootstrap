@@ -552,7 +552,9 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             );
             Ok(())
         }
-        Command::Healthcheck { url, public_api } => healthcheck(url, public_api).await,
+        Command::Healthcheck { url, public_api } => {
+            healthcheck(url, public_api, HealthRule::Container).await
+        }
         Command::SelfCheck => self_check().await,
         Command::PolicyTransition { .. } => {
             let (current, target) =
@@ -2042,7 +2044,18 @@ fn diagnostic_host(bind: &str) -> String {
     config::authority_host(host)
 }
 
-async fn healthcheck(url: Option<String>, public_api: bool) -> Result<()> {
+/// What a healthcheck requires of the frontend it probes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HealthRule {
+    /// The healthcheck subcommand, which container healthchecks run:
+    /// readiness for a single writer as in 3.0, liveness for a dual-writer
+    /// frontend (`readiness::liveness`).
+    Container,
+    /// `self-check`: readiness in either mode.
+    Readiness,
+}
+
+async fn healthcheck(url: Option<String>, public_api: bool, rule: HealthRule) -> Result<()> {
     let (bind_name, port_name, default_port) = if public_api {
         ("PRISM_PUBLIC_API_BIND", "PRISM_PUBLIC_API_PORT", 3342u16)
     } else {
@@ -2050,6 +2063,15 @@ async fn healthcheck(url: Option<String>, public_api: bool) -> Result<()> {
     };
     let port = config::number(port_name, default_port)?;
     if url.is_none() && port == 0 && !public_api {
+        // A dual-writer frontend's Stratum listeners refuse every connection
+        // while it does not admit miners, catching up included, so they
+        // cannot tell a live frontend from a dead one.
+        ensure!(
+            rule == HealthRule::Readiness || !config::flag("PRISM_DUAL_WRITER", false)?,
+            "a dual-writer frontend's healthcheck reads /healthz on the operator listener: set \
+             PRISM_AUDIT_PORT (its Stratum listeners refuse connections while it does not admit \
+             miners)"
+        );
         return stratum_healthcheck().await;
     }
     let host = diagnostic_host(&config::value(bind_name, "127.0.0.1"));
@@ -2066,14 +2088,22 @@ async fn healthcheck(url: Option<String>, public_api: bool) -> Result<()> {
         }
     }
     let response = request.send().await?;
-    ensure!(
-        response.status().is_success(),
-        "PRISM is unhealthy (HTTP {})",
-        response.status()
-    );
-    let value: Value = response.json().await?;
-    ensure!(value["ok"] == true, "PRISM health is not ready");
-    Ok(())
+    let status = response.status();
+    // Read whole, so a dual-writer body can be told from a single writer's.
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        // As in 3.0, an unsuccessful status is the error, not the unread body.
+        Err(error) => {
+            ensure!(status.is_success(), "PRISM is unhealthy (HTTP {status})");
+            return Err(error.into());
+        }
+    };
+    match rule {
+        HealthRule::Container => crate::readiness::liveness::container_health(status, &body),
+        HealthRule::Readiness => {
+            crate::readiness::liveness::readiness(status, serde_json::from_slice(&body))
+        }
+    }
 }
 
 async fn stratum_healthcheck() -> Result<()> {
@@ -2369,7 +2399,7 @@ async fn self_check_local(config: Config, report: &mut SelfCheckReport) -> Resul
         report.offer_standby = Some(standby);
         usable?;
     }
-    healthcheck(None, false).await?;
+    healthcheck(None, false, HealthRule::Readiness).await?;
     let stratum = crate::stratum::StratumConfig::from_env()?;
     if let Some(highdiff) = stratum.highdiff_config()? {
         let recent: Option<String> = sqlx::query_scalar(
