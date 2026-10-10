@@ -22,6 +22,7 @@ what the workflows run. The manifest names lanes by trigger (`pr`, `nightly`,
 | L4 real-node scenarios | `live-nightly` variants and the Sunday `live-weekly` job | `nightly` (and weekly, below) | running; the 2,000-wallet case **not yet** (#604, #622) |
 | L5 soak and chaos | the Saturday soak (#575) is not L5 | `weekly` | **not yet running** (#556) |
 | L6 shipped images | `prism-load-nightly.yml`'s `shipped-images` job | `L6` | running |
+| 3.1 dual writer | `ci.yml`'s `prism-dual-writer` job (fast lane); `prism-load-nightly.yml`'s `dual-writer-nightly` job (full matrix) | `pr`, `nightly` | running; the fast lane is required |
 
 A GitHub schedule runs only from the default branch's copy of a workflow, and
 only a workflow whose file is on that branch can be dispatched. So each change
@@ -452,6 +453,52 @@ waits for `listwallets` to show the wallet instead of failing (#637).
 `createwallet` plus that wait is bounded at 300 s. The report's `wallet`
 records which way the wallet arrived and how long it took.
 
+## The 3.1 dual-writer scenarios
+
+**Runs:** `crates/qbit-prism-dual-sim` simulates the pair on one runner: two
+PostgreSQL 16 clusters, one regtest `qbitd` per node and one for the
+network, two frontends, a balancer stand-in that routes Stratum sessions by
+each node's readiness, Stratum load through it, and a fault injector. Each
+scenario of the 3.1 contract's matrix (§5) injects its fault and then runs
+the invariant checker (§4) over both databases, the chain and every share the
+miners saw acknowledged. The scenarios are `#[ignore]` gated tests, never run
+by the native shards:
+
+- **Fast lane:** `ci.yml`'s `prism-dual-writer` job runs the ids in
+  [test/prism-dual-writer-gated-tests.txt](../test/prism-dual-writer-gated-tests.txt)
+  on every PR and push, on an 8 vCPU runner, and is part of the required
+  roll-up.
+- **Full matrix:** `prism-load-nightly.yml`'s `dual-writer-nightly` job runs
+  [test/prism-dual-writer-nightly-gated-tests.txt](../test/prism-dual-writer-nightly-gated-tests.txt)
+  (a superset) nightly, on dispatch with `dual_writer=true`, and on a PR when
+  the `run-dual-writer-e2e` label is applied (against the PR's merge result;
+  a later push needs the label again). Its trend row is an L4 job row.
+
+Both prove execution with `scripts/check_gate_manifest.py`, and upload every
+scenario's `report.md`, `report.json`, `invariants.json`, `shares.jsonl`, the
+audit bundles it verified and every process's log (`prism-dual-writer` and
+`prism-dual-writer-nightly` artifacts). Both write the matrix table
+(`scripts/dual_writer_matrix_summary.py`) to their summary, followed by every
+scenario of their lane that does not run yet (`runs = false` in the manifest,
+waiting on the 3.1 stack's code), each also raised as a warning annotation.
+
+**Proves:** each scenario's own expectations (the miner-visible gap after a
+fault, which node took the miners, catch-up, the documented tail of a dead
+node) and the payout invariants: no block raises an account's debt except a
+recorded #478 race, the non-owner's blocks are carry-free, every pool block on
+the chain is landed on both nodes, audited by `qbit-prism-audit-verify`
+against its coinbase and identical on both, every acknowledged share is on
+both nodes, nothing is credited twice, and every window is unchanged and
+reproducible on both nodes. A negative control (`checker-control`) proves the
+checker fails when it must.
+
+**Does not prove:** rates or latencies at production scale (debug builds, 29
+sessions at 20 shares/s), or the deployed Hashbalancer itself (the stand-in
+follows its configuration; D4's CI lab tests the real one).
+
+To reproduce a scenario locally, see the crate's
+[README](../crates/qbit-prism-dual-sim/README.md).
+
 ## Dispatching a run
 
 Dispatch runs the default branch's copy of the workflow. `ref` picks the
@@ -473,14 +520,16 @@ The inputs are:
 - `ref`;
 - `tip_last_notify_p99_budget_ms` and `max_shortfall`: empty keeps each
   preset's own budget;
-- `live`, `weekly`, `fuzz`, `images` and `bridging`: add those jobs.
+- `live`, `weekly`, `fuzz`, `images`, `bridging` and `dual_writer`: add those
+  jobs.
 
 A one-off configuration is a checked-in preset on a branch, dispatched with
 that branch as `ref`. The harness refuses a flag the preset pins if it is given
 again, so a result always matches a reviewed file.
 
-To run the nightly set against a PR, apply the `run-load` label. A later push
-needs the label applied again. The runner probe is dispatched the same way
+To run the nightly set against a PR, apply the `run-load` label; to run the
+dual-writer matrix, apply `run-dual-writer-e2e`. A later push needs the label
+applied again. The runner probe is dispatched the same way
 (`gh workflow run prism-load-runner-probe.yml -f classes=8,16`).
 
 The production-window matrix is dispatched from its own workflow, once the

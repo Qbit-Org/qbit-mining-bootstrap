@@ -922,3 +922,160 @@ lane_checks = [
   "public-api-lists-found-blocks",
 ]
 notes = "scripts/prism_shipped_image_lane.py; the report, client logs and Compose logs are the `prism-shipped-images` artifact."
+
+# ---------------------------------------------------------------------------
+# PRISM 3.1 dual writer (two independent writers, one carry owner): the
+# scenario matrix of the effort's contract, §5, run by crates/qbit-prism-dual-sim
+# on a simulated pair (two PostgreSQL 16 primaries, two frontends, one qbitd
+# per node and one for the network, a balancer stand-in routing by /healthz,
+# Stratum load through it, a fault injector) and held to the contract's §4
+# payout invariants by its checker. Each test writes report.md,
+# report.json and invariants.json; the fast lane (`pr`) is the
+# prism-dual-writer job of ci.yml, the full matrix the dual-writer-nightly
+# job. A scenario that needs the 3.1 stack's code runs once the stack's
+# branches provide it.
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "dual-writer-checker-control"
+title = "Dual-writer checker control: two unsynced single writers fail exactly the checks they must"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Two single-writer nodes on independent databases with nothing between them, both taking miners and each finding a block: the checker fails invariant 3's landing rows and fanouts, the share-presence check, window reproducibility and the owner's balance view, each naming the other node's block or shares, and passes every other check. A checker that passed this would prove nothing elsewhere."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks"]
+
+[[scenario]]
+id = "dual-writer-s10-single-writer"
+title = "S10: with dual mode off, the 3.0 pair keeps every share and pays exactly through a frontend kill"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "On the 3.0 pair (one writer, B a streaming standby, both frontends writing A's database), under load through the balancer stand-in: a block on each node, A's frontend killed with SIGKILL, the balancer marks A down within 10 s, miners move to B with a first accepted share within 30 s, B finds a block, A returns and miners fail back, A finds a block. Every acknowledged share is in the writer, every pool block on the chain is landed, audited by qbit-prism-audit-verify against the chain's coinbase and paid without raising any account's debt, the standby holds every landing, and no node reports a dual-writer mode."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill"]
+
+[[scenario]]
+id = "dual-writer-s01-steady-state"
+title = "S1: A preferred and B idle; A's shares and blocks reach B within the sync interval"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Every miner on A; A's shares appear on B within 2 s (p95), its blocks are landed and confirmed on both nodes, every window recomputes to its digest on both nodes, and both nodes report their dual-writer identity."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s01_steady_state_copies_a_shares_and_blocks_to_b_within_the_sync_interval"]
+
+[[scenario]]
+id = "dual-writer-s02-a-dies"
+title = "S2: A dies (kill -9, PostgreSQL kill, freeze, network drop); miners move to B, which mines carry-free"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Miners reach B within the failover bound; B finds blocks whose priors are empty and whose deltas are non-negative; A's unsynced tail is measured; when A returns it ingests and confirms B's blocks and its next block pays down the carry they accrued (its priors equal the chain's sums); every acknowledged share ends on both nodes; invariants 1 to 4 hold. With A's PostgreSQL killed, A's frontend stops answering ready within 12 s and stays withdrawn until the heal (sampled every 200 ms from before the kill), and the balancer marks it down within 12 s and never marks it up again while its database is dead. The freeze variant holds A frozen for at least 60 s while B keeps landing blocks and builds work on each before A thaws. The PR lane runs the kill -9 variant."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s02_a_frontend_killed_miners_move_to_b_which_mines_carry_free_and_a_pays_down_on_return", "qbit-prism-dual-sim::scenarios::s02_a_postgres_killed_miners_move_to_b_and_a_recovers_its_tail_on_return", "qbit-prism-dual-sim::scenarios::s02_a_frozen_miners_move_to_b_and_a_resumes_without_double_pay", "qbit-prism-dual-sim::scenarios::s02_a_network_dropped_miners_move_to_b_and_a_merges_on_heal"]
+
+[[scenario]]
+id = "dual-writer-s02-a-frozen-during-pulls"
+title = "S2, frozen mid-pull: A's frontend frozen 20 times while its puller works on B's database; B never stalls"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, new-tip rounds aimed first at a moment its puller holds D1's sync barrier on B's database, else at one it has a query or a transaction open there. During each of 16 freezes a new tip arrives and B records jobs on it within 15 s; during every fifth, B instead lands a block solved on work handed out before the freeze and builds work on it. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s02_a_frozen_again_and_again_mid_pull_never_stalls_b"]
+
+[[scenario]]
+id = "dual-writer-s02-a-puller-dies-mid-read"
+title = "S2, A's puller dies mid-read unseen by B: no snapshot left on B, and B's share appends stay flat"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Both nodes take miners at 250 offered shares/s. Sampled every 10 ms for 20 s, B never shows A's peer backend idle in transaction (no pull holds a transaction across a round trip). A's database link discards (B's replies drain and no close reaches it, as when A's host dies), and A's frontend is killed while its puller has a transaction open on B: A's backends on B hold no snapshot, transaction or lock beyond 10 s; every miner session has shares accepted on B 45 to 60 s after the death, and the p95 answer latency of B's shares 45 to 60 s after the death is at most twice that 5 to 20 s after A was marked down, plus 50 ms. A then restarts and catches up; invariants 1 to 4 hold."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s02_a_puller_dying_mid_read_leaves_b_no_snapshot_and_flat_appends"]
+
+[[scenario]]
+id = "dual-writer-s04-transient-apply-failure"
+title = "S4, a transient failure while A applies B's block: retried until the block lands on A, never skipped"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "A holds EXCLUSIVE on its audit bundles, so landing inserts fail at A's 5 s lock_timeout while reads go on. B lands a block, and the lock is held 12 s more: at least one of A's applies is seen waiting on the lock, and the block is not on A meanwhile. Once the lock clears, the block lands and confirms on A within the catch-up bound, and A records no sync conflict for it (D-10 skips only a block whose held facts differ). Invariants 1 to 4 hold."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s04_a_transient_failure_applying_bs_block_is_retried_until_it_lands"]
+
+[[scenario]]
+id = "dual-writer-s06-a-restarts-peer-unreadable"
+title = "S6, A restarts while B answers but cannot be read: A serves on its own D-17 evidence"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "B's PostgreSQL accepts the peer role, but every read of its share ledger hangs (an ACCESS EXCLUSIVE lock held on B) or fails (the peer role's SELECT revoked); a probe as the peer role shows it. A's frontend is restarted with its database untouched: it reports ready within 120 s and takes miners within 60 s of that (D-8, D-17). B is then made readable again and the pair catches up; invariants 1 to 4 hold."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s06_a_restarts_and_serves_while_b_answers_but_its_ledger_is_locked", "qbit-prism-dual-sim::scenarios::s06_a_restarts_and_serves_while_b_answers_but_refuses_its_reads"]
+
+[[scenario]]
+id = "dual-writer-s03-b-dies"
+title = "S3: B dies; A is unaffected and B catches up when it returns"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "A's miners see no gap above 2 s across B's death, A keeps mining, and B, back, holds A's blocks and shares; invariants hold."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s03_b_dies_a_is_unaffected_and_b_catches_up_on_return"]
+
+[[scenario]]
+id = "dual-writer-s04-link-cut"
+title = "S4: the link between the databases cut with both nodes alive"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "No mining impact at the cut or the heal (no gap above 2 s); a block A finds during the cut is absent from B until the heal, then landed on both; the sync catches up within 60 s; nothing is paid twice."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s04_link_cut_with_both_alive_costs_no_mining_and_sync_catches_up_on_heal"]
+
+[[scenario]]
+id = "dual-writer-s05-both-write"
+title = "S5: both nodes take miners and write at once"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "With a misrouting balancer both nodes accept shares and find interleaved blocks; every block lands on both nodes, B's are carry-free, no share or carry is credited or paid twice, and windows match on both nodes."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s05_both_nodes_writing_at_once_keep_every_invariant_and_b_stays_carry_free"]
+
+[[scenario]]
+id = "dual-writer-s06-restore"
+title = "S6: a node restored from an older base backup pulls its own missing rows back before it is ready"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Restored to a backup older than its last block, the node reports not ready until it holds every row of its own that its peer holds; no row is lost or duplicated, its sequences continue above what it recovered, and invariants hold. Run for each node."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s06_a_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_ready", "qbit-prism-dual-sim::scenarios::s06_b_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_ready"]
+
+[[scenario]]
+id = "dual-writer-s07-disk-replaced"
+title = "S7: a node's disk replaced and rebuilt from its peer"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "The node is rebuilt from its peer and re-personalised; only its own unsynced tail at the moment it died is lost, measured and reported; every other acknowledged share and every pool block's landing rows are on both nodes."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s07_b_disk_replaced_is_rebuilt_from_its_peer_and_loses_only_its_unsynced_tail", "qbit-prism-dual-sim::scenarios::s07_a_disk_replaced_is_rebuilt_from_its_peer_and_loses_only_its_unsynced_tail"]
+
+[[scenario]]
+id = "dual-writer-s08-block-at-death"
+title = "S8: a block found at the instant its node dies"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "A dies at the instant it finds a block. Lost (its submitblock held): the block never reaches the chain and is never paid; A may keep its candidate for reconciliation, never offering it again. Accepted (the node took it, A never heard), with the D-19 wait on and off: once the block is 60 blocks deep the survivor adopts it (required with the wait, measured without), A lands it or skips it on return, each node holds one landing, and nothing is paid twice."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s08_a_block_lost_with_its_dying_node_is_never_paid", "qbit-prism-dual-sim::scenarios::s08_a_block_accepted_as_its_node_dies_is_adopted_by_the_survivor_and_landed_once", "qbit-prism-dual-sim::scenarios::s08_without_the_peer_ingest_wait_a_block_accepted_as_its_node_dies_is_landed_once"]
+
+[[scenario]]
+id = "dual-writer-s09-migration"
+title = "S9: a 3.0 single-writer ledger with history, carry and blocks cut over to dual mode"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Balances, the integrity and divergence reports, every table's content digests and every audit are unchanged by the cutover on both nodes; every pre-cutover row is node 0; the first owner job's priors equal the pre-cutover balances; both nodes then mine in dual mode with every invariant holding."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s09_a_3_0_ledger_cut_over_to_dual_mode_keeps_its_balances_and_audits"]
+
+[[scenario]]
+id = "dual-writer-s11-carry-owner-transfer"
+title = "S11: the carry-owner transfer drill"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "The guarded transfer is refused while an own block on the active chain lacks local landing rows, and succeeds once it is resolved; exactly one owner remains."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s11_carry_owner_transfer_is_refused_while_an_own_block_is_unknown_then_succeeds"]

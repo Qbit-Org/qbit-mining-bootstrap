@@ -25,6 +25,8 @@ COMPONENT = "qbit-prism-server::ledger_postgres::alpha"
 NIGHTLY = "qbit-prism-server::live_regtest::node_outage_tests::reindex"
 WEEKLY = "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_soak"
 UNIT = "crates/qbit-prism-server/tests/stratum_protocol.rs::oversized_frames_close"
+DUAL_FAST = "qbit-prism-dual-sim::scenarios::s04_link_cut"
+DUAL_NIGHTLY = "qbit-prism-dual-sim::scenarios::s07_disk_replaced"
 
 LANES = """
 schema = "qbit.e2e-scenarios.v1"
@@ -99,6 +101,24 @@ runs = true
 tests = ["{WEEKLY}"]
 
 [[scenario]]
+id = "dual-link-cut"
+title = "Dual-writer link cut"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Catches up."
+runs = true
+tests = ["{DUAL_FAST}"]
+
+[[scenario]]
+id = "dual-disk-replaced"
+title = "Dual-writer disk replaced"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Loses only the tail."
+runs = true
+tests = ["{DUAL_NIGHTLY}"]
+
+[[scenario]]
 id = "d1"
 title = "D1"
 owner = "#521"
@@ -161,6 +181,7 @@ WORKFLOW = (
     'on:\n  schedule:\n    - cron: x\n    - cron: "43 3 * * 0"\n    - cron: "41 5 * * 6"\n'
     "  pull_request:\n  workflow_dispatch:\n"
     "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n"
+    "--expected test/prism-dual-writer-nightly-gated-tests.txt\n"
     "SELECTION: ${{ inputs.preset || (github.event.schedule == '41 5 * * 6' && 'weekly') }}\n"
     "--expected test/prism-weekly-gated-tests.txt\n"
     "scripts/prism_shipped_image_lane.py run\n"
@@ -175,6 +196,11 @@ class Fixture:
         self.write("test/prism-gated-tests.txt", "\n".join(sorted([LIVE, SMOKE, COMPONENT])) + "\n")
         self.write("test/prism-nightly-gated-tests.txt", f"# opt-in\n{NIGHTLY}\n")
         self.write("test/prism-weekly-gated-tests.txt", f"# opt-in weekly\n{WEEKLY}\n")
+        self.write("test/prism-dual-writer-gated-tests.txt", f"# fast lane\n{DUAL_FAST}\n")
+        self.write(
+            "test/prism-dual-writer-nightly-gated-tests.txt",
+            "# nightly matrix\n" + "\n".join(sorted([DUAL_FAST, DUAL_NIGHTLY])) + "\n",
+        )
         for name, schedule in (("d1-20k", "nightly"), ("d1-500k", "manual"), ("smoke", "smoke")):
             self.write(
                 f"crates/qbit-prism-load/presets/{name}.json",
@@ -183,7 +209,8 @@ class Fixture:
         self.write("crates/qbit-prism-server/tests/stratum_protocol.rs", RUST)
         self.write(
             ".github/workflows/ci.yml",
-            "run: python3 scripts/run_rust_test_shard.py\n--expected test/prism-gated-tests.txt\n",
+            "run: python3 scripts/run_rust_test_shard.py\n--expected test/prism-gated-tests.txt\n"
+            "--expected test/prism-dual-writer-gated-tests.txt\n",
         )
         self.write(
             ".github/workflows/prism-load-nightly.yml",
@@ -348,6 +375,51 @@ class CheckE2eScenarios(unittest.TestCase):
                 )
                 self.assertProblem(f"lane weekly: .github/workflows/prism-load-nightly.yml no longer contains {needle!r}")
 
+    def test_dual_writer_scenarios_run_in_the_lanes_of_their_lists_and_each_needs_a_scenario(
+        self,
+    ) -> None:
+        self.assertEqual(self.fixture.problems(), [])
+        self.replace(
+            'lanes = ["nightly", "pr"]\ncriteria = "Catches up."',
+            'lanes = ["nightly"]\ncriteria = "Catches up."',
+        )
+        self.assertProblem("scenario dual-link-cut: its evidence runs in 'pr'; add it to lanes")
+        added = "qbit-prism-dual-sim::scenarios::s09_migration"
+        self.fixture.write(
+            "test/prism-dual-writer-nightly-gated-tests.txt",
+            "\n".join(sorted([DUAL_FAST, DUAL_NIGHTLY, added])) + "\n",
+        )
+        self.assertProblem(f"nightly runs {added}, which no running scenario names")
+
+    def test_the_dual_writer_fast_lane_runs_only_what_the_nightly_matrix_runs(self) -> None:
+        self.fixture.write("test/prism-dual-writer-nightly-gated-tests.txt", f"{DUAL_NIGHTLY}\n")
+        self.assertProblem(
+            f"the dual-writer fast lane runs {DUAL_FAST}, which the nightly matrix"
+        )
+
+    def test_the_dual_writer_lanes_need_their_jobs_wired(self) -> None:
+        self.fixture.write(
+            ".github/workflows/ci.yml",
+            "run: python3 scripts/run_rust_test_shard.py\n--expected test/prism-gated-tests.txt\n",
+        )
+        self.assertProblem(
+            "lane pr: .github/workflows/ci.yml no longer contains "
+            "'--expected test/prism-dual-writer-gated-tests.txt'"
+        )
+        self.fixture.write(
+            ".github/workflows/prism-load-nightly.yml",
+            WORKFLOW.replace("--expected test/prism-dual-writer-nightly-gated-tests.txt\n", ""),
+        )
+        self.assertProblem(
+            "lane nightly: .github/workflows/prism-load-nightly.yml no longer contains "
+            "'--expected test/prism-dual-writer-nightly-gated-tests.txt'"
+        )
+
+    def test_a_missing_dual_writer_list_is_refused(self) -> None:
+        (self.fixture.root / "test/prism-dual-writer-gated-tests.txt").unlink()
+        with self.assertRaises(scenarios.ManifestError):
+            scenarios.Lanes(self.fixture.root)
+
     def test_l6_checks_run_in_l6_and_each_needs_a_scenario(self) -> None:
         self.fixture.write("scripts/prism_shipped_image_lane.py", 'CHECKS = ("found-block", "resume", "new")\n')
         self.assertProblem("L6 runs check new, which no running scenario names")
@@ -363,7 +435,8 @@ class CheckE2eScenarios(unittest.TestCase):
         self.fixture.write(
             ".github/workflows/prism-load-nightly.yml",
             "on:\n  schedule:\n    - cron: x\n  workflow_dispatch:\n"
-            "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n",
+            "scripts/prism_load_matrix.py\n--expected test/prism-nightly-gated-tests.txt\n"
+    "--expected test/prism-dual-writer-nightly-gated-tests.txt\n",
         )
         self.assertProblem("no longer contains 'cron: \"43 3 * * 0\"'")
         self.assertProblem("no longer contains 'pull_request:'")

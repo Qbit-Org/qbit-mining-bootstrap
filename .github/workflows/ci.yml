@@ -286,7 +286,7 @@ jobs:
     # Preserve the existing check name for branch protection and consumers.
     name: Lint, compile, and test
     if: ${{ always() }}
-    needs: [lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-native-postgres, prism-integration-proof]
+    needs: [lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-dual-writer, prism-native-postgres, prism-integration-proof]
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -344,6 +344,85 @@ jobs:
 
       - name: Build patched ckpool and run live regression and load tests
         run: make test-ckpool-rejects-observability
+
+  # The 3.1 dual-writer fast lane (crates/qbit-prism-dual-sim, the effort's
+  # contract §5): each scenario runs a whole simulated pair (two PostgreSQL 16
+  # clusters, three regtest qbitds, two frontends, a balancer stand-in and
+  # Stratum load), injects its fault and holds both databases, the chain and
+  # every acknowledged share to the payout invariants. The ids are
+  # test/prism-dual-writer-gated-tests.txt, run once with --ignored --exact,
+  # one at a time, and proven executed like the native shards' list. The
+  # reports (report.md, invariants.json), the share log and every process's
+  # log are the prism-dual-writer artifact, uploaded pass or fail. An 8 vCPU
+  # runner, because the failover bounds measure the pair, not two starved
+  # cores; about 4 minutes of build and 2 minutes per scenario.
+  prism-dual-writer:
+    name: Rust PRISM dual-writer scenarios (fast lane)
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    env:
+      PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      PRISM_TEST_REQUIRE_INTEGRATION: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Name the gate manifest and the test log
+        run: |
+          printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-dual-writer-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'PRISM_TEST_LOG=%s/prism-dual-writer-tests.log\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      # The native shards save this cache; this job only reads it, and the
+      # install script verifies the digest of whatever it uses.
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Run the listed scenarios
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-dual-writer-gated-tests.txt \
+            | grep -v '^$' | sed 's/^qbit-prism-dual-sim::scenarios:://')
+          cargo test --locked -p qbit-prism-dual-sim --test scenarios -- \
+            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+      - name: Prove every listed scenario executed
+        run: |
+          python3 scripts/check_gate_manifest.py \
+            --manifest "${PRISM_TEST_GATE_MANIFEST}" \
+            --expected test/prism-dual-writer-gated-tests.txt \
+            --log "${PRISM_TEST_LOG}"
+      # Lists every fast-lane scenario the branch cannot run yet (planned in
+      # test/e2e-scenarios.toml with runs = false) in the summary and as a
+      # warning, so a partial lane never reads as the whole one.
+      - name: Summarise the fast lane
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/dual_writer_matrix_summary.py target/dual-sim-reports \
+            --manifest test/e2e-scenarios.toml --lane pr \
+            --out target/dual-sim-reports/matrix.md
+          cat target/dual-sim-reports/matrix.md >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the scenario reports, logs and gate manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-dual-writer
+          overwrite: true
+          retention-days: 30
+          path: |
+            ${{ env.PRISM_TEST_GATE_MANIFEST }}
+            ${{ env.PRISM_TEST_LOG }}
+            target/dual-sim-reports
+          if-no-files-found: error
 
   prism-native-postgres:
     name: Rust PRISM PostgreSQL and multi-instance contracts (shard ${{ matrix.shard }})
