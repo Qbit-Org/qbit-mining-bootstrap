@@ -2424,8 +2424,9 @@ async fn restart_beside_unreadable_peer(sim: &mut Sim, body: &mut Body) -> Resul
 /// every read of its share ledger hangs (`Locked`) or fails (`Refused`); a
 /// probe as the peer role shows it. A's frontend is restarted with its
 /// database untouched, so its D-17 evidence matches: D-8 makes the latch
-/// true without the peer, and A must report ready and take miners within
-/// `UNREADABLE_READY_BOUND`. Then B is made readable again (and restarted if
+/// true without the peer, and A must report ready within
+/// `UNREADABLE_READY_BOUND` and take miners within 60 s of that. Then B is
+/// made readable again (and restarted if
 /// its frontend gave up), and the pair catches up.
 async fn s06_peer_unreadable(sim: &mut Sim, how: Unreadable, body: &mut Body) -> Result<()> {
     sim.load()?.resume();
@@ -2846,8 +2847,8 @@ async fn prepared_on_parent(sim: &Sim, parent: &str) -> String {
 /// `submitblock` held at the gate in front of its `qbitd`:
 ///
 /// - [`DeathAtFind::Lost`]: the call never reaches the node. The block never
-///   reaches the chain; whatever A's restart does with its candidate, it is
-///   never paid twice.
+///   reaches the chain and is never offered again (A keeps its candidate for
+///   reconciliation), nor paid.
 /// - [`DeathAtFind::Accepted`]: the node accepts the block and A dies before
 ///   it hears. B adopts the block from A's synced prepared record (D-10,
 ///   D-11, with D-19's wait on, or measured with it off); when A returns with
@@ -2975,6 +2976,18 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
     body.gaps.push(report::gap(&records, fault_at));
     steady(sim, 3).await;
     sim.settle(SETTLE_BOUND).await?;
+    if case == DeathAtFind::Lost {
+        // The gate stays in front of A's qbitd through A's restart: it saw
+        // the call it held and discarded, and must see no other.
+        let offers = sim.gates[&Node::A].submissions_of(&hash);
+        body.expect(
+            "the lost block is never offered again",
+            offers == 1,
+            format!(
+                "{offers} submitblock calls of {hash} reached A's gate (1: the one held as A died)"
+            ),
+        );
+    }
     expect_dual_health(sim, body).await?;
     Ok(())
 }

@@ -140,6 +140,16 @@ impl RpcGate {
     pub fn submissions(&self) -> usize {
         self.state.arrivals.borrow().len()
     }
+
+    /// How many `submitblock` calls for `block` reached the gate.
+    pub fn submissions_of(&self, block: &str) -> usize {
+        self.state
+            .arrivals
+            .borrow()
+            .iter()
+            .filter(|hash| *hash == block)
+            .count()
+    }
 }
 
 impl Drop for RpcGate {

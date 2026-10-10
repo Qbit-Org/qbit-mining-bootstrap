@@ -231,17 +231,18 @@ What each one does:
 - **S6, unreadable peer** (D1 engine review, P1 1): B accepts the peer role
   but every read of its share ledger hangs (an ACCESS EXCLUSIVE lock) or fails
   (SELECT revoked). A is restarted with its database untouched and must report
-  ready and take miners within 120 s (D-8, D-17); then B is healed and the
-  pair catches up.
+  ready within 120 s and take miners within 60 s of that (D-8, D-17); then B
+  is healed and the pair catches up.
 - **S7:** the node's host dies, its disk is wiped and rebuilt as a promoted
   physical copy of the peer, re-personalised (D-16); only its measured tail is
   excused.
 - **S8:** A dies at the instant it finds a block: with the `submitblock` held
-  (the block never reaches the chain, and A may keep its candidate for
-  reconciliation, never offering it again) or answered by the node and withheld
-  (60 external blocks are then minted on top of it, the depth D3 waits for
-  before adopting; B adopts it, and once A returns each node holds one landing
-  of it), with D-19's wait on and off.
+  (the block never reaches the chain; A may keep its candidate for
+  reconciliation, and its gate must see the block offered no second time) or
+  answered by the node and withheld (60 external blocks are then minted on top
+  of it, the depth D3 waits for before adopting; B must adopt it with D-19's
+  wait on, and its adoption is measured with the wait off; once A returns each
+  node holds one landing of it).
 - **S9:** the 3.0 pair mines a history, is cut over live (drain, with no
   candidate left that could still be offered, promote B, migrate, identity,
   B then A in dual mode); both ledgers equal the 3.0
