@@ -641,23 +641,28 @@ fn dead_url(url: &str) -> Result<String> {
 /// Rows held under an identity with other content are recorded as
 /// conflicts and kept out, and the stream moves past them: a share whose
 /// header this node credits to another share, a block held with other
-/// landing facts. A block held with the same facts (an adoption, S8) is
-/// skipped whole, its children never added twice (D-10).
+/// landing facts. A share that breaks two rules is one conflict. A block
+/// held with the same facts (an adoption, S8) is skipped whole, its
+/// children never added twice (D-10).
 #[tokio::test]
 async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
         return Ok(());
     };
     pair(&raw, async |pair| {
-        // B already credits A's next share's header to another share id.
+        // B already credits A's next share's header to another share id, and
+        // the share after it, under its own share_seq, to another header.
         let header = hex("contested");
-        let theirs = append(&pair.a, &["contested", "after"]).await?;
+        let doubled = share("doubled").share_id;
+        let theirs = append(&pair.a, &["contested", "after", "doubled"]).await?;
         let mut tx = pair.b.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(ORDER_LOCK).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) VALUES($1,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(0.001),1,clock_timestamp(),'node-b',0)")
-            .bind(format!("other:{header}")).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,$2)")
-            .bind(&header).bind(format!("other:{header}")).execute(&mut *tx).await?;
+        for (share_id, header) in [(format!("other:{header}"), header.clone()), (doubled.clone(), hex("other doubled header"))] {
+            sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) VALUES($1,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(0.001),1,clock_timestamp(),'node-b',0)")
+                .bind(&share_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id) VALUES($1,$2)")
+                .bind(&header).bind(&share_id).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         // B holds one of A's blocks with other facts, and another adopted with the same.
         let conflicting = land(&pair.a, "conflicting", 300).await?;
@@ -693,19 +698,27 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         )
         .fetch_all(&pair.b.pool)
         .await?;
-        ensure!(
-            conflicts
-                == [
-                    ("qbit_pool_blocks".to_owned(), conflicting.clone()),
-                    ("qbit_share_ledger".to_owned(), share("contested").share_id),
-                ],
-            "{conflicts:?}"
-        );
+        let mut expected = vec![
+            ("qbit_pool_blocks".to_owned(), conflicting.clone()),
+            ("qbit_share_ledger".to_owned(), share("contested").share_id),
+            ("qbit_share_ledger".to_owned(), doubled.clone()),
+        ];
+        expected.sort();
+        ensure!(conflicts == expected, "{conflicts:?}");
         let scrape = metrics.render();
         ensure!(scrape.contains("qbit_prism_peer_sync_conflicts_total{table=\"qbit_pool_blocks\"} 1"), "{scrape}");
+        ensure!(scrape.contains("qbit_prism_peer_sync_conflicts_total{table=\"qbit_share_ledger\"} 2"), "{scrape}");
+        // The doubled share broke two rules: one sighting, both reasons.
+        let (seen, detail): (i64, String) = sqlx::query_as(
+            "SELECT seen_count,detail FROM qbit_prism_peer_sync_conflicts WHERE row_key=$1",
+        )
+        .bind(&doubled)
+        .fetch_one(&pair.b.pool)
+        .await?;
+        ensure!(seen == 1 && detail.contains("maps header") && detail.contains("another share_seq"), "{seen} {detail}");
         // Seen again, each conflict is counted, not duplicated.
         on_b.pass().await?;
-        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 2);
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 3);
         Ok(())
     })
     .await
@@ -1874,6 +1887,130 @@ async fn recovery_finds_an_own_block_committed_after_a_later_numbered_one() -> R
         }
         .await;
         backup.close(result).await
+    })
+    .await
+}
+
+/// A node prunes its own prepared jobs at expiry, while the peer may keep
+/// its copy longer. Own-log recovery reads only the unexpired ones, so a job
+/// pruned here is neither missing, which would forget the verification, nor
+/// put back.
+#[tokio::test]
+async fn recovery_leaves_own_prepared_jobs_pruned_at_expiry() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let job = prepare(&pair.a, "pruned").await?;
+        let held = |pool: PgPool| {
+            let job = job.clone();
+            async move {
+                count(
+                    &pool,
+                    &format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{job}'"),
+                )
+                .await
+            }
+        };
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| Ok(held(pair.b.pool.clone()).await? == 1)).await?;
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut on_a, async |report| Ok(report.own_log_caught_up)).await?;
+        // The job expires on both nodes; A prunes it, B keeps its copy.
+        for pool in [&pair.a.pool, &pair.b.pool] {
+            sqlx::query(
+                "UPDATE qbit_prism_jobs SET expires_at=clock_timestamp()-interval '1 minute' WHERE job_id=$1",
+            )
+            .bind(&job)
+            .execute(pool)
+            .await?;
+        }
+        ensure!(pair.a.prune_expired_jobs().await? == 1);
+        ensure!(held(pair.b.pool.clone()).await? == 1);
+        // A restarts while B's journal is locked: recovery reads A's rows the
+        // peer holds, finds none missing, and stops at the journal, leaving
+        // the verification in place.
+        let mut lock = pair.b.pool.begin().await?;
+        sqlx::raw_sql("LOCK TABLE qbit_prism_node_roles IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await?;
+        let (mut restarted, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let cut_short = restarted.pass().await;
+        lock.rollback().await?;
+        ensure!(cut_short.is_err(), "recovery read a locked journal: {cut_short:?}");
+        ensure!(
+            pair.a.node_lineage().await?.and_then(|lineage| lineage.verified).is_some(),
+            "a job pruned here at expiry counted as a missing own row"
+        );
+        // A full recovery leaves it pruned.
+        let (mut recovered, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut recovered, async |report| Ok(report.own_log_caught_up)).await?;
+        ensure!(
+            held(pair.a.pool.clone()).await? == 0,
+            "recovery put back a job pruned at expiry"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Own-log recovery takes back this node's rows however far above its own
+/// sequence they lie, up to the peer's cursor over its shares, which every
+/// own row the peer holds came through. An own row beyond that and the pull
+/// headroom (a damaged peer) is a conflict: the own log has diverged, the
+/// latch stays down, and nothing is raised or attached for it.
+#[tokio::test]
+async fn recovery_refuses_an_own_row_beyond_the_peers_cursor() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        append(&pair.a, &["near"]).await?;
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| Ok(shares_of(&pair.b.pool, 0).await?.len() == 1)).await?;
+        // B holds a row of A's 200 partitions beyond either node's reach.
+        let (rows, covered): (i64, i64) = sqlx::query_as(
+            "SELECT partition_rows,(SELECT max(upper_seq) FROM qbit_prism_share_partitions WHERE state='attached') FROM qbit_prism_share_partitioning",
+        )
+        .fetch_one(&pair.a.pool)
+        .await?;
+        let b_covered = count(
+            &pair.b.pool,
+            "SELECT max(upper_seq) FROM qbit_prism_share_partitions WHERE state='attached'",
+        )
+        .await?;
+        let lower = (covered.max(b_covered) / rows + 200) * rows;
+        let far = lower + 2;
+        let far_id = format!("worker:{}", hex("far beyond"));
+        let mut tx = pair.b.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(ORDER_LOCK).execute(&mut *tx).await?;
+        sqlx::query("SELECT qbit_prism_share_partition_create('qbit_share_ledger_far',$1,$2)")
+            .bind(lower).bind(lower + rows).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch,origin_node) VALUES($1,$2,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(0.001),1,clock_timestamp(),'node-a',0,0)")
+            .bind(far).bind(&far_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO qbit_prism_share_hashes(header_hash,share_id,origin_node) VALUES($1,$2,0)")
+            .bind(hex("far beyond")).bind(&far_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        sqlx::query("SELECT qbit_prism_share_partition_ensure()").execute(&pair.a.pool).await?;
+        let partitions = "SELECT count(*) FROM qbit_prism_share_partitions";
+        let partitions_before = count(&pair.a.pool, partitions).await?;
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let refused = on_a.pass().await;
+        ensure!(
+            refused.as_ref().is_err_and(|error| format!("{error:#}").contains("diverged")),
+            "{refused:?}"
+        );
+        ensure!(!on_a.subscribe().borrow().own_log_caught_up);
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM qbit_prism_peer_sync_conflicts WHERE row_key=$1",
+        )
+        .bind(&far_id)
+        .fetch_one(&pair.a.pool)
+        .await?;
+        ensure!(detail.contains("beyond any key"), "{detail}");
+        ensure!(last_share_seq(&pair.a.pool).await? < lower);
+        ensure!(count(&pair.a.pool, partitions).await? == partitions_before);
+        Ok(())
     })
     .await
 }

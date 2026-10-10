@@ -358,8 +358,9 @@ enum NodeIdentityCommand {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
         index: u8,
         /// Repersonalise a copy whose lineage carries no own-log verification of the peer's, or
-        /// without reading the server behind PRISM_PEER_DATABASE_URL: only once you have made
-        /// sure this is the promoted copy, never the peer's own database.
+        /// without reading the peer's server (PRISM_PEER_DATABASE_URL, then its _FALLBACK) when
+        /// neither path answers: only once you have made sure this is the promoted copy, never
+        /// the peer's own database.
         #[arg(long)]
         unverified_copy: bool,
     },
@@ -810,24 +811,38 @@ async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
                 unverified_copy,
             } => {
                 // The peer's own server, when its URL is set: this database
-                // must not be on it.
-                let peer_server = match config::optional("PRISM_PEER_DATABASE_URL") {
-                    Some(url) => match crate::ledger::server_lineage_evidence(&url).await {
-                        Ok(evidence) => Some(evidence),
-                        Err(error) if unverified_copy => {
-                            tracing::warn!(error = %format!("{error:#}"), "the server behind PRISM_PEER_DATABASE_URL could not be read; going on, --unverified-copy given");
-                            None
+                // must not be on it. Either path to it will do.
+                let mut peer_server = None;
+                let mut unread = None;
+                for name in [
+                    "PRISM_PEER_DATABASE_URL",
+                    "PRISM_PEER_DATABASE_URL_FALLBACK",
+                ] {
+                    let Some(url) = config::optional(name) else {
+                        continue;
+                    };
+                    match crate::ledger::server_lineage_evidence(&url).await {
+                        Ok(evidence) => {
+                            peer_server = Some(evidence);
+                            break;
                         }
-                        Err(error) => {
-                            return Err(error.context(
-                                "reading the server behind PRISM_PEER_DATABASE_URL, which this \
-                                 database must not be on; run again once it answers, or with \
-                                 --unverified-copy",
-                            ))
-                        }
-                    },
-                    None => None,
-                };
+                        Err(error) => unread = Some(error.context(format!("reading {name}"))),
+                    }
+                }
+                match unread {
+                    Some(error) if peer_server.is_none() && unverified_copy => {
+                        tracing::warn!(error = %format!("{error:#}"), "the peer's server could not be read; going on, --unverified-copy given");
+                    }
+                    Some(error) if peer_server.is_none() => {
+                        return Err(error.context(
+                            "the peer's server, which this database must not be on, could not \
+                             be read; run again once it answers. --unverified-copy goes on \
+                             without it, and without the own-log verification check: only once \
+                             you have made sure this database is the promoted copy",
+                        ))
+                    }
+                    _ => {}
+                }
                 let guard = crate::ledger::RepersonaliseGuard {
                     unverified_copy,
                     peer_server,

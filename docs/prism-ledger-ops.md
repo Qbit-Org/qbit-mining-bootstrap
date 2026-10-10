@@ -3881,9 +3881,13 @@ investigate any row in it.
 sync's one readiness input. Until it is set, the Stratum listeners, the
 refresh and the submit loop wait. It is unset at start, and is set once this
 node holds every row it originated that the peer holds. The node pulls back
-any it lacks (its own shares, landings, prepared jobs and journal rows), then
-raises its own sequences and ledger clock above everything the peer has seen
-of it, and records the system identifier and WAL timeline it verified on in
+any it lacks (its own shares, landings, prepared jobs and journal rows).
+Landings and prepared jobs commit out of order, so it reads every one of its
+own the peer holds since the node was personalised: the key of each landing,
+then whole only the landings missing here, and each prepared job whose expiry
+has not passed (it prunes expired ones itself). It then raises its own
+sequences and ledger clock above everything the peer has seen of it, and
+records the system identifier and WAL timeline it verified on in
 `qbit_prism_node_lineage`. If the peer cannot be reached or read at start, the
 latch is set when the database is still on that server, so a plain restart
 or a crash recovery serves. A new identifier or timeline, or no record, is
@@ -3891,9 +3895,9 @@ rollback evidence: the latch stays unset, `qbit_prism_peer_sync_rollback_evidenc
 reads 1, and the node waits for the peer. Once recovery finds an own row
 missing, the node first forgets its last verification, so a recovery cut
 short (a peer that fails partway, a crash) leaves it waiting for the peer
-even after a restore that kept the timeline. If a row of this node's that the
-peer holds differs from the one here, the own log has diverged: the conflict
-is recorded, and the latch stays unset, with or without the peer, until an
+even after a restore that kept the timeline. If an own row that recovery
+reads from the peer differs from the one here, the own log has diverged: the
+conflict is recorded, and the latch stays unset, with or without the peer, until an
 operator decides. Losing the peer later never clears the latch. A change of
 identifier or timeline while the frontend runs, a restore or promotion under
 it, stops the frontend with an `ALERT`, refusing every share until it has
@@ -3907,7 +3911,9 @@ stay unset. Before a found block's
 default) for the peer's cursors to cover its shares through the block's window
 and the prepared record the block was built on: what the peer needs to adopt
 the block if this node dies. The bound covers the node's own read of those
-needs too. The wait keeps one connection open to the peer on each path, tries
+needs too; if that read fails, or the prepared record is no longer held here
+(pruned while the block waited), the block is offered at once, counted
+`unreachable`. The wait keeps one connection open to the peer on each path, tries
 the path that answered last first, and gives each path an even share of the
 time left, so a path that hangs cannot use up the other's. The block is
 offered whatever the wait finds, counted in
@@ -3919,7 +3925,9 @@ the peer's: the sync inserts them later, below shares this node already
 holds. The rollup sweep runs as on a single writer, and a peer share that
 lands below its watermark is folded into the rollups by the pull that
 inserts it, in the same transaction; the two serialise on the rollup progress
-row. So the rollups never wait for the peer. The archive does: `share-archive
+row, which every frontend on a personalised database takes before its sweep,
+`PRISM_DUAL_WRITER` on or not. So the rollups never wait for the peer. The
+archive does: `share-archive
 plan` holds back every partition the safe peer mark has not passed (its
 `rollup_watermark` condition says so), since the peer's rows can still land
 in it. While the peer is down, partitions stop leaving. If the peer will be
@@ -4015,10 +4023,12 @@ refuses, changing nothing:
   own-log recovery forgot it), since nothing then tells the peer's own
   database from a copy, unless `--unverified-copy` says the operator made
   sure this is the promoted copy;
-- when the server behind `PRISM_PEER_DATABASE_URL`, read first, reports this
-  database's system identifier and timeline: the peer's own database again.
-  If that setting is set and its server cannot be read, it refuses too,
-  unless `--unverified-copy` is given;
+- when the peer's server, read first over `PRISM_PEER_DATABASE_URL` or else
+  `PRISM_PEER_DATABASE_URL_FALLBACK`, reports this database's system
+  identifier and timeline: the peer's own database again. If either setting
+  is set and neither path can be read within 10 seconds, it refuses too,
+  unless `--unverified-copy` is given. That flag also lifts the refusal
+  above, so give it only once you have made sure this is the promoted copy;
 - while the schema holds a table that the dual-writer table inventory
   (`crates/qbit-prism-server/src/ledger/table_inventory.rs`) does not
   classify, or lacks one it names.

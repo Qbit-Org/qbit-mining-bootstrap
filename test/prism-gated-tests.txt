@@ -255,6 +255,8 @@ qbit-prism-server::dual_writer_sync::conflicts_are_recorded_and_never_written_ov
 qbit-prism-server::dual_writer_sync::out_of_order_commits_are_never_skipped
 qbit-prism-server::dual_writer_sync::peer_rows_beyond_the_attached_partitions_get_partitions
 qbit-prism-server::dual_writer_sync::recovery_finds_an_own_block_committed_after_a_later_numbered_one
+qbit-prism-server::dual_writer_sync::recovery_leaves_own_prepared_jobs_pruned_at_expiry
+qbit-prism-server::dual_writer_sync::recovery_refuses_an_own_row_beyond_the_peers_cursor
 qbit-prism-server::dual_writer_sync::steady_sync_copies_each_nodes_rows_to_the_other
 qbit-prism-server::dual_writer_sync::the_offer_wait_reads_the_peers_cursors
 qbit-prism-server::dual_writer_sync::the_origin_share_reads_never_walk_the_other_nodes_rows

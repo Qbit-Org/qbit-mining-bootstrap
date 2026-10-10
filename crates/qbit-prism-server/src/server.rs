@@ -86,7 +86,9 @@ pub async fn run(config: Config) -> Result<()> {
     // reported: the frontend runs, but the peer sync refuses to start and the
     // frontend never becomes ready. A single writer refuses a database that
     // has run as a dual-writer node, unless the rollback says so (D-12).
-    match &coordinator.config.dual_writer {
+    // A dual writer, or a single writer on a personalised database, sweeps
+    // the rollups as a dual writer does.
+    let dual_writer_sweep = match &coordinator.config.dual_writer {
         Some(dual) => {
             let node = dual.identity.node;
             match coordinator.ledger.check_node_identity(node).await? {
@@ -122,14 +124,16 @@ pub async fn run(config: Config) -> Result<()> {
                     node.index()
                 ),
             }
+            true
         }
         None => {
             coordinator
                 .ledger
                 .refuse_single_writer_on_dual_ledger(config::dual_writer_downgrade()?)
                 .await?;
+            coordinator.ledger.recorded_node_identity().await?.is_some()
         }
-    }
+    };
     coordinator.landing_trim.set_enabled(landing_trim);
     tracing::info!(
         enabled = landing_trim,
@@ -282,7 +286,11 @@ pub async fn run(config: Config) -> Result<()> {
         config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
-        let settings = if config.dual_writer.is_some() {
+        // On a personalised database a peer sync may insert late shares, its
+        // own frontend's or another one's (a rollback in progress, or a
+        // frontend started without PRISM_DUAL_WRITER beside a dual writer),
+        // so the sweep takes the progress row first, as a dual writer's does.
+        let settings = if dual_writer_sweep {
             settings.for_dual_writer()
         } else {
             settings

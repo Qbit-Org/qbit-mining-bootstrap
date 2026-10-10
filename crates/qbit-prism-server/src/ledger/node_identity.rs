@@ -112,24 +112,24 @@ pub struct PeerSyncCursor {
 }
 
 /// The system identifier and WAL timeline of the server behind `url`, read
-/// in one statement on a connection of its own: the peer's, for
-/// `node-identity repersonalise`, which must not run on it.
+/// in one statement on a connection of its own, all within 10 seconds: the
+/// peer's, for `node-identity repersonalise`, which must not run on it.
 pub async fn server_lineage_evidence(url: &str) -> Result<LineageEvidence> {
     use sqlx::Connection;
-    let mut connection = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        sqlx::PgConnection::connect(url),
-    )
-    .await
-    .context("connecting timed out")??;
-    let (system_identifier, timeline): (i64, i32) = sqlx::query_as(LINEAGE_EVIDENCE_SQL)
-        .fetch_one(&mut connection)
-        .await?;
-    let _ = connection.close().await;
-    Ok(LineageEvidence {
-        system_identifier,
-        timeline,
-    })
+    let read = async {
+        let mut connection = sqlx::PgConnection::connect(url).await?;
+        let (system_identifier, timeline): (i64, i32) = sqlx::query_as(LINEAGE_EVIDENCE_SQL)
+            .fetch_one(&mut connection)
+            .await?;
+        let _ = connection.close().await;
+        anyhow::Ok(LineageEvidence {
+            system_identifier,
+            timeline,
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .context("reading it timed out")?
 }
 
 /// What `node-identity repersonalise` knows beyond the copy it changes.

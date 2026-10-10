@@ -8,9 +8,10 @@ use tokio::sync::watch;
 /// 3.0's sweep, which a 3.1 dual writer runs too.
 const SWEEP: &str = include_str!("rollups.sql");
 
-/// The 3.1 dual writer's sweep takes the progress row first, so its own
-/// statement's snapshot starts after any transaction that holds it: the
-/// peer sync's, which folds the late peer shares it inserts
+/// The sweep on a 3.1 dual-writer database (a dual writer's, or a single
+/// writer's on a personalised database) takes the progress row first, so
+/// its own statement's snapshot starts after any transaction that holds it:
+/// the peer sync's, which folds the late peer shares it inserts
 /// ([`LATE_PEER_SHARES`]). A share that commits after a sweep passed its
 /// `share_seq` is therefore either seen by the next sweep or folded by the
 /// transaction that inserted it, never neither.
@@ -64,7 +65,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The sweep of a 3.1 dual-writer frontend, which takes the progress row
+    /// The sweep on a 3.1 dual-writer database, which takes the progress row
     /// first ([`PROGRESS_LOCK`]).
     pub fn for_dual_writer(self) -> Self {
         Self {

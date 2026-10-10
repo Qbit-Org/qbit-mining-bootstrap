@@ -66,6 +66,8 @@ const PRIMARY_RETRY: Duration = Duration::from_secs(30);
 const IDENTITY_RECHECK: Duration = Duration::from_secs(30);
 /// The most landed blocks one pass applies, each in its own transaction.
 const BLOCKS_PER_PASS: i64 = 20;
+/// The most own block keys one recovery read compares.
+const BLOCK_KEYS_PER_READ: i64 = 1_000;
 /// The most peer rows counted for a lag: one index-only count, well inside
 /// the peer's statement timeout even on a peer far ahead.
 const LAG_COUNT_CAP: i64 = 100_000;
@@ -680,6 +682,9 @@ impl PeerSync {
         let node = self.node;
         let mut applied = Applied::default();
         let mut clock_ms = None;
+        // Every own row the peer holds is at or below its cursor over this
+        // node's shares, which bounds the keys taken back.
+        let own_rows_through = bounded(peer::cursors(connection)).await?.shares;
         loop {
             let (held, ..) = self.ledger.highest_held_of(node).await?;
             let batch = bounded(peer::shares_of(
@@ -696,16 +701,17 @@ impl PeerSync {
             clock_ms = clock_ms.max(batch.highest_accepted_at_ms);
             applied.merge(
                 self.ledger
-                    .apply_share_batch(node, node, &batch, None)
+                    .apply_share_batch(node, node, &batch, None, own_rows_through)
                     .await?,
             );
             ensure_progress(&mut self.own_log_diverged, &applied)?;
         }
         // Landed blocks and prepared jobs commit out of sync_seq order, so
         // the highest one held here proves no prefix: a backup can hold a
-        // block whose earlier-numbered sibling was still open. Every one the
-        // peer holds of this node's since it was personalised is read again,
-        // and those held here are compared, not inserted.
+        // block whose earlier-numbered sibling was still open. The key of
+        // every block of this node's the peer holds since it was
+        // personalised is compared; only the blocks missing here are read
+        // whole.
         let floor = self
             .ledger
             .node_lineage()
@@ -713,20 +719,33 @@ impl PeerSync {
             .map_or(0, |lineage| lineage.sync_seq_floor);
         let mut after = floor;
         loop {
-            let blocks =
-                bounded(peer::blocks(connection, node, after, None, BLOCKS_PER_PASS)).await?;
-            let Some(last) = blocks.last().map(|block| block.sync_seq) else {
+            let keys = bounded(peer::block_keys(
+                connection,
+                node,
+                after,
+                BLOCK_KEYS_PER_READ,
+            ))
+            .await?;
+            let Some(last) = keys.last().map(|(sync_seq, _)| *sync_seq) else {
                 break;
             };
-            if self.ledger.missing_blocks(&blocks).await? > 0 {
+            let hashes: Vec<String> = keys.into_iter().map(|(_, hash)| hash).collect();
+            let missing = self.ledger.missing_blocks(&hashes).await?;
+            if !missing.is_empty() {
                 self.own_rows_missing().await?;
             }
-            for block in &blocks {
-                applied.merge(self.ledger.apply_block(block, None).await?);
+            for some in missing.chunks(BLOCKS_PER_PASS as usize) {
+                let blocks = bounded(peer::blocks_with_hashes(connection, node, some)).await?;
+                for block in &blocks {
+                    applied.merge(self.ledger.apply_block(block, None).await?);
+                }
+                ensure_progress(&mut self.own_log_diverged, &applied)?;
             }
-            ensure_progress(&mut self.own_log_diverged, &applied)?;
             after = last;
         }
+        // Only the prepared jobs not yet expired: this node prunes its own at
+        // expiry (the peer may keep its copy longer), so an expired one
+        // missing here is no row lost.
         let mut after = floor;
         loop {
             let batch = bounded(peer::prepared(
@@ -735,6 +754,7 @@ impl PeerSync {
                 after,
                 None,
                 self.batch_rows,
+                true,
             ))
             .await?;
             let Some(last) = batch.highest else {
@@ -837,7 +857,7 @@ impl PeerSync {
         let mut shares_moved = false;
         match self
             .ledger
-            .apply_share_batch(self.node, peer, &batch, Some(SHARES))
+            .apply_share_batch(self.node, peer, &batch, Some(SHARES), None)
             .await
         {
             Ok(applied) => {
@@ -935,6 +955,7 @@ impl PeerSync {
             cursor,
             Some(safe),
             self.batch_rows,
+            false,
         ))
         .await?;
         match self
