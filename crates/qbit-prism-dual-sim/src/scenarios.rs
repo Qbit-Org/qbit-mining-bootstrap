@@ -2912,12 +2912,9 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
     sim.mark(&format!("A died at the instant it found {hash}"));
     sim.balancer.wait_state("a", false, MARK_DOWN_BOUND).await?;
     steady(sim, 6).await;
-    let on_chain = sim
-        .chain
-        .c
-        .rpc("getblockheader", json!([hash]))
-        .await
-        .is_ok();
+    // Asked of C, the rest of the network. Only C's own "not found" means
+    // the block never got there; an unreachable C fails the scenario.
+    let on_chain = sim.chain.c.knows_block(&hash).await?;
     match case {
         DeathAtFind::Lost => {
             body.expect(

@@ -181,6 +181,19 @@ impl QbitNode {
     }
 
     pub async fn rpc_timeout(&self, method: &str, params: Value, limit: Duration) -> Result<Value> {
+        let payload = self.rpc_payload(method, params, limit).await?;
+        ensure!(
+            payload["error"].is_null(),
+            "qbitd {:?} {method}: {}",
+            self.name,
+            payload["error"]
+        );
+        Ok(payload["result"].clone())
+    }
+
+    /// The node's whole JSON-RPC reply, its `error` unchecked: an error only
+    /// when the node could not be asked or its reply read.
+    async fn rpc_payload(&self, method: &str, params: Value, limit: Duration) -> Result<Value> {
         let response = self
             .client
             .post(format!("http://127.0.0.1:{}/", self.rpc_port))
@@ -190,14 +203,25 @@ impl QbitNode {
             .send()
             .await
             .with_context(|| format!("qbitd {:?} {method}", self.name))?;
-        let payload: Value = response.json().await?;
-        ensure!(
-            payload["error"].is_null(),
-            "qbitd {:?} {method}: {}",
-            self.name,
-            payload["error"]
-        );
-        Ok(payload["result"].clone())
+        Ok(response.json().await?)
+    }
+
+    /// Whether this node knows block `hash`: `false` only on its own "block
+    /// not found" answer (RPC error -5). Any other failure is an error, so a
+    /// node that cannot be asked never reads as one without the block.
+    pub async fn knows_block(&self, hash: &str) -> Result<bool> {
+        let payload = self
+            .rpc_payload("getblockheader", json!([hash]), RPC_TIMEOUT)
+            .await?;
+        match payload["error"]["code"].as_i64() {
+            _ if payload["error"].is_null() => Ok(true),
+            Some(-5) => Ok(false),
+            _ => bail!(
+                "qbitd {:?} getblockheader {hash}: {}",
+                self.name,
+                payload["error"]
+            ),
+        }
     }
 
     pub async fn best(&self) -> Result<String> {
