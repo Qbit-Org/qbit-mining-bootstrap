@@ -86,10 +86,13 @@ blackhole (a dead switch: nothing forwarded, nothing closed, and the held
 bytes delivered on heal as TCP would). A link can also discard: every byte is
 read and thrown away and no close is passed on, so a server's replies to a
 dead client drain instead of blocking on a full window (S2's puller death).
+An open link passes each side's close on as it came, a FIN as a FIN and a
+reset (or a socket error) as a reset that ends the connection both ways.
 Any link can carry latency: S2's freeze and puller-death checks put 40 ms
 each way on A's link to B, a path between two sites, so a pull that holds
 the sync barrier or a transaction across round trips holds it long enough
-to be caught.
+to be caught. Bytes and closes alike wait the latency, and a stream keeps
+its rate.
 The relays are user-space, so a blackhole is silence at the application
 layer; TCP keepalives between each endpoint and its relay still succeed.
 

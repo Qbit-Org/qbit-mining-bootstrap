@@ -3,9 +3,11 @@
 //! balancer's routes and health checks, and in the 3.0 topology the writer
 //! endpoint and the standby's replication link).
 //!
-//! A link is in one of three states:
+//! A link is in one of four states:
 //!
-//! - **Open:** bytes flow.
+//! - **Open:** bytes flow, and so does each side's close, an orderly one as
+//!   a FIN and an abortive one (or a socket error) as a reset, which ends
+//!   the connection both ways.
 //! - **Reset:** every connection is closed with a TCP reset and every new one
 //!   is accepted and reset at once, as a host that is gone or rebooted
 //!   answers. Each side learns of the cut on its next read or write.
@@ -147,7 +149,8 @@ impl Relay {
     /// being discarded waits.
     pub fn set_latency(&self, latency: std::time::Duration) {
         let ms = latency.as_millis() as u64;
-        self.latency_ms.send_replace(ms);
+        self.latency_ms
+            .send_if_modified(|current| std::mem::replace(current, ms) != ms);
         self.latency_ms_max.fetch_max(ms, Ordering::SeqCst);
     }
 
@@ -257,12 +260,15 @@ async fn connection(
     let (upstream_read, upstream_write) = upstream.into_split();
     // Set once the connection lives through Discard, in either direction.
     let discarded = Arc::new(AtomicBool::new(false));
+    // Sent once either side's reset has crossed: both directions end.
+    let aborted = Arc::new(watch::channel(false).0);
     let outbound = tokio::spawn(pump(
         client_read,
         upstream_write,
         state.clone(),
         latency_ms.clone(),
         discarded.clone(),
+        aborted.clone(),
     ));
     let inbound = tokio::spawn(pump(
         upstream_read,
@@ -270,6 +276,7 @@ async fn connection(
         state.clone(),
         latency_ms.clone(),
         discarded.clone(),
+        aborted.clone(),
     ));
     // Each pump hands its halves back when it ends, so a reset can abort
     // both sides instead of letting a half-closed connection linger.
@@ -278,9 +285,11 @@ async fn connection(
     // every connection that lived through it, whether or not it lost bytes:
     // the host Discard modelled as dead does not know the connection, and its
     // restarted kernel answers the next segment with a reset (and any bytes
-    // dropped left a hole a resumed stream could not survive).
-    let reset_seen =
-        matches!(*state.borrow(), LinkState::Reset) || discarded.load(Ordering::SeqCst);
+    // dropped left a hole a resumed stream could not survive). And so does a
+    // side's own reset, once it has crossed.
+    let reset_seen = matches!(*state.borrow(), LinkState::Reset)
+        || discarded.load(Ordering::SeqCst)
+        || *aborted.borrow();
     if let (Ok((client_read, upstream_write)), Ok((upstream_read, client_write))) =
         (outbound, inbound)
     {
@@ -298,17 +307,31 @@ async fn connection(
 
 /// How much a pump may hold in its delay line before it stops reading, with
 /// latency on the link: a receiver slower than its sender pushes back, as it
-/// would over TCP. Without latency it holds one chunk, as a plain relay
+/// would over TCP. Without latency it holds one read, as a plain relay
 /// would, so a stopped receiver pushes back at once.
 const DELAY_LINE_BYTES: usize = 1 << 20;
-/// How many chunks the line may hold, whatever their size.
-const DELAY_LINE_CHUNKS: usize = 4096;
+/// How many entries the line may hold, whatever their size. Reads less than
+/// [`COALESCE`] apart share an entry, so this binds only on a receiver that
+/// stopped reading, or a latency of seconds.
+const DELAY_LINE_ENTRIES: usize = 4096;
+const COALESCE: std::time::Duration = std::time::Duration::from_millis(1);
 const CHUNK: usize = 16 * 1024;
+
+/// What a delay line holds, in the order the sender sent it.
+enum Sent {
+    Bytes(Vec<u8>),
+    /// An orderly close (a FIN).
+    Close,
+    /// An abortive one: a reset, or a socket error that ends the connection
+    /// as one.
+    Reset,
+}
 
 /// Copy `from` to `to` as a delay line. Each chunk, and the sender's close,
 /// is stamped when it is read and passed on once the link's latency has
 /// passed since then, so every byte and the close wait the same latency and
-/// a stream keeps its rate.
+/// a stream keeps its rate. A close passes on as the sender closed: a FIN,
+/// or a reset that ends both directions (`aborted`).
 ///
 /// - **Open:** reads, and passes on what is due.
 /// - **Blackholed:** neither reads nor passes anything on, a close included.
@@ -320,25 +343,32 @@ const CHUNK: usize = 16 * 1024;
 /// - **Reset:** ends at once.
 ///
 /// A change of state, or of latency, is acted on before anything else is
-/// read or written. Writes are partial and cancel-safe, so a change also
-/// interrupts one stuck on a receiver that stopped reading. It hands both
-/// halves back when it ends.
+/// read or written; a new latency re-dates what the line holds, except a
+/// chunk already partly written. Writes are partial and cancel-safe, so a
+/// change also interrupts one stuck on a receiver that stopped reading. It
+/// hands both halves back when it ends.
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
     mut state: watch::Receiver<LinkState>,
     mut latency_ms: watch::Receiver<u64>,
     discarded: Arc<AtomicBool>,
+    aborted: Arc<watch::Sender<bool>>,
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
+    let mut ended = aborted.subscribe();
     let mut buffer = vec![0u8; CHUNK];
-    // Each entry: when it was read, and its bytes (`None`: the sender's close).
-    let mut line: VecDeque<(tokio::time::Instant, Option<Vec<u8>>)> = VecDeque::new();
+    // Each entry: when it was read, and what.
+    let mut line: VecDeque<(tokio::time::Instant, Sent)> = VecDeque::new();
     // Bytes the line holds, and how much of its head is already written.
     let (mut held, mut written) = (0usize, 0usize);
     let mut eof = false;
     loop {
         let link = *state.borrow_and_update();
         let latency = std::time::Duration::from_millis(*latency_ms.borrow_and_update());
+        // The other direction passed on a reset: the connection is gone.
+        if *ended.borrow_and_update() {
+            return (from, to);
+        }
         match link {
             LinkState::Reset => return (from, to),
             LinkState::Discard => {
@@ -355,19 +385,25 @@ async fn pump(
             _ if discarded.load(Ordering::SeqCst) => return (from, to),
             LinkState::Open | LinkState::Blackholed => {}
         }
-        let cap = if latency.is_zero() {
-            CHUNK
+        let room = if latency.is_zero() {
+            line.is_empty()
         } else {
-            DELAY_LINE_BYTES
+            held < DELAY_LINE_BYTES && line.len() < DELAY_LINE_ENTRIES
         };
-        let reading =
-            !eof && link != LinkState::Blackholed && held < cap && line.len() < DELAY_LINE_CHUNKS;
+        let reading = !eof && link != LinkState::Blackholed && room;
         let head = match link {
-            LinkState::Open => line.front().map(|(stamp, chunk)| {
-                (
-                    *stamp + latency,
-                    chunk.as_deref().map(|bytes| &bytes[written..]),
-                )
+            LinkState::Open => line.front().map(|(stamp, sent)| {
+                // A chunk partly written is due: its first bytes are out.
+                let due = if written > 0 {
+                    *stamp
+                } else {
+                    *stamp + latency
+                };
+                let bytes = match sent {
+                    Sent::Bytes(bytes) => Some(&bytes[written..]),
+                    Sent::Close | Sent::Reset => None,
+                };
+                (due, bytes)
             }),
             _ => None,
         };
@@ -385,42 +421,63 @@ async fn pump(
                     return (from, to);
                 }
             }
+            // The other direction's reset: acted on at the top.
+            _ = ended.changed() => {}
             wrote = write_due(&mut to, head), if writing => match wrote {
-                // The sender's close, now due: pass it on, and end.
+                // The sender's close, now due: pass it on as it came, and end.
                 Ok(None) => {
-                    let _ = to.shutdown().await;
+                    if matches!(line.front(), Some((_, Sent::Reset))) {
+                        aborted.send_replace(true);
+                    } else {
+                        let _ = to.shutdown().await;
+                    }
                     return (from, to);
                 }
                 Ok(Some(count)) if count > 0 => {
                     written += count;
-                    let done = line
-                        .front()
-                        .is_some_and(|(_, chunk)| chunk.as_ref().is_some_and(|b| written == b.len()));
+                    let done = matches!(
+                        line.front(),
+                        Some((_, Sent::Bytes(bytes))) if written == bytes.len()
+                    );
                     if done {
-                        if let Some((_, Some(chunk))) = line.pop_front() {
-                            held -= chunk.len();
+                        if let Some((_, Sent::Bytes(bytes))) = line.pop_front() {
+                            held -= bytes.len();
                         }
                         written = 0;
                     }
                 }
                 // The receiver is gone. A link that has just turned to Discard
-                // drains on, as a dead client's server must; otherwise end.
-                _ if *state.borrow() == LinkState::Discard => {}
+                // drains on, as a dead client's server must, and the
+                // connection is reset when the link leaves Discard, however
+                // soon; otherwise end.
+                _ if *state.borrow() == LinkState::Discard => {
+                    discarded.store(true, Ordering::SeqCst);
+                }
                 _ => return (from, to),
             },
             read = from.read(&mut buffer), if reading => {
                 let now = tokio::time::Instant::now();
                 match read {
-                    Ok(0) | Err(_) => {
-                        eof = true;
-                        if link != LinkState::Discard {
-                            line.push_back((now, None));
+                    Ok(count @ 1..) if link != LinkState::Discard => {
+                        held += count;
+                        let bytes = &buffer[..count];
+                        match line.back_mut() {
+                            // Reads close together share an entry, so a stream
+                            // of small ones does not fill the line by count.
+                            Some((stamp, Sent::Bytes(tail)))
+                                if now.saturating_duration_since(*stamp) < COALESCE =>
+                            {
+                                tail.extend_from_slice(bytes);
+                            }
+                            _ => line.push_back((now, Sent::Bytes(bytes.to_vec()))),
                         }
                     }
-                    Ok(count) => {
+                    Ok(1..) => {}
+                    end => {
+                        eof = true;
                         if link != LinkState::Discard {
-                            line.push_back((now, Some(buffer[..count].to_vec())));
-                            held += count;
+                            let close = if end.is_ok() { Sent::Close } else { Sent::Reset };
+                            line.push_back((now, close));
                         }
                     }
                 }
@@ -593,6 +650,99 @@ mod tests {
         assert_eq!(round_trip(&mut stream, b"fast").await?, b"fast");
         assert!(started.elapsed() < Duration::from_millis(300));
         assert_eq!(relay.stats().latency_ms_max, 150);
+        Ok(())
+    }
+
+    /// A client through `relay`, and the server end of its connection.
+    async fn connected(relay: &Relay, listener: &TcpListener) -> Result<(TcpStream, TcpStream)> {
+        let client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
+        let (server, _) = timeout(Duration::from_secs(5), listener.accept()).await??;
+        Ok((client, server))
+    }
+
+    #[tokio::test]
+    async fn a_close_waits_the_latency_and_a_reset_crosses_as_a_reset() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        relay.set_latency(Duration::from_millis(150));
+        let mut buffer = [0u8; 4];
+
+        let (mut client, mut server) = connected(&relay, &listener).await?;
+        let started = std::time::Instant::now();
+        client.shutdown().await?;
+        let read = timeout(Duration::from_secs(5), server.read(&mut buffer)).await?;
+        assert!(
+            matches!(read, Ok(0)),
+            "an orderly close arrives as one: {read:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(145),
+            "the close waits the latency: {:?}",
+            started.elapsed()
+        );
+
+        let (client, mut server) = connected(&relay, &listener).await?;
+        let started = std::time::Instant::now();
+        reset(client);
+        let read = timeout(Duration::from_secs(5), server.read(&mut buffer)).await?;
+        assert!(
+            matches!(&read, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+            "an abortive close arrives as a reset: {read:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(145),
+            "the reset waits the latency: {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_close_held_in_the_line_never_crosses_a_blackhole() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        relay.set_latency(Duration::from_millis(300));
+        let (mut client, mut server) = connected(&relay, &listener).await?;
+        client.write_all(b"last").await?;
+        client.shutdown().await?;
+        // The bytes and the close are in the line, not yet due, when the
+        // link goes dark.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        relay.set(LinkState::Blackholed);
+        let mut buffer = [0u8; 4];
+        assert!(
+            timeout(Duration::from_millis(600), server.read(&mut buffer))
+                .await
+                .is_err(),
+            "neither bytes nor a close cross a blackhole"
+        );
+        relay.set(LinkState::Open);
+        timeout(Duration::from_secs(5), server.read_exact(&mut buffer)).await??;
+        assert_eq!(&buffer, b"last");
+        let read = timeout(Duration::from_secs(5), server.read(&mut buffer)).await?;
+        assert!(matches!(read, Ok(0)), "then the close: {read:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_latency_re_dates_what_the_line_holds() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        relay.set_latency(Duration::from_secs(5));
+        let (mut client, mut server) = connected(&relay, &listener).await?;
+        let started = std::time::Instant::now();
+        client.write_all(b"held").await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        relay.set_latency(Duration::ZERO);
+        let mut buffer = [0u8; 4];
+        timeout(Duration::from_secs(10), server.read_exact(&mut buffer)).await??;
+        assert_eq!(&buffer, b"held");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "lifting the latency releases what waited: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(relay.stats().latency_ms_max, 5000);
         Ok(())
     }
 
