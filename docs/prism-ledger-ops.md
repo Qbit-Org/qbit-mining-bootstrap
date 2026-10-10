@@ -1873,6 +1873,11 @@ lookback unlanded, a last ALERT says so. Causes:
 - a record past retention;
 - a record built by another builder version or other keys.
 
+A pass recognizes the pool's blocks only by the current `PRISM_COINBASE_TAG`
+and pool-fee program. A pool block found under an earlier tag or fee recipient
+is therefore not adopted, so change either only while both nodes are up and
+landing their blocks.
+
 The peer's prepared records, and the templates and balance snapshots they
 reference, are kept here until 24 hours after their own expiry.
 
@@ -1899,7 +1904,11 @@ fail after printing if a check refuses, or without `--confirm`.
    `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (6, and never fewer than 2) blocks
    past the release height, and the old owner's last blocks must have synced.
 3. **On the new owner:**
-   `qbit-prism-server carry-owner transfer --reason <text> [--from-height H] --confirm`.
+   `qbit-prism-server carry-owner transfer --reason <text> [--from-height H] [--also-tag T]... [--also-fee-program P]... --confirm`.
+   The chain scan recognizes pool blocks by the current coinbase tag and
+   pool-fee program. If either changed since the peer's last claim of ownership,
+   pass every earlier one with `--also-tag` and `--also-fee-program` (repeatable),
+   or the scan misses the blocks found under them.
    It refuses unless all of these pass:
    - `node_identity`: the node identity matches.
    - `this_node_not_owner`: this node does not already hold ownership.
@@ -1913,8 +1922,10 @@ fail after printing if a check refuses, or without `--confirm`.
    - `scan_start`: `--from-height` is no higher than the tip the peer's last
      claim of ownership recorded (its `acquire`). Below that height the peer
      found no carry-paying block. A peer that owned since its seed has no
-     recorded height, so only `--from-height 0` passes. If the peer's claims
-     cannot be read live, the check fails.
+     recorded height, so only `--from-height 0` passes. The check fails if the
+     peer's claims cannot be read live, or if the peer has released but no
+     claim of its can be read. The peer's latest rows and its latest claim are
+     read in one snapshot through one URL.
    - `chain_scan`: reading the active chain from `--from-height` (default 0, the
      whole chain) to its tip, every pool block is landed and confirmed in this
      node's ledger. The scan follows a moving tip and reorganisations. A foreign

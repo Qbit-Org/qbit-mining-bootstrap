@@ -388,6 +388,15 @@ enum CarryOwnerCommand {
         /// The first height the chain scan reads. The default, 0, reads the whole chain.
         #[arg(long, default_value_t = 0)]
         from_height: u64,
+        /// A coinbase tag the pool used before the current PRISM_COINBASE_TAG (repeatable): the
+        /// scan counts blocks found under it as pool blocks too. Pass every one in use since the
+        /// peer's last claim of ownership.
+        #[arg(long = "also-tag")]
+        also_tags: Vec<String>,
+        /// A pool-fee program (64 hex digits) the pool paid before the current one (repeatable),
+        /// as for --also-tag.
+        #[arg(long = "also-fee-program")]
+        also_fee_programs: Vec<String>,
         /// Write the transfer. Without it, print the checks, change nothing and fail.
         #[arg(long)]
         confirm: bool,
@@ -903,13 +912,16 @@ async fn carry_owner(command: CarryOwnerCommand) -> Result<()> {
         CarryOwnerCommand::Transfer {
             reason,
             from_height,
+            also_tags,
+            also_fee_programs,
             confirm,
         } => {
             crate::ledger::require_operator_reason(reason)?;
             let recognizer = crate::carry_owner::transfer::PoolRecognizer::new(
                 &config.coinbase_tag,
                 pool_fee_program(&config, &rpc).await?.as_deref(),
-            )?;
+            )?
+            .also(also_tags, also_fee_programs)?;
             (
                 transfer::transfer(
                     &ledger,
