@@ -804,6 +804,115 @@ async fn busy_lock(fixture: &Fixture) -> Result<()> {
     Ok(())
 }
 
+/// A SETTLEMENT_LOCK holder that needs the row being imported (a landing
+/// filling its `found_block_bits`) is let through at once: the importer's
+/// next poll sees it waiting and rolls the row back, well inside the lock
+/// timeout, and a re-run imports the row afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settlement_lock_holder_waiting_for_the_row_goes_first() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = holder_waits_for_row(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn holder_waits_for_row(fixture: &Fixture) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = legacy_bundle(100, 10)?;
+    let (block_hash, digest) =
+        seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x55).await?;
+    let mut holder = PgConnection::connect(&fixture.database.url).await?;
+    let mut held = holder.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SETTLEMENT_LOCK)
+        .execute(&mut *held)
+        .await?;
+    let mut patient = options(None);
+    // Only letting the holder through can end this row before the bound.
+    patient.lock_timeout = Duration::from_secs(30);
+    let importer = fixture.importer().clone();
+    let root = directory.path().to_path_buf();
+    let started = Instant::now();
+    let import = tokio::spawn(async move {
+        importer
+            .import_legacy_audits_with(Some(root.as_path()), &ledger_public_key(), &patient, |_| {})
+            .await
+    });
+    // The row is written and the importer is polling for the lock: its
+    // poll is the only statement that starts this way.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let polling: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
+             AND query LIKE 'SELECT granted,CASE WHEN granted%')",
+        )
+        .fetch_one(&fixture.ledger.pool)
+        .await?;
+        if polling {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the importer never polled for the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let asked = Instant::now();
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1")
+        .bind(&block_hash)
+        .bind("207fffff")
+        .execute(&mut *held)
+        .await?;
+    let waited = asked.elapsed();
+    held.commit().await?;
+    holder.close().await?;
+    let failed = tokio::time::timeout(SLACK, import)
+        .await
+        .context("the import did not end")??;
+    let elapsed = started.elapsed();
+    let error = format!("{:#}", failed.err().context("the import kept the row")?);
+    println!("holder waited {waited:?}; import failed after {elapsed:?}: {error}");
+    ensure!(
+        waited < Duration::from_secs(2),
+        "the SETTLEMENT_LOCK holder waited {waited:?} for the row"
+    );
+    ensure!(
+        error.contains(&block_hash),
+        "the error does not name the row: {error}"
+    );
+    ensure!(
+        error.contains("another session is waiting for this row"),
+        "{error}"
+    );
+    ensure!(
+        fixture.stored_digest(&block_hash).await?.is_none(),
+        "the row was stored"
+    );
+    let imported = fixture
+        .importer()
+        .import_legacy_audits_with(
+            Some(directory.path()),
+            &ledger_public_key(),
+            &options(None),
+            |_| {},
+        )
+        .await?;
+    ensure!(imported == 1, "the re-run imported {imported} rows");
+    ensure!(fixture.stored_digest(&block_hash).await?.as_deref() == Some(digest.as_str()));
+    let bits: Option<String> = sqlx::query_scalar(
+        "SELECT found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+    )
+    .bind(&block_hash)
+    .fetch_one(&fixture.ledger.pool)
+    .await?;
+    ensure!(
+        bits.as_deref() == Some("207fffff"),
+        "the holder's write was lost: {bits:?}"
+    );
+    Ok(())
+}
+
 /// A stop (SIGTERM in the CLI) during a row's write abandons the row at
 /// once: its connection closes, the server rolls it back, nothing waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

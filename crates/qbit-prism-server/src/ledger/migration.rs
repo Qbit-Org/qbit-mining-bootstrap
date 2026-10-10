@@ -3896,13 +3896,15 @@ impl Ledger {
     ///
     /// SETTLEMENT_LOCK covers only the commit (#765). A row is written first,
     /// holding just its own row lock: every parameter is encoded off the
-    /// runtime before the transaction opens, then the UPDATE is sent and run.
-    /// Only then is SETTLEMENT_LOCK taken, the write guard checked under it,
+    /// runtime before the transaction opens, the write guard refuses a halted
+    /// cluster before anything is sent, then the UPDATE is sent and run. Only
+    /// then is SETTLEMENT_LOCK taken, the write guard checked again under it,
     /// and the transaction committed, so every other SETTLEMENT_LOCK holder
     /// still sees a row either committed before it took the lock or not at
     /// all. `options` bounds each phase with transaction-local timeouts; a row
-    /// that exceeds one is rolled back and the import fails, naming it, and a
-    /// re-run resumes from it.
+    /// that exceeds one, or that another session waits for while the lock is
+    /// busy, is rolled back and the import fails, naming it, and a re-run
+    /// resumes from it.
     pub async fn import_legacy_audits_with(
         &self,
         root_dir: Option<&Path>,
@@ -4053,6 +4055,9 @@ impl Ledger {
         // (it is idle in transaction until the whole statement has arrived),
         // and cancels the UPDATE if it runs or waits for the row that long.
         set_transaction_timeouts(&mut tx, options.write_timeout, options.write_timeout).await?;
+        // Refuse a halted cluster or a live legacy writer before sending
+        // anything, as when the guard ran first; it runs again under the lock.
+        writable(&mut tx).await?;
         let write_started = std::time::Instant::now();
         // Store the exact canonical bytes and the non-share metadata only;
         // readers decode the bytes. A two-copy inline JSONB body would cross
@@ -4089,15 +4094,22 @@ impl Ledger {
         // Polled, never queued: the transaction already holds the row's lock,
         // and a queued wait could close a deadlock cycle with a SETTLEMENT_LOCK
         // holder waiting for that row (a landing that fills a legacy row's
-        // found_block_bits). Settlement work queued for the lock goes first.
+        // found_block_bits). Settlement work queued for the lock goes first,
+        // and a session the row's lock blocks is let through at once: the
+        // poll that misses the lock also asks whether anyone waits for this
+        // transaction, and if so the row is rolled back.
         loop {
-            let granted: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            let (granted, blocking): (bool, bool) = sqlx::query_as("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND pg_backend_pid()=ANY(pg_blocking_pids(pid))) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
                 .bind(SETTLEMENT_LOCK)
                 .fetch_one(&mut *tx)
                 .await?;
             if granted {
                 break;
             }
+            ensure!(
+                !blocking,
+                "another session is waiting for this row while SETTLEMENT_LOCK is busy; the row is rolled back so it can go first, and nothing was stored"
+            );
             ensure!(
                 asked.elapsed() < options.lock_timeout,
                 "SETTLEMENT_LOCK stayed busy for {} ms; the row is rolled back and nothing was stored",
@@ -4117,7 +4129,9 @@ impl Ledger {
         tx.commit().await?;
         row.lock_held = granted.elapsed();
         row.total = started.elapsed();
-        let _ = connection.close().await;
+        // The row is committed and the lock released; a peer that stops
+        // reading must not hang the import here either.
+        let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
         Ok(Some(row))
     }
 
@@ -4368,6 +4382,9 @@ impl std::error::Error for ImportStopped {}
 const IMPORT_LOCK_RETRY: Duration = Duration::from_millis(10);
 /// The longest a legacy audit's UPDATE goes unpolled; see [`repolled`].
 const IMPORT_REPOLL: Duration = Duration::from_millis(100);
+/// How long a committed row's connection may take to close before the
+/// importer drops it instead.
+const IMPORT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `future`'s output, or `None` once `stop` reads `true`. Without a stop
 /// signal, or once its sender is gone, just `future`'s output.

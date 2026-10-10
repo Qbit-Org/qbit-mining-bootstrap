@@ -50,7 +50,7 @@ replace one frontend at a time. See the
 | `healthcheck [--url URL] [--public-api]` | Probe HTTP readiness, or identity-free Stratum readiness when audit HTTP is disabled |
 | `self-check` | Check a configured live deployment's node, database integrity/durability, and HTTP health |
 | `migrate` | Apply the additive PostgreSQL schema after stopping Python writers |
-| `import-audits [--root PATH]` | Verify and import database-referenced legacy filesystem bundles, one row per transaction. Each row is written before `SETTLEMENT_LOCK`, which covers only its write-guard check and commit; one line per row goes to stderr; SIGTERM or SIGINT stops it (exit 1) without committing the row in progress |
+| `import-audits [--root PATH]` | Verify and import database-referenced legacy filesystem bundles, one row per transaction. Each row is written before `SETTLEMENT_LOCK`, which covers only its write-guard check and commit; one line per row goes to stderr; SIGTERM or SIGINT stops it (exit 1) without committing the row in progress, and a second signal exits at once |
 | `backfill-ctv` | Reconstruct missing fanout sets from verified database audits |
 | `broadcast-ctv` | Process one batch of mature fanout claims |
 | `capacity-evidence FILE [options]` | Validate the strict v3 native load-evidence format |
@@ -82,8 +82,8 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_DATABASE_MAX_CONNECTIONS` | 16 | Per-instance pool size, minimum 4 |
 | `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` | 15000 | PostgreSQL statement timeout |
 | `PRISM_DATABASE_LOCK_TIMEOUT_MS` | 5000 | PostgreSQL lock wait timeout |
-| `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS` | 60000 | `import-audits` only: how long one row's write may take before `SETTLEMENT_LOCK` (sending the statement, waiting for the row, running it); 1 to 600000 |
-| `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS` | 5000 | `import-audits` only: how long it waits for `SETTLEMENT_LOCK`, and, once it holds it, the longest a statement or a client pause may last before the server ends the session and the lock with it; 1 to 600000 |
+| `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS` | 60000 | `import-audits` only: how long one row's write may take before `SETTLEMENT_LOCK` (sending the statement, waiting for the row, running it); 1000 to 600000 |
+| `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS` | 5000 | `import-audits` only: how long it waits for `SETTLEMENT_LOCK`, and, once it holds it, the longest a statement or a client pause may last before the server ends the session and the lock with it; 100 to 600000 |
 | `PRISM_DATABASE_ACQUIRE_PROBE_IDLE_MS` | 100 | Idle gap after which a pool checkout probes the connection first; `0` probes every checkout |
 | `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS` | 60 | Periodic reward snapshot renewal |
 | `PRISM_BLOCKPOLL_SECONDS` | 2 | Template polling interval |

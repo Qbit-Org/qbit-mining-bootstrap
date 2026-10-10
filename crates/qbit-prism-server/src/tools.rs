@@ -607,22 +607,18 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             // or by rolling back a row not yet granted SETTLEMENT_LOCK. In a
             // container this runs as PID 1, which ignores a SIGTERM it has no
             // handler for, so without one `docker stop` could only kill it.
-            let (stop, stopped) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                if crate::server::signal().await.is_ok() {
-                    stop.send_replace(true);
-                }
-            });
             let options = crate::ledger::ImportAuditsOptions {
                 write_timeout: import_timeout(
                     "PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS",
                     crate::ledger::ImportAuditsOptions::DEFAULT_WRITE_TIMEOUT,
+                    Duration::from_secs(1),
                 )?,
                 lock_timeout: import_timeout(
                     "PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS",
                     crate::ledger::ImportAuditsOptions::DEFAULT_LOCK_TIMEOUT,
+                    Duration::from_millis(100),
                 )?,
-                stop: Some(stopped),
+                stop: Some(stop_on_signals()?),
             };
             let config = config::DatabaseConfig::from_env()?;
             let ledger_public_key = config::DatabaseConfig::ledger_public_key()?;
@@ -643,27 +639,32 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             // an unverifiable or missing historical artifact.
             let completeness = audit_completeness(&ledger.pool).await;
             ledger.pool.close().await;
+            if let Err(error) = &count {
+                // A stop can leave a body still being verified on a blocking
+                // thread, which runtime shutdown would wait for: exit now,
+                // whatever the counts read.
+                if error
+                    .downcast_ref::<crate::ledger::ImportStopped>()
+                    .is_some()
+                {
+                    match &completeness {
+                        Ok(completeness) => println!(
+                            "Audit completeness: {}",
+                            serde_json::to_string(completeness).unwrap_or_default()
+                        ),
+                        Err(read) => eprintln!("Audit completeness unavailable: {read:#}"),
+                    }
+                    refuse(1, format!("Error: {error:?}"))
+                }
+            }
             let completeness = completeness?;
             println!(
                 "Audit completeness: {}",
                 serde_json::to_string(&completeness)?
             );
-            match count {
-                // A stop can leave a body still being verified on a blocking
-                // thread, which runtime shutdown would wait for: exit now.
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::ledger::ImportStopped>()
-                        .is_some() =>
-                {
-                    refuse(1, format!("Error: {error:?}"))
-                }
-                count => {
-                    let count = count?;
-                    println!("Imported {count} audit bodies");
-                    completeness.require_complete()
-                }
-            }
+            let count = count?;
+            println!("Imported {count} audit bodies");
+            completeness.require_complete()
         }
         Command::BackfillCtv => {
             let config = config::DatabaseConfig::from_env()?;
@@ -717,16 +718,55 @@ fn audit_root(root: Option<PathBuf>) -> Option<PathBuf> {
     root.or_else(|| config::optional("PRISM_AUDIT_DIR").map(PathBuf::from))
 }
 
-/// One of `import-audits`' bounds (#765), in milliseconds from `name`, with
-/// the range of the database timeouts.
-fn import_timeout(name: &str, default: Duration) -> Result<Duration> {
+/// One of `import-audits`' bounds (#765), in milliseconds from `name`. Each
+/// is also the transaction's idle timeout in its phase, so it has a floor
+/// well above the importer's own pauses between statements.
+fn import_timeout(name: &str, default: Duration, floor: Duration) -> Result<Duration> {
     let default = u64::try_from(default.as_millis())?;
+    let floor = u64::try_from(floor.as_millis())?;
     let millis = config::number(name, default)?;
     ensure!(
-        (1..=600_000).contains(&millis),
-        "{name} must be between 1 and 600000 milliseconds"
+        (floor..=600_000).contains(&millis),
+        "{name} must be between {floor} and 600000 milliseconds"
     );
     Ok(Duration::from_millis(millis))
+}
+
+/// `import-audits`' stop signal (#765): the first SIGTERM or SIGINT asks
+/// the import to stop, and a second one exits at once, for a stop that
+/// something outside the importer's bounds holds up.
+fn stop_on_signals() -> Result<tokio::sync::watch::Receiver<bool>> {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        tokio::spawn(async move {
+            let mut signals = 0;
+            loop {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
+                signals += 1;
+                if signals > 1 {
+                    refuse(
+                        1,
+                        "import-audits: a second stop signal; exiting now".to_owned(),
+                    );
+                }
+                stop.send_replace(true);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            stop.send_replace(true);
+        }
+    });
+    Ok(stopped)
 }
 
 /// What `signing-transition` prints, and all it does, without `--confirm`.
