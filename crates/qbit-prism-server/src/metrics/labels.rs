@@ -157,6 +157,25 @@ labels!(OrderLockHolder {
     Cleanup => "cleanup", FatalState => "fatal_state", Operator => "operator",
     PeerSync => "peer_sync"
 });
+// 3.1 dual writer (D1): the peer sync's streams, the path a pass took to the
+// peer's database, why it refused the peer, and the tables it copies.
+labels!(PeerSyncStream {
+    Shares => "shares", Blocks => "blocks", Prepared => "prepared", Roles => "roles"
+});
+labels!(PeerSyncPath { Primary => "primary", Fallback => "fallback" });
+labels!(PeerSyncRefusal {
+    LocalIdentity => "local_identity", PeerIdentity => "peer_identity",
+    Fingerprint => "fingerprint", Schema => "schema"
+});
+labels!(PeerSyncTable {
+    ShareLedger => "qbit_share_ledger", ShareHashes => "qbit_prism_share_hashes",
+    PoolBlocks => "qbit_pool_blocks", AuditSnapshots => "qbit_prism_audit_snapshots",
+    AuditBundles => "qbit_pool_audit_bundles", PayoutEntries => "qbit_pool_payout_entries",
+    CarryForward => "qbit_payout_carry_forward", FanoutSets => "qbit_ctv_fanout_sets",
+    FanoutArtifacts => "qbit_ctv_fanout_artifacts", Templates => "qbit_prism_templates",
+    BalanceSnapshots => "qbit_prism_balance_snapshots", Jobs => "qbit_prism_jobs",
+    NodeRoles => "qbit_prism_node_roles"
+});
 // #602: the share acknowledgement p99 bound, in seconds, a landing window is
 // judged against: 2 s tickets after three windows in a row, 10 s warns.
 labels!(LandingAckBound { Ticket => "2", Warning => "10" });

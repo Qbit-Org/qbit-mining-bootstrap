@@ -39,18 +39,22 @@ ALTER TABLE qbit_prism_jobs ADD COLUMN IF NOT EXISTS origin_node smallint NOT NU
 --    committed under ORDER_LOCK, so its order is commit order.
 --
 --    These writers hold no lock that orders their commits, so a pull must
---    not pass a number whose transaction may still commit. The default
---    takes the inserting transaction's xid before it takes the number: a
---    puller that read the sequence, then the xid horizon, and waits until
---    every older xid has ended has seen, or can never see, every row at or
---    below what it read. Rows from before 027 keep NULL and are never pulled:
---    both databases of a pair start from one ledger and hold them already.
+--    not pass a number whose transaction may still commit. The default takes
+--    a shared transaction-scoped advisory lock (0x505249534d000008, the sync
+--    barrier) before it takes the number, and keeps it until the transaction
+--    ends. A puller that takes the same lock exclusively, without waiting
+--    (pg_try_advisory_lock, so no writer ever queues behind it), and reads
+--    the sequence while holding it has seen, or can never see, every row at
+--    or below what it read. The barrier is per database, so no transaction
+--    elsewhere on the server holds a pull back. Rows from before 027 keep
+--    NULL and are never pulled: both databases of a pair start from one
+--    ledger and hold them already.
 CREATE SEQUENCE IF NOT EXISTS qbit_prism_sync_seq AS bigint;
 
 CREATE OR REPLACE FUNCTION qbit_prism_next_sync_seq()
 RETURNS bigint LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
-    PERFORM pg_current_xact_id();
+    PERFORM pg_advisory_xact_lock_shared(5787769093247467528);
     RETURN nextval('qbit_prism_sync_seq');
 END;
 $$;

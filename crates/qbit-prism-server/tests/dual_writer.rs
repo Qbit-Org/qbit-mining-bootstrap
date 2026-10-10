@@ -98,14 +98,23 @@ async fn migration_027_adds_origin_node_to_every_copied_table() -> Result<()> {
             .fetch_one(pool)
             .await?;
         ensure!(mark.is_none(), "the safe peer mark is {mark:?} before any pull");
-        // The sync number is taken after the inserting transaction's xid, and
-        // grows with each insert.
-        let (first, second, xid_held): (i64, i64, bool) = sqlx::query_as(
-            "SELECT qbit_prism_next_sync_seq(),qbit_prism_next_sync_seq(),pg_current_xact_id_if_assigned() IS NOT NULL",
+        // The sync number is drawn under the sync barrier, held shared until
+        // the drawing transaction ends, and grows with each draw.
+        let mut tx = pool.begin().await?;
+        let (first, second): (i64, i64) =
+            sqlx::query_as("SELECT qbit_prism_next_sync_seq(),qbit_prism_next_sync_seq()")
+                .fetch_one(&mut *tx)
+                .await?;
+        let barrier: Vec<String> = sqlx::query_scalar(
+            "SELECT mode FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() \
+             AND ((classid::bigint<<32)|objid::bigint)=$1",
         )
-        .fetch_one(pool)
+        .bind(qbit_prism_server::ledger::peer_sync::SYNC_BARRIER_LOCK)
+        .fetch_all(&mut *tx)
         .await?;
-        ensure!(second > first && xid_held, "{first} {second} {xid_held}");
+        tx.commit().await?;
+        ensure!(second > first, "{first} {second}");
+        ensure!(barrier == ["ShareLock"], "{barrier:?}");
         // The carry-owner journal takes new epochs and refuses every change.
         sqlx::query("INSERT INTO qbit_prism_node_roles(origin_node,epoch,carry_owner,action,recorded_by) VALUES(0,0,true,'seed','test')")
             .execute(pool)

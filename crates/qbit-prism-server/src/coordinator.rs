@@ -339,6 +339,11 @@ pub struct Coordinator {
     pub landing_trim: Arc<crate::memory::LandingTrim>,
     /// The cluster's block submission hold (#664) as `health` last read it.
     submission_hold: SubmissionHoldView,
+    /// 3.1 dual writer (D-9): the peer sync's status, attached once at
+    /// startup by a dual-writer frontend; never set on a single writer.
+    /// `own_log_caught_up` is the readiness input (D-8).
+    pub peer_sync:
+        std::sync::OnceLock<tokio::sync::watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -1018,6 +1023,7 @@ impl Coordinator {
             offer_sections: Default::default(),
             landing_trim: Default::default(),
             submission_hold: Default::default(),
+            peer_sync: Default::default(),
         }))
     }
 

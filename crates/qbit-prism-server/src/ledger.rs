@@ -72,6 +72,7 @@ pub use jobs::{
     PreparedTemplate, StoredCompactPrepared,
 };
 mod node_identity;
+pub mod peer_sync;
 pub use node_identity::{IdentityCheck, LineageEvidence, NodeIdentityRecord, NodeLineage};
 mod migration;
 pub use migration::{

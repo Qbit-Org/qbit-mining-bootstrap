@@ -345,6 +345,88 @@ impl Metrics {
             elapsed,
         );
     }
+    /// 3.1 dual writer (D1): the peer sync's state after a pass. `streams`
+    /// holds each stream's lag in rows and seconds.
+    pub fn publish_peer_sync(
+        &self,
+        reachable: bool,
+        own_log_caught_up: bool,
+        rollback_evidence: bool,
+        path: &str,
+        refusal: Option<&str>,
+        streams: &[(&str, u64, f64)],
+    ) {
+        let flag = |on: bool| if on { 1. } else { 0. };
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        registry.set(Family::PeerSyncReachable, Labels::Empty, flag(reachable));
+        registry.set(
+            Family::PeerSyncOwnLogCaughtUp,
+            Labels::Empty,
+            flag(own_log_caught_up),
+        );
+        registry.set(
+            Family::PeerSyncRollbackEvidence,
+            Labels::Empty,
+            flag(rollback_evidence && !own_log_caught_up),
+        );
+        for value in PeerSyncPath::ALL {
+            registry.set(
+                Family::PeerSyncPath,
+                Labels::One(("path", value.as_str())),
+                flag(value.as_str() == path),
+            );
+        }
+        for value in PeerSyncRefusal::ALL {
+            registry.set(
+                Family::PeerSyncRefused,
+                Labels::One(("reason", value.as_str())),
+                flag(Some(value.as_str()) == refusal),
+            );
+        }
+        for value in PeerSyncStream::ALL {
+            if let Some((_, rows, seconds)) = streams
+                .iter()
+                .find(|(stream, ..)| *stream == value.as_str())
+            {
+                registry.set(
+                    Family::PeerSyncLagRows,
+                    Labels::One(("stream", value.as_str())),
+                    *rows as f64,
+                );
+                registry.set(
+                    Family::PeerSyncLagSeconds,
+                    Labels::One(("stream", value.as_str())),
+                    *seconds,
+                );
+            }
+        }
+    }
+    /// 3.1 dual writer (D1): rows a peer sync pass inserted and conflicts it
+    /// recorded, by copied table.
+    pub fn record_peer_sync_applied(&self, applied: &crate::ledger::peer_sync::Applied) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for table in PeerSyncTable::ALL {
+            let label = Labels::One(("table", table.as_str()));
+            if let Some(rows) = applied.inserted.get(table.as_str()) {
+                registry.add(Family::PeerSyncRows, label.clone(), *rows as f64);
+            }
+            if let Some(conflicts) = applied.conflicts.get(table.as_str()) {
+                registry.add(Family::PeerSyncConflicts, label, *conflicts as f64);
+            }
+        }
+    }
+    /// 3.1 dual writer (D1): a failed peer sync pass on `path`.
+    pub fn record_peer_sync_failure(&self, path: &str) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for value in PeerSyncPath::ALL {
+            if value.as_str() == path {
+                registry.increment(
+                    Family::PeerSyncFailures,
+                    Labels::One(("path", value.as_str())),
+                );
+            }
+        }
+    }
     /// One ORDER_LOCK hold, from the grant to the end of its transaction.
     pub fn observe_order_lock_hold(&self, holder: OrderLockHolder, elapsed: Duration) {
         self.observe(

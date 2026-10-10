@@ -24,7 +24,7 @@ use crate::peer_sync::COPIED_TABLES;
 
 /// The serial columns that are keys of copied tables, each drawn with its
 /// node's parity once personalised.
-const PARITY_KEYS: &[(&str, &str)] = &[
+pub(super) const PARITY_KEYS: &[(&str, &str)] = &[
     ("qbit_share_ledger", "share_seq"),
     ("qbit_pool_payout_entries", "payout_entry_seq"),
     ("qbit_payout_carry_forward", "carry_forward_seq"),
@@ -342,6 +342,48 @@ async fn set_parity(
         .execute(&mut **tx)
         .await?;
     Ok(floor)
+}
+
+/// Raise `table.column`'s sequence, keeping `node`'s parity, to at least
+/// `floor` and, when `scan` is set, above the largest key the table holds.
+/// It only rises: a sequence already above stays where it is. Returns the
+/// sequence's value afterwards. The caller holds the lock its writers
+/// allocate under, so no allocation is in flight while it moves.
+pub(super) async fn raise_parity(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column: &str,
+    node: NodeIndex,
+    floor: Option<i64>,
+    scan: bool,
+) -> Result<i64> {
+    let sequence = serial_sequence(tx, table, column).await?;
+    let held: Option<i64> = if scan {
+        sqlx::query_scalar(&format!("SELECT max({column}) FROM {table}"))
+            .fetch_one(&mut **tx)
+            .await?
+    } else {
+        None
+    };
+    let (last_value, is_called): (i64, bool) =
+        sqlx::query_as(&format!("SELECT last_value,is_called FROM {sequence}"))
+            .fetch_one(&mut **tx)
+            .await?;
+    let wanted = node.share_seq_at_or_above(
+        floor
+            .unwrap_or(i64::MIN)
+            .max(held.unwrap_or(i64::MIN))
+            .max(last_value),
+    );
+    if is_called && wanted == last_value {
+        return Ok(last_value);
+    }
+    sqlx::query("SELECT setval($1::regclass,$2,true)")
+        .bind(&sequence)
+        .bind(wanted)
+        .execute(&mut **tx)
+        .await?;
+    Ok(wanted)
 }
 
 /// Confine the session sequence to `node`'s half of the extranonce1 space,

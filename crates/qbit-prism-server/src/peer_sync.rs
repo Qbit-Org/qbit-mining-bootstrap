@@ -13,6 +13,9 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use tokio::sync::watch;
 
+mod engine;
+pub use engine::{PassReport, PeerSync, Refusal};
+
 /// Every table the peer sync copies, in the order a pull inserts them
 /// (parents before the rows that reference them). Each has an
 /// `origin_node smallint NOT NULL DEFAULT 0` (migration 027), which

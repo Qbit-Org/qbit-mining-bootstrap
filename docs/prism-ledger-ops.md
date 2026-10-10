@@ -3734,10 +3734,13 @@ every ledger for it, whether or not the dual writer is ever turned on:
   constrains it on the existing tables: on the share ledger one would scan
   every partition under the migration's lock.
 - `sync_seq` on `qbit_pool_blocks` and `qbit_prism_jobs`, drawn by
-  `qbit_prism_next_sync_seq()` from `qbit_prism_sync_seq` after the inserting
-  transaction has taken its xid. It orders the two streams that are not shares
-  (landed blocks, and prepared jobs). Rows from before 027 keep `NULL` and are
-  never pulled.
+  `qbit_prism_next_sync_seq()` from `qbit_prism_sync_seq` under the sync
+  barrier, an advisory lock the drawing transaction holds shared until it
+  ends. It orders the two streams that are not shares (landed blocks, and
+  prepared jobs): the peer reads the sequence while it holds the barrier
+  exclusively, never waiting for it, so it never passes a number whose
+  transaction may still commit. Rows from before 027 keep `NULL` and are never
+  pulled.
 - `qbit_prism_node_roles`, the append-only carry-owner journal: which node
   pays down carried balances, as each node last recorded it. It is copied like
   the tables above, and the carry-owner guard writes it.

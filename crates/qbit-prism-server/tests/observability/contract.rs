@@ -343,6 +343,22 @@ pub fn expected(populated: bool) -> Census {
         if populated { &refreshes } else { &[] },
         SECONDS,
     );
+    // 3.1 dual writer (D1): only a dual-writer frontend's peer sync publishes
+    // these, so a single writer declares them without samples.
+    for (name, kind) in [
+        ("peer_sync_peer_reachable", "gauge"),
+        ("peer_sync_own_log_caught_up", "gauge"),
+        ("peer_sync_rollback_evidence", "gauge"),
+        ("peer_sync_refused", "gauge"),
+        ("peer_sync_path", "gauge"),
+        ("peer_sync_lag_rows", "gauge"),
+        ("peer_sync_lag_seconds", "gauge"),
+        ("peer_sync_rows_total", "counter"),
+        ("peer_sync_conflicts_total", "counter"),
+        ("peer_sync_failures_total", "counter"),
+    ] {
+        result.family(name, kind, &[], &[]);
+    }
     // A disabled rollup publishes no lag at all, so the family is declared and
     // unsampled exactly as it is before the loop starts.
     result.family(

@@ -179,35 +179,69 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let mut tasks = JoinSet::new();
-    tasks.spawn(runtime.track(
-        TaskKind::StratumListener,
-        run_listener(
+    // 3.1 dual writer: the peer sync, and the own-log latch (D-8) that the
+    // tasks writing this node's own rows wait for: the Stratum listeners
+    // (share appends), the refresh (prepared work, reconciliation) and the
+    // submit loop (landings). A node restored from an old backup pulls its
+    // own rows back from the peer first, so none of them reuses a key the
+    // peer already holds. A single writer waits for nothing.
+    let own_log = match &config.dual_writer {
+        Some(dual) => {
+            let (sync, status) = crate::peer_sync::PeerSync::new(
+                (*coordinator.ledger).clone(),
+                dual,
+                Some(registry.clone()),
+            );
+            let _ = coordinator.peer_sync.set(status.clone());
+            tasks.spawn(sync.run(shutdown_rx.clone()));
+            Some(status)
+        }
+        None => None,
+    };
+    tasks.spawn(runtime.track(TaskKind::StratumListener, {
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
+        let listener = run_listener(
             primary,
             stratum_config,
             coordinator.clone(),
             coordinator.refresh.subscribe(),
             shutdown_rx.clone(),
             registry.clone(),
-        ),
-    ));
+        );
+        async move {
+            if !caught_up.await {
+                return Ok(());
+            }
+            listener.await
+        }
+    }));
     if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
-        tasks.spawn(runtime.track(
-            TaskKind::StratumListener,
-            run_listener(
+        tasks.spawn(runtime.track(TaskKind::StratumListener, {
+            let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
+            let listener = run_listener(
                 listener,
                 highdiff,
                 coordinator.clone(),
                 coordinator.refresh.subscribe(),
                 shutdown_rx.clone(),
                 registry.clone(),
-            ),
-        ));
+            );
+            async move {
+                if !caught_up.await {
+                    return Ok(());
+                }
+                listener.await
+            }
+        }));
     }
     tasks.spawn(runtime.track(TaskKind::Refresh, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
         async move {
-            coordinator.refresh_loop(rx).await;
+            if caught_up.await {
+                coordinator.refresh_loop(rx).await;
+            }
             Ok(())
         }
     }));
@@ -216,8 +250,11 @@ pub async fn run(config: Config) -> Result<()> {
     tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
         async move {
-            coordinator.submit_loop(rx).await;
+            if caught_up.await {
+                coordinator.submit_loop(rx).await;
+            }
             Ok(())
         }
     }));
@@ -366,6 +403,22 @@ pub async fn run(config: Config) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// 3.1 dual writer (D-8): true once the own log is caught up, false if the
+/// shutdown comes first. A single writer (`None`) never waits.
+async fn wait_for_own_log(
+    status: Option<watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    let Some(mut status) = status else {
+        return true;
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => false,
+        caught_up = status.wait_for(|status| status.own_log_caught_up) => caught_up.is_ok(),
+    }
 }
 
 // One operation ends at publication; subsequent database maintenance is not
