@@ -263,7 +263,8 @@ impl Balancer {
         backends: Vec<BackendTarget>,
         started: Instant,
     ) -> Result<Self> {
-        let listener = TcpListener::from_std(crate::postgres::fresh_listener()?)
+        let listener = crate::postgres::fresh_listener()
+            .and_then(|listener| Ok(TcpListener::from_std(listener)?))
             .context("binding the balancer")?;
         let port = listener.local_addr()?.port();
         let probe = std::sync::RwLock::new(Probe {
