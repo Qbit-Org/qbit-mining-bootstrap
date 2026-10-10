@@ -2920,7 +2920,10 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
                 ),
                 adopted.is_ok() || !wait,
                 match &adopted {
-                    Ok(took) => format!("confirmed on B {:.1} s after A died", took.as_secs_f64()),
+                    Ok(took) => format!(
+                        "confirmed on B {:.1} s after it was {ADOPT_DEPTH} blocks deep",
+                        took.as_secs_f64()
+                    ),
                     Err(error) => format!(
                         "not adoptable: {error:#}; A's prepared records on its parent {parent} \
                          when A died: {held}"
