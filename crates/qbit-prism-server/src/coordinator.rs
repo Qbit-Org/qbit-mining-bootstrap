@@ -3366,12 +3366,15 @@ impl Coordinator {
         self.health_report().await.0
     }
 
-    /// 3.1: read the peer sync's status from `handle` for dual-writer
-    /// readiness. Until one is attached a dual-writer frontend reads its own
+    /// 3.1: read the peer sync's status from the engine's channel for
+    /// dual-writer readiness. Until one is attached a dual-writer frontend reads its own
     /// log as not caught up, so it does not serve; a single writer ignores it.
-    pub fn attach_peer_sync(&self, handle: crate::peer_sync::PeerSyncHandle) {
+    pub fn attach_peer_sync(
+        &self,
+        status: tokio::sync::watch::Receiver<crate::peer_sync::PeerSyncStatus>,
+    ) {
         if let Some(dual) = &self.dual_writer {
-            dual.attach_peer_sync(handle);
+            dual.attach_peer_sync(status);
         }
     }
 

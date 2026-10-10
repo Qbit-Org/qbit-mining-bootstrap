@@ -1,0 +1,293 @@
+//! 3.1 dual-writer readiness against PostgreSQL (D4). A dual-writer frontend
+//! is ready only while its own log is caught up (the peer sync's latch,
+//! decision D-8) and its database is this node's writable primary (the
+//! identity row of decision D-9); `/healthz` carries the `dual_writer`
+//! object of CONTRACT.md §3. A single writer's health is unchanged.
+//!
+//! ```text
+//! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
+//!   cargo test --locked -p qbit-prism-server --test dual_writer_readiness
+//! ```
+use anyhow::{ensure, Context, Result};
+use qbit_prism_server::{
+    config::{Config, DualWriterConfig},
+    coordinator::Coordinator,
+    ledger::Ledger,
+    metrics::Metrics,
+    node_identity::{NodeIdentity, NodeIndex},
+    peer_sync::PeerSyncPublisher,
+};
+use qbit_prism_test_gate as gate;
+use serde_json::{json, Value};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+#[allow(dead_code)]
+#[path = "support/fake_qbitd.rs"]
+mod fake_qbitd;
+use fake_qbitd::FakeNode;
+
+#[allow(dead_code)]
+#[path = "support/ledger_database.rs"]
+mod ledger_database;
+use ledger_database::FixtureDatabase;
+
+/// The hang guard for one wait; no property is decided by comparing to it.
+const DEADLINE: Duration = Duration::from_secs(30);
+
+fn dual_writer(node: NodeIndex) -> DualWriterConfig {
+    DualWriterConfig {
+        identity: NodeIdentity {
+            node,
+            carry_owner: node == NodeIndex::A,
+        },
+        // No sync engine runs in these tests; the peer is never dialled.
+        peer_database_url: "postgresql://prism_peer_sync@127.0.0.1:1/peer".into(),
+        peer_database_url_fallback: None,
+        peer_sync_interval: Duration::from_millis(250),
+        peer_sync_batch_rows: 5000,
+    }
+}
+
+async fn frontend(
+    database: &FixtureDatabase,
+    node: &FakeNode,
+    instance: &str,
+    dual: Option<DualWriterConfig>,
+) -> Result<Arc<Coordinator>> {
+    let mut config: Config = fake_qbitd::coordinator_config(database.url.clone(), node, instance)?;
+    config.dual_writer = dual;
+    let coordinator = Coordinator::new(config, Arc::new(Metrics::default())).await?;
+    coordinator.refresh_once().await?;
+    Ok(coordinator)
+}
+
+/// Poll `health` until `accept` holds, at least past the writer probe's
+/// one-second reuse, so a change in the database is seen.
+async fn health_until(
+    coordinator: &Coordinator,
+    what: &str,
+    accept: impl Fn(&Value) -> bool,
+) -> Result<Value> {
+    let started = Instant::now();
+    loop {
+        let health = coordinator.health().await;
+        if accept(&health) {
+            return Ok(health);
+        }
+        ensure!(
+            started.elapsed() < DEADLINE,
+            "{what}: health never matched; last {health}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Set or reset the fixture database's read-only default from outside it,
+/// then end every session in it, so the coordinator's pool reconnects and
+/// runs with the new default.
+async fn set_read_only(database: &FixtureDatabase, name: &str, read_only: bool) -> Result<()> {
+    let change = if read_only {
+        "SET default_transaction_read_only = on"
+    } else {
+        "RESET default_transaction_read_only"
+    };
+    sqlx::query(&format!("ALTER DATABASE \"{name}\" {change}"))
+        .execute(&database.admin)
+        .await?;
+    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1")
+        .bind(name)
+        .execute(&database.admin)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dual_writer_health_follows_the_own_log_latch_and_the_database_identity() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_readiness_").await?;
+    let ledger =
+        match Ledger::connect_tool(&database.url, "d4-readiness-fixture".into(), 2, true, None)
+            .await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(database.abandon(error).await),
+        };
+    let outcome = latch_and_identity(&database, &ledger).await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+async fn latch_and_identity(database: &FixtureDatabase, ledger: &Ledger) -> Result<()> {
+    let node = FakeNode::open().await?;
+    let frontend = frontend(
+        database,
+        &node,
+        "d4-readiness-b",
+        Some(dual_writer(NodeIndex::B)),
+    )
+    .await
+    .context("starting the dual-writer frontend")?;
+
+    // No sync attached and no identity: the own log is not caught up, which
+    // is reported first, and the database is not yet any node's.
+    let health = frontend.health().await;
+    ensure!(
+        health["ok"] == false && health["ready"] == false,
+        "{health}"
+    );
+    ensure!(health["status"] == "own-log-behind", "{health}");
+    ensure!(
+        health["dual_writer"]["own_log_caught_up"] == false,
+        "{health}"
+    );
+    ensure!(
+        health["dual_writer"]["writer_path"] == "unidentified",
+        "{health}"
+    );
+
+    // The latch alone is not enough while the database is unidentified.
+    let (sync, status) = PeerSyncPublisher::new();
+    frontend.attach_peer_sync(status);
+    sync.update(|status| {
+        status.peer_reachable = true;
+        status.own_log_caught_up = true;
+    });
+    let health = frontend.health().await;
+    ensure!(health["ok"] == false, "{health}");
+    ensure!(health["status"] == "writer-not-local", "{health}");
+
+    // Personalised as this node: ready, with the contract's object.
+    ledger.set_node_identity(NodeIndex::B, "d4-test").await?;
+    let health = health_until(&frontend, "personalised as B", |health| {
+        health["dual_writer"]["writer_path"] == "local"
+    })
+    .await?;
+    ensure!(health["ok"] == true && health["status"] == "ok", "{health}");
+    ensure!(
+        health["dual_writer"]
+            == json!({
+                "node_index": 1,
+                "carry_owner": false,
+                "own_log_caught_up": true,
+                "peer_sync": {"peer_reachable": true, "own_log_caught_up": true, "per_table": {}},
+                "writer_path": "local",
+            }),
+        "{health}"
+    );
+
+    // D-8: losing the peer later never withdraws the node.
+    sync.update(|status| status.peer_reachable = false);
+    let health = frontend.health().await;
+    ensure!(health["ok"] == true, "{health}");
+    ensure!(
+        health["dual_writer"]["peer_sync"]["peer_reachable"] == false,
+        "{health}"
+    );
+
+    // The database stops taking writes, as a fence's read-only default does.
+    let name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&ledger.pool)
+        .await?;
+    set_read_only(database, &name, true).await?;
+    let health = health_until(&frontend, "the database read-only", |health| {
+        health["dual_writer"]["writer_path"] == "read_only"
+    })
+    .await?;
+    ensure!(health["ok"] == false, "{health}");
+    ensure!(health["status"] == "writer-not-local", "{health}");
+
+    set_read_only(database, &name, false).await?;
+    health_until(&frontend, "the database writable again", |health| {
+        health["dual_writer"]["writer_path"] == "local" && health["ok"] == true
+    })
+    .await?;
+    frontend.ledger.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_database_personalised_as_the_peer_keeps_the_frontend_out() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_remote_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "d4-remote-fixture".into(),
+        2,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let outcome = async {
+        // B's frontend whose database is A's: a writer left pointing at
+        // the peer.
+        ledger.set_node_identity(NodeIndex::A, "d4-test").await?;
+        let node = FakeNode::open().await?;
+        let frontend = frontend(
+            &database,
+            &node,
+            "d4-remote-b",
+            Some(dual_writer(NodeIndex::B)),
+        )
+        .await?;
+        let (sync, status) = PeerSyncPublisher::new();
+        frontend.attach_peer_sync(status);
+        sync.update(|status| status.own_log_caught_up = true);
+        let health = frontend.health().await;
+        ensure!(health["ok"] == false, "{health}");
+        ensure!(health["status"] == "writer-not-local", "{health}");
+        ensure!(health["dual_writer"]["writer_path"] == "remote", "{health}");
+        ensure!(health["dual_writer"]["node_index"] == 1, "{health}");
+        frontend.ledger.pool.close().await;
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_writer_health_carries_no_dual_writer_state() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_single_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "d4-single-fixture".into(),
+        2,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let outcome = async {
+        let node = FakeNode::open().await?;
+        let frontend = frontend(&database, &node, "d4-single", None).await?;
+        // A latch reported to a single writer changes nothing.
+        let (_sync, status) = PeerSyncPublisher::new();
+        frontend.attach_peer_sync(status);
+        let health = frontend.health().await;
+        ensure!(health["ok"] == true && health["status"] == "ok", "{health}");
+        ensure!(health.get("dual_writer").is_none(), "{health}");
+        ensure!(health.get("admission").is_none(), "{health}");
+        frontend.ledger.pool.close().await;
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}

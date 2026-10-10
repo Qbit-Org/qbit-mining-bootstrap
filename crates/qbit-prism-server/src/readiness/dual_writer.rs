@@ -5,14 +5,11 @@
 //! writable PostgreSQL. A broken link to the peer never withdraws it: the
 //! peer's reachability and the sync lag are reported, never decided on.
 use super::admission::Withdrawal;
-use crate::{
-    metrics::WriterPathLabel,
-    node_identity::NodeIdentity,
-    peer_sync::{PeerSyncHandle, PeerSyncStatus},
-};
+use crate::{metrics::WriterPathLabel, node_identity::NodeIdentity, peer_sync::PeerSyncStatus};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 /// How long one probe of this node's database may take before it counts as
 /// unanswered.
@@ -29,11 +26,12 @@ const WRITER_PROBE_REUSE: Duration = Duration::from_secs(1);
 /// Where this frontend's writes go, as its database last answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriterPath {
-    /// A writable primary that is this node's own database.
+    /// A writable primary that is this node's own database: its
+    /// `qbit_prism_node_identity` row names `PRISM_NODE_INDEX` (D-9).
     Local,
-    /// A database that identifies as the peer node.
+    /// A database whose identity row names the peer node.
     Remote,
-    /// A database that records no node identity.
+    /// A database with no identity row, never personalised for dual mode.
     Unidentified,
     /// A standby, or a database whose sessions are read-only.
     ReadOnly,
@@ -128,7 +126,7 @@ impl DualWriterReport {
 #[derive(Debug)]
 pub struct DualWriterReadiness {
     identity: NodeIdentity,
-    peer_sync: std::sync::RwLock<Option<PeerSyncHandle>>,
+    peer_sync: std::sync::RwLock<Option<watch::Receiver<PeerSyncStatus>>>,
     writer: tokio::sync::Mutex<WriterProbe>,
 }
 
@@ -141,14 +139,14 @@ impl DualWriterReadiness {
         }
     }
 
-    /// Read the peer sync's status from `handle` from now on. Until a sync
-    /// is attached the own log reads as not caught up, so the node does not
-    /// serve.
-    pub fn attach_peer_sync(&self, handle: PeerSyncHandle) {
+    /// Read the peer sync's status from `status`, the engine's channel,
+    /// from now on. Until a sync is attached the own log reads as not caught
+    /// up, so the node does not serve.
+    pub fn attach_peer_sync(&self, status: watch::Receiver<PeerSyncStatus>) {
         *self
             .peer_sync
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
     }
 
     fn peer_sync_status(&self) -> PeerSyncStatus {
@@ -156,7 +154,7 @@ impl DualWriterReadiness {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(PeerSyncHandle::status)
+            .map(|status| status.borrow().clone())
             .unwrap_or_default()
     }
 
@@ -202,15 +200,18 @@ impl DualWriterReadiness {
     }
 }
 
-/// Ask this frontend's own database whether it can take this node's writes.
-/// Any error or a timeout is no answer.
-async fn probe_writer(pool: &PgPool, identity: NodeIdentity) -> WriterPath {
-    let probe = sqlx::query_as::<_, (bool, bool)>(
-        "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on'",
+/// Ask this frontend's own database whether it is this node's and can take
+/// its writes. Any error or a timeout is no answer.
+pub(crate) async fn probe_writer(pool: &PgPool, identity: NodeIdentity) -> WriterPath {
+    let probe = sqlx::query_as::<_, (bool, bool, Option<i16>)>(
+        "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on', \
+         (SELECT node_index FROM qbit_prism_node_identity WHERE singleton)",
     )
     .fetch_one(pool);
     match tokio::time::timeout(WRITER_PROBE_TIMEOUT, probe).await {
-        Ok(Ok((in_recovery, read_only))) => classify(in_recovery, read_only, identity),
+        Ok(Ok((in_recovery, read_only, recorded))) => {
+            classify(in_recovery, read_only, recorded, identity)
+        }
         Ok(Err(error)) => {
             tracing::warn!(%error, "dual-writer writer probe failed");
             WriterPath::Unanswered
@@ -225,11 +226,19 @@ async fn probe_writer(pool: &PgPool, identity: NodeIdentity) -> WriterPath {
     }
 }
 
-fn classify(in_recovery: bool, read_only: bool, _identity: NodeIdentity) -> WriterPath {
-    if in_recovery || read_only {
-        WriterPath::ReadOnly
-    } else {
-        WriterPath::Local
+/// The database's identity decides first, since a wrong one is a
+/// configuration fault whatever its role; then whether it can write.
+fn classify(
+    in_recovery: bool,
+    read_only: bool,
+    recorded: Option<i16>,
+    identity: NodeIdentity,
+) -> WriterPath {
+    match recorded {
+        None => WriterPath::Unidentified,
+        Some(index) if index != identity.node.index() => WriterPath::Remote,
+        Some(_) if in_recovery || read_only => WriterPath::ReadOnly,
+        Some(_) => WriterPath::Local,
     }
 }
 
@@ -355,19 +364,32 @@ mod tests {
     fn an_attached_sync_supplies_the_latch() {
         let readiness = DualWriterReadiness::new(IDENTITY);
         assert_eq!(readiness.peer_sync_status(), PeerSyncStatus::default());
-        let (publisher, handle) = crate::peer_sync::PeerSyncPublisher::new();
-        readiness.attach_peer_sync(handle);
+        let (publisher, status) = crate::peer_sync::PeerSyncPublisher::new();
+        readiness.attach_peer_sync(status);
         assert!(!readiness.peer_sync_status().own_log_caught_up);
         publisher.update(|status| status.own_log_caught_up = true);
         assert!(readiness.peer_sync_status().own_log_caught_up);
     }
 
     #[test]
-    fn a_standby_or_read_only_session_is_not_a_local_writer() {
-        assert_eq!(classify(false, false, IDENTITY), WriterPath::Local);
-        assert_eq!(classify(true, false, IDENTITY), WriterPath::ReadOnly);
-        assert_eq!(classify(false, true, IDENTITY), WriterPath::ReadOnly);
-        assert_eq!(classify(true, true, IDENTITY), WriterPath::ReadOnly);
+    fn only_this_nodes_writable_database_is_a_local_writer() {
+        let own = Some(IDENTITY.node.index());
+        let peer = Some(IDENTITY.node.peer().index());
+        assert_eq!(classify(false, false, own, IDENTITY), WriterPath::Local);
+        assert_eq!(classify(true, false, own, IDENTITY), WriterPath::ReadOnly);
+        assert_eq!(classify(false, true, own, IDENTITY), WriterPath::ReadOnly);
+        assert_eq!(classify(true, true, own, IDENTITY), WriterPath::ReadOnly);
+        // A wrong or missing identity is reported whatever the role.
+        for (in_recovery, read_only) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                classify(in_recovery, read_only, peer, IDENTITY),
+                WriterPath::Remote
+            );
+            assert_eq!(
+                classify(in_recovery, read_only, None, IDENTITY),
+                WriterPath::Unidentified
+            );
+        }
     }
 
     #[test]
