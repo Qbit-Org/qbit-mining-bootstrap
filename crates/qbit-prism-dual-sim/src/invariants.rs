@@ -252,6 +252,7 @@ pub async fn check(
     checks.push(windows_reproducible(&pools).await?);
     checks.push(ledger_integrity(&pools).await?);
     checks.push(candidates_settled(&pools).await?);
+    checks.push(local_state_not_copied(sim, &pools).await?);
     for pool in pools.values() {
         pool.close().await;
     }
@@ -1368,6 +1369,57 @@ async fn candidates_settled(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     Ok(check.finish(format!(
         "no candidate in flight or unlanded; {note} landed blocks await their candidate's next attempt"
     )))
+}
+
+/// CONTRACT.md D-2 and D-9: what is never copied holds only this node's
+/// own rows. In dual-writer mode, on each node: no block candidate was
+/// reserved by the peer's frontend (the outbox and its deferred shares are
+/// local: copying them would credit twice), no payout divergence is recorded
+/// for a peer-origin block, and the database's identity is its own node.
+async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    if sim.config.topology != Topology::DualWriter {
+        return Ok(Check::skip(
+            "d2-local-state-not-copied",
+            "no dual-writer pair: nothing is copied",
+        ));
+    }
+    let mut check = CheckBuilder::new("d2-local-state-not-copied");
+    for (node, pool) in pools {
+        let peer = node.peer();
+        let copied_candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT block_hash FROM qbit_block_candidate_outbox WHERE offer_reserved_by = $1",
+        )
+        .bind(peer.instance_id())
+        .fetch_all(pool)
+        .await?;
+        for hash in copied_candidates {
+            check.problem(format!(
+                "node {node:?} holds candidate {hash}, reserved by node {peer:?}'s frontend"
+            ));
+        }
+        let peer_divergences: Vec<String> = sqlx::query_scalar(
+            "SELECT d.block_hash FROM qbit_prism_payout_divergences d \
+             JOIN qbit_pool_blocks b ON b.block_hash = d.block_hash WHERE b.origin_node = $1",
+        )
+        .bind(peer.index() as i16)
+        .fetch_all(pool)
+        .await?;
+        for hash in peer_divergences {
+            check.problem(format!(
+                "node {node:?} records a payout divergence for node {peer:?}'s block {hash}"
+            ));
+        }
+        let identity: Option<i16> =
+            sqlx::query_scalar("SELECT node_index FROM qbit_prism_node_identity")
+                .fetch_optional(pool)
+                .await?;
+        if identity != Some(node.index() as i16) {
+            check.problem(format!(
+                "node {node:?}'s database identifies as {identity:?} (D-9)"
+            ));
+        }
+    }
+    Ok(check.finish("candidates, divergences and identities are each node's own".into()))
 }
 
 fn short(program: &str) -> String {
