@@ -767,41 +767,70 @@ impl Sim {
     /// Wait until each node holds every share and block its peer had
     /// originated when this was called: the sync has caught up to now. Under
     /// load the two databases are never equal at one instant, so this waits
-    /// for the first reading's rows to arrive, not for equal counts.
+    /// for the first reading's rows to arrive, not for equal counts. It says
+    /// nothing about a node's own rows (a restored node pulling its own rows
+    /// back is S6's and S7's check). A read that fails is retried until the
+    /// bound; a timeout names each node's sync conflicts, since a row the peer
+    /// refuses never arrives.
     pub async fn wait_synced(&self, limit: Duration) -> Result<()> {
         let started = Instant::now();
         let mut pools = BTreeMap::new();
         for node in Node::BOTH {
-            pools.insert(node, self.pool(node).await?);
-        }
-        // What each node had originated, as its own database holds it.
-        let mut target = BTreeMap::new();
-        for node in Node::BOTH {
-            target.insert(node, origin_counts(&pools[&node], node).await?);
-        }
-        let result = loop {
-            let mut behind = Vec::new();
-            for node in Node::BOTH {
-                let peer = node.peer();
-                let held = origin_counts(&pools[&peer], node).await?;
-                if held.0 < target[&node].0 || held.1 < target[&node].1 {
-                    behind.push(format!(
-                        "node {peer:?} holds {held:?} of node {node:?}'s (shares, blocks), which had {:?}",
-                        target[&node]
-                    ));
+            match self.pool(node).await {
+                Ok(pool) => {
+                    pools.insert(node, pool);
+                }
+                Err(error) => {
+                    for pool in pools.into_values() {
+                        pool.close().await;
+                    }
+                    return Err(error);
                 }
             }
-            if behind.is_empty() {
-                break Ok(());
+        }
+        let result = async {
+            // What each node had originated, as its own database holds it.
+            let mut target = BTreeMap::new();
+            for node in Node::BOTH {
+                target.insert(node, origin_counts(&pools[&node], node).await?);
             }
-            if started.elapsed() >= limit {
-                break Err(anyhow::anyhow!(
-                    "the sync did not catch up within {limit:?}: {}",
-                    behind.join("; ")
-                ));
+            loop {
+                let mut behind = Vec::new();
+                for node in Node::BOTH {
+                    let peer = node.peer();
+                    match origin_counts(&pools[&peer], node).await {
+                        Ok(held) if held.0 >= target[&node].0 && held.1 >= target[&node].1 => {}
+                        Ok(held) => behind.push(format!(
+                            "node {peer:?} holds {held:?} of node {node:?}'s (shares, blocks), \
+                             which had {:?}",
+                            target[&node]
+                        )),
+                        Err(error) => behind.push(format!("reading node {peer:?}: {error:#}")),
+                    }
+                }
+                if behind.is_empty() {
+                    return Ok(());
+                }
+                if started.elapsed() >= limit {
+                    let mut conflicts = Vec::new();
+                    for (node, pool) in &pools {
+                        let count: Result<i64, _> = sqlx::query_scalar(
+                            "SELECT count(*) FROM qbit_prism_peer_sync_conflicts",
+                        )
+                        .fetch_one(pool)
+                        .await;
+                        conflicts.push(format!("node {node:?}: {count:?}"));
+                    }
+                    anyhow::bail!(
+                        "the sync did not catch up within {limit:?}: {}; sync conflicts {}",
+                        behind.join("; "),
+                        conflicts.join(", ")
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        };
+        }
+        .await;
         for pool in pools.into_values() {
             pool.close().await;
         }
