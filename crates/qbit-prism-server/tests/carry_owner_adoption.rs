@@ -1481,20 +1481,54 @@ async fn refused(f: &Fixture) -> Result<()> {
 
     // Control: with the block's own record back, the adoption loop adopts
     // it, but only once the own-log latch is set (D-8): an adopted block's
-    // rows are this node's own.
+    // rows are this node's own. The adopting frontend runs another
+    // PRISM_STRATUM_EXTRANONCE2_SIZE than the work was issued with (the
+    // pair's fingerprint does not bind it): adoption reads the issuing
+    // width from the record, and the rebuilt coinbase is still the block's.
     sqlx::query(
         "INSERT INTO qbit_prism_jobs SELECT * FROM jsonb_populate_record(NULL::qbit_prism_jobs,$1)",
     )
     .bind(&kept)
     .execute(pool)
     .await?;
+    let narrow = Coordinator::new(
+        qbit_prism_server::config::Config {
+            extranonce2_size: c.config.extranonce2_size / 2,
+            instance_id: "adoption-narrow".into(),
+            ..(*c.config).clone()
+        },
+        Arc::new(Metrics::default()),
+    )
+    .await?;
+    ensure!(
+        narrow.config.extranonce2_size != job.wire.extranonce2_size,
+        "the adopting frontend runs the issuing width"
+    );
+    let result = narrow_control(f, &narrow, &hash, &found_on, &mut state).await;
+    narrow.ledger.pool.close().await;
+    result?;
+    session.release().await
+}
+
+/// The refusal case's control, on `narrow`: the adoption loop adopts the
+/// block from its own record once the own-log latch is set, and not before.
+async fn narrow_control(
+    f: &Fixture,
+    narrow: &Arc<Coordinator>,
+    hash: &str,
+    found_on: &Prepared,
+    state: &mut AdoptionState,
+) -> Result<()> {
+    let c = &f.coordinator;
+    let pool = &f.pool;
+    let (hash, found_on) = (hash.to_owned(), found_on);
     let (sync, status) = PeerSyncPublisher::new();
     ensure!(
-        c.peer_sync.set(status).is_ok(),
-        "the fixture's coordinator already has a peer sync status"
+        narrow.peer_sync.set(status).is_ok(),
+        "the narrow frontend already has a peer sync status"
     );
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let adoption = tokio::spawn(c.clone().adoption_loop(shutdown));
+    let adoption = tokio::spawn(narrow.clone().adoption_loop(shutdown));
     // Without the wait, the loop's first pass would adopt at once.
     tokio::time::sleep(Duration::from_secs(3)).await;
     ensure!(
@@ -1515,7 +1549,7 @@ async fn refused(f: &Fixture) -> Result<()> {
     adoption.await?;
     if !in_time {
         // The loop only logs a failed pass: show what one reports now.
-        let pass = match c.adoption_pass(&mut AdoptionState::default()).await {
+        let pass = match narrow.adoption_pass(&mut AdoptionState::default()).await {
             Ok(adoptions) => format!("{adoptions:?}"),
             Err(error) => format!("{error:#}"),
         };
@@ -1526,7 +1560,7 @@ async fn refused(f: &Fixture) -> Result<()> {
     let versions = row_versions(pool, &hash).await?;
     let held = held_rows(pool, &hash).await?;
     ensure!(
-        c.adopt_block(&hash).await? == landed(&hash, &found_on.storage_key),
+        narrow.adopt_block(&hash).await? == landed(&hash, &found_on.storage_key),
         "the loop did not adopt the block from the record it was found on"
     );
     ensure!(
@@ -1539,8 +1573,8 @@ async fn refused(f: &Fixture) -> Result<()> {
         "the adopted block is {adopted:?}"
     );
     ensure!(
-        c.adoption_pass(&mut state).await?.is_empty(),
+        c.adoption_pass(state).await?.is_empty(),
         "the adopted block is still reported"
     );
-    session.release().await
+    Ok(())
 }
