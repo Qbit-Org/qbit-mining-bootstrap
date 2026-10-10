@@ -517,6 +517,26 @@ impl Load {
             .unwrap_or_default()
     }
 
+    /// How many ordinary shares were accepted on `node`'s jobs and answered
+    /// after `after_ms`, counted in place rather than through a copy of the
+    /// whole log.
+    pub fn accepted_on(&self, node: Node, after_ms: u64) -> usize {
+        self.log
+            .lock()
+            .map(|log| {
+                log.shares
+                    .iter()
+                    .filter(|r| {
+                        r.accepted()
+                            && !r.scheduled_block
+                            && r.issuer == Some(node)
+                            && r.answered_ms.is_some_and(|at| at > after_ms)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub fn connections(&self) -> Vec<ConnectionRecord> {
         self.log
             .lock()

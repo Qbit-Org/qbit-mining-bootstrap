@@ -470,8 +470,10 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
                 failures = 0;
                 passes += 1;
                 if !up && passes >= shared.config.rise {
-                    backend.up.send_replace(true);
+                    // Recorded first, so whoever sees the node up finds the
+                    // mark that made it so.
                     shared.transition(&backend.target.name, true);
+                    backend.up.send_replace(true);
                     shared.event(format!(
                         "{} marked up after {passes} passing checks",
                         backend.target.name
@@ -483,8 +485,8 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
                 failures += 1;
                 shared.failed_check(&backend.target.name, up, &reason);
                 if up && failures >= shared.config.fall {
-                    backend.up.send_replace(false);
                     shared.transition(&backend.target.name, false);
+                    backend.up.send_replace(false);
                     let closed = close_all(backend);
                     shared.event(format!(
                         "{} marked down after {failures} failed checks ({reason}); closed {closed} sessions",

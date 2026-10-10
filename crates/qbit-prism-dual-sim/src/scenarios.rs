@@ -298,11 +298,15 @@ impl Scenario {
                 }
             }
         }
-        // Both nodes originate rows where the scenario needs each to have
-        // its own (S6, S7), or where both writing is the point (S5).
+        // S2's puller death runs at the share rate where a snapshot held on
+        // a node shows in its appends (#738).
         if self == Scenario::S02PullerDiesMidRead {
             config.load.rate = PULLER_DEATH_RATE;
         }
+        // Both nodes take miners where each must originate rows (S6, S7),
+        // where both writing is the point (S5), and where the survivor must
+        // be busy while its peer is frozen, dies or fails to apply (S2's
+        // mid-pull and puller-death variants, S4's transient apply).
         if matches!(
             self,
             Scenario::CheckerControl
@@ -1274,13 +1278,16 @@ enum RoundWork {
         mint_ms: u64,
         job_ms: std::result::Result<u64, String>,
     },
-    /// B's block, solved on work B handed its finder before the freeze: the
-    /// block once it landed (or why not), and B's first job on it, timed
-    /// from the landing.
-    Landing {
-        block: std::result::Result<String, String>,
+    /// B's block, solved on work B handed its finder before the freeze: how
+    /// long it took to land and confirm on B, and B's first job on it, timed
+    /// from the confirmation.
+    Landed {
+        block: String,
+        landing_ms: u64,
         job_ms: std::result::Result<u64, String>,
     },
+    /// B could not land its block while A was frozen.
+    LandingFailed { why: String },
     /// The block was solved on work superseded between the hand-out and the
     /// solve (a tip or revision change): not a stall, and not judged.
     Superseded { why: String },
@@ -1292,13 +1299,11 @@ impl RoundWork {
         match self {
             RoundWork::NewTip {
                 job_ms: Err(why), ..
-            } => Some(why.clone()),
-            RoundWork::Landing {
-                block: Err(why), ..
-            } => Some(why.clone()),
-            RoundWork::Landing {
+            }
+            | RoundWork::Landed {
                 job_ms: Err(why), ..
-            } => Some(why.clone()),
+            }
+            | RoundWork::LandingFailed { why } => Some(why.clone()),
             _ => None,
         }
     }
@@ -1326,6 +1331,7 @@ async fn freeze_round(
 ) -> Result<(PullState, RoundWork, Option<FoundBlock>)> {
     let after_stop = pull_state(pool).await?;
     if landing {
+        let started = Instant::now();
         return Ok(
             match solve_and_land(
                 sim,
@@ -1336,20 +1342,19 @@ async fn freeze_round(
             .await
             {
                 Ok(Ok(found)) => {
+                    let landing_ms = started.elapsed().as_millis() as u64;
                     let job_ms = first_job_on(pool, Node::B, &found.hash, NEW_WORK_BOUND).await?;
-                    let work = RoundWork::Landing {
-                        block: Ok(found.hash.clone()),
+                    let work = RoundWork::Landed {
+                        block: found.hash.clone(),
+                        landing_ms,
                         job_ms,
                     };
                     (after_stop, work, Some(found))
                 }
                 Ok(Err(why)) => (after_stop, RoundWork::Superseded { why }, None),
                 Err(error) => {
-                    let work = RoundWork::Landing {
-                        block: Err(format!("{error:#}")),
-                        job_ms: Err("no block".into()),
-                    };
-                    (after_stop, work, None)
+                    let why = format!("{error:#}");
+                    (after_stop, RoundWork::LandingFailed { why }, None)
                 }
             },
         );
@@ -1429,35 +1434,37 @@ async fn s02_frozen_during_pulls(sim: &mut Sim) -> Result<Body> {
         serde_json::to_vec_pretty(&json!({"seed": seed, "rounds": rounds}))?,
     )?;
     let stalled: Vec<&FreezeRound> = rounds.iter().filter(|r| r.work.stall().is_some()).collect();
-    let mut took: Vec<u64> = rounds
+    let mut tip_jobs: Vec<u64> = rounds
         .iter()
         .filter_map(|r| match &r.work {
-            RoundWork::NewTip { job_ms: Ok(ms), .. }
-            | RoundWork::Landing { job_ms: Ok(ms), .. } => Some(*ms),
+            RoundWork::NewTip { job_ms: Ok(ms), .. } => Some(*ms),
             _ => None,
         })
         .collect();
-    took.sort_unstable();
-    let landed = rounds
+    tip_jobs.sort_unstable();
+    let landings: Vec<(u64, u64)> = rounds
         .iter()
-        .filter(|r| matches!(r.work, RoundWork::Landing { block: Ok(_), .. }))
-        .count();
+        .filter_map(|r| match &r.work {
+            RoundWork::Landed { landing_ms, .. } => Some((*landing_ms, r.held_ms)),
+            _ => None,
+        })
+        .collect();
     let timed = rounds.iter().filter(|r| r.timed_to_a_pull).count();
     let caught = rounds.iter().filter(|r| r.after_stop.mid_pull()).count();
-    let longest = rounds.iter().map(|r| r.held_ms).max();
     body.expect(
         "B records jobs and lands blocks while A is frozen mid-pull",
-        stalled.is_empty() && landed > 0,
+        stalled.is_empty() && !landings.is_empty(),
         format!(
             "{} freezes ({timed} timed to one of A's pulls on B; {caught} left A with a query, a \
-             transaction or an advisory lock open there; longest {longest:?} ms); B landed \
-             {landed} blocks during freezes; B's first job on new work after {:?} ms (median) and \
-             {:?} ms (max), bound {} s; stalled: {stalled:?}. Schedule seed {seed}; every round \
-             in freezes.json",
+             transaction or an advisory lock open there). New tips: B's first job on each after \
+             {:?} ms (median) and {:?} ms (max) from the mint, bound {} s. Landings: {} blocks \
+             landed and confirmed on B during freezes, as (landing ms, freeze ms): {landings:?}. \
+             Stalled: {stalled:?}. Schedule seed {seed}; every round in freezes.json",
             rounds.len(),
-            took.get(took.len() / 2),
-            took.last(),
-            NEW_WORK_BOUND.as_secs()
+            tip_jobs.get(tip_jobs.len() / 2),
+            tip_jobs.last(),
+            NEW_WORK_BOUND.as_secs(),
+            landings.len()
         ),
     );
     sim.settle(SETTLE_BOUND).await?;
@@ -1504,14 +1511,14 @@ fn answer_p95(
 /// 1. While both run, no pull of A's holds a transaction open on B across a
 ///    round trip: sampled every 10 ms for `PULL_SAMPLE`, B never shows A's
 ///    backend idle in transaction.
-/// 2. A's database link is blackholed, so B never sees the close (as when
-///    A's host or its VLAN dies; a plain kill -9 sends a FIN that B handles
-///    at once), and A's frontend is killed, timed to a moment its puller is
-///    busy on B. A's backends on B must hold no snapshot and no open
-///    transaction beyond `IDLE_BOUND`.
+/// 2. A's database link discards (B's replies drain and no close reaches
+///    it, as when A's host or its VLAN dies; a plain kill -9 sends a FIN
+///    that B handles at once), and A's frontend is killed, timed to a moment
+///    its puller is busy on B. A's backends on B must hold no snapshot and
+///    no open transaction beyond `IDLE_BOUND`.
 /// 3. B takes every miner meanwhile, and its share answer latency stays
-///    flat: the p95 late in the minute after the death is at most twice the
-///    p95 early in it, plus 50 ms.
+///    flat: its p95 45 to 60 s after the death is at most twice its p95 5 to
+///    20 s after A was marked down, plus 50 ms.
 ///
 /// Then the link heals, A restarts and catches up.
 async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
@@ -1548,9 +1555,11 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
     );
 
     let timed = wait_for_a_pull(&pool, Duration::from_secs(5)).await?;
-    sim.links.set("peer-a-to-b", LinkState::Blackholed)?;
+    sim.links.set("peer-a-to-b", LinkState::Discard)?;
     let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
-    sim.mark("A's database link blackholed as its frontend died: B never sees the close");
+    sim.mark(
+        "A's database link discards as its frontend dies: B's replies drain, no close reaches it",
+    );
     let died = Instant::now();
     let (mut last_holding, mut most) = (None, 0i64);
     while died.elapsed() < LINGER_WATCH {
@@ -1574,7 +1583,8 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         last_holding.is_none_or(|held| held <= IDLE_BOUND),
         format!(
             "killed {} one of A's pulls was seen busy on B; up to {most} of A's backends on B held \
-             a snapshot or a transaction until {:?} after the death (bound {} s, watched {} s)",
+             a snapshot or a transaction until {:?} after the death (bound {} s, watched {} s; the \
+             peer role's idle-in-transaction timeout is the one status/D1.md drafts)",
             if timed { "as" } else { "without" },
             last_holding,
             IDLE_BOUND.as_secs(),
@@ -1582,17 +1592,42 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         ),
     );
 
+    // Flat appends: B's p95 early in the minute after the death, once A's
+    // miners have moved to it, against its p95 late in that minute, while a
+    // snapshot A left behind would still be held.
+    let report = sim.balancer.report();
+    let marked_down = report
+        .transitions
+        .iter()
+        .find(|t| t.backend == "a" && !t.up && t.at_ms >= fault_at)
+        .map(|t| t.at_ms);
     let records = sim.load()?.records();
-    let (early, early_n) = answer_p95(&records, Node::B, fault_at + 10_000, fault_at + 25_000);
-    let (late, late_n) = answer_p95(&records, Node::B, fault_at + 45_000, fault_at + 60_000);
-    body.expect(
-        "B's share appends stay flat while A's puller is dead",
-        matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50),
-        format!(
-            "p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares 10 to 25 s \
-             after the death, {late:?} ms over {late_n} shares 45 to 60 s after it (bound: twice the \
-             first, plus 50 ms), at {PULLER_DEATH_RATE} offered shares/s"
+    let sessions = sim.balancer.sessions();
+    let flat = match marked_down {
+        Some(down) if down + 20_000 <= fault_at + 45_000 => {
+            let (early, early_n) = answer_p95(&records, Node::B, down + 5_000, down + 20_000);
+            let (late, late_n) = answer_p95(&records, Node::B, fault_at + 45_000, fault_at + 60_000);
+            let passed = matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50);
+            (
+                passed && sessions.get("a").copied().unwrap_or(0) == 0,
+                format!(
+                    "p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares \
+                     5 to 20 s after A was marked down ({} ms after the death), {late:?} ms over \
+                     {late_n} shares 45 to 60 s after the death (bound: twice the first, plus \
+                     50 ms), at {PULLER_DEATH_RATE} offered shares/s; open sessions now {sessions:?}",
+                    down - fault_at
+                ),
+            )
+        }
+        other => (
+            false,
+            format!("A was marked down at {other:?} ms, too late for an early window (death at {fault_at} ms)"),
         ),
+    };
+    body.expect(
+        "B takes every miner and its share appends stay flat while A's puller is dead",
+        flat.0,
+        flat.1,
     );
     body.gaps.push(report::gap(&records, fault_at));
 
@@ -1668,6 +1703,9 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
     sim.load()?.resume();
     steady(sim, 5).await;
     routing_settled(sim).await?;
+    // Both nodes are up from here (each mark is recorded before the state
+    // it sets is visible), so D-8 below judges both.
+    let settled_at = sim.clock.now_ms();
     let fault = Fault::LinkCut(LinkState::Blackholed);
     let fault_at = sim.inject(fault).await?;
     steady(sim, 4).await;
@@ -1716,12 +1754,12 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
     let serving: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| report.up_at(name, fault_at))
+        .filter(|name| report.up_at(name, settled_at))
         .collect();
     let withdrawn: Vec<&str> = serving
         .iter()
         .copied()
-        .filter(|name| !report.up_throughout(name, fault_at, until))
+        .filter(|name| !report.up_throughout(name, settled_at, until))
         .collect();
     let failed_while_up: std::collections::BTreeMap<&str, usize> = names
         .iter()
@@ -1730,7 +1768,7 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
                 .failed_checks
                 .iter()
                 .filter(|f| {
-                    f.backend == name && f.while_up && (fault_at..=until).contains(&f.at_ms)
+                    f.backend == name && f.while_up && (settled_at..=until).contains(&f.at_ms)
                 })
                 .count();
             (name, count)
@@ -1738,10 +1776,11 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
         .collect();
     body.expect(
         "a link loss never withdraws a serving node (D-8)",
-        !serving.is_empty() && withdrawn.is_empty(),
+        serving.len() == names.len() && withdrawn.is_empty(),
         format!(
-            "serving at the cut: {serving:?} (others not judged); withdrawn between the cut and \
-             {} ms after the catch-up ({fault_at}..{until} ms): {withdrawn:?}; checks failed while \
+            "serving just before the cut: {serving:?} (both must be); withdrawn between then and \
+             {} ms after the catch-up ({settled_at}..{until} ms; the cut at {fault_at} ms): \
+             {withdrawn:?}; checks failed while \
              serving: {failed_while_up:?}; transitions: {:?}",
             horizon.as_millis(),
             report.transitions
@@ -1797,7 +1836,23 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
             return Err(error);
         }
     };
-    tokio::time::sleep(TRANSIENT_HOLD).await;
+    // Every apply of A's that reaches the locked table waits there until
+    // A's lock_timeout: each distinct (backend, statement start) seen
+    // waiting is one attempt.
+    let mut attempts: std::collections::BTreeSet<(i32, String)> = Default::default();
+    let holding = Instant::now();
+    while holding.elapsed() < TRANSIENT_HOLD {
+        let waiting: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT a.pid, a.query_start::text FROM pg_locks l \
+             JOIN pg_stat_activity a ON a.pid = l.pid \
+             WHERE NOT l.granted AND l.relation = 'qbit_pool_audit_bundles'::regclass \
+               AND a.query_start IS NOT NULL",
+        )
+        .fetch_all(&a)
+        .await?;
+        attempts.extend(waiting);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let held_while_locked: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM qbit_pool_blocks WHERE block_hash = $1)")
             .bind(&block)
@@ -1816,10 +1871,14 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
     a.close().await;
     body.expect(
         "B's block, which A failed to apply while locked, lands on A once the lock clears",
-        !held_while_locked && landed.is_ok() && conflicts.is_empty(),
+        !attempts.is_empty() && !held_while_locked && landed.is_ok() && conflicts.is_empty(),
         format!(
-            "on A while locked: {held_while_locked} (the lock must keep it out); confirmed on A \
+            "{} of A's applies waited on the lock during the {} s hold (at least one must, or the \
+             retry was never exercised); on A while locked: {held_while_locked} (the lock must keep \
+             it out); confirmed on A \
              after the release: {}; sync conflicts recorded for it: {conflicts:?}",
+            attempts.len(),
+            TRANSIENT_HOLD.as_secs(),
             match &landed {
                 Ok(took) => format!("after {:.1} s", took.as_secs_f64()),
                 Err(error) => format!("not within {CATCH_UP_BOUND:?} ({error:#})"),
@@ -2050,12 +2109,44 @@ async fn peer_read_probe(sim: &Sim, node: Node) -> (bool, String) {
 async fn wait_accepted_on(sim: &Sim, node: Node, after_ms: u64, limit: Duration) -> Result<usize> {
     let started = Instant::now();
     loop {
-        let accepted = accepted_from(&sim.load()?.records(), node, after_ms);
+        let accepted = sim.load()?.accepted_on(node, after_ms);
         if accepted > 0 || started.elapsed() >= limit {
             return Ok(accepted);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// S6's unreadable-peer restart, with B unreadable: probe B as the peer
+/// role, restart A's frontend, and judge whether it serves.
+async fn restart_beside_unreadable_peer(sim: &mut Sim, body: &mut Body) -> Result<()> {
+    let (unreadable, probe) = peer_read_probe(sim, Node::B).await;
+    let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
+    sim.frontend_mut(Node::A).start()?;
+    let restarted_at = sim.clock.now_ms();
+    let ready = sim
+        .frontend(Node::A)
+        .wait_ready(UNREADABLE_READY_BOUND)
+        .await;
+    let accepted = match &ready {
+        Ok(_) => wait_accepted_on(sim, Node::A, restarted_at, Duration::from_secs(60)).await?,
+        Err(_) => 0,
+    };
+    body.expect(
+        "A restarts and serves while its peer answers but cannot be read (D-8, D-17)",
+        unreadable && ready.is_ok() && accepted > 0,
+        format!(
+            "B as the peer role: {probe}; A {}; shares accepted on A's jobs after its restart: \
+             {accepted}",
+            match &ready {
+                Ok(took) => format!("ready {:.1} s after its restart", took.as_secs_f64()),
+                Err(error) => format!("not ready within {UNREADABLE_READY_BOUND:?} ({error:#})"),
+            }
+        ),
+    );
+    body.gaps
+        .push(report::gap(&sim.load()?.records(), fault_at));
+    Ok(())
 }
 
 /// S6, the peer answers but cannot be read (the coordinator's review of D1's
@@ -2097,34 +2188,9 @@ async fn s06_peer_unreadable(sim: &mut Sim, how: Unreadable) -> Result<Body> {
         "B answers, but its share ledger cannot be read ({})",
         how.id()
     ));
-    let (unreadable, probe) = peer_read_probe(sim, Node::B).await;
-
-    let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
-    sim.frontend_mut(Node::A).start()?;
-    let restarted_at = sim.clock.now_ms();
-    let ready = sim
-        .frontend(Node::A)
-        .wait_ready(UNREADABLE_READY_BOUND)
-        .await;
-    let accepted = match &ready {
-        Ok(_) => wait_accepted_on(sim, Node::A, restarted_at, Duration::from_secs(60)).await?,
-        Err(_) => 0,
-    };
-    body.expect(
-        "A restarts and serves while its peer answers but cannot be read (D-8, D-17)",
-        unreadable && ready.is_ok() && accepted > 0,
-        format!(
-            "B as the peer role: {probe}; A {}; shares accepted on A's jobs after its restart: \
-             {accepted}",
-            match &ready {
-                Ok(took) => format!("ready {:.1} s after its restart", took.as_secs_f64()),
-                Err(error) => format!("not ready within {UNREADABLE_READY_BOUND:?} ({error:#})"),
-            }
-        ),
-    );
-    body.gaps
-        .push(report::gap(&sim.load()?.records(), fault_at));
-
+    // Whatever the restart does, B is made readable again before an error is
+    // raised.
+    let outcome = restart_beside_unreadable_peer(sim, &mut body).await;
     match lock.take() {
         Some(transaction) => transaction.rollback().await?,
         None => {
@@ -2138,6 +2204,7 @@ async fn s06_peer_unreadable(sim: &mut Sim, how: Unreadable) -> Result<Body> {
     }
     b.close().await;
     sim.mark("B readable again");
+    outcome?;
     for node in Node::BOTH {
         if !sim.frontend(node).running() {
             sim.frontend_mut(node).start()?;
