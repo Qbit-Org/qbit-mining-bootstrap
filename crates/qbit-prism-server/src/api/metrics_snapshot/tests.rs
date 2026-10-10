@@ -107,6 +107,46 @@ fn assert_pool_histogram(body: &str, result: &str, observations: &[(f64, u64)]) 
     }
 }
 
+/// 3.1: a stale snapshot's admission and gated-listener samples read 0,
+/// as the readiness endpoint and the listeners treat a decision that old;
+/// a stalled runtime with a fresh snapshot rewrites only the health sample.
+#[tokio::test]
+async fn a_stale_snapshot_reports_no_admission_and_closed_listeners() {
+    let cached = "# TYPE qbit_prism_health_state gauge\nqbit_prism_health_state 1\n\
+        # TYPE qbit_prism_admission_admitting gauge\nqbit_prism_admission_admitting 1\n\
+        # TYPE qbit_prism_admission_state gauge\nqbit_prism_admission_state{state=\"admitting\"} 1\n\
+        # TYPE qbit_prism_stratum_listener_accepting gauge\n\
+        qbit_prism_stratum_listener_accepting{listener=\"default\"} 1\n\
+        qbit_prism_connections 7\n";
+    let stale_after = Duration::from_secs(15);
+    let published_at = Instant::now();
+    let snapshot = MetricsSnapshot {
+        body: cached.into(),
+        published_at: Some(published_at),
+    };
+    let fresh = body(snapshot.clone().response(published_at, stale_after)).await;
+    assert_eq!(sample(&fresh, "qbit_prism_admission_admitting"), 1.);
+    let stale = body(snapshot.response(
+        published_at + stale_after + Duration::from_secs(1),
+        stale_after,
+    ))
+    .await;
+    for name in [
+        "qbit_prism_health_state",
+        "qbit_prism_admission_admitting",
+        "qbit_prism_stratum_listener_accepting{listener=\"default\"}",
+    ] {
+        assert_eq!(sample(&stale, name), 0., "{name}");
+    }
+    // The last decision's state and every other family keep their values.
+    assert_eq!(
+        sample(&stale, "qbit_prism_admission_state{state=\"admitting\"}"),
+        1.
+    );
+    assert_eq!(sample(&stale, "qbit_prism_connections"), 7.);
+    assert!(stale.contains("# TYPE qbit_prism_admission_admitting gauge\n"));
+}
+
 #[tokio::test]
 async fn stale_snapshot_overlays_new_pool_waits_without_republishing_other_observations() {
     let metrics = Metrics::default();

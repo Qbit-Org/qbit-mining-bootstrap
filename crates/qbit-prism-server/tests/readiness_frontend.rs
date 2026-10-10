@@ -580,8 +580,9 @@ async fn a_rebuild_inside_the_grace_keeps_the_endpoint_ready_and_a_longer_one_wi
         // with the next fetch unanswered the work stays on the old revision.
         let mut held = node.pause_next("getblocktemplate")?;
         tokio::time::timeout(DEADLINE, held.entered()).await??;
-        // Taken before the bump commits, so the frontend cannot have seen
-        // the bump, and started its grace, any earlier.
+        // Taken before the bump commits. The grace runs from the frontend's
+        // last ready publication, which came at most one publication
+        // interval (PRISM_HEALTH_REFRESH_SECONDS, 1 s here) before the bump.
         let bumped = Instant::now();
         let revision = bump_payout_revision(pool).await?;
         let readyz = format!("http://127.0.0.1:{}/readyz", ports.readiness);
@@ -615,8 +616,10 @@ async fn a_rebuild_inside_the_grace_keeps_the_endpoint_ready_and_a_longer_one_wi
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         ensure!(dipped, "readiness never dipped while the rebuild was held");
+        // One publication interval before the bump, plus scheduling jitter.
+        let earliest = DEFAULT_GRACE - Duration::from_secs(2);
         ensure!(
-            withdrawn_after >= DEFAULT_GRACE,
+            withdrawn_after >= earliest,
             "withdrawn {withdrawn_after:?} after the bump, inside the {DEFAULT_GRACE:?} grace"
         );
         let health = health_until(client, ports, server, "withdrawn", |health| {

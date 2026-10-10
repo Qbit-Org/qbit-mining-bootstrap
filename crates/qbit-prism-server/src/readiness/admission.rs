@@ -6,8 +6,12 @@
 //! work is published, so admission tolerates a dip shorter than the grace
 //! (`PRISM_READINESS_GRACE_SECONDS`, ten seconds by default: the bound of the
 //! operator readiness contract in `docs/prism-ha-reference-architecture.md`).
-//! A hard fault, one that says this node must not take miners at all,
-//! withdraws at once. A frontend that has never been ready admits nothing.
+//! The grace runs from the last observation that found the frontend ready,
+//! not from the first that did not: a publisher stalled for longer than the
+//! grace, as by a dead database, withdraws the frontend at its next
+//! publication instead of granting it a fresh grace. A hard fault, one that
+//! says this node must not take miners at all, withdraws at once. A frontend
+//! that has never been ready admits nothing.
 use std::time::{Duration, Instant};
 
 /// The default `PRISM_READINESS_GRACE_SECONDS`.
@@ -65,7 +69,9 @@ pub enum AdmissionState {
     /// Never admitted since the process started.
     Starting,
     Admitting,
-    /// Still admitting, with readiness false since `since`.
+    /// Still admitting, with readiness false since the observation after
+    /// `since`, the last that found the frontend ready, which the grace runs
+    /// from.
     Grace {
         since: Instant,
     },
@@ -122,6 +128,9 @@ pub enum AdmissionChange {
 pub struct Admission {
     grace: Duration,
     state: AdmissionState,
+    /// The last observation that found the frontend ready without a hard
+    /// fault.
+    last_ready: Option<Instant>,
 }
 
 impl Admission {
@@ -129,6 +138,7 @@ impl Admission {
         Self {
             grace,
             state: AdmissionState::Starting,
+            last_ready: None,
         }
     }
 
@@ -158,9 +168,14 @@ impl Admission {
             (AdmissionState::Withdrawn { .. }, None) => AdmissionState::Withdrawn {
                 reason: Withdrawal::NotReady,
             },
-            (AdmissionState::Admitting, None) => self.within_grace(now, now),
+            (AdmissionState::Admitting, None) => {
+                self.within_grace(self.last_ready.unwrap_or(now), now)
+            }
             (AdmissionState::Grace { since }, None) => self.within_grace(since, now),
         };
+        if ready && hard.is_none() {
+            self.last_ready = Some(now);
+        }
         match (before.admits(), self.state) {
             (false, now) if now.admits() => Some(AdmissionChange::Admitted),
             (true, AdmissionState::Withdrawn { reason }) => {
@@ -170,7 +185,7 @@ impl Admission {
         }
     }
 
-    /// Readiness false since `since`: admitting until the grace runs out.
+    /// Ready last at `since`: admitting until the grace from then runs out.
     fn within_grace(&self, since: Instant, now: Instant) -> AdmissionState {
         if now.saturating_duration_since(since) >= self.grace {
             AdmissionState::Withdrawn {
@@ -275,21 +290,48 @@ mod tests {
         let mut admission = Admission::new(GRACE);
         admission.observe(start, true, None);
         assert_eq!(admission.observe(at(start, 1), false, None), None);
+        // The grace runs from the last ready observation.
+        assert_eq!(admission.state(), AdmissionState::Grace { since: start });
+        assert_eq!(admission.observe(at(start, 9), false, None), None);
+        assert!(admission.state().admits());
+        assert_eq!(admission.observe(at(start, 9), true, None), None);
+        assert_eq!(admission.state(), AdmissionState::Admitting);
+    }
+
+    #[test]
+    fn a_publication_later_than_the_grace_after_the_last_ready_one_withdraws_at_once() {
+        // A publisher stalled by a dead database publishes again 30 s after
+        // it last found the frontend ready: no fresh grace.
+        let start = Instant::now();
+        let mut admission = Admission::new(GRACE);
+        admission.observe(start, true, None);
+        assert_eq!(
+            admission.observe(at(start, 30), false, None),
+            Some(AdmissionChange::Withdrawn(Withdrawal::NotReady))
+        );
+        assert!(!admission.state().admits());
+    }
+
+    #[test]
+    fn a_dip_after_readiness_returns_measures_from_the_new_ready_observation() {
+        let start = Instant::now();
+        let mut admission = Admission::new(GRACE);
+        admission.observe(start, true, None);
+        admission.observe(at(start, 5), false, None);
+        assert_eq!(admission.observe(at(start, 8), true, None), None);
+        assert_eq!(admission.observe(at(start, 15), false, None), None);
         assert_eq!(
             admission.state(),
             AdmissionState::Grace {
-                since: at(start, 1)
+                since: at(start, 8)
             }
         );
-        // Later dips keep the first one's start: the grace is continuous.
-        assert_eq!(admission.observe(at(start, 10), false, None), None);
+        assert_eq!(admission.observe(at(start, 17), false, None), None);
         assert!(admission.state().admits());
-        assert_eq!(admission.observe(at(start, 11), true, None), None);
-        assert_eq!(admission.state(), AdmissionState::Admitting);
-        // A new dip starts a new grace.
-        assert_eq!(admission.observe(at(start, 12), false, None), None);
-        assert_eq!(admission.observe(at(start, 21), false, None), None);
-        assert!(admission.state().admits());
+        assert_eq!(
+            admission.observe(at(start, 18), false, None),
+            Some(AdmissionChange::Withdrawn(Withdrawal::NotReady))
+        );
     }
 
     #[test]
@@ -298,8 +340,9 @@ mod tests {
         let mut admission = Admission::new(GRACE);
         admission.observe(start, true, None);
         admission.observe(at(start, 2), false, None);
+        assert_eq!(admission.observe(at(start, 9), false, None), None);
         assert_eq!(
-            admission.observe(at(start, 12), false, None),
+            admission.observe(at(start, 10), false, None),
             Some(AdmissionChange::Withdrawn(Withdrawal::NotReady))
         );
         assert_eq!(
