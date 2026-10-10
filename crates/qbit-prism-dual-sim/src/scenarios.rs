@@ -2728,6 +2728,36 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
 /// chain holds (D-10, D-11): its reconciler's next look at the chain, the
 /// synced prepared record, a landing.
 pub const ADOPTION_BOUND: Duration = Duration::from_secs(90);
+/// How long a returned node may take to land the block it died offering:
+/// the dead frontend's claim on the candidate holds for PRISM's 120 s
+/// candidate lease from its last renewal, then the restarted frontend
+/// recovers the reservation as unknown, finds the block on the chain and
+/// lands it (or skips it, if the peer's adoption reached it first).
+pub const RECOVERED_LANDING_BOUND: Duration = Duration::from_secs(180);
+
+/// How many of A's prepared records on `parent` each node holds, as text:
+/// what the survivor needs to adopt A's block (D-11).
+async fn prepared_on_parent(sim: &Sim, parent: &str) -> String {
+    let mut held = Vec::new();
+    for node in Node::BOTH {
+        let count = match sim.pool(node).await {
+            Ok(pool) => {
+                let count: Result<i64, _> = sqlx::query_scalar(
+                    "SELECT count(*) FROM qbit_prism_jobs \
+                     WHERE job_id LIKE 'prepared:%' AND parent_hash = $1 AND origin_node = 0",
+                )
+                .bind(parent)
+                .fetch_one(&pool)
+                .await;
+                pool.close().await;
+                count.map_or_else(|error| format!("unreadable ({error})"), |n| n.to_string())
+            }
+            Err(error) => format!("unreachable ({error:#})"),
+        };
+        held.push(format!("{node:?} {count}"));
+    }
+    held.join(", ")
+}
 
 /// S8. Node A finds a block and dies at that instant, with its
 /// `submitblock` held at the gate in front of its `qbitd`:
@@ -2795,6 +2825,15 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
             }
         }
         DeathAtFind::Accepted { wait } => {
+            let parent = sim
+                .chain
+                .c
+                .rpc("getblockheader", json!([hash]))
+                .await
+                .ok()
+                .and_then(|header| header["previousblockhash"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let held = prepared_on_parent(sim, &parent).await;
             let adopted = sim.wait_confirmed(&hash, &[Node::B], ADOPTION_BOUND).await;
             body.expect(
                 &format!(
@@ -2804,7 +2843,10 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
                 adopted.is_ok() || !wait,
                 match &adopted {
                     Ok(took) => format!("confirmed on B {:.1} s after A died", took.as_secs_f64()),
-                    Err(error) => format!("not adoptable: {error:#}"),
+                    Err(error) => format!(
+                        "not adoptable: {error:#}; A's prepared records on its parent {parent} \
+                         when A died: {held}"
+                    ),
                 },
             );
         }
@@ -2815,8 +2857,13 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
         .wait_state("a", true, Duration::from_secs(60))
         .await?;
     if on_chain {
-        sim.wait_confirmed(&hash, &Node::BOTH, CATCH_UP_BOUND)
+        let took = sim
+            .wait_confirmed(&hash, &Node::BOTH, RECOVERED_LANDING_BOUND)
             .await?;
+        sim.mark(&format!(
+            "{hash} landed and confirmed on both nodes {:.1} s after A returned",
+            took.as_secs_f64()
+        ));
         for node in Node::BOTH {
             let pool = sim.pool(node).await?;
             let (blocks, carry): (i64, i64) = sqlx::query_as(
