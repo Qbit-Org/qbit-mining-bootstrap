@@ -147,10 +147,9 @@ CREATE TABLE IF NOT EXISTS qbit_prism_node_identity (
 --    peer_tail_lost_at is an operator's declaration, during a long peer
 --    outage, that the peer's rows this node has not pulled are lost and the
 --    peer will be rebuilt from this node (docs/prism-ledger-ops.md). Until it
---    is set, the hashrate rollups and the share archive stop at the safe peer
---    mark (6), since a peer row can still arrive above it; while it is set
---    they do not. Local state, never copied; the peer's sync role reads the
---    floors.
+--    is set, the share archive stops at the safe peer mark (6), since a peer
+--    row can still arrive above it; while it is set it does not. Local
+--    state, never copied; the peer's sync role reads the floors.
 CREATE TABLE IF NOT EXISTS qbit_prism_node_lineage (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     share_seq_floor bigint NOT NULL,

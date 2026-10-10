@@ -3916,28 +3916,28 @@ offered whatever the wait finds, counted in
 **Hashrate rollups and the share archive.** Both assume a row never commits
 below one already folded, which holds for a node's own shares but not for
 the peer's: the sync inserts them later, below shares this node already
-holds. None arrives at or below the safe peer mark, so on a dual writer the
-rollup sweep stops there, and `share-archive plan` holds back every partition
-the mark has not passed (its `rollup_watermark` condition says so). In steady
-state the rollups trail by about two sync passes. While the peer is down they
-stop, `qbit_prism_hashrate_rollup_watermark_lag_seconds` grows, and the
-dashboards read the unfolded shares since. If the peer will be rebuilt from
-this node (below), its rows this node has not pulled are lost anyway; declare
-so, and the rollups and the archive go on without the mark:
+holds. The rollup sweep runs as on a single writer, and a peer share that
+lands below its watermark is folded into the rollups by the pull that
+inserts it, in the same transaction; the two serialise on the rollup progress
+row. So the rollups never wait for the peer. The archive does: `share-archive
+plan` holds back every partition the safe peer mark has not passed (its
+`rollup_watermark` condition says so), since the peer's rows can still land
+in it. While the peer is down, partitions stop leaving. If the peer will be
+rebuilt from this node (below), its rows this node has not pulled are lost
+anyway; declare so, and the archive goes on without the mark:
 
 ```sql
 UPDATE qbit_prism_node_lineage SET peer_tail_lost_at = clock_timestamp();
 ```
 
 Clear it (`SET peer_tail_lost_at = NULL`) once the rebuilt peer syncs.
-`node-identity repersonalise` clears it on the rebuilt node. A frontend
-decides its rollups from its own mode, and `share-archive plan` from the
-database, which stays personalised: after a downgrade to a single writer
-(`PRISM_DUAL_WRITER_DOWNGRADE`), declare the peer's tail lost too, or the
-archive waits for a peer that no longer syncs. Never declare it
+`node-identity repersonalise` clears it on the rebuilt node. `share-archive
+plan` reads the database, which stays personalised: after a downgrade to a
+single writer (`PRISM_DUAL_WRITER_DOWNGRADE`), declare the peer's tail lost
+too, or the archive waits for a peer that no longer syncs. Never declare it
 for a peer that will come back with its own database: its unpulled shares
-would then arrive below the watermark, unfolded, or into a partition that has
-left, where the share stream stops until the partition is restored.
+could then arrive into a partition that has left, where the share stream
+stops until the partition is restored.
 
 **The peer's sync role.** Each node's database grants the other node's
 pulls one login role, `prism_peer_sync`, with no write right anywhere, and
@@ -4010,9 +4010,15 @@ refuses, changing nothing:
   counting 60 seconds after the copy stopped following the peer;
 - on the server the peer last proved its own log on (the same system
   identifier and timeline): that is the peer's own database, not a promoted
-  copy. This check needs that proof: while the peer has none recorded (its
-  own-log recovery has not completed since a restore), nothing tells its own
-  database from a copy, so run the command only on the promoted copy;
+  copy;
+- when the copy carries no such proof (a peer never verified, or one whose
+  own-log recovery forgot it), since nothing then tells the peer's own
+  database from a copy, unless `--unverified-copy` says the operator made
+  sure this is the promoted copy;
+- when the server behind `PRISM_PEER_DATABASE_URL`, read first, reports this
+  database's system identifier and timeline: the peer's own database again.
+  If that setting is set and its server cannot be read, it refuses too,
+  unless `--unverified-copy` is given;
 - while the schema holds a table that the dual-writer table inventory
   (`crates/qbit-prism-server/src/ledger/table_inventory.rs`) does not
   classify, or lacks one it names.

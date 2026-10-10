@@ -965,6 +965,106 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
     .await
 }
 
+/// Every column of each copied table, sorted, as this release's migrations
+/// leave them (CONTRACT D-2's list). A new column on a copied table fails
+/// here until someone decides what the sync does with it: carry it, or keep
+/// it local (ledger/table_inventory.rs, and `carried()` in
+/// ledger/peer_sync.rs), and then pins it here.
+const COPIED_COLUMNS: [(&str, &str); 13] = [
+    (
+        "qbit_share_ledger",
+        "accepted,accepted_at,credit_policy,job_id,job_issued_at,miner_id,\
+         network_difficulty,ntime,origin_node,p2mr_program,payout_order_key,\
+         reject_reason,share_difficulty,share_id,share_seq,template_height,\
+         writer_epoch,writer_id",
+    ),
+    (
+        "qbit_prism_share_hashes",
+        "header_hash,origin_node,share_id",
+    ),
+    (
+        "qbit_pool_blocks",
+        "as_issued_audit_sha256,audit_publication_sequence,block_hash,\
+         block_height,chain_state,coinbase_txid,disconnected_at,found_at,\
+         inactive_since,matured_at,maturity_state,origin_node,parent_hash,\
+         payout_manifest_sha256,solver_miner_id,solver_network_difficulty,\
+         solver_share_difficulty,solver_share_id,sync_seq",
+    ),
+    (
+        "qbit_prism_audit_snapshots",
+        "anchor_ms,created_at,first_share_seq,inline_shares,last_share_seq,\
+         origin_node,share_count,snapshot_sha256",
+    ),
+    (
+        "qbit_pool_audit_bundles",
+        "audit_body_byte_len,audit_bundle,audit_bundle_sha256,\
+         audit_commitment_leaves_hex,block_hash,body_uri,canonical_audit_bytes,\
+         coinbase_tx_hex,created_at,found_block_bits,\
+         found_block_coinbase_value_sats,found_block_network_difficulty,\
+         origin_node,schema_version,share_snapshot_sha256,\
+         witness_merkle_leaves_hex",
+    ),
+    (
+        "qbit_pool_payout_entries",
+        "action,block_hash,block_height,carry_forward_balance_sats,created_at,\
+         maturity_state,miner_id,onchain_amount_sats,origin_node,p2mr_program,\
+         payout_entry_seq,payout_order_key",
+    ),
+    (
+        "qbit_payout_carry_forward",
+        "action,block_hash,block_height,candidate_balance_sats,\
+         carry_forward_balance_sats,carry_forward_seq,created_at,\
+         gross_amount_sats,maturity_state,miner_id,onchain_amount_sats,\
+         origin_node,p2mr_program,payout_order_key,prior_balance_sats,\
+         settlement_fee_sats",
+    ),
+    (
+        "qbit_ctv_fanout_sets",
+        "block_hash,covenant_output_value_sats,created_at,fanout_count,\
+         fanout_output_sum_sats,manifest_set,manifest_set_json,\
+         manifest_set_sha256,origin_node,parent_coinbase_tx_hex,\
+         parent_coinbase_txid,settlement_mode",
+    ),
+    (
+        "qbit_ctv_fanout_artifacts",
+        "anchor_vout,block_hash,broadcast_attempt_count,\
+         broadcast_attempt_detail_count,broadcast_attempt_status_counts,\
+         broadcast_retry_backoff_seconds,chunk_count,chunk_index,\
+         claim_expires_at,claim_instance_id,claim_lease_seconds,claim_renewals,\
+         claim_token,commitment_witness_leaf_hex,confirmed_block_hash,\
+         confirmed_block_height,confirmed_depth,covenant_output_value_sats,\
+         ctv_hash,fanout_output_sum_sats,fanout_tx_hex,fanout_tx_template_hex,\
+         fanout_txid,first_broadcast_attempt_at,last_broadcast_attempt_at,\
+         last_broadcast_attempt_status,last_broadcast_error,\
+         last_broadcast_package_tx_hexes,last_broadcast_package_txids,\
+         last_broadcast_submit_result,manifest,manifest_json,\
+         manifest_set_sha256,manifest_sha256,next_broadcast_attempt_at,\
+         origin_node,parent_coinbase_txid,parent_coinbase_vout,\
+         precommitment_sha256,settlement_status,spend_scan_anchor_hash,\
+         spend_scan_anchor_height,spend_scan_next_height,updated_at",
+    ),
+    (
+        "qbit_prism_templates",
+        "origin_node,template_bytes,template_sha256",
+    ),
+    (
+        "qbit_prism_balance_snapshots",
+        "balances,origin_node,prior_balances_digest",
+    ),
+    (
+        "qbit_prism_jobs",
+        "created_at,expires_at,instance_id,job_id,origin_node,parent_hash,\
+         payload,payout_revision,sync_seq,template_sha256,window_anchor_ms,\
+         window_first_share_seq,window_last_share_seq,\
+         window_prior_balances_sha256,window_share_count,\
+         window_snapshot_sha256",
+    ),
+    (
+        "qbit_prism_node_roles",
+        "action,carry_owner,detail,epoch,origin_node,recorded_at,recorded_by",
+    ),
+];
+
 /// The sync carries exactly the columns of each copied table that the table
 /// inventory does not name as a node's own (ledger/table_inventory.rs), but
 /// a prepared job's `expires_at`, which it copies as the peer held it, so
@@ -980,6 +1080,7 @@ async fn the_sync_carries_every_column_the_inventory_does_not_keep_local() -> Re
     let ledger = Ledger::connect(&db.url, "columns".into(), 4, true).await?;
     let result = async {
         let carried = ledger.carried_columns().await?;
+        ensure!(COPIED_COLUMNS.len() == COPIED_TABLES.len());
         for table in COPIED_TABLES {
             let all: Vec<String> = sqlx::query_scalar(
                 "SELECT attname::text FROM pg_attribute WHERE attrelid=$1::regclass AND attnum>0 AND NOT attisdropped ORDER BY attname",
@@ -987,6 +1088,15 @@ async fn the_sync_carries_every_column_the_inventory_does_not_keep_local() -> Re
             .bind(table)
             .fetch_all(&ledger.pool)
             .await?;
+            let pinned = COPIED_COLUMNS
+                .iter()
+                .find(|(pinned, _)| pinned == table)
+                .map(|(_, columns)| columns.split(',').collect::<Vec<_>>())
+                .with_context(|| format!("{table} has no pinned column list"))?;
+            ensure!(
+                all == pinned,
+                "{table}'s columns changed: decide whether the sync carries each new one, then pin them; now {all:?}"
+            );
             let local = table_inventory::local_columns(table);
             for column in &all {
                 let is_carried = carried.of(table).contains(column);
@@ -1294,11 +1404,10 @@ async fn rollup_watermark(pool: &PgPool) -> Result<i64> {
     .await
 }
 
-/// A dual writer's hashrate rollups stop at the safe peer mark, so a peer
-/// share pulled after this node's own newer ones, with a share_seq below
-/// them, is still folded, where 3.0's sweep would have passed it already.
-/// Nothing is folded before the first pull, and an operator's declaration
-/// that the peer's unpulled rows are lost lifts the stop.
+/// A dual writer's hashrate rollups sweep as a single writer's do, and a
+/// peer share pulled after this node's own newer ones, with a share_seq
+/// below the sweep's watermark, is folded once, by the pull that inserts it.
+/// A peer share above the watermark is the sweep's.
 #[tokio::test]
 async fn a_late_peer_share_below_the_local_max_is_still_rolled_up() -> Result<()> {
     use qbit_prism_server::rollups::advance_dual_writer;
@@ -1312,46 +1421,37 @@ async fn a_late_peer_share_below_the_local_max_is_still_rolled_up() -> Result<()
             b_seqs[0] < a_seqs[2],
             "B's share {b_seqs:?} is not below A's {a_seqs:?}"
         );
-        // Before A's first pull nothing is folded, not even A's own shares:
-        // 3.0's sweep would move the watermark to A's newest share here, and
-        // B's share would arrive below it.
-        ensure!(advance_dual_writer(&pair.a.pool, 1000).await?.scanned == 0);
-        ensure!(rollup_watermark(&pair.a.pool).await? == 0);
+        // A's own shares fold as a single writer's do, peer or no peer.
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        ensure!(rollup_watermark(&pair.a.pool).await? == a_seqs[2]);
+        ensure!(rolled_up(&pair.a.pool).await? == 3);
+        // B's share arrives below that watermark: the pull folds it.
         let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
         pass_until(&mut on_a, async |_| {
             Ok(shares_of(&pair.a.pool, 1).await?.len() == 1)
         })
         .await?;
-        advance_dual_writer(&pair.a.pool, 1000).await?;
-        ensure!(rollup_watermark(&pair.a.pool).await? < a_seqs[2]);
-        // Once B holds A's shares, A's mark passes them and all four fold.
-        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
-        pass_until(&mut on_b, async |_| {
-            Ok(shares_of(&pair.b.pool, 0).await?.len() == 3)
-        })
-        .await?;
-        pass_until(&mut on_a, async |_| {
-            let mark: Option<i64> = sqlx::query_scalar("SELECT qbit_prism_peer_share_mark()")
-                .fetch_one(&pair.a.pool)
-                .await?;
-            Ok(mark >= Some(a_seqs[2]))
-        })
-        .await?;
-        advance_dual_writer(&pair.a.pool, 1000).await?;
-        ensure!(rollup_watermark(&pair.a.pool).await? == a_seqs[2]);
         ensure!(
             rolled_up(&pair.a.pool).await? == 4,
             "{} folded",
             rolled_up(&pair.a.pool).await?
         );
-        // A share of A's above the mark waits, until the peer's tail is
-        // declared lost.
-        append(&pair.a, &["late-a4"]).await?;
+        // The sweep never counts it again.
         advance_dual_writer(&pair.a.pool, 1000).await?;
         ensure!(rolled_up(&pair.a.pool).await? == 4);
-        sqlx::query("UPDATE qbit_prism_node_lineage SET peer_tail_lost_at=clock_timestamp()")
-            .execute(&pair.a.pool)
-            .await?;
+        // A share of B's above A's watermark is left to the sweep.
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| {
+            Ok(shares_of(&pair.b.pool, 0).await?.len() == 3)
+        })
+        .await?;
+        let high = append(&pair.b, &["late-b2"]).await?;
+        ensure!(high[0] > a_seqs[2], "{high:?}");
+        pass_until(&mut on_a, async |_| {
+            Ok(shares_of(&pair.a.pool, 1).await?.len() == 2)
+        })
+        .await?;
+        ensure!(rolled_up(&pair.a.pool).await? == 4);
         advance_dual_writer(&pair.a.pool, 1000).await?;
         ensure!(rolled_up(&pair.a.pool).await? == 5);
         Ok(())
@@ -1689,6 +1789,91 @@ async fn a_frontend_whose_identity_changes_while_it_runs_stops() -> Result<()> {
         ensure!(!status.borrow().own_log_caught_up);
         ensure!(pair.b.own_log_lost());
         Ok(())
+    })
+    .await
+}
+
+/// Landed blocks commit out of sync_seq order, so a backup can hold a block
+/// whose earlier-numbered sibling was still open. Own-log recovery reads
+/// every own block the peer holds, not only those above the highest held
+/// here, and the restored node gets the earlier one back.
+#[tokio::test]
+async fn recovery_finds_an_own_block_committed_after_a_later_numbered_one() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        append(&pair.a, &["o1", "o2", "o3"]).await?;
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut on_a, async |report| Ok(report.own_log_caught_up)).await?;
+        // The first block draws its sync_seq and stays open while the second
+        // lands and commits.
+        let first = hex("block out-of-order-1");
+        let mut open = pair.a.pool.begin().await?;
+        land_in(
+            &mut open,
+            "out-of-order-1",
+            400,
+            &first,
+            &hex("snapshot out-of-order-1"),
+            &hex("coinbase out-of-order-1"),
+        )
+        .await?;
+        let second = land(&pair.a, "out-of-order-2", 401).await?;
+        let (first_seq, second_seq): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT sync_seq FROM qbit_pool_blocks WHERE block_hash=$1),\
+             (SELECT sync_seq FROM qbit_pool_blocks WHERE block_hash=$2)",
+        )
+        .bind(&first)
+        .bind(&second)
+        .fetch_one(&mut *open)
+        .await?;
+        ensure!(first_seq < second_seq, "{first_seq} {second_seq}");
+        let backup = FixtureDatabase::open(&raw, "sync_backup_").await?;
+        let result = async {
+            pg_copy(&pair.a.pool, &backup).await?;
+            open.commit().await?;
+            let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+            pass_until(&mut on_b, async |_| {
+                Ok(count(&pair.b.pool, "SELECT count(*) FROM qbit_pool_blocks").await? == 2)
+            })
+            .await?;
+            // A is restored: it holds the second block, not the first.
+            let restored = Ledger::connect(&backup.url, "node-a".into(), 8, true).await?;
+            let held = |hash: String| {
+                let pool = restored.pool.clone();
+                async move {
+                    count(
+                        &pool,
+                        &format!("SELECT count(*) FROM qbit_pool_blocks WHERE block_hash='{hash}'"),
+                    )
+                    .await
+                }
+            };
+            ensure!(held(second.clone()).await? == 1 && held(first.clone()).await? == 0);
+            let (mut on_restored, _) = sync(&restored, NodeIndex::A, &pair.b_url);
+            pass_until(
+                &mut on_restored,
+                async |report| Ok(report.own_log_caught_up),
+            )
+            .await?;
+            ensure!(
+                held(first.clone()).await? == 1,
+                "recovery skipped the earlier-numbered block"
+            );
+            ensure!(
+                count(
+                    &restored.pool,
+                    "SELECT count(*) FROM qbit_prism_peer_sync_conflicts"
+                )
+                .await?
+                    == 0
+            );
+            restored.pool.close().await;
+            Ok(())
+        }
+        .await;
+        backup.close(result).await
     })
     .await
 }

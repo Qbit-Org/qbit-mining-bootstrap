@@ -869,10 +869,18 @@ impl Ledger {
     ) -> Result<Applied> {
         let mut applied = Applied::default();
         let own = origin == node;
-        // A key this far above what this node can hold is no key a node
+        // A peer key this far above what this node can hold is no key a node
         // drew: raising the sequence to it would leave every local append
         // without a partition. Refused below as a conflict, never raised to.
-        let ceiling = self.share_seq_ceiling().await?;
+        // This node's own rows, pulled back from the peer after a restore,
+        // are keys it drew itself, however far its restored sequence lags
+        // them (a backup node restored from an old backup): the sequence is
+        // raised to the highest of them.
+        let ceiling = if own {
+            i64::MAX
+        } else {
+            self.share_seq_ceiling().await?
+        };
         let acceptable = acceptable_highest(&batch.rows, ceiling)?;
         if batch.row_count > 0 {
             // Above every row about to be inserted, the peer's and this node's
@@ -889,8 +897,10 @@ impl Ledger {
             None
         };
         if batch.row_count > 0 {
-            // Header mappings this node holds for another share, and rows below
-            // every attached partition: refused whole.
+            // Header mappings this node holds for another share, a share this
+            // node credits at another share_seq (the ledger is unique on
+            // share_id per partition only), and rows below every attached
+            // partition: refused whole.
             let refused: Vec<(String, String)> = sqlx::query_as(
                 "WITH incoming AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_share_ledger,$1)),\
                  mappings AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_prism_share_hashes,$2)) \
@@ -898,6 +908,9 @@ impl Ledger {
                  FROM mappings m JOIN qbit_prism_share_hashes h ON h.header_hash=m.header_hash WHERE h.share_id<>m.share_id \
                  UNION ALL SELECT m.share_id,'share_id '||m.share_id||' maps header '||h.header_hash||' here, not '||m.header_hash \
                  FROM mappings m JOIN qbit_prism_share_hashes h ON h.share_id=m.share_id WHERE h.header_hash<>m.header_hash \
+                 UNION ALL SELECT i.share_id,'share_id '||i.share_id||' is credited here at another share_seq than '||i.share_seq \
+                 FROM incoming i WHERE EXISTS (SELECT 1 FROM qbit_prism_share_hashes h WHERE h.share_id=i.share_id) \
+                 AND NOT EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_seq=i.share_seq AND l.share_id=i.share_id) \
                  UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is below every attached partition' FROM incoming i \
                  WHERE i.share_seq<(SELECT COALESCE(min(lower_seq),-1) FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NOT NULL) \
                  AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NULL) \
@@ -991,6 +1004,17 @@ impl Ledger {
                 )
                 .await?;
                 applied.conflict("qbit_share_ledger");
+            }
+            // Inserted below the hashrate rollups' watermark, which this
+            // node's sweep has passed and never reads again: folded here, in
+            // this transaction, under the sweep's progress row.
+            let folded: i64 = sqlx::query_scalar(crate::rollups::LATE_PEER_SHARES)
+                .bind(&batch.rows)
+                .bind(&inserted)
+                .fetch_one(&mut *tx)
+                .await?;
+            if folded > 0 {
+                tracing::debug!(folded, "peer shares below the rollup watermark folded");
             }
         }
         if let (Some(stream), Some(through)) = (stream, batch.through) {
@@ -1397,6 +1421,32 @@ impl Ledger {
         .await?
         .rows_affected()
             == 1)
+    }
+
+    /// How many of `blocks` this database lacks.
+    pub async fn missing_blocks(&self, blocks: &[BlockBundle]) -> Result<i64> {
+        let hashes: Vec<&str> = blocks
+            .iter()
+            .map(|block| block.block_hash.as_str())
+            .collect();
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM unnest($1::text[]) h \
+             WHERE NOT EXISTS (SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=h)",
+        )
+        .bind(&hashes)
+        .fetch_one(&mut *self.acquire().await?)
+        .await?)
+    }
+
+    /// How many of `batch`'s prepared jobs this database lacks.
+    pub async fn missing_prepared(&self, batch: &PreparedBatch) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM jsonb_array_elements($1) j \
+             WHERE NOT EXISTS (SELECT 1 FROM qbit_prism_jobs p WHERE p.job_id=j->>'job_id')",
+        )
+        .bind(&batch.jobs)
+        .fetch_one(&mut *self.acquire().await?)
+        .await?)
     }
 
     /// Record that this node's own log was proved complete on the server

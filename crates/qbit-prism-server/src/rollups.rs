@@ -2,36 +2,44 @@
 use crate::metrics::{time_pool_acquire, Metrics};
 use anyhow::{ensure, Result};
 use sqlx::{PgPool, Transaction};
-use std::{
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-/// 3.0's sweep, which a single writer runs unchanged.
+/// 3.0's sweep, which a 3.1 dual writer runs too.
 const SWEEP: &str = include_str!("rollups.sql");
 
-/// The bound of the sweep's batch that the dual writer's sweep extends.
-const BATCH_BOUND: &str = "WHERE ledger.share_seq > (SELECT last_share_seq FROM progress)";
+/// The 3.1 dual writer's sweep takes the progress row first, so its own
+/// statement's snapshot starts after any transaction that holds it: the
+/// peer sync's, which folds the late peer shares it inserts
+/// ([`LATE_PEER_SHARES`]). A share that commits after a sweep passed its
+/// `share_seq` is therefore either seen by the next sweep or folded by the
+/// transaction that inserted it, never neither.
+pub(crate) const PROGRESS_LOCK: &str =
+    "SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton FOR UPDATE";
 
-/// The 3.1 dual writer's sweep. The watermark relies on rows committing in
-/// `share_seq` order, which holds for this node's own rows (ORDER_LOCK) but
-/// not for the peer's: the peer sync inserts them later, below shares this
-/// node already holds. None arrives at or below the safe peer mark
-/// (`qbit_prism_peer_share_mark()`, migration 027), so the batch stops
-/// there, and nothing rolls up before the first pull. An operator's
-/// declaration that the peer's unpulled rows are lost lifts the stop.
-static DUAL_WRITER_SWEEP: LazyLock<String> = LazyLock::new(|| {
-    SWEEP.replacen(
-        BATCH_BOUND,
-        &format!(
-            "{BATCH_BOUND}\n      AND ledger.share_seq <= (SELECT CASE WHEN EXISTS (SELECT 1 FROM \
-             qbit_prism_node_lineage WHERE peer_tail_lost_at IS NOT NULL) THEN 9223372036854775807 \
-             ELSE qbit_prism_peer_share_mark() END)"
-        ),
-        1,
-    )
-});
+/// Fold the peer shares a pull inserts at or below the sweep's watermark,
+/// which the sweep has passed and never reads again, into the rollup
+/// buckets, in the inserting transaction and under [`PROGRESS_LOCK`]: the
+/// same grains and buckets as `rollups.sql`'s `pool_rollup` and
+/// `miner_rollup`. Peer shares arrive below shares this node already holds,
+/// so the watermark can be past them; a share above it is the sweep's. `$1`
+/// is the pulled rows as JSON, `$2` the share IDs inserted. Returns the
+/// shares folded.
+pub(crate) const LATE_PEER_SHARES: &str = "WITH progress AS (SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton FOR UPDATE),\
+ batch AS (SELECT i.accepted_at,i.miner_id,i.share_difficulty FROM jsonb_populate_recordset(NULL::qbit_share_ledger,$1) i \
+   WHERE i.share_id=ANY($2) AND i.accepted AND i.share_seq<=(SELECT last_share_seq FROM progress)),\
+ grains AS (SELECT grain_seconds FROM (VALUES (300), (3600), (86400)) AS grain(grain_seconds)),\
+ pool_rollup AS (INSERT INTO qbit_hashrate_rollup_pool (grain_seconds,bucket_epoch,accepted_share_count,accepted_share_difficulty) \
+   SELECT grains.grain_seconds,floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch,\
+   count(*),sum(batch.share_difficulty) FROM batch, grains GROUP BY grains.grain_seconds, bucket_epoch \
+   ON CONFLICT (grain_seconds, bucket_epoch) DO UPDATE SET accepted_share_count = qbit_hashrate_rollup_pool.accepted_share_count + EXCLUDED.accepted_share_count,\
+   accepted_share_difficulty = qbit_hashrate_rollup_pool.accepted_share_difficulty + EXCLUDED.accepted_share_difficulty RETURNING 1),\
+ miner_rollup AS (INSERT INTO qbit_hashrate_rollup_miner (grain_seconds,bucket_epoch,miner_id,accepted_share_count,accepted_share_difficulty) \
+   SELECT grains.grain_seconds,floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch,\
+   batch.miner_id,count(*),sum(batch.share_difficulty) FROM batch, grains GROUP BY grains.grain_seconds, bucket_epoch, batch.miner_id \
+   ON CONFLICT (grain_seconds, bucket_epoch, miner_id) DO UPDATE SET accepted_share_count = qbit_hashrate_rollup_miner.accepted_share_count + EXCLUDED.accepted_share_count,\
+   accepted_share_difficulty = qbit_hashrate_rollup_miner.accepted_share_difficulty + EXCLUDED.accepted_share_difficulty RETURNING 1) \
+ SELECT (SELECT count(*) FROM batch)+0*(SELECT count(*) FROM pool_rollup)+0*(SELECT count(*) FROM miner_rollup)";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Progress {
@@ -56,8 +64,8 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The sweep of a 3.1 dual-writer frontend, which stops at the safe peer
-    /// mark.
+    /// The sweep of a 3.1 dual-writer frontend, which takes the progress row
+    /// first ([`PROGRESS_LOCK`]).
     pub fn for_dual_writer(self) -> Self {
         Self {
             dual_writer: true,
@@ -99,8 +107,8 @@ pub async fn advance(pool: &PgPool, batch: u32) -> Result<Progress> {
     advance_with_metrics(pool, batch, false, None).await
 }
 
-/// [`advance`] for a 3.1 dual-writer database: the batch stops at the safe
-/// peer mark.
+/// [`advance`] for a 3.1 dual-writer database: the progress row first
+/// ([`PROGRESS_LOCK`]), then 3.0's sweep.
 pub async fn advance_dual_writer(pool: &PgPool, batch: u32) -> Result<Progress> {
     advance_with_metrics(pool, batch, true, None).await
 }
@@ -120,12 +128,12 @@ async fn advance_with_metrics(
     sqlx::query("SET LOCAL statement_timeout = '10s'")
         .execute(&mut *transaction)
         .await?;
-    let sweep = if dual_writer {
-        DUAL_WRITER_SWEEP.as_str()
-    } else {
-        SWEEP
-    };
-    let (scanned, last_share_seq, advanced): (i64, i64, bool) = sqlx::query_as(sweep)
+    if dual_writer {
+        sqlx::query(PROGRESS_LOCK)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let (scanned, last_share_seq, advanced): (i64, i64, bool) = sqlx::query_as(SWEEP)
         .bind(i64::from(batch))
         .fetch_one(&mut *transaction)
         .await?;

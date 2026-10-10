@@ -2950,11 +2950,12 @@ impl Coordinator {
         wait: &crate::peer_sync::PeerIngestWait,
         candidate: &crate::ledger::Candidate,
     ) {
-        // This node's own read is inside the wait's bound too; if it fails,
-        // the offer goes unconfirmed at once.
+        // This node's own read is inside the wait's bound too. If it fails,
+        // or the record is gone (pruned while the block waited), nothing
+        // proves the peer holds it, and the offer goes unconfirmed at once.
         let needs = async {
             let prepared = match self.ledger.dual_writer_identity() {
-                Some(identity) => {
+                Some(identity) => Some(
                     self.ledger
                         .own_prepared_sync_seq(
                             identity.node,
@@ -2962,7 +2963,8 @@ impl Coordinator {
                             &hex::encode(candidate.window.prior_balances_digest),
                         )
                         .await?
-                }
+                        .context("the block's prepared record is no longer held here")?,
+                ),
                 None => None,
             };
             Ok(crate::peer_sync::AdoptionNeeds {

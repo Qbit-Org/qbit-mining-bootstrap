@@ -357,6 +357,11 @@ enum NodeIdentityCommand {
         /// The node being rebuilt: 0 for node A, 1 for node B. The copy must say it is the other.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
         index: u8,
+        /// Repersonalise a copy whose lineage carries no own-log verification of the peer's, or
+        /// without reading the server behind PRISM_PEER_DATABASE_URL: only once you have made
+        /// sure this is the promoted copy, never the peer's own database.
+        #[arg(long)]
+        unverified_copy: bool,
     },
 }
 
@@ -800,14 +805,43 @@ async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
                     .await?;
                 None
             }
-            NodeIdentityCommand::Repersonalise { index } => Some(
-                ledger
-                    .repersonalise_node_identity(
-                        node(index)?,
-                        "qbit-prism-server node-identity repersonalise",
-                    )
-                    .await?,
-            ),
+            NodeIdentityCommand::Repersonalise {
+                index,
+                unverified_copy,
+            } => {
+                // The peer's own server, when its URL is set: this database
+                // must not be on it.
+                let peer_server = match config::optional("PRISM_PEER_DATABASE_URL") {
+                    Some(url) => match crate::ledger::server_lineage_evidence(&url).await {
+                        Ok(evidence) => Some(evidence),
+                        Err(error) if unverified_copy => {
+                            tracing::warn!(error = %format!("{error:#}"), "the server behind PRISM_PEER_DATABASE_URL could not be read; going on, --unverified-copy given");
+                            None
+                        }
+                        Err(error) => {
+                            return Err(error.context(
+                                "reading the server behind PRISM_PEER_DATABASE_URL, which this \
+                                 database must not be on; run again once it answers, or with \
+                                 --unverified-copy",
+                            ))
+                        }
+                    },
+                    None => None,
+                };
+                let guard = crate::ledger::RepersonaliseGuard {
+                    unverified_copy,
+                    peer_server,
+                };
+                Some(
+                    ledger
+                        .repersonalise_node_identity(
+                            node(index)?,
+                            "qbit-prism-server node-identity repersonalise",
+                            &guard,
+                        )
+                        .await?,
+                )
+            }
         };
         let mut report = json!({
             "schema": "qbit.prism.node-identity.v1",

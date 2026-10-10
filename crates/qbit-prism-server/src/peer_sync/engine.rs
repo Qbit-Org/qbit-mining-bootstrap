@@ -270,6 +270,9 @@ impl PeerSync {
         metrics: Option<Arc<Metrics>>,
     ) -> (Self, watch::Receiver<PeerSyncStatus>) {
         let (publisher, status) = PeerSyncPublisher::new();
+        if let Some(metrics) = &metrics {
+            metrics.start_peer_sync();
+        }
         let sync = Self {
             ledger,
             node: config.identity.node,
@@ -698,41 +701,51 @@ impl PeerSync {
             );
             ensure_progress(&mut self.own_log_diverged, &applied)?;
         }
+        // Landed blocks and prepared jobs commit out of sync_seq order, so
+        // the highest one held here proves no prefix: a backup can hold a
+        // block whose earlier-numbered sibling was still open. Every one the
+        // peer holds of this node's since it was personalised is read again,
+        // and those held here are compared, not inserted.
+        let floor = self
+            .ledger
+            .node_lineage()
+            .await?
+            .map_or(0, |lineage| lineage.sync_seq_floor);
+        let mut after = floor;
         loop {
-            let (_, held, ..) = self.ledger.highest_held_of(node).await?;
-            let blocks = bounded(peer::blocks(
-                connection,
-                node,
-                held.unwrap_or(0),
-                None,
-                BLOCKS_PER_PASS,
-            ))
-            .await?;
-            if blocks.is_empty() {
+            let blocks =
+                bounded(peer::blocks(connection, node, after, None, BLOCKS_PER_PASS)).await?;
+            let Some(last) = blocks.last().map(|block| block.sync_seq) else {
                 break;
+            };
+            if self.ledger.missing_blocks(&blocks).await? > 0 {
+                self.own_rows_missing().await?;
             }
-            self.own_rows_missing().await?;
             for block in &blocks {
                 applied.merge(self.ledger.apply_block(block, None).await?);
             }
             ensure_progress(&mut self.own_log_diverged, &applied)?;
+            after = last;
         }
+        let mut after = floor;
         loop {
-            let (_, _, held, _) = self.ledger.highest_held_of(node).await?;
             let batch = bounded(peer::prepared(
                 connection,
                 node,
-                held.unwrap_or(0),
+                after,
                 None,
                 self.batch_rows,
             ))
             .await?;
-            if batch.count == 0 {
+            let Some(last) = batch.highest else {
                 break;
+            };
+            if self.ledger.missing_prepared(&batch).await? > 0 {
+                self.own_rows_missing().await?;
             }
-            self.own_rows_missing().await?;
             applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
             ensure_progress(&mut self.own_log_diverged, &applied)?;
+            after = last;
         }
         let roles = bounded(peer::node_roles(connection, node)).await?;
         let journal = self.ledger.apply_node_roles(&roles, node).await?;
