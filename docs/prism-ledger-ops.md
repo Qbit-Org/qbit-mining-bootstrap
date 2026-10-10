@@ -1882,7 +1882,9 @@ an ALERT and tried again every 10 minutes. When it leaves the 1,440-block
 lookback unlanded, a last ALERT says so. Causes:
 - an empty-window bootstrap block;
 - a record past retention;
-- a record built by another builder version or other keys.
+- a record built by another builder version or other keys;
+- a window holding a peer share, or a prepared record, that this node's sync
+  refused as a conflict (`qbit_prism_peer_sync_conflicts`).
 
 A pass recognizes the pool's blocks only by the current `PRISM_COINBASE_TAG`
 and pool-fee program. A pool block found under an earlier tag or fee recipient
@@ -4331,9 +4333,11 @@ GRANT SELECT ON SEQUENCE qbit_prism_sync_seq, qbit_share_ledger_share_seq_seq TO
 Reads of the share ledger go through its parent, so new partitions need no
 grant. The sync also calls `qbit_prism_sync_barrier()` and reads the catalogs,
 which every role may do by default. Each frontend holds up to two connections
-for its sync and one per path for the found-block wait, so allow the role at
-least four per frontend, with room for a restarted frontend's old sessions
-until the peer drops them. The role's settings bound what a dead
+for its sync and, on each path, one for the found-block wait, one for the
+carry-owner guard and one for the broadcaster's check of a silent finder. Allow
+the role at least five per frontend, or eight with a fallback path, plus one
+per path while a `carry-owner` command runs, with room for a restarted
+frontend's old sessions until the peer drops them. The role's settings bound what a dead
 puller can hold on the peer: `default_transaction_read_only = on`,
 `statement_timeout = '8s'`, `lock_timeout = '2s'`,
 `idle_in_transaction_session_timeout = '5s'`, and TCP keepalives with a 10 s

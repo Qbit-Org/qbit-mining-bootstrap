@@ -41,7 +41,8 @@
 //! is refused or never catches up cannot hide a block.
 //!
 //! A block with no adoptable record (an empty-window bootstrap block, a record
-//! past retention, or one built by another builder or keys) is reported with
+//! past retention, one built by another builder or keys, or a window or record
+//! holding a peer row this node's sync refused as a conflict) is reported with
 //! an ALERT and tried again every [`ADOPTION_RETRY_INTERVAL`]; nothing is
 //! guessed. When it leaves the lookback unlanded, a last ALERT says so.
 use super::*;
