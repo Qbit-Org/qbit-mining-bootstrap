@@ -1246,16 +1246,37 @@ async fn pull_state(pool: &sqlx::PgPool) -> Result<PullState> {
 /// `pg_locks` adds no contention to the database whose stalls it measures.
 const PULL_POLL: Duration = Duration::from_millis(20);
 
-/// Wait, up to `limit`, until A's puller is seen mid-pull on B's database.
-async fn wait_for_a_pull(pool: &sqlx::PgPool, limit: Duration) -> Result<bool> {
+/// What a freeze was timed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PullMoment {
+    /// A's puller held an advisory lock on B (D1's sync barrier is one): the
+    /// moment a frozen puller can stall B's writes.
+    LockHeld,
+    /// A's puller had a query running or a transaction open on B.
+    Busy,
+    /// Neither was seen within the wait: a random moment.
+    Unseen,
+}
+
+/// Wait for the most telling moment to freeze A: first, for up to two
+/// thirds of `limit`, one where its puller holds an advisory lock on B's
+/// database; then, for the rest, any moment it is busy there.
+async fn wait_for_a_pull(pool: &sqlx::PgPool, limit: Duration) -> Result<PullMoment> {
     let started = Instant::now();
-    while started.elapsed() < limit {
-        if pull_state(pool).await?.mid_pull() {
-            return Ok(true);
+    while started.elapsed() < limit * 2 / 3 {
+        if pull_state(pool).await?.advisory_locks > 0 {
+            return Ok(PullMoment::LockHeld);
         }
         tokio::time::sleep(PULL_POLL).await;
     }
-    Ok(false)
+    while started.elapsed() < limit {
+        if pull_state(pool).await?.mid_pull() {
+            return Ok(PullMoment::Busy);
+        }
+        tokio::time::sleep(PULL_POLL).await;
+    }
+    Ok(PullMoment::Unseen)
 }
 
 /// A small seeded generator for the freeze schedule; its seed is reported.
@@ -1323,8 +1344,8 @@ struct FreezeRound {
     round: usize,
     at_ms: u64,
     held_ms: u64,
-    /// A's puller was seen mid-pull on B just before the stop.
-    timed_to_a_pull: bool,
+    /// What A's puller was seen doing on B just before the stop.
+    timed_to: PullMoment,
     /// What it held on B right after the stop.
     after_stop: PullState,
     work: RoundWork,
@@ -1411,7 +1432,7 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
         if landing {
             prepare_finder(sim, Node::B).await?;
         }
-        let timed_to_a_pull = wait_for_a_pull(&pool, Duration::from_secs(3)).await?;
+        let timed_to = wait_for_a_pull(&pool, Duration::from_secs(3)).await?;
         let hold = Duration::from_millis(1_000 + schedule.below(3_000));
         let freeze = Fault::FrontendFreeze(Node::A);
         let at_ms = sim.inject(freeze).await?;
@@ -1429,7 +1450,7 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
             round,
             at_ms,
             held_ms,
-            timed_to_a_pull,
+            timed_to,
             after_stop,
             work,
         });
@@ -1459,13 +1480,21 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
             _ => None,
         })
         .collect();
-    let timed = rounds.iter().filter(|r| r.timed_to_a_pull).count();
+    let timed = rounds
+        .iter()
+        .filter(|r| r.timed_to != PullMoment::Unseen)
+        .count();
+    let at_lock = rounds
+        .iter()
+        .filter(|r| r.timed_to == PullMoment::LockHeld)
+        .count();
     let caught = rounds.iter().filter(|r| r.after_stop.mid_pull()).count();
     body.expect(
         "B records jobs and lands blocks while A is frozen mid-pull",
         stalled.is_empty() && !landings.is_empty(),
         format!(
-            "{} freezes ({timed} timed to one of A's pulls on B; {caught} left A with a query, a \
+            "{} freezes ({timed} timed to one of A's pulls on B, {at_lock} of them to a lock it \
+             held there; {caught} left A with a query, a \
              transaction or an advisory lock open there). New tips: B's first job on each after \
              {:?} ms (median) and {:?} ms (max) from the mint, bound {} s. Landings: {} blocks \
              found, landed and confirmed on B during freezes, as (ms from the solve request to \
@@ -1593,10 +1622,14 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
         "A's dead puller leaves B no snapshot and no open transaction beyond the bound",
         last_holding.is_none_or(|held| held <= IDLE_BOUND),
         format!(
-            "killed {} one of A's pulls was seen busy on B; up to {most} of A's backends on B held \
-             a snapshot or a transaction until {:?} after the death (bound {} s, watched {} s; the \
-             peer role's idle-in-transaction timeout is the one status/D1.md drafts)",
-            if timed { "as" } else { "without" },
+            "A was killed {}; up to {most} of A's backends on B held a snapshot or a transaction \
+             until {:?} after the death (bound {} s, watched {} s; the peer role's \
+             idle-in-transaction timeout is the one status/D1.md drafts)",
+            match timed {
+                PullMoment::LockHeld => "while its puller held an advisory lock on B",
+                PullMoment::Busy => "while its puller had a query or a transaction open on B",
+                PullMoment::Unseen => "at a moment none of its pulls was seen on B",
+            },
             last_holding,
             IDLE_BOUND.as_secs(),
             LINGER_WATCH.as_secs()

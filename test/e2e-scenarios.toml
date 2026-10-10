@@ -977,7 +977,7 @@ id = "dual-writer-s02-a-frozen-during-pulls"
 title = "S2, frozen mid-pull: A's frontend frozen 20 times while its puller works on B's database; B never stalls"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, each timed where possible to a moment its puller has a query, a transaction or an advisory lock open on B's database. During each of 16 freezes a new tip arrives and B records jobs on it within 15 s; during every fifth, B instead lands a block solved on work handed out before the freeze and builds work on it. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
+criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, each timed first to a moment its puller holds an advisory lock on B's database (the sync barrier is one), else to one it has a query or a transaction open there. During each of 16 freezes a new tip arrives and B records jobs on it within 15 s; during every fifth, B instead lands a block solved on work handed out before the freeze and builds work on it. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
 runs = false
 reason = "Needs the 3.1 stack: peer sync (D1, pushed) and readiness for the balancer's checks (D4)."
 
