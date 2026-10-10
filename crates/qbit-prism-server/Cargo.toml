@@ -27,6 +27,10 @@ dotenvy = "0.15"
 futures-util = "0.3"
 flate2 = "1"
 hex = "0.4"
+# The readiness endpoint's HTTP/1 connections, with their own deadlines (3.1).
+# Both are already in the graph through axum.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 num-bigint = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 percent-encoding = "2"

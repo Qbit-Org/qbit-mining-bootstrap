@@ -63,6 +63,21 @@ macro_rules! labels {
 }
 
 labels!(AckResult { Accepted => "accepted", Rejected => "rejected" });
+// 3.1 admission and dual-writer readiness (D4).
+labels!(AdmissionStateLabel {
+    Starting => "starting", Admitting => "admitting", Grace => "grace", Withdrawn => "withdrawn"
+});
+labels!(WithdrawalReason {
+    OwnLogBehind => "own-log-behind", WriterNotLocal => "writer-not-local", NotReady => "not-ready"
+});
+labels!(StratumListenerName { Default => "default", Highdiff => "highdiff" });
+labels!(WriterPathLabel {
+    Local => "local", Remote => "remote", Unidentified => "unidentified",
+    ReadOnly => "read_only", Unanswered => "unanswered"
+});
+labels!(ReadinessAnswer {
+    Ready => "ready", NotReady => "not_ready", Unauthorized => "unauthorized", NotFound => "not_found"
+});
 labels!(Outcome { Success => "success", Failure => "failure" });
 labels!(RevisionWorkResult {
     Published => "published", Degraded => "degraded", Superseded => "superseded"

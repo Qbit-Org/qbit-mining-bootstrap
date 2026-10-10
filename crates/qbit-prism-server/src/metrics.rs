@@ -1,4 +1,5 @@
 //! Bounded native telemetry. Event producers share one registry per instance.
+mod admission;
 pub mod collectors;
 mod events;
 mod labels;
@@ -247,6 +248,16 @@ impl Metrics {
             Family::PeerSyncFailures,
             Family::PeerSyncOfferWaits,
             Family::DualWriterOriginIndexMissing,
+            // 3.1: sampled only once dual-writer mode or the readiness
+            // endpoint exposes admission (`Metrics::enable_admission`).
+            Family::AdmissionAdmitting,
+            Family::AdmissionState,
+            Family::AdmissionWithdrawals,
+            Family::StratumListenerAccepting,
+            Family::DualWriterWriterPath,
+            Family::DualWriterNodeIndex,
+            Family::DualWriterCarryOwner,
+            Family::ReadinessRequests,
         ] {
             registry.declare(family);
         }

@@ -125,16 +125,7 @@ impl Ledger {
     /// revision, `None` whenever [`Ledger::payout_revision`] refuses it, and
     /// the cluster's block submission hold.
     pub async fn health_reads(&self) -> Result<(Option<i64>, Option<SubmissionHold>)> {
-        let row = sqlx::query(&format!(
-            "SELECT CASE WHEN {SERVING} THEN c.payout_revision END AS payout_revision,{HOLD_COLUMNS} \
-             FROM qbit_prism_cluster c CROSS JOIN qbit_prism_submission_hold h WHERE c.singleton AND h.singleton"
-        ))
-        .fetch_one(&mut *self.acquire().await?)
-        .await?;
-        Ok((
-            row.try_get("payout_revision")?,
-            SubmissionHold::from_row(&row)?,
-        ))
+        health_reads_with(&mut *self.acquire().await?).await
     }
 
     /// Hold block submission cluster-wide, or keep a hold already set as it
@@ -250,4 +241,21 @@ async fn read_submission_hold_report(connection: &mut sqlx::PgConnection) -> Res
     state["schema_supports_hold"] = json!(supported);
     state["pending_candidates"] = json!(pending);
     Ok(state)
+}
+
+/// [`Ledger::health_reads`]'s statement on `connection`: a dual-writer
+/// frontend runs it on its own health pool (3.1).
+pub(crate) async fn health_reads_with(
+    connection: &mut sqlx::PgConnection,
+) -> Result<(Option<i64>, Option<SubmissionHold>)> {
+    let row = sqlx::query(&format!(
+        "SELECT CASE WHEN {SERVING} THEN c.payout_revision END AS payout_revision,{HOLD_COLUMNS} \
+         FROM qbit_prism_cluster c CROSS JOIN qbit_prism_submission_hold h WHERE c.singleton AND h.singleton"
+    ))
+    .fetch_one(&mut *connection)
+    .await?;
+    Ok((
+        row.try_get("payout_revision")?,
+        SubmissionHold::from_row(&row)?,
+    ))
 }

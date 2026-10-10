@@ -30,7 +30,7 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     assert!(!startup_census
         .series
         .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
-    assert_eq!(startup_census.families.len(), 95);
+    assert_eq!(startup_census.families.len(), 103);
     assert_eq!(startup_census.series.len(), 314);
     assert_eq!(sample(&startup, "qbit_prism_tip_poll_age_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_node_peers"), -1.);
@@ -169,7 +169,7 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 95);
+        assert_eq!(populated.families.len(), 103);
         // 981 since the 3.1 dual writer's peer_sync ORDER_LOCK holder: one
         // more holder's hold histogram, 16 series; 997 with the carry owner
         // guard's state (13), alert (1) and peer check (2) series.

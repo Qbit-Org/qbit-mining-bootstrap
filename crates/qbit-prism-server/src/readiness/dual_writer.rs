@@ -1,0 +1,572 @@
+//! Dual-writer readiness (3.1, CONTRACT.md §3): the `/healthz` `dual_writer`
+//! object, and what keeps a node from serving whatever its work. A node
+//! serves only while its own share log is caught up from the peer (the peer
+//! sync's startup lineage latch, decision D-8) and its writes go to its own
+//! writable PostgreSQL. A broken link to the peer never withdraws it: the
+//! peer's reachability and the sync lag are reported, never decided on.
+use super::admission::Withdrawal;
+use crate::{
+    ledger::SubmissionHold, metrics::WriterPathLabel, node_identity::NodeIdentity,
+    peer_sync::PeerSyncStatus,
+};
+use futures_util::future::BoxFuture;
+use serde_json::{json, Value};
+use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::watch;
+
+/// How long one probe of this node's database may take before it counts as
+/// unanswered.
+pub const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long after its last answer the database may go unanswered before the
+/// node withdraws at once, rather than after the readiness grace: long enough
+/// to ride out one slow probe, short enough that a dead or hung local
+/// PostgreSQL moves its miners to the peer within seconds of its last answer.
+pub const WRITER_UNANSWERED_WITHDRAWAL: Duration = Duration::from_secs(4);
+/// A health read within this long of the last refresh's completion reuses
+/// it, so Stratum health probes cannot multiply database reads.
+const WRITER_PROBE_REUSE: Duration = Duration::from_secs(1);
+/// The health path's own connections: the writer probe and the health reads,
+/// one of each at a time.
+const HEALTH_POOL_CONNECTIONS: u32 = 2;
+
+/// Where this frontend's writes go, as its database last answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterPath {
+    /// A writable primary that is this node's own database: its
+    /// `qbit_prism_node_identity` row names `PRISM_NODE_INDEX` (D-9).
+    Local,
+    /// A database whose identity row names the peer node.
+    Remote,
+    /// A database with no identity row, never personalised for dual mode.
+    Unidentified,
+    /// A standby, or a database whose sessions are read-only.
+    ReadOnly,
+    /// The probe failed or timed out.
+    Unanswered,
+}
+
+impl WriterPath {
+    pub fn label(self) -> WriterPathLabel {
+        match self {
+            Self::Local => WriterPathLabel::Local,
+            Self::Remote => WriterPathLabel::Remote,
+            Self::Unidentified => WriterPathLabel::Unidentified,
+            Self::ReadOnly => WriterPathLabel::ReadOnly,
+            Self::Unanswered => WriterPathLabel::Unanswered,
+        }
+    }
+}
+
+/// The last probe, and when the database last answered one.
+#[derive(Clone, Copy, Debug, Default)]
+struct WriterProbe {
+    path: Option<WriterPath>,
+    probed_at: Option<Instant>,
+    /// When a probe last got an answer, whatever it said.
+    answered_at: Option<Instant>,
+}
+
+impl WriterProbe {
+    fn record(&mut self, at: Instant, path: WriterPath) {
+        if path != WriterPath::Unanswered {
+            self.answered_at = Some(at);
+        }
+        self.path = Some(path);
+        self.probed_at = Some(at);
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.probed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= WRITER_PROBE_REUSE)
+    }
+
+    /// A definitive answer that this is not the node's writable database
+    /// withdraws at once. No answer does once the last answer is
+    /// [`WRITER_UNANSWERED_WITHDRAWAL`] old, counted from that answer and not
+    /// from the first probe that went unanswered, so a database that dies
+    /// between two probes withdraws the node a fixed time after it last
+    /// answered; a database that never answered withdraws it at once.
+    fn withdrawal(&self, now: Instant) -> Option<Withdrawal> {
+        match self.path? {
+            WriterPath::Local => None,
+            WriterPath::Remote | WriterPath::Unidentified | WriterPath::ReadOnly => {
+                Some(Withdrawal::WriterNotLocal)
+            }
+            WriterPath::Unanswered => self
+                .answered_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= WRITER_UNANSWERED_WITHDRAWAL)
+                .then_some(Withdrawal::WriterNotLocal),
+        }
+    }
+}
+
+/// What the health reads return: the payout revision as served, and the
+/// cluster's block submission hold.
+pub type HealthReads = (Option<i64>, Option<SubmissionHold>);
+
+/// The last health refresh: the writer probe and the health reads it ran
+/// beside, `None` when they failed or ran out of time.
+#[derive(Clone, Debug, Default)]
+struct HealthRefresh {
+    writer: WriterProbe,
+    reads: Option<HealthReads>,
+}
+
+/// One evaluation, for `/healthz`, admission and the metrics.
+#[derive(Clone, Debug)]
+pub struct DualWriterReport {
+    pub identity: NodeIdentity,
+    pub own_log_caught_up: bool,
+    pub writer_path: Option<WriterPath>,
+    /// The fault that withdraws the node without waiting for the grace, if
+    /// any.
+    pub withdrawal: Option<Withdrawal>,
+    /// The `dual_writer` object of `/healthz`.
+    pub value: Value,
+}
+
+impl DualWriterReport {
+    /// Whether the node may serve as far as dual-writer state goes.
+    pub fn serving(&self) -> bool {
+        self.own_log_caught_up && self.writer_path == Some(WriterPath::Local)
+    }
+
+    /// A definite fault that forbids every share this node would write: the
+    /// own log behind, or a database that answered that it is not this
+    /// node's writable primary. A withdrawal on one closes the established
+    /// sessions too; a database that only stopped answering does not, since
+    /// it may be a stall that a checkpoint or an fsync ends.
+    pub fn forbids_sessions(&self) -> bool {
+        !self.own_log_caught_up
+            || matches!(
+                self.writer_path,
+                Some(WriterPath::Remote | WriterPath::Unidentified | WriterPath::ReadOnly)
+            )
+    }
+
+    /// The health `status` that names why the node does not serve.
+    pub fn status(&self) -> Option<&'static str> {
+        if !self.own_log_caught_up {
+            Some(Withdrawal::OwnLogBehind.as_str())
+        } else if self.writer_path != Some(WriterPath::Local) {
+            Some(Withdrawal::WriterNotLocal.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+/// A dual-writer frontend's readiness inputs, besides the peer sync's status
+/// (`Coordinator::peer_sync`, attached where the sync starts).
+#[derive(Debug)]
+pub struct DualWriterReadiness {
+    identity: NodeIdentity,
+    /// The last health refresh. Held while one runs, so however many
+    /// callers ask, Stratum `mining.get_health` included, at most one
+    /// refresh runs at a time and at most one per reuse window; the others
+    /// wait for it or reuse it.
+    refresh: tokio::sync::Mutex<HealthRefresh>,
+    refreshes: AtomicU64,
+    /// The health path's own small pool: the writer probe and the health
+    /// reads never wait behind share traffic for a ledger connection, so a
+    /// busy but healthy database still answers them in time.
+    health_pool: OnceLock<PgPool>,
+}
+
+impl DualWriterReadiness {
+    pub fn new(identity: NodeIdentity) -> Self {
+        Self {
+            identity,
+            refresh: tokio::sync::Mutex::new(HealthRefresh::default()),
+            refreshes: AtomicU64::new(0),
+            health_pool: OnceLock::new(),
+        }
+    }
+
+    /// The health path's pool: built on first use from the ledger pool's
+    /// connect options (the same server, credentials and options, the search
+    /// path included) and connected lazily. A connection waits at most the
+    /// probe's budget to be acquired, and the database cancels a health
+    /// statement it cannot answer within that budget too, so none holds a
+    /// connection or waits on a lock past it.
+    pub fn health_pool(&self, ledger: &PgPool) -> &PgPool {
+        self.health_pool.get_or_init(|| {
+            let budget = WRITER_PROBE_TIMEOUT.as_millis().to_string();
+            PgPoolOptions::new()
+                .max_connections(HEALTH_POOL_CONNECTIONS)
+                .min_connections(0)
+                .acquire_timeout(WRITER_PROBE_TIMEOUT)
+                // No ping on checkout: it would spend a round trip of the
+                // probe's budget, and the probe itself is the liveness check.
+                .test_before_acquire(false)
+                .after_connect(move |connection, _| {
+                    let budget = budget.clone();
+                    Box::pin(async move {
+                        sqlx::query(
+                            "SELECT set_config('statement_timeout',$1,false),\
+                             set_config('lock_timeout',$1,false)",
+                        )
+                        .bind(budget)
+                        .execute(&mut *connection)
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .connect_lazy_with((*ledger.connect_options()).clone())
+        })
+    }
+
+    /// Refresh, unless the last refresh completed within the reuse window,
+    /// then report, with the health reads the refresh ran. A refresh is the
+    /// writer probe and the health reads, side by side on the health pool
+    /// within the probe's budget; reads that fail or run out of time are
+    /// `None`. `ledger` is the ledger's pool, which the health pool is built
+    /// from. `peer_sync` is the sync's status channel; until it is attached
+    /// the own log reads as not caught up, so the node does not serve.
+    pub async fn report(
+        &self,
+        ledger: &PgPool,
+        peer_sync: Option<&watch::Receiver<PeerSyncStatus>>,
+    ) -> (DualWriterReport, Option<HealthReads>) {
+        let pool = self.health_pool(ledger);
+        let refresh = {
+            let mut refresh = self.refresh.lock().await;
+            if refresh.writer.due(Instant::now()) {
+                let (path, reads) = tokio::join!(
+                    probe_writer(pool, self.identity),
+                    tokio::time::timeout(
+                        WRITER_PROBE_TIMEOUT,
+                        on_health_connection(pool, health_reads_statement),
+                    ),
+                );
+                refresh.writer.record(Instant::now(), path);
+                refresh.reads = reads.ok().and_then(Result::ok);
+                self.refreshes.fetch_add(1, Ordering::Relaxed);
+            }
+            refresh.clone()
+        };
+        let peer = peer_sync
+            .map(|status| status.borrow().clone())
+            .unwrap_or_default();
+        (
+            self.assemble(refresh.writer, peer, Instant::now()),
+            refresh.reads,
+        )
+    }
+
+    /// How many health refreshes this frontend has run.
+    pub fn refreshes(&self) -> u64 {
+        self.refreshes.load(Ordering::Relaxed)
+    }
+
+    /// Close the health pool, if it was ever built: at shutdown, beside the
+    /// ledger's pool.
+    pub async fn close(&self) {
+        if let Some(pool) = self.health_pool.get() {
+            pool.close().await;
+        }
+    }
+
+    fn assemble(
+        &self,
+        writer: WriterProbe,
+        peer: PeerSyncStatus,
+        now: Instant,
+    ) -> DualWriterReport {
+        let own_log_caught_up = peer.own_log_caught_up;
+        let withdrawal = if own_log_caught_up {
+            writer.withdrawal(now)
+        } else {
+            Some(Withdrawal::OwnLogBehind)
+        };
+        let value = json!({
+            "node_index": self.identity.node,
+            "carry_owner": self.identity.carry_owner,
+            "own_log_caught_up": own_log_caught_up,
+            "peer_sync": peer,
+            "writer_path": writer.path.map(|path| path.label().as_str()),
+        });
+        DualWriterReport {
+            identity: self.identity,
+            own_log_caught_up,
+            writer_path: writer.path,
+            withdrawal,
+            value,
+        }
+    }
+}
+
+/// Run `statement` on a connection of the health pool and, if it fails, once
+/// more on a fresh connection. The pool does not ping a connection on
+/// checkout, so an idle connection that died with a restarted PostgreSQL
+/// fails its first statement; that must not read as a database that does not
+/// answer. The caller's budget bounds both attempts.
+async fn on_health_connection<T, E: From<sqlx::Error>>(
+    pool: &PgPool,
+    statement: for<'c> fn(&'c mut PgConnection) -> BoxFuture<'c, Result<T, E>>,
+) -> Result<T, E> {
+    let mut connection = pool.acquire().await?;
+    if let Ok(value) = statement(&mut connection).await {
+        return Ok(value);
+    }
+    // Neither the failed connection nor another idle one that has died goes
+    // back to the pool: a connection that does not answer a ping is dropped,
+    // and the pool opens a fresh one.
+    drop(connection.detach());
+    let mut connection = pool.acquire().await?;
+    if connection.ping().await.is_err() {
+        drop(connection.detach());
+        connection = pool.acquire().await?;
+    }
+    statement(&mut connection).await
+}
+
+fn probe_statement(
+    connection: &mut PgConnection,
+) -> BoxFuture<'_, sqlx::Result<(bool, bool, Option<i16>)>> {
+    Box::pin(
+        sqlx::query_as(
+            "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on', \
+             (SELECT node_index FROM qbit_prism_node_identity WHERE singleton)",
+        )
+        .fetch_one(&mut *connection),
+    )
+}
+
+fn health_reads_statement(
+    connection: &mut PgConnection,
+) -> BoxFuture<'_, anyhow::Result<HealthReads>> {
+    Box::pin(crate::ledger::health_reads_with(connection))
+}
+
+/// Ask this frontend's own database, on `pool` (the health pool), whether it
+/// is this node's and can take its writes. Any error, after the one retry,
+/// or a timeout is no answer.
+pub(crate) async fn probe_writer(pool: &PgPool, identity: NodeIdentity) -> WriterPath {
+    let probe = on_health_connection(pool, probe_statement);
+    match tokio::time::timeout(WRITER_PROBE_TIMEOUT, probe).await {
+        Ok(Ok((in_recovery, read_only, recorded))) => {
+            classify(in_recovery, read_only, recorded, identity)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "dual-writer writer probe failed");
+            WriterPath::Unanswered
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = WRITER_PROBE_TIMEOUT.as_millis() as u64,
+                "dual-writer writer probe timed out"
+            );
+            WriterPath::Unanswered
+        }
+    }
+}
+
+/// The database's identity decides first, since a wrong one is a
+/// configuration fault whatever its role; then whether it can write.
+fn classify(
+    in_recovery: bool,
+    read_only: bool,
+    recorded: Option<i16>,
+    identity: NodeIdentity,
+) -> WriterPath {
+    match recorded {
+        None => WriterPath::Unidentified,
+        Some(index) if index != identity.node.index() => WriterPath::Remote,
+        Some(_) if in_recovery || read_only => WriterPath::ReadOnly,
+        Some(_) => WriterPath::Local,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{node_identity::NodeIndex, peer_sync::TableSyncStatus};
+
+    const IDENTITY: NodeIdentity = NodeIdentity {
+        node: NodeIndex::B,
+        carry_owner: false,
+    };
+
+    fn probe(path: WriterPath, at: Instant) -> WriterProbe {
+        let mut probe = WriterProbe::default();
+        probe.record(at, path);
+        probe
+    }
+
+    fn caught_up() -> PeerSyncStatus {
+        PeerSyncStatus {
+            peer_reachable: false,
+            own_log_caught_up: true,
+            per_table: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_node_serves_only_with_its_own_log_caught_up_and_a_local_writer() {
+        let readiness = DualWriterReadiness::new(IDENTITY);
+        let now = Instant::now();
+        let report = readiness.assemble(probe(WriterPath::Local, now), caught_up(), now);
+        assert!(report.serving());
+        assert_eq!(report.status(), None);
+        assert_eq!(report.withdrawal, None);
+        // The peer being unreachable is reported, never a reason to withdraw.
+        assert_eq!(report.value["peer_sync"]["peer_reachable"], false);
+
+        let behind = readiness.assemble(
+            probe(WriterPath::Local, now),
+            PeerSyncStatus::default(),
+            now,
+        );
+        assert!(!behind.serving());
+        assert_eq!(behind.status(), Some("own-log-behind"));
+        assert_eq!(behind.withdrawal, Some(Withdrawal::OwnLogBehind));
+
+        for path in [
+            WriterPath::Remote,
+            WriterPath::Unidentified,
+            WriterPath::ReadOnly,
+        ] {
+            let report = readiness.assemble(probe(path, now), caught_up(), now);
+            assert!(!report.serving(), "{path:?}");
+            assert_eq!(report.status(), Some("writer-not-local"), "{path:?}");
+            assert_eq!(
+                report.withdrawal,
+                Some(Withdrawal::WriterNotLocal),
+                "{path:?}"
+            );
+        }
+        // Only a definite fault forbids the established sessions.
+        for path in [
+            WriterPath::Remote,
+            WriterPath::Unidentified,
+            WriterPath::ReadOnly,
+        ] {
+            assert!(readiness
+                .assemble(probe(path, now), caught_up(), now)
+                .forbids_sessions());
+        }
+        assert!(behind.forbids_sessions());
+        let mut stalled = probe(WriterPath::Local, now);
+        let later = now + Duration::from_secs(5);
+        stalled.record(later, WriterPath::Unanswered);
+        let unanswered = readiness.assemble(stalled, caught_up(), later);
+        assert_eq!(unanswered.withdrawal, Some(Withdrawal::WriterNotLocal));
+        assert!(!unanswered.forbids_sessions());
+        assert!(!report.forbids_sessions());
+        let unprobed = readiness.assemble(WriterProbe::default(), caught_up(), now);
+        assert!(!unprobed.serving());
+        assert_eq!(unprobed.status(), Some("writer-not-local"));
+        assert_eq!(unprobed.withdrawal, None, "no probe yet is not a fault");
+        assert_eq!(unprobed.value["writer_path"], Value::Null);
+    }
+
+    #[test]
+    fn an_unanswered_writer_withdraws_once_its_last_answer_is_old_enough() {
+        let readiness = DualWriterReadiness::new(IDENTITY);
+        let start = Instant::now();
+        let mut writer = probe(WriterPath::Local, start);
+        // One slow or failed probe soon after an answer is ridden out.
+        let at = start + Duration::from_secs(3);
+        writer.record(at, WriterPath::Unanswered);
+        let early = readiness.assemble(writer, caught_up(), at);
+        assert!(!early.serving());
+        assert_eq!(early.withdrawal, None, "one slow probe is ridden out");
+        // The streak runs from the last answer, not from the first probe
+        // that went unanswered.
+        let late = readiness.assemble(writer, caught_up(), start + WRITER_UNANSWERED_WITHDRAWAL);
+        assert_eq!(late.withdrawal, Some(Withdrawal::WriterNotLocal));
+        // A probe that first fails long after the last answer, as after a
+        // publication held up by the dead database, withdraws at once.
+        let mut stalled = probe(WriterPath::Local, start);
+        let at = start + Duration::from_secs(6);
+        stalled.record(at, WriterPath::Unanswered);
+        assert_eq!(
+            readiness.assemble(stalled, caught_up(), at).withdrawal,
+            Some(Withdrawal::WriterNotLocal)
+        );
+        // An answer resets it.
+        writer.record(start + Duration::from_secs(5), WriterPath::Local);
+        let answered = readiness.assemble(writer, caught_up(), start + Duration::from_secs(5));
+        assert!(answered.serving());
+        writer.record(start + Duration::from_secs(7), WriterPath::Unanswered);
+        let again = readiness.assemble(writer, caught_up(), start + Duration::from_secs(8));
+        assert_eq!(again.withdrawal, None, "an answer resets the streak");
+    }
+
+    #[test]
+    fn a_database_that_never_answered_withdraws_at_once() {
+        let readiness = DualWriterReadiness::new(IDENTITY);
+        let start = Instant::now();
+        let report = readiness.assemble(probe(WriterPath::Unanswered, start), caught_up(), start);
+        assert!(!report.serving());
+        assert_eq!(report.withdrawal, Some(Withdrawal::WriterNotLocal));
+    }
+
+    #[test]
+    fn the_health_object_carries_the_contract_fields() {
+        let readiness = DualWriterReadiness::new(IDENTITY);
+        let now = Instant::now();
+        let mut status = caught_up();
+        status.per_table.insert(
+            "qbit_share_ledger".into(),
+            TableSyncStatus {
+                lag_rows: 7,
+                lag_seconds: 0.25,
+                last_success: None,
+            },
+        );
+        let report = readiness.assemble(probe(WriterPath::Local, now), status, now);
+        assert_eq!(
+            report.value,
+            json!({
+                "node_index": 1,
+                "carry_owner": false,
+                "own_log_caught_up": true,
+                "peer_sync": {
+                    "peer_reachable": false,
+                    "own_log_caught_up": true,
+                    "per_table": {"qbit_share_ledger": {"lag_rows": 7, "lag_seconds": 0.25, "last_success": null}},
+                },
+                "writer_path": "local",
+            })
+        );
+    }
+
+    #[test]
+    fn only_this_nodes_writable_database_is_a_local_writer() {
+        let own = Some(IDENTITY.node.index());
+        let peer = Some(IDENTITY.node.peer().index());
+        assert_eq!(classify(false, false, own, IDENTITY), WriterPath::Local);
+        assert_eq!(classify(true, false, own, IDENTITY), WriterPath::ReadOnly);
+        assert_eq!(classify(false, true, own, IDENTITY), WriterPath::ReadOnly);
+        assert_eq!(classify(true, true, own, IDENTITY), WriterPath::ReadOnly);
+        // A wrong or missing identity is reported whatever the role.
+        for (in_recovery, read_only) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                classify(in_recovery, read_only, peer, IDENTITY),
+                WriterPath::Remote
+            );
+            assert_eq!(
+                classify(in_recovery, read_only, None, IDENTITY),
+                WriterPath::Unidentified
+            );
+        }
+    }
+
+    #[test]
+    fn a_recent_probe_is_reused() {
+        let now = Instant::now();
+        assert!(WriterProbe::default().due(now));
+        let probe = probe(WriterPath::Local, now);
+        assert!(!probe.due(now + WRITER_PROBE_REUSE / 2));
+        assert!(probe.due(now + WRITER_PROBE_REUSE));
+    }
+}

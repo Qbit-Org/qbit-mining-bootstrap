@@ -129,6 +129,35 @@ impl Ledger {
             .bind(&self.instance_id).bind(status).execute(&mut *self.acquire().await?).await?;
         Ok(())
     }
+
+    /// A dual-writer frontend's health heartbeat (3.1). It runs off the
+    /// health publisher's path, so at shutdown it can be abandoned with its
+    /// statement already sent, and the database may apply it after the
+    /// stopped marker. It never replaces this incarnation's stopped marker
+    /// (the same `session_owner_token`), so however late it lands, the row
+    /// stays `stopped`, and a replacement can still reclaim the sessions.
+    pub async fn health_heartbeat_unless_stopped(&self, health: HeartbeatHealth) -> Result<()> {
+        let mut status = serde_json::to_value(HeartbeatStatus::Health(health))?;
+        status
+            .as_object_mut()
+            .expect("typed heartbeat is an object")
+            .insert(
+                "session_owner_token".into(),
+                self.session_owner.token.clone().into(),
+            );
+        sqlx::query(
+            "INSERT INTO qbit_prism_instances(instance_id,status) VALUES($1,$2) \
+             ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=clock_timestamp(),status=EXCLUDED.status \
+             WHERE (qbit_prism_instances.status->>'state') IS DISTINCT FROM 'stopped' \
+             OR (qbit_prism_instances.status->>'session_owner_token') IS DISTINCT FROM \
+             (EXCLUDED.status->>'session_owner_token')",
+        )
+        .bind(&self.instance_id)
+        .bind(status)
+        .execute(&mut *self.acquire().await?)
+        .await?;
+        Ok(())
+    }
 }
 
 // Sample with the configured database's clock. The reader supplies the same
@@ -554,6 +583,35 @@ mod live_instance_tests {
             );
             assert_eq!(report.stale_instances.unwrap().len(), 1);
         }
+        // 3.1: a dual-writer frontend's health heartbeat, applied however
+        // late, never replaces this incarnation's stopped marker.
+        let guarded = Ledger::offline_for_tests(pool.clone(), "guarded-writer".into());
+        let read = async || -> Result<Value> {
+            Ok(sqlx::query_scalar(
+                "SELECT status FROM qbit_prism_instances WHERE instance_id='guarded-writer'",
+            )
+            .fetch_one(&pool)
+            .await?)
+        };
+        let health = || HeartbeatHealth::new(true, Map::new());
+        guarded.health_heartbeat_unless_stopped(health()).await?;
+        guarded.health_heartbeat_unless_stopped(health()).await?;
+        let stored = read().await?;
+        assert_eq!(stored["schema"], "qbit.prism.audit-health.v1", "{stored}");
+        assert_eq!(stored["session_owner_token"], guarded.session_owner.token);
+        guarded.heartbeat(HeartbeatStatus::Stopped).await?;
+        guarded.health_heartbeat_unless_stopped(health()).await?;
+        let stored = read().await?;
+        assert_eq!(
+            stored["state"], "stopped",
+            "a late heartbeat replaced it: {stored}"
+        );
+        // Another incarnation's stopped marker is not this one's to keep.
+        sqlx::query("UPDATE qbit_prism_instances SET status=jsonb_set(status,'{session_owner_token}','\"another\"') WHERE instance_id='guarded-writer'")
+            .execute(&pool)
+            .await?;
+        guarded.health_heartbeat_unless_stopped(health()).await?;
+        assert_eq!(read().await?["schema"], "qbit.prism.audit-health.v1");
         let mut connection = pool.acquire().await?;
         sqlx::query("DROP TABLE qbit_prism_instances")
             .execute(&mut *connection)
