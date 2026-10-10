@@ -473,6 +473,107 @@ fn run(binary: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
     output
 }
 
+/// The `--serve` daemon (protocol 3) builds a request's `window_cut` into the
+/// reward manifest it signs: its job summary is the one-shot build's of the
+/// same window with the cut, which differs from the build without it.
+#[test]
+fn a_serve_build_with_a_cut_signs_what_the_one_shot_build_signs() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let binary = env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle");
+    let keys = [
+        "--signing-key-seed-hex".to_owned(),
+        "42".repeat(32),
+        "--ledger-signing-key-seed-hex".to_owned(),
+        "43".repeat(32),
+    ];
+    let one_shot = |input: &serde_json::Value, tag: &str| -> serde_json::Value {
+        let path = temp_path(tag);
+        fs::write(&path, serde_json::to_vec(input).unwrap()).unwrap();
+        let mut args: Vec<&std::ffi::OsStr> = vec!["--input".as_ref(), path.as_os_str()];
+        args.extend(keys.iter().map(std::ffi::OsStr::new));
+        args.push("--job-summary-output".as_ref());
+        let output = run(binary, &args);
+        let _ = fs::remove_file(&path);
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let with_cut = fixture_cli_input();
+    let mut without_cut = with_cut.clone();
+    without_cut.as_object_mut().unwrap().remove("window_cut");
+    let cut_summary = one_shot(&with_cut, "serve-cut");
+    assert_ne!(
+        cut_summary,
+        one_shot(&without_cut, "serve-uncut"),
+        "the cut must change the signed coinbase manifest"
+    );
+
+    // The same window as a serve request carries it: compact, inline.
+    let mut identities = Vec::<serde_json::Value>::new();
+    let mut compact = Vec::<serde_json::Value>::new();
+    for share in with_cut["shares"].as_array().unwrap() {
+        let identity = serde_json::json!([
+            share["miner_id"],
+            share["order_key"],
+            share["p2mr_program_hex"],
+        ]);
+        let index = identities
+            .iter()
+            .position(|candidate| candidate == &identity)
+            .unwrap_or_else(|| {
+                identities.push(identity);
+                identities.len() - 1
+            });
+        compact.push(serde_json::json!([
+            share["share_seq"],
+            share["share_id"],
+            index,
+            share["share_difficulty"],
+            share["job_issued_at_ms"],
+            share["accepted_at_ms"],
+            share
+                .get("credit_policy")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ]));
+    }
+    let mut request = with_cut.clone();
+    let fields = request.as_object_mut().unwrap();
+    fields.remove("shares");
+    fields.insert(
+        "window_key".into(),
+        serde_json::json!({"share_snapshot_sha256": "dual-writer"}),
+    );
+    fields.insert(
+        "compact_share_identities".into(),
+        serde_json::Value::Array(identities),
+    );
+    fields.insert("compact_shares".into(), serde_json::Value::Array(compact));
+
+    let mut daemon = Command::new(binary)
+        .arg("--serve")
+        .args(&keys)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = BufReader::new(daemon.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let handshake: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(handshake["protocol"], 3, "{handshake}");
+    writeln!(stdin, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let built: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(built["ok"], true, "serve response: {line}");
+    assert_eq!(built["summary"], cut_summary);
+    drop(stdin);
+    assert!(daemon.wait().unwrap().success());
+}
+
 #[test]
 fn the_shipped_binaries_build_verify_and_canonicalize_a_cut_bundle() {
     let fixture = fixture();

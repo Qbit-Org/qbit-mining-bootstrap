@@ -17,8 +17,9 @@ use std::{env, error::Error, fs, process};
 
 const PHASE_METRICS_PREFIX: &str = "qbit-prism-build-phase-metrics ";
 /// Version of the --serve JSONL protocol announced in the startup handshake.
-/// The coordinator refuses to speak to a daemon announcing a different
-/// version and falls back to one-shot builds instead. Version 2 adds the
+/// A client checks it exactly: the retired Python coordinator refused a
+/// daemon announcing another version and built one-shot instead (the native
+/// server builds in process and never starts the daemon). Version 2 adds the
 /// prepare_window request (payout-window fold, canonical digest, and
 /// incremental advance daemon-side) and unifies its window state with the
 /// build cache. Its non-success prepare_window envelopes carry structure,
@@ -27,8 +28,12 @@ const PHASE_METRICS_PREFIX: &str = "qbit-prism-build-phase-metrics ";
 /// vocabulary) beside the human-readable `error`, and `out_of_range` --
 /// distinct from a malformed request -- declares an integer outside the
 /// daemon's declared widths (`field`, `width`, `error`) so the coordinator
-/// folds that window in-process and keeps the daemon.
-const SERVE_PROTOCOL_VERSION: u64 = 2;
+/// folds that window in-process and keeps the daemon. Version 3 adds a build
+/// request's `window_cut` (PRISM 3.1's dual-writer cut, committed in the
+/// reward manifest). A version 2 daemon ignores the field and signs a
+/// manifest without the cut, which the build summary cannot reveal, so a
+/// client that sends a cut needs a daemon announcing 3.
+const SERVE_PROTOCOL_VERSION: u64 = 3;
 /// Parsed share windows retained by the --serve daemon. Windows rotate with
 /// payout/artifact generations, so two entries cover the current generation
 /// plus the previous one still finishing in-flight builds.
