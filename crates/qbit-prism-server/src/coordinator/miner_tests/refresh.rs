@@ -399,3 +399,55 @@ fn refresh_trigger_precedence_is_tip_revision_balances_reanchor_shares_fee_templ
         RefreshTrigger::WriterTimeline
     );
 }
+
+/// 3.1 dual writer: the peer sync's mark can move while the accepted cutoff
+/// does not, the peer's newly eligible rows all below it. Empty-window
+/// (bootstrap) work is then replaced at once, as a first share replaces it,
+/// and labelled `shares`; published work with a window keeps 3.0's
+/// same-template cadence.
+#[tokio::test]
+async fn an_empty_window_is_replaced_once_the_peer_mark_moves_and_a_full_one_keeps_its_cadence() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    let original = {
+        let mut slot = f.store.snapshot.lock().unwrap();
+        let snapshot = slot.as_mut().unwrap();
+        let original = snapshot.clone();
+        snapshot.shares.clear();
+        snapshot.share_seq = 0;
+        snapshot.cut = Some(qbit_prism::WindowCut::default());
+        original
+    };
+    f.coordinator.refresh_once().await.unwrap();
+    let empty = f.coordinator.prepared.read().await.clone().unwrap();
+    assert!(
+        empty.bundle.is_none(),
+        "the empty window's work has a bundle"
+    );
+    let reads = f.store.snapshots.lock().unwrap().len();
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads);
+    *f.store.peer_mark.lock().unwrap() = Some(7);
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads + 1);
+    assert_refresh_observations(&f.coordinator, "shares", 1.0);
+    // At the same mark the new window is reused.
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads + 1);
+
+    // Work with a window keeps 3.0's cadence when only the mark moves.
+    *f.store.snapshot.lock().unwrap() = Some(Snapshot {
+        cut: Some(qbit_prism::WindowCut::new(Some(original.share_seq), None).unwrap()),
+        ..original
+    });
+    f.coordinator.refresh_once().await.unwrap();
+    let full = f.coordinator.prepared.read().await.clone().unwrap();
+    assert!(full.bundle.is_some(), "the window's work has no bundle");
+    let reads = f.store.snapshots.lock().unwrap().len();
+    *f.store.peer_mark.lock().unwrap() = Some(9);
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads);
+    assert!(Arc::ptr_eq(
+        f.coordinator.prepared.read().await.as_ref().unwrap(),
+        &full
+    ));
+}

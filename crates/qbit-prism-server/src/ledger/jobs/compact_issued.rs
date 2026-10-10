@@ -329,7 +329,12 @@ impl CompactDependency<'_> {
 // Return only bounded identity/column metadata and server-side consistency
 // results: never transfer the prepared payload, template or balance bytes on
 // the hot path. The blob keys' existence is not proof of unseen byte integrity.
-const DEPENDENCY_ROW_SQL: &str = r#"SELECT parent_hash,payout_revision,expires_at,
+//
+// One text for both statements below, the payload's window spelled `$window`.
+macro_rules! dependency_row_sql {
+    ($window:literal) => {
+        concat!(
+            r#"SELECT parent_hash,payout_revision,expires_at,
         window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,
         window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256,
         payload->'original_expires_at_ms' AS original_expires_at_ms,
@@ -338,7 +343,9 @@ const DEPENDENCY_ROW_SQL: &str = r#"SELECT parent_hash,payout_revision,expires_a
             AND payload->'parent_hash'=to_jsonb(parent_hash)
             AND payload->'payout_revision'=to_jsonb(payout_revision)
             AND payload->'template_sha256'=to_jsonb(template_sha256)
-            AND payload->'window'=jsonb_build_object(
+            AND "#,
+            $window,
+            r#"=jsonb_build_object(
                 'anchor_ms',window_anchor_ms,
                 'prior_balances_digest',window_prior_balances_sha256,
                 'shares',CASE WHEN window_first_share_seq IS NULL THEN 'null'::jsonb
@@ -346,28 +353,29 @@ const DEPENDENCY_ROW_SQL: &str = r#"SELECT parent_hash,payout_revision,expires_a
                         'last_share_seq',window_last_share_seq,'share_count',window_share_count,
                         'snapshot_sha256',window_snapshot_sha256) END),false)
             AS payload_matches_columns
-        FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#;
+        FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#
+        )
+    };
+}
+
+/// A single writer's dependency statement, 3.0's text.
+const DEPENDENCY_ROW_SQL: &str = dependency_row_sql!("payload->'window'");
 
 /// [`DEPENDENCY_ROW_SQL`] for a dual-writer frontend, whose prepared windows
 /// carry a cut. The typed window columns duplicate the reference's anchor,
 /// balances digest and range, not the cut, so the payload's window is
 /// compared without its `cut` key. The cut is held to the payload's canonical
 /// encoding when the record is decoded (`prepared.rs`), and to the record's
-/// audit hashes when it is rebuilt. A single writer issues 3.0's statement.
-static DUAL_WRITER_DEPENDENCY_ROW_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
-        let window = "AND payload->'window'=jsonb_build_object(";
-        assert_eq!(DEPENDENCY_ROW_SQL.matches(window).count(), 1);
-        DEPENDENCY_ROW_SQL.replace(window, "AND (payload->'window')-'cut'=jsonb_build_object(")
-    });
+/// audit hashes when it is rebuilt.
+const DUAL_WRITER_DEPENDENCY_ROW_SQL: &str = dependency_row_sql!("(payload->'window')-'cut'");
 
 pub(super) async fn dependency_row(
     tx: &mut Transaction<'_, Postgres>,
     key: &str,
     dual_writer: bool,
 ) -> Result<Option<PgRow>> {
-    let sql: &str = if dual_writer {
-        &DUAL_WRITER_DEPENDENCY_ROW_SQL
+    let sql = if dual_writer {
+        DUAL_WRITER_DEPENDENCY_ROW_SQL
     } else {
         DEPENDENCY_ROW_SQL
     };
@@ -411,14 +419,19 @@ pub(super) async fn require_live(
 #[cfg(test)]
 mod dependency_row_tests {
     use super::*;
+    use sha2::Digest;
 
     #[test]
     fn a_dual_writer_compares_the_window_without_its_cut_and_a_single_writer_as_3_0() {
-        assert!(DEPENDENCY_ROW_SQL.contains("AND payload->'window'=jsonb_build_object("));
-        assert!(!DEPENDENCY_ROW_SQL.contains("'cut'"));
-        let dual: &str = &DUAL_WRITER_DEPENDENCY_ROW_SQL;
+        // 3.0's text, byte for byte.
         assert_eq!(
-            dual.replace("(payload->'window')-'cut'", "payload->'window'"),
+            hex::encode(sha2::Sha256::digest(DEPENDENCY_ROW_SQL.as_bytes())),
+            "34b0e2bd21a97e5477c0822739083e55980fb41e38e0e72c1ed3ebcffeb704f8"
+        );
+        assert!(!DEPENDENCY_ROW_SQL.contains("'cut'"));
+        assert_eq!(
+            DUAL_WRITER_DEPENDENCY_ROW_SQL
+                .replace("(payload->'window')-'cut'", "payload->'window'"),
             DEPENDENCY_ROW_SQL
         );
     }

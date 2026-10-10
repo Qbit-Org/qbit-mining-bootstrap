@@ -86,6 +86,12 @@ impl RefreshWindow {
         self.anchored.elapsed() < interval
     }
 
+    /// The dual-writer peer mark this window's cut was taken at; `None` for
+    /// a single writer.
+    pub(super) fn peer_mark(&self) -> Option<i64> {
+        self.peer_mark
+    }
+
     /// Whether a new template may reuse this window. A window read on
     /// another writer timeline never is: a promotion can lose its rows and
     /// hand their numbers to other shares, so an equal cutoff proves nothing
