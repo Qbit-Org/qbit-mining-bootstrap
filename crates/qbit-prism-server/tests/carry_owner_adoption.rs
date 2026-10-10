@@ -185,10 +185,11 @@ impl Fixture {
             .set_node_identity(NODE.node, "carry_owner_adoption")
             .await?;
         // The fixture's shares are the peer's, as peer sync would have
-        // copied them: mark them pulled, as the sync's share cursor does, so
-        // the window cut admits them (D-14).
+        // copied them: mark them pulled, as a clean pull leaves the sync's
+        // share cursor (nothing refused), so the window cut admits them
+        // (D-14).
         sqlx::query(
-            "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) SELECT 'shares',$1,max(share_seq),max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1 ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through,ingested_through=EXCLUDED.ingested_through",
+            "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) SELECT 'shares',$1,max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1 ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through",
         )
         .bind(NODE.node.peer().index())
         .execute(&pool)
