@@ -1337,6 +1337,22 @@ impl Ledger {
         Ok(applied)
     }
 
+    /// Forget the last own-log verification (D-17): own rows the peer holds
+    /// are missing here, so the evidence it recorded no longer proves this
+    /// database whole, as after a restore that kept the timeline. Until
+    /// recovery records a new one, the latch never sets without the peer.
+    /// Returns whether a verification was forgotten.
+    pub async fn forget_own_log_verification(&self) -> Result<bool> {
+        Ok(sqlx::query(
+            "UPDATE qbit_prism_node_lineage SET verified_system_identifier=NULL,verified_timeline=NULL,\
+             verified_at=NULL WHERE singleton AND verified_at IS NOT NULL",
+        )
+        .execute(&mut *self.acquire().await?)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
     /// Record that this node's own log was proved complete on the server
     /// `evidence` names (D-8, D-17).
     pub async fn record_own_log_verified(
@@ -1416,7 +1432,11 @@ impl BlockRefused {
 /// How many partitions above what it can already hold a node accepts a
 /// pulled `share_seq`: at 2^24 rows a partition, days of the peer's appends
 /// even at peak, and few enough that attaching them stays within one
-/// `ensure`.
+/// `ensure`. Only a jump in the peer's own sequence can pass it, never a
+/// backlog however long: the pull reads the peer's rows in order from its
+/// cursor, a batch at a time, each node's rows are dense in its own
+/// sequence, and this node raises its sequence above every batch it takes,
+/// so the next batch starts within reach again.
 const PULL_HEADROOM_PARTITIONS: i64 = 64;
 
 /// The highest `share_seq` among `rows` at or below `ceiling`.
@@ -1446,6 +1466,39 @@ fn prefixed(columns: &str, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pull's lists and the table inventory's local columns agree
+    /// without a database: every column a pull skips is local there, every
+    /// local column is skipped (but a prepared job's `expires_at`, carried as
+    /// the peer held it, D-11), and no fact a pull names is local.
+    #[test]
+    fn the_pull_and_the_table_inventory_agree_on_every_copied_column() {
+        for table in COPIED_TABLES {
+            let local = super::super::table_inventory::local_columns(table);
+            match carried(table) {
+                Carried::AllBut(skipped) => {
+                    for column in skipped {
+                        assert!(
+                            local.contains(column),
+                            "{table}.{column} is skipped but not local"
+                        );
+                    }
+                    for column in &local {
+                        assert!(
+                            skipped.contains(column)
+                                || (*table == "qbit_prism_jobs" && *column == "expires_at"),
+                            "{table}.{column} is local but carried"
+                        );
+                    }
+                }
+                Carried::Only(facts) => {
+                    for fact in facts {
+                        assert!(!local.contains(fact), "{table}.{fact} is local but carried");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn derived_columns_are_never_carried_and_landing_facts_are_listed() {

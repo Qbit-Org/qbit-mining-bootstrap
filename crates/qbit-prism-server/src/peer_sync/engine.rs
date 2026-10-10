@@ -200,6 +200,9 @@ pub struct PeerSync {
     /// Own-log recovery met an own row this database holds with other
     /// content: the latch stays down until an operator resolves it.
     own_log_diverged: bool,
+    /// Own-log recovery found own rows missing here and forgot the last
+    /// verification before inserting them.
+    own_rows_missing: bool,
     safe_sync_mark: Option<i64>,
     streams: BTreeMap<&'static str, StreamState>,
     started: Instant,
@@ -236,6 +239,7 @@ impl PeerSync {
             identity_refusal: None,
             latch: Latch::default(),
             own_log_diverged: false,
+            own_rows_missing: false,
             safe_sync_mark: None,
             streams: BTreeMap::new(),
             started: Instant::now(),
@@ -586,6 +590,7 @@ impl PeerSync {
             if batch.row_count == 0 {
                 break;
             }
+            self.own_rows_missing().await?;
             clock_ms = clock_ms.max(batch.highest_accepted_at_ms);
             applied.merge(
                 self.ledger
@@ -607,6 +612,7 @@ impl PeerSync {
             if blocks.is_empty() {
                 break;
             }
+            self.own_rows_missing().await?;
             for block in &blocks {
                 applied.merge(self.ledger.apply_block(block, None).await?);
             }
@@ -625,11 +631,18 @@ impl PeerSync {
             if batch.count == 0 {
                 break;
             }
+            self.own_rows_missing().await?;
             applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
             ensure_progress(&mut self.own_log_diverged, &applied)?;
         }
         let roles = bounded(peer::node_roles(connection, node)).await?;
-        applied.merge(self.ledger.apply_node_roles(&roles, node).await?);
+        let journal = self.ledger.apply_node_roles(&roles, node).await?;
+        if !journal.inserted.is_empty() {
+            // Missing too, so the verification goes, as above; the rows are
+            // already back, which is all a crash here could leave behind.
+            self.own_rows_missing().await?;
+        }
+        applied.merge(journal);
         ensure_progress(&mut self.own_log_diverged, &applied)?;
         // Above everything the peer has seen of this node: its cursors over
         // this node's streams, and the highest own rows it holds.
@@ -642,6 +655,7 @@ impl PeerSync {
             .await?;
         let evidence = self.ledger.lineage_evidence().await?;
         self.ledger.record_own_log_verified(evidence).await?;
+        self.own_rows_missing = false;
         tracing::info!(
             recovered = ?applied.inserted,
             system_identifier = evidence.system_identifier,
@@ -654,6 +668,27 @@ impl PeerSync {
             rollback_alerted: false,
         };
         Ok(applied)
+    }
+
+    /// Own rows the peer holds are missing here, so whatever verification
+    /// this database recorded no longer proves it whole: a restore that kept
+    /// the timeline (S6) shows the evidence it was verified on. Forget it
+    /// before the rows are inserted, so that if recovery stops partway, on
+    /// a peer that answers but fails or a crash, the latch cannot set from
+    /// that evidence; it sets when recovery completes.
+    async fn own_rows_missing(&mut self) -> Result<()> {
+        if !self.own_rows_missing {
+            if self.ledger.forget_own_log_verification().await? {
+                tracing::error!(
+                    "ALERT: own rows the peer holds are missing here although this database \
+                     showed the evidence of its last own-log verification (a restore that kept \
+                     the timeline): the verification is forgotten, and this node does not serve \
+                     until it has recovered them from the peer"
+                );
+            }
+            self.own_rows_missing = true;
+        }
+        Ok(())
     }
 
     /// Pull the peer's rows: shares, the journal, then landed blocks and
@@ -685,6 +720,9 @@ impl PeerSync {
             peer,
         ))
         .await?;
+        // Whether the share mark moved: blocks waiting for it pass again at
+        // once only then.
+        let mut shares_moved = false;
         match self
             .ledger
             .apply_share_batch(self.node, peer, &batch, Some(SHARES))
@@ -693,6 +731,7 @@ impl PeerSync {
             Ok(applied) => {
                 report.applied.merge(applied);
                 report.more |= batch.scanned >= self.batch_rows;
+                shares_moved = batch.through.is_some_and(|through| through > cursor);
                 let through = batch.through.unwrap_or(cursor);
                 let lag = bounded(peer::shares_beyond(
                     connection,
@@ -761,7 +800,9 @@ impl PeerSync {
         if let Some((pending, error)) = failed {
             self.stream_failed(BLOCKS, pending as u64, &error, report);
         } else if covered < blocks.len() {
-            report.more = true;
+            // Never at once while the share mark stands still, as when the
+            // share stream fails: the interval paces the retry.
+            report.more |= shares_moved;
             self.stream_done(BLOCKS, (blocks.len() - covered) as u64);
         } else if (blocks.len() as i64) < BLOCKS_PER_PASS {
             self.ledger

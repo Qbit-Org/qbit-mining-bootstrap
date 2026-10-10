@@ -3866,7 +3866,10 @@ of it, and records the system identifier and WAL timeline it verified on in
 latch is set when the database is still on that server, so a plain restart
 or a crash recovery serves. A new identifier or timeline, or no record, is
 rollback evidence: the latch stays unset, `qbit_prism_peer_sync_rollback_evidence`
-reads 1, and the node waits for the peer. If a row of this node's that the
+reads 1, and the node waits for the peer. Once recovery finds an own row
+missing, the node first forgets its last verification, so a recovery cut
+short (a peer that fails partway, a crash) leaves it waiting for the peer
+even after a restore that kept the timeline. If a row of this node's that the
 peer holds differs from the one here, the own log has diverged: the conflict
 is recorded, and the latch stays unset, with or without the peer, until an
 operator decides. Losing the peer later never clears the latch. A change of
@@ -3878,8 +3881,12 @@ stay unset. Before a found block's
 `submitblock`, the node waits up to `PRISM_PEER_INGEST_WAIT_MS` (250 ms by
 default) for the peer's cursors to cover its shares through the block's window
 and the prepared record the block was built on: what the peer needs to adopt
-the block if this node dies. The block is offered whatever the wait finds,
-counted in `qbit_prism_peer_sync_offer_waits_total{outcome}`.
+the block if this node dies. The bound covers the node's own read of those
+needs too. The wait keeps one connection open to the peer on each path, tries
+the path that answered last first, and gives each path an even share of the
+time left, so a path that hangs cannot use up the other's. The block is
+offered whatever the wait finds, counted in
+`qbit_prism_peer_sync_offer_waits_total{outcome}`.
 
 **Hashrate rollups and the share archive.** Both assume a row never commits
 below one already folded, which holds for a node's own shares but not for
@@ -3898,7 +3905,11 @@ UPDATE qbit_prism_node_lineage SET peer_tail_lost_at = clock_timestamp();
 ```
 
 Clear it (`SET peer_tail_lost_at = NULL`) once the rebuilt peer syncs.
-`node-identity repersonalise` clears it on the rebuilt node. Never declare it
+`node-identity repersonalise` clears it on the rebuilt node. A frontend
+decides its rollups from its own mode, and `share-archive plan` from the
+database, which stays personalised: after a downgrade to a single writer
+(`PRISM_DUAL_WRITER_DOWNGRADE`), declare the peer's tail lost too, or the
+archive waits for a peer that no longer syncs. Never declare it
 for a peer that will come back with its own database: its unpulled shares
 would then arrive below the watermark, unfolded, or into a partition that has
 left, where the share stream stops until the partition is restored.
@@ -3924,7 +3935,10 @@ GRANT SELECT ON SEQUENCE qbit_prism_sync_seq, qbit_share_ledger_share_seq_seq TO
 
 Reads of the share ledger go through its parent, so new partitions need no
 grant. The sync also calls `qbit_prism_sync_barrier()` and reads the catalogs,
-which every role may do by default. The role's settings bound what a dead
+which every role may do by default. Each frontend holds up to two connections
+for its sync and one per path for the found-block wait, so allow the role at
+least four per frontend, with room for a restarted frontend's old sessions
+until the peer drops them. The role's settings bound what a dead
 puller can hold on the peer: `default_transaction_read_only = on`,
 `statement_timeout = '8s'`, `lock_timeout = '2s'`,
 `idle_in_transaction_session_timeout = '5s'`, and TCP keepalives with a 10 s

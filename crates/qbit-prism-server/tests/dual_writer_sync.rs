@@ -399,7 +399,8 @@ async fn out_of_order_commits_are_never_skipped() -> Result<()> {
 /// A node restored from an old backup (S6) pulls back its own rows the peer
 /// holds before its latch is set, raises its sequences above everything the
 /// peer has seen of it, and then appends without colliding; the peer takes
-/// the new rows as usual.
+/// the new rows as usual. A recovery cut short leaves the latch down, even
+/// with the backup on the server and timeline it was verified on.
 #[tokio::test]
 async fn a_restored_node_recovers_its_own_log_from_the_peer() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -431,7 +432,26 @@ async fn a_restored_node_recovers_its_own_log_from_the_peer() -> Result<()> {
             let restored = Ledger::connect(&backup.url, "node-a".into(), 8, true).await?;
             ensure!(shares_of(&restored.pool, 0).await?.len() == 2);
             ensure!(restored.recorded_node_identity().await?.map(|r| r.node) == Some(NodeIndex::A));
-            let (mut on_restored, _) = sync(&restored, NodeIndex::A, &pair.b_url);
+            // The backup kept A's last verification, on this server and
+            // timeline: a restore that kept the timeline. B answers, but
+            // recovery fails partway (B's journal is locked). The node found
+            // its own rows missing, so it must not latch on that evidence.
+            let mut lock = pair.b.pool.begin().await?;
+            sqlx::raw_sql("LOCK TABLE qbit_prism_node_roles IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            let (mut on_restored, metrics) = sync(&restored, NodeIndex::A, &pair.b_url);
+            let cut_short = on_restored.pass().await;
+            lock.rollback().await?;
+            ensure!(cut_short.is_err(), "recovery read a locked journal: {cut_short:?}");
+            ensure!(metrics
+                .render()
+                .contains("qbit_prism_peer_sync_own_log_caught_up 0"));
+            let verified: Option<i64> =
+                sqlx::query_scalar("SELECT verified_system_identifier FROM qbit_prism_node_lineage")
+                    .fetch_one(&restored.pool)
+                    .await?;
+            ensure!(verified.is_none(), "the verification outlived missing own rows");
             let report = on_restored.pass().await?;
             ensure!(report.own_log_caught_up, "{report:?}");
             ensure!(
@@ -822,7 +842,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
             share_seq: Some(seqs[1]),
             prepared_sync_seq: prepared,
         };
-        let (waited, outcome) = wait.wait(held).await;
+        let (waited, outcome, _) = wait.wait(std::future::ready(held)).await;
         ensure!(
             outcome == PeerIngest::Confirmed && waited < bound,
             "{outcome:?} after {waited:?}"
@@ -831,7 +851,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
             share_seq: Some(seqs[1] + 1000),
             prepared_sync_seq: prepared,
         };
-        let (waited, outcome) = wait.wait(beyond).await;
+        let (waited, outcome, _) = wait.wait(std::future::ready(beyond)).await;
         ensure!(
             outcome == PeerIngest::TimedOut && waited >= bound.mul_f32(0.9),
             "{outcome:?} after {waited:?}"
@@ -839,8 +859,43 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         ensure!(waited < bound * 4, "the wait overran its bound: {waited:?}");
         let dead = PeerIngestWait::new(&config(NodeIndex::A, &dead_url(&pair.b_url)?, None))
             .context("the wait is on by default")?;
-        let (_, outcome) = dead.wait(held).await;
+        let (_, outcome, _) = dead.wait(std::future::ready(held)).await;
         ensure!(matches!(outcome, PeerIngest::Unreachable(_)), "{outcome:?}");
+        // This node's own read of the needs is inside the bound too.
+        let (waited, outcome, needs) = wait
+            .wait(async {
+                tokio::time::sleep(bound * 2).await;
+                held
+            })
+            .await;
+        ensure!(
+            outcome == PeerIngest::TimedOut && needs.is_none() && waited < bound * 2,
+            "{outcome:?} after {waited:?}"
+        );
+        // A first path that accepts connections and never answers does not
+        // use up the fallback's time.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut hung = url::Url::parse(&pair.b_url)?;
+        hung.set_ip_host("127.0.0.1".parse()?)
+            .ok()
+            .context("the silent path's host")?;
+        hung.set_port(Some(silent.local_addr()?.port()))
+            .ok()
+            .context("the silent path's port")?;
+        let held_sockets = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = silent.accept().await {
+                sockets.push(socket);
+            }
+        });
+        let fallback = PeerIngestWait::new(&config(NodeIndex::A, hung.as_str(), Some(&pair.b_url)))
+            .context("the wait is on by default")?;
+        let (waited, outcome, _) = fallback.wait(std::future::ready(held)).await;
+        held_sockets.abort();
+        ensure!(
+            outcome == PeerIngest::Confirmed && waited < bound,
+            "{outcome:?} after {waited:?} with a silent first path"
+        );
         let mut off = on_a.clone();
         off.peer_ingest_wait = Duration::ZERO;
         ensure!(PeerIngestWait::new(&off).is_none(), "0 turns the wait off");
@@ -1139,11 +1194,11 @@ async fn the_sync_needs_only_the_peer_roles_documented_grants() -> Result<()> {
             let wait = PeerIngestWait::new(&config(NodeIndex::A, &b_as_role, None))
                 .context("the offer wait is configured")?;
             let a_last = shares_of(&pair.a.pool, 0).await?.last().map(|(seq, _)| *seq);
-            let (_, ingest) = wait
-                .wait(AdoptionNeeds {
+            let (_, ingest, _) = wait
+                .wait(std::future::ready(AdoptionNeeds {
                     share_seq: a_last,
                     prepared_sync_seq: None,
-                })
+                }))
                 .await;
             ensure!(ingest == PeerIngest::Confirmed, "{ingest:?}");
             Ok(())
