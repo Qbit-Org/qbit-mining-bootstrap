@@ -772,6 +772,7 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::probe_tests::a_d
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::postgres_fixture_cleans_up_after_setup_error_and_body_panic
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
+qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued::dependency_row_tests::a_dual_writer_prepared_row_matches_its_columns_on_a_single_writer
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_connection_lost_while_checking_a_failed_attempt_keeps_both_errors
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_cursor_dropped_after_its_look_up_reads_as_nothing_pending
