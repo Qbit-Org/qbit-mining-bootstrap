@@ -9,8 +9,9 @@ the release candidates' notes, [3.0.0-rc.1](release-notes-3.0.0-rc.1.md),
 [3.0.0-rc.2](release-notes-3.0.0-rc.2.md),
 [3.0.0-rc.3](release-notes-3.0.0-rc.3.md),
 [3.0.0-rc.4](release-notes-3.0.0-rc.4.md),
-[3.0.0-rc.5](release-notes-3.0.0-rc.5.md) and
-[3.0.0-rc.6](release-notes-3.0.0-rc.6.md).
+[3.0.0-rc.5](release-notes-3.0.0-rc.5.md),
+[3.0.0-rc.6](release-notes-3.0.0-rc.6.md) and
+[3.0.0-rc.7](release-notes-3.0.0-rc.7.md).
 
 ## Migration and recovery (D5)
 
