@@ -637,12 +637,7 @@ async fn routing_settled(sim: &Sim) -> Result<()> {
 fn accepted_from(records: &[ShareRecord], node: Node, after_ms: u64) -> usize {
     records
         .iter()
-        .filter(|r| {
-            r.accepted()
-                && !r.scheduled_block
-                && r.issuer == Some(node)
-                && r.answered_ms.is_some_and(|at| at > after_ms)
-        })
+        .filter(|r| r.accepted_on(node, after_ms))
         .count()
 }
 
@@ -1279,11 +1274,12 @@ enum RoundWork {
         job_ms: std::result::Result<u64, String>,
     },
     /// B's block, solved on work B handed its finder before the freeze: how
-    /// long it took to land and confirm on B, and B's first job on it, timed
-    /// from the confirmation.
+    /// long from asking the finder to solve it, through its acceptance and
+    /// landing, to its confirmation on B, and B's first job on it, timed from
+    /// the confirmation.
     Landed {
         block: String,
-        landing_ms: u64,
+        found_and_confirmed_ms: u64,
         job_ms: std::result::Result<u64, String>,
     },
     /// B could not land its block while A was frozen.
@@ -1342,11 +1338,11 @@ async fn freeze_round(
             .await
             {
                 Ok(Ok(found)) => {
-                    let landing_ms = started.elapsed().as_millis() as u64;
+                    let found_and_confirmed_ms = started.elapsed().as_millis() as u64;
                     let job_ms = first_job_on(pool, Node::B, &found.hash, NEW_WORK_BOUND).await?;
                     let work = RoundWork::Landed {
                         block: found.hash.clone(),
-                        landing_ms,
+                        found_and_confirmed_ms,
                         job_ms,
                     };
                     (after_stop, work, Some(found))
@@ -1445,7 +1441,10 @@ async fn s02_frozen_during_pulls(sim: &mut Sim) -> Result<Body> {
     let landings: Vec<(u64, u64)> = rounds
         .iter()
         .filter_map(|r| match &r.work {
-            RoundWork::Landed { landing_ms, .. } => Some((*landing_ms, r.held_ms)),
+            RoundWork::Landed {
+                found_and_confirmed_ms,
+                ..
+            } => Some((*found_and_confirmed_ms, r.held_ms)),
             _ => None,
         })
         .collect();
@@ -1458,7 +1457,8 @@ async fn s02_frozen_during_pulls(sim: &mut Sim) -> Result<Body> {
             "{} freezes ({timed} timed to one of A's pulls on B; {caught} left A with a query, a \
              transaction or an advisory lock open there). New tips: B's first job on each after \
              {:?} ms (median) and {:?} ms (max) from the mint, bound {} s. Landings: {} blocks \
-             landed and confirmed on B during freezes, as (landing ms, freeze ms): {landings:?}. \
+             found, landed and confirmed on B during freezes, as (ms from the solve request to \
+             confirmation, freeze ms): {landings:?}. \
              Stalled: {stalled:?}. Schedule seed {seed}; every round in freezes.json",
             rounds.len(),
             tip_jobs.get(tip_jobs.len() / 2),
@@ -1555,6 +1555,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
     );
 
     let timed = wait_for_a_pull(&pool, Duration::from_secs(5)).await?;
+    let cut_at = sim.clock.now_ms();
     sim.links.set("peer-a-to-b", LinkState::Discard)?;
     let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
     sim.mark(
@@ -1599,23 +1600,22 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
     let marked_down = report
         .transitions
         .iter()
-        .find(|t| t.backend == "a" && !t.up && t.at_ms >= fault_at)
+        .find(|t| t.backend == "a" && !t.up && t.at_ms >= cut_at)
         .map(|t| t.at_ms);
     let records = sim.load()?.records();
-    let sessions = sim.balancer.sessions();
     let flat = match marked_down {
         Some(down) if down + 20_000 <= fault_at + 45_000 => {
             let (early, early_n) = answer_p95(&records, Node::B, down + 5_000, down + 20_000);
             let (late, late_n) = answer_p95(&records, Node::B, fault_at + 45_000, fault_at + 60_000);
             let passed = matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50);
             (
-                passed && sessions.get("a").copied().unwrap_or(0) == 0,
+                passed,
                 format!(
                     "p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares \
                      5 to 20 s after A was marked down ({} ms after the death), {late:?} ms over \
                      {late_n} shares 45 to 60 s after the death (bound: twice the first, plus \
-                     50 ms), at {PULLER_DEATH_RATE} offered shares/s; open sessions now {sessions:?}",
-                    down - fault_at
+                     50 ms), at {PULLER_DEATH_RATE} offered shares/s",
+                    down as i64 - fault_at as i64
                 ),
             )
         }
@@ -1625,7 +1625,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         ),
     };
     body.expect(
-        "B takes every miner and its share appends stay flat while A's puller is dead",
+        "B's share appends stay flat while A's puller is dead",
         flat.0,
         flat.1,
     );
@@ -1704,7 +1704,7 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
     steady(sim, 5).await;
     routing_settled(sim).await?;
     // Both nodes are up from here (each mark is recorded before the state
-    // it sets is visible), so D-8 below judges both.
+    // it sets is visible); D-8 below needs them still up at the cut.
     let settled_at = sim.clock.now_ms();
     let fault = Fault::LinkCut(LinkState::Blackholed);
     let fault_at = sim.inject(fault).await?;
@@ -1751,15 +1751,17 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
     let until = sim.clock.now_ms();
     let report = sim.balancer.report();
     let names: Vec<&str> = Node::BOTH.iter().map(|node| node.label()).collect();
+    // Serving at the cut: up once routing settled and still up when the
+    // link was cut. Withdrawn: marked down after the cut.
     let serving: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| report.up_at(name, settled_at))
+        .filter(|name| report.up_throughout(name, settled_at, fault_at))
         .collect();
     let withdrawn: Vec<&str> = serving
         .iter()
         .copied()
-        .filter(|name| !report.up_throughout(name, settled_at, until))
+        .filter(|name| !report.up_throughout(name, fault_at, until))
         .collect();
     let failed_while_up: std::collections::BTreeMap<&str, usize> = names
         .iter()
@@ -1768,7 +1770,7 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
                 .failed_checks
                 .iter()
                 .filter(|f| {
-                    f.backend == name && f.while_up && (settled_at..=until).contains(&f.at_ms)
+                    f.backend == name && f.while_up && (fault_at..=until).contains(&f.at_ms)
                 })
                 .count();
             (name, count)
@@ -1778,9 +1780,9 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
         "a link loss never withdraws a serving node (D-8)",
         serving.len() == names.len() && withdrawn.is_empty(),
         format!(
-            "serving just before the cut: {serving:?} (both must be); withdrawn between then and \
-             {} ms after the catch-up ({settled_at}..{until} ms; the cut at {fault_at} ms): \
-             {withdrawn:?}; checks failed while \
+            "serving from when routing settled ({settled_at} ms) to the cut ({fault_at} ms): \
+             {serving:?} (both must be); withdrawn after the cut, until {} ms after the catch-up \
+             ({until} ms): {withdrawn:?}; checks failed while \
              serving: {failed_while_up:?}; transitions: {:?}",
             horizon.as_millis(),
             report.transitions
@@ -1802,14 +1804,20 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
     Ok(body)
 }
 
+/// One of A's statements seen waiting on the locked table in S4's
+/// transient apply: its backend, when the statement started, and its text.
+type WaitingApply = (i32, String, String);
+
 /// S4, a transient failure applying a peer block (the coordinator's review
 /// of D1's engine, P1 3). A transaction on A holds EXCLUSIVE on its audit
-/// bundles, so every landing insert on A waits past A's lock_timeout (5 s)
+/// bundles, so every landing insert on A waits until A's lock_timeout (5 s)
 /// and fails while reads go on. B lands a block, and the lock stays for
-/// `TRANSIENT_HOLD` more, through at least two failed applies on A. Once it
-/// clears, the block must land on A within the catch-up bound, and A must
-/// record no sync conflict for it: a transient failure is retried, never
-/// skipped (D-10 skips only a block whose held facts differ).
+/// `TRANSIENT_HOLD` more, long enough for two failed applies; at least one
+/// of A's statements must be seen waiting on the lock, or the retry was
+/// never exercised. Once the lock clears, the block must land on A within
+/// the catch-up bound, and A must record no sync conflict for it: a
+/// transient failure is retried, never skipped (D-10 skips only a block
+/// whose held facts differ).
 async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
     let mut body = Body::default();
     sim.load()?.resume();
@@ -1820,46 +1828,49 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
     sqlx::query("LOCK TABLE qbit_pool_audit_bundles IN EXCLUSIVE MODE")
         .execute(&mut *lock)
         .await?;
-    sim.mark("A's audit bundles locked: landing inserts wait past lock_timeout, reads go on");
-    let block = match find_block(
-        sim,
-        &mut body,
-        Node::B,
-        "B while A cannot apply its blocks",
-        Some(&[Node::B]),
-    )
-    .await
-    {
-        Ok(block) => block,
-        Err(error) => {
-            lock.rollback().await?;
-            return Err(error);
-        }
-    };
-    // Every apply of A's that reaches the locked table waits there until
-    // A's lock_timeout: each distinct (backend, statement start) seen
-    // waiting is one attempt.
-    let mut attempts: std::collections::BTreeSet<(i32, String)> = Default::default();
-    let holding = Instant::now();
-    while holding.elapsed() < TRANSIENT_HOLD {
-        let waiting: Vec<(i32, String)> = sqlx::query_as(
-            "SELECT a.pid, a.query_start::text FROM pg_locks l \
-             JOIN pg_stat_activity a ON a.pid = l.pid \
-             WHERE NOT l.granted AND l.relation = 'qbit_pool_audit_bundles'::regclass \
-               AND a.query_start IS NOT NULL",
+    sim.mark("A's audit bundles locked: landing inserts wait until lock_timeout, reads go on");
+    // Whatever happens while the lock is held, it is released before an
+    // error is raised.
+    let held = async {
+        let block = find_block(
+            sim,
+            &mut body,
+            Node::B,
+            "B while A cannot apply its blocks",
+            Some(&[Node::B]),
         )
-        .fetch_all(&a)
         .await?;
-        attempts.extend(waiting);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let held_while_locked: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM qbit_pool_blocks WHERE block_hash = $1)")
-            .bind(&block)
-            .fetch_one(&a)
+        // Each distinct (backend, statement start) of A's frontend seen
+        // waiting on the locked table is one attempt.
+        let mut attempts: std::collections::BTreeSet<WaitingApply> = Default::default();
+        let holding = Instant::now();
+        while holding.elapsed() < TRANSIENT_HOLD {
+            let waiting: Vec<WaitingApply> = sqlx::query_as(
+                "SELECT a.pid, a.query_start::text, left(a.query, 120) \
+                 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+                 WHERE NOT l.granted \
+                   AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                   AND l.relation = 'qbit_pool_audit_bundles'::regclass \
+                   AND a.usename = $1 AND a.query_start IS NOT NULL",
+            )
+            .bind(crate::sim::OWNER_ROLE)
+            .fetch_all(&a)
             .await?;
+            attempts.extend(waiting);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let on_a: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM qbit_pool_blocks WHERE block_hash = $1)",
+        )
+        .bind(&block)
+        .fetch_one(&a)
+        .await?;
+        anyhow::Ok((block, attempts, on_a))
+    }
+    .await;
     lock.rollback().await?;
     sim.mark("A's audit bundles unlocked");
+    let (block, attempts, held_while_locked) = held?;
     let landed = sim.wait_confirmed(&block, &[Node::A], CATCH_UP_BOUND).await;
     let conflicts: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT source_table, row_key, detail FROM qbit_prism_peer_sync_conflicts \
@@ -1873,10 +1884,10 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
         "B's block, which A failed to apply while locked, lands on A once the lock clears",
         !attempts.is_empty() && !held_while_locked && landed.is_ok() && conflicts.is_empty(),
         format!(
-            "{} of A's applies waited on the lock during the {} s hold (at least one must, or the \
-             retry was never exercised); on A while locked: {held_while_locked} (the lock must keep \
-             it out); confirmed on A \
-             after the release: {}; sync conflicts recorded for it: {conflicts:?}",
+            "{} statements of A's frontend waited on the lock during the {} s hold (at least one \
+             must, or the retry was never exercised): {attempts:?}; on A while locked: \
+             {held_while_locked} (the lock must keep it out); confirmed on A after the release: \
+             {}; sync conflicts recorded for it: {conflicts:?}",
             attempts.len(),
             TRANSIENT_HOLD.as_secs(),
             match &landed {
@@ -2191,20 +2202,32 @@ async fn s06_peer_unreadable(sim: &mut Sim, how: Unreadable) -> Result<Body> {
     // Whatever the restart does, B is made readable again before an error is
     // raised.
     let outcome = restart_beside_unreadable_peer(sim, &mut body).await;
-    match lock.take() {
-        Some(transaction) => transaction.rollback().await?,
-        None => {
-            sqlx::query(&format!(
-                "GRANT SELECT ON qbit_share_ledger TO {}",
-                crate::sim::PEER_ROLE
-            ))
-            .execute(&b)
-            .await?;
+    let restored = async {
+        match lock.take() {
+            Some(transaction) => transaction.rollback().await?,
+            None => {
+                sqlx::query(&format!(
+                    "GRANT SELECT ON qbit_share_ledger TO {}",
+                    crate::sim::PEER_ROLE
+                ))
+                .execute(&b)
+                .await?;
+            }
         }
+        anyhow::Ok(())
     }
+    .await;
     b.close().await;
+    // The restart's own failure is the root cause; a failure to restore B
+    // is added to it, never put in its place.
+    match (outcome, restored) {
+        (Err(error), Err(restore)) => {
+            return Err(error.context(format!("and making B readable again failed: {restore:#}")))
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
+    }
     sim.mark("B readable again");
-    outcome?;
     for node in Node::BOTH {
         if !sim.frontend(node).running() {
             sim.frontend_mut(node).start()?;

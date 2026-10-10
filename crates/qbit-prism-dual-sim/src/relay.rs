@@ -29,7 +29,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::sync::{
-    atomic::{AtomicU16, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     Arc,
 };
 use tokio::{
@@ -212,12 +212,29 @@ async fn connection(
     let _ = upstream.set_nodelay(true);
     let (client_read, client_write) = client.into_split();
     let (upstream_read, upstream_write) = upstream.into_split();
-    let outbound = tokio::spawn(pump(client_read, upstream_write, state.clone()));
-    let inbound = tokio::spawn(pump(upstream_read, client_write, state.clone()));
+    // Set once either direction drops bytes: the stream then has a hole in
+    // it, so the connection cannot carry on when the link leaves Discard.
+    let spliced = Arc::new(AtomicBool::new(false));
+    let outbound = tokio::spawn(pump(
+        client_read,
+        upstream_write,
+        state.clone(),
+        spliced.clone(),
+    ));
+    let inbound = tokio::spawn(pump(
+        upstream_read,
+        client_write,
+        state.clone(),
+        spliced.clone(),
+    ));
     // Each pump hands its halves back when it ends, so a reset can abort
     // both sides instead of letting a half-closed connection linger.
     let (outbound, inbound) = (outbound.await, inbound.await);
-    let reset_seen = matches!(*state.borrow(), LinkState::Reset);
+    // A reset ends every connection with a reset. So does leaving Discard for
+    // a connection that lived through it: what it dropped is gone, and its
+    // closes were held, as a dead host's restarted kernel answers the old
+    // connection's next segment with a reset.
+    let reset_seen = matches!(*state.borrow(), LinkState::Reset) || spliced.load(Ordering::SeqCst);
     if let (Ok((client_read, upstream_write)), Ok((upstream_read, client_write))) =
         (outbound, inbound)
     {
@@ -233,13 +250,21 @@ async fn connection(
     }
 }
 
-/// Wait until bytes move: `Some(false)` when the link is open, `Some(true)`
-/// when it discards, `None` when it is reset (or the relay is gone).
-async fn moving(state: &mut watch::Receiver<LinkState>) -> Option<bool> {
+/// What a link in motion does with bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    Forward,
+    Drop,
+}
+
+/// Wait until bytes move: forwarded when the link is open, dropped when it
+/// discards; `None` when it is reset (or the relay is gone). A blackhole
+/// waits.
+async fn flowing(state: &mut watch::Receiver<LinkState>) -> Option<Flow> {
     loop {
         match *state.borrow_and_update() {
-            LinkState::Open => return Some(false),
-            LinkState::Discard => return Some(true),
+            LinkState::Open => return Some(Flow::Forward),
+            LinkState::Discard => return Some(Flow::Drop),
             LinkState::Reset => return None,
             LinkState::Blackholed => {}
         }
@@ -249,21 +274,39 @@ async fn moving(state: &mut watch::Receiver<LinkState>) -> Option<bool> {
     }
 }
 
+/// Hold until the link leaves Discard (or the relay is gone).
+async fn while_discarding(state: &mut watch::Receiver<LinkState>) {
+    while *state.borrow_and_update() == LinkState::Discard {
+        if state.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Copy `from` to `to` while the link is open. Blackholed, it stops reading,
 /// so the sender's window fills as it would against a dead path, and it
 /// writes nothing it already holds until the link opens again. Discarding,
-/// it reads and drops, and passes on no close. It ends on EOF, an error, or
-/// a reset, and hands both halves back.
+/// it reads and drops everything, including a chunk it was about to write
+/// or was writing, and passes on no close; it holds until the link leaves
+/// Discard and then ends, for the connection to be reset. It ends on EOF,
+/// an error, or a reset, and hands both halves back.
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
     mut state: watch::Receiver<LinkState>,
+    spliced: Arc<AtomicBool>,
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
     let mut buffer = vec![0u8; 16 * 1024];
     loop {
-        let Some(discarding) = moving(&mut state).await else {
+        let Some(flow) = flowing(&mut state).await else {
             return (from, to);
         };
+        if flow == Flow::Drop {
+            spliced.store(true, Ordering::SeqCst);
+        } else if spliced.load(Ordering::SeqCst) {
+            // Out of Discard with a hole in the stream: end, to be reset.
+            return (from, to);
+        }
         let read = tokio::select! {
             read = from.read(&mut buffer) => read,
             // Re-check the state: a blackhole stops the read here.
@@ -276,37 +319,54 @@ async fn pump(
         };
         let count = match read {
             Ok(0) | Err(_) => {
-                if !discarding {
-                    let _ = to.shutdown().await;
+                if spliced.load(Ordering::SeqCst) || *state.borrow() == LinkState::Discard {
+                    // Pass on no close: hold until the link leaves Discard.
+                    spliced.store(true, Ordering::SeqCst);
+                    while_discarding(&mut state).await;
+                    return (from, to);
                 }
+                let _ = to.shutdown().await;
                 return (from, to);
             }
             Ok(count) => count,
         };
-        if discarding {
+        // Bytes read before a blackhole wait for the link, as unacknowledged
+        // segments wait for a path; bytes read as it turned to Discard are
+        // dropped.
+        match flowing(&mut state).await {
+            None => return (from, to),
+            Some(Flow::Drop) => {
+                spliced.store(true, Ordering::SeqCst);
+                continue;
+            }
+            Some(Flow::Forward) => {}
+        }
+        // A receiver that stopped reading blocks the write: a reset must
+        // still end it, and Discard must drop the chunk and drain on.
+        let written = tokio::select! {
+            written = to.write_all(&buffer[..count]) => Some(written.is_ok()),
+            () = until_reset_or_discard(&mut state) => None,
+        };
+        if written == Some(true) {
             continue;
         }
-        // Bytes read before a blackhole wait for the link, as unacknowledged
-        // segments wait for a path.
-        if !opened(&mut state).await {
-            return (from, to);
+        if *state.borrow() == LinkState::Discard {
+            // The receiver is gone or the write was abandoned: keep draining
+            // the sender, which must never block on a dead client.
+            spliced.store(true, Ordering::SeqCst);
+            continue;
         }
-        // A receiver that stopped reading blocks the write; a reset must
-        // still end it.
-        let written = tokio::select! {
-            written = to.write_all(&buffer[..count]) => written.is_ok(),
-            () = until_reset(&mut state) => false,
-        };
-        if !written {
-            return (from, to);
-        }
+        return (from, to);
     }
 }
 
-/// Resolve once the link is reset or the relay is gone.
-async fn until_reset(state: &mut watch::Receiver<LinkState>) {
+/// Resolve once the link is reset or discards, or the relay is gone.
+async fn until_reset_or_discard(state: &mut watch::Receiver<LinkState>) {
     loop {
-        if *state.borrow_and_update() == LinkState::Reset {
+        if matches!(
+            *state.borrow_and_update(),
+            LinkState::Reset | LinkState::Discard
+        ) {
             return;
         }
         if state.changed().await.is_err() {
@@ -395,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_discarding_link_drains_both_ways_and_passes_on_no_close() -> Result<()> {
+    async fn a_discarding_link_drains_both_ways_holds_closes_and_resets_on_heal() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let relay = Relay::open("test", listener.local_addr()?.port()).await?;
         let mut client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
@@ -414,6 +474,36 @@ mod tests {
                 .is_err(),
             "neither the client's bytes nor its close reach the server"
         );
+        // Leaving Discard resets what lived through it: its stream has a hole.
+        relay.set(LinkState::Open);
+        let read = timeout(Duration::from_secs(5), server.read(&mut buffer)).await?;
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the spliced connection is reset"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_write_stuck_on_a_stalled_client_is_dropped_when_the_link_discards() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        // The client never reads, so with the link open the relay's write to
+        // it blocks once the windows fill.
+        let _client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
+        let (server, _) = timeout(Duration::from_secs(5), listener.accept()).await??;
+        let (_server_read, mut server_write) = server.into_split();
+        // Far more than the four socket buffers on the way can hold, even
+        // fully autotuned (about 20 MiB on loopback).
+        let flood =
+            tokio::spawn(async move { server_write.write_all(&vec![1u8; 64 * 1024 * 1024]).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !flood.is_finished(),
+            "the stalled client holds the flood back"
+        );
+        relay.set(LinkState::Discard);
+        timeout(Duration::from_secs(10), flood).await???;
         Ok(())
     }
 }
