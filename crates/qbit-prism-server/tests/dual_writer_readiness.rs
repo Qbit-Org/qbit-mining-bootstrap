@@ -48,6 +48,8 @@ fn dual_writer(node: NodeIndex) -> DualWriterConfig {
         peer_database_url_fallback: None,
         peer_sync_interval: Duration::from_millis(250),
         peer_sync_batch_rows: 5000,
+        // No peer to wait for before a found block's offer.
+        peer_ingest_wait: Duration::ZERO,
     }
 }
 
