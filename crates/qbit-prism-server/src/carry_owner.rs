@@ -101,6 +101,16 @@ pub enum PeerRead {
     Failed,
 }
 
+impl PeerRead {
+    /// The peer's latest row, if the peer answered and holds one.
+    pub fn peer_live(&self) -> Option<&RoleRow> {
+        match self {
+            Self::Answered { peer, .. } => peer.as_ref(),
+            Self::Failed => None,
+        }
+    }
+}
+
 /// Everything one decision reads.
 #[derive(Clone, Debug)]
 pub struct GuardInputs {
@@ -371,6 +381,15 @@ pub fn peer_index(node_index: i16) -> i16 {
     1 - node_index
 }
 
+/// One snapshot of the peer's journal ([`PeerJournal::view`]).
+#[derive(Clone, Debug)]
+pub struct PeerView {
+    /// This node's and the peer's latest rows there.
+    pub latest: LatestRoles,
+    /// The peer's latest claim of ownership there.
+    pub peer_claim: Option<RoleRow>,
+}
+
 /// The latest rows one journal holds for this node and its peer.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct LatestRoles {
@@ -526,11 +545,21 @@ impl PeerJournal {
         }
     }
 
-    /// The latest row in which `origin` claimed ownership in the peer's
-    /// journal; `None` if the peer could not be read.
-    pub async fn latest_claim(&self, origin: i16) -> Option<Option<RoleRow>> {
+    /// One consistent view of the peer's journal, for `carry-owner transfer`:
+    /// the latest rows of both nodes, and the peer's latest claim of
+    /// ownership, read in one snapshot on one connection, so they never come
+    /// from different paths that lag differently. `None` if the peer could
+    /// not be read.
+    pub async fn view(&self, node_index: i16) -> Option<PeerView> {
         self.first_answer(|mut connection| async move {
-            read_latest_claim(&mut connection, origin).await
+            let mut tx = sqlx::Connection::begin(&mut *connection).await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *tx)
+                .await?;
+            let latest = read_latest_roles(&mut tx, node_index).await?;
+            let peer_claim = read_latest_claim(&mut tx, peer_index(node_index)).await?;
+            tx.commit().await?;
+            Ok(PeerView { latest, peer_claim })
         })
         .await
     }
