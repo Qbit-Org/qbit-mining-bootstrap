@@ -216,12 +216,7 @@ impl Ledger {
             );
         }
         require_live(&mut tx, earliest).await?;
-        let row = dependency_row(
-            &mut tx,
-            dependency.key,
-            self.dual_writer_identity().is_some(),
-        )
-        .await?;
+        let row = dependency_row(&mut tx, dependency.key).await?;
         require_live(&mut tx, earliest).await?;
         let Some(row) = row else {
             tx.rollback().await?;
