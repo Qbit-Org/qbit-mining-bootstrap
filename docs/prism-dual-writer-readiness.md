@@ -135,10 +135,13 @@ answers:
 
 Every answer is plain text with `Cache-Control: no-store` and
 `Connection: close`, and says nothing else: no health payload, no metrics,
-no operator route. Each connection has a five-second deadline and carries one
-request; at most 32 are served at once and further ones are dropped, which a
-checker reads as a failed probe. The operator listener (`PRISM_AUDIT_PORT`)
-stays private.
+no operator route. Each connection carries one request and has a two-second
+deadline, twice the balancer's check timeout. At most 256 connections are
+served at once, and at most 8 from one source address (an IPv6 source counts by
+its /64), so a client holding connections open cannot take the slots the
+balancer's checks need; a connection past either cap is closed at once,
+unanswered, which a checker reads as a failed probe. The operator listener
+(`PRISM_AUDIT_PORT`) stays private.
 
 On the pair, the endpoint is published on each node's public address under the
 same condition as public Stratum, with the Hashbalancer's health token; both
@@ -205,7 +208,8 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
 ## Tests
 
 - Unit: the admission state machine, the signal's freshness, the endpoint's
-  token and answers, the reserved address, the writer-path classification,
+  token, answers and connection caps, the reserved address, the writer-path
+  classification,
   the metrics, and the healthcheck's liveness rule.
 - `tests/healthcheck_cli.rs`: the healthcheck binary against canned
   `/healthz` answers: a dual-writer body catching up passes and one with a

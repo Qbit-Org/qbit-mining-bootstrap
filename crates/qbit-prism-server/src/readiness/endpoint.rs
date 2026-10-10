@@ -6,9 +6,12 @@
 //! metrics, no operator route, and a request without the token learns only
 //! that it was refused.
 //!
-//! Every connection has a five-second deadline, carries one request and is
-//! closed after its answer; at most 32 are served at once and the rest are
-//! dropped unanswered, which a checker counts as a failed probe.
+//! Every connection has a two-second deadline, twice the balancer's check
+//! timeout, carries one request and is closed after its answer. At most 256
+//! are served at once, and at most 8 from one source address (an IPv6 source
+//! counts by its /64), so one client cannot hold the slots the balancer's
+//! checks need. A connection beyond either cap is closed at once, unanswered,
+//! which a checker counts as a failed probe.
 use super::admission::AdmissionSignal;
 use crate::{config, metrics::Metrics, metrics::ReadinessAnswer};
 use anyhow::{ensure, Context, Result};
@@ -17,7 +20,13 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
 };
 use sha2::{Digest, Sha256};
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::{IpAddr, Ipv6Addr},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{watch, Semaphore},
@@ -27,8 +36,10 @@ use tokio::{
 /// The header the Hashbalancer's HTTP checks carry (its `HEALTH_HEADER`).
 pub const TOKEN_HEADER: &str = "x-qbit-healthcheck-token";
 pub const PATH: &str = "/readyz";
-const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
-const MAX_CONNECTIONS: usize = 32;
+/// How long one connection, and every slot it holds, may last.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(2);
+const MAX_CONNECTIONS: usize = 256;
+const MAX_CONNECTIONS_PER_SOURCE: usize = 8;
 /// hyper's smallest read buffer; a request line and headers must fit.
 const MAX_REQUEST_BYTES: usize = 8192;
 
@@ -171,15 +182,99 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
         == 0
 }
 
+/// What one listener allows: the connection deadline and both caps.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    deadline: Duration,
+    connections: usize,
+    per_source: usize,
+}
+
+impl Limits {
+    const DEFAULT: Self = Self {
+        deadline: CONNECTION_DEADLINE,
+        connections: MAX_CONNECTIONS,
+        per_source: MAX_CONNECTIONS_PER_SOURCE,
+    };
+}
+
+/// The address a source's connections are counted under: an IPv4 address
+/// (an IPv4-mapped IPv6 one included) as itself, an IPv6 address by its /64,
+/// the smallest block one client is usually given.
+fn source_key(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(address) => IpAddr::V4(address),
+            None => IpAddr::V6(Ipv6Addr::from(u128::from(address) & !(u64::MAX as u128))),
+        },
+        address => address,
+    }
+}
+
+/// Open connections per source address.
+#[derive(Default)]
+struct Sources(Mutex<HashMap<IpAddr, usize>>);
+
+/// One connection's place in its source's share, given back when it ends.
+struct SourceSlot {
+    sources: Arc<Sources>,
+    key: IpAddr,
+}
+
+impl Sources {
+    fn acquire(self: &Arc<Self>, address: IpAddr, cap: usize) -> Option<SourceSlot> {
+        let key = source_key(address);
+        let mut open = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = open.entry(key).or_default();
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(SourceSlot {
+            sources: self.clone(),
+            key,
+        })
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .sources
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = open.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Serve the endpoint on `listener` until `shutdown`. An accept error is
 /// logged and retried after a pause, never fatal: the endpoint is a probe
 /// target, and losing it reads as not ready, which is the safe failure.
 pub async fn serve(
     listener: TcpListener,
     endpoint: Endpoint,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    serve_with(listener, endpoint, shutdown, Limits::DEFAULT).await
+}
+
+async fn serve_with(
+    listener: TcpListener,
+    endpoint: Endpoint,
+    mut shutdown: watch::Receiver<bool>,
+    limits: Limits,
+) -> Result<()> {
+    let permits = Arc::new(Semaphore::new(limits.connections));
+    let sources = Arc::new(Sources::default());
     let mut connections = JoinSet::new();
     loop {
         if *shutdown.borrow() {
@@ -189,21 +284,26 @@ pub async fn serve(
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
-                let stream = match accepted {
-                    Ok((stream, _)) => stream,
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
                     Err(error) => {
                         tracing::warn!(%error, "readiness endpoint accept failed");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
+                // Beyond either cap the connection is closed unanswered.
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let Some(slot) = sources.acquire(peer.ip(), limits.per_source) else {
                     drop(stream);
                     continue;
                 };
                 let endpoint = endpoint.clone();
                 connections.spawn(async move {
-                    let _permit = permit;
+                    let _held = (permit, slot);
                     let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
                         let response = endpoint.answer(request.method(), request.uri().path(), request.headers());
                         async move { Ok::<_, Infallible>(response) }
@@ -212,9 +312,9 @@ pub async fn serve(
                         .keep_alive(false)
                         .max_buf_size(MAX_REQUEST_BYTES)
                         .timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(CONNECTION_DEADLINE)
+                        .header_read_timeout(limits.deadline)
                         .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
-                    let _ = tokio::time::timeout(CONNECTION_DEADLINE, connection).await;
+                    let _ = tokio::time::timeout(limits.deadline, connection).await;
                 });
             }
         }
@@ -328,6 +428,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_source_is_counted_by_its_address_or_its_ipv6_64() {
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(source_key(loopback), loopback);
+        assert_eq!(
+            source_key(IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped())),
+            loopback
+        );
+        // ::1 is counted under ::/64, with every address of that block.
+        assert_eq!(
+            source_key(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
+        let sources = Arc::new(Sources::default());
+        let mut slots: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+            .map(|_| {
+                sources
+                    .acquire(loopback, MAX_CONNECTIONS_PER_SOURCE)
+                    .unwrap()
+            })
+            .collect();
+        assert!(sources
+            .acquire(loopback, MAX_CONNECTIONS_PER_SOURCE)
+            .is_none());
+        let other = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+        let other_slot = sources.acquire(other, MAX_CONNECTIONS_PER_SOURCE).unwrap();
+        slots.pop();
+        let again = sources
+            .acquire(loopback, MAX_CONNECTIONS_PER_SOURCE)
+            .unwrap();
+        drop((slots, other_slot, again));
+        assert!(
+            sources.0.lock().unwrap().is_empty(),
+            "a slot was not given back"
+        );
+    }
+
     async fn exchange(address: std::net::SocketAddr, request: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -368,6 +505,75 @@ mod tests {
         assert!(!response.contains("ready"), "{response}");
         stop.send_replace(true);
         server.await.unwrap().unwrap();
+    }
+
+    /// What a client gets over one connection, if anything: a connection
+    /// closed unanswered reads as empty, whether by a FIN or a reset.
+    async fn exchange_or_closed(address: std::net::SocketAddr, request: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let _ = stream.write_all(request.as_bytes()).await;
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the connection was neither answered nor closed");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Past the per-source cap, or the global one, a connection is closed at
+    /// once and unanswered, and a slot is given back when its connection
+    /// ends: a client holding connections open shuts nobody else out, and
+    /// shuts itself out only for as long as it holds them.
+    #[tokio::test]
+    async fn connections_past_a_cap_are_closed_unanswered_until_a_slot_frees() {
+        let long = Duration::from_secs(60);
+        for limits in [
+            Limits {
+                deadline: long,
+                connections: MAX_CONNECTIONS,
+                per_source: 2,
+            },
+            Limits {
+                deadline: long,
+                connections: 2,
+                per_source: MAX_CONNECTIONS_PER_SOURCE,
+            },
+        ] {
+            let (endpoint, _decisions, _metrics) = endpoint();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, shutdown) = watch::channel(false);
+            let server = tokio::spawn(serve_with(listener, endpoint, shutdown, limits));
+            let check = format!("GET /readyz HTTP/1.0\r\n{TOKEN_HEADER}: {TOKEN}\r\n\r\n");
+            // Two unfinished requests hold both slots: accepted in order,
+            // they are served before the check behind them.
+            let mut holders = Vec::new();
+            for _ in 0..2 {
+                let mut holder = tokio::net::TcpStream::connect(address).await.unwrap();
+                holder.write_all(b"GET /readyz HTTP/1.1\r\n").await.unwrap();
+                holders.push(holder);
+            }
+            let response = exchange_or_closed(address, &check).await;
+            assert!(
+                response.is_empty(),
+                "{limits:?}: answered past the cap: {response}"
+            );
+            drop(holders.pop());
+            let freed = std::time::Instant::now();
+            loop {
+                let response = exchange_or_closed(address, &check).await;
+                if response.starts_with("HTTP/1.0 503") {
+                    break;
+                }
+                assert!(response.is_empty(), "{limits:?}: {response}");
+                assert!(
+                    freed.elapsed() < Duration::from_secs(10),
+                    "{limits:?}: the freed slot was never given back"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            stop.send_replace(true);
+            server.await.unwrap().unwrap();
+        }
     }
 
     /// A client that never finishes its request is cut off at the deadline,

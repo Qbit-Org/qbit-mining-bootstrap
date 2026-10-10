@@ -428,7 +428,7 @@
       "labels": {
         "result": "ReadinessAnswer"
       },
-      "status": "Every answer starts at zero once the endpoint is enabled (3.1, CONTRACT.md decision D-7). The token is checked first, so `unauthorized` also counts requests for unknown paths without the token; a steady `unauthorized` rate on a public address is scanning, not a fault. A connection dropped at the 32-connection cap or cut at its five-second deadline counts nothing."
+      "status": "Every answer starts at zero once the endpoint is enabled (3.1, CONTRACT.md decision D-7). The token is checked first, so `unauthorized` also counts requests for unknown paths without the token; a steady `unauthorized` rate on a public address is scanning, not a fault. A connection closed unanswered past the 256-connection or 8-per-source cap, or cut at its two-second deadline, counts nothing."
     }
   },
   "public": {
