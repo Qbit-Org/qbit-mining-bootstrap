@@ -59,12 +59,18 @@ of the frontend's own pool:
 | `remote` | the identity row names the peer: a DSN left pointing at the other node | withdraws at once |
 | `unidentified` | no identity row: the database was never personalised | withdraws at once |
 | `read_only` | in recovery, or `default_transaction_read_only` on | withdraws at once |
-| `unanswered` | the probe failed or took over 2 s | withdraws once it has lasted 4 s at a publication |
+| `unanswered` | the probe failed or took over 2 s | withdraws once the database's last answer is 4 s old |
 
 The probe is one statement, `pg_is_in_recovery()`,
 `transaction_read_only` and the identity row, at most once a second however
 many health reads ask; it never reads the peer. The first health read
-probes, so `/healthz` never reports a `writer_path` of `null`.
+probes, so `/healthz` never reports a `writer_path` of `null`. A database
+that stops answering, dead or hung, withdraws the frontend about 4 s after its
+last answer, plus at most one 2 s probe: each publication reads the database
+beside the probe and waits for neither longer than the probe's 2 s, and its
+heartbeat to the cluster table is bounded the same way, or skipped when the
+probe went unanswered, so the publications keep coming while the database is
+gone.
 
 ## Admission
 
@@ -92,9 +98,10 @@ which runs from the last publication that found the frontend ready (default
 [the HA reference](prism-ha-reference-architecture.md#operator-tcp-load-balancer-readiness-contract)).
 The health publisher decides at each publication. A decision older than the
 health freshness budget, `max(15, 3 * PRISM_HEALTH_REFRESH_SECONDS)` seconds,
-admits nothing, so a publisher stalled by a dead database withdraws the
-frontend at its next publication or when its decision goes stale, whichever
-comes first.
+admits nothing, so a publisher that stalls withdraws the frontend at its next
+publication or when its decision goes stale, whichever comes first. A
+dual-writer publication does not stall on its database (above); a single
+writer's waits on it as in 3.0.
 
 ## Stratum gating (dual mode)
 
@@ -241,4 +248,8 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
   grace, turns `503` only after it, and is readmitted once rebuilt. The
   healthcheck passes for the dual-mode frontend catching up and fails for one
   on the other node's database; a single writer's passes once ready and fails
-  inside the grace, as in 3.0.
+  inside the grace, as in 3.0. An admitted dual-mode frontend (its own log
+  verified on this server, the peer unreachable) answers `200` and accepts
+  Stratum; with its database frozen behind a proxy it answers `503` within
+  10 s and refuses Stratum, and once the database answers again it is
+  readmitted.

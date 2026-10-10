@@ -416,7 +416,7 @@
       "labels": {
         "path": "WriterPathLabel"
       },
-      "status": "Probed at each health publication with one statement on the frontend's own pool (at most once a second, two-second timeout). `unanswered` withdraws the frontend once it has lasted four seconds at a publication; `remote`, `unidentified` and `read_only` withdraw it at once. The probe never reads the peer."
+      "status": "Probed at each health publication with one statement on the frontend's own pool (at most once a second, two-second timeout). `unanswered` withdraws the frontend once the database's last answer is four seconds old, so a dead or hung database withdraws it about four seconds after it last answered, plus at most one probe; `remote`, `unidentified` and `read_only` withdraw it at once. The probe never reads the peer."
     },
     "dual_writer_node_index": {
       "status": "Published with the other dual-writer gauges at each health publication (3.1)."

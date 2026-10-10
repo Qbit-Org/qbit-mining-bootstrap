@@ -3386,7 +3386,28 @@ impl Coordinator {
         let prepared = self.prepared.read().await.clone();
         let observed = self.observed_tip.read().await.as_deref().map(str::to_owned);
         // #664: the cluster's hold in the same statement, as last read.
-        let (revision, hold) = match self.ledger.health_reads().await {
+        // 3.1: a dual-writer frontend reads it beside its writer probe and
+        // within the probe's budget, so a dead or hung database makes this
+        // publication within seconds (and withdraws the node) instead of
+        // holding it for the pool's whole acquire timeout; a read that runs
+        // out of time is a failed read. A single writer reads as in 3.0.
+        let (reads, dual) = match &self.dual_writer {
+            Some(dual) => {
+                let (reads, report) = tokio::join!(
+                    tokio::time::timeout(
+                        crate::readiness::dual_writer::WRITER_PROBE_TIMEOUT,
+                        self.ledger.health_reads(),
+                    ),
+                    dual.report(&self.ledger.pool, self.peer_sync.get()),
+                );
+                (
+                    reads.unwrap_or_else(|_| Err(anyhow::anyhow!("health reads timed out"))),
+                    Some(report),
+                )
+            }
+            None => (self.ledger.health_reads().await, None),
+        };
+        let (revision, hold) = match reads {
             Ok((revision, hold)) => (revision, Some(hold)),
             Err(_) => (None, None),
         };
@@ -3401,10 +3422,6 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let dual = match &self.dual_writer {
-            Some(dual) => Some(dual.report(&self.ledger.pool, self.peer_sync.get()).await),
-            None => None,
-        };
         let ready = ready
             && dual
                 .as_ref()

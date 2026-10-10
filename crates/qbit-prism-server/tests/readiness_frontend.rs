@@ -10,7 +10,9 @@
 //! and one held past it withdraws the frontend until its work is rebuilt.
 //! The `healthcheck` subcommand is liveness for a dual-writer frontend (it
 //! passes while the frontend catches up, and fails when it writes to the
-//! other node's database) and 3.0's readiness rule for a single writer.
+//! other node's database) and 3.0's readiness rule for a single writer. An
+//! admitted dual-writer frontend whose database hangs withdraws within
+//! seconds: its readiness endpoint answers 503 and Stratum refuses.
 //!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
@@ -26,14 +28,20 @@ use serde_json::Value;
 use std::{
     future::Future,
     io,
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     process::Stdio,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::{
-    net::TcpStream,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
     process::{Child, Command},
+    sync::watch,
+    task::JoinHandle,
 };
 
 #[allow(dead_code)]
@@ -272,6 +280,86 @@ async fn healthcheck(ports: &Ports) -> Result<(bool, String)> {
     ))
 }
 
+/// A TCP proxy in front of the fixture PostgreSQL that a test can freeze:
+/// frozen, it moves no byte either way and keeps every socket open, the way
+/// a hung database looks to its clients; connections made while it is
+/// frozen are held the same way.
+struct DatabaseProxy {
+    address: SocketAddr,
+    frozen: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl DatabaseProxy {
+    async fn start(upstream: SocketAddr) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (frozen, watcher) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            // Dropped with the accept loop, so stopping the proxy closes
+            // every connection it carries.
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((client, _)) = listener.accept().await {
+                let frozen = watcher.clone();
+                connections.spawn(async move {
+                    let Ok(server) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let (client_read, client_write) = client.into_split();
+                    let (server_read, server_write) = server.into_split();
+                    tokio::join!(
+                        pump(client_read, server_write, frozen.clone()),
+                        pump(server_read, client_write, frozen),
+                    );
+                });
+            }
+        });
+        Ok(Self {
+            address,
+            frozen,
+            task,
+        })
+    }
+
+    fn freeze(&self) {
+        self.frozen.send_replace(true);
+    }
+
+    fn thaw(&self) {
+        self.frozen.send_replace(false);
+    }
+}
+
+impl Drop for DatabaseProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn pump(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, mut frozen: watch::Receiver<bool>) {
+    let mut buffer = vec![0u8; 16 * 1024];
+    loop {
+        if frozen.wait_for(|frozen| !*frozen).await.is_err() {
+            return;
+        }
+        let read = tokio::select! {
+            read = from.read(&mut buffer) => read,
+            _ = frozen.wait_for(|frozen| *frozen) => continue,
+        };
+        let count = match read {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        // Bytes read just as the proxy froze wait for the thaw too.
+        if frozen.wait_for(|frozen| !*frozen).await.is_err() {
+            return;
+        }
+        if to.write_all(&buffer[..count]).await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn with_server(
     database_url: &str,
     dual_writer: bool,
@@ -393,6 +481,161 @@ async fn a_dual_writer_frontend_that_is_not_ready_refuses_stratum_and_answers_no
                 ensure!(
                     started.elapsed() < DEADLINE,
                     "the not-ready answer was never counted"
+                );
+                tokio::time::sleep(POLL).await;
+            }
+            Ok(())
+        })
+        .await
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+/// D6's full-stack run killed A's PostgreSQL and saw nothing withdraw A for
+/// about 14 s: the health publication waited out the pool's 15 s acquire
+/// timeout before the writer probe ran. A dual-writer frontend now reads its
+/// health beside the probe within the probe's budget, so a database that
+/// stops answering withdraws it about four seconds after its last answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admitted_dual_writer_frontend_withdraws_within_seconds_of_its_database_hanging(
+) -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_frontend_hung_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "d4-frontend-fixture".into(),
+        2,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let outcome = async {
+        // Node B's database, its own log last verified on this very server:
+        // with the peer unreachable, the own-log latch sets at once.
+        ledger
+            .set_node_identity(NodeIndex::B, "d4-test")
+            .await
+            .context("recording node B's identity")?;
+        let evidence = ledger
+            .lineage_evidence()
+            .await
+            .context("reading the lineage evidence")?;
+        ledger
+            .record_own_log_verified(evidence)
+            .await
+            .context("recording the own-log verification")?;
+        // Migration 031's (origin_node, share_seq) index, which a dual-writer
+        // frontend's window cut requires, under 031's name: a no-op once the
+        // schema carries it.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx \
+             ON qbit_share_ledger (origin_node, share_seq)",
+        )
+        .execute(&ledger.pool)
+        .await
+        .context("creating the (origin_node, share_seq) index")?;
+        let mut url = url::Url::parse(&database.url)?;
+        let upstream = tokio::net::lookup_host((
+            url.host_str().context("the fixture URL has no host")?,
+            url.port().unwrap_or(5432),
+        ))
+        .await?
+        .next()
+        .context("the fixture host does not resolve")?;
+        let proxy = DatabaseProxy::start(upstream).await?;
+        url.set_host(Some("127.0.0.1"))?;
+        url.set_port(Some(proxy.address.port()))
+            .map_err(|()| anyhow::anyhow!("the fixture URL cannot take a port"))?;
+        with_server(url.as_str(), true, async |client, ports, server, _| {
+            let readyz = format!("http://127.0.0.1:{}/readyz", ports.readiness);
+            // Admitted: ready, and Stratum accepts.
+            let started = Instant::now();
+            loop {
+                alive(server)?;
+                if let Ok((200, body)) = get(client, &readyz, Some(TOKEN)).await {
+                    ensure!(body == "ready\n", "{body:?}");
+                    break;
+                }
+                ensure!(
+                    started.elapsed() < DEADLINE,
+                    "the dual-writer frontend was never admitted"
+                );
+                tokio::time::sleep(POLL).await;
+            }
+            let health = health_until(client, ports, server, "admitting", |health| {
+                health["admission"]["state"] == "admitting"
+            })
+            .await?;
+            ensure!(
+                health["dual_writer"]["own_log_caught_up"] == true,
+                "{health}"
+            );
+            ensure!(health["dual_writer"]["writer_path"] == "local", "{health}");
+            ensure!(
+                TcpStream::connect(("127.0.0.1", ports.stratum))
+                    .await
+                    .is_ok(),
+                "an admitted dual-writer frontend refused Stratum"
+            );
+
+            proxy.freeze();
+            let frozen = Instant::now();
+            let withdrawn_after = loop {
+                alive(server)?;
+                let (status, body) = get(client, &readyz, Some(TOKEN)).await?;
+                if status != 200 {
+                    ensure!(status == 503 && body == "not ready\n", "{status} {body:?}");
+                    break frozen.elapsed();
+                }
+                ensure!(
+                    frozen.elapsed() < DEADLINE,
+                    "a hung database never withdrew the frontend"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            eprintln!("hung database: /readyz answered 503 {withdrawn_after:?} after the freeze");
+            // The balancer's first failed check must come within 10 s of
+            // the database hanging at a 2 s check interval.
+            ensure!(
+                withdrawn_after <= Duration::from_secs(10),
+                "withdrawn {withdrawn_after:?} after the database hung"
+            );
+            let health = health_until(client, ports, server, "the withdrawal", |health| {
+                health["admission"]["state"] == "withdrawn"
+            })
+            .await?;
+            ensure!(
+                health["dual_writer"]["writer_path"] == "unanswered",
+                "{health}"
+            );
+            ensure!(
+                health["admission"]["reason"] == "writer-not-local",
+                "{health}"
+            );
+            ensure!(
+                refused(ports.stratum).await?,
+                "a withdrawn frontend accepted a Stratum connection"
+            );
+
+            // Answering again, it is readmitted.
+            proxy.thaw();
+            let thawed = Instant::now();
+            loop {
+                alive(server)?;
+                if let Ok((200, _)) = get(client, &readyz, Some(TOKEN)).await {
+                    break;
+                }
+                ensure!(
+                    thawed.elapsed() < DEADLINE,
+                    "the frontend was never readmitted after the database answered again"
                 );
                 tokio::time::sleep(POLL).await;
             }

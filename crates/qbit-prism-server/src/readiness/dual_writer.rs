@@ -14,10 +14,10 @@ use tokio::sync::watch;
 /// How long one probe of this node's database may take before it counts as
 /// unanswered.
 pub const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long the database may go unanswered before the node withdraws at
-/// once, rather than after the readiness grace: long enough to ride out one
-/// slow probe, short enough that a dead local PostgreSQL moves its miners to
-/// the peer within seconds.
+/// How long after its last answer the database may go unanswered before the
+/// node withdraws at once, rather than after the readiness grace: long enough
+/// to ride out one slow probe, short enough that a dead or hung local
+/// PostgreSQL moves its miners to the peer within seconds of its last answer.
 pub const WRITER_UNANSWERED_WITHDRAWAL: Duration = Duration::from_secs(4);
 /// A health read within this long of the last probe reuses it, so Stratum
 /// health probes cannot multiply database reads.
@@ -51,20 +51,20 @@ impl WriterPath {
     }
 }
 
-/// The last probe, and since when the database has gone unanswered.
+/// The last probe, and when the database last answered one.
 #[derive(Clone, Copy, Debug, Default)]
 struct WriterProbe {
     path: Option<WriterPath>,
     probed_at: Option<Instant>,
-    unanswered_since: Option<Instant>,
+    /// When a probe last got an answer, whatever it said.
+    answered_at: Option<Instant>,
 }
 
 impl WriterProbe {
     fn record(&mut self, at: Instant, path: WriterPath) {
-        self.unanswered_since = match path {
-            WriterPath::Unanswered => Some(self.unanswered_since.unwrap_or(at)),
-            _ => None,
-        };
+        if path != WriterPath::Unanswered {
+            self.answered_at = Some(at);
+        }
         self.path = Some(path);
         self.probed_at = Some(at);
     }
@@ -75,7 +75,11 @@ impl WriterProbe {
     }
 
     /// A definitive answer that this is not the node's writable database
-    /// withdraws at once; no answer does after a short streak.
+    /// withdraws at once. No answer does once the last answer is
+    /// [`WRITER_UNANSWERED_WITHDRAWAL`] old, counted from that answer and not
+    /// from the first probe that went unanswered, so a database that dies
+    /// between two probes withdraws the node a fixed time after it last
+    /// answered; a database that never answered withdraws it at once.
     fn withdrawal(&self, now: Instant) -> Option<Withdrawal> {
         match self.path? {
             WriterPath::Local => None,
@@ -83,11 +87,9 @@ impl WriterProbe {
                 Some(Withdrawal::WriterNotLocal)
             }
             WriterPath::Unanswered => self
-                .unanswered_since
-                .filter(|since| {
-                    now.saturating_duration_since(*since) >= WRITER_UNANSWERED_WITHDRAWAL
-                })
-                .map(|_| Withdrawal::WriterNotLocal),
+                .answered_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= WRITER_UNANSWERED_WITHDRAWAL)
+                .then_some(Withdrawal::WriterNotLocal),
         }
     }
 }
@@ -297,26 +299,45 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswered_writer_withdraws_only_after_its_streak() {
+    fn an_unanswered_writer_withdraws_once_its_last_answer_is_old_enough() {
         let readiness = DualWriterReadiness::new(IDENTITY);
         let start = Instant::now();
-        let mut writer = probe(WriterPath::Unanswered, start);
-        let early = readiness.assemble(writer, caught_up(), start + Duration::from_secs(2));
+        let mut writer = probe(WriterPath::Local, start);
+        // One slow or failed probe soon after an answer is ridden out.
+        let at = start + Duration::from_secs(3);
+        writer.record(at, WriterPath::Unanswered);
+        let early = readiness.assemble(writer, caught_up(), at);
         assert!(!early.serving());
         assert_eq!(early.withdrawal, None, "one slow probe is ridden out");
-        writer.record(start + Duration::from_secs(2), WriterPath::Unanswered);
+        // The streak runs from the last answer, not from the first probe
+        // that went unanswered.
         let late = readiness.assemble(writer, caught_up(), start + WRITER_UNANSWERED_WITHDRAWAL);
+        assert_eq!(late.withdrawal, Some(Withdrawal::WriterNotLocal));
+        // A probe that first fails long after the last answer, as after a
+        // publication held up by the dead database, withdraws at once.
+        let mut stalled = probe(WriterPath::Local, start);
+        let at = start + Duration::from_secs(6);
+        stalled.record(at, WriterPath::Unanswered);
         assert_eq!(
-            late.withdrawal,
-            Some(Withdrawal::WriterNotLocal),
-            "the streak counts from the first unanswered probe"
+            readiness.assemble(stalled, caught_up(), at).withdrawal,
+            Some(Withdrawal::WriterNotLocal)
         );
+        // An answer resets it.
         writer.record(start + Duration::from_secs(5), WriterPath::Local);
-        let answered = readiness.assemble(writer, caught_up(), start + Duration::from_secs(9));
+        let answered = readiness.assemble(writer, caught_up(), start + Duration::from_secs(5));
         assert!(answered.serving());
-        writer.record(start + Duration::from_secs(10), WriterPath::Unanswered);
-        let again = readiness.assemble(writer, caught_up(), start + Duration::from_secs(11));
+        writer.record(start + Duration::from_secs(7), WriterPath::Unanswered);
+        let again = readiness.assemble(writer, caught_up(), start + Duration::from_secs(8));
         assert_eq!(again.withdrawal, None, "an answer resets the streak");
+    }
+
+    #[test]
+    fn a_database_that_never_answered_withdraws_at_once() {
+        let readiness = DualWriterReadiness::new(IDENTITY);
+        let start = Instant::now();
+        let report = readiness.assemble(probe(WriterPath::Unanswered, start), caught_up(), start);
+        assert!(!report.serving());
+        assert_eq!(report.withdrawal, Some(Withdrawal::WriterNotLocal));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::{
     metrics::{self, TaskKind},
     readiness::{
         admission::{Admission, AdmissionChange, AdmissionSignal},
-        dual_writer::{DualWriterReport, WriterPath},
+        dual_writer::{DualWriterReport, WriterPath, WRITER_PROBE_TIMEOUT},
         endpoint,
     },
     stratum::{run_gated_listener, run_listener, StratumConfig, StratumStats},
@@ -671,6 +671,32 @@ impl AdmissionPublisher {
     }
 }
 
+/// How a publication's cluster heartbeat may wait on the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeartbeatWait {
+    /// As long as the write takes: a single writer, as in 3.0.
+    Unbounded,
+    /// At most the writer probe's budget, then retried at the next
+    /// publication: a dual-writer frontend whose database answered.
+    Bounded,
+    /// Not sent: a dual-writer frontend whose database did not answer its
+    /// writer probe, which a heartbeat would only wait out.
+    Skipped,
+}
+
+impl HeartbeatWait {
+    /// 3.1: a dual-writer frontend's publications must keep their cadence
+    /// while its database is dead or hung, since the next one is what
+    /// withdraws it.
+    fn for_report(dual: Option<&DualWriterReport>) -> Self {
+        match dual {
+            None => Self::Unbounded,
+            Some(dual) if dual.writer_path == Some(WriterPath::Unanswered) => Self::Skipped,
+            Some(_) => Self::Bounded,
+        }
+    }
+}
+
 async fn publish_health(
     coordinator: Arc<Coordinator>,
     state: ApiState,
@@ -682,7 +708,7 @@ async fn publish_health(
     let mut missing_since = None::<Instant>;
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-        let health = with_health_publication_progress(&state, async {
+        let (health, heartbeat) = with_health_publication_progress(&state, async {
             let (mut health, dual) = coordinator.health_report().await;
             let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
             if snapshot.authorized_missing_current_work == 0 {
@@ -725,15 +751,26 @@ async fn publish_health(
             registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
             registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
             state.publish_metrics(registry.render())?;
-            Ok(health)
+            Ok((health, HeartbeatWait::for_report(dual.as_ref())))
         })
         .await?;
         let health: HeartbeatHealth = serde_json::from_value(health)?;
-        if let Err(error) = coordinator
+        let beat = coordinator
             .ledger
-            .heartbeat(HeartbeatStatus::Health(health))
-            .await
-        {
+            .heartbeat(HeartbeatStatus::Health(health));
+        let result = match heartbeat {
+            HeartbeatWait::Unbounded => beat.await,
+            HeartbeatWait::Bounded => tokio::time::timeout(WRITER_PROBE_TIMEOUT, beat)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "timed out after {} ms",
+                        WRITER_PROBE_TIMEOUT.as_millis()
+                    ))
+                }),
+            HeartbeatWait::Skipped => Ok(()),
+        };
+        if let Err(error) = result {
             tracing::warn!(%error,"cluster heartbeat failed");
         }
     }
@@ -781,6 +818,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    /// 3.1: a dual-writer frontend's heartbeat never holds the next
+    /// publication on a dead or hung database; a single writer's waits as in
+    /// 3.0.
+    #[test]
+    fn a_dual_writer_heartbeat_is_bounded_and_skipped_without_an_answer() {
+        let report = |path| DualWriterReport {
+            identity: crate::node_identity::NodeIdentity {
+                node: crate::node_identity::NodeIndex::B,
+                carry_owner: false,
+            },
+            own_log_caught_up: true,
+            writer_path: Some(path),
+            withdrawal: None,
+            value: json!({}),
+        };
+        assert_eq!(HeartbeatWait::for_report(None), HeartbeatWait::Unbounded);
+        assert_eq!(
+            HeartbeatWait::for_report(Some(&report(WriterPath::Unanswered))),
+            HeartbeatWait::Skipped
+        );
+        for path in [WriterPath::Local, WriterPath::Remote, WriterPath::ReadOnly] {
+            assert_eq!(
+                HeartbeatWait::for_report(Some(&report(path))),
+                HeartbeatWait::Bounded,
+                "{path:?}"
+            );
+        }
     }
 
     #[tokio::test]
