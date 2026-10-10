@@ -713,7 +713,7 @@ impl PeerSync {
                     .apply_share_batch(node, node, &batch, None, own_rows_through)
                     .await?,
             );
-            self.ensure_progress(&applied).await?;
+            self.ensure_progress(&applied)?;
         }
         // Landed blocks and prepared jobs commit out of sync_seq order, so
         // the highest one held here proves no prefix: a backup can hold a
@@ -758,7 +758,7 @@ impl PeerSync {
                 for block in &blocks {
                     applied.merge(self.ledger.apply_block(block, None).await?);
                 }
-                self.ensure_progress(&applied).await?;
+                self.ensure_progress(&applied)?;
             }
             after = last;
         }
@@ -783,7 +783,7 @@ impl PeerSync {
                 self.own_rows_missing().await?;
             }
             applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
-            self.ensure_progress(&applied).await?;
+            self.ensure_progress(&applied)?;
             after = last;
         }
         let roles = bounded(peer::node_roles(connection, node)).await?;
@@ -794,7 +794,7 @@ impl PeerSync {
             self.own_rows_missing().await?;
         }
         applied.merge(journal);
-        self.ensure_progress(&applied).await?;
+        self.ensure_progress(&applied)?;
         // Above everything the peer has seen of this node: its cursors over
         // this node's streams, and the highest own rows it holds.
         let cursors = bounded(peer::cursors(connection)).await?;
@@ -823,11 +823,11 @@ impl PeerSync {
 
     /// An own-log conflict: the own log has diverged from the peer's copy
     /// of it, and the latch stays unset until an operator resolves it. The
-    /// verification goes too, so no start without the peer latches on it.
-    async fn ensure_progress(&mut self, applied: &Applied) -> Result<()> {
+    /// verification went in the transaction that recorded the conflict, so
+    /// no start without the peer latches on it.
+    fn ensure_progress(&mut self, applied: &Applied) -> Result<()> {
         if applied.total_conflicts() > 0 {
             self.own_log_diverged = true;
-            self.ledger.forget_own_log_verification().await?;
             bail!(
                 "own-log recovery met rows this node holds with other content ({:?}); the own log \
                  has diverged from the peer's copy of it and this node does not serve until an \

@@ -727,59 +727,83 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         .fetch_one(&pair.b.pool)
         .await?;
         ensure!(seen == 1 && detail.contains("maps header") && detail.contains("another share_seq"), "{seen} {detail}");
-        // B now holds A's shares only below the first one it refused, and
-        // A's prepared jobs only below the contested one, even after a later
-        // clean pull, so A's found-block wait confirms needs ending there and
-        // no later ones.
+        // The refused rows are quarantined for good. Each stream keeps its
+        // highest refused key, and later clean pulls keep it. The safe peer
+        // mark only rises, and no peer share is ever inserted at or below a
+        // mark already passed: a window cut there stays whole.
+        let mark = async || -> Result<i64> {
+            let mark: Option<i64> = sqlx::query_scalar("SELECT qbit_prism_peer_share_mark()")
+                .fetch_one(&pair.b.pool)
+                .await?;
+            mark.context("no safe peer mark")
+        };
+        let first_mark = mark().await?;
+        let held_below = async || -> Result<Vec<String>> {
+            Ok(sqlx::query_scalar(
+                "SELECT share_id FROM qbit_share_ledger WHERE origin_node=0 AND share_seq<=$1 ORDER BY share_seq",
+            )
+            .bind(first_mark)
+            .fetch_all(&pair.b.pool)
+            .await?)
+        };
+        let below_first_mark = held_below().await?;
         let job_seq = count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_prism_jobs WHERE job_id='{contested_job}'")).await?;
         let later_job = prepare(&pair.a, "later-job").await?;
+        let fresh = append(&pair.a, &["fresh"]).await?[0];
+        let mut marks = vec![first_mark];
         pass_until(&mut on_b, async |_| {
-            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{later_job}'")).await? == 1)
+            marks.push(mark().await?);
+            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{later_job}'")).await? == 1
+                && shares_of(&pair.b.pool, 0).await?.iter().any(|(seq, _)| *seq == fresh))
         })
         .await?;
+        for _ in 0..3 {
+            on_b.pass().await?;
+            marks.push(mark().await?);
+        }
+        ensure!(marks.windows(2).all(|pair| pair[0] <= pair[1]), "the safe peer mark stepped back: {marks:?}");
+        let below_after = held_below().await?;
+        ensure!(below_after == below_first_mark, "a peer share was inserted below a passed mark: {below_after:?}");
+        let held = shares_of(&pair.b.pool, 0).await?;
+        ensure!(held == [(theirs[1], share("after").share_id), (fresh, share("fresh").share_id)], "{held:?}");
         let later_seq = count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_prism_jobs WHERE job_id='{later_job}'")).await?;
-        let stops: Vec<(String, Option<i64>)> = sqlx::query_as(
+        let refused: Vec<(String, Option<i64>)> = sqlx::query_as(
             "SELECT stream,ingested_through FROM qbit_prism_peer_sync_cursors ORDER BY stream",
         )
         .fetch_all(&pair.b.pool)
         .await?;
         ensure!(
-            stops
+            refused
                 == [
                     ("blocks".to_owned(), None),
-                    ("prepared".to_owned(), Some(job_seq - 1)),
-                    ("shares".to_owned(), Some(theirs[0] - 1)),
+                    ("prepared".to_owned(), Some(job_seq)),
+                    ("shares".to_owned(), Some(theirs[2])),
                 ],
-            "{stops:?}"
+            "{refused:?}"
         );
+        // A's found-block wait confirms only a window that starts above the
+        // highest quarantined share, and a prepared record above the
+        // quarantined one.
         {
             use qbit_prism_server::peer_sync::{AdoptionNeeds, PeerIngest, PeerIngestWait};
             let wait = PeerIngestWait::new(&config(NodeIndex::A, &pair.b_url, None))?
                 .context("the wait is on by default")?;
-            let below = AdoptionNeeds {
-                share_seq: Some(theirs[0] - 1),
-                prepared_sync_seq: None,
+            let needs = |first: Option<i64>, last: Option<i64>, prepared: Option<i64>| AdoptionNeeds {
+                share_seq: last,
+                first_share_seq: first,
+                prepared_sync_seq: prepared,
             };
-            let (_, outcome, _) = wait.wait(std::future::ready(Ok(below))).await;
-            ensure!(outcome == PeerIngest::Confirmed, "{outcome:?}");
-            let past = AdoptionNeeds {
-                share_seq: Some(theirs[1]),
-                prepared_sync_seq: None,
-            };
-            let (_, outcome, _) = wait.wait(std::future::ready(Ok(past))).await;
-            ensure!(outcome == PeerIngest::TimedOut, "{outcome:?}");
-            let prepared_below = AdoptionNeeds {
-                share_seq: None,
-                prepared_sync_seq: Some(job_seq - 1),
-            };
-            let (_, outcome, _) = wait.wait(std::future::ready(Ok(prepared_below))).await;
-            ensure!(outcome == PeerIngest::Confirmed, "{outcome:?}");
-            let prepared_past = AdoptionNeeds {
-                share_seq: None,
-                prepared_sync_seq: Some(later_seq),
-            };
-            let (_, outcome, _) = wait.wait(std::future::ready(Ok(prepared_past))).await;
-            ensure!(outcome == PeerIngest::TimedOut, "{outcome:?}");
+            for (case, confirmed) in [
+                (needs(Some(fresh), Some(fresh), Some(later_seq)), true),
+                (needs(Some(theirs[1]), Some(fresh), None), false),
+                (needs(None, None, Some(job_seq)), false),
+            ] {
+                let (_, outcome, _) = wait.wait(std::future::ready(Ok(case))).await;
+                ensure!(
+                    (outcome == PeerIngest::Confirmed) == confirmed && (confirmed || outcome == PeerIngest::TimedOut),
+                    "{case:?}: {outcome:?}"
+                );
+            }
         }
         // Seen again, each conflict is counted, not duplicated.
         on_b.pass().await?;
@@ -966,6 +990,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         let bound = wait.bound();
         let held = AdoptionNeeds {
             share_seq: Some(seqs[1]),
+            first_share_seq: Some(seqs[0]),
             prepared_sync_seq: prepared,
         };
         let (waited, outcome, _) = wait.wait(std::future::ready(Ok(held))).await;
@@ -975,6 +1000,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         );
         let beyond = AdoptionNeeds {
             share_seq: Some(seqs[1] + 1000),
+            first_share_seq: Some(seqs[0]),
             prepared_sync_seq: prepared,
         };
         let (waited, outcome, _) = wait.wait(std::future::ready(Ok(beyond))).await;
@@ -1446,6 +1472,7 @@ async fn the_sync_needs_only_the_peer_roles_documented_grants() -> Result<()> {
             let (_, ingest, _) = wait
                 .wait(std::future::ready(Ok(AdoptionNeeds {
                     share_seq: a_last,
+                    first_share_seq: a_last,
                     prepared_sync_seq: None,
                 })))
                 .await;
@@ -2083,8 +2110,9 @@ async fn recovery_refuses_an_own_row_beyond_the_peers_cursor() -> Result<()> {
 /// Own-log recovery compares each own landed block the peer holds and this
 /// database holds too by a digest of its immutable facts: one held here
 /// with other facts is read whole and recorded as a conflict, the own log
-/// has diverged, and the latch stays down. The verification goes too, so a
-/// restart without the peer stays down as well.
+/// has diverged, and the latch stays down. The verification goes in the
+/// transaction that records the conflict, so a restart without the peer
+/// stays down as well, even after a crash right after it.
 #[tokio::test]
 async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -2106,6 +2134,26 @@ async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
             .bind(hex("another coinbase"))
             .execute(&pair.a.pool)
             .await?;
+        // Recording the conflict clears the verification in the same
+        // transaction, so a crash right after it cannot leave A trusting it.
+        {
+            use sqlx::Connection;
+            let mut on_b_database = sqlx::PgConnection::connect(&pair.b_url).await?;
+            let bundles = qbit_prism_server::ledger::peer_sync::peer::blocks_with_hashes(
+                &mut on_b_database,
+                NodeIndex::A,
+                std::slice::from_ref(&block),
+            )
+            .await?;
+            on_b_database.close().await?;
+            ensure!(bundles.len() == 1, "{}", bundles.len());
+            let applied = pair.a.apply_block(&bundles[0], None).await?;
+            ensure!(applied.total_conflicts() == 1, "{applied:?}");
+            ensure!(
+                pair.a.node_lineage().await?.and_then(|lineage| lineage.verified).is_none(),
+                "the conflict was recorded without clearing the verification"
+            );
+        }
         let (mut restarted, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
         let refused = restarted.pass().await;
         ensure!(

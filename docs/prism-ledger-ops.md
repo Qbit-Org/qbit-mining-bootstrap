@@ -3880,24 +3880,19 @@ stream's `qbit_prism_peer_sync_lag_seconds` grows while it fails, and after
 while it lasts. In normal operation the conflicts table stays empty:
 investigate any row in it.
 
-The first conflict in the shares or prepared stream also sets that stream's
-`ingested_through` in `qbit_prism_peer_sync_cursors` just below the refused
-row (it is NULL while the node holds every peer row it scanned). The peer's
-found-block wait then never confirms a block whose window or prepared record
-lies above it, since adopting that block would need the refused row: each
-such wait runs to its bound and counts `timed_out`. Once the conflict is
-resolved, move that stream's cursor back to the stop, so the next pull reads
-the refused row again, and clear the stop, naming the stream:
-
-```sql
-UPDATE qbit_prism_peer_sync_cursors
-SET scanned_through = ingested_through, ingested_through = NULL
-WHERE stream = 'shares' AND ingested_through IS NOT NULL;
-```
-
-The pull then takes the row, or refuses it again and sets the stop again.
-Until it passes the old position, the shares stream's reset also holds the
-safe peer mark back at the stop.
+A refused peer share or prepared job is quarantined for good. It stays in the
+conflicts table, is never inserted and is never read again. The pull moves
+past it and nothing ever moves back, so the safe peer mark only rises, and no
+peer share is inserted at or below a mark already passed: a window cut there
+stays whole. The highest refused key of each of the two streams is kept as
+that stream's `ingested_through` in `qbit_prism_peer_sync_cursors` (NULL
+while none was refused); the node holds every peer row it scanned above it.
+Adopting a block needs every row of its window and its prepared record, so
+the peer's found-block wait confirms a block only when its window starts
+above the highest refused share and its prepared record lies above the
+highest refused one. Until the windows have moved past a quarantined share,
+each wait runs to its bound and counts `timed_out`. There is nothing to
+reset.
 
 **The own-log latch.** `qbit_prism_peer_sync_own_log_caught_up` is the peer
 sync's one readiness input. Until it is set, the Stratum listeners, the
@@ -3933,9 +3928,9 @@ own-log recovery completes.
 stay unset. Before a found block's
 `submitblock`, the node waits up to `PRISM_PEER_INGEST_WAIT_MS` (250 ms by
 default) for the peer's cursors to cover its shares through the block's window
-and the prepared record the block was built on, below any row the peer
-refused as a conflict: what the peer needs to adopt the block if this node
-dies. The bound covers the node's own read of those
+and the prepared record the block was built on, with none of them
+quarantined there as a conflict: what the peer needs to adopt the block if
+this node dies. The bound covers the node's own read of those
 needs too; if that read fails, or the prepared record is no longer held here
 (pruned while the block waited), the block is offered at once, counted
 `unreachable`. The wait keeps one connection open to the peer on each path, tries

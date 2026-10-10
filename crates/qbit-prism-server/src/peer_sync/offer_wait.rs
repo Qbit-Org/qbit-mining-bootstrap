@@ -26,22 +26,40 @@ const CONNECTION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 /// What adopting a found block needs the peer to hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdoptionNeeds {
-    /// This node's own shares through this `share_seq`.
+    /// This node's own shares through this `share_seq`, the window's last.
     pub share_seq: Option<i64>,
+    /// The window's first `share_seq`.
+    pub first_share_seq: Option<i64>,
     /// This node's prepared jobs through this `sync_seq`.
     pub prepared_sync_seq: Option<i64>,
 }
 
 impl AdoptionNeeds {
+    /// Scanned through, and nothing of it refused: a row the peer refused
+    /// as a conflict is quarantined there for good, and it can never adopt
+    /// a block with it. A window that starts above the highest refused
+    /// share, and a prepared record above the highest refused one, are
+    /// clear.
     fn met_by(&self, cursors: &PeerCursors) -> bool {
-        let covered = |need: Option<i64>, cursor: Option<i64>| match need {
+        let shares = match self.share_seq {
             None => true,
-            Some(need) => cursor.is_some_and(|cursor| cursor >= need),
+            Some(last) => {
+                cursors.shares.is_some_and(|scanned| scanned >= last)
+                    && cursors.shares_refused.is_none_or(|refused| {
+                        self.first_share_seq.is_some_and(|first| first > refused)
+                    })
+            }
         };
-        // Held, not only scanned: a row the peer refused as a conflict is
-        // one it can never adopt the block with.
-        covered(self.share_seq, cursors.shares_held)
-            && covered(self.prepared_sync_seq, cursors.prepared_held)
+        let prepared = match self.prepared_sync_seq {
+            None => true,
+            Some(need) => {
+                cursors.prepared.is_some_and(|scanned| scanned >= need)
+                    && cursors
+                        .prepared_refused
+                        .is_none_or(|refused| need > refused)
+            }
+        };
+        shares && prepared
     }
 }
 
@@ -204,51 +222,31 @@ mod tests {
             shares: Some(10),
             blocks: None,
             prepared: Some(5),
-            shares_held: Some(10),
-            prepared_held: Some(5),
+            ..PeerCursors::default()
+        };
+        let needs = |first, last, prepared| AdoptionNeeds {
+            share_seq: last,
+            first_share_seq: first,
+            prepared_sync_seq: prepared,
         };
         assert!(AdoptionNeeds::default().met_by(&PeerCursors::default()));
-        assert!(AdoptionNeeds {
-            share_seq: Some(10),
-            prepared_sync_seq: Some(5)
-        }
-        .met_by(&cursors));
-        assert!(!AdoptionNeeds {
-            share_seq: Some(11),
-            prepared_sync_seq: None
-        }
-        .met_by(&cursors));
-        assert!(!AdoptionNeeds {
-            share_seq: None,
-            prepared_sync_seq: Some(6)
-        }
-        .met_by(&cursors));
-        assert!(!AdoptionNeeds {
-            share_seq: Some(1),
-            prepared_sync_seq: None
-        }
-        .met_by(&PeerCursors::default()));
-        // Scanned past the need, but holding only rows below a refused one.
+        assert!(needs(Some(2), Some(10), Some(5)).met_by(&cursors));
+        assert!(!needs(Some(2), Some(11), None).met_by(&cursors));
+        assert!(!needs(None, None, Some(6)).met_by(&cursors));
+        assert!(!needs(Some(1), Some(1), None).met_by(&PeerCursors::default()));
+        // Rows the peer refused, quarantined there: only a window that
+        // starts above the highest refused share, and a prepared record
+        // above the highest refused one, are met.
         let refused = PeerCursors {
-            shares_held: Some(7),
-            prepared_held: Some(3),
+            shares_refused: Some(6),
+            prepared_refused: Some(3),
             ..cursors.clone()
         };
-        assert!(!AdoptionNeeds {
-            share_seq: Some(8),
-            prepared_sync_seq: None
-        }
-        .met_by(&refused));
-        assert!(!AdoptionNeeds {
-            share_seq: None,
-            prepared_sync_seq: Some(4)
-        }
-        .met_by(&refused));
-        assert!(AdoptionNeeds {
-            share_seq: Some(7),
-            prepared_sync_seq: Some(3)
-        }
-        .met_by(&refused));
+        assert!(needs(Some(7), Some(10), Some(4)).met_by(&refused));
+        assert!(!needs(Some(6), Some(10), None).met_by(&refused));
+        assert!(!needs(Some(2), Some(4), None).met_by(&refused));
+        assert!(!needs(None, Some(10), None).met_by(&refused));
+        assert!(!needs(None, None, Some(3)).met_by(&refused));
         assert_eq!(PeerIngest::TimedOut.outcome(), "timed_out");
     }
 }

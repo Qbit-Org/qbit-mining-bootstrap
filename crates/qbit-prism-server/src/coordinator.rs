@@ -2972,6 +2972,10 @@ impl Coordinator {
                     .window
                     .shares
                     .and_then(|range| i64::try_from(range.last_share_seq).ok()),
+                first_share_seq: candidate
+                    .window
+                    .shares
+                    .and_then(|range| i64::try_from(range.first_share_seq).ok()),
                 prepared_sync_seq: prepared,
             })
         };

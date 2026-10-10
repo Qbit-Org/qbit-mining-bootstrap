@@ -103,9 +103,9 @@ pub struct TableRows {
 
 /// A `qbit_prism_peer_sync_cursors` row: how far this node has pulled one
 /// stream of the peer's rows, in the stream's key on the peer.
-/// `ingested_through` is NULL while this node holds every peer row it
-/// scanned, and otherwise the position below the first one it refused as a
-/// conflict.
+/// For shares and prepared jobs, `ingested_through` is the highest peer row
+/// this node refused as a conflict, quarantined for good (NULL while none
+/// was); it holds every peer row it scanned above it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PeerSyncCursor {
     pub stream: String,
