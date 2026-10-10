@@ -587,12 +587,26 @@ fn run(program: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// A port nobody listens on now. The listener is dropped before the
-/// postmaster binds it; a collision fails the start loudly, never silently.
+/// A port nobody listens on now, and one this process has not handed out
+/// before. The listener is dropped before the port's user binds it, so two
+/// ports taken in a row could otherwise come back the same and collide
+/// within one scenario. A collision with another process still fails the
+/// start loudly, never silently.
 pub fn free_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port())
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    for _ in 0..64 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let mut handed_out = HANDED_OUT
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the port registry is poisoned"))?;
+        if handed_out.insert(port) {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no port this process has not handed out already, in 64 tries")
 }
 
 fn set_private(path: &Path) -> Result<()> {
@@ -619,4 +633,14 @@ pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn free_ports_are_never_handed_out_twice() {
+        let ports: Vec<u16> = (0..200).map(|_| super::free_port().unwrap()).collect();
+        let distinct: std::collections::BTreeSet<_> = ports.iter().collect();
+        assert_eq!(distinct.len(), ports.len());
+    }
 }
