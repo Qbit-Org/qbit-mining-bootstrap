@@ -163,6 +163,8 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
         assert_eq!(populated.families.len(), 91);
+        // 981 since the 3.1 dual writer's peer_sync ORDER_LOCK holder: one
+        // more holder's hold histogram, 16 series.
         assert_eq!(populated.series.len(), 981);
         assert_eq!(
             sample(&body, "qbit_prism_tip_poll_age_seconds"),

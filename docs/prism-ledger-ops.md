@@ -2397,7 +2397,9 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
 
    The [exact SQL](../scripts/prism-recovery-evidence.sql) exports ordered share
    rows, block/publication order, audit SHAs, payouts, carry rows, candidate and
-   CTV state in one read-only snapshot. The [streaming summarizer](../scripts/prism-recovery-evidence.py)
+   CTV state in one read-only snapshot. It leaves out migration 027's
+   `origin_node`, a row's provenance in a 3.1 dual-writer pair, so a `2.x.x`
+   source and its migrated copy export the same rows. The [streaming summarizer](../scripts/prism-recovery-evidence.py)
    records counts and digests and reproduces the legacy `audit_head_sha256`;
    compare that head to the mirrored pre-cutover report. It refuses incomplete
    exports and carry mismatches/drift. It checks legacy carry rows per payout
