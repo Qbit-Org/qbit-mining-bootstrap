@@ -270,6 +270,24 @@ dual-writer node (its carry-owner journal `qbit_prism_node_roles` holds rows),
 because it would pay carried balances beside the carry owner. Set to `1`, the
 frontend starts anyway, with a warning. Only the deliberate rollback sets it.
 
+## Readiness endpoint and admission (3.1)
+
+A readiness-only HTTP listener for a balancer's checks, meant for a node's
+public address (decision D-7); off unless `PRISM_READINESS_PORT` is set.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PRISM_READINESS_PORT` | `0` (off) | its TCP port; 9084 on the pair |
+| `PRISM_READINESS_BIND` | `127.0.0.1` | its bind address; `0.0.0.0` inside a container |
+| `PRISM_READINESS_TOKEN` or `PRISM_READINESS_TOKEN_FILE` | required with the port | the token checks must send in `X-Qbit-Healthcheck-Token`: at least 16 visible ASCII characters with no whitespace. Use exactly one form; a group-readable file is fine |
+| `PRISM_READINESS_GRACE_SECONDS` | `10` | how long readiness may stay false, as through a tip or payout-revision rebuild, before the frontend stops admitting miners; 0 to 120 |
+
+`GET /readyz` answers `200` while the frontend admits miners, `503` while it
+does not, `401` without the token and `404` for anything else. In dual-writer
+mode the Stratum listeners also accept connections only while it admits. With
+the port unset and `PRISM_DUAL_WRITER` off, nothing changes from 3.0. See
+[dual-writer readiness](prism-dual-writer-readiness.md).
+
 ## Preventing stale guidance
 
 CI runs `python3 scripts/check_prism_settings.py`. It checks the native name

@@ -614,6 +614,14 @@ readiness transitions and routing decisions, confirm ordinary rebuilds stay
 within budget, then hold work unavailable and confirm ejection by the stated
 bound and re-entry after two successes. This is the #186 carry-over to #291.
 
+### PRISM 3.1: readiness endpoint and admission grace
+
+PRISM 3.1 adds a readiness-only, token-protected endpoint for balancers that
+check each frontend on an address they can reach from outside, and a grace
+that keeps an ordinary rebuild from withdrawing a frontend; in dual-writer
+mode the Stratum listeners refuse connections while it is withdrawn. See
+[dual-writer readiness](prism-dual-writer-readiness.md).
+
 ## Self-check live instances
 
 `qbit-prism-server self-check` adds `live_instances` to its existing JSON report.
