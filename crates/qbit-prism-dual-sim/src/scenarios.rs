@@ -43,6 +43,16 @@ pub const ROUTING_SETTLE_BOUND: Duration = Duration::from_secs(30);
 pub const FAILOVER_GAP_BOUND_MS: u64 = 30_000;
 /// The whole settle: answers, candidates, chain, replication or sync.
 pub const SETTLE_BOUND: Duration = Duration::from_secs(180);
+/// How long S2's frozen variant keeps A frozen while B mines. A frozen peer
+/// must never stall the survivor's writes: D1's sync barrier, held by a
+/// puller frozen mid-pull, would block every job and landing on B.
+pub const FREEZE_HOLD: Duration = Duration::from_secs(60);
+/// How long B may take, while A is frozen, to record new jobs after a new
+/// tip or one of its own landings: its block poll, the template, the
+/// prepared record and the jobs it issues.
+pub const NEW_WORK_BOUND: Duration = Duration::from_secs(15);
+/// The short freezes of S2's frozen-during-pulls variant.
+pub const SHORT_FREEZES: usize = 20;
 
 /// How node A dies in S2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +116,9 @@ pub enum Scenario {
     /// S2: A dies; miners move to B, B finds carry-free blocks, A returns,
     /// ingests them and resumes paydowns.
     S02ADies(Death),
+    /// S2, frozen mid-pull: A's frontend is frozen 20 times while its
+    /// puller works on B's database; B never stalls.
+    S02FrozenDuringPulls,
     /// S3: B dies; A is unaffected, and B catches up when it returns.
     S03BDies,
     /// S4: the link between the databases is cut with both nodes alive.
@@ -143,6 +156,7 @@ impl Scenario {
             Scenario::CheckerControl => "checker-control".into(),
             Scenario::S01SteadyState => "s01-steady-state".into(),
             Scenario::S02ADies(death) => format!("s02-a-dies-{}", death.id()),
+            Scenario::S02FrozenDuringPulls => "s02-a-frozen-during-pulls".into(),
             Scenario::S03BDies => "s03-b-dies".into(),
             Scenario::S04LinkCut => "s04-link-cut".into(),
             Scenario::S05BothWrite => "s05-both-write".into(),
@@ -173,6 +187,9 @@ impl Scenario {
                 "A dies ({}): miners move to B, B mines carry-free, A returns and pays down",
                 death.id()
             ),
+            Scenario::S02FrozenDuringPulls => {
+                "A frozen again and again mid-pull: B keeps preparing work and landing blocks".into()
+            }
             Scenario::S03BDies => "B dies: A is unaffected and B catches up on return".into(),
             Scenario::S04LinkCut => {
                 "Link cut with both alive: no mining impact, sync catches up on heal".into()
@@ -228,6 +245,7 @@ impl Scenario {
         if matches!(
             self,
             Scenario::CheckerControl
+                | Scenario::S02FrozenDuringPulls
                 | Scenario::S05BothWrite
                 | Scenario::S06Restore(_)
                 | Scenario::S07DiskReplaced(_)
@@ -281,6 +299,7 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
             Scenario::CheckerControl => checker_control(&mut sim).await?,
             Scenario::S01SteadyState => s01_steady_state(&mut sim).await?,
             Scenario::S02ADies(death) => s02_a_dies(&mut sim, death).await?,
+            Scenario::S02FrozenDuringPulls => s02_frozen_during_pulls(&mut sim).await?,
             Scenario::S03BDies => s03_b_dies(&mut sim).await?,
             Scenario::S04LinkCut => s04_link_cut(&mut sim).await?,
             Scenario::S05BothWrite => s05_both_write(&mut sim).await?,
@@ -893,6 +912,9 @@ async fn s02_a_dies(sim: &mut Sim, death: Death) -> Result<Body> {
     for note in ["B while A is down", "B again while A is down"] {
         b_blocks.push(find_block(sim, &mut body, Node::B, note, Some(&[Node::B])).await?);
     }
+    if death == Death::Freeze {
+        hold_frozen(sim, &mut body, fault_at, &mut b_blocks).await?;
+    }
     let records = sim.load()?.records();
     let tail = crate::measure::tail(&records, Node::A, fault_at, &held);
     sim.mark(&format!(
@@ -953,6 +975,301 @@ async fn s02_a_dies(sim: &mut Sim, death: Death) -> Result<Body> {
         ),
     );
     expect_owner_paid_down(sim, &mut body, &a2).await?;
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// The database's clock now: every time compared with a row's timestamp is
+/// taken from the database that wrote the row.
+async fn db_now(pool: &sqlx::PgPool) -> Result<chrono::DateTime<chrono::Utc>> {
+    Ok(sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await?)
+}
+
+/// The jobs `node`'s frontend recorded after `after`, and how many of them
+/// are prepared records (`prepared:` keys; the rest are issued jobs). Every
+/// one takes D1's sync barrier (`sync_seq`'s default), as a landing does.
+async fn jobs_after(
+    pool: &sqlx::PgPool,
+    node: Node,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE job_id LIKE 'prepared:%') \
+         FROM qbit_prism_jobs WHERE instance_id = $1 AND created_at > $2",
+    )
+    .bind(node.instance_id())
+    .bind(after)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// S2's frozen variant, once B has taken the miners: keep A frozen for
+/// `FREEZE_HOLD` while B finds a block every few seconds. Each must land, and
+/// B must record new jobs after each one, all before A thaws.
+async fn hold_frozen(
+    sim: &mut Sim,
+    body: &mut Body,
+    fault_at: u64,
+    b_blocks: &mut Vec<String>,
+) -> Result<()> {
+    let pool = sim.pool(Node::B).await?;
+    let frozen_since = Duration::from_millis(sim.clock.now_ms().saturating_sub(fault_at));
+    let since =
+        db_now(&pool).await? - chrono::Duration::milliseconds(frozen_since.as_millis() as i64);
+    while Duration::from_millis(sim.clock.now_ms().saturating_sub(fault_at)) < FREEZE_HOLD {
+        steady(sim, 5).await;
+        b_blocks.push(
+            find_block(
+                sim,
+                body,
+                Node::B,
+                "B while A stays frozen",
+                Some(&[Node::B]),
+            )
+            .await?,
+        );
+    }
+    // New jobs after each of B's blocks, before the thaw.
+    let started = Instant::now();
+    let without = loop {
+        let mut without = Vec::new();
+        for block in b_blocks.iter() {
+            let after: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM qbit_prism_jobs j JOIN qbit_pool_blocks b ON b.block_hash = $2 \
+                 WHERE j.instance_id = $1 AND j.created_at > b.found_at",
+            )
+            .bind(Node::B.instance_id())
+            .bind(block)
+            .fetch_one(&pool)
+            .await?;
+            if after == 0 {
+                without.push(block.clone());
+            }
+        }
+        if without.is_empty() || started.elapsed() >= NEW_WORK_BOUND {
+            break without;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let held = Duration::from_millis(sim.clock.now_ms().saturating_sub(fault_at));
+    let (jobs, prepared) = jobs_after(&pool, Node::B, since).await?;
+    pool.close().await;
+    body.expect(
+        "B keeps landing blocks and recording jobs while A stays frozen",
+        held >= FREEZE_HOLD && without.is_empty() && prepared > 0,
+        format!(
+            "A frozen {:.1} s (at least {} s); B landed {} blocks meanwhile and recorded {jobs} jobs \
+             ({prepared} prepared records) since the freeze; blocks with no job of B's after them \
+             within {} s: {without:?}",
+            held.as_secs_f64(),
+            FREEZE_HOLD.as_secs(),
+            b_blocks.len(),
+            NEW_WORK_BOUND.as_secs()
+        ),
+    );
+    Ok(())
+}
+
+/// What A's puller was doing on B's database: its backends there (the peer
+/// role's), how many were running a query or had a transaction open, and how
+/// many advisory locks they held (D1's sync barrier is one).
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct PullState {
+    backends: i64,
+    busy: i64,
+    advisory_locks: i64,
+}
+
+impl PullState {
+    fn mid_pull(&self) -> bool {
+        self.busy > 0 || self.advisory_locks > 0
+    }
+}
+
+async fn pull_state(pool: &sqlx::PgPool) -> Result<PullState> {
+    let (backends, busy, advisory_locks): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), \
+                count(*) FILTER (WHERE a.state IN ('active', 'idle in transaction', \
+                                                   'idle in transaction (aborted)')), \
+                coalesce(sum(held.locks), 0)::bigint \
+         FROM pg_stat_activity a \
+         LEFT JOIN LATERAL (SELECT count(*) AS locks FROM pg_locks l \
+                            WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted) held \
+           ON true \
+         WHERE a.usename = $1 AND a.datname = current_database()",
+    )
+    .bind(crate::sim::PEER_ROLE)
+    .fetch_one(pool)
+    .await?;
+    Ok(PullState {
+        backends,
+        busy,
+        advisory_locks,
+    })
+}
+
+/// A small seeded generator for the freeze schedule; its seed is reported.
+struct Schedule(u64);
+
+impl Schedule {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    /// A number in `0..n` (xorshift64).
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n.max(1)
+    }
+}
+
+/// One short freeze of A in `s02_frozen_during_pulls`.
+#[derive(Clone, Debug, serde::Serialize)]
+struct FreezeRound {
+    round: usize,
+    at_ms: u64,
+    held_ms: u64,
+    /// A's puller was seen mid-pull on B just before the stop.
+    timed_to_a_pull: bool,
+    /// What it held on B right after the stop.
+    after_stop: PullState,
+    /// How long B took to record a job on the new tip, or why it did not.
+    new_work_ms: std::result::Result<u64, String>,
+    /// B's block found while A was frozen, every fifth round.
+    landed: Option<std::result::Result<String, String>>,
+}
+
+/// S2, frozen mid-pull. Both nodes take miners. A's frontend is frozen
+/// `SHORT_FREEZES` times for 1 to 4 s, each time, where it can be seen
+/// within 3 s, the moment its puller is working on B's database (a query
+/// running, a transaction open or an advisory lock held there). While A is
+/// frozen a new tip arrives, and B must record jobs on it within the bound;
+/// every fifth time B also finds a block, which must land. A puller frozen
+/// holding D1's sync barrier on B would stall exactly these writes.
+async fn s02_frozen_during_pulls(sim: &mut Sim) -> Result<Body> {
+    let mut body = Body::default();
+    sim.load()?.resume();
+    steady(sim, 6).await;
+    routing_settled(sim).await?;
+    let pool = sim.pool(Node::B).await?;
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos() as u64;
+    let mut schedule = Schedule::new(seed);
+    let mut rounds = Vec::new();
+    for round in 1..=SHORT_FREEZES {
+        let looking = Instant::now();
+        let mut timed_to_a_pull = false;
+        while looking.elapsed() < Duration::from_secs(3) {
+            if pull_state(&pool).await?.mid_pull() {
+                timed_to_a_pull = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let at_ms = sim.inject(Fault::FrontendFreeze(Node::A)).await?;
+        let frozen = Instant::now();
+        let after_stop = pull_state(&pool).await?;
+        let hold = Duration::from_millis(1_000 + schedule.below(3_000));
+        let tip = sim
+            .chain
+            .mint(1)
+            .await?
+            .pop()
+            .context("the mint made no block")?;
+        let new_work_ms = loop {
+            let jobs: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM qbit_prism_jobs WHERE instance_id = $1 AND parent_hash = $2",
+            )
+            .bind(Node::B.instance_id())
+            .bind(&tip)
+            .fetch_one(&pool)
+            .await?;
+            if jobs > 0 {
+                break Ok(frozen.elapsed().as_millis() as u64);
+            }
+            if frozen.elapsed() >= NEW_WORK_BOUND {
+                break Err(format!(
+                    "no job of B's on tip {tip} {} s into the freeze",
+                    NEW_WORK_BOUND.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // A stalled B cannot land either; trying would only add minutes.
+        let landed = if round % 5 == 0 && new_work_ms.is_ok() {
+            Some(
+                find_block(
+                    sim,
+                    &mut body,
+                    Node::B,
+                    "B while A is frozen mid-pull",
+                    Some(&[Node::B]),
+                )
+                .await
+                .map_err(|error| format!("{error:#}")),
+            )
+        } else {
+            None
+        };
+        if let Some(rest) = hold.checked_sub(frozen.elapsed()) {
+            tokio::time::sleep(rest).await;
+        }
+        let held_ms = frozen.elapsed().as_millis() as u64;
+        sim.heal(Fault::FrontendFreeze(Node::A)).await?;
+        rounds.push(FreezeRound {
+            round,
+            at_ms,
+            held_ms,
+            timed_to_a_pull,
+            after_stop,
+            new_work_ms,
+            landed,
+        });
+        tokio::time::sleep(Duration::from_millis(500 + schedule.below(2_500))).await;
+    }
+    pool.close().await;
+    std::fs::write(
+        sim.report_dir.join("freezes.json"),
+        serde_json::to_vec_pretty(&json!({"seed": seed, "rounds": rounds}))?,
+    )?;
+    let stalled: Vec<&FreezeRound> = rounds.iter().filter(|r| r.new_work_ms.is_err()).collect();
+    let mut took: Vec<u64> = rounds
+        .iter()
+        .filter_map(|r| r.new_work_ms.as_ref().ok().copied())
+        .collect();
+    took.sort_unstable();
+    let timed = rounds.iter().filter(|r| r.timed_to_a_pull).count();
+    let caught = rounds.iter().filter(|r| r.after_stop.mid_pull()).count();
+    body.expect(
+        "B records jobs on every new tip while A is frozen mid-pull",
+        stalled.is_empty(),
+        format!(
+            "{} freezes ({timed} timed to one of A's pulls on B; {caught} left A with a query, a \
+             transaction or an advisory lock open there); B's first job on the new tip after \
+             {:?} ms (median) and {:?} ms (max), bound {} s; stalled: {stalled:?}. Schedule seed \
+             {seed}; every round in freezes.json",
+            rounds.len(),
+            took.get(took.len() / 2),
+            took.last(),
+            NEW_WORK_BOUND.as_secs()
+        ),
+    );
+    let failed_landings: Vec<&FreezeRound> = rounds
+        .iter()
+        .filter(|r| matches!(r.landed, Some(Err(_))))
+        .collect();
+    let landings = rounds.iter().filter(|r| r.landed.is_some()).count();
+    body.expect(
+        "B lands its blocks while A is frozen mid-pull",
+        landings > 0 && failed_landings.is_empty(),
+        format!("{landings} blocks found on B during a freeze; failed: {failed_landings:?}"),
+    );
+    sim.settle(SETTLE_BOUND).await?;
     expect_dual_health(sim, &mut body).await?;
     Ok(body)
 }
