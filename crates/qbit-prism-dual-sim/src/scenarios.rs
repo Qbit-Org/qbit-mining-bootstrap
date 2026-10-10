@@ -34,15 +34,18 @@ pub const LANDING_BOUND: Duration = Duration::from_secs(60);
 /// failed checks 2 s apart, each failing at once (refused) or after its 1 s
 /// timeout (blackholed or frozen): 4 to 7 s.
 pub const MARK_DOWN_BOUND: Duration = Duration::from_secs(12);
-/// How long a frontend whose own PostgreSQL died may keep answering ready,
-/// as the balancer's first failed check on it shows: D4's writer probe gives
-/// up after 2 s and a writer unanswered for 4 s withdraws, health publishes
-/// every second, and the next check comes within 2 s.
-pub const SELF_WITHDRAWAL_BOUND: Duration = Duration::from_secs(10);
+/// How long a frontend whose own PostgreSQL died may keep answering ready
+/// (sampled every 200 ms), until it stops for good. D4 withdraws a writer
+/// unanswered for 4 s: its probe gives up after 2 s, starts once a second's
+/// reuse is over and is judged once a later probe has also given up, so 6
+/// to 10 s. D4's backstop, an admission decision gone stale, comes only 14 to
+/// 15 s after the kill.
+pub const SELF_WITHDRAWAL_BOUND: Duration = Duration::from_secs(12);
 /// How long S2 waits for the balancer to mark A down after A's PostgreSQL
-/// died: past D4's backstop (an admission decision 15 s old is stale) and the
-/// balancer's fall, so a slow withdrawal is measured rather than fatal.
-pub const SELF_MARK_DOWN_WAIT: Duration = Duration::from_secs(35);
+/// died: past D4's backstop twice over (staleness, then a grace a late
+/// not-ready publication may open) and the balancer's fall, so a slow
+/// withdrawal is measured rather than fatal.
+pub const SELF_MARK_DOWN_WAIT: Duration = Duration::from_secs(60);
 /// How long routing may take to settle on the preferred node before a
 /// fault: both nodes up, and every session back on A after a failback.
 pub const ROUTING_SETTLE_BOUND: Duration = Duration::from_secs(30);
@@ -992,39 +995,55 @@ fn expect_landing_order(body: &mut Body, on: Node, report: crate::measure::Landi
 }
 
 /// S2 with A's PostgreSQL killed: A's frontend, up without its database,
-/// stops answering ready within [`SELF_WITHDRAWAL_BOUND`] of the kill (its
-/// first failed check), and the balancer marks it down within
-/// [`MARK_DOWN_BOUND`] of that.
-fn expect_self_withdrawal(sim: &Sim, body: &mut Body, fault_at: u64) {
-    let report = sim.balancer.report();
-    let first_failed = report
-        .failed_checks
-        .iter()
-        .find(|check| check.backend == "a" && check.at_ms >= fault_at);
-    let marked_down = report
+/// stops answering ready for good within [`SELF_WITHDRAWAL_BOUND`] of the
+/// kill, as sampled from just before it, and the balancer marks it down
+/// within [`MARK_DOWN_BOUND`] of that.
+fn expect_self_withdrawal(
+    sim: &Sim,
+    body: &mut Body,
+    fault_at: u64,
+    trace: &crate::measure::ReadinessTrace,
+) {
+    let marked_down = sim
+        .balancer
+        .report()
         .transitions
         .iter()
         .find(|t| t.backend == "a" && !t.up && t.at_ms >= fault_at)
         .map(|t| t.at_ms);
-    let withdrew_ms = first_failed.map(|check| check.at_ms - fault_at);
+    let since_kill = |at: u64| at.saturating_sub(fault_at);
+    let first_ms = trace.first_not_ready(fault_at).map(since_kill);
+    let withdrawn_ms = trace
+        .withdrawn_since()
+        .filter(|at| *at >= fault_at)
+        .map(since_kill);
     let followed_ms = marked_down
-        .zip(first_failed)
-        .map(|(down, check)| down.saturating_sub(check.at_ms));
+        .zip(trace.withdrawn_since())
+        .map(|(down, since)| down.saturating_sub(since));
     sim.mark(&format!(
-        "A's first failed check {withdrew_ms:?} ms after its PostgreSQL died"
+        "A stopped answering ready {first_ms:?} ms after its PostgreSQL died, for good \
+         {withdrawn_ms:?} ms after"
     ));
     body.expect(
         "A withdrew on its own soon after its PostgreSQL died, and the balancer followed",
-        withdrew_ms.is_some_and(|ms| ms <= SELF_WITHDRAWAL_BOUND.as_millis() as u64)
+        withdrawn_ms.is_some_and(|ms| ms <= SELF_WITHDRAWAL_BOUND.as_millis() as u64)
             && followed_ms.is_some_and(|ms| ms <= MARK_DOWN_BOUND.as_millis() as u64),
         format!(
-            "A's first failed readiness check came {withdrew_ms:?} ms after the kill ({:?}), \
-             bound {} ms (D4: the writer probe gives up after 2 s and a writer unanswered \
-             for 4 s withdraws; health publishes every second; checks are 2 s apart); the \
-             balancer marked A down {followed_ms:?} ms after that, bound {} ms",
-            first_failed.map(|check| &check.reason),
+            "A first stopped answering ready {first_ms:?} ms after the kill, and for good \
+             {withdrawn_ms:?} ms after it, answering ready again {} times in between; bound \
+             {} ms (D4: the writer probe gives up after 2 s and a writer unanswered for 4 s \
+             withdraws). The balancer marked A down {followed_ms:?} ms after that, bound {} \
+             ms. {} samples every {} ms; the answers: {:?}",
+            trace.readmissions(fault_at),
             SELF_WITHDRAWAL_BOUND.as_millis(),
             MARK_DOWN_BOUND.as_millis(),
+            trace.samples,
+            crate::measure::READINESS_SAMPLE.as_millis(),
+            trace
+                .changes
+                .iter()
+                .map(|change| (change.at_ms, change.ready, change.reason.as_deref()))
+                .collect::<Vec<_>>(),
         ),
     );
 }
@@ -1043,25 +1062,33 @@ async fn s02_a_dies(sim: &mut Sim, death: Death, body: &mut Body) -> Result<()> 
     routing_settled(sim).await?;
 
     let fault = death.fault(Node::A);
+    // A frontend whose own database died still answers: it must withdraw on
+    // its own before the balancer's count can start, so its readiness is
+    // timed finer than the balancer's checks.
+    let readiness = match death {
+        Death::PostgresKill => Some(crate::measure::ReadinessSampler::start(
+            sim.balancer.node_check("a")?,
+        )),
+        _ => None,
+    };
     let fault_at = sim.inject(fault).await?;
     // B's last pull from A's database finishes or fails within two sync
     // intervals; what B holds then is what it had when A went.
     tokio::time::sleep(Duration::from_millis(2 * sim.config.sync_interval_ms + 500)).await;
     let held = crate::measure::credited_headers(&sim.pool(Node::B).await?).await?;
-    // A frontend whose own database died still answers: it must withdraw on
-    // its own before the balancer's count can start.
     let mark_down_wait = match death {
         Death::PostgresKill => SELF_MARK_DOWN_WAIT,
         _ => MARK_DOWN_BOUND,
     };
-    sim.balancer
-        .wait_state("a", false, mark_down_wait)
-        .await
-        .context("the balancer kept A up")?;
-    sim.mark("balancer marked A down");
-    if death == Death::PostgresKill {
-        expect_self_withdrawal(sim, body, fault_at);
+    let marked_down = sim.balancer.wait_state("a", false, mark_down_wait).await;
+    if let Some(readiness) = readiness {
+        // Recorded whether or not the balancer followed, so a withdrawal too
+        // slow for the wait is still measured.
+        let trace = readiness.finish().await?;
+        expect_self_withdrawal(sim, body, fault_at, &trace);
     }
+    marked_down.context("the balancer kept A up")?;
+    sim.mark("balancer marked A down");
     steady(sim, 8).await;
     let mut b_blocks = Vec::new();
     for note in ["B while A is down", "B again while A is down"] {
@@ -2751,11 +2778,22 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
         .await
         .is_ok();
     match case {
-        DeathAtFind::Lost => body.expect(
-            "the lost block never reached the chain",
-            !on_chain,
-            format!("{hash} known to the network: {on_chain}"),
-        ),
+        DeathAtFind::Lost => {
+            body.expect(
+                "the lost block never reached the chain",
+                !on_chain,
+                format!("{hash} known to the network: {on_chain}"),
+            );
+            if !on_chain {
+                // Its submitblock never reached the node and its outcome was
+                // never recorded: PRISM keeps the candidate for
+                // reconciliation and never offers it again.
+                body.options.unresolved_candidates.insert(
+                    hash.clone(),
+                    "lost with A: its offer's outcome was never recorded".to_owned(),
+                );
+            }
+        }
         DeathAtFind::Accepted { wait } => {
             let adopted = sim.wait_confirmed(&hash, &[Node::B], ADOPTION_BOUND).await;
             body.expect(

@@ -67,6 +67,90 @@ impl<T> Drop for Poller<T> {
     }
 }
 
+/// How often [`ReadinessSampler`] checks its node.
+pub const READINESS_SAMPLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Checks one node's readiness every [`READINESS_SAMPLE`], as the balancer's
+/// check sees it, while it runs: when the answer changed, by the run clock.
+pub struct ReadinessSampler {
+    poller: Poller<ReadinessTrace>,
+}
+
+/// What a [`ReadinessSampler`] saw.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReadinessTrace {
+    /// The first answer, then each change: when, whether ready, and why not.
+    pub changes: Vec<ReadinessChange>,
+    pub samples: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReadinessChange {
+    pub at_ms: u64,
+    pub ready: bool,
+    pub reason: Option<String>,
+}
+
+impl ReadinessSampler {
+    pub fn start(check: crate::balancer::NodeCheck) -> Self {
+        let poller = Poller::spawn(move |stop| async move {
+            let mut trace = ReadinessTrace::default();
+            while !stop.load(Ordering::SeqCst) {
+                let result = check.check().await;
+                let at_ms = check.now_ms();
+                trace.samples += 1;
+                let ready = result.is_ok();
+                if trace.changes.last().is_none_or(|last| last.ready != ready) {
+                    trace.changes.push(ReadinessChange {
+                        at_ms,
+                        ready,
+                        reason: result.err(),
+                    });
+                }
+                tokio::time::sleep(READINESS_SAMPLE).await;
+            }
+            trace
+        });
+        Self { poller }
+    }
+
+    pub async fn finish(self) -> Result<ReadinessTrace> {
+        self.poller.finish().await
+    }
+}
+
+impl ReadinessTrace {
+    /// When the node stopped answering ready for good, as of the last
+    /// sample: the start of the final not-ready stretch, if it ends on one.
+    pub fn withdrawn_since(&self) -> Option<u64> {
+        self.changes
+            .last()
+            .filter(|change| !change.ready)
+            .map(|change| change.at_ms)
+    }
+
+    /// The first time, at or after `from_ms`, that the node did not answer
+    /// ready.
+    pub fn first_not_ready(&self, from_ms: u64) -> Option<u64> {
+        self.changes
+            .iter()
+            .find(|change| !change.ready && change.at_ms >= from_ms)
+            .map(|change| change.at_ms)
+    }
+
+    /// How often, after `from_ms`, the node answered ready again once it had
+    /// stopped.
+    pub fn readmissions(&self, from_ms: u64) -> usize {
+        let Some(first) = self.first_not_ready(from_ms) else {
+            return 0;
+        };
+        self.changes
+            .iter()
+            .filter(|change| change.ready && change.at_ms > first)
+            .count()
+    }
+}
+
 /// Samples, while it runs, the newest accepted share committed on one
 /// database and the time it first appears on the other.
 pub struct LagSampler {
@@ -458,6 +542,44 @@ pub fn excuse(tail: &TailReport, why: &str) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{ReadinessChange, ReadinessTrace};
+
+    fn change(at_ms: u64, ready: bool) -> ReadinessChange {
+        ReadinessChange {
+            at_ms,
+            ready,
+            reason: (!ready).then(|| "HTTP 503".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_readiness_trace_times_the_withdrawal_that_held() {
+        let steady = ReadinessTrace {
+            changes: vec![change(100, true), change(5_000, false)],
+            samples: 40,
+        };
+        assert_eq!(steady.withdrawn_since(), Some(5_000));
+        assert_eq!(steady.first_not_ready(1_000), Some(5_000));
+        assert_eq!(steady.readmissions(1_000), 0);
+        let flapping = ReadinessTrace {
+            changes: vec![
+                change(100, true),
+                change(4_000, false),
+                change(6_000, true),
+                change(20_000, false),
+            ],
+            samples: 120,
+        };
+        assert_eq!(flapping.first_not_ready(1_000), Some(4_000));
+        assert_eq!(flapping.withdrawn_since(), Some(20_000));
+        assert_eq!(flapping.readmissions(1_000), 1);
+        let back = ReadinessTrace {
+            changes: vec![change(100, true), change(4_000, false), change(6_000, true)],
+            samples: 30,
+        };
+        assert_eq!(back.withdrawn_since(), None, "ready again at the end");
+    }
+
     use super::*;
 
     fn acked(id: &str, issuer: Node, answered: u64) -> ShareRecord {

@@ -119,7 +119,7 @@ block whose coinbase carries `/PRISM/`), never from a database's
 | `inv4-windows-unchanged` | every recorded window still has exactly its shares, and no newer share is eligible for it |
 | `inv4-windows-reproducible` | every recorded window recomputes to its digest from every database |
 | `ledger-integrity` | `qbit_carry_forward_integrity_report()` is clean everywhere |
-| `candidates-settled` | no block candidate is left unfinished |
+| `candidates-settled` | no block candidate is left unfinished, except one a scenario names as kept for reconciliation with no landing (S8's lost block) |
 | `d2-local-state-not-copied` | dual-writer pairs, for rows written since the pair began writing as two primaries: no node holds a candidate its peer's frontend claimed or reserved; no candidate or offer decision is the same row on both nodes (same insert timestamp); no node holds an offer decision for a block it never had as a candidate (only the offering frontend records one); no candidate from before a cutover was reserved after it; each database identifies as its own node (D-2, D-9). After S7's rebuild this is D-16's reset |
 
 The negative control (`checker-control`) runs two unsynced single writers
@@ -169,9 +169,11 @@ What each one does:
   carry-free blocks, A's unsynced tail is measured, A returns, confirms B's
   blocks from its own chain view, and its next block pays the carry they
   accrued (its priors equal the chain's sums). With its PostgreSQL killed,
-  A's frontend is still up and must withdraw on its own: its first failed
-  readiness check must come within 10 s of the kill (D4 withdraws a writer
-  unanswered for 4 s), and the mark-down within 12 s of that.
+  A's frontend is still up and must withdraw on its own: sampled every
+  200 ms from before the kill, it must stop answering ready for good within
+  12 s (D4 withdraws a writer unanswered for 4 s; its stale-decision
+  backstop would take 14 to 15 s), and the mark-down must follow within
+  12 s.
 - **S2's freeze** holds A frozen for at least 60 s while B finds a block every
   few seconds; each must land and be followed by new jobs of B's before A
   thaws (a frozen peer must never stall the survivor's writes).
@@ -223,7 +225,8 @@ What each one does:
   physical copy of the peer, re-personalised (D-16); only its measured tail is
   excused.
 - **S8:** A dies at the instant it finds a block: with the `submitblock` held
-  (the block never reaches the chain) or answered by the node and withheld
+  (the block never reaches the chain, and A may keep its candidate for
+  reconciliation, never offering it again) or answered by the node and withheld
   (B adopts it; once A returns each node holds one landing of it), with D-19's
   wait on and off.
 - **S9:** the 3.0 pair mines a history, is cut over live (drain, with no
