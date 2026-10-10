@@ -4087,9 +4087,10 @@ block unverifiable.
 
 **The #619 holding probe.** A dual-writer node has no physical standby, so the
 rows it can lose are each log's newest, to a restore. A window is held when its
-last row is its own, this node's entry is its row under the window's predicate
-(own-log recovery brings own rows back in `share_seq` order), and the peer
-sync's mark is at or above the peer's entry. A mark a restore rewound, or an
+last row still matches the window's predicate, whichever node wrote it, this
+node's entry is its row under that predicate (own-log recovery brings own rows
+back in `share_seq` order), and the peer sync's mark is at or above the peer's
+entry. A mark a restore rewound, or an
 own entry it lost, makes the window not held until the sync and own-log
 recovery bring the rows back; retention under the first row still reads as a
 pruned prefix.
@@ -4143,8 +4144,8 @@ The result has `share_count` rows, and its JSON array hashes to
 **The refresh.** Published work keeps 3.0's cadence: a new share, the peer's
 included, does not replace it before the next template change or reanchor.
 Empty-window (bootstrap) work is the exception, as in 3.0: it is replaced at
-once by the first share, and by the first move of the peer's mark, labelled
-`shares`. A cached window is not reused for a new template once the peer's
+once by the first share, and whenever the peer's mark has moved, labelled
+`shares`, until a window holds shares. A cached window is not reused for a new template once the peer's
 mark has moved, because the peer's newer rows can all lie below this node's
 cutoff. The
 incremental advance reads each node's rows between the retired window's cut and

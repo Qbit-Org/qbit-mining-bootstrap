@@ -1272,6 +1272,9 @@ impl Ledger {
             Some(node) => {
                 let (cutoff, own, mark): (i64, Option<i64>, Option<i64>) =
                     sqlx::query_as(&DUAL_CUTOFF_SQL)
+                        // Planned with its values, as every bounded ledger
+                        // read here is: the retained entry prunes partitions.
+                        .persistent(false)
                         .bind(node)
                         .bind(anchor_ms)
                         .bind(retained_own)
@@ -1771,6 +1774,10 @@ impl std::error::Error for WindowNotHeld {}
 /// connection's `statement_timeout`, and dropping the future between pages
 /// rolls the caller's transaction back and leaves at most one page of blocking
 /// work running detached.
+///
+/// It applies 3.0's predicate, with no dual-writer cut: a dual-writer
+/// window's range holds peer rows the window excludes, so it is read through
+/// [`Ledger::read_window`], which applies the reference's cut.
 pub async fn read_range_paged<S, F>(
     connection: &mut sqlx::PgConnection,
     first: i64,
