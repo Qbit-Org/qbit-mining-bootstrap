@@ -1271,10 +1271,11 @@ impl Ledger {
             ),
             Some(node) => {
                 let (cutoff, own, mark): (i64, Option<i64>, Option<i64>) =
+                    // Cached, as 3.0's cutoff is, so no plan is made
+                    // under ORDER_LOCK: a generic plan prunes the leaves
+                    // below the retained entry at executor start, which the
+                    // bounded-probe guard checks in both plan modes.
                     sqlx::query_as(&DUAL_CUTOFF_SQL)
-                        // Planned with its values, as every bounded ledger
-                        // read here is: the retained entry prunes partitions.
-                        .persistent(false)
                         .bind(node)
                         .bind(anchor_ms)
                         .bind(retained_own)
@@ -1328,18 +1329,20 @@ impl Ledger {
         let timeline = WriterTimeline::read(&mut tx).await?;
         // A dual-writer window's cut: the own entry read under ORDER_LOCK
         // above, and the peer's, chosen against this anchor (`window/cut.rs`).
-        let cut = match dual_writer_node {
+        // The peer mark the window's cut used, which the refresh compares.
+        let (cut, peer_mark) = match dual_writer_node {
             Some(node) => {
                 let own = own_bound.map_or(Ok(None), cut::positive_entry)?;
-                let peer =
+                let (peer, used) =
                     cut::read_peer_cut(&mut tx, 1 - node, peer_high_water, anchor_ms).await?;
-                Some(if node == 0 {
+                let cut = if node == 0 {
                     WindowCut::new(own, peer)?
                 } else {
                     WindowCut::new(peer, own)?
-                })
+                };
+                (Some(cut), used)
             }
-            None => None,
+            None => (None, None),
         };
         let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
         // Without a retired window there is nothing to advance from; the
@@ -1387,7 +1390,7 @@ impl Ledger {
                                 leaf: Some(leaf),
                                 acquisition: report,
                                 timeline,
-                                peer_mark: peer_high_water,
+                                peer_mark,
                             })
                         })
                         .await;
@@ -1490,7 +1493,7 @@ impl Ledger {
                     leaf,
                     acquisition: report,
                     timeline,
-                    peer_mark: peer_high_water,
+                    peer_mark,
                 })
             })
             .await

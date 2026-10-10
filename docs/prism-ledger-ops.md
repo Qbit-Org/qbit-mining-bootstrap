@@ -4090,10 +4090,9 @@ rows it can lose are each log's newest, to a restore. A window is held when its
 last row still matches the window's predicate, whichever node wrote it, this
 node's entry is its row under that predicate (own-log recovery brings own rows
 back in `share_seq` order), and the peer sync's mark is at or above the peer's
-entry. A mark a restore rewound, or an
-own entry it lost, makes the window not held until the sync and own-log
-recovery bring the rows back; retention under the first row still reads as a
-pruned prefix.
+entry. A mark a restore rewound, or an own entry it lost, makes the window not
+held until the sync and own-log recovery bring the rows back; retention under
+the first row still reads as a pruned prefix.
 
 **Clock skew.** The anchor rule applies to every row, the peer's included,
 and the peer's entry stops below its first row stamped after the anchor. Each
@@ -4145,16 +4144,16 @@ The result has `share_count` rows, and its JSON array hashes to
 included, does not replace it before the next template change or reanchor.
 Empty-window (bootstrap) work is the exception, as in 3.0: it is replaced at
 once by the first share, and whenever the peer's mark has moved, labelled
-`shares`, until a window holds shares. A cached window is not reused for a new template once the peer's
-mark has moved, because the peer's newer rows can all lie below this node's
-cutoff. The
-incremental advance reads each node's rows between the retired window's cut and
-the fresh one, at or above the retired window's first row, and merges the
-peer's late rows into it in `share_seq` order, so a late peer row costs a merge,
-not a full scan (about 0.1 s against 1.5 s for the full scan at a 200,000-row
-window). The result is proved by the same leaf witness and eligible-row count
-as in 3.0, under the fresh cut. A cut that moved back is counted as
-`cutoff_regressed` in `qbit_prism_refresh_window_acquisitions_total`.
+`shares`, until a window holds shares. A cached window is not reused for a new
+template once the peer's mark has moved, because the peer's newer rows can all
+lie below this node's cutoff. The incremental advance reads each node's rows
+between the retired window's cut and the fresh one, at or above the retired
+window's first row, and merges the peer's late rows into it in `share_seq`
+order, so a late peer row costs a merge, not a full scan (about 0.1 s against
+1.5 s for the full scan at a 200,000-row window). The result is proved by the
+same leaf witness and eligible-row count as in 3.0, under the fresh cut. A cut
+that moved back is counted as `cutoff_regressed` in
+`qbit_prism_refresh_window_acquisitions_total`.
 
 **The index.** This node's entry is read under `ORDER_LOCK`. Both entries come
 from the `(origin_node, share_seq)` index (migration 031,
@@ -4163,11 +4162,12 @@ serve, so a node whose rows all lie under a long run of the peer's never walks
 that run. This node's entry is first probed at or above the retained window's
 entry, which reads only the newest partitions, usually one, as 3.0's cutoff
 does; the probe of every partition runs only for a first snapshot or when that
-one finds nothing. Without a valid btree index on those columns, a dual-writer snapshot
-refuses before it takes any lock, naming migration 031, and the frontend
-publishes no new work. The refresh loop logs that refusal as an `ALERT` once a
-minute, not on every attempt, and `qbit_prism_dual_writer_origin_index_missing`
-reads 1 until a snapshot finds the index again.
+one finds nothing. Without a valid btree index on those columns, a dual-writer
+snapshot refuses before it takes any lock, naming migration 031, and the
+frontend publishes no new work. The refresh loop logs that refusal as an
+`ALERT` once a minute, not on every attempt, and
+`qbit_prism_dual_writer_origin_index_missing` reads 1 until a snapshot finds
+the index again.
 
 **Not cut-aware.** The operator route `/audit/share-window` and the
 dashboards' current-window figures compute a window by anchor over every row.

@@ -34,9 +34,10 @@ pub use share_hashes::{
 /// `require_known_capabilities` refuses again at connect. Existing native
 /// ledgers apply 013, 017, 024 and 031 online (`ONLINE_MIGRATIONS`) and
 /// record each after its last change, so a start refuses the database until
-/// that has completed. Versions 28 to 30 are reserved for the rest of the
-/// 3.1 dual writer; each version is checked on its own, so 31 needs none of
-/// them. A populated 2.x.x source records 2 the same way, after its
+/// that has completed. Version 28 is the dual writer's window cuts, and 29
+/// and 30 are reserved for the rest of the 3.1 dual writer; each version is
+/// checked on its own, so 31 needs none of them. A populated 2.x.x source
+/// records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582); once
 /// `migrate --defer-share-hashes` has mapped the backfill's recent range
 /// and permitted serving, every start accepts the database without 2 until

@@ -47,8 +47,9 @@ async fn open(
     Ok((fixture, ledger))
 }
 
-/// Restore migration 031's `(origin_node, share_seq)` index, under its
-/// name, after a test dropped it.
+/// Restore an `(origin_node, share_seq)` index under migration 031's parent
+/// name after a test dropped 031's; its leaves take PostgreSQL's names, not
+/// 031's.
 async fn origin_index(ledger: &Ledger) -> Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
@@ -440,6 +441,9 @@ async fn the_cut_reads_probe_the_origin_index_and_never_walk_the_other_nodes_run
             let mut rows: Vec<Row> = (0..200).map(|i| row(1, 4 * i + 1, 1)).collect();
             rows.extend((1..=2_000).map(|i| row(0, 2 * i, 1)));
             insert(ledger, &rows).await?;
+            // The peer sync has pulled every peer row: the peer cut reads the
+            // mark, which bounds its walk at executor start.
+            mark(ledger, 1, 10_000).await?;
             ensure!(
                 sqlx::query_scalar::<_, bool>(ORIGIN_INDEX_SQL)
                     .fetch_one(&ledger.pool)
@@ -715,6 +719,9 @@ async fn a_dual_writer_snapshot_refuses_without_the_origin_index() -> Result<()>
             bail!("a dual-writer snapshot was taken on a BRIN index");
         };
         assert!(error.is::<OriginIndexMissing>(), "{error:#}");
+        sqlx::query("DROP INDEX qbit_share_ledger_origin_seq_brin")
+            .execute(&ledger.pool)
+            .await?;
         // Nothing was taken: no lock is left held and the clock did not move.
         // This test's own database: other tests share the cluster.
         let held: i64 = sqlx::query_scalar(
@@ -1046,12 +1053,15 @@ async fn measure_dual_writer_refresh() -> Result<()> {
         .bind(base + 2 * rows)
         .execute(&ledger.pool)
         .await?;
+        // The read without 031's index first (the snapshot itself would
+        // refuse), then with it restored.
+        sqlx::query("DROP INDEX qbit_share_ledger_origin_seq_idx")
+            .execute(&ledger.pool)
+            .await?;
         sqlx::query("ANALYZE qbit_share_ledger").execute(&ledger.pool).await?;
         for (label, index) in [("own cut on an idle node, no index", false), ("own cut on an idle node, (origin_node, share_seq) index", true)] {
             if index {
-                sqlx::query("CREATE INDEX measure_origin_seq ON qbit_share_ledger (origin_node, share_seq)")
-                    .execute(&ledger.pool)
-                    .await?;
+                origin_index(&ledger).await?;
                 sqlx::query("ANALYZE qbit_share_ledger").execute(&ledger.pool).await?;
             }
             let started = std::time::Instant::now();
