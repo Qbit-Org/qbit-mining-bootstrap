@@ -21,8 +21,11 @@
 //!   server sees it: its replies drain and it never hears a close, so only
 //!   its own session timeouts end the session. (Blackholed, a server still
 //!   sending a result would block on a full window instead.) When the link
-//!   leaves Discard, for any state, every connection that lived through it
-//!   is reset on both sides, as the dead host's restarted kernel would.
+//!   leaves Discard, for any state, every established connection that moved
+//!   or awaited bytes while it discarded is reset on both sides, as the dead
+//!   host's restarted kernel would. A connection accepted while discarding is
+//!   held as when blackholed and connects only once the link opens, and a
+//!   Discard too brief for a connection to notice leaves it alone.
 //!
 //! Adapted from the `Relay` of
 //! `crates/qbit-prism-server/tests/support/live_pg_failover.rs`, which
@@ -493,9 +496,9 @@ mod tests {
     async fn a_write_stuck_on_a_stalled_client_is_dropped_when_the_link_discards() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let relay = Relay::open("test", listener.local_addr()?.port()).await?;
-        // The client never reads, so with the link open the relay's write to
-        // it blocks once the windows fill.
-        let _client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
+        // The client does not read, so with the link open the relay's write
+        // to it blocks once the windows fill.
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
         let (server, _) = timeout(Duration::from_secs(5), listener.accept()).await??;
         let (_server_read, mut server_write) = server.into_split();
         // Far more than the four socket buffers on the way can hold, even
@@ -504,8 +507,20 @@ mod tests {
             tokio::spawn(async move { server_write.write_all(&vec![1u8; 64 * 1024 * 1024]).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         if flood.is_finished() {
-            // Socket buffers this large can hold the whole flood: the host
-            // cannot show a stuck write, so there is nothing to unstick.
+            // Either the host's socket buffers hold the whole flood, and there
+            // is no stuck write to unstick, or the open link lost bytes. Only
+            // the first may pass: an open link delivers every byte.
+            let (mut received, mut buffer) = (0usize, vec![0u8; 1 << 20]);
+            while let Ok(Ok(count @ 1..)) =
+                timeout(Duration::from_secs(2), client.read(&mut buffer)).await
+            {
+                received += count;
+            }
+            assert_eq!(
+                received,
+                64 * 1024 * 1024,
+                "an open link delivers every byte"
+            );
             return Ok(());
         }
         relay.set(LinkState::Discard);

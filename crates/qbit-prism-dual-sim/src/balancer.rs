@@ -128,6 +128,13 @@ pub struct Transition {
     pub up: bool,
 }
 
+/// A session the balancer routed, when it chose the node.
+#[derive(Clone, Debug, Serialize)]
+pub struct RoutedSession {
+    pub at_ms: u64,
+    pub backend: String,
+}
+
 /// A check that failed, and whether its node was up (serving) then.
 #[derive(Clone, Debug, Serialize)]
 pub struct FailedCheck {
@@ -146,6 +153,8 @@ pub struct BalancerReport {
     pub transitions: Vec<Transition>,
     /// Every failed check, in order.
     pub failed_checks: Vec<FailedCheck>,
+    /// Every session routed, in order.
+    pub routings: Vec<RoutedSession>,
     /// Sessions routed to each node over the run.
     pub routed: BTreeMap<String, u64>,
     /// Sessions refused because no node was up.
@@ -199,6 +208,7 @@ struct Shared {
     events: Mutex<Vec<BalancerEvent>>,
     transitions: Mutex<Vec<Transition>>,
     failed_checks: Mutex<Vec<FailedCheck>>,
+    routings: Mutex<Vec<RoutedSession>>,
     next_session: AtomicU64,
     refused: AtomicU64,
 }
@@ -287,6 +297,7 @@ impl Balancer {
             events: Mutex::new(Vec::new()),
             transitions: Mutex::new(Vec::new()),
             failed_checks: Mutex::new(Vec::new()),
+            routings: Mutex::new(Vec::new()),
             next_session: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         });
@@ -385,6 +396,12 @@ impl Balancer {
                 .failed_checks
                 .lock()
                 .map(|f| f.clone())
+                .unwrap_or_default(),
+            routings: self
+                .shared
+                .routings
+                .lock()
+                .map(|r| r.clone())
                 .unwrap_or_default(),
             routed: self
                 .shared
@@ -536,6 +553,15 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             crate::relay::reset(client);
             continue;
         };
+        // Recorded when the node is chosen, not when its connection is up,
+        // so a session is dated by the routing state it saw.
+        let at_ms = shared.now_ms();
+        if let Ok(mut routings) = shared.routings.lock() {
+            routings.push(RoutedSession {
+                at_ms,
+                backend: shared.backends[index].target.name.clone(),
+            });
+        }
         let shared = shared.clone();
         tokio::spawn(async move {
             session(client, shared, index).await;
@@ -703,6 +729,7 @@ mod tests {
                 })
                 .collect(),
             failed_checks: Vec::new(),
+            routings: Vec::new(),
             routed: BTreeMap::new(),
             refused: 0,
         };

@@ -1560,13 +1560,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
     );
     let died = Instant::now();
     let (mut last_holding, mut most) = (None, 0i64);
-    // Sessions routed to A when the balancer first had it down: none may
-    // follow while it is dead.
-    let mut routed_to_a_at_down: Option<u64> = None;
     while died.elapsed() < LINGER_WATCH {
-        if routed_to_a_at_down.is_none() && !sim.balancer.is_up("a") {
-            routed_to_a_at_down = sim.balancer.report().routed.get("a").copied();
-        }
         let holding: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
              WHERE usename = $1 AND datname = current_database() \
@@ -1605,11 +1599,15 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         .iter()
         .find(|t| t.backend == "a" && !t.up && t.at_ms >= cut_at)
         .map(|t| t.at_ms);
-    let routed_to_a = sim.balancer.report().routed.get("a").copied();
-    let routed_after_down = match (routed_to_a_at_down, routed_to_a) {
-        (Some(at_down), Some(now)) => Some(now.saturating_sub(at_down)),
-        _ => None,
-    };
+    // No session may be routed to dead A once it is marked down. A choice
+    // within 100 ms of the mark read the state the mark was about to change.
+    let routed_after_down = marked_down.map(|down| {
+        report
+            .routings
+            .iter()
+            .filter(|r| r.backend == "a" && r.at_ms > down + 100)
+            .count()
+    });
     let records = sim.load()?.records();
     let flat = match marked_down {
         Some(down) if down + 20_000 <= fault_at + 45_000 => {
@@ -1837,6 +1835,7 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
     sqlx::query("LOCK TABLE qbit_pool_audit_bundles IN EXCLUSIVE MODE")
         .execute(&mut *lock)
         .await?;
+    let locked_at = db_now(&a).await?;
     sim.mark("A's audit bundles locked: landing inserts wait until lock_timeout, reads go on");
     // Whatever happens while the lock is held, it is released before an
     // error is raised.
@@ -1877,24 +1876,42 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
         .bind(&block)
         .fetch_one(&a)
         .await?;
+        // The attempts are B's block's apply only if A landed nothing of its
+        // own meanwhile: its own landing would insert into the table too.
+        let own: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_block_candidate_outbox WHERE created_at >= $1",
+        )
+        .bind(locked_at)
+        .fetch_one(&a)
+        .await?;
+        anyhow::ensure!(
+            own == 0,
+            "A found {own} blocks of its own while its audit bundles were locked, so the \
+             waiting inserts cannot be told apart from B's block's apply"
+        );
         anyhow::Ok((block, attempts, on_a))
     }
     .await;
     let unlocked = lock.rollback().await;
+    if unlocked.is_ok() {
+        sim.mark("A's audit bundles unlocked");
+    }
     let (block, attempts, held_while_locked) = match (held, unlocked) {
-        (Err(error), Err(unlock)) => {
-            return Err(error.context(format!(
-                "and unlocking A's audit bundles failed: {unlock:#}"
-            )))
-        }
-        (Err(error), Ok(())) => {
-            sim.mark("A's audit bundles unlocked");
-            return Err(error);
-        }
-        (Ok(_), Err(unlock)) => return Err(unlock.into()),
         (Ok(held), Ok(())) => held,
+        (held, unlocked) => {
+            // Closing the pool ends a connection whose rollback failed, and
+            // with it the lock.
+            a.close().await;
+            return Err(match (held, unlocked) {
+                (Err(error), Err(unlock)) => error.context(format!(
+                    "and unlocking A's audit bundles failed: {unlock:#}"
+                )),
+                (Err(error), _) => error,
+                (_, Err(unlock)) => unlock.into(),
+                (Ok(_), Ok(())) => unreachable!("both succeeded, handled above"),
+            });
+        }
     };
-    sim.mark("A's audit bundles unlocked");
     let landed = sim.wait_confirmed(&block, &[Node::A], CATCH_UP_BOUND).await;
     let conflicts: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT source_table, row_key, detail FROM qbit_prism_peer_sync_conflicts \
