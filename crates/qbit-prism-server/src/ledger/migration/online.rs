@@ -432,12 +432,30 @@ async fn apply_concurrently(
             version = migration.version,
             "taking the share archive lifecycle lock: no share-archive command runs until the partitioned index is built"
         );
-        super::super::connect::session_lock(
+        // A share-archive command can hold the lock for long; say so while
+        // the build waits for it, rather than appear stuck.
+        let lifecycle = super::super::connect::session_lock(
             connection,
             super::super::archive::LIFECYCLE_LOCK,
             metrics,
-        )
-        .await?;
+        );
+        tokio::pin!(lifecycle);
+        let started = Instant::now();
+        let mut waiting = tokio::time::interval(Duration::from_secs(30));
+        waiting.tick().await;
+        loop {
+            tokio::select! {
+                taken = &mut lifecycle => {
+                    taken?;
+                    break;
+                }
+                _ = waiting.tick() => tracing::warn!(
+                    version = migration.version,
+                    waited_s = started.elapsed().as_secs(),
+                    "still waiting for the share archive lifecycle lock: a share-archive command holds it, and the partitioned index is built once it ends"
+                ),
+            }
+        }
     }
     let plan = plan(connection, migration).await?;
     let mut progress = Progress::default();

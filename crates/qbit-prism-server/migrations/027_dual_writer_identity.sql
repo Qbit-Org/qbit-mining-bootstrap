@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS qbit_prism_peer_sync_conflicts (
 );
 
 -- 8. Last, the share ledger and its header mappings (see 1): appends wait on
---    these two from here to the commit only.
+--    these two from here to the commit only. The mappings go first, in the
+--    order an append takes them: its first statement reads the mapping of
+--    its header, and only later ones read and write the ledger. The other
+--    order could deadlock with an append waiting between the two.
 ALTER TABLE qbit_prism_share_hashes ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
 ALTER TABLE qbit_share_ledger ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;

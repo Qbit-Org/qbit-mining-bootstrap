@@ -10,7 +10,7 @@
 //! whole wait, this node's own read of what adoption needs included.
 use crate::config::DualWriterConfig;
 use crate::ledger::peer_sync::{peer, PeerCursors};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
 use std::future::Future;
@@ -76,36 +76,35 @@ pub struct PeerIngestWait {
 }
 
 impl PeerIngestWait {
-    /// `None` when `PRISM_PEER_INGEST_WAIT_MS` is 0, or a peer URL cannot be
-    /// parsed (it was validated at startup).
-    pub fn new(config: &DualWriterConfig) -> Option<Self> {
+    /// `None` when `PRISM_PEER_INGEST_WAIT_MS` is 0. A peer URL the client
+    /// cannot use is an error, never a wait silently off (the settings
+    /// check refuses one first).
+    pub fn new(config: &DualWriterConfig) -> Result<Option<Self>> {
         if config.peer_ingest_wait.is_zero() {
-            return None;
+            return Ok(None);
         }
         let pools = config
             .peer_database_urls()
             .map(|url| {
                 let options = PgConnectOptions::from_str(url)
-                    .ok()?
+                    .context("a peer database URL the PostgreSQL client cannot use")?
                     .application_name("qbit-prism-peer-ingest-wait")
                     .options(super::engine::PEER_SESSION_OPTIONS)
                     .disable_statement_logging();
-                Some(
-                    PgPoolOptions::new()
-                        .max_connections(1)
-                        .min_connections(1)
-                        .acquire_timeout(config.peer_ingest_wait)
-                        .idle_timeout(None)
-                        .max_lifetime(Some(CONNECTION_LIFETIME))
-                        .connect_lazy_with(options),
-                )
+                Ok(PgPoolOptions::new()
+                    .max_connections(1)
+                    .min_connections(1)
+                    .acquire_timeout(config.peer_ingest_wait)
+                    .idle_timeout(None)
+                    .max_lifetime(Some(CONNECTION_LIFETIME))
+                    .connect_lazy_with(options))
             })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Self {
             bound: config.peer_ingest_wait,
             pools,
             preferred: AtomicUsize::new(0),
-        })
+        }))
     }
 
     pub fn bound(&self) -> Duration {

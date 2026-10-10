@@ -510,12 +510,13 @@ impl Ledger {
         .fetch_one(&mut *tx)
         .await?;
         // The peer's own rows commit in share_seq order (D-14), so the copy
-        // holds every peer share at or below the newest it holds.
-        let peer_shares: Option<i64> =
-            sqlx::query_scalar("SELECT max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1")
-                .bind(peer.index())
-                .fetch_one(&mut *tx)
-                .await?;
+        // holds every peer share at or below the newest it holds. Read in
+        // the shape only 031's index serves, never a walk of this node's
+        // rows under the locks held here.
+        let peer_shares: Option<i64> = sqlx::query_scalar(super::peer_sync::HIGHEST_SHARE)
+            .bind(peer.index())
+            .fetch_optional(&mut *tx)
+            .await?;
 
         let mut cleared = Vec::new();
         let mut reset = Vec::new();

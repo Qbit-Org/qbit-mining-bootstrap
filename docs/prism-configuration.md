@@ -237,7 +237,7 @@ on. While it is off, no setting below is read and a frontend behaves exactly as
 | `PRISM_PEER_DATABASE_URL` | required | the peer's PostgreSQL, as its read-only sync role |
 | `PRISM_PEER_DATABASE_URL_FALLBACK` | unset | a second network path to the same database, tried when the first fails |
 | `PRISM_PEER_SYNC_INTERVAL_MS` | `250` | wait between pulls that found nothing new, 10 to 60000 |
-| `PRISM_PEER_SYNC_BATCH_ROWS` | `5000` | most rows of one stream a pull reads and inserts at once, 1 to 100000 |
+| `PRISM_PEER_SYNC_BATCH_ROWS` | `5000` | most rows of one stream a pull reads and inserts at once, 1 to 20000: each batch is one statement on the peer, under its 8 s timeout |
 | `PRISM_PEER_INGEST_WAIT_MS` | `250` | before a found block's `submitblock`, the most it waits for the peer to hold what adopting the block needs, 0 (off) to 10000 |
 
 Each error names its setting and never prints a value: the peer DSNs carry the

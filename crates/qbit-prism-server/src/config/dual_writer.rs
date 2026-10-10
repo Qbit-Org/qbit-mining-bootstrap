@@ -14,7 +14,9 @@ const PEER_SYNC_INTERVAL_MS: std::ops::RangeInclusive<u64> = 10..=60_000;
 /// `PRISM_PEER_SYNC_BATCH_ROWS` when unset: the most rows of one stream one
 /// pull reads from the peer and inserts in one local transaction.
 pub const DEFAULT_PEER_SYNC_BATCH_ROWS: u32 = 5000;
-const PEER_SYNC_BATCH_ROWS: std::ops::RangeInclusive<u32> = 1..=100_000;
+/// At most 20,000: a batch is one statement on the peer, rows and header
+/// mappings built into JSON, which must finish inside its 8 s timeout.
+const PEER_SYNC_BATCH_ROWS: std::ops::RangeInclusive<u32> = 1..=20_000;
 /// `PRISM_PEER_INGEST_WAIT_MS` when unset (CONTRACT D-19): how long a found
 /// block's offer waits for the peer to hold what adopting the block needs.
 pub const DEFAULT_PEER_INGEST_WAIT_MS: u64 = 250;
@@ -188,6 +190,12 @@ fn peer_url(
         parsed.host_str().is_some_and(|host| !host.is_empty()),
         "{name} must name the peer's host"
     );
+    // The sync and the found-block wait connect with these options, so a
+    // URL they cannot use fails here, by name, never at the first offer.
+    ensure!(
+        <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&raw).is_ok(),
+        "{name} is not a connection URL the PostgreSQL client accepts"
+    );
     ensure!(
         !same_database(&parsed, database_url),
         "{name} names this node's own database (PRISM_DATABASE_URL); it must name the peer's"
@@ -277,6 +285,10 @@ mod tests {
             (
                 "postgres://other:secret@DB-A/prism?sslmode=require",
                 "names this node's own database",
+            ),
+            (
+                "postgresql://sync:secret@db-b/prism?sslmode=sometimes",
+                "is not a connection URL the PostgreSQL client accepts",
             ),
         ] {
             let error = peer_url(name, Some(bad.into()), OWN, false)

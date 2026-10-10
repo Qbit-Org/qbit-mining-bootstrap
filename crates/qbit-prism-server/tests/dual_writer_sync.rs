@@ -870,7 +870,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         })
         .await?;
         let on_a = config(NodeIndex::A, &pair.b_url, None);
-        let wait = PeerIngestWait::new(&on_a).context("the wait is on by default")?;
+        let wait = PeerIngestWait::new(&on_a)?.context("the wait is on by default")?;
         let bound = wait.bound();
         let held = AdoptionNeeds {
             share_seq: Some(seqs[1]),
@@ -891,7 +891,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
             "{outcome:?} after {waited:?}"
         );
         ensure!(waited < bound * 4, "the wait overran its bound: {waited:?}");
-        let dead = PeerIngestWait::new(&config(NodeIndex::A, &dead_url(&pair.b_url)?, None))
+        let dead = PeerIngestWait::new(&config(NodeIndex::A, &dead_url(&pair.b_url)?, None))?
             .context("the wait is on by default")?;
         let (_, outcome, _) = dead.wait(std::future::ready(held)).await;
         ensure!(matches!(outcome, PeerIngest::Unreachable(_)), "{outcome:?}");
@@ -922,8 +922,9 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
                 sockets.push(socket);
             }
         });
-        let fallback = PeerIngestWait::new(&config(NodeIndex::A, hung.as_str(), Some(&pair.b_url)))
-            .context("the wait is on by default")?;
+        let fallback =
+            PeerIngestWait::new(&config(NodeIndex::A, hung.as_str(), Some(&pair.b_url)))?
+                .context("the wait is on by default")?;
         let (waited, outcome, _) = fallback.wait(std::future::ready(held)).await;
         held_sockets.abort();
         ensure!(
@@ -932,7 +933,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         );
         let mut off = on_a.clone();
         off.peer_ingest_wait = Duration::ZERO;
-        ensure!(PeerIngestWait::new(&off).is_none(), "0 turns the wait off");
+        ensure!(PeerIngestWait::new(&off)?.is_none(), "0 turns the wait off");
         Ok(())
     })
     .await
@@ -1225,7 +1226,7 @@ async fn the_sync_needs_only_the_peer_roles_documented_grants() -> Result<()> {
             })
             .await?;
             // The offer wait reads B's cursors over A's streams as the role.
-            let wait = PeerIngestWait::new(&config(NodeIndex::A, &b_as_role, None))
+            let wait = PeerIngestWait::new(&config(NodeIndex::A, &b_as_role, None))?
                 .context("the offer wait is configured")?;
             let a_last = shares_of(&pair.a.pool, 0).await?.last().map(|(seq, _)| *seq);
             let (_, ingest, _) = wait

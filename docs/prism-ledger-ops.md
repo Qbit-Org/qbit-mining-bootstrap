@@ -4003,7 +4003,9 @@ refuses, changing nothing:
   counting 60 seconds after the copy stopped following the peer;
 - on the server the peer last proved its own log on (the same system
   identifier and timeline): that is the peer's own database, not a promoted
-  copy;
+  copy. This check needs that proof: while the peer has none recorded (its
+  own-log recovery has not completed since a restore), nothing tells its own
+  database from a copy, so run the command only on the promoted copy;
 - while the schema holds a table that the dual-writer table inventory
   (`crates/qbit-prism-server/src/ledger/table_inventory.rs`) does not
   classify, or lacks one it names.

@@ -988,10 +988,10 @@ impl Coordinator {
             .filter(|millis| *millis > 0)
             .map(Duration::from_millis);
         let (refresh, _) = watch::channel(0);
-        let peer_ingest = config
-            .dual_writer
-            .as_ref()
-            .and_then(crate::peer_sync::PeerIngestWait::new);
+        let peer_ingest = match &config.dual_writer {
+            Some(dual) => crate::peer_sync::PeerIngestWait::new(dual)?,
+            None => None,
+        };
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),

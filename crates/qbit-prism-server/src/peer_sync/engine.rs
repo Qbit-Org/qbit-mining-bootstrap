@@ -63,8 +63,9 @@ const PRIMARY_RETRY: Duration = Duration::from_secs(30);
 const IDENTITY_RECHECK: Duration = Duration::from_secs(30);
 /// The most landed blocks one pass applies, each in its own transaction.
 const BLOCKS_PER_PASS: i64 = 20;
-/// The most peer rows counted for a lag.
-const LAG_COUNT_CAP: i64 = 1_000_000;
+/// The most peer rows counted for a lag: one index-only count, well inside
+/// the peer's statement timeout even on a peer far ahead.
+const LAG_COUNT_CAP: i64 = 100_000;
 /// The longest pause after failed passes.
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// Consecutive passes in which a stream's next peer rows fail to apply here
