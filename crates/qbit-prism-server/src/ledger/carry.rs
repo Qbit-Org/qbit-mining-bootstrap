@@ -75,7 +75,8 @@ pub struct CarryGate {
 /// extranonce1 is read only where `tag` sits right before it: work issued
 /// with another width names no node here, whatever its bytes say. `None`
 /// when the coinbase does not parse, the tag is not there, or extranonce1
-/// is 0, which no session is given. An empty tag verifies nothing.
+/// is 0, which no session is given. An empty tag verifies nothing, so a
+/// dual writer refuses to start with one (`config.rs`).
 pub fn finder_node(coinbase_tx: &[u8], tag: &[u8], extranonce2_size: usize) -> Option<i16> {
     let script_sig = crate::codec::coinbase_script_sig(coinbase_tx).ok()?;
     let end = script_sig.len().checked_sub(extranonce2_size)?;
