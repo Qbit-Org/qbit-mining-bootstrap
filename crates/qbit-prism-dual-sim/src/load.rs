@@ -101,6 +101,16 @@ impl ShareRecord {
         self.outcome == "accepted"
     }
 
+    /// An ordinary share (not a scheduled block) accepted on `node`'s jobs
+    /// and answered after `after_ms`: what the scenarios count as `node`
+    /// taking miners.
+    pub fn accepted_on(&self, node: Node, after_ms: u64) -> bool {
+        self.accepted()
+            && !self.scheduled_block
+            && self.issuer == Some(node)
+            && self.answered_ms.is_some_and(|at| at > after_ms)
+    }
+
     /// The header hash the `share_id` ends with: the block hash when the
     /// share was also a block.
     pub fn header_hash(&self) -> &str {
@@ -526,12 +536,7 @@ impl Load {
             .map(|log| {
                 log.shares
                     .iter()
-                    .filter(|r| {
-                        r.accepted()
-                            && !r.scheduled_block
-                            && r.issuer == Some(node)
-                            && r.answered_ms.is_some_and(|at| at > after_ms)
-                    })
+                    .filter(|r| r.accepted_on(node, after_ms))
                     .count()
             })
             .unwrap_or(0)
