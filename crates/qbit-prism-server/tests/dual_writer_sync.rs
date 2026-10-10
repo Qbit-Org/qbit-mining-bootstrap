@@ -1129,8 +1129,8 @@ const COPIED_COLUMNS: [(&str, &str); 13] = [
     ),
     (
         "qbit_prism_audit_snapshots",
-        "anchor_ms,created_at,first_share_seq,inline_shares,last_share_seq,\
-         origin_node,share_count,snapshot_sha256",
+        "anchor_ms,created_at,cut_seq_0,cut_seq_1,first_share_seq,inline_shares,\
+         last_share_seq,origin_node,share_count,snapshot_sha256",
     ),
     (
         "qbit_pool_audit_bundles",

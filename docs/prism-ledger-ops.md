@@ -4127,6 +4127,15 @@ count, the #619 holding probe at enqueue, the re-read a rebuild makes, and the
 audit reconstruction. A late peer row therefore never makes a landed or offered
 block unverifiable.
 
+**Quarantined peer rows.** A peer row this node's sync refused as a conflict is
+quarantined for good (see
+[Dual-writer node identity (027)](#dual-writer-node-identity-027)): it is never
+inserted here, and the mark moves past it. A window taken here leaves it out and
+stays whole, since no peer row is inserted at or below a mark already passed.
+The peer holds the row as its own, so a window whose range spans it reproduces
+only on the node that took it: the other node's re-read differs by that row,
+and its proofs of the window refuse it rather than pay it differently.
+
 **The #619 holding probe.** A dual-writer node has no physical standby, so the
 rows it can lose are each log's newest, to a restore. A window is held when its
 last row still matches the window's predicate, whichever node wrote it, this
