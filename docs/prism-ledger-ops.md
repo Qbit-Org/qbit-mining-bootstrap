@@ -1796,8 +1796,11 @@ claims and leases are per database, and each attempt re-verifies the chain.
 A zero-fee fanout needs a CPFP child funded from a wallet. Only one node
 sponsors it: the node whose work its block was found on. That node is read from
 the extranonce1 in the block's coinbase, since each node hands out its own half
-of the extranonce1 space; it does not matter which node landed the rows. The
-other node only watches the fanout until it is overdue for a takeover (below),
+of the extranonce1 space; it does not matter which node landed the rows. Keep
+`PRISM_STRATUM_EXTRANONCE2_SIZE` the same on both nodes: extranonce1 is read at
+this node's width, and the pair's fingerprint does not compare it. (Adoption
+reads a peer record's own width, so it lands either way.) The other node only
+watches the fanout until it is overdue for a takeover (below),
 so the two nodes do not fund conflicting children, which would leave a wallet
 coin locked.
 
@@ -1925,8 +1928,12 @@ fail after printing if a check refuses, or without `--confirm`.
    It refuses unless all of these pass:
    - `node_identity`: the node identity matches.
    - `this_node_not_owner`: this node does not already hold ownership.
-   - `peer_answered`: the peer's journal is read live. An unreachable peer may
-     still act as owner, and there is no override.
+   - `peer_answered`: the peer's journal is read live, over
+     `PRISM_PEER_DATABASE_URL` only. An unreachable peer may still act as
+     owner, and there is no override. The fallback is never read, since it may
+     reach a copy that lags the peer's journal. If the first path is down, run
+     the command with `PRISM_PEER_DATABASE_URL` naming another path to the
+     peer's own database, never a replica.
    - `peer_not_owner`: the peer's latest row is not an ownership claim, and
      neither is its live journal's (a peer restored from a backup behind a
      newer row of it this node holds). A peer with no row is refused.

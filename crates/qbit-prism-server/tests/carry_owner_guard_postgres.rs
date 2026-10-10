@@ -1269,6 +1269,29 @@ async fn transfer_case(a_url: String, b_url: String) -> Result<()> {
         scanned(&report)?
     );
     expect_journal(b, &untouched, "the peer unreachable").await?;
+    // Over PRISM_PEER_DATABASE_URL only: with that path down, a fallback
+    // that answers, which may be a copy lagging the peer's journal, is not
+    // read (here it would show node A's claim).
+    let report = transfer::transfer(
+        &b.ledger,
+        &CarryOwnerSettings {
+            peer_urls: vec![UNREACHABLE_PEER.to_owned(), a.url.clone()],
+            ..settings(b.node, false, &a.url)
+        },
+        &chain,
+        &PoolRecognizer::new(TAG, None)?,
+        SCAN_FROM,
+        RELEASE_DEPTH,
+        HANDOVER,
+        true,
+    )
+    .await?;
+    ensure!(
+        failed(&report) == ["peer_answered"] && report.peer.is_none() && report.written.is_none(),
+        "a transfer with only the fallback path answering reported {:?}",
+        report.checks
+    );
+    expect_journal(b, &untouched, "only the fallback path answering").await?;
 
     // The peer must not hold ownership.
     let report = transfer_on(b, &a.url, &chain, true).await?;

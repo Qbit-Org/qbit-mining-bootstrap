@@ -491,7 +491,7 @@ pub fn transfer_checks(facts: &TransferFacts) -> Vec<Check> {
         PeerRead::Failed => checks.push(check(
             "peer_answered",
             false,
-            "the peer's journal could not be read, so it may still act as owner",
+            "the peer's journal could not be read over PRISM_PEER_DATABASE_URL (transfer never reads the fallback), so it may still act as owner",
         )),
         PeerRead::Answered { peer, own_at_peer } => {
             checks.push(check(
@@ -865,7 +865,14 @@ pub async fn transfer<C: ChainSource>(
     confirm: bool,
 ) -> Result<Report> {
     let release_depth = release_depth.max(MIN_RELEASE_DEPTH);
-    let peer = PeerJournal::new(&settings.peer_urls, settings.peer_timeout)?;
+    // Over PRISM_PEER_DATABASE_URL only. The fallback path may reach a copy
+    // of the peer's database that lags its journal, where an older `release`
+    // would pass every check while the peer itself claims again.
+    let primary = settings
+        .peer_urls
+        .first()
+        .context("no peer database URL is set")?;
+    let peer = PeerJournal::new(std::slice::from_ref(primary), settings.peer_timeout)?;
     let mut report = Report::new("transfer", settings);
     // The peer's latest rows and its latest claim, from one snapshot.
     let view = peer.view(settings.node_index).await;
