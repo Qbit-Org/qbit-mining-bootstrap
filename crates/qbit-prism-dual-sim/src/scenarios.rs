@@ -813,15 +813,22 @@ async fn checker_control(sim: &mut Sim, body: &mut Body) -> Result<()> {
     let d2 = invariants::local_state_check(&both, chrono::Utc::now() - chrono::Duration::hours(1))
         .await?;
     a_pool.close().await;
-    let named = d2
-        .problems
-        .iter()
-        .any(|problem| problem.contains("is the same row in both outboxes"));
+    // Each way it finds a copy must fire: a candidate the peer's frontend
+    // claimed, an issued job of the peer's (both listed first), and the
+    // same row on both nodes (counted, as the list is capped).
+    let named = |words: &str| d2.problems.iter().any(|problem| problem.contains(words));
+    let same_rows = d2.data["same_rows_on_both_nodes"]["candidates"]
+        .as_u64()
+        .unwrap_or(0);
     body.expect(
         "the D-2 check fails on a copied outbox (A's database in both slots)",
-        matches!(d2.status, Status::Fail) && named,
+        matches!(d2.status, Status::Fail)
+            && named("claimed or reserved by node A's frontend")
+            && named("issued by node A's frontend")
+            && same_rows > 0,
         format!(
-            "{:?} with {} problems: {:?}",
+            "{:?} with {} problems; candidates on both nodes as the same row: {same_rows}; \
+             first problems: {:?}",
             d2.status,
             d2.problem_count,
             d2.problems.iter().take(3).collect::<Vec<_>>()
