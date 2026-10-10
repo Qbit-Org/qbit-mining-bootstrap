@@ -2540,23 +2540,35 @@ async fn s07_disk_replaced(sim: &mut Sim, x: Node, body: &mut Body) -> Result<()
         .port();
     let user = sim.pg[&y].superuser().to_owned();
     sim.pg_mut(x).rebuild_from_peer(&user, link).await?;
-    let repersonalise = sim
+    // D1's runbook: the copy carries the peer's frontend rows, and they stop
+    // counting as running 60 s after the copy stopped following the peer;
+    // until then the command refuses, changing nothing. So it is retried for
+    // that refusal only.
+    let index = x.index().to_string();
+    let args = ["node-identity", "repersonalise", "--index", index.as_str()];
+    let waited = Instant::now();
+    let mut repersonalise = sim
         .frontend(x)
-        .tool(
-            &[
-                "node-identity",
-                "repersonalise",
-                "--index",
-                &x.index().to_string(),
-            ],
-            Duration::from_secs(120),
-        )
+        .tool(&args, Duration::from_secs(120))
         .await?;
+    while !repersonalise.success
+        && repersonalise
+            .stderr
+            .contains("a frontend may be running on this database")
+        && waited.elapsed() < REPERSONALISE_WAIT
+    {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        repersonalise = sim
+            .frontend(x)
+            .tool(&args, Duration::from_secs(120))
+            .await?;
+    }
     body.expect(
         "the rebuilt database is re-personalised (D-16)",
         repersonalise.success,
         format!(
-            "exit {:?}: {} {}",
+            "after {:.0} s of the runbook's wait for the copied frontend rows: exit {:?}: {} {}",
+            waited.elapsed().as_secs_f64(),
             repersonalise.code,
             repersonalise.stdout.trim(),
             repersonalise.stderr.trim()
@@ -2799,6 +2811,11 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
     expect_dual_health(sim, body).await?;
     Ok(())
 }
+
+/// How long S7 retries `node-identity repersonalise` while it refuses
+/// because the copy's carried frontend rows still look alive: D1's runbook
+/// says they stop counting 60 s after the copy stopped following the peer.
+pub const REPERSONALISE_WAIT: Duration = Duration::from_secs(90);
 
 /// How long the survivor may take to adopt a dead node's block that the
 /// chain holds (D-10, D-11), once it is [`ADOPT_DEPTH`] deep: two of D3's
