@@ -1145,10 +1145,27 @@ pub const PEER_ROLE_GRANTS: &[&str] = &[
      TO prism_peer_sync",
 ];
 
+/// TEMPORARY, until D1's pending push delivers them (status/D6.md, findings
+/// 4 and 6): stand-ins that let the dual-writer scenarios run in CI on the
+/// 3.1 stack meanwhile. Each is a no-op once the schema and grants carry it,
+/// and this list is then removed. Applied after [`PEER_ROLE_GRANTS`], which
+/// stays exactly D1's list.
+/// - Migration 031's `(origin_node, share_seq)` index, under 031's name: D2's
+///   window cut refuses to run without it.
+/// - `singleton` on `qbit_prism_cluster` for the peer role: D1's engine reads
+///   the fingerprint `WHERE singleton` (`ledger/peer_sync.rs`), which D1's
+///   documented column grant does not cover.
+pub const TEMPORARY_STAND_INS: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx \
+     ON qbit_share_ledger (origin_node, share_seq)",
+    "GRANT SELECT (singleton) ON qbit_prism_cluster TO prism_peer_sync",
+];
+
 /// Bring a fresh database to the dual-writer pair's starting state, as the
 /// bootstrap does: `qbit-prism-server migrate`, then `node-identity set`
-/// (D-9), then the peer role's grants. Each command runs with the node's
-/// own frontend environment.
+/// (D-9), then the peer role's grants (and, for now,
+/// [`TEMPORARY_STAND_INS`]). Each command runs with the node's own frontend
+/// environment.
 pub async fn bootstrap_node(frontend: &Frontend, pg: &PgNode) -> Result<()> {
     let node = frontend.node();
     let index = if node == Node::A { "0" } else { "1" };
@@ -1167,7 +1184,7 @@ pub async fn bootstrap_node(frontend: &Frontend, pg: &PgNode) -> Result<()> {
         );
     }
     let pool = pg.admin_pool(DATABASE).await?;
-    for statement in PEER_ROLE_GRANTS {
+    for statement in PEER_ROLE_GRANTS.iter().chain(TEMPORARY_STAND_INS) {
         sqlx::query(statement)
             .execute(&pool)
             .await
