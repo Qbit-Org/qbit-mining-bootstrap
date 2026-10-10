@@ -138,6 +138,19 @@ impl DualWriterReport {
         self.own_log_caught_up && self.writer_path == Some(WriterPath::Local)
     }
 
+    /// A definite fault that forbids every share this node would write: the
+    /// own log behind, or a database that answered that it is not this
+    /// node's writable primary. A withdrawal on one closes the established
+    /// sessions too; a database that only stopped answering does not, since
+    /// it may be a stall that a checkpoint or an fsync ends.
+    pub fn forbids_sessions(&self) -> bool {
+        !self.own_log_caught_up
+            || matches!(
+                self.writer_path,
+                Some(WriterPath::Remote | WriterPath::Unidentified | WriterPath::ReadOnly)
+            )
+    }
+
     /// The health `status` that names why the node does not serve.
     pub fn status(&self) -> Option<&'static str> {
         if !self.own_log_caught_up {
@@ -395,6 +408,24 @@ mod tests {
                 "{path:?}"
             );
         }
+        // Only a definite fault forbids the established sessions.
+        for path in [
+            WriterPath::Remote,
+            WriterPath::Unidentified,
+            WriterPath::ReadOnly,
+        ] {
+            assert!(readiness
+                .assemble(probe(path, now), caught_up(), now)
+                .forbids_sessions());
+        }
+        assert!(behind.forbids_sessions());
+        let mut stalled = probe(WriterPath::Local, now);
+        let later = now + Duration::from_secs(5);
+        stalled.record(later, WriterPath::Unanswered);
+        let unanswered = readiness.assemble(stalled, caught_up(), later);
+        assert_eq!(unanswered.withdrawal, Some(Withdrawal::WriterNotLocal));
+        assert!(!unanswered.forbids_sessions());
+        assert!(!report.forbids_sessions());
         let unprobed = readiness.assemble(WriterProbe::default(), caught_up(), now);
         assert!(!unprobed.serving());
         assert_eq!(unprobed.status(), Some("writer-not-local"));

@@ -1,10 +1,11 @@
 //! 3.1 dual-writer Stratum gating (D4): a listener accepts connections only
 //! while the frontend admits miners. A frontend that is not ready refuses
 //! every connection at the socket, so no TCP check, balancer or miner can see
-//! it as up; a not-ready withdrawal refuses again while established sessions
-//! carry on, and a hard one closes them too; and a decision the health
-//! publisher stops renewing closes the listener by itself. These tests read
-//! no environment input, so they are not gated.
+//! it as up; a withdrawal refuses again while established sessions carry on,
+//! unless it rests on a definite fault, which closes them too, each after
+//! the request in hand; and a decision the health publisher stops renewing
+//! closes the listener by itself. These tests read no environment input, so
+//! they are not gated.
 use qbit_prism_server::{
     codec,
     ledger::SessionId,
@@ -71,6 +72,58 @@ impl MiningBackend for NoWork {
     }
 }
 
+/// Holds every authorize until the test releases it, so a session can have
+/// a request in flight.
+struct HeldAuthorize {
+    sessions: AtomicU32,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl HeldAuthorize {
+    fn new() -> Self {
+        Self {
+            sessions: AtomicU32::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl MiningBackend for HeldAuthorize {
+    type Context = ();
+    async fn new_session_id(&self) -> Result<SessionId, StratumError> {
+        Ok((self.sessions.fetch_add(1, Ordering::Relaxed) + 1).into())
+    }
+    async fn authorize(&self, _username: &str) -> Result<Worker, StratumError> {
+        self.entered.notify_one();
+        let _permit = self.release.acquire().await;
+        Err(StratumError::new(
+            20,
+            "invalid payout",
+            "unauthorized-worker",
+        ))
+    }
+    async fn build_job(
+        &self,
+        _worker: &Worker,
+        _extranonce1: &str,
+        _difficulty: f64,
+        _minimum_difficulty: f64,
+    ) -> Result<MiningJob<()>, StratumError> {
+        unreachable!("no worker is ever authorized")
+    }
+    async fn submit(
+        &self,
+        _worker: &Worker,
+        _job: &MiningJob<()>,
+        _submission: codec::Submission,
+        _grace: StaleGrace,
+    ) -> Result<(), StratumError> {
+        unreachable!("no worker is ever authorized")
+    }
+}
+
 struct Gate {
     addr: SocketAddr,
     decide: watch::Sender<AdmissionSignal>,
@@ -83,6 +136,10 @@ struct Gate {
 
 impl Gate {
     async fn start(stale_after: Duration) -> Self {
+        Self::start_with(stale_after, Arc::new(NoWork::default())).await
+    }
+
+    async fn start_with<B: MiningBackend>(stale_after: Duration, backend: Arc<B>) -> Self {
         let address = reserve_address(("127.0.0.1", 0)).await.unwrap();
         let addr = address.local_addr();
         let (decide, admission) = watch::channel(AdmissionSignal::UNDECIDED);
@@ -92,7 +149,7 @@ impl Gate {
         let task = tokio::spawn(run_gated_listener(
             address,
             StratumConfig::default(),
-            Arc::new(NoWork::default()),
+            backend,
             refresh,
             shutdown,
             metrics.clone(),
@@ -112,6 +169,16 @@ impl Gate {
     fn admit(&self, admits: bool) {
         self.decide
             .send_replace(AdmissionSignal::decided(admits, Instant::now()));
+    }
+
+    /// Withdraw for `reason`; `definite` as for a fault that forbids the
+    /// node's shares, which closes the established sessions too.
+    fn withdraw(&self, reason: Withdrawal, definite: bool) {
+        self.decide.send_replace(AdmissionSignal::of(
+            AdmissionState::Withdrawn { reason },
+            definite,
+            Instant::now(),
+        ));
     }
 
     fn accepting_gauge(&self) -> String {
@@ -250,13 +317,8 @@ async fn a_frontend_that_does_not_admit_refuses_connections_at_the_socket() {
     gate.stop().await;
 }
 
-/// A hard withdrawal, here a database that turned out not to be this node's,
-/// closes the sessions already accepted as well as the listener, so none of
-/// them writes another share there.
-#[tokio::test]
-async fn a_hard_withdrawal_closes_established_sessions_too() {
-    let gate = Gate::start(Duration::from_secs(15)).await;
-    gate.admit(true);
+/// Subscribe a new session on an admitting gate.
+async fn subscribed(gate: &Gate) -> BufReader<TcpStream> {
     let mut session = BufReader::new(connected(gate.addr).await);
     let subscribed = exchange(
         &mut session,
@@ -264,38 +326,38 @@ async fn a_hard_withdrawal_closes_established_sessions_too() {
     )
     .await;
     assert!(subscribed["error"].is_null(), "{subscribed}");
-    gate.decide.send_replace(AdmissionSignal::of(
-        AdmissionState::Withdrawn {
-            reason: Withdrawal::WriterNotLocal,
-        },
-        Instant::now(),
-    ));
-    refusing(gate.addr).await;
+    session
+}
+
+/// The session's next read finds it closed.
+async fn closed(session: &mut BufReader<TcpStream>, what: &str) {
     let mut line = String::new();
     let read = timeout(Duration::from_secs(5), session.read_line(&mut line))
         .await
-        .expect("a session outlived a hard withdrawal");
+        .unwrap_or_else(|_| panic!("a session outlived {what}"));
     assert!(
         matches!(read, Ok(0) | Err(_)),
-        "the session was still served: {read:?} {line:?}"
+        "{what}: the session was still served: {read:?} {line:?}"
     );
+}
 
-    // A session a not-ready withdrawal left in place is closed when a hard
-    // fault turns up later.
+/// A withdrawal on a definite fault, here a database that answered that it
+/// is not this node's, closes the sessions already accepted as well as the
+/// listener, so none of them writes another share there; also one a
+/// not-ready withdrawal had left in place. A database that only stopped
+/// answering withdraws the node without closing them.
+#[tokio::test]
+async fn a_definite_fault_closes_established_sessions_and_a_silent_database_does_not() {
+    let gate = Gate::start(Duration::from_secs(15)).await;
     gate.admit(true);
-    let mut session = BufReader::new(connected(gate.addr).await);
-    let subscribed = exchange(
-        &mut session,
-        json!({"id":1,"method":"mining.subscribe","params":["gate-test"]}),
-    )
-    .await;
-    assert!(subscribed["error"].is_null(), "{subscribed}");
-    gate.decide.send_replace(AdmissionSignal::of(
-        AdmissionState::Withdrawn {
-            reason: Withdrawal::NotReady,
-        },
-        Instant::now(),
-    ));
+    let mut session = subscribed(&gate).await;
+    gate.withdraw(Withdrawal::WriterNotLocal, true);
+    refusing(gate.addr).await;
+    closed(&mut session, "a definite fault").await;
+
+    gate.admit(true);
+    let mut session = subscribed(&gate).await;
+    gate.withdraw(Withdrawal::NotReady, false);
     refusing(gate.addr).await;
     let health = exchange(
         &mut session,
@@ -303,20 +365,58 @@ async fn a_hard_withdrawal_closes_established_sessions_too() {
     )
     .await;
     assert!(health["error"].is_null(), "{health}");
-    gate.decide.send_replace(AdmissionSignal::of(
-        AdmissionState::Withdrawn {
-            reason: Withdrawal::OwnLogBehind,
-        },
-        Instant::now(),
-    ));
-    let mut line = String::new();
-    let read = timeout(Duration::from_secs(5), session.read_line(&mut line))
+    gate.withdraw(Withdrawal::OwnLogBehind, true);
+    closed(&mut session, "a later definite fault").await;
+
+    // Unanswered for the writer probe's streak: withdrawn, sessions served.
+    gate.admit(true);
+    let mut session = subscribed(&gate).await;
+    gate.withdraw(Withdrawal::WriterNotLocal, false);
+    refusing(gate.addr).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let health = exchange(
+        &mut session,
+        json!({"id":3,"method":"mining.get_health","params":[]}),
+    )
+    .await;
+    assert!(health["error"].is_null(), "{health}");
+    gate.stop().await;
+}
+
+/// A session closed by a definite fault stops at a safe point: the request
+/// in hand, here an authorize the backend holds, is answered first, so a
+/// share being made durable is never cut off mid-flight.
+#[tokio::test]
+async fn a_closed_session_answers_the_request_in_hand_first() {
+    let backend = Arc::new(HeldAuthorize::new());
+    let gate = Gate::start_with(Duration::from_secs(15), backend.clone()).await;
+    gate.admit(true);
+    let mut session = subscribed(&gate).await;
+    session
+        .get_mut()
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"id":2,"method":"mining.authorize","params":["gate.worker","x"]})
+            )
+            .as_bytes(),
+        )
         .await
-        .expect("a session outlived a later hard withdrawal");
-    assert!(
-        matches!(read, Ok(0) | Err(_)),
-        "the session was still served: {read:?} {line:?}"
-    );
+        .unwrap();
+    timeout(Duration::from_secs(5), backend.entered.notified())
+        .await
+        .expect("the authorize reached the backend");
+    gate.withdraw(Withdrawal::WriterNotLocal, true);
+    refusing(gate.addr).await;
+    backend.release.add_permits(1);
+    let mut line = String::new();
+    timeout(Duration::from_secs(5), session.read_line(&mut line))
+        .await
+        .expect("the request in hand was answered")
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(answer["id"], 2, "{answer}");
+    closed(&mut session, "a definite fault, after its answer").await;
     gate.stop().await;
 }
 

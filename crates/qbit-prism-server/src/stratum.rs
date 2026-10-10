@@ -2183,9 +2183,10 @@ pub async fn run_listener<B: MiningBackend>(
 /// than `stale_after` admits nothing, so a stalled health publisher closes
 /// it too. Withdrawing resets connections still queued unaccepted. Sessions
 /// already accepted carry on until they end or the balancer closes them,
-/// unless the withdrawal is hard (the own log behind, or a database that is
-/// not this node's): then they are closed at once, so none of them writes
-/// another share to a database that is not this node's.
+/// unless the withdrawal rests on a definite fault (the own log behind, or a
+/// database that answered that it is not this node's writable one): then
+/// they stop, each after the request in hand, so none of them writes another
+/// share there; what is left after a short drain is aborted.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_gated_listener<B: MiningBackend>(
     mut address: crate::listen::ReservedAddress,
@@ -2201,11 +2202,15 @@ pub async fn run_gated_listener<B: MiningBackend>(
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
     metrics.publish_stratum_listener_accepting(&config.listener_name, false);
     let mut connections = JoinSet::new();
+    // The sessions' stop signal, raised on shutdown and on a withdrawal that
+    // closes them. A session reads it between requests, so it finishes the
+    // one in hand before it closes.
+    let (stop_sessions, sessions_stop) = watch::channel(false);
     let sessions = Sessions {
         config: config.clone(),
         backend: backend.clone(),
         refresh: refresh.clone(),
-        shutdown: shutdown.clone(),
+        shutdown: sessions_stop,
         metrics: metrics.clone(),
     };
     // The health publisher holds the sender for the life of the process; if
@@ -2218,14 +2223,16 @@ pub async fn run_gated_listener<B: MiningBackend>(
         let decision = *admission.borrow_and_update();
         let admits = decisions && decision.admits_at(tokio::time::Instant::now(), stale_after);
         if !admits {
-            // A hard fault closes the sessions already accepted too, whether
-            // it withdrew an admitting frontend or found one that a
+            // A definite fault closes the sessions already accepted too,
+            // whether it withdrew an admitting frontend or found one that a
             // not-ready withdrawal had left them on.
-            if let Some(reason) = decision.hard_withdrawal() {
+            if let Some(reason) = decision.closes_sessions() {
                 if !connections.is_empty() {
-                    tracing::warn!(listener = %config.listener_name, reason = reason.as_str(), sessions = connections.len(), "Stratum sessions closed: the frontend withdrew for a fault that forbids serving, so none of them writes another share");
-                    connections.abort_all();
-                    while connections.join_next().await.is_some() {}
+                    tracing::warn!(listener = %config.listener_name, reason = reason.as_str(), sessions = connections.len(), "Stratum sessions closing: the frontend withdrew for a fault that forbids its shares, so each session stops after the request in hand");
+                    stop_sessions.send_replace(true);
+                    drain_sessions_within(std::mem::take(&mut connections), SESSION_CLOSE_DRAIN)
+                        .await;
+                    stop_sessions.send_replace(false);
                 }
             }
             tokio::select! {
@@ -2278,9 +2285,14 @@ pub async fn run_gated_listener<B: MiningBackend>(
         tracing::warn!(listener = %config.listener_name, address = %address.local_addr(), "Stratum listener refusing connections: the frontend withdrew");
     }
     metrics.publish_stratum_listener_accepting(&config.listener_name, false);
+    stop_sessions.send_replace(true);
     drain_sessions(connections).await;
     Ok(())
 }
+
+/// How long sessions closed by a definite fault get to finish the request in
+/// hand before what is left is aborted.
+const SESSION_CLOSE_DRAIN: Duration = Duration::from_secs(3);
 
 /// What every accepted Stratum connection's session needs from its listener.
 struct Sessions<B> {
@@ -2341,8 +2353,13 @@ impl<B: MiningBackend> Sessions<B> {
 }
 
 /// Let sessions finish after the listener stops, for at most ten seconds.
-async fn drain_sessions(mut connections: JoinSet<()>) {
-    if timeout(Duration::from_secs(10), async {
+async fn drain_sessions(connections: JoinSet<()>) {
+    drain_sessions_within(connections, Duration::from_secs(10)).await;
+}
+
+/// Let sessions finish for at most `bound`, then abort the rest.
+async fn drain_sessions_within(mut connections: JoinSet<()>, bound: Duration) {
+    if timeout(bound, async {
         while connections.join_next().await.is_some() {}
     })
     .await

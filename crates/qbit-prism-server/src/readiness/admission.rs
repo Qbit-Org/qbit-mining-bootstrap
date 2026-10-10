@@ -58,12 +58,6 @@ impl Withdrawal {
     pub fn as_str(self) -> &'static str {
         self.label().as_str()
     }
-
-    /// A fault that says this node must not serve at all, whatever its work:
-    /// it withdraws at once, and closes the sessions already accepted too.
-    pub fn is_hard(self) -> bool {
-        !matches!(self, Self::NotReady)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,8 +195,9 @@ impl Admission {
 pub struct AdmissionSignal {
     admits: bool,
     decided_at: Option<tokio::time::Instant>,
-    /// The hard withdrawal this decision carries, if any.
-    hard: Option<Withdrawal>,
+    /// Set when the established sessions must close too, with the
+    /// withdrawal that closes them.
+    close_sessions: Option<Withdrawal>,
 }
 
 impl AdmissionSignal {
@@ -210,30 +205,36 @@ impl AdmissionSignal {
     pub const UNDECIDED: Self = Self {
         admits: false,
         decided_at: None,
-        hard: None,
+        close_sessions: None,
     };
 
     pub fn decided(admits: bool, at: tokio::time::Instant) -> Self {
         Self {
             admits,
             decided_at: Some(at),
-            hard: None,
+            close_sessions: None,
         }
     }
 
-    /// The decision `state` makes at `at`.
-    pub fn of(state: AdmissionState, at: tokio::time::Instant) -> Self {
+    /// The decision `state` makes at `at`. `close_sessions` says that a
+    /// withdrawal rests on a definite fault, one that forbids every share
+    /// this node would write (the own log behind, or a database that
+    /// answered that it is not this node's writable one), so the established
+    /// sessions close too; a database that only stopped answering withdraws
+    /// the node without it, and the balancer moves those sessions.
+    pub fn of(state: AdmissionState, close_sessions: bool, at: tokio::time::Instant) -> Self {
         Self {
             admits: state.admits(),
             decided_at: Some(at),
-            hard: state.reason().filter(|reason| reason.is_hard()),
+            close_sessions: state.reason().filter(|_| close_sessions),
         }
     }
 
-    /// The hard withdrawal this decision carries: the gated listeners close
-    /// their accepted sessions on it, not only their listening sockets.
-    pub fn hard_withdrawal(&self) -> Option<Withdrawal> {
-        self.hard
+    /// The withdrawal that closes the established sessions too, if this
+    /// decision carries one: the gated listeners close their accepted
+    /// sessions on it, not only their listening sockets.
+    pub fn closes_sessions(&self) -> Option<Withdrawal> {
+        self.close_sessions
     }
 
     /// Whether the decision admits at `now`: it says so and is younger than
@@ -258,20 +259,20 @@ mod tests {
     const GRACE: Duration = Duration::from_secs(10);
 
     #[test]
-    fn a_signal_carries_only_a_hard_withdrawal() {
+    fn a_signal_closes_sessions_only_for_a_withdrawal_on_a_definite_fault() {
         let at = tokio::time::Instant::now();
         for reason in [Withdrawal::OwnLogBehind, Withdrawal::WriterNotLocal] {
-            let signal = AdmissionSignal::of(AdmissionState::Withdrawn { reason }, at);
-            assert_eq!(signal.hard_withdrawal(), Some(reason));
-            assert!(!signal.admits_at(at, Duration::from_secs(15)));
+            let state = AdmissionState::Withdrawn { reason };
+            let definite = AdmissionSignal::of(state, true, at);
+            assert_eq!(definite.closes_sessions(), Some(reason));
+            assert!(!definite.admits_at(at, Duration::from_secs(15)));
+            // The same reason without a definite fault, as for a database
+            // that stopped answering, leaves the sessions open.
+            assert_eq!(
+                AdmissionSignal::of(state, false, at).closes_sessions(),
+                None
+            );
         }
-        let soft = AdmissionSignal::of(
-            AdmissionState::Withdrawn {
-                reason: Withdrawal::NotReady,
-            },
-            at,
-        );
-        assert_eq!(soft.hard_withdrawal(), None);
         for state in [
             AdmissionState::Starting,
             AdmissionState::Admitting,
@@ -279,9 +280,9 @@ mod tests {
                 since: Instant::now(),
             },
         ] {
-            assert_eq!(AdmissionSignal::of(state, at).hard_withdrawal(), None);
+            assert_eq!(AdmissionSignal::of(state, true, at).closes_sessions(), None);
         }
-        assert!(AdmissionSignal::of(AdmissionState::Admitting, at)
+        assert!(AdmissionSignal::of(AdmissionState::Admitting, false, at)
             .admits_at(at, Duration::from_secs(15)));
     }
 
