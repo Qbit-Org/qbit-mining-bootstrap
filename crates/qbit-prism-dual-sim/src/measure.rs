@@ -3,7 +3,7 @@
 //! handed to its survivor (its unsynced tail).
 
 use crate::{frontend::Node, load::RunClock, load::ShareRecord};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::PgPool;
 use std::{
@@ -26,7 +26,7 @@ const LAG_GIVE_UP_MS: u64 = 30_000;
 /// database and the time it first appears on the other.
 pub struct LagSampler {
     stop: Arc<AtomicBool>,
-    task: JoinHandle<Result<Vec<LagSample>>>,
+    task: Option<JoinHandle<(Vec<LagSample>, u64)>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -45,6 +45,9 @@ pub struct LagReport {
     pub max_ms: Option<u64>,
     /// The sampler's poll interval: no lag below it can be told apart.
     pub resolution_ms: u64,
+    /// Reads of either database that failed; each costs a sample or delays
+    /// one's resolution.
+    pub failed_polls: u64,
 }
 
 impl LagSampler {
@@ -56,18 +59,18 @@ impl LagSampler {
             let stop = stop.clone();
             async move {
                 let mut samples: Vec<LagSample> = Vec::new();
+                let mut failed_polls = 0;
                 let mut last: Option<String> = None;
                 while !stop.load(Ordering::SeqCst) {
-                    let newest: Option<String> = sqlx::query_scalar(
+                    let newest = sqlx::query_scalar::<_, String>(
                         "SELECT share_id FROM qbit_share_ledger WHERE accepted \
                          ORDER BY accepted_at DESC, share_seq DESC LIMIT 1",
                     )
                     .fetch_optional(&origin)
-                    .await
-                    .unwrap_or(None);
+                    .await;
                     let now = clock.now_ms();
-                    if let Some(newest) = newest {
-                        if last.as_ref() != Some(&newest) {
+                    match newest {
+                        Ok(Some(newest)) if last.as_ref() != Some(&newest) => {
                             samples.push(LagSample {
                                 share_id: newest.clone(),
                                 seen_on_origin_ms: now,
@@ -75,6 +78,8 @@ impl LagSampler {
                             });
                             last = Some(newest);
                         }
+                        Ok(_) => {}
+                        Err(_) => failed_polls += 1,
                     }
                     let pending: Vec<String> = samples
                         .iter()
@@ -85,34 +90,59 @@ impl LagSampler {
                         .map(|s| s.share_id.clone())
                         .collect();
                     if !pending.is_empty() {
-                        let seen: Vec<String> = sqlx::query_scalar(
+                        match sqlx::query_scalar::<_, String>(
                             "SELECT share_id FROM qbit_prism_share_hashes WHERE share_id = ANY($1)",
                         )
                         .bind(&pending)
                         .fetch_all(&peer)
                         .await
-                        .unwrap_or_default();
-                        let seen: BTreeSet<String> = seen.into_iter().collect();
-                        let at = clock.now_ms();
-                        for sample in samples.iter_mut() {
-                            if sample.seen_on_peer_ms.is_none() && seen.contains(&sample.share_id) {
-                                sample.seen_on_peer_ms = Some(at);
+                        {
+                            Ok(seen) => {
+                                let seen: BTreeSet<String> = seen.into_iter().collect();
+                                let at = clock.now_ms();
+                                for sample in samples.iter_mut() {
+                                    if sample.seen_on_peer_ms.is_none()
+                                        && seen.contains(&sample.share_id)
+                                    {
+                                        sample.seen_on_peer_ms = Some(at);
+                                    }
+                                }
                             }
+                            Err(_) => failed_polls += 1,
                         }
                     }
                     tokio::time::sleep(LAG_POLL).await;
                 }
-                Ok(samples)
+                (samples, failed_polls)
             }
         });
-        Self { stop, task }
+        Self {
+            stop,
+            task: Some(task),
+        }
     }
 
-    /// Stop sampling, give pending samples a last look, and summarise.
-    pub async fn stop(self) -> Result<(LagReport, Vec<LagSample>)> {
+    /// Stop sampling and summarise.
+    pub async fn stop(mut self) -> Result<(LagReport, Vec<LagSample>)> {
         self.stop.store(true, Ordering::SeqCst);
-        let samples = self.task.await??;
-        Ok((lag_report(&samples), samples))
+        let task = self
+            .task
+            .take()
+            .context("the sampler was already stopped")?;
+        let (samples, failed_polls) = task.await?;
+        let mut report = lag_report(&samples);
+        report.failed_polls = failed_polls;
+        Ok((report, samples))
+    }
+}
+
+impl Drop for LagSampler {
+    /// A scenario that fails part-way drops its samplers: stop polling.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -136,79 +166,218 @@ pub fn lag_report(samples: &[LagSample]) -> LagReport {
         p95_ms: percentile(0.95),
         max_ms: lags.last().copied(),
         resolution_ms: LAG_POLL.as_millis() as u64,
+        failed_polls: 0,
     }
 }
 
 /// CONTRACT.md D-5: within a sync cycle shares are applied before
 /// landings, so a peer's block is never seen on a node before every share
-/// of its window is. While it runs, the sampler looks at one node for peer
-/// blocks it has not seen yet and, the moment each appears, counts its
-/// window's shares there against the recorded count.
+/// of its window is. While it runs, the sampler polls one node for peer
+/// blocks it has not seen yet and, in the same statement (one snapshot),
+/// counts each one's window shares there against the recorded count.
+///
+/// It samples: an out-of-order landing shorter than its poll interval can
+/// go unseen, and a failed poll widens that blind spot (it is counted and
+/// reported, never ignored). A block whose audit bundle arrives after its
+/// landing row is counted once its window record does; since shares only
+/// ever accumulate, a short count then still proves a violation, while a
+/// full one cannot prove the order and is reported as unresolved.
 pub struct LandingOrderSampler {
     stop: Arc<AtomicBool>,
-    task: JoinHandle<Result<Vec<LandingOrder>>>,
+    task: Option<JoinHandle<LandingOrderReport>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LandingOrder {
     pub block: String,
+    /// When the sampler first saw the block's landing row.
     pub seen_ms: u64,
-    pub window_shares: i64,
-    pub present: i64,
+    /// When its window was counted: `seen_ms` when the window's record was
+    /// there with the block, later when it arrived after it, never when it
+    /// did not arrive while the sampler ran.
+    pub counted_ms: Option<u64>,
+    pub window_shares: Option<i64>,
+    pub present: Option<i64>,
+    /// A bootstrap window, held inline: no ledger rows to wait for.
+    pub inline: bool,
+}
+
+/// What a sample shows about D-5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandingVerdict {
+    /// Counted with the block's first sighting, every share present.
+    InOrder,
+    /// Counted short: the block was there before its window's shares.
+    Violated,
+    /// Counted complete only after the block's first sighting, inline, or
+    /// never counted: the order is not shown either way.
+    Unresolved,
 }
 
 impl LandingOrder {
-    pub fn complete(&self) -> bool {
-        self.present == self.window_shares
+    pub fn verdict(&self) -> LandingVerdict {
+        match (self.window_shares, self.present) {
+            _ if self.inline => LandingVerdict::Unresolved,
+            (Some(window), Some(present)) if present < window => LandingVerdict::Violated,
+            (Some(_), Some(_)) if self.counted_ms == Some(self.seen_ms) => LandingVerdict::InOrder,
+            _ => LandingVerdict::Unresolved,
+        }
     }
 }
 
+/// Everything one sampler saw.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LandingOrderReport {
+    pub samples: Vec<LandingOrder>,
+    pub polls: u64,
+    pub failed_polls: u64,
+    /// The first errors, in order.
+    pub errors: Vec<String>,
+    /// The poll interval: an out-of-order landing shorter than this can go
+    /// unseen.
+    pub resolution_ms: u64,
+}
+
+/// How many poll errors a report keeps.
+const KEPT_ERRORS: usize = 10;
+
+/// One poll's row: the block, its window's recorded count, the window
+/// shares present now (both NULL until the window's record is there), and
+/// whether the window is inline.
+type LandingRow = (String, Option<i64>, Option<i64>, Option<bool>);
+
+/// The poll: each peer block not yet settled, with its window counted in
+/// the same statement. `cut` adds D-13's per-node cut, which a window
+/// without one (both columns NULL) skips.
+fn landing_order_sql(cut: bool) -> String {
+    let cut = if cut {
+        "AND ((s.cut_seq_0 IS NULL AND s.cut_seq_1 IS NULL) \
+              OR (l.origin_node = 0 AND l.share_seq <= s.cut_seq_0) \
+              OR (l.origin_node = 1 AND l.share_seq <= s.cut_seq_1))"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT b.block_hash, s.share_count::bigint, \
+                CASE WHEN s.snapshot_sha256 IS NULL OR s.inline_shares IS NOT NULL THEN NULL \
+                     ELSE (SELECT count(*) FROM qbit_share_ledger l \
+                            WHERE l.accepted \
+                              AND l.share_seq BETWEEN s.first_share_seq AND s.last_share_seq \
+                              AND l.accepted_at <= to_timestamp(s.anchor_ms::double precision / 1000) \
+                              AND l.job_issued_at <= to_timestamp(s.anchor_ms::double precision / 1000) \
+                              {cut}) END, \
+                s.inline_shares IS NOT NULL \
+         FROM qbit_pool_blocks b \
+         LEFT JOIN qbit_pool_audit_bundles a ON a.block_hash = b.block_hash \
+         LEFT JOIN qbit_prism_audit_snapshots s ON s.snapshot_sha256 = a.share_snapshot_sha256 \
+         WHERE b.origin_node = $1 AND NOT (b.block_hash = ANY($2))"
+    )
+}
+
 impl LandingOrderSampler {
-    /// Watch `pool` (one node's database) for blocks of `peer` origin.
+    /// Watch `pool` (one node's database) for blocks of `peer` origin that
+    /// arrive after it starts.
     pub fn start(pool: PgPool, peer: Node, clock: RunClock) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn({
             let stop = stop.clone();
             async move {
-                let mut seen: Vec<String> = Vec::new();
-                let mut samples = Vec::new();
+                let mut report = LandingOrderReport {
+                    resolution_ms: LAG_POLL.as_millis() as u64,
+                    ..Default::default()
+                };
+                let mut sql: Option<String> = None;
+                // Blocks there before the first poll, and blocks counted:
+                // neither is looked at again. Blocks seen but not yet
+                // counted stay out of it, so their window is counted the
+                // moment it arrives.
+                let mut settled: Vec<String> = Vec::new();
+                let mut baseline = false;
+                let mut index: BTreeMap<String, usize> = BTreeMap::new();
                 while !stop.load(Ordering::SeqCst) {
-                    let rows: Vec<(String, String)> = sqlx::query_as(
-                        "SELECT b.block_hash, a.share_snapshot_sha256 \
-                         FROM qbit_pool_blocks b \
-                         JOIN qbit_pool_audit_bundles a ON a.block_hash = b.block_hash \
-                         WHERE b.origin_node = $1 AND NOT (b.block_hash = ANY($2))",
-                    )
-                    .bind(peer.index() as i16)
-                    .bind(&seen)
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap_or_default();
-                    for (block, snapshot) in rows {
-                        let seen_ms = clock.now_ms();
-                        let windows = crate::invariants::recorded_windows(&pool).await?;
-                        if let Some(window) = windows.iter().find(|w| w.snapshot == snapshot) {
-                            let (present, _) = crate::invariants::window_now(&pool, window).await?;
-                            samples.push(LandingOrder {
-                                block: block.clone(),
-                                seen_ms,
-                                window_shares: window.count,
-                                present,
-                            });
+                    report.polls += 1;
+                    let rows = async {
+                        if sql.is_none() {
+                            let shape = crate::invariants::window_shape(&pool).await?;
+                            sql = Some(landing_order_sql(
+                                shape == crate::invariants::WindowShape::Cut,
+                            ));
                         }
-                        seen.push(block);
+                        let rows: Vec<LandingRow> =
+                            sqlx::query_as(sql.as_deref().unwrap_or_default())
+                                .bind(peer.index() as i16)
+                                .bind(&settled)
+                                .fetch_all(&pool)
+                                .await?;
+                        anyhow::Ok(rows)
+                    }
+                    .await;
+                    let now = clock.now_ms();
+                    match rows {
+                        Err(error) => {
+                            report.failed_polls += 1;
+                            if report.errors.len() < KEPT_ERRORS {
+                                report.errors.push(format!("at {now} ms: {error:#}"));
+                            }
+                        }
+                        Ok(rows) if !baseline => {
+                            baseline = true;
+                            settled.extend(rows.into_iter().map(|(block, ..)| block));
+                        }
+                        Ok(rows) => {
+                            for (block, window, present, inline) in rows {
+                                let at = *index.entry(block.clone()).or_insert_with(|| {
+                                    report.samples.push(LandingOrder {
+                                        block: block.clone(),
+                                        seen_ms: now,
+                                        counted_ms: None,
+                                        window_shares: None,
+                                        present: None,
+                                        inline: false,
+                                    });
+                                    report.samples.len() - 1
+                                });
+                                let sample = &mut report.samples[at];
+                                if inline == Some(true) {
+                                    sample.inline = true;
+                                    settled.push(block);
+                                } else if let (Some(window), Some(present)) = (window, present) {
+                                    sample.counted_ms = Some(now);
+                                    sample.window_shares = Some(window);
+                                    sample.present = Some(present);
+                                    settled.push(block);
+                                }
+                            }
+                        }
                     }
                     tokio::time::sleep(LAG_POLL).await;
                 }
-                Ok(samples)
+                report
             }
         });
-        Self { stop, task }
+        Self {
+            stop,
+            task: Some(task),
+        }
     }
 
-    pub async fn stop(self) -> Result<Vec<LandingOrder>> {
+    pub async fn stop(mut self) -> Result<LandingOrderReport> {
         self.stop.store(true, Ordering::SeqCst);
-        self.task.await?
+        let task = self
+            .task
+            .take()
+            .context("the sampler was already stopped")?;
+        Ok(task.await?)
+    }
+}
+
+impl Drop for LandingOrderSampler {
+    /// A scenario that fails part-way drops its samplers: stop polling.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -310,6 +479,57 @@ mod tests {
             (Some(200), Some(300))
         );
         assert_eq!(excuse(&tail, "why").len(), 2);
+    }
+
+    fn landing(seen: u64, counted: Option<u64>, window: i64, present: i64) -> LandingOrder {
+        LandingOrder {
+            block: "b".into(),
+            seen_ms: seen,
+            counted_ms: counted,
+            window_shares: counted.map(|_| window),
+            present: counted.map(|_| present),
+            inline: false,
+        }
+    }
+
+    #[test]
+    fn a_landing_shows_the_order_only_when_counted_as_it_arrived() {
+        assert_eq!(
+            landing(100, Some(100), 50, 50).verdict(),
+            LandingVerdict::InOrder
+        );
+        assert_eq!(
+            landing(100, Some(100), 50, 49).verdict(),
+            LandingVerdict::Violated
+        );
+        // Counted after it arrived: a short count still proves the block came
+        // first (shares only accumulate); a full one proves nothing.
+        assert_eq!(
+            landing(100, Some(400), 50, 49).verdict(),
+            LandingVerdict::Violated
+        );
+        assert_eq!(
+            landing(100, Some(400), 50, 50).verdict(),
+            LandingVerdict::Unresolved
+        );
+        assert_eq!(
+            landing(100, None, 0, 0).verdict(),
+            LandingVerdict::Unresolved
+        );
+        let mut inline = landing(100, Some(100), 50, 50);
+        inline.inline = true;
+        assert_eq!(inline.verdict(), LandingVerdict::Unresolved);
+    }
+
+    #[test]
+    fn the_landing_poll_applies_the_cut_only_where_the_schema_has_one() {
+        assert!(landing_order_sql(true).contains("s.cut_seq_0"));
+        assert!(!landing_order_sql(false).contains("cut_seq"));
+        for cut in [true, false] {
+            let sql = landing_order_sql(cut);
+            assert!(sql.contains("LEFT JOIN qbit_pool_audit_bundles"));
+            assert!(sql.contains("b.origin_node = $1"));
+        }
     }
 
     #[test]

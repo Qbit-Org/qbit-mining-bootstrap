@@ -1372,41 +1372,74 @@ async fn candidates_settled(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
 }
 
 /// CONTRACT.md D-2 and D-9: what is never copied holds only this node's
-/// own rows. In dual-writer mode, on each node: no block candidate was
-/// reserved by the peer's frontend (the outbox and its deferred shares are
-/// local: copying them would credit twice), no payout divergence is recorded
-/// for a peer-origin block, and the database's identity is its own node.
+/// own rows. In dual-writer mode, on each node, for rows written since the
+/// pair began writing as two primaries (`Sim::dual_since`; older rows are
+/// the history both databases share after a 3.0 cutover):
+///
+/// - no block candidate was claimed or reserved by the peer's frontend: the
+///   outbox and its deferred shares are local, and copying them would credit
+///   twice;
+/// - no offer decision is recorded for a block this node never had as a
+///   candidate. Only the offering frontend records one, in its own database
+///   (`ledger/divergence.rs`), so such a divergence row was copied. A row
+///   without one is the local reconciler's, which records divergences for
+///   every block it confirms, the peer's included;
+/// - the database identifies as its own node.
+///
+/// A disk rebuilt from the peer (S7) holds the peer's local rows until D-16's
+/// re-personalise resets them, so there this also checks that reset.
 async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
-    if sim.config.topology != Topology::DualWriter {
-        return Ok(Check::skip(
-            "d2-local-state-not-copied",
-            "no dual-writer pair: nothing is copied",
-        ));
-    }
+    let since = match (sim.config.topology, sim.dual_since) {
+        (Topology::DualWriter, Some(since)) => since,
+        _ => {
+            return Ok(Check::skip(
+                "d2-local-state-not-copied",
+                "no dual-writer pair: nothing is copied",
+            ))
+        }
+    };
     let mut check = CheckBuilder::new("d2-local-state-not-copied");
+    let mut candidates = BTreeMap::new();
     for (node, pool) in pools {
         let peer = node.peer();
-        let copied_candidates: Vec<String> = sqlx::query_scalar(
-            "SELECT block_hash FROM qbit_block_candidate_outbox WHERE offer_reserved_by = $1",
+        let own: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_block_candidate_outbox WHERE created_at >= $1",
+        )
+        .bind(since)
+        .fetch_one(pool)
+        .await?;
+        candidates.insert(node.label(), own);
+        let peers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT block_hash, state FROM qbit_block_candidate_outbox \
+             WHERE created_at >= $2 AND (offer_reserved_by = $1 OR claim_instance_id = $1) \
+             ORDER BY created_at",
         )
         .bind(peer.instance_id())
+        .bind(since)
         .fetch_all(pool)
         .await?;
-        for hash in copied_candidates {
+        for (hash, state) in peers {
             check.problem(format!(
-                "node {node:?} holds candidate {hash}, reserved by node {peer:?}'s frontend"
+                "node {node:?} holds candidate {hash} ({state}), claimed or reserved by node \
+                 {peer:?}'s frontend: copied (D-2), or left by a rebuild that re-personalise \
+                 did not reset (D-16)"
             ));
         }
-        let peer_divergences: Vec<String> = sqlx::query_scalar(
-            "SELECT d.block_hash FROM qbit_prism_payout_divergences d \
-             JOIN qbit_pool_blocks b ON b.block_hash = d.block_hash WHERE b.origin_node = $1",
+        let decisions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT d.block_hash, d.offer_decision FROM qbit_prism_payout_divergences d \
+             WHERE d.offer_decision IS NOT NULL AND d.offer_decided_at >= $1 \
+               AND NOT EXISTS (SELECT 1 FROM qbit_block_candidate_outbox o \
+                               WHERE o.block_hash = d.block_hash) \
+             ORDER BY d.offer_decided_at",
         )
-        .bind(peer.index() as i16)
+        .bind(since)
         .fetch_all(pool)
         .await?;
-        for hash in peer_divergences {
+        for (hash, decision) in decisions {
             check.problem(format!(
-                "node {node:?} records a payout divergence for node {peer:?}'s block {hash}"
+                "node {node:?} records an offer decision ({decision}) for block {hash}, which it \
+                 never had as a candidate: a divergence row copied (D-2), or left by a rebuild \
+                 that re-personalise did not reset (D-16)"
             ));
         }
         let identity: Option<i16> =
@@ -1419,7 +1452,11 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             ));
         }
     }
-    Ok(check.finish("candidates, divergences and identities are each node's own".into()))
+    check.data("since", json!(since));
+    check.data("own_candidates_since", json!(candidates));
+    Ok(check.finish(format!(
+        "candidates, offer decisions and identities since {since} are each node's own"
+    )))
 }
 
 fn short(program: &str) -> String {
