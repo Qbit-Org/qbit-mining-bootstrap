@@ -97,7 +97,7 @@ async fn rows(ledger: &Ledger, node: i16, seqs: impl IntoIterator<Item = i64>) -
 async fn mark(ledger: &Ledger, peer: i16, through: i64) -> Result<()> {
     sqlx::query(
         "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) VALUES('shares',$1,$2)
-         ON CONFLICT(stream) DO UPDATE SET scanned_through=EXCLUDED.scanned_through",
+         ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through",
     )
     .bind(peer)
     .bind(through)
