@@ -15,9 +15,16 @@
 //!   under `ORDER_LOCK` once the anchor is taken: every own row is appended
 //!   under that lock, so every later one is above it.
 //! - The peer's entry is its newest synced row at or below the peer sync's
-//!   high-water mark for the share stream, below which every peer row is
-//!   already committed here (the sync writes the mark in the transaction that
-//!   inserts the rows), that is stamped at or before the anchor.
+//!   high-water mark for the share stream that is stamped at or before the
+//!   anchor. The sync writes the mark in the transaction that inserts the
+//!   rows, so every peer row below it is already committed here but one the
+//!   sync refused as a conflict, and none arrives later.
+//!
+//! **Quarantined peer rows.** A peer row the sync refused as a conflict is
+//! quarantined for good: never inserted, while the mark moves past it. A
+//! window taken here leaves it out and stays whole. The peer holds it as its
+//! own row, so a window whose range spans one reproduces only on the node
+//! that took it, and the other node's proofs of it refuse.
 //!
 //! **The anchor rule and peer rows.** It applies to every row, as it always
 //! has and as the fold in `qbit_prism` applies it to every bundle share.
@@ -208,9 +215,10 @@ pub struct OriginIndexMissing;
 
 /// The peer's share-stream high-water mark (CONTRACT D-14, migration 027):
 /// every row the peer originated with `share_seq` at or below it is committed
-/// in this database, and none can arrive later, because the peer sync pulls
-/// the share stream in `share_seq` order and writes the mark in the
-/// transaction that inserts the rows it covers. NULL before the first pull.
+/// in this database but one the sync quarantined, and none can arrive later,
+/// because the peer sync pulls the share stream in `share_seq` order and
+/// writes the mark in the transaction that inserts the rows it covers. NULL
+/// before the first pull.
 pub(crate) const PEER_HIGH_WATER_SQL: &str = "SELECT qbit_prism_peer_share_mark()";
 
 /// The peer's newest row at or below the high-water mark that is stamped at
@@ -234,9 +242,10 @@ const PEER_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHER
 /// it used ([`PEER_CUT_SQL`]): its newest synced row at or below both the
 /// mark the cutoff's statement read, `high_water`, and the mark now, that
 /// is stamped at or before the anchor. Every peer row at or below it is in
-/// this database and stamped at or before the anchor too (a node's stamps
-/// rise with its `share_seq`), so the anchor rule never removes a row the
-/// cut admits, and the peer's rows above it join the next windows.
+/// this database, but one the sync quarantined, and is stamped at or before
+/// the anchor too (a node's stamps rise with its `share_seq`), so the anchor
+/// rule never removes a row the cut admits, and the peer's rows above it
+/// join the next windows.
 pub(crate) async fn read_peer_cut(
     connection: &mut sqlx::PgConnection,
     peer: i16,
@@ -264,10 +273,11 @@ pub(crate) async fn read_peer_cut(
 ///   `share_seq` order, so holding this node's entry holds every own row
 ///   below it;
 /// - whether the peer sync's safe mark (D-14) is at or above the peer's
-///   entry, so every peer row of the window is here. The cursor row names the
-///   node whose stream the mark covers, so a window read on either node is
-///   judged from this database's side; before the first pull there is no
-///   cursor and no peer row either.
+///   entry, so every peer row of the window is here: one the sync
+///   quarantined is in no window taken here. The cursor row names the node
+///   whose stream the mark covers, so a window read on either node is judged
+///   from this database's side; before the first pull there is no cursor and
+///   no peer row either.
 ///
 /// An entry absent from the cut, or below the window's first row, has no row
 /// in the window and holds trivially. `$first` is the window's first

@@ -75,9 +75,10 @@ pub use jobs::{
 };
 mod node_identity;
 pub mod peer_sync;
+pub use node_identity::server_lineage_evidence;
 pub use node_identity::{
     IdentityCheck, LineageEvidence, NodeIdentityRecord, NodeLineage, PeerSyncCursor,
-    Repersonalisation, TableRows,
+    Repersonalisation, RepersonaliseGuard, TableRows,
 };
 mod migration;
 pub mod table_inventory;

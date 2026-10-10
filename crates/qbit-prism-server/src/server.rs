@@ -86,7 +86,9 @@ pub async fn run(config: Config) -> Result<()> {
     // reported: the frontend runs, but the peer sync refuses to start and the
     // frontend never becomes ready. A single writer refuses a database that
     // has run as a dual-writer node, unless the rollback says so (D-12).
-    match &coordinator.config.dual_writer {
+    // A dual writer, or a single writer on a personalised database, sweeps
+    // the rollups as a dual writer does.
+    let dual_writer_sweep = match &coordinator.config.dual_writer {
         Some(dual) => {
             let node = dual.identity.node;
             match coordinator.ledger.check_node_identity(node).await? {
@@ -122,14 +124,16 @@ pub async fn run(config: Config) -> Result<()> {
                     node.index()
                 ),
             }
+            true
         }
         None => {
             coordinator
                 .ledger
                 .refuse_single_writer_on_dual_ledger(config::dual_writer_downgrade()?)
                 .await?;
+            coordinator.ledger.recorded_node_identity().await?.is_some()
         }
-    }
+    };
     coordinator.landing_trim.set_enabled(landing_trim);
     tracing::info!(
         enabled = landing_trim,
@@ -303,7 +307,11 @@ pub async fn run(config: Config) -> Result<()> {
         config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
-        let settings = if config.dual_writer.is_some() {
+        // On a personalised database a peer sync may insert late shares, its
+        // own frontend's or another one's (a rollback in progress, or a
+        // frontend started without PRISM_DUAL_WRITER beside a dual writer),
+        // so the sweep takes the progress row first, as a dual writer's does.
+        let settings = if dual_writer_sweep {
             settings.for_dual_writer()
         } else {
             settings
@@ -389,12 +397,14 @@ pub async fn run(config: Config) -> Result<()> {
         result=tasks.join_next()=>{Some(match result {Some(Ok(Err(error)))=>error,Some(Err(error))=>error.into(),_=>anyhow::anyhow!("critical PRISM task exited")})}
     };
     shutdown.send_replace(true);
-    // A database restored under the running frontend (D-8): no task may
-    // commit another own row, so nothing drains; every task is cancelled at
-    // once, and its open transaction rolls back. The restart recovers first.
+    // A database restored, promoted or re-identified under the running
+    // frontend (D-8, D-9): nothing drains. Every task is cancelled at once,
+    // and its open transaction rolls back, so none commits another own row
+    // unless its COMMIT was already sent. The restart runs every startup
+    // check again.
     if failure.as_ref().is_some_and(|failure| {
         failure
-            .downcast_ref::<crate::peer_sync::OwnLogLostWhileRunning>()
+            .downcast_ref::<crate::peer_sync::FrontendStop>()
             .is_some()
     }) {
         tasks.abort_all();

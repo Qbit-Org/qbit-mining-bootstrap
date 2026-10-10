@@ -362,6 +362,12 @@ enum NodeIdentityCommand {
         /// The node being rebuilt: 0 for node A, 1 for node B. The copy must say it is the other.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
         index: u8,
+        /// Repersonalise a copy whose lineage carries no own-log verification of the peer's, or
+        /// without reading the peer's server (PRISM_PEER_DATABASE_URL, then its _FALLBACK) when
+        /// neither path answers: only once you have made sure this is the promoted copy, never
+        /// the peer's own database.
+        #[arg(long)]
+        unverified_copy: bool,
     },
 }
 
@@ -850,14 +856,55 @@ async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
                     .await?;
                 None
             }
-            NodeIdentityCommand::Repersonalise { index } => Some(
-                ledger
-                    .repersonalise_node_identity(
-                        node(index)?,
-                        "qbit-prism-server node-identity repersonalise",
-                    )
-                    .await?,
-            ),
+            NodeIdentityCommand::Repersonalise {
+                index,
+                unverified_copy,
+            } => {
+                // The peer's own server, when its URL is set: this database
+                // must not be on it. Either path to it will do.
+                let mut peer_server = None;
+                let mut unread = Vec::new();
+                for name in [
+                    "PRISM_PEER_DATABASE_URL",
+                    "PRISM_PEER_DATABASE_URL_FALLBACK",
+                ] {
+                    let Some(url) = config::optional(name) else {
+                        continue;
+                    };
+                    match crate::ledger::server_lineage_evidence(&url).await {
+                        Ok(evidence) => {
+                            peer_server = Some(evidence);
+                            break;
+                        }
+                        Err(error) => unread.push(format!("{name}: {error:#}")),
+                    }
+                }
+                if peer_server.is_none() && !unread.is_empty() {
+                    let unread = unread.join("; ");
+                    if !unverified_copy {
+                        bail!(
+                            "the peer's server, which this database must not be on, could not be \
+                             read ({unread}); run again once it answers. --unverified-copy goes \
+                             on without it, and without the own-log verification check: only \
+                             once you have made sure this database is the promoted copy"
+                        );
+                    }
+                    tracing::warn!(%unread, "the peer's server could not be read; going on, --unverified-copy given");
+                }
+                let guard = crate::ledger::RepersonaliseGuard {
+                    unverified_copy,
+                    peer_server,
+                };
+                Some(
+                    ledger
+                        .repersonalise_node_identity(
+                            node(index)?,
+                            "qbit-prism-server node-identity repersonalise",
+                            &guard,
+                        )
+                        .await?,
+                )
+            }
         };
         let mut report = json!({
             "schema": "qbit.prism.node-identity.v1",

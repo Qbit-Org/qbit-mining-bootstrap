@@ -92,11 +92,12 @@ async fn rows(ledger: &Ledger, node: i16, seqs: impl IntoIterator<Item = i64>) -
     Ok(())
 }
 
-/// The peer sync's high-water mark for node `peer`'s shares.
+/// The peer sync's high-water mark for node `peer`'s shares, from a pull
+/// that refused none.
 async fn mark(ledger: &Ledger, peer: i16, through: i64) -> Result<()> {
     sqlx::query(
-        "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) VALUES('shares',$1,$2,$2)
-         ON CONFLICT(stream) DO UPDATE SET scanned_through=EXCLUDED.scanned_through,ingested_through=EXCLUDED.ingested_through",
+        "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) VALUES('shares',$1,$2)
+         ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through",
     )
     .bind(peer)
     .bind(through)

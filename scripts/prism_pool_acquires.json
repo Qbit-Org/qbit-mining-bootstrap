@@ -145,6 +145,8 @@
     "ledger/peer_sync.rs::carried_columns#1::self .acquire()": [1,"ledger"],
     "ledger/peer_sync.rs::highest_held_of#1::self .acquire()": [1,"ledger"],
     "ledger/peer_sync.rs::origin_index_valid#1::self .acquire()": [1,"ledger"],
+    "ledger/peer_sync.rs::missing_blocks#1::self .acquire()": [1,"ledger"],
+    "ledger/peer_sync.rs::missing_prepared#1::self .acquire()": [1,"ledger"],
     "ledger/peer_sync.rs::own_prepared_sync_seq#1::self .acquire()": [1,"ledger"],
     "ledger/peer_sync.rs::peer_sync_cursor#1::self .acquire()": [1,"ledger"],
     "ledger/peer_sync.rs::raise_own_sequences#1::self .begin()": [1,"ledger"],

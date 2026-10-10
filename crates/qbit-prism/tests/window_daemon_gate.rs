@@ -257,7 +257,7 @@ fn check_mirror_digest(
 
 fn exchange(daemon: &Daemon, case: &Case, mismatches: &mut Mismatches) -> Result<Outcome, String> {
     let handshake = daemon.read_json_line()?;
-    if handshake["event"] != "handshake" || handshake["protocol"] != 2 {
+    if handshake["event"] != "handshake" || handshake["protocol"] != 3 {
         return Err(format!("unexpected handshake: {handshake}"));
     }
 
