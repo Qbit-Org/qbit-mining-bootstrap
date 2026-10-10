@@ -398,7 +398,7 @@
       "labels": {
         "state": "AdmissionStateLabel"
       },
-      "status": "Every state's series appears at zero, `starting` at one, when admission is first exposed. `starting`: never admitted since the process started (a restored node pulling its own log back stays here). `grace`: readiness is false, less than `PRISM_READINESS_GRACE_SECONDS` (10 s by default) after the last publication that found the frontend ready, as through an ordinary tip or payout-revision rebuild. A stale snapshot keeps the last decision's state. `withdrawn`: admitted once, then a hard fault (`own-log-behind`, `writer-not-local`) or a readiness dip longer than the grace."
+      "status": "Every state's series appears at zero, `starting` at one, when admission is first exposed. `starting`: never admitted since the process started (a restored node pulling its own log back stays here). `grace`: readiness is false, less than `PRISM_READINESS_GRACE_SECONDS` (10 s by default) after the last publication that found the frontend ready, as through an ordinary tip or payout-revision rebuild. A stale snapshot keeps the last decision's state, while `qbit_prism_admission_admitting` and the gated listeners' `qbit_prism_stratum_listener_accepting` read 0 in it: a decision that old admits nothing. `withdrawn`: admitted once, then a hard fault (`own-log-behind`, `writer-not-local`) or a readiness dip longer than the grace."
     },
     "admission_withdrawals_total": {
       "labels": {

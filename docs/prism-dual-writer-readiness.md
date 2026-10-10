@@ -220,7 +220,7 @@ ordinary rebuild never ejects a frontend, whatever the check interval.
 | Family | Labels | Meaning |
 | --- | --- | --- |
 | `qbit_prism_admission_admitting` | none | 1 while the frontend admits miners; 0 in a stale snapshot |
-| `qbit_prism_admission_state` | `state` | one-hot admission state |
+| `qbit_prism_admission_state` | `state` | one-hot admission state: the last decision, also in a stale snapshot, where `qbit_prism_admission_admitting` reads 0 |
 | `qbit_prism_admission_withdrawals_total` | `reason` | withdrawals since start |
 | `qbit_prism_stratum_listener_accepting` | `listener=default,highdiff` | dual mode: whether a listener accepts; 0 in a stale snapshot |
 | `qbit_prism_peer_sync_own_log_caught_up` | none | the own-log latch, published by the peer sync |
