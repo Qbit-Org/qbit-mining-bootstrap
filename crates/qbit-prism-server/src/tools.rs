@@ -919,7 +919,8 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             // peer and carry-free blocks as the frontends do.
             if let Some(dual) = &config.dual_writer {
                 ledger.set_dual_writer_identity(dual.identity)?;
-                ledger.set_extranonce2_size(config.extranonce2_size)?;
+                ledger
+                    .set_coinbase_layout(config.coinbase_tag.as_bytes(), config.extranonce2_size)?;
             }
             let result = ledger
                 .clear_fatal_state_within(&config, &reason, Duration::from_secs(timeout_seconds))
@@ -1038,7 +1039,7 @@ async fn carry_owner(command: CarryOwnerCommand) -> Result<()> {
     let ledger = crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
     if let Some(dual) = &config.dual_writer {
         ledger.set_dual_writer_identity(dual.identity)?;
-        ledger.set_extranonce2_size(config.extranonce2_size)?;
+        ledger.set_coinbase_layout(config.coinbase_tag.as_bytes(), config.extranonce2_size)?;
     }
     let (result, writes) = match &command {
         CarryOwnerCommand::Status => (transfer::status(&ledger, &settings).await, false),
