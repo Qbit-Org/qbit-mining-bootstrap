@@ -4165,12 +4165,20 @@ impl Ledger {
         // transaction is among them. Other waiters, such as a second
         // importer, just wait.
         loop {
-            let (granted, blocking): (bool, bool) = sqlx::query_as("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(WITH RECURSIVE chain(pid) AS (SELECT blocker.pid FROM pg_locks holder CROSS JOIN LATERAL unnest(pg_blocking_pids(holder.pid)) AS blocker(pid) WHERE holder.granted AND holder.locktype='advisory' AND holder.classid::bigint=$2 AND holder.objid::bigint=$3 AND holder.objsubid=1 UNION SELECT blocker.pid FROM chain CROSS JOIN LATERAL unnest(pg_blocking_pids(chain.pid)) AS blocker(pid)) SELECT 1 FROM chain WHERE chain.pid=pg_backend_pid()) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
+            // A stop wins until the lock is known to be held: before each
+            // poll, and while the poll is in flight.
+            if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+                return Ok(None);
+            }
+            let poll = sqlx::query_as::<_, (bool, bool)>("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(WITH RECURSIVE chain(pid) AS (SELECT blocker.pid FROM pg_locks holder CROSS JOIN LATERAL unnest(pg_blocking_pids(holder.pid)) AS blocker(pid) WHERE holder.granted AND holder.locktype='advisory' AND holder.classid::bigint=$2 AND holder.objid::bigint=$3 AND holder.objsubid=1 UNION SELECT blocker.pid FROM chain CROSS JOIN LATERAL unnest(pg_blocking_pids(chain.pid)) AS blocker(pid)) SELECT 1 FROM chain WHERE chain.pid=pg_backend_pid()) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
                 .bind(SETTLEMENT_LOCK)
                 .bind(SETTLEMENT_LOCK >> 32)
                 .bind(SETTLEMENT_LOCK & 0xffff_ffff)
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_one(&mut *tx);
+            let Some(poll) = until_stopped(stop, poll).await else {
+                return Ok(None);
+            };
+            let (granted, blocking) = poll?;
             if granted {
                 break;
             }

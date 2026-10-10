@@ -425,6 +425,22 @@ impl Fixture {
         self.importer.as_ref().unwrap()
     }
 
+    /// An importer whose connections to the relay are plaintext even where
+    /// the gate's URL asks for TLS, for the relay's pattern triggers.
+    async fn plaintext_importer(&self) -> Result<Ledger> {
+        let mut url = url::Url::parse(&self.relay.url)?;
+        let query: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| !key.starts_with("ssl"))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(query)
+            .append_pair("sslmode", "disable");
+        Ledger::connect_tool(url.as_str(), "import-765-plain".into(), 4, false, None).await
+    }
+
     async fn close(mut self, result: Result<()>) -> Result<()> {
         self.relay.control.release();
         if let Some(importer) = self.importer.take() {
@@ -658,20 +674,7 @@ async fn stalled_under_lock(fixture: &Fixture) -> Result<()> {
     let bundle = legacy_bundle(100, 10)?;
     let (block_hash, digest) =
         seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x52).await?;
-    // The relay matches what the client sends, so this importer's
-    // connections are plaintext even where the gate's URL asks for TLS.
-    let mut url = url::Url::parse(&fixture.relay.url)?;
-    let query: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(key, _)| !key.starts_with("ssl"))
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    url.query_pairs_mut()
-        .clear()
-        .extend_pairs(query)
-        .append_pair("sslmode", "disable");
-    let importer =
-        Ledger::connect_tool(url.as_str(), "import-765-plain".into(), 4, false, None).await?;
+    let importer = fixture.plaintext_importer().await?;
     let waiter = SettlementWaiter::start(&fixture.database.url).await?;
     // SQLx sends COMMIT as text, whatever the connection has prepared, after
     // the lock is granted and the write guard has run.
@@ -1185,6 +1188,76 @@ async fn stop_mid_execution(fixture: &Fixture) -> Result<()> {
     sqlx::raw_sql("DROP TRIGGER import765_slow ON qbit_pool_audit_bundles")
         .execute(&fixture.ledger.pool)
         .await?;
+    let imported = fixture
+        .importer()
+        .import_legacy_audits_with(
+            Some(directory.path()),
+            &ledger_public_key(),
+            &options(None),
+            |_| {},
+        )
+        .await?;
+    ensure!(imported == 1, "the re-run imported {imported} rows");
+    ensure!(fixture.stored_digest(&block_hash).await?.as_deref() == Some(digest.as_str()));
+    Ok(())
+}
+
+/// A stop that lands after the row is written but before SETTLEMENT_LOCK is
+/// granted rolls the row back, even while the first lock poll is in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_before_the_lock_is_granted_rolls_the_row_back() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = stop_before_grant(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn stop_before_grant(fixture: &Fixture) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = legacy_bundle(100, 10)?;
+    let (block_hash, digest) =
+        seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x58).await?;
+    let importer = fixture.plaintext_importer().await?;
+    // The first lock poll reaches the relay and goes no further.
+    fixture
+        .relay
+        .control
+        .stall_before(b"pg_try_advisory_xact_lock");
+    let (stop, stopping) = watch::channel(false);
+    let patient = options(Some(stopping));
+    let running = importer.clone();
+    let root = directory.path().to_path_buf();
+    let import = tokio::spawn(async move {
+        running
+            .import_legacy_audits_with(Some(root.as_path()), &ledger_public_key(), &patient, |_| {})
+            .await
+    });
+    stalled_mid_write(&fixture.relay).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stopped = Instant::now();
+    stop.send_replace(true);
+    let failed = tokio::time::timeout(SLACK, import)
+        .await
+        .context("the import did not stop")??;
+    let elapsed = stopped.elapsed();
+    // Let the held poll through now: the stopped importer must not use it.
+    fixture.relay.control.release();
+    let error = failed.err().context("a stopped import succeeded")?;
+    ensure!(
+        error.downcast_ref::<ImportStopped>().is_some(),
+        "not a stop: {error:#}"
+    );
+    ensure!(
+        elapsed < Duration::from_secs(2),
+        "the stop took {elapsed:?}"
+    );
+    fixture.transactions_end(Duration::from_secs(5)).await?;
+    ensure!(
+        fixture.stored_digest(&block_hash).await?.is_none(),
+        "the stopped row was stored"
+    );
+    importer.pool.close().await;
     let imported = fixture
         .importer()
         .import_legacy_audits_with(
