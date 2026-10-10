@@ -22,12 +22,13 @@
 //! - **Dual writer**: the gate starts closed, carry-free, and only the owner
 //!   guard (`crate::carry_owner`) opens it. Work is also carry-free whenever
 //!   this node's journal no longer claims ownership, so a release takes
-//!   effect at its commit, before the guard's next check closes the gate. A change is published to the gate
-//!   first and then fenced by a payout revision bump. A snapshot reads the
-//!   gate after it has read the revision under `SETTLEMENT_LOCK`, which the
-//!   bump also takes, so work built under the old mode is always at a
-//!   revision the bump superseded: its shares are no longer credited, and a
-//!   block on it is offered only through the #478 capture bound.
+//!   effect at its commit, before the guard's next check closes the gate. A
+//!   change is published to the gate first and then fenced by a payout
+//!   revision bump. A snapshot reads the gate after it has read the revision
+//!   under `SETTLEMENT_LOCK`, which the bump also takes, so work built under
+//!   the old mode is always at a revision the bump superseded: its shares
+//!   are no longer credited, and a block on it is offered only through the
+//!   #478 capture bound.
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -125,9 +126,10 @@ impl Ledger {
         !self.dual_writer() || self.carry.paying.load(Ordering::SeqCst)
     }
 
-    /// The prior-balance read for work built now. Single-writer mode always
-    /// runs 3.0's canonical statement.
-    pub(super) fn job_prior_balance_sql(&self) -> &'static str {
+    /// The prior-balance read the gate alone allows. Work reads it only
+    /// through [`Ledger::job_prior_balance_sql_in`], which also reads the
+    /// journal. Single-writer mode always runs 3.0's canonical statement.
+    fn job_prior_balance_sql(&self) -> &'static str {
         if self.carry_paying() {
             window::PRIOR_BALANCE_SQL
         } else {
