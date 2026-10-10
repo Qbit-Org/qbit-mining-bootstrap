@@ -1274,6 +1274,30 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         !sponsors_fanout(c, &txid).await?,
         "a finder whose own database shows fresh work was taken over"
     );
+    // A's database answers but holds no work of A's at all (just started, or
+    // its expired work pruned): unknown, not silent, until it has shown none
+    // for the takeover delay.
+    sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id='prepared:live-work'")
+        .execute(&peer.pool)
+        .await?;
+    c.finder_liveness.use_journal(live_view()?).await;
+    ensure!(
+        !sponsors_fanout(c, &txid).await?,
+        "a finder whose database shows no work at all was taken over at once"
+    );
+    c.finder_liveness
+        .assume_no_work_since(std::time::Instant::now() - Duration::from_secs(31 * 60))
+        .await;
+    ensure!(
+        sponsors_fanout(c, &txid).await?,
+        "a finder whose database has shown no work for the takeover delay was not taken over"
+    );
+    sqlx::query(
+        "INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,origin_node) \
+         VALUES('prepared:live-work','adoption-peer',repeat('ab',32),0,'{}'::jsonb,clock_timestamp()+interval '1 hour',0)",
+    )
+    .execute(&peer.pool)
+    .await?;
     // A's own database shows that work half an hour old: A is silent (a
     // fresh view, as once the last verdict has expired).
     sqlx::query("UPDATE qbit_prism_jobs SET created_at=clock_timestamp()-interval '31 minutes' WHERE job_id='prepared:live-work'")

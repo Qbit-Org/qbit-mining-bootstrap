@@ -1825,9 +1825,12 @@ fanout is overdue and its finder silent:
   matured here, and the newest work (prepared record) of the finder's that this
   node holds was published, at least 30 minutes ago.
 - **Silent:** the finder's own database, read through every peer URL, shows
-  its newest work, aged by its own clock, to be at least 30 minutes old. Or
-  that database has failed three checks in a row, over a minute at least; then
-  the stale copy here decides. A blip or two only waits. One check runs at a
+  its newest work, aged by its own clock, to be at least 30 minutes old. A
+  database that answers with no work of its node at all (a frontend just
+  started, or its expired work pruned) is not silent until the checks have
+  found none for 30 minutes. Or that database has failed three checks in a row,
+  over a minute at least; then the stale copy here decides. A blip or two only
+  waits. One check runs at a
   time, and its verdict serves every fanout for 30 seconds.
 
 A frontend that is alive publishes work every few minutes (the reanchor and the

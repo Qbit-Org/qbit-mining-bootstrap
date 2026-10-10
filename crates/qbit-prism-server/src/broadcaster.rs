@@ -518,6 +518,9 @@ struct LivenessState {
     verdict: Option<(std::time::Instant, bool)>,
     /// The outage the last check found, if it found one.
     outage: Option<Outage>,
+    /// Since when the checks have found the peer's database answering with
+    /// no work of its node at all, with none between them that found work.
+    no_work_since: Option<std::time::Instant>,
 }
 
 /// Checks that each found the peer's database out of reach, with no check
@@ -571,6 +574,16 @@ impl FinderLiveness {
             since,
             failed_checks: OUTAGE_CHECKS - 1,
         });
+        state.verdict = Some((std::time::Instant::now() - VERDICT_TTL, false));
+    }
+
+    /// For tests: checks have found the peer's database answering with no
+    /// work of its node since `since`, the last one long enough ago for the
+    /// next to run.
+    #[doc(hidden)]
+    pub async fn assume_no_work_since(&self, since: std::time::Instant) {
+        let mut state = self.state.lock().await;
+        state.no_work_since = Some(since);
         state.verdict = Some((std::time::Instant::now() - VERDICT_TTL, false));
     }
 }
@@ -643,6 +656,9 @@ pub async fn sponsors_fanout(coordinator: &Coordinator, fanout_txid: &str) -> Re
 ///   youngest newest work it shows of its own node, aged by its own clock, is
 ///   [`SPONSOR_TAKEOVER_AFTER`] old. A frontend that is alive publishes work
 ///   every few minutes (the reanchor and the template's maximum age).
+/// - **It answers with no work of its node at all** (a frontend just
+///   started, or its expired work pruned): unknown, and silent only once the
+///   checks have found none for [`SPONSOR_TAKEOVER_AFTER`].
 /// - **It has failed [`OUTAGE_CHECKS`] checks in a row, over
 ///   [`OUT_OF_REACH_AFTER`] at least:** silent.
 ///   The overdue fence has already found the finder's work this node holds as
@@ -672,9 +688,15 @@ async fn finder_silent(coordinator: &Coordinator) -> Result<bool> {
     let answer = journal.work_age(peer).await;
     let now = std::time::Instant::now();
     let silent = match answer {
-        Some(age) => {
+        Some(Some(age)) => {
             state.outage = None;
-            age.is_none_or(|age| age >= SPONSOR_TAKEOVER_AFTER)
+            state.no_work_since = None;
+            age >= SPONSOR_TAKEOVER_AFTER
+        }
+        Some(None) => {
+            state.outage = None;
+            let since = *state.no_work_since.get_or_insert(now);
+            now.saturating_duration_since(since) >= SPONSOR_TAKEOVER_AFTER
         }
         None => {
             let outage = continue_outage(state.outage, state.verdict.map(|(at, _)| at), now);
