@@ -42,7 +42,9 @@ Native snapshots record a database-coordinated monotonic anchor, share range,
 and payout revision. Share acceptance and snapshot creation use the same
 ordering lock, so equal wall-clock timestamps or host clock differences cannot
 let a later share enter an earlier snapshot. Published jobs bind their snapshot;
-later accepted work cannot change their committed coinbase.
+later accepted work cannot change their committed coinbase. With two writers,
+a snapshot also records a per-node cut, so a peer's late rows cannot enter it
+either ([dual-writer window cuts](#dual-writer-window-cuts-028)).
 
 Payout-changing operations serialize under the settlement transaction lock.
 They advance the shared payout revision, and job publication checks that its
@@ -4094,6 +4096,137 @@ A node restored from its own backup is not a copy of its peer: its identity is
 its own, so the command refuses it, and its own-log recovery completes it. A
 new, empty database followed by a full pull is not supported: rows from before
 3.1 are never pulled.
+
+## Dual-writer window cuts (028)
+
+With `PRISM_DUAL_WRITER` on, a node's ledger holds its own rows and the rows it
+pulled from the peer, and the peer's rows can arrive after this node's own,
+higher-numbered ones. Each payout window therefore records a **cut**: for each
+node, the highest `share_seq` of that node's rows the window may include,
+`{"0": <share_seq or null>, "1": <share_seq or null>}` (`null` admits none).
+With `PRISM_DUAL_WRITER` off, windows carry no cut and every window, statement,
+audit and coinbase is 3.0's.
+
+**Eligibility.** A row is in a window when it is eligible as in 3.0 (accepted,
+and accepted and issued at or before the window's anchor) **and** its
+`share_seq` is at most its own node's entry in the cut:
+
+- this node's entry is its newest own row eligible at the anchor, read under
+  `ORDER_LOCK` once the anchor is taken, so every own row appended later is
+  above it;
+- the peer's entry is the peer's newest row at or below
+  `qbit_prism_peer_share_mark()` that is stamped at or before the anchor.
+
+Both entries are rows the window's predicate admits, so the higher one is the
+window's newest row, as the accepted cutoff is without a cut.
+
+A peer row that reaches this node after a window was taken is above the peer's
+entry, so it is outside that window and joins the next ones. Every proof of a
+window applies its recorded cut: the landing's durable-range proof and in-lock
+count, the #619 holding probe at enqueue, the re-read a rebuild makes, and the
+audit reconstruction. A late peer row therefore never makes a landed or offered
+block unverifiable.
+
+**Quarantined peer rows.** A peer row this node's sync refused as a conflict is
+quarantined for good (see
+[Dual-writer node identity (027)](#dual-writer-node-identity-027)): it is never
+inserted here, and the mark moves past it. A window taken here leaves it out and
+stays whole, since no peer row is inserted at or below a mark already passed.
+The peer holds the row as its own, so a window whose range spans it reproduces
+only on the node that took it: the other node's re-read differs by that row,
+and its proofs of the window refuse it rather than pay it differently.
+
+**The #619 holding probe.** A dual-writer node has no physical standby, so the
+rows it can lose are each log's newest, to a restore. A window is held when its
+last row still matches the window's predicate, whichever node wrote it, this
+node's entry is its row under that predicate (own-log recovery brings own rows
+back in `share_seq` order), and the peer sync's mark is at or above the peer's
+entry. A mark a restore rewound, or an own entry it lost, makes the window not
+held until the sync and own-log recovery bring the rows back; retention under
+the first row still reads as a pruned prefix.
+
+**Clock skew.** The anchor rule applies to every row, the peer's included,
+and the peer's entry stops below its first row stamped after the anchor. Each
+node's stamps rise with its own `share_seq`, so the cut alone decides which
+rows are in, and the anchor rule only confirms it, as the audit verifier's
+fold always has. Rows and their stamps are copied verbatim, so both nodes and
+every verifier evaluate the same rows: a peer clock running ahead delays that
+peer's newest shares by the skew, and can never make a window irreproducible
+or a landing fail.
+
+**Where the cut is recorded.**
+
+- In the window reference (`window.cut`) inside the candidate document and the
+  prepared-job payload, which are digest-checked; absent without a cut, so
+  single-writer documents keep their bytes.
+- In `qbit_prism_audit_snapshots.cut_seq_0` and `cut_seq_1` (migration 028):
+  both `NULL` without a cut, and `0` for "no row of that node".
+- In the audit bundle's `reward_manifest.cut`, which the coinbase commits
+  through the reward-manifest leaf. The bootstrap window's bundle has none: its
+  one share is synthetic, and its landing proves the empty window against the
+  reference's cut.
+
+`qbit-prism-audit-verify`, `qbit-prism-audit-canonicalize` and
+`qbit-prism-build-audit-bundle` (input `window_cut`) handle bundles with and
+without a cut. A window share above the cut's highest entry is refused, and so
+is a dropped, added or altered cut, at the commitment leaf. A 3.0 verifier
+refuses a dual-writer bundle rather than mis-verifying it.
+`qbit-prism-reorg-verify` reads only policy manifests and is unchanged.
+
+**Reproducing a window from a ledger.** From the audit snapshot row, on
+either node, once that node holds each node's rows up to its entry:
+
+```sql
+SELECT * FROM qbit_share_ledger
+WHERE share_seq BETWEEN :first_share_seq AND :last_share_seq
+  AND accepted
+  AND accepted_at   <= to_timestamp(:anchor_ms / 1000.0)
+  AND job_issued_at <= to_timestamp(:anchor_ms / 1000.0)
+  AND (:cut_seq_0 IS NULL                                   -- no cut: 3.0
+       OR (origin_node = 0 AND share_seq <= :cut_seq_0)
+       OR (origin_node = 1 AND share_seq <= :cut_seq_1))
+ORDER BY share_seq;
+```
+
+The result has `share_count` rows, and its JSON array hashes to
+`snapshot_sha256`.
+
+**The refresh.** Published work keeps 3.0's cadence: a new share, the peer's
+included, does not replace it before the next template change or reanchor.
+Empty-window (bootstrap) work is the exception, as in 3.0: it is replaced at
+once by the first share, and whenever the peer's mark has moved, labelled
+`shares`, until a window holds shares. A cached window is not reused for a new
+template once the peer's mark has moved, because the peer's newer rows can all
+lie below this node's cutoff. Nor is it reused while an accepted peer row at or
+below the mark waits above the peer's entry, stamped after the anchor by a peer
+clock running ahead: a later anchor admits that row with no new row and no move
+of the mark, so the next template's window is read afresh and the row is not
+held back to the reanchor. The incremental advance reads each node's rows
+between the retired window's cut and the fresh one, at or above the retired
+window's first row, and merges the peer's late rows into it in `share_seq`
+order, so a late peer row costs a merge, not a full scan (about 0.1 s against
+1.5 s for the full scan at a 200,000-row window). The result is proved by the
+same leaf witness and eligible-row count as in 3.0, under the fresh cut. A cut
+that moved back is counted as `cutoff_regressed` in
+`qbit_prism_refresh_window_acquisitions_total`.
+
+**The index.** This node's entry is read under `ORDER_LOCK`. Both entries come
+from the `(origin_node, share_seq)` index (migration 031,
+`qbit_share_ledger_origin_seq_idx`), in a statement shape only that index can
+serve, so a node whose rows all lie under a long run of the peer's never walks
+that run. This node's entry is first probed at or above the retained window's
+entry, which reads only the newest partitions, usually one, as 3.0's cutoff
+does; the probe of every partition runs only for a first snapshot or when that
+one finds nothing. Without a valid btree index on those columns, a dual-writer
+snapshot refuses before it takes any lock, naming migration 031, and the
+frontend publishes no new work. The refresh loop logs that refusal as an
+`ALERT` once a minute, not on every attempt, and
+`qbit_prism_dual_writer_origin_index_missing` reads 1 until a snapshot finds
+the index again.
+
+**Not cut-aware.** The operator route `/audit/share-window` and the
+dashboards' current-window figures compute a window by anchor over every row.
+Neither is a payout path.
 
 ## Health, diagnostics, and validation
 

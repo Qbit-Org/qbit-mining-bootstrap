@@ -345,6 +345,15 @@ impl Metrics {
             elapsed,
         );
     }
+    /// 3.1 dual writer (D2): whether this frontend's latest window snapshot
+    /// found the `(origin_node, share_seq)` index its cut reads need.
+    pub fn record_origin_index(&self, indexed: bool) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(
+            Family::DualWriterOriginIndexMissing,
+            Labels::Empty,
+            if indexed { 0. } else { 1. },
+        );
+    }
     /// 3.1 dual writer (D1): the peer sync's state after a pass. `streams`
     /// holds each stream's lag in rows and seconds.
     pub fn publish_peer_sync(

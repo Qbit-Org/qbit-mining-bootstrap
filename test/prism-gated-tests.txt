@@ -267,6 +267,10 @@ qbit-prism-server::dual_writer_sync::the_own_log_latch_without_and_with_the_peer
 qbit-prism-server::dual_writer_sync::the_sync_carries_every_column_the_inventory_does_not_keep_local
 qbit-prism-server::dual_writer_sync::the_sync_needs_only_the_peer_roles_documented_grants
 qbit-prism-server::dual_writer_sync::the_sync_refuses_wrong_identities_and_fingerprints
+qbit-prism-server::dual_writer_windows::a_block_lands_after_late_peer_rows_arrive_inside_its_window
+qbit-prism-server::dual_writer_windows::a_block_lands_while_the_peer_is_idle_and_its_entry_is_empty
+qbit-prism-server::dual_writer_windows::a_dual_writer_bootstrap_block_lands_after_peer_rows_arrive
+qbit-prism-server::dual_writer_windows::a_window_whose_cut_disagrees_with_its_bundle_is_never_landed
 qbit-prism-server::equal_work_scheduler::a_fresh_observation_after_completed_peer_aba_cannot_repeat_unchanged
 qbit-prism-server::equal_work_scheduler::immediate_retry_budget_resets_only_after_an_external_tick
 qbit-prism-server::equal_work_scheduler::non_retry_epoch_refusal_keeps_the_normal_poll_cadence
@@ -734,6 +738,9 @@ qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::a_refresh_o
 qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::a_refresh_publishes_the_reference_for_the_window_it_captured
 qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::the_entry_point_holds_a_window_read_permit_only_while_it_reads
 qbit-prism-server::qbit_prism_server::coordinator::window_ref_tests::the_entry_point_reads_without_occupying_a_blocking_thread
+qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::a_dual_writer_block_lands_through_its_rebuilt_audit_with_an_idle_peer
+qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::a_dual_writer_block_whose_landing_failed_lands_on_its_reconciliation_retry
+qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::a_dual_writer_ctv_block_lands_through_its_rebuilt_audit_with_both_nodes_rows
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::a_node_error_after_acceptance_settles_the_row_in_reconciliation_with_the_reason
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::a_parent_landing_late_diverges_the_child_which_lands_as_issued_with_additive_balances
 qbit-prism-server::qbit_prism_server::coordinator::window_switch_tests::a_refused_candidate_is_a_definite_rejection_not_an_unknown_outcome
@@ -772,6 +779,7 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::probe_tests::a_d
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::postgres_fixture_cleans_up_after_setup_error_and_body_panic
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
+qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued::dependency_row_tests::a_dual_writer_prepared_row_matches_its_columns_on_a_single_writer
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_connection_lost_while_checking_a_failed_attempt_keeps_both_errors
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_cursor_dropped_after_its_look_up_reads_as_nothing_pending
@@ -781,6 +789,17 @@ qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_commit_reply_never_comes_is_read_afresh_at_its_deadline
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_connection_drops_after_its_commit_is_read_on_a_fresh_connection
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_connection_drops_before_its_commit_stops_for_a_rerun
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::a_dual_writer_snapshot_refuses_without_the_origin_index
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::a_peer_clock_running_ahead_only_delays_its_newest_rows
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::a_snapshot_cuts_each_node_at_its_newest_row_the_window_may_hold
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::late_peer_rows_never_change_a_window_already_built
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::the_cut_reads_probe_the_origin_index_and_never_walk_the_other_nodes_run
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::the_holding_probe_checks_each_nodes_entry_and_the_peer_mark
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::the_incremental_advance_merges_late_peer_rows_exactly
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::the_own_cut_probes_only_the_partitions_at_or_above_the_retained_entry
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::the_refresh_probe_and_the_snapshot_report_the_peer_mark
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::the_same_window_reproduces_on_the_other_nodes_database
+qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::without_window_cuts_a_ledger_holding_peer_rows_keeps_the_3_0_window
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::a_snapshot_reads_its_writer_timeline_in_the_transaction_that_reads_its_rows
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancellation_and_sql_timeout_release_probe_connection
 qbit-prism-server::qbit_prism_server::ledger::window::payout_state::tests::cancelled_hash_keeps_build_admission_until_blocking_cleanup_finishes

@@ -52,6 +52,7 @@ async fn cancelling_400k_read_after_96_pages_measures_runtime_stall() -> Result<
                 // Completion is impossible while the final page is gated.
                 snapshot_sha256: [0; 32],
             }),
+            cut: None,
         };
         let source = ledger.clone();
         let reader = tokio::spawn(async move { source.read_window(&window, BalanceSource::Current).await });

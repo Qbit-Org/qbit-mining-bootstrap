@@ -199,6 +199,7 @@ pub(super) async fn original_snapshot(
         payout_revision: prepared.snapshot.payout_revision,
         shares: window.shares,
         prior_balances: window.prior_balances,
+        cut: prepared.window.cut,
     })
 }
 

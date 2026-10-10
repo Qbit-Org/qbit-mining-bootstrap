@@ -50,6 +50,7 @@ async fn advance_at(
         network * 8,
         full.anchor_ms,
         i64::try_from(full.share_seq)?,
+        full.cut,
         &completion,
     )
     .await?;
@@ -71,6 +72,7 @@ fn audit_write(
         share_count: i64::try_from(shares.len())?,
         inline: None,
         shares: std::sync::Arc::new(shares),
+        cut: None,
     })
 }
 

@@ -215,6 +215,7 @@ fn candidate(bundle: AuditBundle, payout_revision: i64, nonce: u32) -> Result<Te
             anchor_ms: bundle.found_block.anchor_job_issued_at_ms,
             prior_balances_digest: qbit_prism::prior_balances_digest(&bundle.prior_balances),
             shares: range,
+            cut: None,
         },
         bootstrap_share: None,
         found_block: bundle.found_block.clone(),
@@ -746,6 +747,7 @@ fn window_ref(anchor_ms: i64, shares: &[AcceptedShare], snapshot: &Snapshot) -> 
             share_count: shares.len() as u64,
             snapshot_sha256: Sha256::digest(serde_json::to_vec(shares)?).into(),
         }),
+        cut: None,
     })
 }
 

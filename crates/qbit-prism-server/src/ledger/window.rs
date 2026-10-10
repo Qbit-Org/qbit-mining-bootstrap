@@ -9,9 +9,27 @@ mod snapshot_delta;
 pub(crate) use snapshot_delta::{
     AcquisitionReport, Advance, LeafWitness, RetainedShares, SnapshotCapture, WindowAcquisition,
 };
+pub(super) mod cut;
+use cut::BindCut;
+pub use cut::{OriginIndexMissing, WindowCut};
 
 const ACCEPTED_CUTOFF_SQL: &str =
     "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted";
+
+/// The dual-writer snapshot's [`ACCEPTED_CUTOFF_SQL`]: in the same statement,
+/// so in one MVCC snapshot and under the same `ORDER_LOCK`, this node's own
+/// cut entry and the peer's share-stream high-water mark (`window/cut.rs`).
+/// Every peer row at or below the mark is visible to the cutoff's read, so
+/// the cutoff is at least every row the window's cut can admit. `$1` is this
+/// node's index, `$2` the anchor, `$3` the retained window's entry for this
+/// node or NULL.
+static DUAL_CUTOFF_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT ({ACCEPTED_CUTOFF_SQL}),({}),({})",
+        cut::OWN_CUT_SQL,
+        cut::PEER_HIGH_WATER_SQL
+    )
+});
 
 #[derive(Clone, Debug)]
 pub struct AppendResult {
@@ -144,6 +162,10 @@ pub struct Snapshot {
     pub payout_revision: i64,
     pub shares: Vec<AcceptedShare>,
     pub prior_balances: Vec<CarryForwardBalance>,
+    /// The dual-writer window's per-node cut (`window/cut.rs`); `None` in
+    /// single-writer mode, where the window is exactly 3.0's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<WindowCut>,
 }
 
 /// Immutable builder inputs; the issued/current revision belongs to the caller.
@@ -153,6 +175,12 @@ pub struct WindowRef {
     #[serde(with = "hex32")]
     pub prior_balances_digest: [u8; 32],
     pub shares: Option<ShareRange>,
+    /// The dual-writer window's per-node cut, which every re-read and proof of
+    /// the window applies (`window/cut.rs`). Absent from the JSON when `None`,
+    /// so a single-writer reference, and every document that holds one,
+    /// keeps its 3.0 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<WindowCut>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +291,7 @@ impl WindowRef {
             anchor_ms: snapshot.anchor_ms,
             prior_balances_digest: qbit_prism::prior_balances_digest(&snapshot.prior_balances),
             shares,
+            cut: snapshot.cut,
         })
     }
 }
@@ -390,6 +419,7 @@ impl Ledger {
                 first,
                 last,
                 window.anchor_ms,
+                window.cut.as_ref(),
                 &completion,
                 WindowRead::new(),
                 move |state: &mut WindowRead, shares| state.page(shares, range.share_count),
@@ -1195,7 +1225,35 @@ impl Ledger {
             .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
             .context("window difficulty overflow")?;
         ensure!(weight > 0, "network difficulty must be positive");
+        // A dual-writer frontend's windows carry a cut (`window/cut.rs`);
+        // a single writer's are exactly 3.0's.
+        let dual_writer_node = self
+            .dual_writer_identity()
+            .map(|identity| identity.node.index());
+        // The retained window's entry for this node bounds the own-cut probe
+        // below (`cut::OWN_CUT_SQL`); NULL without one.
+        let retained_own = match (dual_writer_node, prior.as_ref().and_then(|prior| prior.cut)) {
+            (Some(node), Some(cut)) => cut
+                .get(u8::try_from(node)?)?
+                .map(i64::try_from)
+                .transpose()?,
+            _ => None,
+        };
         let mut tx = self.begin().await?;
+        if dual_writer_node.is_some() {
+            // The cut reads probe the (origin_node, share_seq) index, the own
+            // one inside ORDER_LOCK; refuse before the locks rather than scan
+            // the ledger under them.
+            let indexed: bool = sqlx::query_scalar(cut::ORIGIN_INDEX_SQL)
+                .fetch_one(&mut *tx)
+                .await?;
+            if let Some(metrics) = self.metrics.as_deref() {
+                metrics.record_origin_index(indexed);
+            }
+            if !indexed {
+                return Err(cut::OriginIndexMissing.into());
+            }
+        }
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         let order = self
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Prepared)
@@ -1204,9 +1262,29 @@ impl Ledger {
         let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision").fetch_one(&mut *tx).await?;
         let anchor_ms: i64 = row.try_get("anchor_ms")?;
         let payout_revision: i64 = row.try_get("payout_revision")?;
-        let cutoff: i64 = sqlx::query_scalar(ACCEPTED_CUTOFF_SQL)
-            .fetch_one(&mut *tx)
-            .await?;
+        let (cutoff, own_bound, peer_high_water) = match dual_writer_node {
+            None => (
+                sqlx::query_scalar(ACCEPTED_CUTOFF_SQL)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                None,
+                None,
+            ),
+            Some(node) => {
+                let (cutoff, own, mark): (i64, Option<i64>, Option<i64>) =
+                    // Cached, as 3.0's cutoff is, so no plan is made
+                    // under ORDER_LOCK: a generic plan prunes the leaves
+                    // below the retained entry at executor start, which the
+                    // bounded-probe guard checks in both plan modes.
+                    sqlx::query_as(&DUAL_CUTOFF_SQL)
+                        .bind(node)
+                        .bind(anchor_ms)
+                        .bind(retained_own)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                (cutoff, own, mark)
+            }
+        };
         let rows = prior_balance_rows(&mut tx).await?;
         #[cfg(test)]
         let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
@@ -1250,14 +1328,40 @@ impl Ledger {
         // matches the rows, and a tag that is not the current writer's makes
         // the work prove its window before it is used.
         let timeline = WriterTimeline::read(&mut tx).await?;
+        // A dual-writer window's cut: the own entry read under ORDER_LOCK
+        // above, and the peer's, chosen against this anchor (`window/cut.rs`).
+        // The peer mark the window's cut used, and whether a peer row below
+        // it waits for a later anchor, which the refresh compares.
+        let (cut, peer) = match dual_writer_node {
+            Some(node) => {
+                let own = own_bound.map_or(Ok(None), cut::positive_entry)?;
+                let peer =
+                    cut::read_peer_cut(&mut tx, 1 - node, peer_high_water, anchor_ms).await?;
+                let cut = if node == 0 {
+                    WindowCut::new(own, peer.entry)?
+                } else {
+                    WindowCut::new(peer.entry, own)?
+                };
+                (Some(cut), peer)
+            }
+            None => (None, cut::PeerCut::default()),
+        };
         let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
         // Without a retired window there is nothing to advance from; the
         // report still says so, because how often that happens is part of
         // what the refresh path costs.
         let mut report = AcquisitionReport::full(WindowAcquisition::NoPrior);
         if let Some(prior) = prior {
-            match snapshot_delta::advance(&mut tx, prior, weight, anchor_ms, cutoff, &completion)
-                .await?
+            match snapshot_delta::advance(
+                &mut tx,
+                prior,
+                weight,
+                anchor_ms,
+                cutoff,
+                cut,
+                &completion,
+            )
+            .await?
             {
                 Advance::Advanced {
                     shares,
@@ -1272,6 +1376,7 @@ impl Ledger {
                                 payout_revision,
                                 shares,
                                 prior_balances: prior_balances.into_inner(),
+                                cut,
                             })
                         })
                         .await?;
@@ -1287,6 +1392,8 @@ impl Ledger {
                                 leaf: Some(leaf),
                                 acquisition: report,
                                 timeline,
+                                peer_mark: peer.mark,
+                                peer_pending: peer.pending,
                             })
                         })
                         .await;
@@ -1294,17 +1401,34 @@ impl Ledger {
                 Advance::Rejected(rejected) => report = rejected,
             }
         }
-        let before = snapshot_delta::leaf_witness(&mut tx, cutoff, cutoff, anchor_ms, None).await?;
+        // The window's top: the accepted cutoff, or with a cut the higher of
+        // its two entries, each a row of its node the cut admits.
+        let (top, cursor) = match cut.as_ref().map(WindowCut::top) {
+            None => (Some(cutoff), cursor),
+            Some(top) => {
+                let top = top.map(i64::try_from).transpose()?;
+                (top, top.unwrap_or(0) + 1)
+            }
+        };
+        let before = match top {
+            Some(top) => {
+                snapshot_delta::leaf_witness(&mut tx, top, top, anchor_ms, cut.as_ref(), None)
+                    .await?
+            }
+            None => None,
+        };
+        let page = format!(
+            "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 4096",
+            cut::window_eligibility_sql(2, cut.map(|_| 3))
+        );
         let mut scan = completion.own((Vec::<AcceptedShare>::new(), weight, cursor));
         while scan.1 > 0 {
-            let rows = sqlx::query(&format!(
-                "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 4096",
-                super::audit::anchored_eligibility_sql(2)
-            ))
-            .bind(scan.2)
-            .bind(anchor_ms)
-            .fetch_all(&mut *tx)
-            .await?;
+            let rows = sqlx::query(&page)
+                .bind(scan.2)
+                .bind(anchor_ms)
+                .bind_cut(cut.as_ref())?
+                .fetch_all(&mut *tx)
+                .await?;
             if rows.is_empty() {
                 break;
             }
@@ -1341,15 +1465,17 @@ impl Ledger {
                     payout_revision,
                     shares,
                     prior_balances: prior_balances.into_inner(),
+                    cut,
                 })
             })
             .await?;
-        let after = if let Some(first) = snapshot.shares.first() {
+        let after = if let (Some(first), Some(top)) = (snapshot.shares.first(), top) {
             snapshot_delta::leaf_witness(
                 &mut tx,
                 i64::try_from(first.share_seq)?,
-                cutoff,
+                top,
                 anchor_ms,
+                cut.as_ref(),
                 Some(i64::try_from(snapshot.shares.len())?),
             )
             .await?
@@ -1370,6 +1496,8 @@ impl Ledger {
                     leaf,
                     acquisition: report,
                     timeline,
+                    peer_mark: peer.mark,
+                    peer_pending: peer.pending,
                 })
             })
             .await
@@ -1518,8 +1646,9 @@ pub enum WindowHolding {
     /// a prefix of the range.
     PrefixPruned,
     /// The last row is absent, or is another share that does not match the
-    /// window's own predicate: this primary does not hold the history the
-    /// window was read from.
+    /// window's own predicate, or, in a dual-writer window, a node's entry
+    /// or the peer's rows under it are missing: this primary does not hold
+    /// the history the window was read from.
     NotHeld,
 }
 
@@ -1542,6 +1671,18 @@ pub enum WindowHolding {
 /// A reissued row can only match the predicate if the promoted host's clock
 /// runs behind the old primary's by more than the time from the anchor to
 /// its reissue. The landing's count and digest stay the proof either way.
+///
+/// **A dual-writer window** (one with a cut) holds rows from two logs, and
+/// its database has no physical standby (CONTRACT D-19): the rows it can
+/// lose are the newest of each log, to a restore. Own-log recovery brings
+/// back the own rows the peer had pulled, in `share_seq` order, and the
+/// peer sync pulls the peer's again from the restored mark. So the window is
+/// held when, besides its last row, this node's entry in the window's range
+/// is its row under the predicate (the own rows below it came back with it),
+/// and the peer sync's safe mark is at or above the peer's entry
+/// ([`cut::entries_held_sql`]). A rewound mark is [`WindowHolding::NotHeld`]
+/// whatever retention did; a missing entry row is only when the first row
+/// is present, since retention may have removed an entry under it.
 pub async fn probe_window_holding(
     connection: &mut sqlx::PgConnection,
     window: &WindowRef,
@@ -1550,21 +1691,43 @@ pub async fn probe_window_holding(
         return Ok(WindowHolding::Held);
     };
     let (first, last) = range.bounds()?;
-    let (first_present, last_held): (bool, bool) = sqlx::query_as(&format!(
+    let endpoints = format!(
         "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1),\
          EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2 AND {})",
-        super::audit::anchored_eligibility_sql(3)
-    ))
-    .bind(first)
-    .bind(last)
-    .bind(window.anchor_ms)
-    .fetch_one(&mut *connection)
-    .await?;
-    Ok(match (last_held, first_present) {
-        (false, _) => WindowHolding::NotHeld,
-        (true, false) => WindowHolding::PrefixPruned,
-        (true, true) => WindowHolding::Held,
-    })
+        cut::window_eligibility_sql(3, window.cut.map(|_| 4))
+    );
+    let (first_present, last_held, entries_present, peer_rows_present) = match &window.cut {
+        None => {
+            let (first_present, last_held): (bool, bool) = sqlx::query_as(&endpoints)
+                .bind(first)
+                .bind(last)
+                .bind(window.anchor_ms)
+                .fetch_one(&mut *connection)
+                .await?;
+            (first_present, last_held, true, true)
+        }
+        Some(cut) => {
+            sqlx::query_as(&format!("{endpoints},{}", cut::entries_held_sql(1, 3, 4)))
+                .bind(first)
+                .bind(last)
+                .bind(window.anchor_ms)
+                .bind_cut(Some(cut))?
+                .fetch_one(&mut *connection)
+                .await?
+        }
+    };
+    Ok(
+        match (
+            last_held && peer_rows_present,
+            first_present,
+            entries_present,
+        ) {
+            (false, _, _) => WindowHolding::NotHeld,
+            (true, false, _) => WindowHolding::PrefixPruned,
+            (true, true, false) => WindowHolding::NotHeld,
+            (true, true, true) => WindowHolding::Held,
+        },
+    )
 }
 
 /// A block candidate refused before its enqueue: the primary that would hold
@@ -1618,6 +1781,10 @@ impl std::error::Error for WindowNotHeld {}
 /// connection's `statement_timeout`, and dropping the future between pages
 /// rolls the caller's transaction back and leaves at most one page of blocking
 /// work running detached.
+///
+/// It applies 3.0's predicate, with no dual-writer cut: a dual-writer
+/// window's range holds peer rows the window excludes, so it is read through
+/// [`Ledger::read_window`], which applies the reference's cut.
 pub async fn read_range_paged<S, F>(
     connection: &mut sqlx::PgConnection,
     first: i64,
@@ -1635,6 +1802,7 @@ where
         first,
         last,
         anchor_ms,
+        None,
         &ReadAdmission::default(),
         state,
         consume,
@@ -1645,11 +1813,16 @@ where
 
 /// Keep the completion owner attached to the accumulated state until its
 /// caller finishes validation and commits, or hands that state to cleanup.
+/// A dual-writer window's `cut` bounds each node's rows as well
+/// (`window/cut.rs`); without one the page statement is 3.0's.
+// The parameter list is read_range_paged's plus the cut and the completion owner.
+#[allow(clippy::too_many_arguments)]
 async fn read_range_owned<S, F>(
     connection: &mut sqlx::PgConnection,
     first: i64,
     last: i64,
     anchor_ms: i64,
+    cut: Option<&WindowCut>,
     completion: &ReadAdmission,
     state: S,
     consume: F,
@@ -1672,7 +1845,8 @@ where
     // reads the whole remaining range on every page, forty times the cost
     // of the ordered scan. Planning a page costs a fraction of a millisecond.
     let page = format!(
-        "{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY share_seq LIMIT {WINDOW_PAGE_ROWS}"
+        "{SELECT_SHARE} WHERE accepted AND share_seq>$1 AND share_seq<=$2 AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000){} ORDER BY share_seq LIMIT {WINDOW_PAGE_ROWS}",
+        cut::cut_clause(cut.map(|_| 4), None)
     );
     while carried.get().2 < last {
         let rows = sqlx::query(&page)
@@ -1680,6 +1854,7 @@ where
             .bind(carried.get().2)
             .bind(last)
             .bind(anchor_ms)
+            .bind_cut(cut)?
             .fetch_all(&mut *connection)
             .await?;
         if rows.is_empty() {

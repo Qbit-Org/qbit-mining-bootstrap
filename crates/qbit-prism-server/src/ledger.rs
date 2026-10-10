@@ -91,8 +91,9 @@ pub use difficulty::WorkerDifficulty;
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
 pub use window::{
     probe_share_rows, probe_window_holding, put_balance_snapshot, read_range_paged, AppendResult,
-    BalanceSource, ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot,
-    Window, WindowError, WindowHolding, WindowNotHeld, WindowRef, WriterTimeline,
+    BalanceSource, ChainObservationState, ChainTransition, OriginIndexMissing, PayoutState,
+    ShareRange, Snapshot, Window, WindowError, WindowHolding, WindowNotHeld, WindowRef,
+    WriterTimeline,
 };
 use window::{read_prior_balances, share_from_row};
 pub(crate) use window::{

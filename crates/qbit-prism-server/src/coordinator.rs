@@ -1598,6 +1598,9 @@ impl Coordinator {
                 probe.payout_state.payout_revision,
                 probe.payout_state.prior_balances_digest,
                 probe.accepted_share_seq,
+                cached_window
+                    .as_ref()
+                    .is_some_and(|window| window.peer_mark() != probe.peer_mark),
                 cached_within_reanchor,
                 &fee,
             )
@@ -1608,7 +1611,10 @@ impl Coordinator {
             // A new share invalidates build inputs, but does not itself replace
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
-            // reads the latest shares. Empty-to-first-share remains immediate.
+            // reads the latest shares. Empty-to-first-share remains immediate,
+            // and in dual-writer mode so does empty-to-first-peer-share: the
+            // peer sync's mark can move while the accepted cutoff does not,
+            // with the peer's newly eligible rows all below it.
             // A new writer timeline does replace it: a promotion can lose the
             // window's rows while revision, balances and template stay equal
             // (#619). Issuance re-checks the timeline at every admission, so a
@@ -1616,6 +1622,7 @@ impl Coordinator {
             if cached_window.as_ref().is_some_and(|window| {
                 window.reference == current.window
                     && window.within_reanchor_interval(self.config.snapshot_interval)
+                    && (current.bundle.is_some() || window.peer_mark() == probe.peer_mark)
             }) && current.timeline == Some(probe.timeline)
                 && current.fee == fee
                 && current.fingerprint == fingerprint
@@ -1698,6 +1705,7 @@ impl Coordinator {
                 probe.accepted_share_seq,
                 probe.payout_state,
                 probe.timeline,
+                probe.peer_mark,
                 self.config.snapshot_interval,
             )
         } else {
@@ -1770,14 +1778,21 @@ impl Coordinator {
                 admitted.0.snapshot.payout_revision,
                 admitted.0.reference.prior_balances_digest,
                 admitted.0.snapshot.share_seq,
+                current
+                    .as_ref()
+                    .is_some_and(|current| current.window.cut != admitted.0.reference.cut),
                 cached_within_reanchor,
                 &fee,
             )
         });
+        // A dual-writer window's rows are its cutoff's and its cut's: the
+        // peer's rows can change it under an equal cutoff. A single writer's
+        // cut is always None.
         let equivalent = current.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
                 && current.timeline == Some(admitted.0.timeline)
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
+                && current.window.cut == admitted.0.reference.cut
                 && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
                 && current.window.prior_balances_digest
                     == admitted.0.reference.prior_balances_digest
@@ -1921,6 +1936,7 @@ impl Coordinator {
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_hint_prune = Instant::now();
+        let mut origin_index_alert = refresh_window::AlertEveryMinute::default();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
             // One definite accounting-only refusal may retry immediately with
@@ -1934,11 +1950,24 @@ impl Coordinator {
                 match self.refresh_once().await {
                     Ok(()) => {
                         *self.last_error.write().await = None;
+                        origin_index_alert.clear();
                         break;
                     }
                     Err(error) => {
                         let retry = error.is::<crate::ledger::ChainObservationRetry>();
-                        tracing::warn!(%error,"template refresh deferred");
+                        if error.is::<crate::ledger::OriginIndexMissing>() {
+                            // Every tick and wake repeats it until the index
+                            // is valid: alert once a minute, while the
+                            // dual_writer_origin_index_missing gauge holds 1.
+                            if origin_index_alert.due(Instant::now()) {
+                                tracing::error!(
+                                    %error,
+                                    "ALERT: template refresh deferred: this dual-writer frontend publishes no new work until migration 031's index is valid"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(%error,"template refresh deferred");
+                        }
                         *self.last_error.write().await = Some(error.to_string());
                         if !retry {
                             break;
@@ -4086,7 +4115,10 @@ mod offer_not_executed_tests;
 /// (tip, revision, balances, reanchor, shares, fee, then template) when
 /// several changed on one poll; the reuse test checks them in another order.
 /// The revision, balances digest and share sequence are the ledger probe's
-/// on a same-template poll and the admitted window's on a new template. A
+/// on a same-template poll and the admitted window's on a new template.
+/// `peer_rows` says whether a dual-writer window's peer rows may have moved
+/// without the share sequence: the probe's peer mark against the cached
+/// window's, or the admitted window's cut against the published one's. A
 /// missing cached window with published work is labelled `reanchor`. A
 /// label for the refresh metric and log, never a decision input.
 #[allow(clippy::too_many_arguments)]
@@ -4097,6 +4129,7 @@ fn refresh_trigger(
     payout_revision: i64,
     prior_balances_digest: [u8; 32],
     share_seq: u64,
+    peer_rows: bool,
     window_within_reanchor: bool,
     fee: &Option<FanoutFeeRatePolicy>,
 ) -> RefreshTrigger {
@@ -4109,7 +4142,7 @@ fn refresh_trigger(
         revision: current.snapshot.payout_revision != payout_revision,
         balances: current.window.prior_balances_digest != prior_balances_digest,
         window_within_reanchor,
-        shares: current.bundle.is_none() && current.snapshot.share_seq != share_seq,
+        shares: current.bundle.is_none() && (current.snapshot.share_seq != share_seq || peer_rows),
         fee: current.fee != *fee,
     })
 }

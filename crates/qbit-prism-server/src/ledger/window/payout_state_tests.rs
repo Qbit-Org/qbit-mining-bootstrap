@@ -141,10 +141,10 @@ async fn revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_con
                 // weaker isolation, with the writer committing before SELECT 2.
                 let mut tx = source.begin().await?;
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
-                let (payout_revision, timeline) = refresh_revision(&mut tx).await?;
+                let (payout_revision, timeline, _) = refresh_revision(&mut tx, false).await?;
                 let (accepted_share_seq, prior_balances_digest) = refresh_balances(&mut tx, &ReadAdmission::default()).await?;
                 tx.commit().await?;
-                Ok(RefreshProbe { payout_state: PayoutState { payout_revision, prior_balances_digest }, accepted_share_seq, timeline })
+                Ok(RefreshProbe { payout_state: PayoutState { payout_revision, prior_balances_digest }, accepted_share_seq, timeline, peer_mark: None })
             }));
             wait_for_advisory_gate(admin, key).await?;
             sqlx::raw_sql("UPDATE probe_state_source SET payout_revision=payout_revision+1; UPDATE qbit_payout_carry_forward_current SET balance_sats=balance_sats+1")

@@ -1,3 +1,4 @@
+use super::window::cut::{self, BindCut, WindowCut};
 use super::*;
 use qbit_prism::FoundBlock;
 use sqlx::{pool::PoolConnection, PgConnection};
@@ -278,16 +279,23 @@ async fn materialize_audit_row_with_metrics<'a>(
     // lets the public read pool apply the remaining request deadline to each;
     // retaining one transaction would give a late range scan the first
     // query's full budget.
-    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(&mut *reader.connection(metrics).await?).await?;
+    // A dual-writer window's cut (migration 028) bounds each node's rows of
+    // the range: rows a peer synced after the window was taken are outside it.
+    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares,cut_seq_0,cut_seq_1 FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(&mut *reader.connection(metrics).await?).await?;
     let inline: Option<Value> = snapshot.try_get("inline_shares")?;
     let shares: Vec<AcceptedShare> = if let Some(inline) = inline {
         serde_json::from_value(inline)?
     } else {
+        let cut = cut::cut_from_columns(
+            snapshot.try_get("cut_seq_0")?,
+            snapshot.try_get("cut_seq_1")?,
+        )?;
         read_range(
             &mut reader,
             snapshot.try_get("first_share_seq")?,
             snapshot.try_get("last_share_seq")?,
             snapshot.try_get("anchor_ms")?,
+            cut.as_ref(),
             metrics,
         )
         .await?
@@ -419,6 +427,9 @@ pub(super) struct AuditSnapshotWrite {
     /// exemption below is decided by the reference the block committed to
     /// rather than by a share's id and job id.
     pub inline: Option<Value>,
+    /// The window reference's dual-writer cut; `None` in single-writer mode.
+    /// Every proof below and the stored row apply it (`window/cut.rs`).
+    pub cut: Option<WindowCut>,
     pub shares: std::sync::Arc<Vec<AcceptedShare>>,
 }
 
@@ -430,6 +441,7 @@ const VERIFY_PAGE_ROWS: i64 = 4096;
 
 /// The same anchored eligibility at selection, proof, persistence and readback.
 /// `anchor_parameter` is a SQL bind position supplied only by these call sites.
+/// A dual-writer window adds its cut's clause (`window/cut.rs`).
 pub(super) fn anchored_eligibility_sql(anchor_parameter: usize) -> String {
     format!("accepted AND accepted_at<=to_timestamp(${anchor_parameter}::double precision/1000) AND job_issued_at<=to_timestamp(${anchor_parameter}::double precision/1000)")
 }
@@ -492,6 +504,14 @@ fn oldest_boundary(weight: u128, shares: &[AcceptedShare]) -> Result<OldestBound
 /// change, so nothing this proves can change before the transaction; the
 /// in-transaction count guard in [`persist_audit_snapshot`] covers cardinality
 /// again under the lock. It does not establish the boundaries by itself.
+///
+/// **Dual-writer windows.** Every probe applies the window's cut as well as
+/// its anchor (`window/cut.rs`), so "the immutable ledger holds for its
+/// issued anchor" stays true when a peer's rows keep arriving: a peer row that
+/// reached this database after the window was taken is above the peer's cut
+/// entry, so it is neither in the range nor a newer or older eligible row,
+/// whatever its timestamps say. The newer probe is then also bounded above by
+/// the cut's highest entry. Without a cut every statement is 3.0's.
 // Observe each checkout at its statement boundary, before comparison or folding.
 pub(super) async fn verify_durable_range(
     pool: &PgPool,
@@ -502,12 +522,23 @@ pub(super) async fn verify_durable_range(
         snapshot.share_count > 0,
         "audit share snapshot cannot be empty"
     );
+    let cut = snapshot.cut.as_ref();
+    // The cut's highest entry: no row above it is the window's. `None` with a
+    // cut that admits no row at all.
+    let top = cut
+        .map(|cut| cut.top().map(i64::try_from).transpose())
+        .transpose()?;
     if snapshot.inline.is_some() {
+        if top == Some(None) {
+            // A cut that admits no row: nothing can be omitted.
+            return Ok(());
+        }
         let any: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE {})",
-            anchored_eligibility_sql(1)
+            cut::window_eligibility_sql(1, cut.map(|_| 2))
         ))
         .bind(snapshot.anchor_ms)
+        .bind_cut(cut)?
         .fetch_one(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?)
         .await?;
         ensure!(!any, "bootstrap audit window omits canonical shares");
@@ -529,9 +560,9 @@ pub(super) async fn verify_durable_range(
         // Planned per page with its bounds, as `read_range_owned` does
         // (`ledger/window.rs`): a cached generic plan for a `share_seq` range
         // sorts the partitioned ledger instead of walking it in order.
-        let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", anchored_eligibility_sql(3)))
+        let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", cut::window_eligibility_sql(3, cut.map(|_| 5))))
             .persistent(false)
-            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).bind_cut(cut)?.fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         if rows.is_empty() {
             break;
         }
@@ -569,8 +600,19 @@ pub(super) async fn verify_durable_range(
     // and job_issued_at <= accepted_at, guaranteed by native append under the
     // ordering lock but not by legacy/raw rows. Those rows may hide a later
     // eligible share behind an ineligible one, so keep both timestamp filters.
-    let newer: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq>$1 ORDER BY share_seq LIMIT 1", anchored_eligibility_sql(2)))
-        .bind(last).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+    //
+    // With a cut the probe is bounded on both sides: nothing above the cut's
+    // highest entry can be the window's.
+    let newer: Option<i64> = match (cut, top) {
+        (Some(_), Some(Some(top))) => sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq>$1 AND share_seq<=$5 ORDER BY share_seq LIMIT 1", cut::window_eligibility_sql(2, Some(3))))
+            .persistent(false)
+            .bind(last).bind(anchor).bind_cut(cut)?.bind(top).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?,
+        // A cut that admits no row has no newer row; the range check above
+        // already refused a non-empty window under it.
+        (Some(_), _) => None,
+        (None, _) => sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq>$1 ORDER BY share_seq LIMIT 1", anchored_eligibility_sql(2)))
+            .bind(last).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?,
+    };
     ensure!(
         newer.is_none(),
         "audit share snapshot omits newest canonical share"
@@ -584,8 +626,8 @@ pub(super) async fn verify_durable_range(
     })
     .await??;
     if boundary == OldestBoundary::Partial {
-        let older: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 1", anchored_eligibility_sql(2)))
-            .bind(snapshot.first_share_seq).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+        let older: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 1", cut::window_eligibility_sql(2, cut.map(|_| 3))))
+            .bind(snapshot.first_share_seq).bind(anchor).bind_cut(cut)?.fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
         ensure!(
             older.is_none(),
             "audit share snapshot omits oldest canonical shares"
@@ -610,14 +652,16 @@ pub(super) async fn persist_audit_snapshot(
         snapshot.share_count > 0,
         "audit share snapshot cannot be empty"
     );
+    let cut = snapshot.cut.as_ref();
     if snapshot.inline.is_none() {
         let durable: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM qbit_share_ledger WHERE {} AND share_seq BETWEEN $1 AND $2",
-            anchored_eligibility_sql(3)
+            cut::window_eligibility_sql(3, cut.map(|_| 4))
         ))
         .bind(snapshot.first_share_seq)
         .bind(snapshot.last_share_seq)
         .bind(snapshot.anchor_ms)
+        .bind_cut(cut)?
         .fetch_one(&mut **tx)
         .await?;
         ensure!(
@@ -625,30 +669,45 @@ pub(super) async fn persist_audit_snapshot(
             "audit share snapshot count differs from canonical database history"
         );
     }
-    sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
-        .bind(&snapshot.digest).bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).bind(snapshot.share_count).bind(&snapshot.inline).execute(&mut **tx).await?;
+    // A dual-writer window stores its cut with the range (migration 028), and
+    // reconstruction reads the range under it. A window without one writes
+    // the 3.0 row, its cut columns NULL.
+    match cut {
+        None => {
+            sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+                .bind(&snapshot.digest).bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).bind(snapshot.share_count).bind(&snapshot.inline).execute(&mut **tx).await?;
+        }
+        Some(_) => {
+            let (cut_seq_0, cut_seq_1) = cut::cut_columns(cut)?;
+            sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares,cut_seq_0,cut_seq_1) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING")
+                .bind(&snapshot.digest).bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).bind(snapshot.share_count).bind(&snapshot.inline).bind(cut_seq_0).bind(cut_seq_1).execute(&mut **tx).await?;
+        }
+    }
     Ok(snapshot.digest.clone())
 }
 
 /// The unpaged range read the API's `materialize_audit_row` keeps. Landing no
-/// longer uses it; its re-read is paged.
+/// longer uses it; its re-read is paged. A dual-writer window's `cut` bounds
+/// each node's rows of the range too.
 async fn read_range(
     reader: &mut AuditReader<'_>,
     first: i64,
     last: i64,
     anchor: i64,
+    cut: Option<&WindowCut>,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<Vec<AcceptedShare>> {
     // Release the range checkout at the SQL boundary, before decoding rows.
     let rows = sqlx::query(&format!(
         "{SELECT_SHARE} WHERE {} AND share_seq BETWEEN $1 AND $2 ORDER BY share_seq",
-        anchored_eligibility_sql(3)
+        cut::window_eligibility_sql(3, cut.map(|_| 4))
     ))
     // Planned with its bounds; see `read_range_owned` in `ledger/window.rs`.
     .persistent(false)
     .bind(first)
     .bind(last)
     .bind(anchor)
+    .bind_cut(cut)?
     .fetch_all(&mut *reader.connection(metrics).await?)
     .await?;
     rows.iter().map(share_from_row).collect()

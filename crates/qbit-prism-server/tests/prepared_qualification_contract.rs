@@ -68,6 +68,7 @@ fn compact_payload(nonempty: bool) -> Value {
             vec![]
         },
         prior_balances: vec![],
+        cut: None,
     };
     let template = PreparedTemplate::encode(&json!({
         "previousblockhash": "ab".repeat(32), "height": 101, "transactions": []

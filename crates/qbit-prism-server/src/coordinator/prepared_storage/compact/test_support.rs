@@ -226,6 +226,7 @@ impl Coordinator {
                     payout_revision: stored.record.payout_revision,
                     shares: window.shares,
                     prior_balances: stored.prior_balances,
+                    cut: stored.record.window.cut,
                 });
                 drop(window.prior_balances);
                 CompactOwner::new(CompactInputs {

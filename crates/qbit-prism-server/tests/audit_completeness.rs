@@ -79,7 +79,7 @@ async fn counts_distinguish_legacy_imports_and_reconstructible_native_bodies() -
              CREATE TEMP TABLE qbit_prism_audit_snapshots (
                  snapshot_sha256 text PRIMARY KEY, first_share_seq bigint,
                  last_share_seq bigint, anchor_ms bigint, share_count bigint,
-                 inline_shares jsonb);",
+                 inline_shares jsonb, cut_seq_0 bigint, cut_seq_1 bigint);",
         )
         .execute(&pool)
         .await?;

@@ -385,10 +385,15 @@ pub fn build_claim_parts(
         _ => bail!("candidate bootstrap share disagrees with its window reference"),
     };
     let witnesses = crate::codec::witness_merkle_leaves_from_block(&candidate.block_bytes)?;
+    // The cut the coinbase committed: the reference's for a dual-writer
+    // window, none for a single writer's or the bootstrap window's, whose one
+    // share is synthetic (`coordinator/bundle_build.rs` builds the same).
+    let window_cut = candidate.window.shares.and(candidate.window.cut);
     let body = if let Some(ctv) = &candidate.ctv {
-        qbit_prism::build_audit_bundle_body_with_ctv_settlement_options(
+        qbit_prism::build_audit_bundle_body_with_ctv_settlement_options_parallel(
             &shares,
             candidate.found_block.clone(),
+            window_cut,
             prior_balances,
             candidate.payout_policy.clone(),
             ctv.direct_floor_sats,
@@ -398,17 +403,20 @@ pub fn build_claim_parts(
             witnesses,
             manifest_key,
             ledger_key,
+            qbit_prism::Parallelism::serial(),
         )?
     } else {
-        qbit_prism::build_audit_bundle_body_with_coinbase_options(
+        qbit_prism::build_audit_bundle_body_with_coinbase_options_parallel(
             &shares,
             candidate.found_block.clone(),
+            window_cut,
             prior_balances,
             candidate.payout_policy.clone(),
             Some(candidate.coinbase_suffix_hex.clone()),
             witnesses,
             manifest_key,
             ledger_key,
+            qbit_prism::Parallelism::serial(),
         )?
     };
     Ok(ClaimParts {
