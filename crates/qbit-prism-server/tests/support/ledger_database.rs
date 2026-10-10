@@ -127,8 +127,51 @@ impl FixtureDatabase {
     /// while any session is connected to this database, so callers close
     /// their pools to it first.
     pub async fn copy(&self, raw: &str) -> Result<Self> {
+        self.end_template_sessions().await?;
         let (name, _) = generated_names("copy_");
         Self::create(raw, &name, &self.schema, Some(&self.name)).await
+    }
+
+    /// Before a copy: wait up to 10 s for every other session on this
+    /// database to end, then end what remains, naming it on stderr. The
+    /// caller closed its pools; anything left is background work it no
+    /// longer owns, which a busy server can take long to see go.
+    async fn end_template_sessions(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut ended = false;
+        loop {
+            let sessions: Vec<String> = sqlx::query_scalar(
+                "SELECT format('pid %s, %s, %s: %s',pid,application_name,state,left(query,160)) \
+                 FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()",
+            )
+            .bind(&self.name)
+            .fetch_all(&self.admin)
+            .await?;
+            if sessions.is_empty() {
+                return Ok(());
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                ensure!(
+                    !ended,
+                    "sessions on {} outlived pg_terminate_backend: {sessions:?}",
+                    self.name
+                );
+                eprintln!(
+                    "fixture copy: ending {} session(s) still on {} after 10 s: {sessions:?}",
+                    sessions.len(),
+                    self.name
+                );
+                sqlx::query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname=$1 AND pid<>pg_backend_pid()",
+                )
+                .bind(&self.name)
+                .execute(&self.admin)
+                .await?;
+                ended = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     async fn create(raw: &str, name: &str, schema: &str, template: Option<&str>) -> Result<Self> {
@@ -192,27 +235,7 @@ impl FixtureDatabase {
             armed: true,
             creation_unknown: false,
         };
-        let mut created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
-        // A copy refuses while a session is still connected to its template
-        // (55006), and a backend whose client has just closed its pool can
-        // linger a moment on a busy server, so a copy waits for it briefly.
-        // Nothing was created, so the retry cannot meet its own database.
-        if template.is_some() {
-            let mut attempts = 0;
-            while attempts < 50
-                && created.as_ref().err().is_some_and(|error| {
-                    error
-                        .as_database_error()
-                        .and_then(|error| error.code())
-                        .as_deref()
-                        == Some("55006")
-                })
-            {
-                attempts += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
-            }
-        }
+        let created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
         // Return the pool's only connection before any cleanup needs it.
         drop(connection);
         if let Err(error) = created {

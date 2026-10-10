@@ -185,10 +185,11 @@ impl Fixture {
             .set_node_identity(NODE.node, "carry_owner_adoption")
             .await?;
         // The fixture's shares are the peer's, as peer sync would have
-        // copied them: mark them pulled, as the sync's share cursor does, so
-        // the window cut admits them (D-14).
+        // copied them: mark them pulled, as a clean pull leaves the sync's
+        // share cursor (nothing refused), so the window cut admits them
+        // (D-14).
         sqlx::query(
-            "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) SELECT 'shares',$1,max(share_seq),max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1 ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through,ingested_through=EXCLUDED.ingested_through",
+            "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) SELECT 'shares',$1,max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1 ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through",
         )
         .bind(NODE.node.peer().index())
         .execute(&pool)
@@ -1340,7 +1341,8 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
 /// the one the block's coinbase commits to, are each refused for that
 /// reason; with no record left on the parent, none is tried. Nothing lands,
 /// and every pass reports the block again. Control: once its record is back,
-/// the same block adopts from it.
+/// the adoption loop adopts the same block from it, but not before the
+/// own-log latch is set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pool_block_no_held_prepared_record_rebuilds_is_reported_and_lands_nothing() -> Result<()>
 {
@@ -1477,17 +1479,59 @@ async fn refused(f: &Fixture) -> Result<()> {
         "a refused adoption landed rows or moved the revision"
     );
 
-    // Control: with the block's own record back, the next pass adopts it.
+    // Control: with the block's own record back, the adoption loop adopts
+    // it, but only once the own-log latch is set (D-8): an adopted block's
+    // rows are this node's own.
     sqlx::query(
         "INSERT INTO qbit_prism_jobs SELECT * FROM jsonb_populate_record(NULL::qbit_prism_jobs,$1)",
     )
     .bind(&kept)
     .execute(pool)
     .await?;
-    let adoptions = c.adoption_pass(&mut state).await?;
+    let (sync, status) = PeerSyncPublisher::new();
     ensure!(
-        adoptions == [landed(&hash, &found_on.storage_key)],
-        "the block did not adopt once its record was back: {adoptions:?}"
+        c.peer_sync.set(status).is_ok(),
+        "the fixture's coordinator already has a peer sync status"
+    );
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let adoption = tokio::spawn(c.clone().adoption_loop(shutdown));
+    // Without the wait, the loop's first pass would adopt at once.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    ensure!(
+        held_rows(pool, &hash).await? == 0 && !adoption.is_finished(),
+        "the adoption loop landed rows, or ended, before the own-log latch was set"
+    );
+    sync.update(|status| status.own_log_caught_up = true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut in_time = true;
+    while held_rows(pool, &hash).await? == 0 {
+        if std::time::Instant::now() >= deadline {
+            in_time = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop.send_replace(true);
+    adoption.await?;
+    if !in_time {
+        // The loop only logs a failed pass: show what one reports now.
+        let pass = match c.adoption_pass(&mut AdoptionState::default()).await {
+            Ok(adoptions) => format!("{adoptions:?}"),
+            Err(error) => format!("{error:#}"),
+        };
+        bail!("the adoption loop did not adopt the block within 60 s of the own-log latch; a pass now reports {pass}");
+    }
+    // The loop landed it from the block's own record: adopting it again
+    // compares that audit and rewrites or adds nothing.
+    let versions = row_versions(pool, &hash).await?;
+    let held = held_rows(pool, &hash).await?;
+    ensure!(
+        c.adopt_block(&hash).await? == landed(&hash, &found_on.storage_key),
+        "the loop did not adopt the block from the record it was found on"
+    );
+    ensure!(
+        row_versions(pool, &hash).await? == versions && held_rows(pool, &hash).await? == held,
+        "adopting the loop's landing again rewrote or added rows"
     );
     let adopted = block_state(pool, &hash).await?;
     ensure!(

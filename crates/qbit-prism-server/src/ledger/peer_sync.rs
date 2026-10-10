@@ -135,6 +135,22 @@ const BLOCK_FACTS: &[&str] = &[
     "payout_manifest_sha256",
     "as_issued_audit_sha256",
 ];
+/// A digest of landed block `b`'s [`BLOCK_FACTS`] and its audit digest,
+/// everything [`Ledger::apply_block`] compares for a block held already,
+/// computed alike on either node: own-log recovery compares it to tell a
+/// block held here with other facts from one held the same.
+fn block_facts_digest() -> String {
+    let pairs = BLOCK_FACTS
+        .iter()
+        .map(|fact| format!("'{fact}',b.{fact}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "md5(jsonb_build_array(jsonb_build_object({pairs}),(SELECT a.audit_bundle_sha256 \
+         FROM qbit_pool_audit_bundles a WHERE a.block_hash=b.block_hash))::text)"
+    )
+}
+
 /// The content-determined columns of an audit snapshot (D-15): windows with
 /// one share array share one row, whose anchor, cut, origin and creation
 /// time may differ.
@@ -226,12 +242,16 @@ pub struct PeerFacts {
 }
 
 /// The peer's cursors over this node's streams: positions in this node's
-/// key spaces that the peer has scanned through.
+/// key spaces that the peer has scanned through, and, for shares and
+/// prepared jobs, the highest row of this node's it refused as a conflict,
+/// quarantined there for good. It holds every one it scanned above that.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerCursors {
     pub shares: Option<i64>,
     pub blocks: Option<i64>,
     pub prepared: Option<i64>,
+    pub shares_refused: Option<i64>,
+    pub prepared_refused: Option<i64>,
 }
 
 /// One pull of share rows: the peer rows in `(after, through]`, their header
@@ -340,16 +360,19 @@ pub mod peer {
 
     /// How far the peer has pulled this node's streams.
     pub async fn cursors(connection: &mut PgConnection) -> Result<PeerCursors> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT stream,scanned_through FROM qbit_prism_peer_sync_cursors")
-                .fetch_all(&mut *connection)
-                .await?;
+        let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT stream,scanned_through,ingested_through FROM qbit_prism_peer_sync_cursors",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
         let mut cursors = PeerCursors::default();
-        for (stream, position) in rows {
+        for (stream, position, refused) in rows {
             match stream.as_str() {
-                SHARES => cursors.shares = Some(position),
+                SHARES => (cursors.shares, cursors.shares_refused) = (Some(position), refused),
                 BLOCKS => cursors.blocks = Some(position),
-                PREPARED => cursors.prepared = Some(position),
+                PREPARED => {
+                    (cursors.prepared, cursors.prepared_refused) = (Some(position), refused)
+                }
                 _ => {}
             }
         }
@@ -504,17 +527,10 @@ pub mod peer {
         Ok(taken.then_some(position))
     }
 
-    /// Landed blocks `origin` wrote with `sync_seq` in `(after, through]`,
-    /// at most `limit`, each with every row its landing wrote.
-    pub async fn blocks(
-        connection: &mut PgConnection,
-        origin: NodeIndex,
-        after: i64,
-        through: Option<i64>,
-        limit: i64,
-    ) -> Result<Vec<BlockBundle>> {
-        let rows = sqlx::query(
-            "SELECT b.sync_seq,b.block_hash,to_jsonb(b) AS block,\
+    /// Each landed block `b` that `origin` ($1) wrote, with every row its
+    /// landing wrote, as [`BlockBundle`] reads it; the caller completes the
+    /// `WHERE` clause.
+    const BLOCK_BUNDLE: &str = "SELECT b.sync_seq,b.block_hash,to_jsonb(b) AS block,\
              (SELECT to_jsonb(a) FROM qbit_pool_audit_bundles a WHERE a.block_hash=b.block_hash) AS bundle,\
              (SELECT to_jsonb(s) FROM qbit_prism_audit_snapshots s WHERE s.snapshot_sha256=\
                 (SELECT a.share_snapshot_sha256 FROM qbit_pool_audit_bundles a WHERE a.block_hash=b.block_hash)) AS snapshot,\
@@ -522,15 +538,9 @@ pub mod peer {
              COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.carry_forward_seq) FROM qbit_payout_carry_forward c WHERE c.block_hash=b.block_hash),'[]'::jsonb) AS carries,\
              (SELECT to_jsonb(f) FROM qbit_ctv_fanout_sets f WHERE f.block_hash=b.block_hash) AS fanout_set,\
              COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY r.chunk_index) FROM qbit_ctv_fanout_artifacts r WHERE r.block_hash=b.block_hash),'[]'::jsonb) AS artifacts \
-             FROM qbit_pool_blocks b WHERE b.origin_node=$1 AND b.sync_seq>$2 \
-             AND b.sync_seq<=$3 ORDER BY b.sync_seq LIMIT $4",
-        )
-        .bind(origin.index())
-        .bind(after)
-        .bind(through.unwrap_or(i64::MAX))
-        .bind(limit)
-        .fetch_all(&mut *connection)
-        .await?;
+             FROM qbit_pool_blocks b WHERE b.origin_node=$1 AND ";
+
+    fn block_bundles(rows: &[sqlx::postgres::PgRow]) -> Result<Vec<BlockBundle>> {
         rows.iter()
             .map(|row| {
                 Ok(BlockBundle {
@@ -548,18 +558,82 @@ pub mod peer {
             .collect()
     }
 
+    /// Landed blocks `origin` wrote with `sync_seq` in `(after, through]`,
+    /// at most `limit`, each with every row its landing wrote.
+    pub async fn blocks(
+        connection: &mut PgConnection,
+        origin: NodeIndex,
+        after: i64,
+        through: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<BlockBundle>> {
+        let rows = sqlx::query(&format!(
+            "{BLOCK_BUNDLE}b.sync_seq>$2 AND b.sync_seq<=$3 ORDER BY b.sync_seq LIMIT $4"
+        ))
+        .bind(origin.index())
+        .bind(after)
+        .bind(through.unwrap_or(i64::MAX))
+        .bind(limit)
+        .fetch_all(&mut *connection)
+        .await?;
+        block_bundles(&rows)
+    }
+
+    /// The landed blocks `origin` wrote among `hashes`, each with every row
+    /// its landing wrote, in `sync_seq` order.
+    pub async fn blocks_with_hashes(
+        connection: &mut PgConnection,
+        origin: NodeIndex,
+        hashes: &[String],
+    ) -> Result<Vec<BlockBundle>> {
+        let rows = sqlx::query(&format!(
+            "{BLOCK_BUNDLE}b.block_hash=ANY($2) ORDER BY b.sync_seq"
+        ))
+        .bind(origin.index())
+        .bind(hashes)
+        .fetch_all(&mut *connection)
+        .await?;
+        block_bundles(&rows)
+    }
+
+    /// The `sync_seq`, hash and facts digest of each landed block `origin`
+    /// wrote with `sync_seq` above `after`, at most `limit`, in `sync_seq`
+    /// order: what own-log recovery compares before it reads any block
+    /// whole.
+    pub async fn block_keys(
+        connection: &mut PgConnection,
+        origin: NodeIndex,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, String)>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT b.sync_seq,b.block_hash,{} FROM qbit_pool_blocks b WHERE b.origin_node=$1 \
+             AND b.sync_seq>$2 ORDER BY b.sync_seq LIMIT $3",
+            block_facts_digest()
+        ))
+        .bind(origin.index())
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&mut *connection)
+        .await?)
+    }
+
     /// Prepared jobs `origin` wrote with `sync_seq` in `(after, through]`,
     /// at most `limit`, with the template and balance blobs they reference.
+    /// `unexpired` keeps only the jobs whose expiry has not passed, by the
+    /// peer's clock.
     pub async fn prepared(
         connection: &mut PgConnection,
         origin: NodeIndex,
         after: i64,
         through: Option<i64>,
         limit: i64,
+        unexpired: bool,
     ) -> Result<PreparedBatch> {
         let row = sqlx::query(
             "WITH picked AS MATERIALIZED (SELECT j.* FROM qbit_prism_jobs j WHERE j.origin_node=$1 \
                 AND j.job_id LIKE 'prepared:%' AND j.sync_seq>$2 AND j.sync_seq<=$3 \
+                AND (NOT $5 OR j.expires_at>statement_timestamp()) \
                 ORDER BY j.sync_seq LIMIT $4) \
              SELECT COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.sync_seq) FROM picked p),'[]'::jsonb) AS jobs,\
                 COALESCE((SELECT jsonb_agg(to_jsonb(t)) FROM qbit_prism_templates t \
@@ -572,6 +646,7 @@ pub mod peer {
         .bind(after)
         .bind(through.unwrap_or(i64::MAX))
         .bind(limit)
+        .bind(unexpired)
         .fetch_one(&mut *connection)
         .await?;
         Ok(PreparedBatch {
@@ -617,24 +692,27 @@ impl Ledger {
         )
     }
 
-    /// The `sync_seq` of this node's own prepared record that a found block
-    /// was built on, matched by its window's anchor and as-issued balances
-    /// (D-19), if this database still holds it.
+    /// The `sync_seq` of the prepared record a block found on the issued job
+    /// `job_id` was built on, the one the job's `prepared_key` names, when
+    /// this node originated it (D-19). `None` when the peer holds it anyway:
+    /// it is the peer's own, or it predates migration 027, which both
+    /// databases of a pair started from. An error when the job or its record
+    /// is no longer held here: nothing then proves the peer holds it.
     pub async fn own_prepared_sync_seq(
         &self,
         node: NodeIndex,
-        anchor_ms: i64,
-        prior_balances_digest: &str,
+        job_id: &str,
     ) -> Result<Option<i64>> {
-        Ok(sqlx::query_scalar(
-            "SELECT max(sync_seq) FROM qbit_prism_jobs WHERE origin_node=$1 AND job_id LIKE 'prepared:%' \
-             AND window_anchor_ms=$2 AND window_prior_balances_sha256=$3",
+        let record: Option<(i16, Option<i64>)> = sqlx::query_as(
+            "SELECT p.origin_node,p.sync_seq FROM qbit_prism_jobs i JOIN qbit_prism_jobs p \
+             ON p.job_id=i.payload->>'prepared_key' WHERE i.job_id=$1",
         )
-        .bind(node.index())
-        .bind(anchor_ms)
-        .bind(prior_balances_digest)
-        .fetch_one(&mut *self.acquire().await?)
-        .await?)
+        .bind(job_id)
+        .fetch_optional(&mut *self.acquire().await?)
+        .await?;
+        let (origin, sync_seq) = record
+            .context("the block's issued job or its prepared record is no longer held here")?;
+        Ok(sync_seq.filter(|_| origin == node.index()))
     }
 
     /// This node's cursor over the peer's `stream`, if it has pulled it.
@@ -694,6 +772,18 @@ impl Ledger {
         .bind(detail)
         .execute(&mut **tx)
         .await?;
+        // A row this node originated meets a conflict only in own-log
+        // recovery (a pull reads only the peer's rows), where it means the
+        // own log has diverged: the verification goes in the same
+        // transaction, so no start without the peer latches on it (D-17).
+        sqlx::query(
+            "UPDATE qbit_prism_node_lineage SET verified_system_identifier=NULL,verified_timeline=NULL,\
+             verified_at=NULL WHERE singleton AND verified_at IS NOT NULL \
+             AND $1=(SELECT node_index FROM qbit_prism_node_identity WHERE singleton)",
+        )
+        .bind(origin)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 
@@ -713,13 +803,17 @@ impl Ledger {
 
     /// Advance `stream`'s cursor over the peer's rows to `scanned_through`,
     /// in the transaction that inserted the rows it covers. It never moves
-    /// back.
+    /// back. For shares and prepared jobs, `ingested_through` is the highest
+    /// peer row a pull refused as a conflict (`refused_through`; NULL while
+    /// none was): quarantined for good, never inserted and never read again,
+    /// while this node holds every peer row it scanned above it. The peer's
+    /// found-block wait reads it.
     async fn advance_cursor(
         tx: &mut Transaction<'_, Postgres>,
         stream: &str,
         peer: NodeIndex,
         scanned_through: i64,
-        ingested: Option<i64>,
+        refused_through: Option<i64>,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) \
@@ -731,7 +825,7 @@ impl Ledger {
         .bind(stream)
         .bind(peer.index())
         .bind(scanned_through)
-        .bind(ingested)
+        .bind(refused_through)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -815,15 +909,16 @@ impl Ledger {
     }
 
     /// The highest `share_seq` this node accepts from a pull: its attached
-    /// partitions and its own sequence, whichever reaches higher, plus
-    /// `PULL_HEADROOM_PARTITIONS` partitions.
-    async fn share_seq_ceiling(&self) -> Result<i64> {
+    /// partitions, its own sequence and `above`, whichever reaches highest,
+    /// plus `PULL_HEADROOM_PARTITIONS` partitions.
+    async fn share_seq_ceiling(&self, above: i64) -> Result<i64> {
         let ceiling: i64 = sqlx::query_scalar(
             "SELECT GREATEST((SELECT COALESCE(max(upper_seq),0) FROM qbit_prism_share_partitions WHERE state='attached'),\
-             (SELECT last_value FROM qbit_share_ledger_share_seq_seq))\
+             (SELECT last_value FROM qbit_share_ledger_share_seq_seq),$2::bigint)\
              +$1*(SELECT partition_rows FROM qbit_prism_share_partitioning WHERE singleton)",
         )
         .bind(PULL_HEADROOM_PARTITIONS)
+        .bind(above)
         .fetch_one(&mut *self.acquire().await?)
         .await?;
         Ok(ceiling)
@@ -851,7 +946,9 @@ impl Ledger {
     /// Apply one pull of share rows that `origin` wrote: the peer's own
     /// rows (`stream` is `Some(SHARES)`, which also advances its cursor and
     /// the safe peer mark to `batch.through`), or this node's own rows read
-    /// back from the peer (`None`).
+    /// back from the peer (`None`). For those, `own_rows_through` is what
+    /// bounds every own row the peer holds: the higher of its cursor over
+    /// this node's shares and its own lineage floor.
     ///
     /// A peer row is inserted only after this node's share sequence is
     /// above it and a partition holds it. An own row is inserted under
@@ -866,13 +963,22 @@ impl Ledger {
         origin: NodeIndex,
         batch: &ShareBatch,
         stream: Option<&str>,
+        own_rows_through: Option<i64>,
     ) -> Result<Applied> {
         let mut applied = Applied::default();
         let own = origin == node;
         // A key this far above what this node can hold is no key a node
         // drew: raising the sequence to it would leave every local append
         // without a partition. Refused below as a conflict, never raised to.
-        let ceiling = self.share_seq_ceiling().await?;
+        // This node's own rows, read back from the peer after a restore, can
+        // lie far above its restored sequence (a backup node restored from
+        // an old backup), but each came to the peer through a pull, which
+        // its cursor over this node's shares covers, or was held when the
+        // peer was personalised, below its floor (`node-identity
+        // repersonalise` also sets that cursor above them): their ceiling
+        // counts from the higher of the two.
+        let above = own_rows_through.filter(|_| own).unwrap_or(0);
+        let ceiling = self.share_seq_ceiling(above).await?;
         let acceptable = acceptable_highest(&batch.rows, ceiling)?;
         if batch.row_count > 0 {
             // Above every row about to be inserted, the peer's and this node's
@@ -888,21 +994,30 @@ impl Ledger {
         } else {
             None
         };
+        let mut refused_through = None;
         if batch.row_count > 0 {
-            // Header mappings this node holds for another share, and rows below
-            // every attached partition: refused whole.
+            // Header mappings this node holds for another share, a share this
+            // node credits at another share_seq (the ledger is unique on
+            // share_id per partition only), and rows below every attached
+            // partition: refused whole, one conflict per share whatever
+            // number of these it breaks.
             let refused: Vec<(String, String)> = sqlx::query_as(
                 "WITH incoming AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_share_ledger,$1)),\
                  mappings AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_prism_share_hashes,$2)) \
+                 SELECT share_id,string_agg(detail,'; ' ORDER BY detail) FROM (\
                  SELECT m.share_id,'header '||m.header_hash||' is credited here to '||h.share_id \
                  FROM mappings m JOIN qbit_prism_share_hashes h ON h.header_hash=m.header_hash WHERE h.share_id<>m.share_id \
                  UNION ALL SELECT m.share_id,'share_id '||m.share_id||' maps header '||h.header_hash||' here, not '||m.header_hash \
                  FROM mappings m JOIN qbit_prism_share_hashes h ON h.share_id=m.share_id WHERE h.header_hash<>m.header_hash \
+                 UNION ALL SELECT i.share_id,'share_id '||i.share_id||' is credited here at another share_seq than '||i.share_seq \
+                 FROM incoming i WHERE EXISTS (SELECT 1 FROM qbit_prism_share_hashes h WHERE h.share_id=i.share_id) \
+                 AND NOT EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_seq=i.share_seq AND l.share_id=i.share_id) \
                  UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is below every attached partition' FROM incoming i \
                  WHERE i.share_seq<(SELECT COALESCE(min(lower_seq),-1) FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NOT NULL) \
                  AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NULL) \
                  UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is beyond any key a node draws here (above '||$3||')' \
-                 FROM incoming i WHERE i.share_seq>$3",
+                 FROM incoming i WHERE i.share_seq>$3\
+                 ) refusal(share_id,detail) GROUP BY share_id",
             )
             .bind(&batch.rows)
             .bind(&batch.hashes)
@@ -992,9 +1107,43 @@ impl Ledger {
                 .await?;
                 applied.conflict("qbit_share_ledger");
             }
+            let refused: BTreeSet<&str> = refused_ids.iter().map(String::as_str).collect();
+            refused_through = batch
+                .rows
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| {
+                    row.get("share_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| refused.contains(id))
+                })
+                .filter_map(|row| row.get("share_seq").and_then(Value::as_i64))
+                .chain(differing.iter().map(|(share_seq, _)| *share_seq))
+                .max();
+            // Inserted below the hashrate rollups' watermark, which this
+            // node's sweep has passed and never reads again: folded here, in
+            // this transaction, under the sweep's progress row. A sweep
+            // running now holds that row, so this waits for it, one sweep
+            // statement at most. Before the first sweep there is no row: the
+            // table is locked against that sweep until this pull commits, and
+            // the fold runs again against any sweep that committed first.
+            if !inserted.is_empty() {
+                let (mut folded, held) = fold_late_peer_shares(&mut tx, batch, &inserted).await?;
+                if !held {
+                    sqlx::query(crate::rollups::PROGRESS_TABLE_LOCK)
+                        .execute(&mut *tx)
+                        .await?;
+                    (folded, _) = fold_late_peer_shares(&mut tx, batch, &inserted).await?;
+                }
+                if folded > 0 {
+                    tracing::debug!(folded, "peer shares below the rollup watermark folded");
+                }
+            }
         }
         if let (Some(stream), Some(through)) = (stream, batch.through) {
-            Self::advance_cursor(&mut tx, stream, origin, through, batch.highest).await?;
+            Self::advance_cursor(&mut tx, stream, origin, through, refused_through).await?;
         }
         tx.commit().await?;
         Ok(applied)
@@ -1111,8 +1260,8 @@ impl Ledger {
             }
         }
         if let Some((stream, peer)) = stream {
-            Self::advance_cursor(&mut tx, stream, peer, block.sync_seq, Some(block.sync_seq))
-                .await?;
+            // No stop: nothing waits on the peer holding a block.
+            Self::advance_cursor(&mut tx, stream, peer, block.sync_seq, None).await?;
         }
         tx.commit().await?;
         Ok(applied)
@@ -1333,7 +1482,10 @@ impl Ledger {
             }
         }
         if let (Some(stream), Some(highest)) = (stream, batch.highest) {
-            Self::advance_cursor(&mut tx, stream, origin, highest, Some(highest)).await?;
+            // A conflict anywhere in the batch, a job or a blob it names:
+            // refused through the batch's highest job.
+            let refused_through = (applied.total_conflicts() > 0).then_some(highest);
+            Self::advance_cursor(&mut tx, stream, origin, highest, refused_through).await?;
         }
         tx.commit().await?;
         Ok(applied)
@@ -1397,6 +1549,37 @@ impl Ledger {
         .await?
         .rows_affected()
             == 1)
+    }
+
+    /// The blocks among `keys` (hash and facts digest, as
+    /// [`peer::block_keys`] reads them) this database lacks or holds with
+    /// another digest, in their order, each with whether it is held here.
+    pub async fn missing_blocks(&self, keys: &[(String, String)]) -> Result<Vec<(String, bool)>> {
+        let (hashes, digests): (Vec<&str>, Vec<&str>) = keys
+            .iter()
+            .map(|(hash, digest)| (hash.as_str(), digest.as_str()))
+            .unzip();
+        Ok(sqlx::query_as(&format!(
+            "SELECT u.h,b.block_hash IS NOT NULL FROM unnest($1::text[],$2::text[]) \
+             WITH ORDINALITY AS u(h,d,n) LEFT JOIN qbit_pool_blocks b ON b.block_hash=u.h \
+             WHERE b.block_hash IS NULL OR {} IS DISTINCT FROM u.d ORDER BY u.n",
+            block_facts_digest()
+        ))
+        .bind(&hashes)
+        .bind(&digests)
+        .fetch_all(&mut *self.acquire().await?)
+        .await?)
+    }
+
+    /// How many of `batch`'s prepared jobs this database lacks.
+    pub async fn missing_prepared(&self, batch: &PreparedBatch) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM jsonb_array_elements($1) j \
+             WHERE NOT EXISTS (SELECT 1 FROM qbit_prism_jobs p WHERE p.job_id=j->>'job_id')",
+        )
+        .bind(&batch.jobs)
+        .fetch_one(&mut *self.acquire().await?)
+        .await?)
     }
 
     /// Record that this node's own log was proved complete on the server
@@ -1498,6 +1681,20 @@ fn acceptable_highest(rows: &Value, ceiling: i64) -> Result<Option<i64>> {
         }
     }
     Ok(highest)
+}
+
+/// Run [`crate::rollups::LATE_PEER_SHARES`] for the `inserted` rows of
+/// `batch`: the shares folded, and whether a progress row was there.
+async fn fold_late_peer_shares(
+    tx: &mut Transaction<'_, Postgres>,
+    batch: &ShareBatch,
+    inserted: &[String],
+) -> Result<(i64, bool)> {
+    Ok(sqlx::query_as(crate::rollups::LATE_PEER_SHARES)
+        .bind(&batch.rows)
+        .bind(inserted)
+        .fetch_one(&mut **tx)
+        .await?)
 }
 
 /// `a,b` with each name prefixed: `l.a,l.b`.

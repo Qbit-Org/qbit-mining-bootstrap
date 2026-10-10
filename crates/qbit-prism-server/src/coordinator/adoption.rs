@@ -28,6 +28,11 @@
 //!    its coinbase ([`Ledger::found_here`]): only that node sponsors its
 //!    fanouts and counts it as found, and no divergence is recorded here.
 //!
+//! Those rows are this node's own, so the loop starts only once the own-log
+//! latch is set (D-8), as the submit loop does: a node restored from a backup
+//! lands nothing before its own-log recovery has pulled back the landings it
+//! lost and raised its sequences.
+//!
 //! While the peer's database is reachable and the peer sync is still pulling
 //! landed blocks or prepared records it lags behind on (a heal or a
 //! catch-up), a pass adopts and reports nothing: the rows it would miss are
@@ -36,7 +41,8 @@
 //! is refused or never catches up cannot hide a block.
 //!
 //! A block with no adoptable record (an empty-window bootstrap block, a record
-//! past retention, or one built by another builder or keys) is reported with
+//! past retention, one built by another builder or keys, or a window or record
+//! holding a peer row this node's sync refused as a conflict) is reported with
 //! an ALERT and tried again every [`ADOPTION_RETRY_INTERVAL`]; nothing is
 //! guessed. When it leaves the lookback unlanded, a last ALERT says so.
 use super::*;
@@ -106,6 +112,28 @@ impl AdoptionState {
             held_back_since: None,
         }
     }
+}
+
+/// Whether a block's coinbase scriptSig ends with a prepared record's
+/// coinbase suffix: the issuing node's coinbase tag, then extranonce1 and
+/// extranonce2 zeroed, as wide as that node's `PRISM_STRATUM_EXTRANONCE2_SIZE`,
+/// which need not be this node's (the pair's fingerprint does not bind it).
+/// The tag is printable ASCII, so the suffix's trailing zeros are exactly the
+/// placeholder; the block holds the same tag right before its extranonces.
+fn ends_with_suffix(script_sig: &[u8], suffix: &[u8]) -> std::result::Result<(), String> {
+    let placeholder = suffix.iter().rev().take_while(|byte| **byte == 0).count();
+    if !(5..=36).contains(&placeholder) {
+        return Err(format!(
+            "its coinbase suffix ends with {placeholder} zero bytes, not an extranonce placeholder of 5 to 36"
+        ));
+    }
+    let tag_len = suffix.len() - placeholder;
+    if script_sig.len() < suffix.len()
+        || script_sig[script_sig.len() - suffix.len()..][..tag_len] != suffix[..tag_len]
+    {
+        return Err("the block's coinbase does not end with its coinbase suffix".into());
+    }
+    Ok(())
 }
 
 /// What a pass did with one pool block.
@@ -387,18 +415,9 @@ impl Coordinator {
         if codec::witness_merkle_leaves_hex(&transactions) != leaves {
             return Err("its template does not hold the block's transactions".into());
         }
-        let placeholder = 4 + self.config.extranonce2_size;
         let suffix = hex::decode(&record.coinbase_suffix_hex)
             .map_err(|error| format!("its coinbase suffix is not hex: {error}"))?;
-        let Some(tag_len) = suffix.len().checked_sub(placeholder) else {
-            return Err("its coinbase suffix is shorter than the extranonce placeholder".into());
-        };
-        if suffix[tag_len..].iter().any(|byte| *byte != 0)
-            || script_sig.len() < suffix.len()
-            || script_sig[script_sig.len() - suffix.len()..][..tag_len] != suffix[..tag_len]
-        {
-            return Err("the block's coinbase does not end with its coinbase suffix".into());
-        }
+        ends_with_suffix(script_sig, &suffix)?;
         let network = codec::target_from_compact(
             codec::parse_u32_hex(
                 template["bits"]
@@ -491,9 +510,21 @@ pub const ADOPTION_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 
 impl Coordinator {
     /// Dual writer: run [`Coordinator::adoption_pass`] every
-    /// [`ADOPTION_INTERVAL`] until shutdown. A failed pass is logged and
-    /// retried; nothing it read is trusted across a failure.
+    /// [`ADOPTION_INTERVAL`] until shutdown, from the moment the own-log
+    /// latch is set (module comment). A failed pass is logged and retried;
+    /// nothing it read is trusted across a failure.
     pub async fn adoption_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        // The wait the server puts before its other own-row writers.
+        if let Some(mut status) = self.peer_sync.get().cloned() {
+            let caught_up = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => false,
+                caught_up = status.wait_for(|status| status.own_log_caught_up) => caught_up.is_ok(),
+            };
+            if !caught_up {
+                return;
+            }
+        }
         let mut state = AdoptionState::default();
         loop {
             if let Err(error) = self.adoption_pass(&mut state).await {
@@ -504,5 +535,44 @@ impl Coordinator {
                 _ = shutdown.changed() => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ends_with_suffix;
+
+    /// A scriptSig: a height push, the tag, extranonce1 and `width` bytes of
+    /// extranonce2.
+    fn script_sig(tag: &[u8], width: usize) -> Vec<u8> {
+        [
+            &[0x03, 0x01, 0x02, 0x03][..],
+            tag,
+            &[0x80, 0, 0, 7],
+            &vec![0xee; width],
+        ]
+        .concat()
+    }
+
+    /// A prepared record's suffix: the tag and a zeroed placeholder.
+    fn suffix(tag: &[u8], width: usize) -> Vec<u8> {
+        [tag, &vec![0; 4 + width][..]].concat()
+    }
+
+    #[test]
+    fn a_block_ends_with_the_suffix_of_the_work_it_was_found_on_whatever_its_extranonce2_width() {
+        for width in [1, 4, 8, 32] {
+            assert_eq!(
+                ends_with_suffix(&script_sig(b"/PRISM/", width), &suffix(b"/PRISM/", width)),
+                Ok(()),
+                "width {width}"
+            );
+        }
+        // Another width or another tag is another layout.
+        assert!(ends_with_suffix(&script_sig(b"/PRISM/", 4), &suffix(b"/PRISM/", 8)).is_err());
+        assert!(ends_with_suffix(&script_sig(b"/PRISM/", 8), &suffix(b"/OTHER/", 8)).is_err());
+        // No placeholder, or a scriptSig shorter than the suffix.
+        assert!(ends_with_suffix(&script_sig(b"/PRISM/", 8), b"/PRISM/\0\0\0\0").is_err());
+        assert!(ends_with_suffix(&[0, 0], &suffix(b"/PRISM/", 8)).is_err());
     }
 }

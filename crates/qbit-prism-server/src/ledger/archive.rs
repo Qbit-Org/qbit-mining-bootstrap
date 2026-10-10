@@ -1337,8 +1337,8 @@ async fn partition_plan(
                     horizon.next_share_seq, record.upper_seq
                 ),
             ),
-            // The rollup sweep stops at the same mark, so the watermark
-            // check above holds only for the rows already here.
+            // The watermark check above holds only for the rows already
+            // here: a peer row the sync inserts later can land below it.
             _ if horizon
                 .peer_mark
                 .is_some_and(|mark| mark.is_none_or(|mark| mark < record.upper_seq - 1)) =>

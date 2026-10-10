@@ -3,10 +3,10 @@
 //! batch. A pass whose peer reads fail is counted and logged, and the next
 //! one starts over on the other path; peer rows that fail to apply here fail
 //! only their stream, which tries them again next pass and alerts when that
-//! goes on. The loop ends at shutdown, or with [`OwnLogLostWhileRunning`]
-//! when the database was restored or promoted under the running frontend,
-//! which stops the frontend: its restart serves only once own-log recovery
-//! completes (D-8).
+//! goes on. The loop ends at shutdown, or with a [`FrontendStop`] when the
+//! database was restored, promoted or changed identity under the running
+//! frontend, which stops the frontend: its restart runs every startup check
+//! again (D-8, D-9).
 //!
 //! Each pass, in order:
 //! 1. this database must be personalised as this node (D-9, checked every
@@ -30,7 +30,7 @@ use crate::ledger::peer_sync::{
 use crate::ledger::{IdentityCheck, Ledger, LineageEvidence};
 use crate::metrics::Metrics;
 use crate::node_identity::NodeIndex;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
 use std::collections::BTreeMap;
@@ -66,6 +66,8 @@ const PRIMARY_RETRY: Duration = Duration::from_secs(30);
 const IDENTITY_RECHECK: Duration = Duration::from_secs(30);
 /// The most landed blocks one pass applies, each in its own transaction.
 const BLOCKS_PER_PASS: i64 = 20;
+/// The most own block keys one recovery read compares.
+const BLOCK_KEYS_PER_READ: i64 = 1_000;
 /// The most peer rows counted for a lag: one index-only count, well inside
 /// the peer's statement timeout even on a peer far ahead.
 const LAG_COUNT_CAP: i64 = 100_000;
@@ -157,21 +159,39 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// The database was restored or promoted under the running frontend (D-8,
-/// D-17): [`PeerSync::run`] ends with it, which stops the frontend.
+/// The database changed under the running frontend in a way no task started
+/// before it can be trusted with: [`PeerSync::run`] ends with it, which stops
+/// the frontend, and its restart runs every startup check again.
 #[derive(Debug)]
-pub struct OwnLogLostWhileRunning;
+pub enum FrontendStop {
+    /// Restored or promoted: a new system identifier or WAL timeline since
+    /// the own log was verified (D-8, D-17). The restart serves only once
+    /// own-log recovery completes.
+    OwnLogLost,
+    /// Its node identity, an origin default or a key sequence's parity
+    /// changed since the frontend saw it ready (D-9). The restart refuses a
+    /// drifted database, and admits no miners on one that is not this
+    /// node's, until it is repaired.
+    IdentityChanged(String),
+}
 
-impl std::fmt::Display for OwnLogLostWhileRunning {
+impl std::fmt::Display for FrontendStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "this node's database was restored or promoted under the running frontend: it stops, \
-             and its restart serves only once own-log recovery completes (D-8)",
-        )
+        match self {
+            Self::OwnLogLost => f.write_str(
+                "this node's database was restored or promoted under the running frontend: it \
+                 stops, and its restart serves only once own-log recovery completes (D-8)",
+            ),
+            Self::IdentityChanged(why) => write!(
+                f,
+                "this node's database changed identity under the running frontend ({why}): it \
+                 stops, and serves again only on a database personalised as this node (D-9)"
+            ),
+        }
     }
 }
 
-impl std::error::Error for OwnLogLostWhileRunning {}
+impl std::error::Error for FrontendStop {}
 
 /// What one pass did.
 #[derive(Clone, Debug, Default)]
@@ -229,6 +249,8 @@ pub struct PeerSync {
     on_fallback_since: Option<Instant>,
     identity_checked: Option<Instant>,
     identity_refusal: Option<Refusal>,
+    /// This database was found personalised as this node, undrifted.
+    identity_ready: bool,
     latch: Latch,
     /// Own-log recovery met an own row this database holds with other
     /// content: the latch stays down until an operator resolves it.
@@ -250,6 +272,9 @@ impl PeerSync {
         metrics: Option<Arc<Metrics>>,
     ) -> (Self, watch::Receiver<PeerSyncStatus>) {
         let (publisher, status) = PeerSyncPublisher::new();
+        if let Some(metrics) = &metrics {
+            metrics.start_peer_sync();
+        }
         let sync = Self {
             ledger,
             node: config.identity.node,
@@ -268,6 +293,7 @@ impl PeerSync {
             on_fallback_since: None,
             identity_checked: None,
             identity_refusal: None,
+            identity_ready: false,
             latch: Latch::default(),
             own_log_diverged: false,
             own_rows_missing: false,
@@ -285,8 +311,8 @@ impl PeerSync {
 
     /// Pass until `shutdown` turns true. A failed pass is logged and counted,
     /// and the next one starts over on the other path after a pause that
-    /// grows with consecutive failures. The one error it returns is
-    /// [`OwnLogLostWhileRunning`], which stops the frontend.
+    /// grows with consecutive failures. The one error it returns is a
+    /// [`FrontendStop`], which stops the frontend.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut failures: u32 = 0;
         loop {
@@ -302,7 +328,7 @@ impl PeerSync {
                         self.interval
                     }
                 }
-                Err(error) if error.downcast_ref::<OwnLogLostWhileRunning>().is_some() => {
+                Err(error) if error.downcast_ref::<FrontendStop>().is_some() => {
                     for path in &mut self.paths {
                         if let Some(pool) = path.pool.take() {
                             pool.close().await;
@@ -406,6 +432,25 @@ impl PeerSync {
             .context("connecting to the peer's database")
     }
 
+    /// The database changed under the running frontend: refuse every share
+    /// from now until the process exits (the server cancels every other task
+    /// as the sync ends with the returned error), drop the latch and say so,
+    /// so that health and the gauges stop reporting this node ready.
+    fn stop_frontend(&mut self, stop: FrontendStop, refusal: Option<&Refusal>) -> anyhow::Error {
+        tracing::error!(reason = %stop, "ALERT: the frontend stops");
+        self.ledger.set_own_log_lost(true);
+        self.latch = Latch::default();
+        self.publish(false, refusal);
+        stop.into()
+    }
+
+    /// Check this database's identity at the next pass, whatever the time
+    /// since the last check. For tests.
+    #[doc(hidden)]
+    pub fn recheck_identity(&mut self) {
+        self.identity_checked = None;
+    }
+
     /// One pass. Public so that tests can drive the sync step by step.
     pub async fn pass(&mut self) -> Result<PassReport> {
         let mut report = PassReport::default();
@@ -417,17 +462,8 @@ impl PeerSync {
         if self.latch.caught_up {
             let now = self.ledger.lineage_evidence().await?;
             if Some(now) != self.latch.evidence {
-                tracing::error!(
-                    previous = ?self.latch.evidence,
-                    now = ?now,
-                    "ALERT: this database's system identifier or WAL timeline changed while the \
-                     frontend ran: a restore or promotion; the frontend stops, and serves again \
-                     only once its own log is checked against the peer"
-                );
-                self.ledger.set_own_log_lost(true);
-                self.latch = Latch::default();
-                self.publish(false, None);
-                return Err(OwnLogLostWhileRunning.into());
+                tracing::error!(previous = ?self.latch.evidence, now = ?now, "evidence of a restore or promotion");
+                return Err(self.stop_frontend(FrontendStop::OwnLogLost, None));
             }
         }
         if let Some(refusal) = self.check_local_identity().await? {
@@ -494,7 +530,7 @@ impl PeerSync {
         if !self.latch.caught_up {
             report
                 .applied
-                .merge(self.recover_own_log(connection).await?);
+                .merge(self.recover_own_log(connection, &facts).await?);
         }
         report.own_log_caught_up = self.latch.caught_up;
         if self.latch.caught_up {
@@ -505,7 +541,8 @@ impl PeerSync {
 
     /// D-9: refuse unless this database is personalised as this node, with
     /// nothing drifted, and holds a valid 031 index (D-14). Checked every
-    /// `IDENTITY_RECHECK`.
+    /// `IDENTITY_RECHECK`. Once seen ready, a database that is no longer
+    /// this node's stops the frontend ([`FrontendStop::IdentityChanged`]).
     async fn check_local_identity(&mut self) -> Result<Option<Refusal>> {
         if self
             .identity_checked
@@ -513,7 +550,11 @@ impl PeerSync {
         {
             return Ok(self.identity_refusal.clone());
         }
-        let refusal = match self.ledger.check_node_identity(self.node).await? {
+        let check = self.ledger.check_node_identity(self.node).await?;
+        if matches!(check, IdentityCheck::Ready(_)) {
+            self.identity_ready = true;
+        }
+        let refusal = match check {
             IdentityCheck::Ready(_) => None,
             IdentityCheck::Unidentified => Some(Refusal::LocalIdentity(format!(
                 "no node identity; run `qbit-prism-server node-identity set --index {}`",
@@ -534,6 +575,12 @@ impl PeerSync {
             }
             refusal => refusal,
         };
+        // Seen ready once, then not: the identity changed under the running
+        // frontend, which every one of its writers was started on. It stops.
+        if let (Some(Refusal::LocalIdentity(why)), true) = (&refusal, self.identity_ready) {
+            let stop = FrontendStop::IdentityChanged(why.clone());
+            return Err(self.stop_frontend(stop, refusal.as_ref()));
+        }
         if let Some(refusal) = &refusal {
             tracing::error!(%refusal, "ALERT: the peer sync does not run");
         }
@@ -631,10 +678,22 @@ impl PeerSync {
     /// the peer has seen of this node, record the verification, and set the
     /// latch (D-8, D-14). A conflict among the own rows leaves the latch
     /// unset: the own log has diverged, and an operator must decide.
-    async fn recover_own_log(&mut self, connection: &mut sqlx::PgConnection) -> Result<Applied> {
+    async fn recover_own_log(
+        &mut self,
+        connection: &mut sqlx::PgConnection,
+        facts: &PeerFacts,
+    ) -> Result<Applied> {
         let node = self.node;
         let mut applied = Applied::default();
         let mut clock_ms = None;
+        // Every own row the peer holds came through its pulls, which its
+        // cursor over this node's shares covers, or was held when it was
+        // personalised, below its floor: together they bound the keys taken
+        // back.
+        let own_rows_through = bounded(peer::cursors(connection))
+            .await?
+            .shares
+            .max(facts.share_seq_floor);
         loop {
             let (held, ..) = self.ledger.highest_held_of(node).await?;
             let batch = bounded(peer::shares_of(
@@ -651,46 +710,81 @@ impl PeerSync {
             clock_ms = clock_ms.max(batch.highest_accepted_at_ms);
             applied.merge(
                 self.ledger
-                    .apply_share_batch(node, node, &batch, None)
+                    .apply_share_batch(node, node, &batch, None, own_rows_through)
                     .await?,
             );
-            ensure_progress(&mut self.own_log_diverged, &applied)?;
+            self.ensure_progress(&applied)?;
         }
+        // Landed blocks and prepared jobs commit out of sync_seq order, so
+        // the highest one held here proves no prefix: a backup can hold a
+        // block whose earlier-numbered sibling was still open. The key and
+        // facts digest of every block of this node's the peer holds since it
+        // was personalised are compared; only the blocks missing here, or
+        // held with other facts (a conflict: the own log has diverged), are
+        // read whole.
+        let floor = self
+            .ledger
+            .node_lineage()
+            .await?
+            .map_or(0, |lineage| lineage.sync_seq_floor);
+        let mut after = floor;
         loop {
-            let (_, held, ..) = self.ledger.highest_held_of(node).await?;
-            let blocks = bounded(peer::blocks(
+            let keys = bounded(peer::block_keys(
                 connection,
                 node,
-                held.unwrap_or(0),
-                None,
-                BLOCKS_PER_PASS,
+                after,
+                BLOCK_KEYS_PER_READ,
             ))
             .await?;
-            if blocks.is_empty() {
+            let Some(last) = keys.last().map(|(sync_seq, ..)| *sync_seq) else {
                 break;
+            };
+            let keys: Vec<(String, String)> = keys
+                .into_iter()
+                .map(|(_, hash, digest)| (hash, digest))
+                .collect();
+            let unlike = self.ledger.missing_blocks(&keys).await?;
+            if unlike.iter().any(|(_, held)| !held) {
+                self.own_rows_missing().await?;
             }
-            self.own_rows_missing().await?;
-            for block in &blocks {
-                applied.merge(self.ledger.apply_block(block, None).await?);
+            let hashes: Vec<String> = unlike.into_iter().map(|(hash, _)| hash).collect();
+            for some in hashes.chunks(BLOCKS_PER_PASS as usize) {
+                let blocks = bounded(peer::blocks_with_hashes(connection, node, some)).await?;
+                ensure!(
+                    blocks.len() == some.len(),
+                    "the peer no longer holds {} of the own blocks it listed; recovery starts again",
+                    some.len() - blocks.len()
+                );
+                for block in &blocks {
+                    applied.merge(self.ledger.apply_block(block, None).await?);
+                }
+                self.ensure_progress(&applied)?;
             }
-            ensure_progress(&mut self.own_log_diverged, &applied)?;
+            after = last;
         }
+        // Only the prepared jobs not yet expired: this node prunes its own at
+        // expiry (the peer may keep its copy longer), so an expired one
+        // missing here is no row lost.
+        let mut after = floor;
         loop {
-            let (_, _, held, _) = self.ledger.highest_held_of(node).await?;
             let batch = bounded(peer::prepared(
                 connection,
                 node,
-                held.unwrap_or(0),
+                after,
                 None,
                 self.batch_rows,
+                true,
             ))
             .await?;
-            if batch.count == 0 {
+            let Some(last) = batch.highest else {
                 break;
+            };
+            if self.ledger.missing_prepared(&batch).await? > 0 {
+                self.own_rows_missing().await?;
             }
-            self.own_rows_missing().await?;
             applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
-            ensure_progress(&mut self.own_log_diverged, &applied)?;
+            self.ensure_progress(&applied)?;
+            after = last;
         }
         let roles = bounded(peer::node_roles(connection, node)).await?;
         let journal = self.ledger.apply_node_roles(&roles, node).await?;
@@ -700,7 +794,7 @@ impl PeerSync {
             self.own_rows_missing().await?;
         }
         applied.merge(journal);
-        ensure_progress(&mut self.own_log_diverged, &applied)?;
+        self.ensure_progress(&applied)?;
         // Above everything the peer has seen of this node: its cursors over
         // this node's streams, and the highest own rows it holds.
         let cursors = bounded(peer::cursors(connection)).await?;
@@ -725,6 +819,23 @@ impl PeerSync {
             rollback_alerted: false,
         };
         Ok(applied)
+    }
+
+    /// An own-log conflict: the own log has diverged from the peer's copy
+    /// of it, and the latch stays unset until an operator resolves it. The
+    /// verification went in the transaction that recorded the conflict, so
+    /// no start without the peer latches on it.
+    fn ensure_progress(&mut self, applied: &Applied) -> Result<()> {
+        if applied.total_conflicts() > 0 {
+            self.own_log_diverged = true;
+            bail!(
+                "own-log recovery met rows this node holds with other content ({:?}); the own log \
+                 has diverged from the peer's copy of it and this node does not serve until an \
+                 operator resolves qbit_prism_peer_sync_conflicts",
+                applied.conflicts
+            );
+        }
+        Ok(())
     }
 
     /// Own rows the peer holds are missing here, so whatever verification
@@ -782,7 +893,7 @@ impl PeerSync {
         let mut shares_moved = false;
         match self
             .ledger
-            .apply_share_batch(self.node, peer, &batch, Some(SHARES))
+            .apply_share_batch(self.node, peer, &batch, Some(SHARES), None)
             .await
         {
             Ok(applied) => {
@@ -880,6 +991,7 @@ impl PeerSync {
             cursor,
             Some(safe),
             self.batch_rows,
+            false,
         ))
         .await?;
         match self
@@ -1054,20 +1166,6 @@ fn start_position(held: Option<i64>, floor: Option<i64>) -> i64 {
         (Some(position), None) | (None, Some(position)) => position,
         (None, None) => 0,
     }
-}
-
-/// An own-log conflict leaves the latch unset.
-fn ensure_progress(diverged: &mut bool, applied: &Applied) -> Result<()> {
-    if applied.total_conflicts() > 0 {
-        *diverged = true;
-        bail!(
-            "own-log recovery met rows this node holds with other content ({:?}); the own log has \
-             diverged from the peer's copy of it and this node does not serve until an operator \
-             resolves qbit_prism_peer_sync_conflicts",
-            applied.conflicts
-        );
-    }
-    Ok(())
 }
 
 /// One statement against the peer, bounded so a dead path fails the pass.

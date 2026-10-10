@@ -480,6 +480,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
                 ),
                 timeline: crate::ledger::WriterTimeline::new(1),
                 peer_mark: *self.peer_mark.lock().unwrap(),
+                peer_pending: *self.peer_pending.lock().unwrap(),
             }))
         })
     }
