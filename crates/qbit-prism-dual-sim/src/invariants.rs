@@ -171,6 +171,11 @@ pub struct CheckOptions {
     /// Databases whose landing rows are not expected yet (a node still
     /// down), with why. Its other checks still run where they can.
     pub absent_ledgers: BTreeMap<Node, String>,
+    /// Candidates that may stay in `reconciliation` with no landing, by
+    /// block hash, with why: a block lost with its node, whose offer outcome
+    /// was never recorded, which PRISM keeps for reconciliation and never
+    /// offers again (S8).
+    pub unresolved_candidates: BTreeMap<String, String>,
     /// Who owned the carry from which height, oldest first, when it is not
     /// the dual-writer pair's A from the start: the 3.0 epoch before a
     /// cutover has no owner (S9), and a transfer moves it (S11). Empty means
@@ -251,7 +256,7 @@ pub async fn check(
     checks.push(windows_unchanged(&pools).await?);
     checks.push(windows_reproducible(&pools).await?);
     checks.push(ledger_integrity(&pools).await?);
-    checks.push(candidates_settled(&pools).await?);
+    checks.push(candidates_settled(&pools, options).await?);
     checks.push(local_state_not_copied(sim, &pools).await?);
     for pool in pools.values() {
         pool.close().await;
@@ -1345,11 +1350,16 @@ async fn ledger_integrity(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
 /// that never came. A `reconciliation` row whose block is landed and
 /// confirmed is bookkeeping its next attempt finishes (a post-offer step
 /// that lost a race with a payout-revision bump retries with a backoff): it
-/// is listed, not failed. Invariant 3 separately holds every pool block on
-/// the chain to its landing rows.
-async fn candidates_settled(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+/// is listed, not failed. So is an unlanded one the scenario names in
+/// [`CheckOptions::unresolved_candidates`]. Invariant 3 separately holds
+/// every pool block on the chain to its landing rows.
+async fn candidates_settled(
+    pools: &BTreeMap<Node, PgPool>,
+    options: &CheckOptions,
+) -> Result<Check> {
     let mut check = CheckBuilder::new("candidates-settled");
     let mut pending_bookkeeping = Vec::new();
+    let mut unresolved = Vec::new();
     for (node, pool) in pools {
         let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT o.block_hash, o.state, o.last_error, b.chain_state \
@@ -1366,6 +1376,14 @@ async fn candidates_settled(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
                 }));
                 continue;
             }
+            if state == "reconciliation" && landed.is_none() {
+                if let Some(why) = options.unresolved_candidates.get(&hash) {
+                    unresolved.push(json!({
+                        "node": node, "block": hash, "last_error": error, "why": why,
+                    }));
+                    continue;
+                }
+            }
             check.problem(format!(
                 "candidate {hash} on node {node:?} is still {state}, its block {} ({error:?})",
                 landed.unwrap_or_else(|| "not landed".to_owned())
@@ -1373,9 +1391,12 @@ async fn candidates_settled(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
         }
     }
     let note = pending_bookkeeping.len();
+    let excused = unresolved.len();
     check.data("landed_awaiting_bookkeeping", json!(pending_bookkeeping));
+    check.data("excused_unresolved", json!(unresolved));
     Ok(check.finish(format!(
-        "no candidate in flight or unlanded; {note} landed blocks await their candidate's next attempt"
+        "no candidate in flight or unlanded; {note} landed blocks await their candidate's next \
+         attempt; {excused} unlanded kept for reconciliation as the scenario expects"
     )))
 }
 

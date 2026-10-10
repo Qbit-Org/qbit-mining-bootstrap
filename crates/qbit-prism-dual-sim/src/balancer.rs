@@ -317,6 +317,27 @@ impl Balancer {
         self.port
     }
 
+    /// A handle that checks `name` on demand exactly as the check loop does
+    /// (path, token, timeout), for a scenario that must time a node's
+    /// withdrawal finer than the check interval.
+    pub fn node_check(&self, name: &str) -> Result<NodeCheck> {
+        let backend = self
+            .shared
+            .backends
+            .iter()
+            .find(|backend| backend.target.name == name)
+            .with_context(|| format!("the balancer has no node {name}"))?;
+        let client = reqwest::Client::builder()
+            .timeout(self.shared.config.check_timeout)
+            .pool_max_idle_per_host(0)
+            .build()?;
+        Ok(NodeCheck {
+            shared: self.shared.clone(),
+            port: backend.target.health_port,
+            client,
+        })
+    }
+
     pub fn is_up(&self, name: &str) -> bool {
         self.shared
             .backends
@@ -415,6 +436,32 @@ impl Drop for Balancer {
                 }
             }
         }
+    }
+}
+
+/// One node's check, made on demand; see [`Balancer::node_check`].
+#[derive(Clone)]
+pub struct NodeCheck {
+    shared: Arc<Shared>,
+    port: u16,
+    client: reqwest::Client,
+}
+
+impl NodeCheck {
+    /// Whether the node answers ready now, with the reason when it does not.
+    pub async fn check(&self) -> Result<(), String> {
+        let probe = self
+            .shared
+            .probe
+            .read()
+            .map(|probe| probe.clone())
+            .map_err(|_| "the probe's lock is poisoned".to_owned())?;
+        check(&self.client, &probe, self.port).await
+    }
+
+    /// The run clock's time, as the balancer's records use it.
+    pub fn now_ms(&self) -> u64 {
+        self.shared.now_ms()
     }
 }
 
