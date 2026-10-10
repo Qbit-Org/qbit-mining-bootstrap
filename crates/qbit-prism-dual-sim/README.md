@@ -134,6 +134,7 @@ cannot see an out-of-order landing shorter than its poll interval.
 | control | `checker_control_*` | PR, nightly | today's code |
 | S1 | `s01_steady_state_*` | PR, nightly | the 3.1 stack |
 | S2 | `s02_a_frontend_killed_*` (PR), `s02_a_postgres_killed_*`, `s02_a_frozen_*`, `s02_a_network_dropped_*` | PR, nightly | the 3.1 stack |
+| S2, mid-pull | `s02_a_frozen_again_and_again_mid_pull_*` | nightly | the 3.1 stack |
 | S3 | `s03_b_dies_*` | nightly | the 3.1 stack |
 | S4 | `s04_link_cut_*` | PR, nightly | the 3.1 stack |
 | S5 | `s05_both_nodes_writing_*` | PR, nightly | the 3.1 stack |
@@ -154,6 +155,16 @@ What each one does:
   carry-free blocks, A's unsynced tail is measured, A returns, confirms B's
   blocks from its own chain view, and its next block pays the carry they
   accrued (its priors equal the chain's sums).
+- **S2's freeze** holds A frozen for at least 60 s while B finds a block every
+  few seconds; each must land and be followed by new jobs of B's before A
+  thaws (a frozen peer must never stall the survivor's writes).
+- **S2, mid-pull:** both nodes take miners; A's frontend is frozen 20 times
+  for 1 to 4 s, each timed where possible to a moment its puller has a query,
+  a transaction or an advisory lock open on B's database. During each freeze a
+  new tip arrives and B must record jobs on it within 15 s; every fifth freeze
+  B also finds a block, which must land. D1's sync barrier, held by a frozen
+  puller, would stall exactly these writes. The schedule's seed and every
+  round are in `freezes.json`.
 - **S3:** B's host dies (frontend and PostgreSQL); A's miners see no gap above
   2 s, and B catches up on return.
 - **S4:** the databases' link blackholed with both nodes up: no gap at the cut

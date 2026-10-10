@@ -161,6 +161,13 @@ async fn s02_a_frozen_miners_move_to_b_and_a_resumes_without_double_pay() -> Res
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s02_a_frozen_again_and_again_mid_pull_never_stalls_b() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S02FrozenDuringPulls, gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
 async fn s02_a_network_dropped_miners_move_to_b_and_a_merges_on_heal() -> Result<()> {
     let gated = gated!();
     run(Scenario::S02ADies(Death::NetworkDrop), gated).await
