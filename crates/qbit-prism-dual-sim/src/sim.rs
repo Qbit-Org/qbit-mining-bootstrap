@@ -239,6 +239,49 @@ pub struct Sim {
     /// bootstrap, or the cutover's. Rows written before it are history both
     /// databases share (the 3.0 pair wrote one database).
     pub dual_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// S9's prepared state across the cutover's data steps: A's right after
+    /// the drain, and each node's after the promotion and the bootstrap,
+    /// before either frontend starts (nothing writes or prunes it then).
+    pub cutover_prepared: Option<(PreparedState, BTreeMap<Node, PreparedState>)>,
+}
+
+/// Every row of the tables that hold prepared work and the carry-owner
+/// journal, by table and key, whole (in UTC): prepared records (every
+/// column), their template and balance blobs (by digest, as md5 of the
+/// bytes), and the journal.
+pub type PreparedState = BTreeMap<&'static str, BTreeMap<String, serde_json::Value>>;
+
+/// Read [`PreparedState`] from `pool`.
+pub async fn prepared_state(pool: &PgPool) -> Result<PreparedState> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let mut state = PreparedState::new();
+    for (table, sql) in [
+        (
+            "qbit_prism_jobs",
+            "SELECT job_id, to_jsonb(j) FROM qbit_prism_jobs j WHERE job_id LIKE 'prepared:%'",
+        ),
+        (
+            "qbit_prism_templates",
+            "SELECT template_sha256, to_jsonb(md5(template_bytes)) FROM qbit_prism_templates",
+        ),
+        (
+            "qbit_prism_balance_snapshots",
+            "SELECT prior_balances_digest, to_jsonb(md5(balances)) FROM qbit_prism_balance_snapshots",
+        ),
+        (
+            "qbit_prism_node_roles",
+            "SELECT origin_node || ':' || epoch, to_jsonb(r) FROM qbit_prism_node_roles r",
+        ),
+    ] {
+        let rows: Vec<(String, serde_json::Value)> =
+            sqlx::query_as(sql).fetch_all(&mut *tx).await?;
+        state.insert(table, rows.into_iter().collect());
+    }
+    tx.commit().await?;
+    Ok(state)
 }
 
 impl Sim {
@@ -471,6 +514,7 @@ impl Sim {
             timeline: Mutex::new(Vec::new()),
             backups: BTreeMap::new(),
             dual_since,
+            cutover_prepared: None,
         };
         sim.mark(&format!(
             "started: {:?} pair, {} sessions through the balancer",
@@ -972,6 +1016,10 @@ impl Sim {
         self.mark(&format!(
             "no candidate can still be offered; {bookkeeping} landed blocks await their reconciliation bookkeeping"
         ));
+        let pool = self.pool(Node::A).await?;
+        let prepared_before = prepared_state(&pool).await;
+        pool.close().await;
+        let prepared_before = prepared_before?;
         self.wait_standby_replayed(Duration::from_secs(60)).await?;
         self.pg[&Node::B].promote().await?;
         self.mark("B's standby promoted into an independent primary");
@@ -1020,6 +1068,14 @@ impl Sim {
         for node in [Node::B, Node::A] {
             bootstrap_node(&self.frontends[&node], &self.pg[&node]).await?;
         }
+        let mut prepared_after = BTreeMap::new();
+        for node in Node::BOTH {
+            let pool = self.pool(node).await?;
+            let state = prepared_state(&pool).await;
+            pool.close().await;
+            prepared_after.insert(node, state?);
+        }
+        self.cutover_prepared = Some((prepared_before, prepared_after));
         for node in [Node::B, Node::A] {
             self.frontend_mut(node).start()?;
         }
