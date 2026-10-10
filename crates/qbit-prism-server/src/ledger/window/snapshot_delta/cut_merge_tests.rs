@@ -140,13 +140,12 @@ proptest! {
             .collect();
         under.sort_by_key(|row| std::cmp::Reverse(row.seq));
         for row in under {
-            if merge.remaining == 0 {
+            if merge.margin.remaining == 0 {
                 break;
             }
-            merge.remaining = merge.remaining.saturating_sub(row.difficulty);
-            merge.margin.push(share(row));
+            merge.margin.take(share(row));
         }
-        let remaining = merge.remaining;
+        let remaining = merge.margin.remaining;
         let assembled = merge.assemble();
         let (expected, expected_remaining) = walk(&rows, &fresh, weights.1);
         prop_assert_eq!(remaining, expected_remaining);
@@ -169,7 +168,7 @@ fn an_append_only_delta_keeps_the_retained_vector() {
     let prior: Vec<AcceptedShare> = rows[..4].iter().map(share).collect();
     let delta: Vec<AcceptedShare> = rows[4..].iter().map(share).collect();
     let merge = merge_cut_delta(prior, delta, 35).unwrap();
-    assert_eq!(merge.remaining, 0);
+    assert_eq!(merge.margin.remaining, 0);
     assert_eq!(merge.retired, 2);
     assert_eq!(
         merge
@@ -206,7 +205,7 @@ fn late_peer_rows_inside_the_window_are_merged_in_order() {
         })
         .collect();
     let merge = merge_cut_delta(retained, late, 1_000).unwrap();
-    assert_eq!(merge.remaining, 1_000 - 70);
+    assert_eq!(merge.margin.remaining, 1_000 - 70);
     assert_eq!(merge.retired, 0);
     assert_eq!(
         merge

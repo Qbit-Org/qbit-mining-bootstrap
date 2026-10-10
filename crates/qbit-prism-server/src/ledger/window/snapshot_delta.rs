@@ -286,11 +286,9 @@ pub(crate) enum Advance {
 struct Merge {
     prior: Vec<AcceptedShare>,
     delta: Vec<AcceptedShare>,
-    /// Newest first, as the margin pages arrive.
-    margin: Vec<AcceptedShare>,
+    margin: Margin,
     delta_start: usize,
     start: usize,
-    remaining: u128,
 }
 
 /// Release a retained vector under admission on a blocking thread and wait
@@ -433,10 +431,9 @@ pub(super) async fn advance(
             Ok(Merge {
                 prior: prior.shares,
                 delta,
-                margin: Vec::new(),
+                margin: Margin::to(remaining),
                 delta_start,
                 start,
-                remaining,
             })
         })
         .await?;
@@ -463,7 +460,7 @@ pub(super) async fn advance(
                 start,
                 ..
             } = merge;
-            let shares = if margin.is_empty() {
+            let shares = if margin.rows.is_empty() {
                 prior.drain(..start);
                 prior.extend(delta.drain(delta_start..));
                 if prior.capacity() > prior.len().saturating_mul(2).max(4) {
@@ -472,9 +469,9 @@ pub(super) async fn advance(
                 prior
             } else {
                 let mut shares = Vec::with_capacity(
-                    margin.len() + (prior.len() - start) + (delta.len() - delta_start),
+                    margin.rows.len() + (prior.len() - start) + (delta.len() - delta_start),
                 );
-                shares.extend(margin.into_iter().rev());
+                shares.extend(margin.rows.into_iter().rev());
                 shares.extend(prior.drain(start..));
                 shares.extend(delta.drain(delta_start..));
                 shares
@@ -509,42 +506,53 @@ fn reject(mut report: AcquisitionReport, outcome: WindowAcquisition) -> Advance 
     Advance::Rejected(report)
 }
 
-/// The newest-first walk's state while the margin below the retained first
-/// row is read: what [`walk_margin`] extends, for [`advance`]'s merge and
-/// [`advance_in_cut`]'s alike.
-trait MarginWalk: Send + 'static {
-    /// The target weight the walk has still to meet.
-    fn remaining(&self) -> u128;
-    /// The rows read below the retained first row, newest first.
-    fn margin(&self) -> &[AcceptedShare];
+/// The newest-first walk below the retained first row: the rows it read,
+/// newest first as the pages arrive, and the target weight it has still to
+/// meet. [`advance`]'s merge and [`advance_in_cut`]'s each carry one, which
+/// [`walk_margin`] extends.
+struct Margin {
+    rows: Vec<AcceptedShare>,
+    remaining: u128,
+}
+
+impl Margin {
+    /// No rows yet, `remaining` of the target unmet.
+    fn to(remaining: u128) -> Self {
+        Self {
+            rows: Vec::new(),
+            remaining,
+        }
+    }
+
     /// Take the next older row: its weight comes off the target, saturating
     /// as the full reader's fold does.
-    fn take(&mut self, share: AcceptedShare);
-}
-
-impl MarginWalk for Merge {
-    fn remaining(&self) -> u128 {
-        self.remaining
-    }
-    fn margin(&self) -> &[AcceptedShare] {
-        &self.margin
-    }
     fn take(&mut self, share: AcceptedShare) {
         self.remaining = self.remaining.saturating_sub(share.share_difficulty);
-        self.margin.push(share);
+        self.rows.push(share);
     }
 }
 
-impl MarginWalk for CutMerge {
-    fn remaining(&self) -> u128 {
-        self.remaining
-    }
-    fn margin(&self) -> &[AcceptedShare] {
+/// A merge state that carries a [`Margin`].
+trait WithMargin: Send + 'static {
+    fn margin(&self) -> &Margin;
+    fn margin_mut(&mut self) -> &mut Margin;
+}
+
+impl WithMargin for Merge {
+    fn margin(&self) -> &Margin {
         &self.margin
     }
-    fn take(&mut self, share: AcceptedShare) {
-        self.remaining = self.remaining.saturating_sub(share.share_difficulty);
-        self.margin.push(share);
+    fn margin_mut(&mut self) -> &mut Margin {
+        &mut self.margin
+    }
+}
+
+impl WithMargin for CutMerge {
+    fn margin(&self) -> &Margin {
+        &self.margin
+    }
+    fn margin_mut(&mut self) -> &mut Margin {
+        &mut self.margin
     }
 }
 
@@ -556,7 +564,7 @@ impl MarginWalk for CutMerge {
 /// before the target ([`WindowAcquisition::Partial`]), where the count proof
 /// could not tell the partial window from one missing older rows, so the
 /// full scan decides.
-async fn walk_margin<M: MarginWalk>(
+async fn walk_margin<M: WithMargin>(
     tx: &mut Transaction<'_, Postgres>,
     mut merge: BlockingDrop<M>,
     first: i64,
@@ -571,7 +579,7 @@ async fn walk_margin<M: MarginWalk>(
     );
     let mut margin_pages = 0;
     let mut cursor = first;
-    while merge.remaining() > 0 {
+    while merge.margin().remaining > 0 {
         if margin_pages == MAX_MARGIN_PAGES {
             retire(merge).await?;
             return Ok(Err(WindowAcquisition::MarginTooLarge));
@@ -591,8 +599,9 @@ async fn walk_margin<M: MarginWalk>(
         merge = merge
             .map_anyhow(move |mut merge| {
                 for row in &rows {
-                    merge.take(share_from_row(row)?);
-                    if merge.remaining() == 0 {
+                    let margin = merge.margin_mut();
+                    margin.take(share_from_row(row)?);
+                    if margin.remaining == 0 {
                         break;
                     }
                 }
@@ -602,14 +611,15 @@ async fn walk_margin<M: MarginWalk>(
         cursor = i64::try_from(
             merge
                 .margin()
+                .rows
                 .last()
                 .context("decoded margin page is empty")?
                 .share_seq,
         )?;
     }
-    report.margin_rows = merge.margin().len();
+    report.margin_rows = merge.margin().rows.len();
     report.retired_rows = retired;
-    if merge.remaining() > 0 {
+    if merge.margin().remaining > 0 {
         retire(merge).await?;
         return Ok(Err(WindowAcquisition::Partial));
     }
@@ -798,8 +808,7 @@ async fn advance_in_cut(
 /// read below them (newest first), and the target weight still unmet.
 struct CutMerge {
     kept: Vec<AcceptedShare>,
-    margin: Vec<AcceptedShare>,
-    remaining: u128,
+    margin: Margin,
     /// Merged rows the fold dropped from the old end.
     retired: usize,
 }
@@ -810,11 +819,11 @@ impl CutMerge {
         let CutMerge {
             mut kept, margin, ..
         } = self;
-        if margin.is_empty() {
+        if margin.rows.is_empty() {
             return kept;
         }
-        let mut shares = Vec::with_capacity(margin.len() + kept.len());
-        shares.extend(margin.into_iter().rev());
+        let mut shares = Vec::with_capacity(margin.rows.len() + kept.len());
+        shares.extend(margin.rows.into_iter().rev());
         shares.append(&mut kept);
         shares
     }
@@ -878,8 +887,7 @@ fn merge_cut_delta(
     }
     Ok(CutMerge {
         kept,
-        margin: Vec::new(),
-        remaining,
+        margin: Margin::to(remaining),
         retired: start,
     })
 }

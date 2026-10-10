@@ -228,6 +228,12 @@ const PEER_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHER
 /// database and stamped at or before the anchor too (a node's stamps rise
 /// with its `share_seq`), so the anchor rule never removes a row the cut
 /// admits, and the peer's rows above it join the next windows.
+///
+/// `high_water` is the mark the cutoff's statement read under `ORDER_LOCK`,
+/// in another transaction. The mark is read again here and the lower one
+/// bounds the entry, so a mark rewound in between (a restore, or a
+/// repersonalise) never admits a peer row whose lower rows this database no
+/// longer holds; NULL either time admits none.
 pub(crate) async fn read_peer_cut(
     connection: &mut sqlx::PgConnection,
     peer: i16,
@@ -235,6 +241,12 @@ pub(crate) async fn read_peer_cut(
     anchor_ms: i64,
 ) -> Result<Option<u64>, WindowError> {
     let Some(high_water) = high_water else {
+        return Ok(None);
+    };
+    let now: Option<i64> = sqlx::query_scalar(PEER_HIGH_WATER_SQL)
+        .fetch_one(&mut *connection)
+        .await?;
+    let Some(high_water) = now.map(|now| now.min(high_water)) else {
         return Ok(None);
     };
     let entry: Option<i64> = sqlx::query_scalar(PEER_CUT_SQL)
