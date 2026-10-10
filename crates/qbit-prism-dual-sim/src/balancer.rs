@@ -553,12 +553,18 @@ async fn session(client: TcpStream, shared: Arc<Shared>, index: usize) {
     let id = shared.next_session.fetch_add(1, Ordering::Relaxed);
     let (closer, mut closed) = watch::channel(false);
     if let Ok(mut sessions) = backend.sessions.lock() {
-        sessions.insert(id, closer.clone());
+        sessions.insert(id, closer);
     }
     // A session chosen just before its node's mark-down can register after
-    // the mark-down closed every session: close it as the mark-down would.
+    // the mark-down closed every session: it ends as the mark-down would have
+    // ended it, before a byte reaches the node, and is not counted as routed.
     if !*backend.up.borrow() {
-        closer.send_replace(true);
+        if let Ok(mut sessions) = backend.sessions.lock() {
+            sessions.remove(&id);
+        }
+        crate::relay::reset(client);
+        crate::relay::reset(upstream);
+        return;
     }
     backend.routed.fetch_add(1, Ordering::Relaxed);
     let (mut client, mut upstream) = (client, upstream);
