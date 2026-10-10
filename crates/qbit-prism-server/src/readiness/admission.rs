@@ -56,11 +56,7 @@ impl Withdrawal {
 
     /// The metric, health and log label of the reason.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OwnLogBehind => "own-log-behind",
-            Self::WriterNotLocal => "writer-not-local",
-            Self::NotReady => "not-ready",
-        }
+        self.label().as_str()
     }
 }
 
@@ -82,8 +78,6 @@ pub enum AdmissionState {
 }
 
 impl AdmissionState {
-    pub const LABELS: [&'static str; 4] = ["starting", "admitting", "grace", "withdrawn"];
-
     pub fn admits(self) -> bool {
         matches!(self, Self::Admitting | Self::Grace { .. })
     }
@@ -108,12 +102,7 @@ impl AdmissionState {
 
     /// The metric and health label of the state.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Admitting => "admitting",
-            Self::Grace { .. } => "grace",
-            Self::Withdrawn { .. } => "withdrawn",
-        }
+        self.label().as_str()
     }
 }
 
@@ -422,44 +411,6 @@ mod tests {
         assert_eq!(
             admission.observe(start, false, None),
             Some(AdmissionChange::Withdrawn(Withdrawal::NotReady))
-        );
-    }
-
-    #[test]
-    fn metric_labels_match_the_state_and_reason_names() {
-        for reason in Withdrawal::ALL {
-            assert_eq!(reason.label().as_str(), reason.as_str());
-        }
-        assert_eq!(
-            crate::metrics::WithdrawalReason::ALL.len(),
-            Withdrawal::ALL.len()
-        );
-        let labels: Vec<_> = crate::metrics::AdmissionStateLabel::ALL
-            .iter()
-            .map(|label| label.as_str())
-            .collect();
-        let mut names = AdmissionState::LABELS.to_vec();
-        names.sort_unstable();
-        let mut sorted = labels.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, names);
-    }
-
-    #[test]
-    fn labels_cover_every_state() {
-        let now = Instant::now();
-        let states = [
-            AdmissionState::Starting,
-            AdmissionState::Admitting,
-            AdmissionState::Grace { since: now },
-            AdmissionState::Withdrawn {
-                reason: Withdrawal::NotReady,
-            },
-        ];
-        assert_eq!(
-            states.map(AdmissionState::as_str),
-            AdmissionState::LABELS,
-            "LABELS lists every state in order"
         );
     }
 }
