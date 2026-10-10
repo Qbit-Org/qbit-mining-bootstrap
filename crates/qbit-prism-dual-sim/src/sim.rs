@@ -602,20 +602,41 @@ impl Sim {
         let Ok(pool) = self.pool(node).await else {
             return "database unreachable".into();
         };
-        let row: Option<(String, Option<String>, Option<String>, i32)> = sqlx::query_as(
-            "SELECT state, offer_outcome, last_error, attempt_count \
+        // The claim's holder and its expiry, and the next attempt, in
+        // seconds from now: why a row is not being worked on.
+        type Row = (
+            String,
+            Option<String>,
+            Option<String>,
+            i32,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+        );
+        // A parked row's next attempt is 'infinity', which PostgreSQL 16
+        // cannot subtract from.
+        let row: Result<Option<Row>, _> = sqlx::query_as(
+            "SELECT state, offer_outcome, last_error, attempt_count, claim_instance_id, \
+                    CASE WHEN isfinite(claim_expires_at) \
+                      THEN EXTRACT(EPOCH FROM claim_expires_at - clock_timestamp())::float8 \
+                      ELSE 'Infinity'::float8 END, \
+                    CASE WHEN isfinite(next_attempt_at) \
+                      THEN EXTRACT(EPOCH FROM next_attempt_at - clock_timestamp())::float8 \
+                      ELSE 'Infinity'::float8 END \
              FROM qbit_block_candidate_outbox WHERE block_hash = $1",
         )
         .bind(hash)
         .fetch_optional(&pool)
-        .await
-        .unwrap_or(None);
+        .await;
         pool.close().await;
         match row {
-            Some((state, outcome, error, attempts)) => format!(
-                "candidate {state}, outcome {outcome:?}, {attempts} attempts, last error {error:?}"
+            Ok(Some((state, outcome, error, attempts, holder, expires_in, next_in))) => format!(
+                "candidate {state}, outcome {outcome:?}, {attempts} attempts, last error \
+                 {error:?}, claimed by {holder:?} for {expires_in:?} s more, next attempt in \
+                 {next_in:?} s"
             ),
-            None => "no candidate row".into(),
+            Ok(None) => "no candidate row".into(),
+            Err(error) => format!("candidate unreadable: {error}"),
         }
     }
 
