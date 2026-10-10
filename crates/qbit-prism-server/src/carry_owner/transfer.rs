@@ -696,7 +696,7 @@ async fn observe(
     peer: &PeerJournal,
     report: &mut Report,
 ) -> Result<PeerRead> {
-    let mut connection = ledger.pool.acquire().await?;
+    let mut connection = ledger.acquire().await?;
     report.database_node = read_node_identity(&mut connection).await?;
     report.local = read_latest_roles(&mut connection, settings.node_index).await?;
     drop(connection);
@@ -827,7 +827,7 @@ pub async fn transfer<C: ChainSource>(
     let peer_read = observe(ledger, settings, &peer, &mut report).await?;
     let peer_node = peer_index(settings.node_index);
     let synced_claim = {
-        let mut connection = ledger.pool.acquire().await?;
+        let mut connection = ledger.acquire().await?;
         read_latest_claim(&mut connection, peer_node).await?
     };
     let live_claim = match peer_read {
@@ -879,7 +879,7 @@ pub async fn transfer<C: ChainSource>(
         latest.action
     );
     let unchanged = |local: &LatestRoles| local.own == report.local.own;
-    let mut connection = ledger.pool.acquire().await?;
+    let mut connection = ledger.acquire().await?;
     let local = read_latest_roles(&mut connection, settings.node_index).await?;
     drop(connection);
     ensure!(
