@@ -1629,16 +1629,19 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
                 .map(|r| r.session)
                 .collect();
             let passed = matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50);
+            let missing: Vec<usize> = (0..sessions)
+                .filter(|session| !on_b.contains(session))
+                .collect();
             (
-                passed && (0..sessions).all(|session| on_b.contains(&session)),
+                passed && missing.is_empty(),
                 format!(
-                    "sessions with shares accepted on B 45 to 60 s after the death: {} of \
-                     {sessions}; p95 answer latency of shares on B's jobs: {early:?} ms over \
+                    "miner sessions with no share accepted on B 45 to 60 s after the death: \
+                     {missing:?} (of {sessions}); p95 answer latency of shares on B's jobs: \
+                     {early:?} ms over \
                      {early_n} shares \
                      5 to 20 s after A was marked down ({} ms after the death), {late:?} ms over \
                      {late_n} shares 45 to 60 s after the death (bound: twice the first, plus \
                      50 ms), at {PULLER_DEATH_RATE} offered shares/s",
-                    on_b.len(),
                     down as i64 - fault_at as i64
                 ),
             )

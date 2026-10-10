@@ -822,7 +822,7 @@ impl Sim {
                 if let std::collections::btree_map::Entry::Vacant(slot) = since.entry(node) {
                     match capped(deadline, db_clock(&pools[&node])).await {
                         Ok(at) => {
-                            slot.insert(at);
+                            slot.insert((at, started.elapsed()));
                         }
                         Err(error) => last = format!("reading node {node:?}'s clock: {error:#}"),
                     }
@@ -861,7 +861,10 @@ impl Sim {
                     // Every conflict, and those seen during the wait: a row
                     // refused before it stays missing just the same. Without
                     // the database's clock at the start, the second is unread.
-                    let since = since.get(node).copied();
+                    let (since, late) = match since.get(node) {
+                        Some((at, read_after)) => (Some(*at), *read_after),
+                        None => (None, Duration::ZERO),
+                    };
                     let count = tokio::time::timeout(
                         Duration::from_secs(5),
                         sqlx::query_as::<_, (i64, Option<i64>)>(
@@ -874,9 +877,14 @@ impl Sim {
                     )
                     .await;
                     conflicts.push(match count {
-                        Ok(Ok((all, Some(recent)))) => {
+                        Ok(Ok((all, Some(recent)))) if late < Duration::from_secs(2) => {
                             format!("node {node:?}: {all} ({recent} seen during the wait)")
                         }
+                        Ok(Ok((all, Some(recent)))) => format!(
+                            "node {node:?}: {all} ({recent} seen since its clock was first read, \
+                             {:.0} s into the wait)",
+                            late.as_secs_f64()
+                        ),
                         Ok(Ok((all, None))) => {
                             format!("node {node:?}: {all} (during the wait: unread)")
                         }
