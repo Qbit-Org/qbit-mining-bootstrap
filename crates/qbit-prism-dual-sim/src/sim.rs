@@ -1148,16 +1148,17 @@ pub const PEER_ROLE_GRANTS: &[&str] = &[
      TO prism_peer_sync",
 ];
 
-/// TEMPORARY, until D1's pending push delivers them (status/D6.md, findings
-/// 4 and 6): stand-ins that let the dual-writer scenarios run in CI on the
-/// 3.1 stack meanwhile. Each is a no-op once the schema and grants carry it,
-/// and this list is then removed. Applied after [`PEER_ROLE_GRANTS`], which
-/// stays exactly D1's list.
+/// TEMPORARY, until D1's pending push (status/D6.md, findings 4 and 6):
+/// stand-ins that let the dual-writer scenarios run in CI on the 3.1 stack
+/// meanwhile. The list is removed with the rebase onto that push. Applied
+/// after [`PEER_ROLE_GRANTS`], which stays exactly D1's list.
 /// - Migration 031's `(origin_node, share_seq)` index, under 031's name: D2's
-///   window cut refuses to run without it.
+///   window cut refuses to run without it. A no-op once 031 is in the stack.
 /// - `singleton` on `qbit_prism_cluster` for the peer role: D1's engine reads
 ///   the fingerprint `WHERE singleton` (`ledger/peer_sync.rs`), which D1's
-///   documented column grant does not cover.
+///   documented column grant does not cover. D1's fix drops that predicate
+///   instead, so this grant never becomes a no-op: it must go with the list,
+///   or it would hide the same fault coming back.
 pub const TEMPORARY_STAND_INS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx \
      ON qbit_share_ledger (origin_node, share_seq)",

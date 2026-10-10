@@ -1004,7 +1004,7 @@ id = "dual-writer-s06-a-restarts-peer-unreadable"
 title = "S6, A restarts while B answers but cannot be read: A serves on its own D-17 evidence"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "B's PostgreSQL accepts the peer role, but every read of its share ledger hangs (an ACCESS EXCLUSIVE lock held on B) or fails (the peer role's SELECT revoked); a probe as the peer role shows it. A's frontend is restarted with its database untouched: it reports ready and takes miners within 120 s (D-8, D-17). B is then made readable again and the pair catches up; invariants 1 to 4 hold."
+criteria = "B's PostgreSQL accepts the peer role, but every read of its share ledger hangs (an ACCESS EXCLUSIVE lock held on B) or fails (the peer role's SELECT revoked); a probe as the peer role shows it. A's frontend is restarted with its database untouched: it reports ready within 120 s and takes miners within 60 s of that (D-8, D-17). B is then made readable again and the pair catches up; invariants 1 to 4 hold."
 runs = true
 tests = ["qbit-prism-dual-sim::scenarios::s06_a_restarts_and_serves_while_b_answers_but_its_ledger_is_locked", "qbit-prism-dual-sim::scenarios::s06_a_restarts_and_serves_while_b_answers_but_refuses_its_reads"]
 
@@ -1058,7 +1058,7 @@ id = "dual-writer-s08-block-at-death"
 title = "S8: a block found at the instant its node dies"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "Whether the dying node's block reached its qbitd or not, it ends landed once on both nodes or adoptable, and nothing is paid twice."
+criteria = "A dies at the instant it finds a block. Lost (its submitblock held): the block never reaches the chain and is never paid; A may keep its candidate for reconciliation, never offering it again. Accepted (the node took it, A never heard), with the D-19 wait on and off: once the block is 60 blocks deep the survivor adopts it (required with the wait, measured without), A lands it or skips it on return, each node holds one landing, and nothing is paid twice."
 runs = true
 tests = ["qbit-prism-dual-sim::scenarios::s08_a_block_lost_with_its_dying_node_is_never_paid", "qbit-prism-dual-sim::scenarios::s08_a_block_accepted_as_its_node_dies_is_adopted_by_the_survivor_and_landed_once", "qbit-prism-dual-sim::scenarios::s08_without_the_peer_ingest_wait_a_block_accepted_as_its_node_dies_is_landed_once"]
 
