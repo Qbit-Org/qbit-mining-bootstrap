@@ -38,7 +38,10 @@ impl AdoptionNeeds {
             None => true,
             Some(need) => cursor.is_some_and(|cursor| cursor >= need),
         };
-        covered(self.share_seq, cursors.shares) && covered(self.prepared_sync_seq, cursors.prepared)
+        // Held, not only scanned: a row the peer refused as a conflict is
+        // one it can never adopt the block with.
+        covered(self.share_seq, cursors.shares_held)
+            && covered(self.prepared_sync_seq, cursors.prepared_held)
     }
 }
 
@@ -201,6 +204,8 @@ mod tests {
             shares: Some(10),
             blocks: None,
             prepared: Some(5),
+            shares_held: Some(10),
+            prepared_held: Some(5),
         };
         assert!(AdoptionNeeds::default().met_by(&PeerCursors::default()));
         assert!(AdoptionNeeds {
@@ -223,6 +228,27 @@ mod tests {
             prepared_sync_seq: None
         }
         .met_by(&PeerCursors::default()));
+        // Scanned past the need, but holding only rows below a refused one.
+        let refused = PeerCursors {
+            shares_held: Some(7),
+            prepared_held: Some(3),
+            ..cursors.clone()
+        };
+        assert!(!AdoptionNeeds {
+            share_seq: Some(8),
+            prepared_sync_seq: None
+        }
+        .met_by(&refused));
+        assert!(!AdoptionNeeds {
+            share_seq: None,
+            prepared_sync_seq: Some(4)
+        }
+        .met_by(&refused));
+        assert!(AdoptionNeeds {
+            share_seq: Some(7),
+            prepared_sync_seq: Some(3)
+        }
+        .met_by(&refused));
         assert_eq!(PeerIngest::TimedOut.outcome(), "timed_out");
     }
 }

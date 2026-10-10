@@ -242,12 +242,16 @@ pub struct PeerFacts {
 }
 
 /// The peer's cursors over this node's streams: positions in this node's
-/// key spaces that the peer has scanned through.
+/// key spaces that the peer has scanned through, and, for shares and
+/// prepared jobs, through which it holds every row of this node's it
+/// scanned: below the first one it refused as a conflict, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerCursors {
     pub shares: Option<i64>,
     pub blocks: Option<i64>,
     pub prepared: Option<i64>,
+    pub shares_held: Option<i64>,
+    pub prepared_held: Option<i64>,
 }
 
 /// One pull of share rows: the peer rows in `(after, through]`, their header
@@ -356,16 +360,18 @@ pub mod peer {
 
     /// How far the peer has pulled this node's streams.
     pub async fn cursors(connection: &mut PgConnection) -> Result<PeerCursors> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT stream,scanned_through FROM qbit_prism_peer_sync_cursors")
-                .fetch_all(&mut *connection)
-                .await?;
+        let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT stream,scanned_through,ingested_through FROM qbit_prism_peer_sync_cursors",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
         let mut cursors = PeerCursors::default();
-        for (stream, position) in rows {
+        for (stream, position, stopped) in rows {
+            let held = Some(stopped.unwrap_or(position).min(position));
             match stream.as_str() {
-                SHARES => cursors.shares = Some(position),
+                SHARES => (cursors.shares, cursors.shares_held) = (Some(position), held),
                 BLOCKS => cursors.blocks = Some(position),
-                PREPARED => cursors.prepared = Some(position),
+                PREPARED => (cursors.prepared, cursors.prepared_held) = (Some(position), held),
                 _ => {}
             }
         }
@@ -781,25 +787,30 @@ impl Ledger {
 
     /// Advance `stream`'s cursor over the peer's rows to `scanned_through`,
     /// in the transaction that inserted the rows it covers. It never moves
-    /// back.
+    /// back. For shares and prepared jobs, `ingested_through` stays NULL
+    /// while this node holds every peer row it scanned; the first pull that
+    /// refuses one as a conflict, at `refused_from`, sets it just below that
+    /// row, where it stays until an operator resets it. The peer's
+    /// found-block wait reads it as the position through which this node
+    /// holds its rows.
     async fn advance_cursor(
         tx: &mut Transaction<'_, Postgres>,
         stream: &str,
         peer: NodeIndex,
         scanned_through: i64,
-        ingested: Option<i64>,
+        refused_from: Option<i64>,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) \
-             VALUES($1,$2,$3,$4) ON CONFLICT(stream) DO UPDATE SET \
+             VALUES($1,$2,$3,$4::bigint-1) ON CONFLICT(stream) DO UPDATE SET \
              scanned_through=GREATEST(qbit_prism_peer_sync_cursors.scanned_through,EXCLUDED.scanned_through),\
-             ingested_through=GREATEST(qbit_prism_peer_sync_cursors.ingested_through,EXCLUDED.ingested_through),\
+             ingested_through=COALESCE(qbit_prism_peer_sync_cursors.ingested_through,EXCLUDED.ingested_through),\
              peer_node=EXCLUDED.peer_node,updated_at=clock_timestamp()",
         )
         .bind(stream)
         .bind(peer.index())
         .bind(scanned_through)
-        .bind(ingested)
+        .bind(refused_from)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -968,6 +979,7 @@ impl Ledger {
         } else {
             None
         };
+        let mut refused_from = None;
         if batch.row_count > 0 {
             // Header mappings this node holds for another share, a share this
             // node credits at another share_seq (the ledger is unique on
@@ -1080,6 +1092,21 @@ impl Ledger {
                 .await?;
                 applied.conflict("qbit_share_ledger");
             }
+            let refused: BTreeSet<&str> = refused_ids.iter().map(String::as_str).collect();
+            refused_from = batch
+                .rows
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| {
+                    row.get("share_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| refused.contains(id))
+                })
+                .filter_map(|row| row.get("share_seq").and_then(Value::as_i64))
+                .chain(differing.iter().map(|(share_seq, _)| *share_seq))
+                .min();
             // Inserted below the hashrate rollups' watermark, which this
             // node's sweep has passed and never reads again: folded here, in
             // this transaction, under the sweep's progress row. A sweep
@@ -1097,7 +1124,7 @@ impl Ledger {
             }
         }
         if let (Some(stream), Some(through)) = (stream, batch.through) {
-            Self::advance_cursor(&mut tx, stream, origin, through, batch.highest).await?;
+            Self::advance_cursor(&mut tx, stream, origin, through, refused_from).await?;
         }
         tx.commit().await?;
         Ok(applied)
@@ -1214,8 +1241,8 @@ impl Ledger {
             }
         }
         if let Some((stream, peer)) = stream {
-            Self::advance_cursor(&mut tx, stream, peer, block.sync_seq, Some(block.sync_seq))
-                .await?;
+            // No stop: nothing waits on the peer holding a block.
+            Self::advance_cursor(&mut tx, stream, peer, block.sync_seq, None).await?;
         }
         tx.commit().await?;
         Ok(applied)
@@ -1436,7 +1463,20 @@ impl Ledger {
             }
         }
         if let (Some(stream), Some(highest)) = (stream, batch.highest) {
-            Self::advance_cursor(&mut tx, stream, origin, highest, Some(highest)).await?;
+            // A conflict anywhere in the batch: held from below its first job.
+            let refused_from = (applied.total_conflicts() > 0)
+                .then(|| {
+                    batch
+                        .jobs
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|job| job.get("sync_seq").and_then(Value::as_i64))
+                        .min()
+                })
+                .flatten();
+            Self::advance_cursor(&mut tx, stream, origin, highest, refused_from).await?;
         }
         tx.commit().await?;
         Ok(applied)

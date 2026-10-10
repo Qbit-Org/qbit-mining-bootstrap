@@ -103,6 +103,9 @@ pub struct TableRows {
 
 /// A `qbit_prism_peer_sync_cursors` row: how far this node has pulled one
 /// stream of the peer's rows, in the stream's key on the peer.
+/// `ingested_through` is NULL while this node holds every peer row it
+/// scanned, and otherwise the position below the first one it refused as a
+/// conflict.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PeerSyncCursor {
     pub stream: String,
@@ -666,7 +669,7 @@ impl Ledger {
                 scanned_through: peer_shares.map_or(peer_lineage.share_seq_floor, |held| {
                     held.max(peer_lineage.share_seq_floor)
                 }),
-                ingested_through: peer_shares,
+                ingested_through: None,
             },
             PeerSyncCursor {
                 stream: "blocks".into(),

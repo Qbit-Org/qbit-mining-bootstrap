@@ -671,11 +671,21 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         let mut tx = pair.b.pool.begin().await?;
         land_in(&mut tx, "conflicting", 300, &conflicting, &hex("snapshot conflicting"), &hex("another coinbase")).await?;
         land_in(&mut tx, "adopted", 301, &adopted, &hex("snapshot adopted"), &hex("coinbase adopted")).await?;
+        // And one of A's prepared jobs, under its id, built on another parent.
+        let contested_job = prepare(&pair.a, "contested-job").await?;
+        sqlx::query("INSERT INTO qbit_prism_templates(template_sha256,template_bytes) VALUES($1,$2)")
+            .bind(hex("template contested-job")).bind("contested-job".as_bytes()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2)")
+            .bind(hex("balances contested-job")).bind("[contested-job]".as_bytes()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,window_anchor_ms,window_prior_balances_sha256,template_sha256) VALUES($1,'node-a',$2,0,'{\"compact\":true}'::jsonb,clock_timestamp()+interval '1 hour',1000,$3,$4)")
+            .bind(&contested_job).bind(hex("another parent")).bind(hex("balances contested-job")).bind(hex("template contested-job"))
+            .execute(&mut *tx).await?;
         tx.commit().await?;
         let carries_before = count(&pair.b.pool, "SELECT count(*) FROM qbit_payout_carry_forward").await?;
         let (mut on_b, metrics) = sync(&pair.b, NodeIndex::B, &pair.a_url);
         pass_until(&mut on_b, async |_| {
-            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_pool_blocks WHERE block_hash='{later}'")).await? == 1)
+            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_pool_blocks WHERE block_hash='{later}'")).await? == 1
+                && count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_prism_jobs'").await? == 1)
         })
         .await?;
         // The contested share is refused whole; the one after it arrives.
@@ -700,6 +710,7 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         .await?;
         let mut expected = vec![
             ("qbit_pool_blocks".to_owned(), conflicting.clone()),
+            ("qbit_prism_jobs".to_owned(), contested_job.clone()),
             ("qbit_share_ledger".to_owned(), share("contested").share_id),
             ("qbit_share_ledger".to_owned(), doubled.clone()),
         ];
@@ -716,9 +727,63 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         .fetch_one(&pair.b.pool)
         .await?;
         ensure!(seen == 1 && detail.contains("maps header") && detail.contains("another share_seq"), "{seen} {detail}");
+        // B now holds A's shares only below the first one it refused, and
+        // A's prepared jobs only below the contested one, even after a later
+        // clean pull, so A's found-block wait confirms needs ending there and
+        // no later ones.
+        let job_seq = count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_prism_jobs WHERE job_id='{contested_job}'")).await?;
+        let later_job = prepare(&pair.a, "later-job").await?;
+        pass_until(&mut on_b, async |_| {
+            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{later_job}'")).await? == 1)
+        })
+        .await?;
+        let later_seq = count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_prism_jobs WHERE job_id='{later_job}'")).await?;
+        let stops: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT stream,ingested_through FROM qbit_prism_peer_sync_cursors ORDER BY stream",
+        )
+        .fetch_all(&pair.b.pool)
+        .await?;
+        ensure!(
+            stops
+                == [
+                    ("blocks".to_owned(), None),
+                    ("prepared".to_owned(), Some(job_seq - 1)),
+                    ("shares".to_owned(), Some(theirs[0] - 1)),
+                ],
+            "{stops:?}"
+        );
+        {
+            use qbit_prism_server::peer_sync::{AdoptionNeeds, PeerIngest, PeerIngestWait};
+            let wait = PeerIngestWait::new(&config(NodeIndex::A, &pair.b_url, None))?
+                .context("the wait is on by default")?;
+            let below = AdoptionNeeds {
+                share_seq: Some(theirs[0] - 1),
+                prepared_sync_seq: None,
+            };
+            let (_, outcome, _) = wait.wait(std::future::ready(Ok(below))).await;
+            ensure!(outcome == PeerIngest::Confirmed, "{outcome:?}");
+            let past = AdoptionNeeds {
+                share_seq: Some(theirs[1]),
+                prepared_sync_seq: None,
+            };
+            let (_, outcome, _) = wait.wait(std::future::ready(Ok(past))).await;
+            ensure!(outcome == PeerIngest::TimedOut, "{outcome:?}");
+            let prepared_below = AdoptionNeeds {
+                share_seq: None,
+                prepared_sync_seq: Some(job_seq - 1),
+            };
+            let (_, outcome, _) = wait.wait(std::future::ready(Ok(prepared_below))).await;
+            ensure!(outcome == PeerIngest::Confirmed, "{outcome:?}");
+            let prepared_past = AdoptionNeeds {
+                share_seq: None,
+                prepared_sync_seq: Some(later_seq),
+            };
+            let (_, outcome, _) = wait.wait(std::future::ready(Ok(prepared_past))).await;
+            ensure!(outcome == PeerIngest::TimedOut, "{outcome:?}");
+        }
         // Seen again, each conflict is counted, not duplicated.
         on_b.pass().await?;
-        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 3);
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 4);
         Ok(())
     })
     .await

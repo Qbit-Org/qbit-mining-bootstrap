@@ -496,7 +496,7 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
                 == [
                     ("blocks".into(), 0, 0, None),
                     ("prepared".into(), 0, 0, None),
-                    ("shares".into(), 0, 18, Some(18)),
+                    ("shares".into(), 0, 18, None),
                 ],
             "{cursors:?}"
         );
@@ -509,7 +509,7 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
         ensure!(
             done.cursors
                 == [
-                    cursor("shares", 18, Some(18)),
+                    cursor("shares", 18, None),
                     cursor("blocks", 0, None),
                     cursor("prepared", 0, None),
                 ],

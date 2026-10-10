@@ -164,11 +164,14 @@ CREATE TABLE IF NOT EXISTS qbit_prism_node_lineage (
 
 -- 6. How far this node has pulled each stream of the peer's rows: the
 --    position scanned through, in the stream's key on the peer (share_seq
---    for 'shares', sync_seq for 'blocks' and 'prepared'), and the highest
---    peer-originated key inserted. Written in the transaction that inserts
---    the rows, so a restore rewinds both together and the pull repeats what
---    the restore lost. Local state, never copied; the peer's sync role reads
---    it when the peer recovers its own log.
+--    for 'shares', sync_seq for 'blocks' and 'prepared'), and, for shares
+--    and prepared jobs, once a pull refuses a peer row as a conflict, the
+--    position below it, through which this node holds every peer row (NULL
+--    while it holds them all; an operator resets it). Written in the
+--    transaction that inserts the rows, so a restore rewinds both together
+--    and the pull repeats what the restore lost. Local state, never copied;
+--    the peer's sync role reads it when the peer recovers its own log, and
+--    before it offers a found block.
 CREATE TABLE IF NOT EXISTS qbit_prism_peer_sync_cursors (
     stream text PRIMARY KEY CHECK (stream IN ('shares', 'blocks', 'prepared')),
     peer_node smallint NOT NULL CHECK (peer_node IN (0, 1)),
