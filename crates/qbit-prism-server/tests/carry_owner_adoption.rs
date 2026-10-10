@@ -170,6 +170,8 @@ impl Fixture {
             peer_database_url_fallback: None,
             peer_sync_interval: Duration::from_millis(DEFAULT_PEER_SYNC_INTERVAL_MS),
             peer_sync_batch_rows: DEFAULT_PEER_SYNC_BATCH_ROWS,
+            // No peer holds anything here: the D-19 wait is off.
+            peer_ingest_wait: Duration::ZERO,
         });
         let coordinator = Coordinator::new(config, Arc::new(Metrics::default())).await?;
         let pool = coordinator.ledger.pool.clone();
@@ -182,7 +184,6 @@ impl Fixture {
             .ledger
             .set_node_identity(NODE.node, "carry_owner_adoption")
             .await?;
-        ensure_origin_index(&pool).await?;
         // The fixture's shares are the peer's, as peer sync would have
         // copied them: mark them pulled, as the sync's share cursor does, so
         // the window cut admits them (D-14).
@@ -1498,23 +1499,4 @@ async fn refused(f: &Fixture) -> Result<()> {
         "the adopted block is still reported"
     );
     session.release().await
-}
-
-/// Until D1's migration 031 lands, a dual-writer window cut refuses to read
-/// the share ledger without the `(origin_node, share_seq)` index; create it
-/// the way D2's tests do. A no-op once the migration has made one.
-async fn ensure_origin_index(pool: &PgPool) -> Result<()> {
-    let indexed: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
-         JOIN pg_attribute b ON b.attrelid=i.indrelid AND b.attnum=i.indkey[1] \
-         WHERE i.indrelid='qbit_share_ledger'::regclass AND i.indisvalid AND a.attname='origin_node' AND b.attname='share_seq')",
-    )
-    .fetch_one(pool)
-    .await?;
-    if !indexed {
-        sqlx::query("CREATE INDEX qbit_share_ledger_origin_seq_until_031 ON qbit_share_ledger (origin_node, share_seq)")
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
 }

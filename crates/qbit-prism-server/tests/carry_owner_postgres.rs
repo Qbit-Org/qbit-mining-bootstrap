@@ -54,25 +54,6 @@ const DEBT_GAUGE: &str = "qbit_prism_carry_forward_debt_sats";
 /// miner-c's debt in the local settlement.
 const LOCAL_DEBT: f64 = 300.;
 
-/// Until D1's migration 031 lands, a dual-writer window cut refuses to read
-/// the share ledger without the `(origin_node, share_seq)` index; create it
-/// the way D2's tests do. A no-op once the migration has made one.
-async fn ensure_origin_index(pool: &PgPool) -> Result<()> {
-    let indexed: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
-         JOIN pg_attribute b ON b.attrelid=i.indrelid AND b.attnum=i.indkey[1] \
-         WHERE i.indrelid='qbit_share_ledger'::regclass AND i.indisvalid AND a.attname='origin_node' AND b.attname='share_seq')",
-    )
-    .fetch_one(pool)
-    .await?;
-    if !indexed {
-        sqlx::query("CREATE INDEX qbit_share_ledger_origin_seq_until_031 ON qbit_share_ledger (origin_node, share_seq)")
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
-}
-
 /// Run `ledger` as dual-writer node B: its gate starts closed, and the rows
 /// the peer sync inserts (origin_node 0, the column default) are node A's.
 /// Its journal claims ownership, so the gate alone decides what work pays.
@@ -94,10 +75,9 @@ async fn as_node_a(ledger: &Ledger) -> Result<()> {
     claim_ownership(ledger, NodeIndex::A).await
 }
 
-/// The origin index a dual-writer snapshot needs, and a journal row of
-/// `node`'s that claims ownership, as an owner's guard seeds it.
+/// A journal row of `node`'s that claims ownership, as an owner's guard
+/// seeds it.
 async fn claim_ownership(ledger: &Ledger, node: NodeIndex) -> Result<()> {
-    ensure_origin_index(&ledger.pool).await?;
     seed_role(ledger, node.index(), true).await?;
     Ok(())
 }

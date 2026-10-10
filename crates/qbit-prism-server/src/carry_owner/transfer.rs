@@ -728,6 +728,15 @@ pub async fn status(ledger: &Ledger, settings: &CarryOwnerSettings) -> Result<Re
     Ok(report)
 }
 
+/// The bound on `release`'s tip read under `SETTLEMENT_LOCK`.
+const RELEASE_TIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The least release depth `transfer` waits for, whatever
+/// `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` says: carry-paying work built just
+/// before a release can still reach the tip after the one it recorded, and
+/// the scan must see what it finds there.
+pub const MIN_RELEASE_DEPTH: u64 = 2;
+
 /// `carry-owner release`: this node gives up ownership. The `release` row
 /// and a payout revision bump commit together, so work built before it is
 /// superseded. Without `confirm` nothing is written and the report says what
@@ -772,9 +781,14 @@ pub async fn release<C: ChainSource>(
         "this node's journal changed while release was checking; run it again"
     );
     // The release height is the tip when the release is fenced: read under
-    // SETTLEMENT_LOCK, which every snapshot takes and which reads this row,
-    // so no carry-paying work of this node's is built on a later tip.
-    let (tip_height, _) = chain.tip().await?;
+    // SETTLEMENT_LOCK, which every snapshot takes before it reads this node's
+    // journal, so no carry-paying snapshot is taken after it. Work already
+    // built on an earlier snapshot can still reach the next tip, which the
+    // release depth (at least `MIN_RELEASE_DEPTH`) covers. The read is
+    // bounded, since the lock holds back all work building meanwhile.
+    let (tip_height, _) = tokio::time::timeout(RELEASE_TIP_TIMEOUT, chain.tip())
+        .await
+        .context("the node did not report its tip in time while the release held SETTLEMENT_LOCK; nothing was written")??;
     let detail = json!({"reason": reason, "tip_height": tip_height});
     let epoch = append_role(
         &mut tx,
@@ -807,6 +821,7 @@ pub async fn transfer<C: ChainSource>(
     reason: &str,
     confirm: bool,
 ) -> Result<Report> {
+    let release_depth = release_depth.max(MIN_RELEASE_DEPTH);
     let peer = PeerJournal::new(&settings.peer_urls, settings.peer_timeout)?;
     let mut report = Report::new("transfer", settings);
     let peer_read = observe(ledger, settings, &peer, &mut report).await?;
