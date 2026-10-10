@@ -648,6 +648,39 @@ async fn an_admitted_dual_writer_frontend_withdraws_within_seconds_of_its_databa
     database.close(outcome).await
 }
 
+/// Two gated addresses that could never both listen, here the readiness
+/// endpoint on the Stratum port, are refused at startup, before the
+/// coordinator connects or writes cluster state: reserved, both bind
+/// (`SO_REUSEADDR`, neither listening), so only a listen after admission would
+/// have failed. No database: the refusal comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dual_writer_frontend_refuses_listener_addresses_that_cannot_both_listen() -> Result<()> {
+    let node = FakeNode::open().await?;
+    let (ports, held) = reserve_ports()?;
+    let overlapping = Ports {
+        readiness: ports.stratum,
+        ..ports
+    };
+    let log = tempfile::NamedTempFile::new()?;
+    let mut server = spawn(
+        "postgresql://prism@127.0.0.1:1/unreachable",
+        &node.url,
+        &overlapping,
+        held,
+        true,
+        &log,
+    )?;
+    let status = tokio::time::timeout(DEADLINE, server.wait()).await??;
+    let stderr = std::fs::read_to_string(log.path())?;
+    ensure!(!status.success(), "the server started: {stderr}");
+    ensure!(
+        stderr.contains("the readiness endpoint address")
+            && stderr.contains("overlaps the primary Stratum address"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dual_writer_frontend_on_the_other_nodes_database_fails_its_healthcheck() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
