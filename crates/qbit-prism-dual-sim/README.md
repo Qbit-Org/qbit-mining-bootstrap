@@ -70,6 +70,15 @@ work.
 | `DualWriter` (3.1) | two independent primaries | each writes its own and pulls its peer's rows |
 | `Unsynced` | two independent primaries | each writes its own; nothing between them (the checker's negative control) |
 
+A dual-writer database is bootstrapped as the pair's is: `migrate`,
+`node-identity set` (D-9), then the peer role's grants, exactly D1's list
+(`PEER_ROLE_GRANTS` in `src/sim.rs`). **Temporarily**, until D1's pending push
+delivers them, the bootstrap also applies two stand-ins
+(`TEMPORARY_STAND_INS`): migration 031's `(origin_node, share_seq)` index
+under 031's name, which D2's window cut requires, and `singleton` on
+`qbit_prism_cluster` for the peer role, which D1's engine reads. Both are
+no-ops once the stack carries them, and the list goes then.
+
 ## Faults
 
 | Fault | Injection | Heal |
