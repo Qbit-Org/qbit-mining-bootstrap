@@ -942,6 +942,74 @@ async fn the_import_audits_command_stops_on_sigterm() -> Result<()> {
     fixture.close(result).await
 }
 
+/// What an operator's retry sees when SETTLEMENT_LOCK stays busy: exit 1,
+/// the remaining-work counts on stdout, and on stderr an error naming the
+/// row and the lock. Nothing is stored, so a plain re-run is the retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_import_audits_command_names_the_row_when_settlement_lock_stays_busy() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = busy_lock_command(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn busy_lock_command(fixture: &Fixture) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = legacy_bundle(100, 10)?;
+    let (block_hash, digest) =
+        seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x73).await?;
+    let mut holder = PgConnection::connect(&fixture.database.url).await?;
+    let mut held = holder.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SETTLEMENT_LOCK)
+        .execute(&mut *held)
+        .await?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        import_audits_command(fixture, directory.path()).output(),
+    )
+    .await??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!(
+        "exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code()
+    );
+    ensure!(
+        output.status.code() == Some(1),
+        "exit status {:?}",
+        output.status
+    );
+    ensure!(
+        stdout.contains(
+            r#"Audit completeness: {"missing_stored_bodies":1,"missing_canonical_bytes":1}"#
+        ),
+        "{stdout}"
+    );
+    ensure!(
+        stderr.contains(&format!("importing legacy audit {block_hash}"))
+            && stderr.contains("SETTLEMENT_LOCK stayed busy for 2000 ms"),
+        "{stderr}"
+    );
+    ensure!(
+        fixture.stored_digest(&block_hash).await?.is_none(),
+        "the row was stored"
+    );
+    held.commit().await?;
+    holder.close().await?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        import_audits_command(fixture, directory.path()).output(),
+    )
+    .await??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    ensure!(output.status.success(), "the re-run failed: {stdout}");
+    ensure!(stdout.contains("Imported 1 audit bodies"), "{stdout}");
+    ensure!(fixture.stored_digest(&block_hash).await?.as_deref() == Some(digest.as_str()));
+    Ok(())
+}
+
 fn import_audits_command(fixture: &Fixture, root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     command
