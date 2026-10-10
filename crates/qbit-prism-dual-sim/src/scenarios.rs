@@ -53,6 +53,21 @@ pub const FREEZE_HOLD: Duration = Duration::from_secs(60);
 pub const NEW_WORK_BOUND: Duration = Duration::from_secs(15);
 /// The short freezes of S2's frozen-during-pulls variant.
 pub const SHORT_FREEZES: usize = 20;
+/// How long a dead puller's backend on its peer may keep a snapshot or an
+/// open transaction: "a few seconds" (the coordinator's review of D1's
+/// engine, P1 2). Longer, and every share append on the peer pays for it
+/// (#738).
+pub const IDLE_BOUND: Duration = Duration::from_secs(10);
+/// The offered share rate of S2's puller-dies-mid-read variant: where a
+/// snapshot held on a node shows in its share appends (#738).
+pub const PULLER_DEATH_RATE: f64 = 250.0;
+/// How long a restarted node whose peer answers but cannot be read may take
+/// to serve (D-8: with the peer unreachable the latch is true unless there is
+/// evidence of a rollback).
+pub const UNREADABLE_READY_BOUND: Duration = Duration::from_secs(120);
+/// How long A keeps its landing tables locked after B's block lands, in S4's
+/// transient-apply variant: past A's 5 s lock_timeout twice over.
+pub const TRANSIENT_HOLD: Duration = Duration::from_secs(12);
 
 /// How node A dies in S2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +114,27 @@ pub enum DeathAtFind {
     Accepted { wait: bool },
 }
 
+/// How a peer that accepts connections cannot be read (S6's unreadable-peer
+/// variant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreadable {
+    /// A transaction on the peer holds ACCESS EXCLUSIVE on its share ledger:
+    /// every read of it waits until the peer role's lock_timeout.
+    Locked,
+    /// The peer role's SELECT on the share ledger is revoked: every read of it
+    /// fails at once.
+    Refused,
+}
+
+impl Unreadable {
+    fn id(self) -> &'static str {
+        match self {
+            Unreadable::Locked => "locked",
+            Unreadable::Refused => "refused",
+        }
+    }
+}
+
 /// CONTRACT.md D-19's peer-ingest wait before a found block's submitblock,
 /// in milliseconds (default 250 in dual mode, 0 turns it off). D1 names the
 /// setting in status/D1.md.
@@ -119,15 +155,23 @@ pub enum Scenario {
     /// S2, frozen mid-pull: A's frontend is frozen 20 times while its
     /// puller works on B's database; B never stalls.
     S02FrozenDuringPulls,
+    /// S2, A's puller dies mid-read where B never sees the close: B keeps no
+    /// snapshot of it and its appends stay flat.
+    S02PullerDiesMidRead,
     /// S3: B dies; A is unaffected, and B catches up when it returns.
     S03BDies,
     /// S4: the link between the databases is cut with both nodes alive.
     S04LinkCut,
+    /// S4, a transient failure while A applies B's block: retried, never
+    /// skipped.
+    S04TransientApply,
     /// S5: both nodes take miners and write at once.
     S05BothWrite,
     /// S6: a node restored from an older base backup recovers its own rows
     /// from the peer before it is ready.
     S06Restore(Node),
+    /// S6, A restarts while B answers but cannot be read: A serves.
+    S06PeerUnreadable(Unreadable),
     /// S7: a node's disk replaced and rebuilt from its peer.
     S07DiskReplaced(Node),
     /// S8: a block found at the instant its node dies.
@@ -157,10 +201,13 @@ impl Scenario {
             Scenario::S01SteadyState => "s01-steady-state".into(),
             Scenario::S02ADies(death) => format!("s02-a-dies-{}", death.id()),
             Scenario::S02FrozenDuringPulls => "s02-a-frozen-during-pulls".into(),
+            Scenario::S02PullerDiesMidRead => "s02-a-puller-dies-mid-read".into(),
             Scenario::S03BDies => "s03-b-dies".into(),
             Scenario::S04LinkCut => "s04-link-cut".into(),
+            Scenario::S04TransientApply => "s04-transient-apply-failure".into(),
             Scenario::S05BothWrite => "s05-both-write".into(),
             Scenario::S06Restore(node) => format!("s06-restore-{}", node.label()),
+            Scenario::S06PeerUnreadable(how) => format!("s06-a-restarts-peer-{}", how.id()),
             Scenario::S07DiskReplaced(node) => format!("s07-disk-replaced-{}", node.label()),
             Scenario::S08BlockAtDeath(DeathAtFind::Lost) => "s08-block-at-death-lost".into(),
             Scenario::S08BlockAtDeath(DeathAtFind::Accepted { wait: true }) => {
@@ -190,15 +237,26 @@ impl Scenario {
             Scenario::S02FrozenDuringPulls => {
                 "A frozen again and again mid-pull: B keeps preparing work and landing blocks".into()
             }
+            Scenario::S02PullerDiesMidRead => {
+                "A's puller dies mid-read unseen by B: no snapshot left on B, appends stay flat".into()
+            }
             Scenario::S03BDies => "B dies: A is unaffected and B catches up on return".into(),
             Scenario::S04LinkCut => {
                 "Link cut with both alive: no mining impact, sync catches up on heal".into()
+            }
+            Scenario::S04TransientApply => {
+                "A transient failure applying B's block on A: retried until it lands, never skipped"
+                    .into()
             }
             Scenario::S05BothWrite => {
                 "Both nodes write at once: invariants hold and B's blocks stay carry-free".into()
             }
             Scenario::S06Restore(node) => format!(
                 "Node {node:?} restored from an older base backup recovers its own rows before it is ready"
+            ),
+            Scenario::S06PeerUnreadable(how) => format!(
+                "A restarts while B answers but cannot be read ({}): A serves on its own evidence",
+                how.id()
             ),
             Scenario::S07DiskReplaced(node) => format!(
                 "Node {node:?}'s disk replaced: rebuilt from its peer, only its unsynced tail lost"
@@ -242,10 +300,15 @@ impl Scenario {
         }
         // Both nodes originate rows where the scenario needs each to have
         // its own (S6, S7), or where both writing is the point (S5).
+        if self == Scenario::S02PullerDiesMidRead {
+            config.load.rate = PULLER_DEATH_RATE;
+        }
         if matches!(
             self,
             Scenario::CheckerControl
                 | Scenario::S02FrozenDuringPulls
+                | Scenario::S02PullerDiesMidRead
+                | Scenario::S04TransientApply
                 | Scenario::S05BothWrite
                 | Scenario::S06Restore(_)
                 | Scenario::S07DiskReplaced(_)
@@ -300,10 +363,13 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
             Scenario::S01SteadyState => s01_steady_state(&mut sim).await?,
             Scenario::S02ADies(death) => s02_a_dies(&mut sim, death).await?,
             Scenario::S02FrozenDuringPulls => s02_frozen_during_pulls(&mut sim).await?,
+            Scenario::S02PullerDiesMidRead => s02_puller_dies_mid_read(&mut sim).await?,
             Scenario::S03BDies => s03_b_dies(&mut sim).await?,
             Scenario::S04LinkCut => s04_link_cut(&mut sim).await?,
+            Scenario::S04TransientApply => s04_transient_apply(&mut sim).await?,
             Scenario::S05BothWrite => s05_both_write(&mut sim).await?,
             Scenario::S06Restore(node) => s06_restore(&mut sim, node).await?,
+            Scenario::S06PeerUnreadable(how) => s06_peer_unreadable(&mut sim, how).await?,
             Scenario::S07DiskReplaced(node) => s07_disk_replaced(&mut sim, node).await?,
             Scenario::S08BlockAtDeath(case) => s08_block_at_death(&mut sim, case).await?,
             Scenario::S09Migration => s09_migration(&mut sim).await?,
@@ -1399,6 +1465,149 @@ async fn s02_frozen_during_pulls(sim: &mut Sim) -> Result<Body> {
     Ok(body)
 }
 
+/// How long S2's puller-dies-mid-read variant samples B for a pull that
+/// holds a transaction open across a round trip, and how often.
+pub const PULL_SAMPLE: Duration = Duration::from_secs(20);
+const PULL_SAMPLE_EVERY: Duration = Duration::from_millis(10);
+/// How long it watches B after A's death: past the peer role's 60 s
+/// idle-in-transaction timeout, so a snapshot held until then is measured.
+pub const LINGER_WATCH: Duration = Duration::from_secs(70);
+
+/// The p95 answer latency, in milliseconds, of the shares accepted on
+/// `node`'s jobs and answered within `from_ms..to_ms`, and how many there were.
+fn answer_p95(
+    records: &[ShareRecord],
+    node: Node,
+    from_ms: u64,
+    to_ms: u64,
+) -> (Option<u64>, usize) {
+    let mut latencies: Vec<u64> = records
+        .iter()
+        .filter(|r| r.accepted() && !r.scheduled_block && r.issuer == Some(node))
+        .filter_map(|r| {
+            let answered = r.answered_ms?;
+            (from_ms..to_ms)
+                .contains(&answered)
+                .then(|| answered.saturating_sub(r.sent_ms))
+        })
+        .collect();
+    latencies.sort_unstable();
+    let count = latencies.len();
+    let p95 = (count > 0).then(|| latencies[((count * 95).div_ceil(100)).clamp(1, count) - 1]);
+    (p95, count)
+}
+
+/// S2, A's puller dies mid-read (the coordinator's review of D1's engine,
+/// P1 2). Both nodes take miners at `PULLER_DEATH_RATE`, where a snapshot
+/// held on B shows in B's share appends (#738).
+///
+/// 1. While both run, no pull of A's holds a transaction open on B across a
+///    round trip: sampled every 10 ms for `PULL_SAMPLE`, B never shows A's
+///    backend idle in transaction.
+/// 2. A's database link is blackholed, so B never sees the close (as when
+///    A's host or its VLAN dies; a plain kill -9 sends a FIN that B handles
+///    at once), and A's frontend is killed, timed to a moment its puller is
+///    busy on B. A's backends on B must hold no snapshot and no open
+///    transaction beyond `IDLE_BOUND`.
+/// 3. B takes every miner meanwhile, and its share answer latency stays
+///    flat: the p95 late in the minute after the death is at most twice the
+///    p95 early in it, plus 50 ms.
+///
+/// Then the link heals, A restarts and catches up.
+async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
+    let mut body = Body::default();
+    sim.load()?.resume();
+    steady(sim, 8).await;
+    routing_settled(sim).await?;
+    let pool = sim.pool(Node::B).await?;
+
+    let sampling = Instant::now();
+    let (mut samples, mut idle_in_transaction, mut longest_ms) = (0u64, 0u64, 0f64);
+    while sampling.elapsed() < PULL_SAMPLE {
+        let (idle, oldest_ms): (i64, Option<f64>) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE state LIKE 'idle in transaction%'), \
+                    max(extract(epoch FROM clock_timestamp() - xact_start) * 1000)::float8 \
+             FROM pg_stat_activity WHERE usename = $1 AND datname = current_database()",
+        )
+        .bind(crate::sim::PEER_ROLE)
+        .fetch_one(&pool)
+        .await?;
+        samples += 1;
+        idle_in_transaction += u64::from(idle > 0);
+        longest_ms = longest_ms.max(oldest_ms.unwrap_or(0.0));
+        tokio::time::sleep(PULL_SAMPLE_EVERY).await;
+    }
+    body.expect(
+        "A's pulls never hold a transaction open on B across a round trip",
+        idle_in_transaction == 0,
+        format!(
+            "{idle_in_transaction} of {samples} samples of B's pg_stat_activity over {} s showed \
+             A's backend idle in transaction; the longest transaction seen had run {longest_ms:.0} ms",
+            PULL_SAMPLE.as_secs()
+        ),
+    );
+
+    let timed = wait_for_a_pull(&pool, Duration::from_secs(5)).await?;
+    sim.links.set("peer-a-to-b", LinkState::Blackholed)?;
+    let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
+    sim.mark("A's database link blackholed as its frontend died: B never sees the close");
+    let died = Instant::now();
+    let (mut last_holding, mut most) = (None, 0i64);
+    while died.elapsed() < LINGER_WATCH {
+        let holding: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE usename = $1 AND datname = current_database() \
+               AND (backend_xmin IS NOT NULL OR xact_start IS NOT NULL)",
+        )
+        .bind(crate::sim::PEER_ROLE)
+        .fetch_one(&pool)
+        .await?;
+        if holding > 0 {
+            last_holding = Some(died.elapsed());
+            most = most.max(holding);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    pool.close().await;
+    body.expect(
+        "A's dead puller leaves B no snapshot and no open transaction beyond the bound",
+        last_holding.is_none_or(|held| held <= IDLE_BOUND),
+        format!(
+            "killed {} one of A's pulls was seen busy on B; up to {most} of A's backends on B held \
+             a snapshot or a transaction until {:?} after the death (bound {} s, watched {} s)",
+            if timed { "as" } else { "without" },
+            last_holding,
+            IDLE_BOUND.as_secs(),
+            LINGER_WATCH.as_secs()
+        ),
+    );
+
+    let records = sim.load()?.records();
+    let (early, early_n) = answer_p95(&records, Node::B, fault_at + 10_000, fault_at + 25_000);
+    let (late, late_n) = answer_p95(&records, Node::B, fault_at + 45_000, fault_at + 60_000);
+    body.expect(
+        "B's share appends stay flat while A's puller is dead",
+        matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50),
+        format!(
+            "p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares 10 to 25 s \
+             after the death, {late:?} ms over {late_n} shares 45 to 60 s after it (bound: twice the \
+             first, plus 50 ms), at {PULLER_DEATH_RATE} offered shares/s"
+        ),
+    );
+    body.gaps.push(report::gap(&records, fault_at));
+
+    sim.links.set("peer-a-to-b", LinkState::Open)?;
+    sim.heal(Fault::FrontendKill9(Node::A)).await?;
+    sim.balancer
+        .wait_state("a", true, Duration::from_secs(60))
+        .await?;
+    sim.wait_synced(CATCH_UP_BOUND).await?;
+    steady(sim, 2).await;
+    sim.settle(SETTLE_BOUND).await?;
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
 /// S3. B dies (its frontend and its database at once, a host crash) while
 /// every miner is on A. A's miners see nothing; A keeps mining and finds a
 /// block. B returns and catches up: A's block and shares, landed on B.
@@ -1550,6 +1759,75 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
         );
         body.gaps.push(gap);
     }
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// S4, a transient failure applying a peer block (the coordinator's review
+/// of D1's engine, P1 3). A transaction on A holds EXCLUSIVE on its audit
+/// bundles, so every landing insert on A waits past A's lock_timeout (5 s)
+/// and fails while reads go on. B lands a block, and the lock stays for
+/// `TRANSIENT_HOLD` more, through at least two failed applies on A. Once it
+/// clears, the block must land on A within the catch-up bound, and A must
+/// record no sync conflict for it: a transient failure is retried, never
+/// skipped (D-10 skips only a block whose held facts differ).
+async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
+    let mut body = Body::default();
+    sim.load()?.resume();
+    steady(sim, 6).await;
+    routing_settled(sim).await?;
+    let a = sim.pool(Node::A).await?;
+    let mut lock = a.begin().await?;
+    sqlx::query("LOCK TABLE qbit_pool_audit_bundles IN EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await?;
+    sim.mark("A's audit bundles locked: landing inserts wait past lock_timeout, reads go on");
+    let block = match find_block(
+        sim,
+        &mut body,
+        Node::B,
+        "B while A cannot apply its blocks",
+        Some(&[Node::B]),
+    )
+    .await
+    {
+        Ok(block) => block,
+        Err(error) => {
+            lock.rollback().await?;
+            return Err(error);
+        }
+    };
+    tokio::time::sleep(TRANSIENT_HOLD).await;
+    let held_while_locked: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM qbit_pool_blocks WHERE block_hash = $1)")
+            .bind(&block)
+            .fetch_one(&a)
+            .await?;
+    lock.rollback().await?;
+    sim.mark("A's audit bundles unlocked");
+    let landed = sim.wait_confirmed(&block, &[Node::A], CATCH_UP_BOUND).await;
+    let conflicts: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT source_table, row_key, detail FROM qbit_prism_peer_sync_conflicts \
+         WHERE row_key LIKE '%' || $1 || '%'",
+    )
+    .bind(&block)
+    .fetch_all(&a)
+    .await?;
+    a.close().await;
+    body.expect(
+        "B's block, which A failed to apply while locked, lands on A once the lock clears",
+        !held_while_locked && landed.is_ok() && conflicts.is_empty(),
+        format!(
+            "on A while locked: {held_while_locked} (the lock must keep it out); confirmed on A \
+             after the release: {}; sync conflicts recorded for it: {conflicts:?}",
+            match &landed {
+                Ok(took) => format!("after {:.1} s", took.as_secs_f64()),
+                Err(error) => format!("not within {CATCH_UP_BOUND:?} ({error:#})"),
+            }
+        ),
+    );
+    steady(sim, 2).await;
+    sim.settle(SETTLE_BOUND).await?;
     expect_dual_health(sim, &mut body).await?;
     Ok(body)
 }
@@ -1733,6 +2011,149 @@ async fn s06_restore(sim: &mut Sim, x: Node) -> Result<Body> {
     steady(sim, 5).await;
     find_block(sim, &mut body, x, "after the restore", None).await?;
     steady(sim, 2).await;
+    sim.settle(SETTLE_BOUND).await?;
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// What a read of `node`'s share ledger gets as the peer role: whether its
+/// PostgreSQL answers, and whether the read succeeds, fails or hangs.
+async fn peer_read_probe(sim: &Sim, node: Node) -> (bool, String) {
+    let url = sim.pg[&node].url(crate::sim::PEER_ROLE, crate::sim::DATABASE);
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => return (false, format!("could not connect: {error}")),
+    };
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM (SELECT 1 FROM qbit_share_ledger LIMIT 1) s",
+        )
+        .fetch_one(&pool),
+    )
+    .await;
+    pool.close().await;
+    match read {
+        Err(_) => (true, "connected; the read hung for 10 s".into()),
+        Ok(Err(error)) => (true, format!("connected; the read failed: {error}")),
+        Ok(Ok(_)) => (false, "connected; the read succeeded".into()),
+    }
+}
+
+/// Wait until shares accepted on `node`'s jobs, answered after `after_ms`,
+/// appear; how many there were when they did or the bound passed.
+async fn wait_accepted_on(sim: &Sim, node: Node, after_ms: u64, limit: Duration) -> Result<usize> {
+    let started = Instant::now();
+    loop {
+        let accepted = accepted_from(&sim.load()?.records(), node, after_ms);
+        if accepted > 0 || started.elapsed() >= limit {
+            return Ok(accepted);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// S6, the peer answers but cannot be read (the coordinator's review of D1's
+/// engine, P1 1). B's PostgreSQL accepts the peer role's connections, but
+/// every read of its share ledger hangs (`Locked`) or fails (`Refused`); a
+/// probe as the peer role shows it. A's frontend is restarted with its
+/// database untouched, so its D-17 evidence matches: D-8 makes the latch
+/// true without the peer, and A must report ready and take miners within
+/// `UNREADABLE_READY_BOUND`. Then B is made readable again (and restarted if
+/// its frontend gave up), and the pair catches up.
+async fn s06_peer_unreadable(sim: &mut Sim, how: Unreadable) -> Result<Body> {
+    let mut body = Body::default();
+    sim.load()?.resume();
+    steady(sim, 6).await;
+    let a1 = find_block(sim, &mut body, Node::A, "A before its restart", None).await?;
+    confirm_on_both(sim, &a1).await?;
+    routing_settled(sim).await?;
+
+    let b = sim.pool(Node::B).await?;
+    let mut lock = None;
+    match how {
+        Unreadable::Locked => {
+            let mut transaction = b.begin().await?;
+            sqlx::query("LOCK TABLE qbit_share_ledger IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *transaction)
+                .await?;
+            lock = Some(transaction);
+        }
+        Unreadable::Refused => {
+            sqlx::query(&format!(
+                "REVOKE SELECT ON qbit_share_ledger FROM {}",
+                crate::sim::PEER_ROLE
+            ))
+            .execute(&b)
+            .await?;
+        }
+    }
+    sim.mark(&format!(
+        "B answers, but its share ledger cannot be read ({})",
+        how.id()
+    ));
+    let (unreadable, probe) = peer_read_probe(sim, Node::B).await;
+
+    let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
+    sim.frontend_mut(Node::A).start()?;
+    let restarted_at = sim.clock.now_ms();
+    let ready = sim
+        .frontend(Node::A)
+        .wait_ready(UNREADABLE_READY_BOUND)
+        .await;
+    let accepted = match &ready {
+        Ok(_) => wait_accepted_on(sim, Node::A, restarted_at, Duration::from_secs(60)).await?,
+        Err(_) => 0,
+    };
+    body.expect(
+        "A restarts and serves while its peer answers but cannot be read (D-8, D-17)",
+        unreadable && ready.is_ok() && accepted > 0,
+        format!(
+            "B as the peer role: {probe}; A {}; shares accepted on A's jobs after its restart: \
+             {accepted}",
+            match &ready {
+                Ok(took) => format!("ready {:.1} s after its restart", took.as_secs_f64()),
+                Err(error) => format!("not ready within {UNREADABLE_READY_BOUND:?} ({error:#})"),
+            }
+        ),
+    );
+    body.gaps
+        .push(report::gap(&sim.load()?.records(), fault_at));
+
+    match lock.take() {
+        Some(transaction) => transaction.rollback().await?,
+        None => {
+            sqlx::query(&format!(
+                "GRANT SELECT ON qbit_share_ledger TO {}",
+                crate::sim::PEER_ROLE
+            ))
+            .execute(&b)
+            .await?;
+        }
+    }
+    b.close().await;
+    sim.mark("B readable again");
+    for node in Node::BOTH {
+        if !sim.frontend(node).running() {
+            sim.frontend_mut(node).start()?;
+            sim.frontend(node).wait_ready(RECOVERY_BOUND).await?;
+            sim.mark(&format!(
+                "node {node:?}'s frontend restarted after it gave up"
+            ));
+        }
+    }
+    sim.balancer
+        .wait_state("a", true, Duration::from_secs(60))
+        .await?;
+    sim.wait_synced(CATCH_UP_BOUND).await?;
+    steady(sim, 4).await;
+    let a2 = find_block(sim, &mut body, Node::A, "A once B is readable again", None).await?;
+    confirm_on_both(sim, &a2).await?;
     sim.settle(SETTLE_BOUND).await?;
     expect_dual_health(sim, &mut body).await?;
     Ok(body)
