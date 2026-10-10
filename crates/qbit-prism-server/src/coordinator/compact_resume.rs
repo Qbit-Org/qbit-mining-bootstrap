@@ -225,6 +225,9 @@ async fn reconstruct(
                 payout_revision: metadata.record.payout_revision,
                 shares: window.map_or_else(Vec::new, |window| window.shares),
                 prior_balances: metadata.prior_balances.clone(),
+                // The stored reference's dual-writer cut, which the original
+                // build committed in the reward manifest.
+                cut: metadata.record.window.cut,
             };
             let inputs = BundleInputs::from(&metadata.record);
             let body = if metadata.record.window.shares.is_some() {

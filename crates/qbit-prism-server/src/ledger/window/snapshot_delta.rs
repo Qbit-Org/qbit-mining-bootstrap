@@ -38,6 +38,9 @@ pub(crate) struct RetainedShares {
     pub network: u128,
     pub anchor_ms: i64,
     pub cutoff: u64,
+    /// The retained window's dual-writer cut (`window/cut.rs`); `None` in
+    /// single-writer mode. A delta advances a window only within its mode.
+    pub cut: Option<WindowCut>,
     pub shares: Vec<AcceptedShare>,
     pub leaf: Option<LeafWitness>,
 }
@@ -104,6 +107,10 @@ pub(crate) struct SnapshotCapture {
     pub acquisition: AcquisitionReport,
     /// The writer timeline the window's rows were read on (#619).
     pub timeline: super::WriterTimeline,
+    /// In dual-writer mode, the peer's share-stream high-water mark the
+    /// snapshot read (`window/cut.rs`), which the refresh probe compares; `None`
+    /// for a single writer. Runtime-only.
+    pub peer_mark: Option<i64>,
 }
 
 impl std::ops::Deref for SnapshotCapture {
@@ -119,15 +126,43 @@ impl RetainedShares {
     /// A changed network difficulty is not one of them: the retained rows are
     /// immutable members of the anchored ledger whatever the target, so a
     /// retarget only moves the crossing row, which `advance` re-derives.
-    fn refusal(&self, anchor: i64, cutoff: u64) -> Option<WindowAcquisition> {
+    ///
+    /// With a cut, the cutoff checks are made per node instead: the fresh cut
+    /// must cover the retained one (a window whose mode changed, cut to none
+    /// or none to cut, counts as regressed; a frontend's mode is fixed for
+    /// its life, so that is a defect, not a path), and the slots between the
+    /// two, summed over the nodes, bound the delta as `MAX_DELTA_SLOTS` does.
+    fn refusal(
+        &self,
+        anchor: i64,
+        cutoff: u64,
+        cut: Option<&WindowCut>,
+    ) -> Option<WindowAcquisition> {
         if self.anchor_ms > anchor {
             return Some(WindowAcquisition::AnchorRegressed);
         }
-        if self.cutoff > cutoff {
-            return Some(WindowAcquisition::CutoffRegressed);
-        }
-        if cutoff - self.cutoff > MAX_DELTA_SLOTS {
-            return Some(WindowAcquisition::DeltaTooLarge);
+        match (self.cut.as_ref(), cut) {
+            (None, None) => {
+                if self.cutoff > cutoff {
+                    return Some(WindowAcquisition::CutoffRegressed);
+                }
+                if cutoff - self.cutoff > MAX_DELTA_SLOTS {
+                    return Some(WindowAcquisition::DeltaTooLarge);
+                }
+            }
+            (Some(retained), Some(cut)) => {
+                if !cut.covers(retained) {
+                    return Some(WindowAcquisition::CutoffRegressed);
+                }
+                let slots = |node| {
+                    let entry = |cut: &WindowCut| cut.get(node).ok().flatten().unwrap_or(0);
+                    entry(cut) - entry(retained)
+                };
+                if slots(0).saturating_add(slots(1)) > MAX_DELTA_SLOTS {
+                    return Some(WindowAcquisition::DeltaTooLarge);
+                }
+            }
+            _ => return Some(WindowAcquisition::CutoffRegressed),
         }
         let Some(first) = self.shares.first() else {
             return Some(WindowAcquisition::EmptyPrior);
@@ -135,11 +170,19 @@ impl RetainedShares {
         if first.share_seq == 0 {
             return Some(WindowAcquisition::EmptyPrior);
         }
-        // Native appends always make the accepted cutoff the last retained
-        // row; only legacy or raw rows with a future timestamp at the top of
-        // the ledger can leave the cutoff above the retained tail.
-        if self.shares.last().unwrap().share_seq != self.cutoff {
-            return Some(WindowAcquisition::TailMismatch);
+        let last = self.shares.last().unwrap().share_seq;
+        match self.cut.as_ref() {
+            // Native appends always make the accepted cutoff the last retained
+            // row; only legacy or raw rows with a future timestamp at the top of
+            // the ledger can leave the cutoff above the retained tail.
+            None if last != self.cutoff => return Some(WindowAcquisition::TailMismatch),
+            // Each entry is a row of its node the cut admits, so the higher
+            // one is the retained window's newest row, as the cutoff is
+            // without a cut.
+            Some(retained) if retained.top() != Some(last) => {
+                return Some(WindowAcquisition::TailMismatch)
+            }
+            _ => {}
         }
         if self.leaf.is_none() {
             return Some(WindowAcquisition::NoEvidence);
@@ -156,14 +199,21 @@ impl RetainedShares {
 /// single-standby D3 promotion/rejoin policy. It is shared across pooled SQL
 /// sessions, but is not a globally unique identity for sibling physical copies.
 /// D5 isolated recovery already stops frontends, discarding retained evidence.
+///
+/// A dual-writer window's `cut` joins the eligibility of both endpoints and
+/// of every counted row (`window/cut.rs`); without one the statement is
+/// 3.0's.
 pub(super) async fn leaf_witness(
     tx: &mut Transaction<'_, Postgres>,
     first: i64,
     last: i64,
     anchor: i64,
+    cut: Option<&WindowCut>,
     expected_count: Option<i64>,
 ) -> Result<Option<LeafWitness>> {
-    let row = sqlx::query(
+    // The cut's clause for each of the three rows the statement names.
+    let within = |row: &str| super::cut::cut_clause(cut.map(|_| 5), Some(row));
+    let row = sqlx::query(&format!(
         "SELECT a.tableoid::bigint AS tableoid,i.xmin::text AS inherits_xmin, \
          left(pg_walfile_name(pg_current_wal_lsn()),8) AS timeline \
          FROM qbit_share_ledger a \
@@ -174,16 +224,20 @@ pub(super) async fn leaf_witness(
            AND a.accepted_at<=to_timestamp($3::double precision/1000) \
            AND a.job_issued_at<=to_timestamp($3::double precision/1000) \
            AND b.accepted_at<=to_timestamp($3::double precision/1000) \
-           AND b.job_issued_at<=to_timestamp($3::double precision/1000) \
+           AND b.job_issued_at<=to_timestamp($3::double precision/1000){}{} \
            AND ($4::bigint IS NULL OR $4=(SELECT count(*) FROM qbit_share_ledger s \
                WHERE s.share_seq BETWEEN $1 AND $2 AND s.accepted \
                  AND s.accepted_at<=to_timestamp($3::double precision/1000) \
-                 AND s.job_issued_at<=to_timestamp($3::double precision/1000)))",
-    )
+                 AND s.job_issued_at<=to_timestamp($3::double precision/1000){}))",
+        within("a"),
+        within("b"),
+        within("s"),
+    ))
     .bind(first)
     .bind(last)
     .bind(anchor)
     .bind(expected_count)
+    .bind_cut(cut)?
     .fetch_optional(&mut **tx)
     .await?;
     row.map(|row| {
@@ -255,30 +309,35 @@ async fn retire<T: Send + 'static>(owned: BlockingDrop<T>) -> Result<()> {
 /// retroactive INSERT into an old slot or a row whose timestamps became
 /// eligible, and the final count catches both. The partition and timeline
 /// witness is re-read in that same final statement.
+///
+/// A dual-writer window (`cut` is `Some`) advances through
+/// [`advance_in_cut`] instead, because a peer's rows are not appends.
+// The parameter list is the single-writer one plus the cut.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn advance(
     tx: &mut Transaction<'_, Postgres>,
     prior: BlockingDrop<RetainedShares>,
     weight: u128,
     anchor: i64,
     cutoff: i64,
+    cut: Option<WindowCut>,
     completion: &ReadAdmission,
 ) -> Result<Advance> {
     let cutoff_u64 = u64::try_from(cutoff)?;
     let mut report = AcquisitionReport::full(WindowAcquisition::Advanced);
     report.prior_rows = prior.shares.len();
     report.prior_network = Some(prior.network);
-    let reject = |mut report: AcquisitionReport, outcome: WindowAcquisition| {
-        report.outcome = outcome;
-        Advance::Rejected(report)
-    };
-    if let Some(outcome) = prior.refusal(anchor, cutoff_u64) {
+    if let Some(outcome) = prior.refusal(anchor, cutoff_u64, cut.as_ref()) {
         retire(prior).await?;
         return Ok(reject(report, outcome));
+    }
+    if let Some(cut) = cut {
+        return advance_in_cut(tx, prior, weight, anchor, cut, completion, report).await;
     }
     // Keep ownership under admission across every SQL await below.
     let prior = completion.own(prior.into_inner());
     let first = i64::try_from(prior.shares[0].share_seq)?;
-    let Some(witness) = leaf_witness(tx, first, cutoff, anchor, None).await? else {
+    let Some(witness) = leaf_witness(tx, first, cutoff, anchor, None, None).await? else {
         retire(prior).await?;
         return Ok(reject(report, WindowAcquisition::LeafChanged));
     };
@@ -494,7 +553,7 @@ pub(super) async fn advance(
             .context("full retained suffix disappeared")?
             .share_seq,
     )?;
-    if leaf_witness(tx, first, cutoff, anchor, None)
+    if leaf_witness(tx, first, cutoff, anchor, None, None)
         .await?
         .as_ref()
         != Some(&witness)
@@ -503,7 +562,7 @@ pub(super) async fn advance(
         return Ok(reject(report, WindowAcquisition::WitnessChanged));
     }
     let count = i64::try_from(merged.len())?;
-    if leaf_witness(tx, first, cutoff, anchor, Some(count))
+    if leaf_witness(tx, first, cutoff, anchor, None, Some(count))
         .await?
         .as_ref()
         != Some(&witness)
@@ -518,5 +577,317 @@ pub(super) async fn advance(
     })
 }
 
+fn reject(mut report: AcquisitionReport, outcome: WindowAcquisition) -> Advance {
+    report.outcome = outcome;
+    Advance::Rejected(report)
+}
+
+/// [`advance`] for a dual-writer window, whose fresh `cut` covers the
+/// retained one (the refusal checked).
+///
+/// The rows the fresh window may add are the rows inside the fresh cut and
+/// outside the retained one: per node, `share_seq` in `(retained[n], cut[n]]`.
+/// This node's are appends, but the peer's can sit anywhere below the
+/// retained window's top, in its middle or under its first row, wherever the
+/// peer's sequence stood when it allocated them. So the delta is read per node
+/// as bounded ascending ranges, at or above the retained first row only, and
+/// merged into the retained rows in `share_seq` order ([`merge_cut_delta`]),
+/// where the newest-first fold runs as in [`advance`]. Rows under the retained
+/// first row, old or new, are reached only by the margin, which reads the
+/// fresh window's whole predicate there, so none is read twice.
+///
+/// Every row the retained window held stays eligible: rows never change, the
+/// anchor only rises and the cut only grows. The proof is [`advance`]'s: the
+/// merged range's leaf witness, then its count of rows eligible under the
+/// fresh anchor and cut, which must equal the merged window's length. A
+/// retained row that would no longer qualify, a delta row read twice, or one
+/// missed, all fail it, and the full scan runs.
+async fn advance_in_cut(
+    tx: &mut Transaction<'_, Postgres>,
+    prior: BlockingDrop<RetainedShares>,
+    weight: u128,
+    anchor: i64,
+    cut: WindowCut,
+    completion: &ReadAdmission,
+    mut report: AcquisitionReport,
+) -> Result<Advance> {
+    let retained_cut = prior
+        .cut
+        .context("a retained dual-writer window has no cut")?;
+    // Keep ownership under admission across every SQL await below.
+    let prior = completion.own(prior.into_inner());
+    let first = i64::try_from(prior.shares[0].share_seq)?;
+    let last = i64::try_from(prior.shares[prior.shares.len() - 1].share_seq)?;
+    let Some(witness) = leaf_witness(tx, first, last, anchor, Some(&cut), None).await? else {
+        retire(prior).await?;
+        return Ok(reject(report, WindowAcquisition::LeafChanged));
+    };
+    if prior.leaf.as_ref() != Some(&witness) {
+        retire(prior).await?;
+        return Ok(reject(report, WindowAcquisition::LeafChanged));
+    }
+    // The delta, one node at a time, in ascending keyset pages bounded on
+    // both sides, each planned with its bounds as `read_range_owned` is.
+    let delta_page = format!(
+        "{SELECT_SHARE} WHERE {} AND origin_node=$6 AND share_seq>$1 AND share_seq<=$2 \
+         ORDER BY share_seq LIMIT {DELTA_PAGE_ROWS}",
+        super::cut::window_eligibility_sql(3, Some(4))
+    );
+    let mut delta = completion.own(Vec::<AcceptedShare>::new());
+    for node in 0..WindowCut::NODES {
+        let Some(high) = cut.get(node)? else {
+            continue;
+        };
+        let high = i64::try_from(high)?;
+        let low = i64::try_from(retained_cut.get(node)?.unwrap_or(0))?;
+        let mut cursor = low.max(first - 1);
+        while cursor < high {
+            let rows = sqlx::query(&delta_page)
+                .persistent(false)
+                .bind(cursor)
+                .bind(high)
+                .bind(anchor)
+                .bind_cut(Some(&cut))?
+                .bind(i16::from(node))
+                .fetch_all(&mut **tx)
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            report.pages += 1;
+            delta = delta
+                .map_anyhow(move |mut delta| {
+                    delta.reserve(rows.len());
+                    for row in &rows {
+                        delta.push(share_from_row(row)?);
+                    }
+                    Ok(delta)
+                })
+                .await?;
+            cursor = i64::try_from(
+                delta
+                    .last()
+                    .context("decoded delta page is empty")?
+                    .share_seq,
+            )?;
+        }
+    }
+    report.delta_rows = delta.len();
+    let mut merge = completion
+        .own((prior, delta))
+        .map_anyhow(move |(prior, delta)| {
+            merge_cut_delta(prior.into_inner().shares, delta.into_inner(), weight)
+        })
+        .await?;
+    // A heavier target than the merged rows reach continues the walk below the
+    // retained first row, newest first and bounded in pages, under the fresh
+    // predicate: old rows and late peer rows alike.
+    let margin_page = format!(
+        "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT {DELTA_PAGE_ROWS}",
+        super::cut::window_eligibility_sql(2, Some(3))
+    );
+    let mut margin_pages = 0;
+    let mut cursor = first;
+    while merge.remaining > 0 {
+        if margin_pages == MAX_MARGIN_PAGES {
+            retire(merge).await?;
+            return Ok(reject(report, WindowAcquisition::MarginTooLarge));
+        }
+        let rows = sqlx::query(&margin_page)
+            .persistent(false)
+            .bind(cursor)
+            .bind(anchor)
+            .bind_cut(Some(&cut))?
+            .fetch_all(&mut **tx)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        margin_pages += 1;
+        report.pages += 1;
+        merge = merge
+            .map_anyhow(move |mut merge| {
+                for row in &rows {
+                    let share = share_from_row(row)?;
+                    merge.remaining = merge.remaining.saturating_sub(share.share_difficulty);
+                    merge.margin.push(share);
+                    if merge.remaining == 0 {
+                        break;
+                    }
+                }
+                Ok(merge)
+            })
+            .await?;
+        cursor = i64::try_from(
+            merge
+                .margin
+                .last()
+                .context("decoded margin page is empty")?
+                .share_seq,
+        )?;
+    }
+    report.margin_rows = merge.margin.len();
+    report.retired_rows = merge.retired;
+    if merge.remaining > 0 {
+        // Out of history before the target: the full scan decides.
+        retire(merge).await?;
+        return Ok(reject(report, WindowAcquisition::Partial));
+    }
+    let merged = merge
+        .map_anyhow(move |merge| {
+            let shares = merge.assemble();
+            let holds = window_invariant(&shares, weight);
+            Ok((shares, holds))
+        })
+        .await?;
+    if !merged.1 {
+        tracing::error!(
+            first = merged.0.first().map(|share| share.share_seq),
+            last = merged.0.last().map(|share| share.share_seq),
+            rows = merged.0.len(),
+            "dual-writer delta window failed its ordering or crossing invariant; taking the full scan"
+        );
+        retire(merged).await?;
+        return Ok(reject(report, WindowAcquisition::Invariant));
+    }
+    let merged = merged.map_anyhow(|(shares, _)| Ok(shares)).await?;
+    report.window_rows = merged.len();
+    let first = i64::try_from(merged.first().context("merged window is empty")?.share_seq)?;
+    let last = i64::try_from(merged.last().context("merged window is empty")?.share_seq)?;
+    if leaf_witness(tx, first, last, anchor, Some(&cut), None)
+        .await?
+        .as_ref()
+        != Some(&witness)
+    {
+        retire(merged).await?;
+        return Ok(reject(report, WindowAcquisition::WitnessChanged));
+    }
+    let count = i64::try_from(merged.len())?;
+    if leaf_witness(tx, first, last, anchor, Some(&cut), Some(count))
+        .await?
+        .as_ref()
+        != Some(&witness)
+    {
+        retire(merged).await?;
+        return Ok(reject(report, WindowAcquisition::CountMismatch));
+    }
+    Ok(Advance::Advanced {
+        shares: merged,
+        leaf: witness,
+        report,
+    })
+}
+
+/// The cut path's state between blocking hand-offs: the merged rows the
+/// newest-first fold kept (ascending, from the oldest kept row up), the margin
+/// read below them (newest first), and the target weight still unmet.
+struct CutMerge {
+    kept: Vec<AcceptedShare>,
+    margin: Vec<AcceptedShare>,
+    remaining: u128,
+    /// Merged rows the fold dropped from the old end.
+    retired: usize,
+}
+
+impl CutMerge {
+    /// Oldest first: the margin, reversed, then the kept rows.
+    fn assemble(self) -> Vec<AcceptedShare> {
+        let CutMerge {
+            mut kept, margin, ..
+        } = self;
+        if margin.is_empty() {
+            return kept;
+        }
+        let mut shares = Vec::with_capacity(margin.len() + kept.len());
+        shares.extend(margin.into_iter().rev());
+        shares.append(&mut kept);
+        shares
+    }
+}
+
+/// Merge the retained window and the delta read at or above its first row,
+/// both ascending and disjoint, in `share_seq` order, and replay the full
+/// reader's newest-first saturating fold over the result: the kept suffix
+/// starts at the row where the fold reached zero, or at the first merged row
+/// when it did not, where the margin continues it. A delta that only appends
+/// is the common case, the building node's own shares, and is appended in
+/// place, as [`advance`] does.
+fn merge_cut_delta(
+    mut prior: Vec<AcceptedShare>,
+    mut delta: Vec<AcceptedShare>,
+    weight: u128,
+) -> Result<CutMerge> {
+    // Each node's run is ascending; the runs were read one after the other.
+    delta.sort_unstable_by_key(|share| share.share_seq);
+    let appends = match (prior.last(), delta.first()) {
+        (Some(last), Some(first)) => first.share_seq > last.share_seq,
+        _ => true,
+    };
+    let merged = if appends {
+        prior.append(&mut delta);
+        prior
+    } else {
+        let mut merged = Vec::with_capacity(prior.len() + delta.len());
+        let (mut old, mut new) = (prior.into_iter().peekable(), delta.into_iter().peekable());
+        loop {
+            let take_old = match (old.peek(), new.peek()) {
+                (Some(retained), Some(late)) => {
+                    ensure!(
+                        retained.share_seq != late.share_seq,
+                        "a delta row repeats retained share_seq {}",
+                        late.share_seq
+                    );
+                    retained.share_seq < late.share_seq
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            merged.push(if take_old { old.next() } else { new.next() }.expect("peeked"));
+        }
+        merged
+    };
+    let mut remaining = weight;
+    let mut start = merged.len();
+    for (index, share) in merged.iter().enumerate().rev() {
+        remaining = remaining.saturating_sub(share.share_difficulty);
+        start = index;
+        if remaining == 0 {
+            break;
+        }
+    }
+    let mut kept = merged;
+    kept.drain(..start);
+    if kept.capacity() > kept.len().saturating_mul(2).max(4) {
+        kept.shrink_to_fit();
+    }
+    Ok(CutMerge {
+        kept,
+        margin: Vec::new(),
+        remaining,
+        retired: start,
+    })
+}
+
+/// The merged window is one strictly ascending sequence that crosses exactly
+/// at its first row: the full fold reaches zero and the fold without the
+/// first row does not. Landing re-derives the same boundary
+/// (`ledger/audit.rs`, `oldest_boundary`).
+fn window_invariant(shares: &[AcceptedShare], weight: u128) -> bool {
+    let ascending = shares
+        .windows(2)
+        .all(|pair| pair[0].share_seq < pair[1].share_seq);
+    let without_first = shares.iter().skip(1).fold(weight, |left, share| {
+        left.saturating_sub(share.share_difficulty)
+    });
+    let crossing = shares.first().is_some_and(|first| {
+        without_first > 0 && without_first.saturating_sub(first.share_difficulty) == 0
+    });
+    ascending && crossing
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cut_merge_tests;

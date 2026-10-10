@@ -690,6 +690,15 @@ applied in the migration transaction, with no capability and no shutdown
 proof: an earlier binary accepts the unknown migration with a warning, and
 its inserts take the defaults. See
 [dual-writer node identity](prism-ledger-ops.md#dual-writer-node-identity-027).
+Migration 028 adds a dual-writer window's per-node cut to the audit share
+snapshot: `cut_seq_0` and `cut_seq_1` on `qbit_prism_audit_snapshots`, both
+`NULL` (no cut, 3.0's meaning) or both set, with a `CHECK` validated against
+the existing rows, all `NULL`. Window references carry the cut inside the
+digest-checked documents that hold them, so no other table changes. It is
+additive and applied in the migration transaction, with no capability and no
+shutdown proof: an earlier binary never names the columns, and every row it
+writes has no cut. See
+[dual-writer window cuts](prism-ledger-ops.md#dual-writer-window-cuts-028).
 While a share-hash backfill that this release started is pending on a
 populated `2.x.x` source, the database declares
 `share_hash_backfill_pending = 1` (#669), raised to 2 once
@@ -2518,7 +2527,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`, and `025` to `027`), 002's share-hash backfill, 013's, 024's
+(`001` and native `002` to `023`, and `025` to `028`), 002's share-hash backfill, 013's, 024's
 and 031's concurrent index builds, 031's parent index and leaf attachments, and 017's prepare,
 validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its

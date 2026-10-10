@@ -1698,6 +1698,7 @@ impl Coordinator {
                 probe.accepted_share_seq,
                 probe.payout_state,
                 probe.timeline,
+                probe.peer_mark,
                 self.config.snapshot_interval,
             )
         } else {
