@@ -953,7 +953,8 @@ async fn s01_steady_state(sim: &mut Sim, body: &mut Body) -> Result<()> {
 }
 
 /// D-5 and D-10, for the peer blocks one sampler watched arrive on `on`: none
-/// was there before its window's shares or without its window record, and at
+/// was there before its window's shares or with part of its landing missing
+/// (bundle, snapshot, payout, carry or fanout rows), and at
 /// least one was seen whole on a poll that followed a good one, so the order
 /// was shown, not merely not contradicted.
 fn expect_landing_order(body: &mut Body, on: Node, report: crate::measure::LandingOrderReport) {
@@ -972,13 +973,13 @@ fn expect_landing_order(body: &mut Body, on: Node, report: crate::measure::Landi
     body.expect(
         &format!(
             "node {:?}'s blocks never land on node {on:?} before their window's shares (D-5) \
-             or without their audit (D-10)",
+             or with part of their landing missing (D-10)",
             on.peer()
         ),
         bad.is_empty() && in_order > 0,
         format!(
             "{} blocks seen arriving ({} already there at the start): {in_order} with every \
-             window share there, {} before their shares, {} without their window record, {} \
+             window share there, {} before their shares, {} with part of their landing missing, {} \
              unresolved (inline, or first seen after a failed poll); out of order: {bad:?}. \
              {} of {} polls failed {:?}; resolution {} ms",
             report.samples.len(),

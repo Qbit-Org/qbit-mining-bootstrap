@@ -345,11 +345,12 @@ pub struct LandingOrder {
     pub seen_ms: u64,
     /// The poll before that one failed: the block may have arrived earlier.
     pub after_failed_poll: bool,
-    /// The block's audit bundle or window snapshot was missing when the
-    /// block was first seen (D-10).
+    /// Part of the block's landing (its audit bundle, window snapshot,
+    /// payout entries, carry rows or CTV fanouts) was missing when the block
+    /// was first seen (D-10).
     pub torn: bool,
     /// When its window was counted: at `seen_ms` unless torn, and never
-    /// when its window record did not arrive while the sampler ran.
+    /// when its landing was not yet whole by the time the sampler stopped.
     pub counted_ms: Option<u64>,
     pub window_shares: Option<i64>,
     pub present: Option<i64>,
@@ -365,7 +366,7 @@ pub enum LandingVerdict {
     /// Counted short: the block was there before its window's shares (D-5).
     /// Shares only accumulate, so a short count at any time proves it.
     Violated,
-    /// Seen without its audit bundle or window snapshot (D-10).
+    /// Seen with part of its landing missing (D-10).
     Torn,
     /// An inline window, or complete but first seen after a failed poll:
     /// the order is not shown either way.
@@ -410,21 +411,23 @@ impl LandingOrderReport {
     }
 }
 
-/// One poll's row: the block, whether its window record (audit bundle and
-/// snapshot) is there, the window's recorded count, the window shares
-/// present now, and whether the window is inline.
+/// One poll's row: the block, whether its whole landing is there
+/// ([`crate::invariants::landing_whole`]), the window's recorded count, the
+/// window shares present now, and whether the window is inline.
 type LandingRow = (String, bool, Option<i64>, Option<i64>, bool);
 
-/// The poll: each peer block not yet settled, with its window counted in the
-/// same statement by D-13's eligibility (`invariants::eligibility`), with
-/// the cut where the schema has one.
+/// The poll: each peer block not yet settled, whether its whole landing is
+/// there, and its window counted in the same statement by D-13's
+/// eligibility (`invariants::eligibility`), with the cut where the schema
+/// has one.
 fn landing_order_sql(cut: bool) -> String {
     let eligible = crate::invariants::eligibility(
         "s.anchor_ms",
         cut.then_some(("s.cut_seq_0", "s.cut_seq_1")),
     );
+    let whole = crate::invariants::landing_whole("b.block_hash");
     format!(
-        "SELECT b.block_hash, s.snapshot_sha256 IS NOT NULL, s.share_count::bigint, \
+        "SELECT b.block_hash, {whole}, s.share_count::bigint, \
                 CASE WHEN s.snapshot_sha256 IS NULL OR s.inline_shares IS NOT NULL THEN NULL \
                      ELSE (SELECT count(*) FROM qbit_share_ledger l \
                             WHERE l.share_seq BETWEEN s.first_share_seq AND s.last_share_seq \
@@ -488,13 +491,13 @@ impl LandingOrderSampler {
                         continue;
                     }
                 };
-                for (block, recorded, window, present, inline) in rows {
+                for (block, whole, window, present, inline) in rows {
                     let at = *index.entry(block.clone()).or_insert_with(|| {
                         report.samples.push(LandingOrder {
                             block: block.clone(),
                             seen_ms: now,
                             after_failed_poll: !previous_ok,
-                            torn: !recorded,
+                            torn: !whole,
                             counted_ms: None,
                             window_shares: None,
                             present: None,
@@ -502,9 +505,9 @@ impl LandingOrderSampler {
                         });
                         report.samples.len() - 1
                     });
-                    // A torn block is polled again until its window record
-                    // arrives, and counted then.
-                    if recorded {
+                    // A torn block is polled again until its landing is
+                    // whole, and counted then.
+                    if whole {
                         let sample = &mut report.samples[at];
                         sample.counted_ms = Some(now);
                         sample.window_shares = window;
@@ -684,7 +687,7 @@ mod tests {
     fn a_landing_shows_the_order_only_when_seen_whole_on_a_poll_after_a_good_one() {
         assert_eq!(landing(50, 50).verdict(), LandingVerdict::InOrder);
         assert_eq!(landing(50, 49).verdict(), LandingVerdict::Violated);
-        // Seen without its window record: a D-10 breach, counted later. A
+        // Seen with part of its landing missing: a D-10 breach, counted later. A
         // short count then still proves the block came first (shares only
         // accumulate).
         let torn = LandingOrder {

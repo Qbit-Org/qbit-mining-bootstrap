@@ -115,7 +115,7 @@ block whose coinbase carries `/PRISM/`), never from a database's
 | `inv1-no-overpay` | per account, summing `gross - onchain` over the as-issued carry rows of the census in height order, no block raises `max(0, -balance)`, except an increase the owner recorded as #478 with enough `overpay_sats` |
 | `owner-balances-match-chain` | the owner's `qbit_current_carry_forward_balances()` equals those sums |
 | `inv2-non-owner-carry-free` | every non-owner block has an empty prior set and digest, and `onchain <= gross` for every miner, in its audit and its carry rows |
-| `inv3-landing-rows` | every census block has its block, audit bundle and snapshot, payout entries, carry rows and fanouts in every database, identical across them |
+| `inv3-landing-rows` | every census block has its block, audit bundle and snapshot, payout entries, carry rows and fanouts in every database, the same on both nodes in every column the peer sync carries (read from each node's catalog with D1's `CarriedColumns`, provenance included; a snapshot by its content-determined facts) |
 | `inv3-audits-verify` | each node serves the block's bundle, `qbit-prism-audit-verify` accepts it against the chain's coinbase with the pinned ledger key, the manifest key is the pinned one, and both nodes serve the same bundle |
 | `inv3-fanouts-identical` | each database holds the bundle's fanout transactions byte for byte |
 | `inv4-acked-shares-present` | every share a miner saw accepted is in every database, except a documented tail the scenario names |
@@ -136,7 +136,8 @@ peer blocks already on a node as its baseline before the scenario goes on,
 then polls every 100 ms for new ones and, in the same statement, counts each
 one's window shares there. A block counted short fails (shares only
 accumulate, so a later short count proves it too), and so does a block seen
-without its audit bundle or window snapshot. Each direction needs at least
+with part of its landing missing: its audit bundle, window snapshot, payout
+entries, carry rows or CTV fanouts. Each direction needs at least
 one block seen whole on a poll that followed a good one. A block first seen
 after a failed poll may have arrived during it, so a complete count then is
 reported as unresolved; failed polls are counted and listed. The sampler
