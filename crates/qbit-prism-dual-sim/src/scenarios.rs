@@ -2596,11 +2596,49 @@ async fn ledger_digest(pool: &sqlx::PgPool) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Object(digest))
 }
 
-/// CONTRACT.md D-12: once a database is a dual-writer node's, a
-/// single-writer start on it is refused unless the downgrade flag is set.
-/// The node's frontend is stopped, started once in single-writer mode (it
-/// must exit, refusing), then started again as it was.
+/// How long a node in dual mode may take to seed its carry-owner journal
+/// (D-4): D3's guard seeds once the node's own log is caught up (D-8) and its
+/// peer's journal has answered that it holds none of this node's rows.
+pub const JOURNAL_SEED_BOUND: Duration = Duration::from_secs(60);
+
+/// This node's own rows in its carry-owner journal.
+async fn own_journal_rows(sim: &Sim, node: Node) -> Result<i64> {
+    let pool = sim.pool(node).await?;
+    let rows =
+        sqlx::query_scalar("SELECT count(*) FROM qbit_prism_node_roles WHERE origin_node = $1")
+            .bind(node.index() as i16)
+            .fetch_one(&pool)
+            .await;
+    pool.close().await;
+    Ok(rows?)
+}
+
+/// CONTRACT.md D-12: once a database is a dual-writer node's (its journal
+/// holds rows), a single-writer start on it is refused unless the downgrade
+/// flag is set. The node must first seed its journal (D-4); then its
+/// frontend is stopped, started once in single-writer mode (it must exit,
+/// refusing), then started again as it was.
 async fn expect_single_writer_refused(sim: &mut Sim, node: Node, body: &mut Body) -> Result<()> {
+    let waited = Instant::now();
+    let mut rows = own_journal_rows(sim, node).await?;
+    while rows == 0 && waited.elapsed() < JOURNAL_SEED_BOUND {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        rows = own_journal_rows(sim, node).await?;
+    }
+    body.expect(
+        &format!("node {node:?} seeds its carry-owner journal in dual mode (D-4)"),
+        rows > 0,
+        format!(
+            "{rows} of its rows in qbit_prism_node_roles after {:.1} s (bound {} s)",
+            waited.elapsed().as_secs_f64(),
+            JOURNAL_SEED_BOUND.as_secs()
+        ),
+    );
+    if rows == 0 {
+        // Nothing marks the database as a dual-writer node's yet, so there
+        // is nothing for D-12 to refuse.
+        return Ok(());
+    }
     sim.frontend_mut(node).stop(Duration::from_secs(30))?;
     let mut spec = sim.frontend(node).spec.clone();
     spec.dual = None;

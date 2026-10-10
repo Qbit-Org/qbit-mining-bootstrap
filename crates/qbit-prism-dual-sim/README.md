@@ -232,8 +232,9 @@ What each one does:
 - **S9:** the 3.0 pair mines a history, is cut over live (drain, with no
   candidate left that could still be offered, promote B, migrate, identity,
   B then A in dual mode); both ledgers equal the 3.0
-  writer's, every pre-cutover row is node 0, a single-writer start is refused
-  (D-12), the owner's first block pays from the 3.0 balances.
+  writer's, every pre-cutover row is node 0, B seeds its carry-owner journal
+  (D-4) and a single-writer start on its database is then refused (D-12),
+  the owner's first block pays from the 3.0 balances.
 - **S11:** A releases ownership while B lacks one of A's blocks; B's transfer is
   refused by the chain scan, succeeds once B has landed the block, and B then
   pays carry while A builds carry-free work.
