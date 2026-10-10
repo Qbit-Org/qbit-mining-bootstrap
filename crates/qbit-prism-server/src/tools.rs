@@ -647,12 +647,14 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                     .downcast_ref::<crate::ledger::ImportStopped>()
                     .is_some()
                 {
-                    match &completeness {
-                        Ok(completeness) => println!(
-                            "Audit completeness: {}",
-                            serde_json::to_string(completeness).unwrap_or_default()
-                        ),
-                        Err(read) => eprintln!("Audit completeness unavailable: {read:#}"),
+                    match completeness
+                        .as_ref()
+                        .map_err(|read| format!("{read:#}"))
+                        .and_then(|completeness| {
+                            serde_json::to_string(completeness).map_err(|error| error.to_string())
+                        }) {
+                        Ok(completeness) => println!("Audit completeness: {completeness}"),
+                        Err(read) => eprintln!("Audit completeness unavailable: {read}"),
                     }
                     refuse(1, format!("Error: {error:?}"))
                 }
@@ -737,35 +739,37 @@ fn import_timeout(name: &str, default: Duration, floor: Duration) -> Result<Dura
 /// something outside the importer's bounds holds up.
 fn stop_on_signals() -> Result<tokio::sync::watch::Receiver<bool>> {
     let (stop, stopped) = tokio::sync::watch::channel(false);
+    let (signal, mut signals) = tokio::sync::mpsc::unbounded_channel::<()>();
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut interrupt = signal(SignalKind::interrupt())?;
+        use tokio::signal::unix::{signal as unix_signal, SignalKind};
+        let mut terminate = unix_signal(SignalKind::terminate())?;
+        let mut interrupt = unix_signal(SignalKind::interrupt())?;
         tokio::spawn(async move {
-            let mut signals = 0;
             loop {
                 tokio::select! {
                     _ = terminate.recv() => {}
                     _ = interrupt.recv() => {}
                 }
-                signals += 1;
-                if signals > 1 {
-                    refuse(
-                        1,
-                        "import-audits: a second stop signal; exiting now".to_owned(),
-                    );
+                if signal.send(()).is_err() {
+                    return;
                 }
-                stop.send_replace(true);
             }
         });
     }
     #[cfg(not(unix))]
     tokio::spawn(async move {
-        let mut signals = 0;
         while tokio::signal::ctrl_c().await.is_ok() {
-            signals += 1;
-            if signals > 1 {
+            if signal.send(()).is_err() {
+                return;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut received = 0;
+        while signals.recv().await.is_some() {
+            received += 1;
+            if received > 1 {
                 refuse(
                     1,
                     "import-audits: a second stop signal; exiting now".to_owned(),

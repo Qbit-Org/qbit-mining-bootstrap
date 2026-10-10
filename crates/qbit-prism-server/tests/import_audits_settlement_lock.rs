@@ -882,7 +882,9 @@ async fn holder_waits_for_row(fixture: &Fixture) -> Result<()> {
         "the error does not name the row: {error}"
     );
     ensure!(
-        error.contains("another session is waiting for a lock this row's write holds"),
+        error.contains(
+            "the session holding SETTLEMENT_LOCK is waiting for a lock this row's write holds"
+        ),
         "{error}"
     );
     ensure!(
@@ -1044,6 +1046,11 @@ async fn stop_mid_execution(fixture: &Fixture) -> Result<()> {
     fixture.transactions_end(Duration::from_secs(5)).await?;
     let ended = stopped.elapsed();
     println!("stopped mid-execution; the server's transaction ended {ended:?} after the stop");
+    // The server checks the client every second.
+    ensure!(
+        ended < Duration::from_secs(3),
+        "the abandoned write ran on for {ended:?} after the stop"
+    );
     ensure!(
         fixture.stored_digest(&block_hash).await?.is_none(),
         "the abandoned row was stored"
@@ -1122,6 +1129,39 @@ async fn stop_between_rows(fixture: &Fixture) -> Result<()> {
         .await?;
     ensure!(imported == 1, "the re-run imported {imported} rows");
     ensure!(fixture.stored_digest(&rows[1].0).await?.as_deref() == Some(rows[1].1.as_str()));
+    Ok(())
+}
+
+/// A stop that lands once the last row is in ends as a finished import,
+/// not as a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_the_last_row_ends_as_a_finished_import() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = stop_after_last_row(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn stop_after_last_row(fixture: &Fixture) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = legacy_bundle(100, 10)?;
+    let (block_hash, digest) =
+        seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x63).await?;
+    let (stop, stopping) = watch::channel(false);
+    let imported = fixture
+        .importer()
+        .import_legacy_audits_with(
+            Some(directory.path()),
+            &ledger_public_key(),
+            &options(Some(stopping)),
+            |_| {
+                stop.send_replace(true);
+            },
+        )
+        .await?;
+    ensure!(imported == 1, "imported {imported} rows");
+    ensure!(fixture.stored_digest(&block_hash).await?.as_deref() == Some(digest.as_str()));
     Ok(())
 }
 
