@@ -102,6 +102,7 @@ pub(super) fn build_body_with(
         qbit_prism::build_audit_bundle_body_with_ctv_settlement_options_parallel(
             shares,
             found,
+            None,
             snapshot.prior_balances.clone(),
             inputs.payout_policy,
             ctv.direct_floor_sats,
@@ -117,6 +118,7 @@ pub(super) fn build_body_with(
         qbit_prism::build_audit_bundle_body_with_coinbase_options_parallel(
             shares,
             found,
+            None,
             snapshot.prior_balances.clone(),
             inputs.payout_policy,
             Some(suffix),

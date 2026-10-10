@@ -4,9 +4,10 @@ use qbit_prism::window::{
     DIFFICULTY_OVERFLOW_MESSAGE,
 };
 use qbit_prism::{
-    build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
-    profile_audit_build, AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy,
-    FoundBlock, PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig,
+    build_audit_bundle_body_with_coinbase_options_parallel,
+    build_audit_bundle_body_with_ctv_settlement_options_parallel, profile_audit_build,
+    AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy, FoundBlock, Parallelism,
+    PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig, WindowCut,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,6 +43,10 @@ struct BuildAuditBundleInput {
     #[serde(default)]
     compact_shares: Vec<CompactAcceptedShare>,
     found_block: FoundBlock,
+    /// A dual-writer window's cut, recorded in the reward manifest. Absent
+    /// for a single-writer window, which then builds exactly as before.
+    #[serde(default)]
+    window_cut: Option<WindowCut>,
     #[serde(default)]
     prior_balances: Vec<CarryForwardBalance>,
     #[serde(default)]
@@ -92,6 +97,9 @@ struct ServeRequest {
     compact_shares: Vec<CompactAcceptedShare>,
     #[serde(default)]
     found_block: Option<FoundBlock>,
+    /// As [`BuildAuditBundleInput::window_cut`].
+    #[serde(default)]
+    window_cut: Option<WindowCut>,
     #[serde(default)]
     prior_balances: Vec<CarryForwardBalance>,
     #[serde(default)]
@@ -227,10 +235,14 @@ fn expand_compact_shares(
         .collect::<Result<Vec<_>, Box<dyn Error>>>()
 }
 
+/// One build, through the serial body builders the owning
+/// `build_audit_bundle_with_*_options` forms wrap, so a `window_cut` reaches
+/// the reward manifest; without one the bundle is the one those forms build.
 #[allow(clippy::too_many_arguments)]
 fn run_profiled_build(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
+    window_cut: Option<WindowCut>,
     prior_balances: Vec<CarryForwardBalance>,
     payout_policy: PayoutPolicy,
     ctv_settlement: Option<CtvSettlementInput>,
@@ -243,10 +255,11 @@ fn run_profiled_build(
     BTreeMap<&'static str, f64>,
 ) {
     profile_audit_build(|| {
-        if let Some(ctv_settlement) = ctv_settlement {
-            build_audit_bundle_with_ctv_settlement_options(
-                shares,
+        let body = if let Some(ctv_settlement) = ctv_settlement {
+            build_audit_bundle_body_with_ctv_settlement_options_parallel(
+                &shares,
                 found_block,
+                window_cut,
                 prior_balances,
                 payout_policy,
                 ctv_settlement.direct_floor_sats,
@@ -256,19 +269,23 @@ fn run_profiled_build(
                 witness_merkle_leaves_hex,
                 signing_key,
                 ledger_signing_key,
+                Parallelism::serial(),
             )
         } else {
-            build_audit_bundle_with_coinbase_options(
-                shares,
+            build_audit_bundle_body_with_coinbase_options_parallel(
+                &shares,
                 found_block,
+                window_cut,
                 prior_balances,
                 payout_policy,
                 coinbase_script_sig_suffix_hex,
                 witness_merkle_leaves_hex,
                 signing_key,
                 ledger_signing_key,
+                Parallelism::serial(),
             )
-        }
+        };
+        Ok(body?.into_bundle(shares))
     })
 }
 
@@ -342,6 +359,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let (bundle_result, phases_seconds) = run_profiled_build(
         input.shares,
         input.found_block,
+        input.window_cut,
         input.prior_balances,
         payout_policy,
         input.ctv_settlement,
@@ -565,6 +583,7 @@ fn serve_requests(
         let (bundle_result, phases_seconds) = run_profiled_build(
             shares,
             found_block,
+            request.window_cut,
             request.prior_balances,
             payout_policy,
             request.ctv_settlement,
