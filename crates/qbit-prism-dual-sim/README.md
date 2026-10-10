@@ -166,8 +166,9 @@ What each one does:
   few seconds; each must land and be followed by new jobs of B's before A
   thaws (a frozen peer must never stall the survivor's writes).
 - **S2, mid-pull:** both nodes take miners; A's frontend is frozen 20 times
-  for 1 to 4 s, each timed where possible to a moment its puller has a query,
-  a transaction or an advisory lock open on B's database. During each freeze
+  for 1 to 4 s, each timed first to a moment its puller holds an advisory lock
+  on B's database (the sync barrier is one), else to one it has a query or a
+  transaction open there. During each freeze
   B must keep writing: in 16 of them a new tip arrives and B must record jobs
   on it within 15 s; in every fifth, B lands a block solved on work handed out
   before the freeze and must build work on it. D1's sync barrier, held by a frozen
