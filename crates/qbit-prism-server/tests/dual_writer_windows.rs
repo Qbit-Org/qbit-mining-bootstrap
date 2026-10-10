@@ -49,20 +49,7 @@ async fn open() -> Result<Option<(FixtureDatabase, Ledger)>> {
         node: NodeIndex::A,
         carry_owner: true,
     };
-    let ready = async {
-        ledger.set_dual_writer_identity(identity)?;
-        // Migration 031's (origin_node, share_seq) index, which a dual-writer
-        // snapshot requires, under 031's name: a no-op once the schema
-        // carries it.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
-        )
-        .execute(&ledger.pool)
-        .await?;
-        anyhow::Ok(())
-    }
-    .await;
-    if let Err(error) = ready {
+    if let Err(error) = ledger.set_dual_writer_identity(identity) {
         ledger.pool.close().await;
         return Err(fixture.abandon(error).await);
     }
