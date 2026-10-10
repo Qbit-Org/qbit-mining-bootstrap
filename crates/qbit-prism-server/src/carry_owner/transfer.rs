@@ -971,6 +971,22 @@ pub async fn transfer<C: ChainSource>(
         local.peer.as_ref() == checked,
         "the peer's journal changed while transfer was checking; the acquire was not written; run it again"
     );
+    // The scanned tip must still be on the active chain: a reorganisation
+    // since the scan could have brought in a carry-paying block of the
+    // peer's that it never saw. A block found on top of it is above the
+    // release depth, so carry-free. Bounded, as release's tip read is.
+    let active = tokio::time::timeout(
+        RELEASE_TIP_TIMEOUT,
+        chain.block_hash(facts.scan.tip_height),
+    )
+    .await
+    .context("the node did not answer in time while transfer held SETTLEMENT_LOCK; the acquire was not written")??;
+    ensure!(
+        active == facts.scan.tip_hash,
+        "the scanned tip {} at height {} is no longer on the active chain ({active} is); the acquire was not written; run it again",
+        facts.scan.tip_hash,
+        facts.scan.tip_height
+    );
     let detail = json!({
         "reason": reason,
         "tip_height": facts.tip_height,

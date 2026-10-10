@@ -516,6 +516,25 @@ impl ChainSource for FakeChain {
     }
 }
 
+/// The chain as [`FakeChain`] serves it, but with the block at any height
+/// another one: the scanned tip was reorganised away after the scan, which
+/// reads only the tips and coinbases of a chain that does not move.
+struct ScannedTipReorged<'a>(&'a FakeChain);
+
+impl ChainSource for ScannedTipReorged<'_> {
+    async fn tip(&self) -> Result<(u64, String)> {
+        self.0.tip().await
+    }
+
+    async fn block_hash(&self, height: u64) -> Result<String> {
+        Ok(format!("{:064x}", 0x5eed_0000_0000_u64 + height))
+    }
+
+    async fn coinbase(&self, height: u64) -> Result<CoinbaseView> {
+        self.0.coinbase(height).await
+    }
+}
+
 /// Writes pool block `hash`'s row as a landing or the peer sync writes it,
 /// under the node that found it.
 async fn insert_block(
@@ -1382,6 +1401,31 @@ async fn transfer_case(a_url: String, b_url: String) -> Result<()> {
     ensure!(scanned(&dry)? == landings, "{:?}", scanned(&dry)?);
     expect_journal(b, &untouched, "an unconfirmed transfer").await?;
 
+    // The scanned tip is reorganised away before the acquire: refused under
+    // the lock, nothing acquired. A's release, copied just before, stands.
+    let reorged = transfer::transfer(
+        &b.ledger,
+        &b.settings(false),
+        &ScannedTipReorged(&chain),
+        &PoolRecognizer::new(TAG, None)?,
+        SCAN_FROM,
+        RELEASE_DEPTH,
+        HANDOVER,
+        true,
+    )
+    .await;
+    ensure!(
+        reorged.as_ref().is_err_and(|error| error
+            .to_string()
+            .contains("is no longer on the active chain")),
+        "a transfer whose scanned tip was reorganised away returned {reorged:?}"
+    );
+    let held = b.journal().await?;
+    ensure!(
+        held.len() == 2 && held.contains(&b_seed) && held.iter().all(|row| row.action != "acquire"),
+        "after a reorganised scan node B's journal is {held:?}"
+    );
+
     // Confirmed: B journals its acquire.
     let report = transfer_on(b, &a.url, &chain, true).await?;
     ensure!(
@@ -1428,7 +1472,8 @@ async fn transfer_case(a_url: String, b_url: String) -> Result<()> {
         "carry_owner": true,
         "action": "acquire",
         "detail": recorded,
-        "peer_row": {"epoch": release.epoch, "copied": true},
+        // Copied by the reorganised attempt above.
+        "peer_row": {"epoch": release.epoch, "copied": false},
     });
     ensure!(
         report.written.as_ref() == Some(&written),
