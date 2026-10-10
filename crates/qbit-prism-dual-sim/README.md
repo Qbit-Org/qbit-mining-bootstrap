@@ -228,8 +228,9 @@ What each one does:
 - **S8:** A dies at the instant it finds a block: with the `submitblock` held
   (the block never reaches the chain, and A may keep its candidate for
   reconciliation, never offering it again) or answered by the node and withheld
-  (B adopts it; once A returns each node holds one landing of it), with D-19's
-  wait on and off.
+  (60 external blocks are then minted on top of it, the depth D3 waits for
+  before adopting; B adopts it, and once A returns each node holds one landing
+  of it), with D-19's wait on and off.
 - **S9:** the 3.0 pair mines a history, is cut over live (drain, with no
   candidate left that could still be offered, promote B, migrate, identity,
   B then A in dual mode); both ledgers equal the 3.0
