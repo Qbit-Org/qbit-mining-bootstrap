@@ -255,6 +255,7 @@ qbit-prism-server::dual_writer_sync::out_of_order_commits_are_never_skipped
 qbit-prism-server::dual_writer_sync::peer_rows_beyond_the_attached_partitions_get_partitions
 qbit-prism-server::dual_writer_sync::steady_sync_copies_each_nodes_rows_to_the_other
 qbit-prism-server::dual_writer_sync::the_offer_wait_reads_the_peers_cursors
+qbit-prism-server::dual_writer_sync::the_origin_share_reads_never_walk_the_other_nodes_rows
 qbit-prism-server::dual_writer_sync::the_own_log_latch_without_and_with_the_peer
 qbit-prism-server::dual_writer_sync::the_sync_carries_every_column_the_inventory_does_not_keep_local
 qbit-prism-server::dual_writer_sync::the_sync_needs_only_the_peer_roles_documented_grants

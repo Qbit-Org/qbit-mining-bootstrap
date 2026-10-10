@@ -41,10 +41,24 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SYNC_BARRIER_LOCK: i64 = 0x505249534d000008;
 
 /// The highest `share_seq` of `$1`'s rows, in the shape only the
-/// (origin_node, share_seq) index of migration 031 can serve.
-const HIGHEST_SHARE: &str =
+/// (origin_node, share_seq) index of migration 031 can serve: with an
+/// equality on origin_node the planner may walk the primary key backward
+/// through the other node's rows instead.
+pub const HIGHEST_SHARE: &str =
     "SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 \
      ORDER BY origin_node DESC,share_seq DESC LIMIT 1";
+
+/// The share ledger's (origin_node, share_seq) index (migration 031), which
+/// every share read by origin needs: the sync runs only while it is a valid
+/// btree on both databases.
+pub const ORIGIN_INDEX: &str = "qbit_share_ledger_origin_seq_idx";
+
+/// Whether [`ORIGIN_INDEX`] is a valid btree: false while 031 has not built
+/// it, or its online build has not attached every partition's leaf.
+const ORIGIN_INDEX_VALID: &str =
+    "SELECT EXISTS(SELECT 1 FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid \
+     JOIN pg_am am ON am.oid=i.relam \
+     WHERE x.indexrelid=to_regclass('qbit_share_ledger_origin_seq_idx') AND x.indisvalid AND am.amname='btree')";
 
 pub const SHARES: &str = "shares";
 pub const BLOCKS: &str = "blocks";
@@ -207,6 +221,8 @@ pub struct PeerFacts {
     pub config_fingerprint: Option<String>,
     pub share_seq_floor: Option<i64>,
     pub sync_seq_floor: Option<i64>,
+    /// [`ORIGIN_INDEX`] is a valid btree on the peer.
+    pub origin_index_valid: bool,
 }
 
 /// The peer's cursors over this node's streams: positions in this node's
@@ -303,12 +319,13 @@ pub mod peer {
     /// without a predicate: the table holds one row (its key is the
     /// singleton), and the sync role may read only `config_fingerprint`.
     pub async fn facts(connection: &mut PgConnection) -> Result<PeerFacts> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "SELECT (SELECT node_index FROM qbit_prism_node_identity WHERE singleton) AS node_index,\
              (SELECT config_fingerprint FROM qbit_prism_cluster) AS config_fingerprint,\
              (SELECT share_seq_floor FROM qbit_prism_node_lineage WHERE singleton) AS share_seq_floor,\
-             (SELECT sync_seq_floor FROM qbit_prism_node_lineage WHERE singleton) AS sync_seq_floor",
-        )
+             (SELECT sync_seq_floor FROM qbit_prism_node_lineage WHERE singleton) AS sync_seq_floor,\
+             ({ORIGIN_INDEX_VALID}) AS origin_index_valid"
+        ))
         .fetch_one(&mut *connection)
         .await?;
         let node: Option<i16> = row.try_get("node_index")?;
@@ -317,6 +334,7 @@ pub mod peer {
             config_fingerprint: row.try_get("config_fingerprint")?,
             share_seq_floor: row.try_get("share_seq_floor")?,
             sync_seq_floor: row.try_get("sync_seq_floor")?,
+            origin_index_valid: row.try_get("origin_index_valid")?,
         })
     }
 
@@ -348,20 +366,12 @@ pub mod peer {
         limit: i64,
         origin: NodeIndex,
     ) -> Result<ShareBatch> {
-        let row = sqlx::query(&format!(
-            "WITH scanned AS MATERIALIZED (SELECT share_seq FROM qbit_share_ledger \
-                WHERE share_seq>$1 ORDER BY share_seq LIMIT $2),\
-             bounds AS MATERIALIZED (SELECT max(share_seq) AS through,count(*) AS scanned FROM scanned),\
-             picked AS MATERIALIZED (SELECT s.* FROM qbit_share_ledger s WHERE s.origin_node BETWEEN $3 AND $3 \
-                AND s.share_seq>$1 AND s.share_seq<=(SELECT through FROM bounds) \
-                ORDER BY s.origin_node,s.share_seq) \
-             SELECT (SELECT through FROM bounds) AS through,(SELECT scanned FROM bounds) AS scanned,{PICKED_SHARES}"
-        ))
-        .bind(after)
-        .bind(limit)
-        .bind(origin.index())
-        .fetch_one(&mut *connection)
-        .await?;
+        let row = sqlx::query(&shares_scanned_sql())
+            .bind(after)
+            .bind(limit)
+            .bind(origin.index())
+            .fetch_one(&mut *connection)
+            .await?;
         share_batch(&row)
     }
 
@@ -375,25 +385,59 @@ pub mod peer {
         limit: i64,
         origin: NodeIndex,
     ) -> Result<ShareBatch> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(&shares_of_sql())
+            .bind(origin.index())
+            .bind(after)
+            .bind(limit)
+            .fetch_one(&mut *connection)
+            .await?;
+        share_batch(&row)
+    }
+
+    /// [`shares_scanned`]'s statement: `$1` after, `$2` limit, `$3` origin.
+    /// The scan walks the primary key from the cursor under its limit; the
+    /// pick reads the origin's rows in the scanned range through the
+    /// (origin_node, share_seq) index of 031, bounded on both sides.
+    pub fn shares_scanned_sql() -> String {
+        format!(
+            "WITH scanned AS MATERIALIZED (SELECT share_seq FROM qbit_share_ledger \
+                WHERE share_seq>$1 ORDER BY share_seq LIMIT $2),\
+             bounds AS MATERIALIZED (SELECT max(share_seq) AS through,count(*) AS scanned FROM scanned),\
+             picked AS MATERIALIZED (SELECT s.* FROM qbit_share_ledger s WHERE s.origin_node BETWEEN $3 AND $3 \
+                AND s.share_seq>$1 AND s.share_seq<=(SELECT through FROM bounds) \
+                ORDER BY s.origin_node,s.share_seq) \
+             SELECT (SELECT through FROM bounds) AS through,(SELECT scanned FROM bounds) AS scanned,{PICKED_SHARES}"
+        )
+    }
+
+    /// [`shares_of`]'s statement: `$1` origin, `$2` after, `$3` limit. Only
+    /// the (origin_node, share_seq) index of 031 can give its order, so the
+    /// planner never walks the primary key through the other node's rows,
+    /// and the read stops at the limit or the origin's last row.
+    pub fn shares_of_sql() -> String {
+        format!(
             "WITH picked AS MATERIALIZED (SELECT s.* FROM qbit_share_ledger s \
                 WHERE s.origin_node BETWEEN $1 AND $1 AND s.share_seq>$2 \
                 ORDER BY s.origin_node,s.share_seq LIMIT $3) \
              SELECT (SELECT max(share_seq) FROM picked) AS through,\
                 (SELECT count(*) FROM picked) AS scanned,{PICKED_SHARES}"
-        ))
-        .bind(origin.index())
-        .bind(after)
-        .bind(limit)
-        .fetch_one(&mut *connection)
-        .await?;
-        share_batch(&row)
+        )
     }
 
-    /// The columns both share reads return of their `picked` rows.
+    /// [`shares_beyond`]'s statement: `$1` origin, `$2` after, `$3` cap, in
+    /// the shape of [`shares_of_sql`].
+    pub const SHARES_BEYOND: &str =
+        "SELECT count(*) FROM (SELECT 1 FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 \
+         AND share_seq>$2 ORDER BY origin_node,share_seq LIMIT $3) beyond";
+
+    /// The columns both share reads return of their `picked` rows. The
+    /// header mappings are looked up by an array of the picked share IDs, so
+    /// the mapping table, which holds a row for every share, is probed by
+    /// its share_id key: a semi-join on the CTE lets the planner hash it and
+    /// scan the whole table.
     const PICKED_SHARES: &str = "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.share_seq) FROM picked p),'[]'::jsonb) AS rows,\
         COALESCE((SELECT jsonb_agg(to_jsonb(h) ORDER BY h.header_hash) FROM qbit_prism_share_hashes h \
-            WHERE h.share_id IN (SELECT share_id FROM picked WHERE accepted)),'[]'::jsonb) AS hashes,\
+            WHERE h.share_id=ANY(ARRAY(SELECT share_id FROM picked WHERE accepted))),'[]'::jsonb) AS hashes,\
         (SELECT count(*) FROM picked) AS row_count,(SELECT max(share_seq) FROM picked) AS highest,\
         (SELECT floor(extract(epoch FROM max(accepted_at))*1000)::bigint FROM picked) AS accepted_ms";
 
@@ -410,10 +454,8 @@ pub mod peer {
     }
 
     /// The highest `share_seq` and `sync_seq` the peer holds of rows
-    /// `origin` wrote, and of the journal's epochs. The share read takes the
-    /// shape only the (origin_node, share_seq) index can serve: with an
-    /// equality on origin_node the planner may walk the primary key backward
-    /// through the other node's rows instead.
+    /// `origin` wrote, and of the journal's epochs. The share read is
+    /// [`HIGHEST_SHARE`].
     pub async fn highest_of(
         connection: &mut PgConnection,
         origin: NodeIndex,
@@ -437,15 +479,12 @@ pub mod peer {
         origin: NodeIndex,
         cap: i64,
     ) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT count(*) FROM (SELECT 1 FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 \
-             AND share_seq>$2 ORDER BY origin_node,share_seq LIMIT $3) beyond",
-        )
-        .bind(origin.index())
-        .bind(after)
-        .bind(cap)
-        .fetch_one(&mut *connection)
-        .await?)
+        Ok(sqlx::query_scalar(SHARES_BEYOND)
+            .bind(origin.index())
+            .bind(after)
+            .bind(cap)
+            .fetch_one(&mut *connection)
+            .await?)
     }
 
     /// The peer's sync sequence position at the sync barrier, or `None` while
@@ -563,6 +602,13 @@ impl Ledger {
     }
 
     /// The cluster fingerprint this database is pinned to (D-6), as stored.
+    /// Whether [`ORIGIN_INDEX`] is a valid btree in this database.
+    pub async fn origin_index_valid(&self) -> Result<bool> {
+        Ok(sqlx::query_scalar(ORIGIN_INDEX_VALID)
+            .fetch_one(&mut *self.acquire().await?)
+            .await?)
+    }
+
     pub async fn stored_config_fingerprint(&self) -> Result<Option<String>> {
         Ok(
             sqlx::query_scalar("SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton")

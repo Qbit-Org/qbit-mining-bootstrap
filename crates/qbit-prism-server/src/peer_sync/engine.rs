@@ -7,11 +7,12 @@
 //!
 //! Each pass, in order:
 //! 1. this database must be personalised as this node (D-9, checked every
-//!    `IDENTITY_RECHECK`), and while the own log is caught up its rollback
-//!    evidence must not have changed (D-8, D-17);
+//!    `IDENTITY_RECHECK`) and hold a valid (origin_node, share_seq) index
+//!    (031, D-14), and while the own log is caught up its rollback evidence
+//!    must not have changed (D-8, D-17);
 //! 2. the peer, on the first path that answers, must be personalised as the
-//!    other node, run this cluster's fingerprint (D-6), and carry the same
-//!    columns of every copied table;
+//!    other node, hold a valid 031 index, run this cluster's fingerprint
+//!    (D-6), and carry the same columns of every copied table;
 //! 3. until the own log is caught up, this node's own rows the peer holds
 //!    and this database lacks are pulled back and the own sequences raised
 //!    above everything the peer has seen of them; then the latch is set;
@@ -21,7 +22,7 @@
 use super::{PeerSyncPublisher, PeerSyncStatus, TableSyncStatus};
 use crate::config::DualWriterConfig;
 use crate::ledger::peer_sync::{
-    peer, Applied, BlockBundle, CarriedColumns, PeerFacts, BLOCKS, PREPARED, SHARES,
+    peer, Applied, BlockBundle, CarriedColumns, PeerFacts, BLOCKS, ORIGIN_INDEX, PREPARED, SHARES,
 };
 use crate::ledger::{IdentityCheck, Ledger, LineageEvidence};
 use crate::metrics::Metrics;
@@ -110,6 +111,10 @@ pub enum Refusal {
     Fingerprint,
     /// The peer's copied tables carry other columns.
     Schema(Vec<String>),
+    /// The (origin_node, share_seq) index of migration 031 is missing or not
+    /// valid yet in this database (`true`) or the peer's (`false`): every
+    /// share read by origin would walk the ledger.
+    OriginIndex { local: bool },
 }
 
 impl Refusal {
@@ -118,7 +123,7 @@ impl Refusal {
             Self::LocalIdentity(_) => "local_identity",
             Self::PeerIdentity(_) => "peer_identity",
             Self::Fingerprint => "fingerprint",
-            Self::Schema(_) => "schema",
+            Self::Schema(_) | Self::OriginIndex { .. } => "schema",
         }
     }
 }
@@ -133,6 +138,16 @@ impl std::fmt::Display for Refusal {
                 f,
                 "the peer's copied tables carry other columns: {}",
                 tables.join("; ")
+            ),
+            Self::OriginIndex { local } => write!(
+                f,
+                "{} has no valid {ORIGIN_INDEX} (migration 031): every share read by origin would \
+                 walk the ledger",
+                if *local {
+                    "this database"
+                } else {
+                    "the peer's database"
+                }
             ),
         }
     }
@@ -452,7 +467,8 @@ impl PeerSync {
     }
 
     /// D-9: refuse unless this database is personalised as this node, with
-    /// nothing drifted. Checked every `IDENTITY_RECHECK`.
+    /// nothing drifted, and holds a valid 031 index (D-14). Checked every
+    /// `IDENTITY_RECHECK`.
     async fn check_local_identity(&mut self) -> Result<Option<Refusal>> {
         if self
             .identity_checked
@@ -475,6 +491,12 @@ impl PeerSync {
                 drift.join(", ")
             ))),
         };
+        let refusal = match refusal {
+            None if !self.ledger.origin_index_valid().await? => {
+                Some(Refusal::OriginIndex { local: true })
+            }
+            refusal => refusal,
+        };
         if let Some(refusal) = &refusal {
             tracing::error!(%refusal, "ALERT: the peer sync does not run");
         }
@@ -486,8 +508,9 @@ impl PeerSync {
         Ok(refusal)
     }
 
-    /// The peer must be the other node, run this cluster's fingerprint (D-6)
-    /// and carry the same columns of every copied table.
+    /// The peer must be the other node, hold a valid 031 index, run this
+    /// cluster's fingerprint (D-6) and carry the same columns of every copied
+    /// table.
     async fn check_peer(
         &mut self,
         connection: &mut sqlx::PgConnection,
@@ -509,6 +532,9 @@ impl PeerSync {
         }
         if facts.share_seq_floor.is_none() || facts.sync_seq_floor.is_none() {
             return Ok(Some(Refusal::PeerIdentity("it has no lineage".into())));
+        }
+        if !facts.origin_index_valid {
+            return Ok(Some(Refusal::OriginIndex { local: false }));
         }
         if self.ledger.stored_config_fingerprint().await? != facts.config_fingerprint {
             return Ok(Some(Refusal::Fingerprint));

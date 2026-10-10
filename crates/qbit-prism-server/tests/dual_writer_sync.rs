@@ -770,7 +770,8 @@ async fn a_dead_first_path_falls_back() -> Result<()> {
 
 /// The sync refuses to run on a database that is not this node's (D-9), and
 /// refuses a peer that is not the other node or runs another cluster
-/// fingerprint (D-6); nothing is pulled.
+/// fingerprint (D-6), and either database without a valid 031 index (D-14);
+/// nothing is pulled.
 #[tokio::test]
 async fn the_sync_refuses_wrong_identities_and_fingerprints() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -802,6 +803,39 @@ async fn the_sync_refuses_wrong_identities_and_fingerprints() -> Result<()> {
         ensure!(metrics
             .render()
             .contains("qbit_prism_peer_sync_refused{reason=\"fingerprint\"} 1"));
+        ensure!(shares_of(&pair.b.pool, 0).await?.is_empty());
+        // Without a valid 031 index, on the peer and then here (D-14).
+        sqlx::query("UPDATE qbit_prism_cluster SET config_fingerprint=$1 WHERE singleton")
+            .bind(
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton",
+                )
+                .fetch_one(&pair.b.pool)
+                .await?,
+            )
+            .execute(&pair.a.pool)
+            .await?;
+        sqlx::raw_sql("DROP INDEX qbit_share_ledger_origin_seq_idx")
+            .execute(&pair.a.pool)
+            .await?;
+        let (mut no_peer_index, metrics) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        let report = no_peer_index.pass().await?;
+        ensure!(
+            report.refused == Some(Refusal::OriginIndex { local: false }),
+            "{report:?}"
+        );
+        ensure!(metrics
+            .render()
+            .contains("qbit_prism_peer_sync_refused{reason=\"schema\"} 1"));
+        sqlx::raw_sql("DROP INDEX qbit_share_ledger_origin_seq_idx")
+            .execute(&pair.b.pool)
+            .await?;
+        let (mut no_index, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        let report = no_index.pass().await?;
+        ensure!(
+            report.refused == Some(Refusal::OriginIndex { local: true }),
+            "{report:?}"
+        );
         ensure!(shares_of(&pair.b.pool, 0).await?.is_empty());
         Ok(())
     })
@@ -1394,4 +1428,179 @@ async fn a_partition_the_peer_mark_has_not_passed_never_leaves() -> Result<()> {
         Ok(())
     })
     .await
+}
+
+/// Every plan node, depth first, init plans and CTEs included.
+fn plan_nodes<'a>(node: &'a Value, all: &mut Vec<&'a Value>) {
+    all.push(node);
+    for child in node["Plans"].as_array().into_iter().flatten() {
+        plan_nodes(child, all);
+    }
+}
+
+/// D-14, with D2: the peer sync's share reads by origin take the shape only
+/// the (origin_node, share_seq) index of 031 can serve, so none walks the
+/// ledger through the other node's rows. Here node A's rows lie under a long
+/// run of node B's, where a plain `origin_node = $1` read walks the primary
+/// key backward even with the index present (D2 measured it). Each read runs
+/// prepared, as sqlx runs it, under PostgreSQL's default random_page_cost
+/// and under 1.1, the SSD value, through custom and generic plans. What is
+/// asserted is the shape: no sequential scan that reads a ledger row or a
+/// header mapping (the empty lead partitions may be scanned, as they read
+/// nothing), the origin reads through the index, and the ledger rows and
+/// mappings each read visits bounded by the rows it returns or scans by
+/// design, plus a probe per partition, whatever the other node's run holds.
+#[tokio::test]
+async fn the_origin_share_reads_never_walk_the_other_nodes_rows() -> Result<()> {
+    use qbit_prism_server::ledger::peer_sync::{peer, HIGHEST_SHARE};
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    /// A's rows, and B's run above them.
+    const OWN: i64 = 2_000;
+    const RUN: i64 = 18_000;
+    let db = FixtureDatabase::open(&raw, "sync_plan_").await?;
+    let result = async {
+        let a = Ledger::connect(&db.url, "node-a".into(), 4, true).await?;
+        a.set_node_identity(NodeIndex::A, "test").await?;
+        let pool = &a.pool;
+        let base: i64 = sqlx::query_scalar("SELECT last_value FROM qbit_share_ledger_share_seq_seq")
+            .fetch_one(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO qbit_share_ledger(share_seq,origin_node,share_id,miner_id,payout_order_key,p2mr_program,\
+             share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,writer_id,writer_epoch) \
+             SELECT $1+g,CASE WHEN g<=$2 THEN 0 ELSE 1 END,'plan-'||g,'miner','miner',decode(repeat('11',32),'hex'),\
+             1,100,100,'job',clock_timestamp(),0,'test',1 FROM generate_series(1,$2+$3) g",
+        )
+        .bind(base)
+        .bind(OWN)
+        .bind(RUN)
+        .execute(pool)
+        .await?;
+        // Their header mappings, which the share reads return beside them.
+        sqlx::query(
+            "INSERT INTO qbit_prism_share_hashes(header_hash,share_id,origin_node) \
+             SELECT md5('plan-h'||g)||md5('plan-x'||g),'plan-'||g,CASE WHEN g<=$1 THEN 0 ELSE 1 END \
+             FROM generate_series(1,$1+$2) g",
+        )
+        .bind(OWN)
+        .bind(RUN)
+        .execute(pool)
+        .await?;
+        for table in ["qbit_share_ledger", "qbit_prism_share_hashes"] {
+            // One statement each: VACUUM refuses a transaction block.
+            sqlx::raw_sql(&format!("VACUUM ANALYZE {table}"))
+                .execute(pool)
+                .await?;
+        }
+        let partitions = count(
+            pool,
+            "SELECT count(*) FROM pg_inherits WHERE inhparent='qbit_share_ledger'::regclass",
+        )
+        .await?;
+        let last_own = base + OWN;
+        // Its own connection, never returned to the pool, so the plan mode
+        // and costs set below reach no other query.
+        let mut conn = pool.acquire().await?.detach();
+        sqlx::raw_sql(&format!(
+            "PREPARE highest(smallint) AS {HIGHEST_SHARE}; \
+             PREPARE scanned(bigint,bigint,smallint) AS {}; \
+             PREPARE shares_of(smallint,bigint,bigint) AS {}; \
+             PREPARE beyond(smallint,bigint,bigint) AS {}",
+            peer::shares_scanned_sql(),
+            peer::shares_of_sql(),
+            peer::SHARES_BEYOND,
+        ))
+        .execute(&mut conn)
+        .await?;
+        // Each read, whether it reads by origin, and the ledger rows it
+        // visits by design.
+        let reads = [
+            // A's newest, under B's whole run; B's newest.
+            ("highest(0::smallint)".to_owned(), true, 1),
+            ("highest(1::smallint)".to_owned(), true, 1),
+            // A's last ten rows, then B's run: the read must stop there.
+            (format!("shares_of(0::smallint,{},5000)", last_own - 10), true, 10),
+            (format!("shares_of(0::smallint,{base},500)"), true, 500),
+            (format!("beyond(0::smallint,{},1000000)", last_own - 10), true, 10),
+            // 5000 rows of any origin by the primary key, and A's ten among
+            // them, which the pick may read again by either index.
+            (format!("scanned({},5000,0::smallint)", last_own - 10), false, 2 * 5000 + 10),
+        ];
+        let mut walks = Vec::new();
+        for cost in ["4", "1.1"] {
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                sqlx::raw_sql(&format!(
+                    "SET random_page_cost={cost}; SET plan_cache_mode={mode}"
+                ))
+                .execute(&mut conn)
+                .await?;
+                for (execute, by_origin, rows) in &reads {
+                    let plan: Value = sqlx::query_scalar(&format!(
+                        "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) EXECUTE {execute}"
+                    ))
+                    .fetch_one(&mut conn)
+                    .await?;
+                    let mut all = Vec::new();
+                    plan_nodes(&plan[0]["Plan"], &mut all);
+                    // Rows per loop: a lookup loops once per row it serves.
+                    let read = |node: &&Value| {
+                        let rows = |key: &str| node[key].as_f64().unwrap_or(0.0);
+                        (rows("Actual Rows")
+                            + rows("Rows Removed by Filter")
+                            + rows("Rows Removed by Index Recheck"))
+                            * node["Actual Loops"].as_f64().unwrap_or(1.0)
+                    };
+                    let of = |table: &'static str| {
+                        all.iter()
+                            .filter(move |node| {
+                                node["Relation Name"]
+                                    .as_str()
+                                    .is_some_and(|name| name.starts_with(table))
+                            })
+                            .copied()
+                            .collect::<Vec<&Value>>()
+                    };
+                    let (ledger, mappings) = (of("qbit_share_ledger"), of("qbit_prism_share_hashes"));
+                    let at = format!("random_page_cost {cost}, {mode}, {execute}");
+                    if ledger
+                        .iter()
+                        .chain(&mappings)
+                        .any(|node| node["Node Type"] == "Seq Scan" && read(node) > 0.0)
+                    {
+                        walks.push(format!("{at}: a sequential scan that reads rows: {plan}"));
+                    }
+                    if *by_origin
+                        && !all.iter().any(|node| {
+                            node["Index Name"]
+                                .as_str()
+                                .is_some_and(|name| name.ends_with("_origin_seq_idx"))
+                        })
+                    {
+                        walks.push(format!("{at}: not through the origin index: {plan}"));
+                    }
+                    let bound = (rows + 2 * partitions) as f64;
+                    for (what, nodes) in [("ledger rows", &ledger), ("header mappings", &mappings)] {
+                        let visited: f64 = nodes.iter().map(read).sum();
+                        if visited > bound {
+                            walks.push(format!(
+                                "{at}: visited {visited} {what}, at most {bound}: {plan}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        drop(conn);
+        a.pool.close().await;
+        ensure!(
+            walks.is_empty(),
+            "the origin share reads walk the ledger:\n{}",
+            walks.join("\n")
+        );
+        Ok(())
+    }
+    .await;
+    db.close(result).await
 }
