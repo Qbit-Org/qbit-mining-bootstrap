@@ -693,7 +693,7 @@ impl Sim {
                     .await?
             }
             Topology::DualWriter => {
-                self.wait_synced(limit - started.elapsed().min(limit))
+                self.wait_converged(limit - started.elapsed().min(limit))
                     .await?
             }
             Topology::Unsynced => {}
@@ -731,9 +731,10 @@ impl Sim {
         Ok(())
     }
 
-    /// Wait until both databases hold the same shares and pool blocks, as
-    /// two readings a second apart agree: the peer pulls have caught up.
-    pub async fn wait_synced(&self, limit: Duration) -> Result<()> {
+    /// Wait until the two databases hold the same shares and blocks, and
+    /// still do a second later: with the load paused (`settle`), the pair's
+    /// end state.
+    pub async fn wait_converged(&self, limit: Duration) -> Result<()> {
         let started = Instant::now();
         let mut last = None;
         loop {
@@ -761,6 +762,50 @@ impl Sim {
             last = Some(reading);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+    }
+
+    /// Wait until each node holds every share and block its peer had
+    /// originated when this was called: the sync has caught up to now. Under
+    /// load the two databases are never equal at one instant, so this waits
+    /// for the first reading's rows to arrive, not for equal counts.
+    pub async fn wait_synced(&self, limit: Duration) -> Result<()> {
+        let started = Instant::now();
+        let mut pools = BTreeMap::new();
+        for node in Node::BOTH {
+            pools.insert(node, self.pool(node).await?);
+        }
+        // What each node had originated, as its own database holds it.
+        let mut target = BTreeMap::new();
+        for node in Node::BOTH {
+            target.insert(node, origin_counts(&pools[&node], node).await?);
+        }
+        let result = loop {
+            let mut behind = Vec::new();
+            for node in Node::BOTH {
+                let peer = node.peer();
+                let held = origin_counts(&pools[&peer], node).await?;
+                if held.0 < target[&node].0 || held.1 < target[&node].1 {
+                    behind.push(format!(
+                        "node {peer:?} holds {held:?} of node {node:?}'s (shares, blocks), which had {:?}",
+                        target[&node]
+                    ));
+                }
+            }
+            if behind.is_empty() {
+                break Ok(());
+            }
+            if started.elapsed() >= limit {
+                break Err(anyhow::anyhow!(
+                    "the sync did not catch up within {limit:?}: {}",
+                    behind.join("; ")
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        for pool in pools.into_values() {
+            pool.close().await;
+        }
+        result
     }
 
     /// The 3.0 to 3.1 cutover (S9), as the cutover playbook runs it: drain
@@ -911,6 +956,18 @@ impl Sim {
             "balancer_port": self.balancer.port(),
         })
     }
+}
+
+/// How many shares and blocks `origin` originated, as `pool`'s database
+/// holds them.
+async fn origin_counts(pool: &PgPool, origin: Node) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT (SELECT count(*) FROM qbit_prism_share_hashes WHERE origin_node = $1), \
+                (SELECT count(*) FROM qbit_pool_blocks WHERE origin_node = $1)",
+    )
+    .bind(origin.index() as i16)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// The `qbitd` a node's frontend uses: its own host's.
