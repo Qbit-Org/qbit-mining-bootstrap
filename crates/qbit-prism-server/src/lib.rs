@@ -2,6 +2,7 @@
 //! frontend owns only its connections and immutable, bounded work cache.
 pub mod api;
 pub mod broadcaster;
+pub mod carry_owner;
 pub mod codec;
 pub mod config;
 pub mod coordinator;

@@ -32,6 +32,7 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
+pub mod adoption;
 mod bundle_build;
 mod chain_observation;
 mod claim_release;
@@ -348,6 +349,9 @@ pub struct Coordinator {
     /// peer to hold what adopting it needs; `None` on a single writer or
     /// with `PRISM_PEER_INGEST_WAIT_MS=0`.
     peer_ingest: Option<crate::peer_sync::PeerIngestWait>,
+    /// 3.1 dual writer: the CTV broadcaster's view of the peer's node, the
+    /// finder of the zero-fee fanouts it may take over.
+    pub finder_liveness: crate::broadcaster::FinderLiveness,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -898,22 +902,13 @@ impl Coordinator {
             rpc.without_relay()
         };
         if let Some(address) = &config.fee_address {
-            let validation = rpc.call("validateaddress", json!([address])).await?;
-            let script = validation["scriptPubKey"]
-                .as_str()
-                .context("pool fee address has no script")?;
-            ensure!(
-                validation["isvalid"] == true
-                    && script.starts_with("5220")
-                    && hex::decode(script)?.len() == 34,
-                "pool fee address must be P2MR"
-            );
+            let program = pool_fee_address_program(&rpc, address).await?;
             config
                 .payout_policy
                 .pool_fee_policy
                 .as_mut()
                 .context("missing fee policy")?
-                .p2mr_program_hex = script[4..].into();
+                .p2mr_program_hex = program;
         }
         let genesis = rpc.call("getblockhash", json!([0])).await?;
         config.verify_genesis(genesis.as_str().context("qbit genesis hash missing")?)?;
@@ -964,6 +959,7 @@ impl Coordinator {
         }
         if let Some(dual) = &config.dual_writer {
             ledger.set_dual_writer_identity(dual.identity)?;
+            ledger.set_extranonce2_size(config.extranonce2_size)?;
         }
         // Keep a frontend's initial heartbeat non-quiescent if configuration
         // fails. Another live incarnation may share this instance ID, so this
@@ -1033,6 +1029,7 @@ impl Coordinator {
             submission_hold: Default::default(),
             peer_sync: Default::default(),
             peer_ingest,
+            finder_liveness: Default::default(),
         }))
     }
 
@@ -3479,6 +3476,22 @@ fn job_deferral(error: &anyhow::Error) -> crate::metrics::JobDeferral {
         None if error.is::<JobFeeRefused>() => JobDeferral::FeeFloor,
         None => JobDeferral::Other,
     }
+}
+
+/// The 32-byte P2MR program, as hex, that a pool-fee address pays, checked
+/// through the node; shared by the frontend and the `carry-owner` scan.
+pub(crate) async fn pool_fee_address_program(rpc: &Rpc, address: &str) -> Result<String> {
+    let validation = rpc.call("validateaddress", json!([address])).await?;
+    let script = validation["scriptPubKey"]
+        .as_str()
+        .context("pool fee address has no script")?;
+    ensure!(
+        validation["isvalid"] == true
+            && script.starts_with("5220")
+            && hex::decode(script)?.len() == 34,
+        "pool fee address must be P2MR"
+    );
+    Ok(script[4..].into())
 }
 
 fn header_parent(block: &[u8]) -> Result<String> {

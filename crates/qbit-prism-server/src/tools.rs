@@ -83,6 +83,11 @@ enum Command {
         #[command(subcommand)]
         command: CandidatesCommand,
     },
+    /// Show the dual-writer carry owner, release it on this node, or transfer it here.
+    CarryOwner {
+        #[command(subcommand)]
+        command: CarryOwnerCommand,
+    },
     /// Validate compact target bits and print Prism's exact scaled difficulty.
     HeaderDifficulty {
         #[arg(long)]
@@ -361,6 +366,35 @@ enum NodeIdentityCommand {
 }
 
 #[derive(Subcommand)]
+enum CarryOwnerCommand {
+    /// Print what the carry owner guard reads (setting, node identity, both journals) and what
+    /// it would decide, as JSON.
+    Status,
+    /// Give up carry ownership on this node: journal a release and supersede its work.
+    Release {
+        /// Why ownership is released, journaled (1 to 4096 bytes).
+        #[arg(long)]
+        reason: String,
+        /// Write the release. Without it, print the checks, change nothing and fail.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Take carry ownership on this node once the peer has released it, the release is buried
+    /// and every pool block on the active chain is landed here.
+    Transfer {
+        /// Why ownership moves, journaled (1 to 4096 bytes).
+        #[arg(long)]
+        reason: String,
+        /// The first height the chain scan reads. The default, 0, reads the whole chain.
+        #[arg(long, default_value_t = 0)]
+        from_height: u64,
+        /// Write the transfer. Without it, print the checks, change nothing and fail.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum CandidatesCommand {
     /// Print unfinished candidates up to --limit, oldest due first; warn if truncated.
     List {
@@ -536,6 +570,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         Command::NodeIdentity { command } => node_identity(command).await,
         Command::ShareArchive { command } => share_archive(command).await,
         Command::Candidates { command } => candidates(command).await,
+        Command::CarryOwner { command } => carry_owner(command).await,
         Command::HeaderDifficulty { bits } => {
             let compact = crate::codec::parse_u32_hex(&bits)?;
             let target = crate::codec::target_from_compact(compact)?;
@@ -765,6 +800,12 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             let config = Config::from_env()?;
             let ledger =
                 crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+            // The clear reconciles blocks: in dual-writer mode it must treat
+            // peer and carry-free blocks as the frontends do.
+            if let Some(dual) = &config.dual_writer {
+                ledger.set_dual_writer_identity(dual.identity)?;
+                ledger.set_extranonce2_size(config.extranonce2_size)?;
+            }
             let result = ledger
                 .clear_fatal_state_within(&config, &reason, Duration::from_secs(timeout_seconds))
                 .await;
@@ -823,6 +864,98 @@ async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
     ledger.pool.close().await;
     println!("{}", serde_json::to_string_pretty(&result?)?);
     Ok(())
+}
+
+/// `carry-owner`: every subcommand prints its report as JSON. `release` and
+/// `transfer` fail, after printing, when a check refuses or without
+/// `--confirm`.
+async fn carry_owner(command: CarryOwnerCommand) -> Result<()> {
+    use crate::carry_owner::{transfer, CarryOwnerSettings};
+    let config = Config::from_env()?;
+    let settings = CarryOwnerSettings::from_config(&config)?;
+    let rpc = Rpc::new(
+        config.rpc_url.clone(),
+        config.rpc_user.clone(),
+        config.rpc_password.clone(),
+        config.rpc_timeout,
+    )?;
+    let ledger = crate::ledger::Ledger::connect_operator(&config.database_url, false).await?;
+    if let Some(dual) = &config.dual_writer {
+        ledger.set_dual_writer_identity(dual.identity)?;
+        ledger.set_extranonce2_size(config.extranonce2_size)?;
+    }
+    let (result, writes) = match &command {
+        CarryOwnerCommand::Status => (transfer::status(&ledger, &settings).await, false),
+        CarryOwnerCommand::Release { reason, confirm } => {
+            crate::ledger::require_operator_reason(reason)?;
+            (
+                transfer::release(
+                    &ledger,
+                    &settings,
+                    &transfer::RpcChain(&rpc),
+                    reason,
+                    *confirm,
+                )
+                .await,
+                true,
+            )
+        }
+        CarryOwnerCommand::Transfer {
+            reason,
+            from_height,
+            confirm,
+        } => {
+            crate::ledger::require_operator_reason(reason)?;
+            let recognizer = crate::carry_owner::transfer::PoolRecognizer::new(
+                &config.coinbase_tag,
+                pool_fee_program(&config, &rpc).await?.as_deref(),
+            )?;
+            (
+                transfer::transfer(
+                    &ledger,
+                    &settings,
+                    &transfer::RpcChain(&rpc),
+                    &recognizer,
+                    *from_height,
+                    config.candidate_orphan_confirmations,
+                    reason,
+                    *confirm,
+                )
+                .await,
+                true,
+            )
+        }
+    };
+    ledger.pool.close().await;
+    let report = result?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if writes {
+        ensure!(
+            report.passed(),
+            "refused: a check failed; nothing was written"
+        );
+        ensure!(
+            report.written.is_some(),
+            "nothing was written; rerun with --confirm to write it"
+        );
+    }
+    Ok(())
+}
+
+/// The pool-fee P2MR program, as `Coordinator::connect` resolves it: the
+/// program of `PRISM_POOL_FEE_ADDRESS`, or the configured one.
+async fn pool_fee_program(config: &Config, rpc: &Rpc) -> Result<Option<String>> {
+    if let Some(address) = &config.fee_address {
+        return Ok(Some(
+            crate::coordinator::pool_fee_address_program(rpc, address).await?,
+        ));
+    }
+    Ok(config
+        .payout_policy
+        .pool_fee_policy
+        .as_ref()
+        .map(|fee| fee.p2mr_program_hex.clone())
+        .filter(|program| !program.is_empty()))
 }
 
 /// #664: every subcommand reads only the database URL, so a frontend-only

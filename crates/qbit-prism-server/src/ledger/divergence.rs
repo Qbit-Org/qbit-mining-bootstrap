@@ -394,9 +394,26 @@ async fn record_offer_decision(
     Ok(())
 }
 
-/// Program, miner, as-issued prior (text), gross, on-chain, block height, and
-/// whether the block already has a divergence record.
-type CarryRecordRow = (String, String, String, i64, i64, i64, bool);
+/// Program, miner, as-issued prior (text), gross, on-chain, block height,
+/// whether the block already has a divergence record, the block's origin
+/// node, and its landed coinbase (dual mode only).
+type CarryRecordRow = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    bool,
+    i16,
+    Option<String>,
+);
+
+/// What a dual-writer node knows about who found a block: its own node, and
+/// the ledger's reading of a coinbase ([`Ledger::found_here`]).
+pub(super) struct DualScope<'a> {
+    pub ledger: &'a Ledger,
+}
 
 /// Record, in the transaction that is about to make a landed block's carry
 /// rows count (its confirmation, or a reactivation), the debt those rows
@@ -405,27 +422,65 @@ type CarryRecordRow = (String, String, String, i64, i64, i64, bool);
 /// re-confirmation that no longer diverges clears them. Returns the
 /// divergence, for the caller's metrics after its commit, or `None` for a
 /// block with no carry rows.
+///
+/// In dual-writer mode (`dual` is given):
+/// - a block this node did not find, a peer's or one adopted from the
+///   peer's work (S8), is recorded by the node that found it, which built it
+///   on its own balances; here it would only measure this node's sync lag,
+///   so it is neither recorded nor counted (`None`);
+/// - a carry-free block, every issued prior zero and no account paid more
+///   than its gross, creates no debt by construction (the policy pays at most
+///   `max(0, issued + g)`), and its prior differs from the canonical balances
+///   by design: it is not divergent, and nothing is recorded for it unless a
+///   record already exists.
 pub(super) async fn record_confirmation(
     tx: &mut Transaction<'_, Postgres>,
     block_hash: &str,
     candidate: Option<&Candidate>,
+    dual: Option<DualScope<'_>>,
 ) -> Result<Option<LandingDivergence>> {
     // One read: the block's carry rows while they do not count yet, its
     // height, and whether it already has a record.
-    let rows: Vec<CarryRecordRow> = sqlx::query_as(
-        "SELECT encode(ledger.p2mr_program,'hex'),ledger.miner_id,ledger.prior_balance_sats::text,ledger.gross_amount_sats,ledger.onchain_amount_sats,block.block_height,EXISTS(SELECT 1 FROM qbit_prism_payout_divergences divergence WHERE divergence.block_hash=$1) FROM qbit_payout_carry_forward ledger JOIN qbit_pool_blocks block ON block.block_hash=ledger.block_hash WHERE ledger.block_hash=$1 AND ledger.maturity_state<>'reversed' AND block.chain_state IN ('prepared','inactive')",
-    )
-    .bind(block_hash)
-    .fetch_all(&mut **tx)
-    .await?;
-    let Some(&(_, _, _, _, _, height, exists)) = rows.first() else {
+    // A single writer runs 3.0's statement; dual mode reads the origin too.
+    let rows: Vec<CarryRecordRow> = if dual.is_some() {
+        sqlx::query_as(
+            "SELECT encode(ledger.p2mr_program,'hex'),ledger.miner_id,ledger.prior_balance_sats::text,ledger.gross_amount_sats,ledger.onchain_amount_sats,block.block_height,EXISTS(SELECT 1 FROM qbit_prism_payout_divergences divergence WHERE divergence.block_hash=$1),block.origin_node,(SELECT audit.coinbase_tx_hex FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=$1) FROM qbit_payout_carry_forward ledger JOIN qbit_pool_blocks block ON block.block_hash=ledger.block_hash WHERE ledger.block_hash=$1 AND ledger.maturity_state<>'reversed' AND block.chain_state IN ('prepared','inactive')",
+        )
+        .bind(block_hash)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        sqlx::query_as::<_, (String, String, String, i64, i64, i64, bool)>(
+            "SELECT encode(ledger.p2mr_program,'hex'),ledger.miner_id,ledger.prior_balance_sats::text,ledger.gross_amount_sats,ledger.onchain_amount_sats,block.block_height,EXISTS(SELECT 1 FROM qbit_prism_payout_divergences divergence WHERE divergence.block_hash=$1) FROM qbit_payout_carry_forward ledger JOIN qbit_pool_blocks block ON block.block_hash=ledger.block_hash WHERE ledger.block_hash=$1 AND ledger.maturity_state<>'reversed' AND block.chain_state IN ('prepared','inactive')",
+        )
+        .bind(block_hash)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|(program, miner, issued, gross, onchain, height, exists)| {
+            (program, miner, issued, gross, onchain, height, exists, 0, None)
+        })
+        .collect()
+    };
+    let Some((_, _, _, _, _, height, exists, origin, coinbase)) = rows.first() else {
         return Ok(None);
     };
+    let (height, exists) = (*height, *exists);
+    if let Some(dual) = &dual {
+        let coinbase = coinbase
+            .as_deref()
+            .and_then(|coinbase| hex::decode(coinbase).ok());
+        let origin_is_own = dual.ledger.own_node() == Some(*origin);
+        if !dual.ledger.found_here(coinbase.as_deref(), origin_is_own) {
+            return Ok(None);
+        }
+    }
+    let dual_writer = dual.is_some();
     let current = read_prior_balances(tx).await?;
     let (divergence, digest) = tokio::task::spawn_blocking(move || {
         let rows = rows
             .into_iter()
-            .map(|(program, miner_id, issued, gross, onchain, _, _)| {
+            .map(|(program, miner_id, issued, gross, onchain, _, _, _, _)| {
                 Ok(CarryRow {
                     p2mr_program_hex: program,
                     miner_id,
@@ -435,10 +490,16 @@ pub(super) async fn record_confirmation(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        anyhow::Ok((
-            rows_divergence(rows, &current),
-            qbit_prism::prior_balances_digest(&current),
-        ))
+        let carry_free = dual_writer && carry_free_rows(&rows);
+        let mut divergence = rows_divergence(rows, &current);
+        if carry_free {
+            // No debt is possible; anything else would be a policy breach,
+            // which stays visible as an overpay.
+            if divergence.overpay_sats == 0 {
+                divergence.divergent_accounts = 0;
+            }
+        }
+        anyhow::Ok((divergence, qbit_prism::prior_balances_digest(&current)))
     })
     .await??;
     if divergence.divergent_accounts == 0 && !exists {
@@ -476,6 +537,14 @@ pub(super) async fn record_confirmation(
             .await?;
     }
     Ok(Some(divergence))
+}
+
+/// Whether a block's carry rows are carry-free work: every issued prior is
+/// zero and no account was paid more than its gross, so every delta
+/// `gross - onchain` is non-negative (CONTRACT.md §4, invariant 2).
+pub fn carry_free_rows(rows: &[CarryRow]) -> bool {
+    rows.iter()
+        .all(|row| row.issued_prior_sats == 0 && row.gross_sats >= row.onchain_sats)
 }
 
 /// The integrity report's `payout_divergence` line: migration 020's report

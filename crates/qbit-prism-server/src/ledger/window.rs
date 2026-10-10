@@ -381,7 +381,18 @@ impl Ledger {
         let expected_balances = window.prior_balances_digest;
         let prior_balances = match balances {
             BalanceSource::Current => {
-                let rows = prior_balance_rows(&mut tx).await?;
+                // The balances of the reference's own mode, whatever the gate
+                // says now: an owner's candidate whose as-issued snapshot is
+                // gone meets the canonical balances even while its gate is
+                // closed (before a restarted guard's first peer read, or in
+                // `candidates recover`, which runs no guard).
+                let sql = if super::carry::carry_free_block(self.dual_writer(), &expected_balances)
+                {
+                    super::carry::CARRY_FREE_PRIOR_BALANCE_SQL
+                } else {
+                    PRIOR_BALANCE_SQL
+                };
+                let rows = prior_balance_rows(&mut tx, sql).await?;
                 completion
                     .own(rows)
                     .map(move |rows| {
@@ -1284,7 +1295,11 @@ impl Ledger {
                 (cutoff, own, mark)
             }
         };
-        let rows = prior_balance_rows(&mut tx).await?;
+        // The carry gate and this node's journal are read here, after the
+        // revision under SETTLEMENT_LOCK, which the gate's fencing bump and a
+        // release also take (`carry.rs`).
+        let prior_sql = self.job_prior_balance_sql_in(&mut tx).await?;
+        let rows = prior_balance_rows(&mut tx, prior_sql).await?;
         #[cfg(test)]
         let decode_hook = self.snapshot_decode_hook.lock().unwrap().clone();
         // #478: every account's debt, summed on the decoding thread, for the
@@ -1313,7 +1328,13 @@ impl Ledger {
         tx.commit().await?;
         drop(order);
         let debt = debt.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(metrics) = self.metrics.as_deref().filter(|_| debt != u64::MAX) {
+        // Carry-free work reads no balances, so it says nothing about the
+        // debt; the gauge is read from canonical balances only.
+        if let Some(metrics) = self
+            .metrics
+            .as_deref()
+            .filter(|_| debt != u64::MAX && prior_sql == PRIOR_BALANCE_SQL)
+        {
             metrics.record_carry_forward_debt(debt);
         }
         // Ledger rows are immutable and later commits receive a timestamp
@@ -1500,17 +1521,25 @@ impl Ledger {
     }
 }
 
+/// The canonical balances, whatever the carry gate says: landing,
+/// confirmation and the #478 debt record measure against these.
 pub(super) async fn read_prior_balances(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<CarryForwardBalance>> {
-    let rows = prior_balance_rows(tx).await?;
+    let rows = prior_balance_rows(tx, PRIOR_BALANCE_SQL).await?;
     tokio::task::spawn_blocking(move || decode_prior_balances(rows)).await?
 }
 
-const PRIOR_BALANCE_SQL: &str = "SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()";
+/// The canonical balance read. Work reads it only through the carry gate,
+/// [`Ledger::job_prior_balance_sql`], which in single-writer mode is always
+/// this statement.
+pub(super) const PRIOR_BALANCE_SQL: &str = "SELECT miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,balance_sats::text AS balance FROM qbit_current_carry_forward_balances()";
 
-async fn prior_balance_rows(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<PgRow>, sqlx::Error> {
-    sqlx::query(PRIOR_BALANCE_SQL).fetch_all(&mut **tx).await
+async fn prior_balance_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    sql: &'static str,
+) -> Result<Vec<PgRow>, sqlx::Error> {
+    sqlx::query(sql).fetch_all(&mut **tx).await
 }
 
 fn decode_prior_balances(rows: Vec<PgRow>) -> Result<Vec<CarryForwardBalance>> {

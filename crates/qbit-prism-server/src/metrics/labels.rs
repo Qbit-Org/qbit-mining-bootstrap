@@ -125,6 +125,19 @@ labels!(JobDeferral {
     NewTipPending => "new_tip_pending", WorkRetired => "work_retired",
     FeeFloor => "fee_floor", Other => "other"
 });
+// PRISM 3.1 dual writer: the carry owner guard's state, paying or the reason
+// its work is carry-free (`carry_owner::CarryFreeReason`).
+labels!(CarryOwnerState {
+    Paying => "paying", NotOwner => "not_owner", NodeUnidentified => "node_unidentified",
+    NoJournalRow => "no_journal_row", ConfigMismatch => "config_mismatch",
+    SettingPending => "setting_pending",
+    OwnJournalBehindPeer => "own_journal_behind_peer",
+    OwnJournalRolledBack => "own_journal_rolled_back", ClaimNotVetted => "claim_not_vetted",
+    PeerClaimsOwnership => "peer_claims_ownership", PeerNotSeeded => "peer_not_seeded",
+    PeerUnconfirmed => "peer_unconfirmed"
+});
+// Whether the carry owner guard's live read of the peer's journal answered.
+labels!(PeerCheckResult { Answered => "answered", Failed => "failed" });
 // #478: what the offer did with a pending block on the current tip whose
 // payout revision was superseded.
 labels!(CaptureDecision {

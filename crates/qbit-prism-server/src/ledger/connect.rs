@@ -208,6 +208,7 @@ impl Ledger {
             own_log_lost: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
+            carry: std::sync::Arc::default(),
             compact_decode_hook: Default::default(),
             snapshot_decode_hook: Default::default(),
         }
@@ -443,6 +444,7 @@ impl Ledger {
             own_log_lost: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
+            carry: std::sync::Arc::default(),
             #[cfg(test)]
             compact_decode_hook: Default::default(),
             #[cfg(test)]

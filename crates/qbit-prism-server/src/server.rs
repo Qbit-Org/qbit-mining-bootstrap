@@ -271,6 +271,26 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }));
     }
+    // PRISM 3.1 dual writer: the carry owner guard, and adoption of pool
+    // blocks whose finder died before their rows arrived (S8).
+    if config.dual_writer.is_some() {
+        let settings = crate::carry_owner::CarryOwnerSettings::from_config(config)?;
+        tasks.spawn(crate::carry_owner::run(
+            coordinator.ledger.clone(),
+            settings,
+            own_log.clone(),
+            Some(registry.clone()),
+            shutdown_rx.clone(),
+        ));
+        tasks.spawn({
+            let coordinator = coordinator.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                coordinator.adoption_loop(rx).await;
+                Ok(())
+            }
+        });
+    }
     match config.block_submission().ctv_broadcaster {
         config::CtvBroadcaster::On => {
             tasks.spawn(runtime.track(
