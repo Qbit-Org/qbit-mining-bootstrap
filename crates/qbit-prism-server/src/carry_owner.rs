@@ -307,6 +307,13 @@ impl Guard {
             }
             PeerRead::Failed => (None, false),
         };
+        // A live claim of the peer's counts even behind a newer row this node
+        // holds of it (the peer's database was rolled back): the peer may act
+        // on it until its own guard sees the rollback.
+        if peer_live.is_some_and(|row| row.carry_owner) {
+            self.peer_confirmed = false;
+            return CarryDecision::CarryFree(PeerClaimsOwnership);
+        }
         // The newest of the peer's rows this node can see, live or synced.
         let peer = [peer_live, inputs.peer_synced.as_ref()]
             .into_iter()
@@ -389,7 +396,7 @@ pub async fn read_latest_claim(
 ) -> sqlx::Result<Option<RoleRow>> {
     sqlx::query(LATEST_CLAIM_SQL)
         .bind(origin)
-        .fetch_optional(connection)
+        .fetch_optional(&mut *connection)
         .await?
         .as_ref()
         .map(role_row)
@@ -409,7 +416,7 @@ fn role_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<RoleRow> {
 /// The database's node identity, if one was ever set.
 pub async fn read_node_identity(connection: &mut PgConnection) -> sqlx::Result<Option<i16>> {
     sqlx::query_scalar(NODE_IDENTITY_SQL)
-        .fetch_optional(connection)
+        .fetch_optional(&mut *connection)
         .await
 }
 
@@ -418,7 +425,7 @@ pub async fn read_node_identity(connection: &mut PgConnection) -> sqlx::Result<O
 /// journal never reuses an epoch its old rows had.
 async fn next_epoch(connection: &mut PgConnection) -> sqlx::Result<i64> {
     sqlx::query_scalar("SELECT GREATEST(floor(extract(epoch FROM clock_timestamp())*1000)::bigint,COALESCE(max(epoch),0)+1) FROM qbit_prism_node_roles")
-        .fetch_one(connection)
+        .fetch_one(&mut *connection)
         .await
 }
 
@@ -439,7 +446,7 @@ pub async fn append_role(
         .bind(action)
         .bind(recorded_by)
         .bind(detail)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     Ok(epoch)
 }
@@ -700,7 +707,7 @@ pub async fn check(
     own_log_caught_up: bool,
     metrics: Option<&Metrics>,
 ) -> Result<CarryDecision> {
-    let mut connection = ledger.pool.acquire().await?;
+    let mut connection = ledger.acquire().await?;
     let database_node = read_node_identity(&mut connection).await?;
     let mut local = read_latest_roles(&mut connection, settings.node_index).await?;
     drop(connection);
@@ -727,7 +734,7 @@ pub async fn check(
                     "carry owner guard: seeded this node's journal from PRISM_CARRY_OWNER"
                 );
             }
-            let mut connection = ledger.pool.acquire().await?;
+            let mut connection = ledger.acquire().await?;
             local = read_latest_roles(&mut connection, settings.node_index).await?;
         }
         peer_read = Some(read);
@@ -1072,6 +1079,16 @@ mod tests {
         inputs.peer_read = answered(Some(row(1, 29, false, "seed")));
         assert_eq!(
             guard.decide(&inputs),
+            CarryDecision::CarryFree(CarryFreeReason::PeerClaimsOwnership)
+        );
+        // A live claim counts even behind the newer release this node's copy
+        // holds, which this node's transfer read: the peer's database was
+        // rolled back, and the peer may act on its claim until it sees that.
+        let mut rolled_back_peer = owner_inputs(answered(Some(row(1, 30, true, "acquire"))));
+        rolled_back_peer.own = Some(acquire(0, 32, 31));
+        rolled_back_peer.peer_synced = Some(row(1, 31, false, "release"));
+        assert_eq!(
+            Guard::default().decide(&rolled_back_peer),
             CarryDecision::CarryFree(CarryFreeReason::PeerClaimsOwnership)
         );
     }
