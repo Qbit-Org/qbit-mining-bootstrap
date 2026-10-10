@@ -166,6 +166,7 @@ impl Fixture {
             version_mask: codec::VERSION_ROLLING_MASK,
             audit_bind: "127.0.0.1".into(),
             audit_port: 0,
+            dual_writer: None,
         };
         let metrics = Arc::new(Metrics::default());
         let coordinator = Coordinator::new(config, metrics.clone()).await?;

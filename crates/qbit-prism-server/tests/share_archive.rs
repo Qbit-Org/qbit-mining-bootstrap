@@ -1734,8 +1734,8 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
         .fetch_one(&ledger.pool)
         .await?;
         ensure!(
-            shape.try_get::<i64, _>("indexes")? == 6,
-            "the restored partition has {} indexes, not the release set of six",
+            shape.try_get::<i64, _>("indexes")? == 7,
+            "the restored partition has {} indexes, not the release set of six and 031's",
             shape.try_get::<i64, _>("indexes")?
         );
         ensure!(

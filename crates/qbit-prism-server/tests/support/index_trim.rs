@@ -15,7 +15,8 @@
 //! first partition: `undo_013` undoes 017 first (the concurrent builds need
 //! the plain table), the trimmed set is asserted on the parent and on that
 //! partition, and every successful migrate here ends with 017 applied
-//! again through its online runner.
+//! again through its online runner, then 031, whose index on the partitions
+//! `undo_017` undoes first.
 //!
 //! `migrate --offline-indexes` builds the same set with a plain `CREATE
 //! INDEX` and `DROP INDEX`, in the transaction that records the version,
@@ -113,8 +114,11 @@ async fn schema_versions(pool: &PgPool) -> Result<Vec<i32>> {
 /// kept release indexes and the two replacements as partitioned indexes,
 /// without the global share_id key a partitioned table cannot carry; on
 /// the release table, now the first partition, the same set under its
-/// `_p0` names plus its own share_id key. Every index valid, with 13 and
-/// 16 recorded. Returns the parent's indexes.
+/// `_p0` names plus its own share_id key. 031's (origin_node, share_seq)
+/// index is there too, on the parent and as the first partition's leaf:
+/// `undo_013` undoes it with 017, and every migrate here builds it again
+/// after 017. Every index valid, with 13 and 16 recorded. Returns the
+/// parent's indexes.
 async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, String)>> {
     let indexes = ledger_indexes(pool).await?;
     let mut expected: Vec<&str> = KEPT
@@ -122,7 +126,7 @@ async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, Stri
         .copied()
         .filter(|name| *name != "qbit_share_ledger_share_id_key")
         .collect();
-    expected.extend([MINER_HISTORY, SEQ_WALK]);
+    expected.extend([MINER_HISTORY, SEQ_WALK, super::origin_index::ORIGIN]);
     expected.sort_unstable();
     let names: Vec<&str> = indexes.iter().map(|(name, ..)| name.as_str()).collect();
     assert_eq!(names, expected);
@@ -146,7 +150,7 @@ async fn assert_trimmed(pool: &PgPool) -> Result<Vec<(String, String, bool, Stri
     let leaf = table_indexes(pool, "qbit_share_ledger_p0").await?;
     let mut expected: Vec<String> = KEPT
         .iter()
-        .chain([MINER_HISTORY, SEQ_WALK].iter())
+        .chain([MINER_HISTORY, SEQ_WALK, super::origin_index::ORIGIN].iter())
         .map(|name| name.replacen("qbit_share_ledger_", "qbit_share_ledger_p0_", 1))
         .collect();
     expected.sort_unstable();
@@ -356,11 +360,12 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
     );
     writer.commit().await?;
     let online = timeout(Duration::from_secs(60), migrate).await??;
-    // Migration 017's detached connection, registration's transaction and
-    // heartbeat add three observed checkouts;
+    // Migrations 017's and 031's detached connections (undo_013 undid 031
+    // with 017), registration's transaction and heartbeat add four observed
+    // checkouts;
     // the intervening startup validation checkouts remain untimed. The
     // online version-recording transaction reuses its detached connection.
-    assert_acquire_counts(&metrics, 5, 0);
+    assert_acquire_counts(&metrics, 6, 0);
     assert_trimmed(&pool).await?;
     assert_eq!(share_count(&pool).await?, 2);
 
@@ -377,7 +382,7 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         Some(metrics.clone()),
     ));
     let pid = blocked_build(&pool, migrate.as_mut()).await?;
-    assert_acquire_counts(&metrics, 7, 0);
+    assert_acquire_counts(&metrics, 8, 0);
     let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
         .bind(pid)
         .fetch_one(&pool)
@@ -397,12 +402,12 @@ async fn migration_013_builds_its_indexes_without_blocking_appends() -> Result<(
         "{error:#}"
     );
     // SQL cancellation neither relabels the checkout nor observes it again.
-    assert_acquire_counts(&metrics, 7, 0);
+    assert_acquire_counts(&metrics, 8, 0);
     writer.rollback().await?;
     // The runner awaits close on SQL error; its session lock must be released
     // so the metrics-None restart can rebuild the interrupted index.
     let resumed = timeout(Duration::from_secs(60), db.ledger("resumed-no-metrics")).await??;
-    assert_acquire_counts(&metrics, 7, 0);
+    assert_acquire_counts(&metrics, 8, 0);
     assert_trimmed(&pool).await?;
     assert_eq!(share_count(&pool).await?, 2);
     db.close(vec![first, online, resumed]).await
@@ -534,7 +539,10 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
         assert_eq!(ledger_indexes(&pool).await?, before);
         assert_eq!(
             schema_versions(&pool).await?,
-            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+            [
+                2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+                27
+            ]
         );
         sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
             .execute(&pool)
@@ -612,7 +620,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
     assert_eq!(ledger_indexes(&pool).await?, before);
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     // The declared definition under the reserved name is an earlier build
     // of the migration's own: kept as it is, not rebuilt.
@@ -777,7 +785,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     }
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     assert_eq!(share_count(&pool).await?, 2);
     // The operator puts the name back; the next start keeps both builds
@@ -857,7 +865,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
     );
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     sqlx::raw_sql(&format!(
         "DROP INDEX {SEQ_WALK}; ALTER INDEX operator_kept RENAME TO {SEQ_WALK}"
@@ -935,7 +943,7 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
     assert!(error.contains("migrate again"), "{error}");
     assert_eq!(
         schema_versions(&pool).await?,
-        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
     );
     let after_refusal = ledger_indexes(&pool).await?;
     let mut expected: Vec<&str> = KEPT.to_vec();
@@ -1030,10 +1038,27 @@ CREATE EVENT TRIGGER offline_probe_dropped ON sql_drop WHEN TAG IN ('DROP INDEX'
     Ok(())
 }
 
+/// 031's builds in an offline run: each partition's leaf, oldest first, then
+/// the parent ON ONLY, every statement its rendering verbatim. The leaves'
+/// attachments are not index creations and the probe does not see them.
+pub(super) async fn origin_steps(pool: &PgPool) -> Result<Vec<(String, String)>> {
+    let mut steps: Vec<(String, String)> = super::origin_index::partitions(pool)
+        .await?
+        .iter()
+        .map(|partition| super::origin_index::leaf(partition))
+        .collect();
+    steps.push((
+        super::origin_index::ORIGIN.to_owned(),
+        super::origin_index::ORIGIN_DEFINITION.to_owned(),
+    ));
+    Ok(steps)
+}
+
 /// What the probe saw of an offline run that found the release indexes in
 /// place and no build of its own: 013's two builds, its rendered
 /// definitions verbatim, and its four plain drops, all in the transaction
 /// that recorded 13; 024's one build in the transaction that recorded 24;
+/// 031's leaf builds and its parent in the transaction that recorded 31;
 /// and no concurrent build or drop anywhere.
 pub(super) async fn assert_built_offline(pool: &PgPool) -> Result<()> {
     const LANE: &str = "qbit_ctv_fanout_artifacts_lane_idx";
@@ -1070,6 +1095,12 @@ pub(super) async fn assert_built_offline(pool: &PgPool) -> Result<()> {
         vec![step("CREATE INDEX", LANE, lane)],
         "migration 24"
     );
+    let origin: Vec<_> = origin_steps(pool)
+        .await?
+        .into_iter()
+        .map(|(index, statement)| step("CREATE INDEX", &index, statement))
+        .collect();
+    assert_eq!(steps(31).await?, origin, "migration 31");
     let concurrent: Vec<String> = sqlx::query_scalar(
         "SELECT statement FROM offline_probe.ddl WHERE statement ~* '^\\s*(CREATE|DROP)\\s+INDEX\\s+CONCURRENTLY'",
     )
@@ -1156,9 +1187,10 @@ async fn leave_invalid_seq_walk(pool: &PgPool) -> Result<()> {
 /// rebuilds an interrupted build's invalid index and drops the replaced
 /// indexes, every statement in the transaction that records 13, with the
 /// run's lock timeout, workers and sort memory; 024 builds its index the
-/// same way in its own. Meanwhile the run holds the share ledger ACCESS
-/// EXCLUSIVE, so an append waits for it, and it leaves the index set the
-/// concurrent runner leaves.
+/// same way in its own, and 031 (undone with 017) each partition's leaf and
+/// then its parent in its own. Meanwhile the run holds the share ledger
+/// ACCESS EXCLUSIVE, so an append waits for it, and it leaves the index set
+/// the concurrent runner leaves.
 #[tokio::test]
 async fn migration_013_offline_builds_plain_indexes_in_one_transaction_with_every_instance_stopped(
 ) -> Result<()> {
@@ -1246,14 +1278,23 @@ async fn migration_013_offline_builds_plain_indexes_in_one_transaction_with_ever
         step("CREATE INDEX", SEQ_WALK, SEQ_WALK_DEFINITION.to_owned()),
     ];
     thirteen.extend(replaced.into_iter().map(dropped));
-    for (version, expected) in [(13, thirteen), (24, vec![step("CREATE INDEX", LANE, lane)])] {
+    let origin: Vec<_> = origin_steps(&pool)
+        .await?
+        .into_iter()
+        .map(|(index, statement)| step("CREATE INDEX", &index, statement))
+        .collect();
+    for (version, expected) in [
+        (13, thirteen),
+        (24, vec![step("CREATE INDEX", LANE, lane)]),
+        (31, origin),
+    ] {
         let logged: Vec<(String, String, String, String)> = sqlx::query_as("SELECT d.tag,d.index_name,d.statement,d.settings FROM offline_probe.ddl d JOIN qbit_prism_schema_migrations m ON m.xmin=d.xmin WHERE m.version=$1 ORDER BY d.seq")
             .bind(version)
             .fetch_all(&pool)
             .await?;
         assert_eq!(logged, expected, "migration {version}");
     }
-    // 017's conversion, between the two, is the only other index DDL the
+    // 017's conversion, between 13 and 24, is the only other index DDL the
     // probe saw, and none of it was concurrent either.
     let concurrent: Vec<String> = sqlx::query_scalar(
         "SELECT statement FROM offline_probe.ddl WHERE statement ILIKE '%concurrently%'",
@@ -1459,14 +1500,18 @@ async fn migration_013_offline_rolls_back_a_partial_run_whole() -> Result<()> {
     let built: Vec<String> = sqlx::query_scalar("SELECT statement FROM offline_probe.ddl WHERE tag='CREATE INDEX' AND statement LIKE 'CREATE INDEX%' ORDER BY seq")
         .fetch_all(&pool)
         .await?;
-    assert_eq!(
-        built,
-        [MINER_HISTORY_DEFINITION, SEQ_WALK_DEFINITION].map(|definition| definition.replacen(
-            "CREATE INDEX ",
-            "CREATE INDEX CONCURRENTLY ",
-            1
-        ))
-    );
+    // 013's two builds, then 031's (undone with 017): each partition's leaf
+    // concurrently, then the parent ON ONLY, which is catalog work.
+    let concurrently =
+        |definition: &str| definition.replacen("CREATE INDEX ", "CREATE INDEX CONCURRENTLY ", 1);
+    let mut expected: Vec<String> = [MINER_HISTORY_DEFINITION, SEQ_WALK_DEFINITION]
+        .map(concurrently)
+        .to_vec();
+    let mut origin = origin_steps(&pool).await?;
+    let parent = origin.pop().context("031 declares no parent")?;
+    expected.extend(origin.iter().map(|(_, leaf)| concurrently(leaf)));
+    expected.push(parent.1);
+    assert_eq!(built, expected);
     db.close(vec![first, rerun]).await
 }
 

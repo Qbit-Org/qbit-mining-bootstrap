@@ -119,6 +119,62 @@ impl FixtureDatabase {
     /// the database exists. `name` must have the generated fixture form, and a
     /// name that is already taken is refused without dropping anything.
     pub async fn open_named(raw: &str, name: &str, schema: &str) -> Result<Self> {
+        Self::create(raw, name, schema, None).await
+    }
+
+    /// A physical copy of this fixture's database, as a fixture of its own
+    /// with the same schema: `CREATE DATABASE ... TEMPLATE`, which refuses
+    /// while any session is connected to this database, so callers close
+    /// their pools to it first.
+    pub async fn copy(&self, raw: &str) -> Result<Self> {
+        self.end_template_sessions().await?;
+        let (name, _) = generated_names("copy_");
+        Self::create(raw, &name, &self.schema, Some(&self.name)).await
+    }
+
+    /// Before a copy: wait up to 10 s for every other session on this
+    /// database to end, then end what remains, naming it on stderr. The
+    /// caller closed its pools; anything left is background work it no
+    /// longer owns, which a busy server can take long to see go.
+    async fn end_template_sessions(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut ended = false;
+        loop {
+            let sessions: Vec<String> = sqlx::query_scalar(
+                "SELECT format('pid %s, %s, %s: %s',pid,application_name,state,left(query,160)) \
+                 FROM pg_stat_activity WHERE datname=$1 AND pid<>pg_backend_pid()",
+            )
+            .bind(&self.name)
+            .fetch_all(&self.admin)
+            .await?;
+            if sessions.is_empty() {
+                return Ok(());
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                ensure!(
+                    !ended,
+                    "sessions on {} outlived pg_terminate_backend: {sessions:?}",
+                    self.name
+                );
+                eprintln!(
+                    "fixture copy: ending {} session(s) still on {} after 10 s: {sessions:?}",
+                    sessions.len(),
+                    self.name
+                );
+                sqlx::query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname=$1 AND pid<>pg_backend_pid()",
+                )
+                .bind(&self.name)
+                .execute(&self.admin)
+                .await?;
+                ended = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn create(raw: &str, name: &str, schema: &str, template: Option<&str>) -> Result<Self> {
         ensure!(
             name.strip_prefix("prism_fixture_").is_some_and(|id| {
                 id.len() == 32
@@ -129,6 +185,13 @@ impl FixtureDatabase {
             "{name:?} is not a generated fixture database name"
         );
         let url = fixture_url(raw, name, schema)?;
+        let statement = match template {
+            Some(template) => format!(
+                "CREATE DATABASE \"{name}\" TEMPLATE \"{}\"",
+                identifier(template)?
+            ),
+            None => format!("CREATE DATABASE \"{name}\""),
+        };
         let admin = PgPoolOptions::new().max_connections(1).connect(raw).await?;
         let mut connection = match admin.acquire().await {
             Ok(connection) => connection,
@@ -172,9 +235,7 @@ impl FixtureDatabase {
             armed: true,
             creation_unknown: false,
         };
-        let created = sqlx::raw_sql(&format!("CREATE DATABASE \"{name}\""))
-            .execute(&mut *connection)
-            .await;
+        let created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
         // Return the pool's only connection before any cleanup needs it.
         drop(connection);
         if let Err(error) = created {
@@ -196,9 +257,10 @@ impl FixtureDatabase {
                 Some("42501") => error.context(
                     "ledger fixtures create one database each, so the test database role needs CREATEDB",
                 ),
-                Some("55006") => error.context(
-                    "CREATE DATABASE copies template1, so no other session may be connected to it",
-                ),
+                Some("55006") => error.context(format!(
+                    "CREATE DATABASE copies {}, so no other session may be connected to it",
+                    template.unwrap_or("template1")
+                )),
                 // The server answered, so the CREATE rolled back.
                 Some(_) => error.context(format!("creating fixture database {name}")),
                 // No server answer: the CREATE may still commit.
@@ -210,6 +272,10 @@ impl FixtureDatabase {
                 }
             };
             return Err(fixture.abandon(error).await);
+        }
+        if template.is_some() {
+            // The copy holds the template's schema already.
+            return Ok(fixture);
         }
         let schema_created = async {
             let mut connection = PgConnection::connect(&fixture.url).await?;

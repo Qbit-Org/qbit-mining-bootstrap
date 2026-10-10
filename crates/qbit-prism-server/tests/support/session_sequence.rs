@@ -132,22 +132,25 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         sqlx::query_scalar("SELECT to_jsonb(j) FROM qbit_prism_jobs j ORDER BY job_id")
             .fetch_all(&pool)
             .await?;
-    // The combined runner adds 008's nullable references. Require exactly
-    // those null additions while preserving every original field and value.
+    // The combined runner adds 008's nullable references, and 027's origin
+    // (node 0 for every row from before it) and pull order (none). Require
+    // exactly those additions while preserving every original field and value.
     for row in &mut before {
-        for column in [
-            "template_sha256",
-            "window_anchor_ms",
-            "window_first_share_seq",
-            "window_last_share_seq",
-            "window_prior_balances_sha256",
-            "window_share_count",
-            "window_snapshot_sha256",
+        for (column, value) in [
+            ("template_sha256", serde_json::Value::Null),
+            ("window_anchor_ms", serde_json::Value::Null),
+            ("window_first_share_seq", serde_json::Value::Null),
+            ("window_last_share_seq", serde_json::Value::Null),
+            ("window_prior_balances_sha256", serde_json::Value::Null),
+            ("window_share_count", serde_json::Value::Null),
+            ("window_snapshot_sha256", serde_json::Value::Null),
+            ("origin_node", serde_json::json!(0)),
+            ("sync_seq", serde_json::Value::Null),
         ] {
             assert!(row
                 .as_object_mut()
                 .unwrap()
-                .insert(column.into(), serde_json::Value::Null)
+                .insert(column.into(), value)
                 .is_none());
         }
     }
@@ -165,7 +168,7 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         versions,
         vec![
             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26
+            26, 27, 31
         ]
     );
     let cycled: bool = sqlx::query_scalar(

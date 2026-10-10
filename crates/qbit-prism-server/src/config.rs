@@ -8,9 +8,14 @@ use sha2::{Digest, Sha256};
 use std::{env, time::Duration};
 
 mod database;
+mod dual_writer;
 mod environment;
 mod policy_transition;
 pub use database::{public_database_options_from_env, DatabaseConfig};
+pub use dual_writer::{
+    dual_writer_downgrade, DualWriterConfig, DEFAULT_PEER_INGEST_WAIT_MS,
+    DEFAULT_PEER_SYNC_BATCH_ROWS, DEFAULT_PEER_SYNC_INTERVAL_MS,
+};
 pub use environment::check_environment;
 pub(crate) use policy_transition::transition_configs;
 
@@ -143,6 +148,11 @@ pub struct Config {
     pub version_mask: u32,
     pub audit_bind: String,
     pub audit_port: u16,
+    /// `PRISM_DUAL_WRITER` and its settings (3.1): `None`, the default,
+    /// is the single writer, which behaves exactly as 3.0 does. Per node,
+    /// not in the cluster fingerprint: each node's database is its own
+    /// cluster, and the two nodes differ by design.
+    pub dual_writer: Option<DualWriterConfig>,
 }
 
 pub fn value(name: &str, default: &str) -> String {
@@ -398,6 +408,7 @@ impl Config {
             "fixed ledger writer sessions are retired; unset PRISM_LEDGER_WRITER_SESSION_TOKEN and PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN");
         let database = DatabaseConfig::from_env()?;
         let database_url = database.database_url;
+        let dual_writer = DualWriterConfig::from_env(&database_url)?;
         let allow_test = flag("PRISM_ALLOW_TEST_SIGNING_SEEDS", false)? && !production;
         let seed = |name: &str, byte: &str| -> Result<String> {
             ensure!(
@@ -673,6 +684,7 @@ impl Config {
             version_mask,
             audit_bind: value("PRISM_AUDIT_BIND", "127.0.0.1"),
             audit_port: number("PRISM_AUDIT_PORT", 3341u16)?,
+            dual_writer,
         })
     }
 
@@ -817,6 +829,7 @@ mod tests {
             version_mask: 0x1fffe000,
             audit_bind: "127.0.0.1".into(),
             audit_port: 3341,
+            dual_writer: None,
         }
     }
 

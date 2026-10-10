@@ -68,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         command: SubmissionHoldCommand,
     },
+    /// Show, set or re-personalise which 3.1 dual-writer node this database is.
+    NodeIdentity {
+        #[command(subcommand)]
+        command: NodeIdentityCommand,
+    },
     /// Seal, archive, verify, detach, drop and restore share ledger partitions.
     ShareArchive {
         #[command(subcommand)]
@@ -93,7 +98,7 @@ enum Command {
         /// PRISM_POSTGRES_INIT_SCHEMA=1 migrate too.
         #[arg(long)]
         defer_share_hashes: bool,
-        /// Build the indexes of migrations 13 and 24 with a plain, parallel
+        /// Build the indexes of migrations 13, 24 and 31 with a plain, parallel
         /// CREATE INDEX in one transaction instead of CONCURRENTLY: quicker,
         /// but appends and reads wait for it, so stop every frontend and tool
         /// first. An instance that has not reported drained or stopped is
@@ -333,6 +338,34 @@ enum SubmissionHoldCommand {
     },
 }
 
+/// 3.1 dual writer: which node a database is (CONTRACT D-9). Only the
+/// bootstrap and cutover steps set it, and the rebuild of a node from its
+/// peer's database re-personalises it (D-16); a frontend never writes it.
+#[derive(Subcommand)]
+enum NodeIdentityCommand {
+    /// Print the database's node identity and lineage as JSON. Needs only PRISM_DATABASE_URL.
+    Show,
+    /// Make this database node A's (0) or node B's (1), once, before its first dual-writer start.
+    Set {
+        /// 0 for node A, 1 for node B.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
+        index: u8,
+    },
+    /// Make a promoted physical copy of the peer's database this node's, rebuilding a node whose
+    /// disk was replaced, before its first start; every PRISM process using it must be stopped.
+    Repersonalise {
+        /// The node being rebuilt: 0 for node A, 1 for node B. The copy must say it is the other.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
+        index: u8,
+        /// Repersonalise a copy whose lineage carries no own-log verification of the peer's, or
+        /// without reading the peer's server (PRISM_PEER_DATABASE_URL, then its _FALLBACK) when
+        /// neither path answers: only once you have made sure this is the promoted copy, never
+        /// the peer's own database.
+        #[arg(long)]
+        unverified_copy: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum CandidatesCommand {
     /// Print unfinished candidates up to --limit, oldest due first; warn if truncated.
@@ -506,6 +539,7 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         Command::SigningTransition { confirm } => signing_transition(confirm).await,
         Command::FatalState { command } => fatal_state(command).await,
         Command::SubmissionHold { command } => submission_hold(command).await,
+        Command::NodeIdentity { command } => node_identity(command).await,
         Command::ShareArchive { command } => share_archive(command).await,
         Command::Candidates { command } => candidates(command).await,
         Command::HeaderDifficulty { bits } => {
@@ -745,6 +779,97 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 3.1 dual writer (CONTRACT D-9, D-16): reads only the database URL, so it
+/// runs before any dual-writer setting exists. `set` personalises the
+/// database as the given node (`Ledger::set_node_identity`) on the operator
+/// connection, which writes no heartbeat; run again on the same node it
+/// restores only what the database lost, and it refuses a database that is
+/// the other node's. `repersonalise` makes a promoted physical copy of the
+/// other node's database the given node's
+/// (`Ledger::repersonalise_node_identity`) and adds what it did under
+/// `repersonalised`. Each prints the identity and lineage that result as JSON.
+async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
+    let url = config::DatabaseConfig::url_from_env()?;
+    let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
+    let result = async {
+        let node = |index: u8| {
+            crate::node_identity::NodeIndex::from_index(index.into())
+                .context("--index must be 0 (node A) or 1 (node B)")
+        };
+        let repersonalised = match command {
+            NodeIdentityCommand::Show => None,
+            NodeIdentityCommand::Set { index } => {
+                ledger
+                    .set_node_identity(node(index)?, "qbit-prism-server node-identity set")
+                    .await?;
+                None
+            }
+            NodeIdentityCommand::Repersonalise {
+                index,
+                unverified_copy,
+            } => {
+                // The peer's own server, when its URL is set: this database
+                // must not be on it. Either path to it will do.
+                let mut peer_server = None;
+                let mut unread = Vec::new();
+                for name in [
+                    "PRISM_PEER_DATABASE_URL",
+                    "PRISM_PEER_DATABASE_URL_FALLBACK",
+                ] {
+                    let Some(url) = config::optional(name) else {
+                        continue;
+                    };
+                    match crate::ledger::server_lineage_evidence(&url).await {
+                        Ok(evidence) => {
+                            peer_server = Some(evidence);
+                            break;
+                        }
+                        Err(error) => unread.push(format!("{name}: {error:#}")),
+                    }
+                }
+                if peer_server.is_none() && !unread.is_empty() {
+                    let unread = unread.join("; ");
+                    if !unverified_copy {
+                        bail!(
+                            "the peer's server, which this database must not be on, could not be \
+                             read ({unread}); run again once it answers. --unverified-copy goes \
+                             on without it, and without the own-log verification check: only \
+                             once you have made sure this database is the promoted copy"
+                        );
+                    }
+                    tracing::warn!(%unread, "the peer's server could not be read; going on, --unverified-copy given");
+                }
+                let guard = crate::ledger::RepersonaliseGuard {
+                    unverified_copy,
+                    peer_server,
+                };
+                Some(
+                    ledger
+                        .repersonalise_node_identity(
+                            node(index)?,
+                            "qbit-prism-server node-identity repersonalise",
+                            &guard,
+                        )
+                        .await?,
+                )
+            }
+        };
+        let mut report = json!({
+            "schema": "qbit.prism.node-identity.v1",
+            "identity": ledger.recorded_node_identity().await?,
+            "lineage": ledger.node_lineage().await?,
+        });
+        if let Some(repersonalised) = repersonalised {
+            report["repersonalised"] = serde_json::to_value(repersonalised)?;
+        }
+        Ok::<_, anyhow::Error>(report)
+    }
+    .await;
+    ledger.pool.close().await;
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
 }
 
 /// #664: every subcommand reads only the database URL, so a frontend-only

@@ -48,7 +48,7 @@ SCRIPT = Path(__file__).resolve().with_name("prism-recovery-evidence.sql")
 # Where the script is cut. Each must appear exactly once, so an edit that
 # rewrites one fails here rather than exporting something else.
 BEGIN = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n"
-SHARES = ("SELECT jsonb_build_object('kind', 'shares', 'row', to_jsonb(s))\n"
+SHARES = ("SELECT jsonb_build_object('kind', 'shares', 'row', to_jsonb(s) - 'origin_node')\n"
           "FROM qbit_share_ledger s ORDER BY share_seq;\n")
 SHARES_ORDER = " ORDER BY share_seq;"
 HASHES = "\\if :has_native_share_hashes\n"

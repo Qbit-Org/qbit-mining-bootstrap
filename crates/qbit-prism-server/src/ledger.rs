@@ -71,7 +71,15 @@ pub use jobs::{
     CompactPrepared, CompactRepair, IssuedJobSave, PreparedAuditHashes, PreparedDependency,
     PreparedTemplate, StoredCompactPrepared,
 };
+mod node_identity;
+pub mod peer_sync;
+pub use node_identity::server_lineage_evidence;
+pub use node_identity::{
+    IdentityCheck, LineageEvidence, NodeIdentityRecord, NodeLineage, PeerSyncCursor,
+    Repersonalisation, RepersonaliseGuard, TableRows,
+};
 mod migration;
+pub mod table_inventory;
 pub use migration::{
     required_schema_versions, schema_version_list, IndexBuildMode, MigrationSource,
     ShareHashBackfill, SourceState, SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS,
@@ -91,7 +99,7 @@ pub(crate) use window::{
     AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
     RetainedShares, SnapshotCapture, WRITER_TIMELINE_SQL,
 };
-pub use window::{CommitGateClosed, MovedRevision, PayoutRevisionChanged};
+pub use window::{CommitGateClosed, MovedRevision, OwnLogLost, PayoutRevisionChanged};
 
 const MIGRATION_LOCK: i64 = 0x505249534d000001;
 const ORDER_LOCK: i64 = 0x505249534d000002;
@@ -121,6 +129,15 @@ pub struct Ledger {
     /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
     /// SHARE` in its own transaction and compares it against this.
     config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// This frontend's dual-writer identity (`PRISM_NODE_INDEX`,
+    /// `PRISM_CARRY_OWNER`), set once at startup by
+    /// [`Ledger::set_dual_writer_identity`]; unset for a single writer. Shared
+    /// across clones, like the fingerprint.
+    dual_writer_identity: std::sync::Arc<std::sync::OnceLock<crate::node_identity::NodeIdentity>>,
+    /// Set by the peer sync when this database showed rollback evidence while
+    /// the frontend ran (D-8, D-17), which stops the frontend; no share is
+    /// appended until it has exited. Shared across clones.
+    own_log_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The candidate claims this frontend has watched, each timed on its own
     /// monotonic clock (#581). Shared across clones: one process, one clock
     /// per claim.

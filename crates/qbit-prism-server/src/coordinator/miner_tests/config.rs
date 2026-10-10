@@ -49,5 +49,6 @@ pub(super) fn test_config() -> Config {
         version_mask: 0x1fffe000,
         audit_bind: "127.0.0.1".into(),
         audit_port: 3341,
+        dual_writer: None,
     }
 }

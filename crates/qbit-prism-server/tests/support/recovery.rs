@@ -157,14 +157,16 @@ pub async fn seed_legacy(pool: &PgPool, root: &Path) -> Result<Vec<Artifact>> {
 }
 
 /// Stable accounting facts only: native migration metadata and the summary's
-/// repair timestamp are intentionally outside the recovery comparison.
+/// repair timestamp are intentionally outside the recovery comparison, and
+/// so is migration 027's origin_node, a row's provenance, which the evidence
+/// export leaves out too.
 pub async fn accounting_state(pool: &PgPool) -> Result<Value> {
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object(\
-          'shares',(SELECT jsonb_agg(to_jsonb(s) ORDER BY share_seq) FROM qbit_share_ledger s),\
+          'shares',(SELECT jsonb_agg(to_jsonb(s)-'origin_node' ORDER BY share_seq) FROM qbit_share_ledger s),\
           'audits',(SELECT jsonb_agg(jsonb_build_array(block_hash,audit_bundle_sha256) ORDER BY block_hash) FROM qbit_pool_audit_bundles),\
           'ordinals',(SELECT jsonb_agg(jsonb_build_array(block_hash,audit_publication_sequence) ORDER BY audit_publication_sequence) FROM qbit_pool_blocks),\
-          'carry',(SELECT jsonb_agg(to_jsonb(c) ORDER BY carry_forward_seq) FROM qbit_payout_carry_forward c),\
+          'carry',(SELECT jsonb_agg(to_jsonb(c)-'origin_node' ORDER BY carry_forward_seq) FROM qbit_payout_carry_forward c),\
           'current',(SELECT jsonb_agg(to_jsonb(c)-'updated_at' ORDER BY miner_id,payout_order_key,p2mr_program) FROM qbit_payout_carry_forward_current c),\
           'drift',(SELECT count(*) FROM qbit_carry_forward_current_drift()))",
     )

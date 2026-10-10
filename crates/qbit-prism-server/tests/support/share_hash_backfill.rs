@@ -102,18 +102,18 @@ async fn cursor(pool: &PgPool) -> Result<Option<(i64, i64)>> {
 }
 
 /// 2 is recorded after every migration of the transaction and before the
-/// online 013, 017 and 024, which each check that they come after every
+/// online 013, 017, 024 and 031, which each check that they come after every
 /// lower version.
 async fn assert_recorded_in_order(pool: &PgPool) -> Result<()> {
     let (after_transaction, before_online): (bool, bool) = sqlx::query_as(
-        "SELECT (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) >= (SELECT max(applied_at) FROM qbit_prism_schema_migrations WHERE version NOT IN (2,13,17,24)), \
-                (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) <= (SELECT min(applied_at) FROM qbit_prism_schema_migrations WHERE version IN (13,17,24))",
+        "SELECT (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) >= (SELECT max(applied_at) FROM qbit_prism_schema_migrations WHERE version NOT IN (2,13,17,24,31)), \
+                (SELECT applied_at FROM qbit_prism_schema_migrations WHERE version=2) <= (SELECT min(applied_at) FROM qbit_prism_schema_migrations WHERE version IN (13,17,24,31))",
     )
     .fetch_one(pool)
     .await?;
     ensure!(
         after_transaction && before_online,
-        "2 is not recorded between the transaction's migrations and 013, 017 and 024"
+        "2 is not recorded between the transaction's migrations and 013, 017, 024 and 031"
     );
     Ok(())
 }
@@ -210,12 +210,12 @@ async fn migration_002_backfill_resumes_from_its_last_committed_batch_after_an_i
         result = &mut migrate => bail!("migrate ended before the backfill ran: {:?}", result.err()),
         result = committed => result.context("the migration transaction never committed")??,
     }
-    // Committed: every migration but 2 and the online 013, 017 and 024 recorded,
-    // nothing mapped yet, and no start serves the database.
+    // Committed: every migration but 2 and the online 013, 017, 024 and 031
+    // recorded, nothing mapped yet, and no start serves the database.
     let pending: Vec<i32> = REQUIRED_SCHEMA_VERSIONS
         .iter()
         .copied()
-        .filter(|version| ![2, 13, 17, 24].contains(version))
+        .filter(|version| ![2, 13, 17, 24, 31].contains(version))
         .collect();
     assert_eq!(schema_versions(&pool).await?, pending);
     assert_eq!(cursor(&pool).await?, Some((first, end)));
@@ -284,7 +284,8 @@ async fn migration_002_backfill_resumes_from_its_last_committed_batch_after_an_i
         .await?;
 
     // migrate resumes at the cursor and finishes: the single statement's
-    // mapping, 2 recorded before 013, 017 and 024, the progress table gone.
+    // mapping, 2 recorded before 013, 017, 024 and 031, the progress table
+    // gone.
     let resumed = timeout(Duration::from_secs(120), db.ledger("resumed")).await??;
     assert_eq!(mapping(&pool).await?, expected);
     assert_eq!(cursor(&pool).await?, None);
@@ -608,7 +609,7 @@ async fn a_crashed_resume_leaves_no_fence_for_an_earlier_runner_to_strand() -> R
         .bind(RUNNER_LOCK_CLASS)
         .execute(&mut runners)
         .await?;
-    // No fence was left: migrate finishes 013, 017 and 024, and the database
+    // No fence was left: migrate finishes 013, 017, 024 and 031, and the database
     // starts.
     assert!(
         !fence_declared(&pool).await?,
@@ -841,7 +842,7 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
     );
     assert_eq!(schema_versions(&pool).await?, pending);
     set_fence(&pool, 1).await?;
-    // Recording 2 by hand as well lets nothing start: 013, 017 and 024
+    // Recording 2 by hand as well lets nothing start: 013, 017, 024 and 031
     // never ran behind the pending backfill, and migrate still names the
     // fence.
     sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)")
@@ -852,7 +853,10 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
         .err()
         .context("a start accepted a fence without its cursor")?
         .to_string();
-    ensure!(error.contains("missing migration(s) 13, 17, 24"), "{error}");
+    ensure!(
+        error.contains("missing migration(s) 13, 17, 24, 31"),
+        "{error}"
+    );
     refused(
         db.ledger("migrate-again")
             .await
@@ -862,15 +866,18 @@ async fn migration_002_refuses_a_backfill_fence_left_without_its_cursor() -> Res
     )?;
     assert!(fence_declared(&pool).await?);
     // With the record past 3 without 2, serving's value is no different: a
-    // start still refuses the missing 13, 17 and 24, and migrate names the
-    // orphan. A newer release's value is refused as newer.
+    // start still refuses the missing 13, 17, 24 and 31, and migrate names
+    // the orphan. A newer release's value is refused as newer.
     set_fence(&pool, 2).await?;
     let error = Ledger::connect(&db.url, "cold".into(), 8, false)
         .await
         .err()
         .context("a start accepted a serving fence without its cursor")?
         .to_string();
-    ensure!(error.contains("missing migration(s) 13, 17, 24"), "{error}");
+    ensure!(
+        error.contains("missing migration(s) 13, 17, 24, 31"),
+        "{error}"
+    );
     let error = db
         .ledger("migrate-serving-again")
         .await
@@ -1452,12 +1459,12 @@ async fn share_archive_restore_detach_and_drop_refuse_while_a_backfill_is_pendin
     db.close(vec![migrated, operator, finished]).await
 }
 
-/// Deferred, 013, 017 and 024 run with the backfill pending, which they
+/// Deferred, 013, 017, 024 and 031 run with the backfill pending, which they
 /// never did before: the recent range runs first, while 2.x's
 /// template-height index it reads is there, and the cursor table is no
-/// object 013's, 017's or 024's checks look at. A later `migrate` of either
-/// kind applies nothing over them; plain `migrate` maps the rest after
-/// them and records 2 last.
+/// object 013's, 017's, 024's or 031's checks look at. A later `migrate` of
+/// either kind applies nothing over them; plain `migrate` maps the rest
+/// after them and records 2 last.
 #[tokio::test]
 async fn migrations_13_17_and_24_run_with_a_deferred_backfill_pending() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -1470,18 +1477,20 @@ async fn migrations_13_17_and_24_run_with_a_deferred_backfill_pending() -> Resul
         .await?
         .context("the deferred backfill has no cursor")?;
     assert_eq!(pending.1, end);
-    let (partitioned, trimmed, lane): (bool, bool, bool) = sqlx::query_as(
+    let (partitioned, trimmed, lane, origin): (bool, bool, bool, bool) = sqlx::query_as(
         "SELECT (SELECT relkind='p' FROM pg_class WHERE oid='qbit_share_ledger'::regclass), \
                 to_regclass('qbit_share_ledger_template_height_idx') IS NULL \
                     AND to_regclass('qbit_share_ledger_accepted_seq_walk_idx') IS NOT NULL \
                     AND to_regclass('qbit_share_ledger_accepted_miner_history_idx') IS NOT NULL, \
-                to_regclass('qbit_ctv_fanout_artifacts_lane_idx') IS NOT NULL",
+                to_regclass('qbit_ctv_fanout_artifacts_lane_idx') IS NOT NULL, \
+                COALESCE((SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass('qbit_share_ledger_origin_seq_idx')), false)",
     )
     .fetch_one(&pool)
     .await?;
     assert!(partitioned, "017 did not convert the share ledger");
     assert!(trimmed, "013 did not trim the share ledger's indexes");
     assert!(lane, "024 did not build the fanout lane index");
+    assert!(origin, "031 did not build the share ledger's origin index");
     // The recent range ran: it records its bounds beside the cursor.
     assert_eq!(recent_range(&pool).await?.0, Some(RECENT_MIN_HEIGHT));
     // Nothing is applied twice, and a start that migrates applies nothing.
@@ -1509,8 +1518,8 @@ async fn migrations_13_17_and_24_run_with_a_deferred_backfill_pending() -> Resul
 /// The W1 cutover's migrate step, `migrate --defer-share-hashes
 /// --offline-indexes`, in one run on a populated 2.x.x source. The recent
 /// range is mapped and serving permitted, with the rest pending where it was
-/// planned; 013 and 024 then build offline with the cursor present, each in
-/// the transaction that records it and nothing concurrent; and the start
+/// planned; 013, 024 and 031 then build offline with the cursor present, each
+/// in the transaction that records it and nothing concurrent; and the start
 /// gate admits a frontend that migrates at its start, which leaves the
 /// backfill alone and serves.
 #[tokio::test]
@@ -1852,8 +1861,8 @@ async fn a_connect_queued_behind_a_deferred_claim_maps_nothing() -> Result<()> {
 /// runners' lock, and stop before 017. Recording 2 under fence 2 needs
 /// 017's conversion bound, so the run would refuse at its record after
 /// every batch, hours on a production ledger: it refuses before it maps
-/// anything instead. A rerun plans from fence 2, applies 013, 017 and 024
-/// first, then maps the rest and records 2.
+/// anything instead. A rerun plans from fence 2, applies 013, 017, 024 and
+/// 031 first, then maps the rest and records 2.
 #[tokio::test]
 async fn plain_migrate_refuses_before_mapping_when_the_fence_reached_2_while_it_waited(
 ) -> Result<()> {
@@ -2915,7 +2924,7 @@ async fn the_record_of_2_stops_cleanly_behind_a_held_migration_lock_and_records_
 /// 5,000 `share_seq`, each under a 2 s statement timeout, resting as long as
 /// each took. Never rc.4's batches, which double to 50,000 under the pool's
 /// timeout, back to back (#738). The same with `--offline-indexes`, which
-/// changes only how 013 and 024 build (#745).
+/// changes only how 013, 024 and 031 build (#745).
 #[tokio::test]
 async fn plain_migrate_maps_a_deferred_backfill_at_the_default_throttle() -> Result<()> {
     for index_build in [
