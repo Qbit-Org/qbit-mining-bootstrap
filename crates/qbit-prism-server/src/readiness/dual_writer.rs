@@ -5,11 +5,19 @@
 //! writable PostgreSQL. A broken link to the peer never withdraws it: the
 //! peer's reachability and the sync lag are reported, never decided on.
 use super::admission::Withdrawal;
-use crate::{metrics::WriterPathLabel, node_identity::NodeIdentity, peer_sync::PeerSyncStatus};
+use crate::{
+    ledger::{Ledger, SubmissionHold},
+    metrics::WriterPathLabel,
+    node_identity::NodeIdentity,
+    peer_sync::PeerSyncStatus,
+};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -22,8 +30,8 @@ pub const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// to ride out one slow probe, short enough that a dead or hung local
 /// PostgreSQL moves its miners to the peer within seconds of its last answer.
 pub const WRITER_UNANSWERED_WITHDRAWAL: Duration = Duration::from_secs(4);
-/// A health read within this long of the last probe reuses it, so Stratum
-/// health probes cannot multiply database reads.
+/// A health read within this long of the last refresh's completion reuses
+/// it, so Stratum health probes cannot multiply database reads.
 const WRITER_PROBE_REUSE: Duration = Duration::from_secs(1);
 /// The health path's own connections: the writer probe and the health reads,
 /// one of each at a time.
@@ -100,6 +108,18 @@ impl WriterProbe {
     }
 }
 
+/// What the health reads return: the payout revision as served, and the
+/// cluster's block submission hold.
+pub type HealthReads = (Option<i64>, Option<SubmissionHold>);
+
+/// The last health refresh: the writer probe and the health reads it ran
+/// beside, `None` when they failed or ran out of time.
+#[derive(Clone, Debug, Default)]
+struct HealthRefresh {
+    writer: WriterProbe,
+    reads: Option<HealthReads>,
+}
+
 /// One evaluation, for `/healthz`, admission and the metrics.
 #[derive(Clone, Debug)]
 pub struct DualWriterReport {
@@ -135,7 +155,12 @@ impl DualWriterReport {
 #[derive(Debug)]
 pub struct DualWriterReadiness {
     identity: NodeIdentity,
-    writer: tokio::sync::Mutex<WriterProbe>,
+    /// The last health refresh. Held while one runs, so however many
+    /// callers ask, Stratum `mining.get_health` included, at most one
+    /// refresh runs at a time and at most one per reuse window; the others
+    /// wait for it or reuse it.
+    refresh: tokio::sync::Mutex<HealthRefresh>,
+    refreshes: AtomicU64,
     /// The health path's own small pool: the writer probe and the health
     /// reads never wait behind share traffic for a ledger connection, so a
     /// busy but healthy database still answers them in time.
@@ -146,7 +171,8 @@ impl DualWriterReadiness {
     pub fn new(identity: NodeIdentity) -> Self {
         Self {
             identity,
-            writer: tokio::sync::Mutex::new(WriterProbe::default()),
+            refresh: tokio::sync::Mutex::new(HealthRefresh::default()),
+            refreshes: AtomicU64::new(0),
             health_pool: OnceLock::new(),
         }
     }
@@ -181,29 +207,43 @@ impl DualWriterReadiness {
         })
     }
 
-    /// Probe the writer, on the health pool, if the last probe is not
-    /// recent, then report. `ledger` is the ledger's pool, which the health
-    /// pool is built from. `peer_sync` is the sync's status channel; until it
-    /// is attached the own log reads as not caught up, so the node does not
-    /// serve.
+    /// Refresh, unless the last refresh completed within the reuse window,
+    /// then report, with the health reads the refresh ran. A refresh is the
+    /// writer probe and the health reads, side by side on the health pool
+    /// within the probe's budget; reads that fail or run out of time are
+    /// `None`. `peer_sync` is the sync's status channel; until it is attached
+    /// the own log reads as not caught up, so the node does not serve.
     pub async fn report(
         &self,
-        ledger: &PgPool,
+        ledger: &Ledger,
         peer_sync: Option<&watch::Receiver<PeerSyncStatus>>,
-    ) -> DualWriterReport {
-        let pool = self.health_pool(ledger);
-        let writer = {
-            let mut probe = self.writer.lock().await;
-            if probe.due(Instant::now()) {
-                let path = probe_writer(pool, self.identity).await;
-                probe.record(Instant::now(), path);
+    ) -> (DualWriterReport, Option<HealthReads>) {
+        let pool = self.health_pool(&ledger.pool);
+        let refresh = {
+            let mut refresh = self.refresh.lock().await;
+            if refresh.writer.due(Instant::now()) {
+                let (path, reads) = tokio::join!(
+                    probe_writer(pool, self.identity),
+                    tokio::time::timeout(WRITER_PROBE_TIMEOUT, ledger.health_reads_on(pool)),
+                );
+                refresh.writer.record(Instant::now(), path);
+                refresh.reads = reads.ok().and_then(Result::ok);
+                self.refreshes.fetch_add(1, Ordering::Relaxed);
             }
-            *probe
+            refresh.clone()
         };
         let peer = peer_sync
             .map(|status| status.borrow().clone())
             .unwrap_or_default();
-        self.assemble(writer, peer, Instant::now())
+        (
+            self.assemble(refresh.writer, peer, Instant::now()),
+            refresh.reads,
+        )
+    }
+
+    /// How many health refreshes this frontend has run.
+    pub fn refreshes(&self) -> u64 {
+        self.refreshes.load(Ordering::Relaxed)
     }
 
     fn assemble(

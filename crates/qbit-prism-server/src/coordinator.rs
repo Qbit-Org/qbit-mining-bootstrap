@@ -3366,6 +3366,14 @@ impl Coordinator {
         self.health_report().await.0
     }
 
+    /// How many dual-writer health refreshes (the writer probe and the health
+    /// reads) this frontend has run; `None` for a single writer.
+    pub fn dual_writer_health_refreshes(&self) -> Option<u64> {
+        self.dual_writer
+            .as_ref()
+            .map(crate::readiness::dual_writer::DualWriterReadiness::refreshes)
+    }
+
     /// `health`, and in dual-writer mode (3.1) the report it was read with,
     /// for admission and the metrics. A dual-writer frontend is ready only
     /// while its own log is caught up and its writer is local; a single
@@ -3386,24 +3394,20 @@ impl Coordinator {
         let prepared = self.prepared.read().await.clone();
         let observed = self.observed_tip.read().await.as_deref().map(str::to_owned);
         // #664: the cluster's hold in the same statement, as last read.
-        // 3.1: a dual-writer frontend reads it on its own health pool, beside
-        // its writer probe and within the probe's budget: a saturated ledger
-        // pool never delays it, and a dead or hung database makes this
-        // publication within seconds (and withdraws the node) instead of
-        // holding it for the ledger pool's whole acquire timeout. A read that
-        // runs out of time is a failed read. A single writer reads as in 3.0.
+        // 3.1: a dual-writer frontend reads it in its health refresh, on its
+        // own health pool beside its writer probe and within the probe's
+        // budget, at most one refresh at a time and one per reuse window
+        // however many callers ask: a saturated ledger pool never delays it,
+        // a flood of Stratum health probes cannot starve it, and a dead or
+        // hung database makes this publication within seconds (and withdraws
+        // the node) instead of holding it for the ledger pool's whole acquire
+        // timeout. Reads that fail or run out of time are a failed read. A
+        // single writer reads as in 3.0.
         let (reads, dual) = match &self.dual_writer {
             Some(dual) => {
-                let (reads, report) = tokio::join!(
-                    tokio::time::timeout(
-                        crate::readiness::dual_writer::WRITER_PROBE_TIMEOUT,
-                        self.ledger
-                            .health_reads_on(dual.health_pool(&self.ledger.pool)),
-                    ),
-                    dual.report(&self.ledger.pool, self.peer_sync.get()),
-                );
+                let (report, reads) = dual.report(&self.ledger, self.peer_sync.get()).await;
                 (
-                    reads.unwrap_or_else(|_| Err(anyhow::anyhow!("health reads timed out"))),
+                    reads.context("the health reads failed or ran out of time"),
                     Some(report),
                 )
             }

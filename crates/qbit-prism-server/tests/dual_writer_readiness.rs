@@ -325,6 +325,85 @@ async fn a_saturated_ledger_pool_leaves_the_writer_local() -> Result<()> {
     database.close(outcome).await
 }
 
+/// Stratum's `mining.get_health` reads health too, and any client can send
+/// it in a loop. In dual mode every caller shares one health refresh: a
+/// burst of 50 at once runs one, so the health pool is never starved and the
+/// writer stays local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_health_reads_shares_one_refresh() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_burst_").await?;
+    let ledger =
+        match Ledger::connect_tool(&database.url, "d4-burst-fixture".into(), 2, true, None).await {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(database.abandon(error).await),
+        };
+    let outcome = async {
+        ledger.set_node_identity(NodeIndex::B, "d4-test").await?;
+        let node = FakeNode::open().await?;
+        let frontend = frontend(
+            &database,
+            &node,
+            "d4-burst-b",
+            Some(dual_writer(NodeIndex::B)),
+        )
+        .await?;
+        let (sync, status) = PeerSyncPublisher::new();
+        frontend.peer_sync.set(status).expect("attached once");
+        sync.update(|status| status.own_log_caught_up = true);
+        health_until(&frontend, "a local writer", |health| {
+            health["dual_writer"]["writer_path"] == "local"
+        })
+        .await?;
+        let burst = async |frontend: &Arc<Coordinator>| -> Result<()> {
+            let mut calls = tokio::task::JoinSet::new();
+            for _ in 0..50 {
+                let frontend = frontend.clone();
+                calls.spawn(async move { frontend.health().await });
+            }
+            while let Some(health) = calls.join_next().await {
+                let health = health?;
+                ensure!(health["dual_writer"]["writer_path"] == "local", "{health}");
+            }
+            Ok(())
+        };
+        // Past the reuse window, so the burst's first caller refreshes.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let before = frontend
+            .dual_writer_health_refreshes()
+            .context("a dual-writer frontend counts its refreshes")?;
+        let started = Instant::now();
+        burst(&frontend).await?;
+        ensure!(
+            started.elapsed() < Duration::from_secs(3),
+            "the burst took {:?}",
+            started.elapsed()
+        );
+        let after = frontend.dual_writer_health_refreshes().unwrap_or_default();
+        ensure!(
+            after - before == 1,
+            "50 health reads ran {} refreshes",
+            after - before
+        );
+        // A second burst right after reuses that refresh, or runs at most one
+        // more if the window has passed.
+        burst(&frontend).await?;
+        let again = frontend.dual_writer_health_refreshes().unwrap_or_default();
+        ensure!(
+            again - after <= 1,
+            "a second burst ran {} refreshes",
+            again - after
+        );
+        frontend.ledger.pool.close().await;
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_writer_health_carries_no_dual_writer_state() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {

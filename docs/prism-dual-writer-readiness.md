@@ -62,8 +62,10 @@ of the frontend's own pool:
 | `unanswered` | the probe failed or took over 2 s | withdraws once the database's last answer is 4 s old |
 
 The probe is one statement, `pg_is_in_recovery()`,
-`transaction_read_only` and the identity row, at most once a second however
-many health reads ask; it never reads the peer. The first health read
+`transaction_read_only` and the identity row; it never reads the peer. It and
+the health reads form one refresh, and however many health reads ask,
+Stratum `mining.get_health` included, at most one refresh runs at a time and
+at most one a second; the others wait for it or reuse it. The first health read
 probes, so `/healthz` never reports a `writer_path` of `null`. The probe and
 the health reads run on the frontend's own pool of at most two connections,
 beside the ledger's `PRISM_DATABASE_MAX_CONNECTIONS`, so share traffic that
