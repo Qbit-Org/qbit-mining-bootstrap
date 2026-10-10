@@ -7,7 +7,9 @@
 //!
 //! - **Open:** bytes flow, and so does each side's close, an orderly one as
 //!   a FIN and an abortive one (or a socket error) as a reset, which ends
-//!   the connection both ways.
+//!   the connection both ways. So does a write a side refuses (it reset, or
+//!   is gone), at once: whichever direction meets a reset first, the other
+//!   side is reset too.
 //! - **Reset:** every connection is closed with a TCP reset and every new one
 //!   is accepted and reset at once, as a host that is gone or rebooted
 //!   answers. Each side learns of the cut on its next read or write.
@@ -331,7 +333,10 @@ enum Sent {
 /// is stamped when it is read and passed on once the link's latency has
 /// passed since then, so every byte and the close wait the same latency and
 /// a stream keeps its rate. A close passes on as the sender closed: a FIN,
-/// or a reset that ends both directions (`aborted`).
+/// or a reset that ends both directions (`aborted`). A write `to` refuses
+/// ends both directions at once: its reset may have been used up by that
+/// write, so the pump reading that socket would see only an end of file, or,
+/// with its line full, nothing at all.
 ///
 /// - **Open:** reads, and passes on what is due.
 /// - **Blackholed:** neither reads nor passes anything on, a close included.
@@ -449,11 +454,14 @@ async fn pump(
                 // The receiver is gone. A link that has just turned to Discard
                 // drains on, as a dead client's server must, and the
                 // connection is reset when the link leaves Discard, however
-                // soon; otherwise end.
+                // soon; otherwise the connection ends with a reset.
                 _ if *state.borrow() == LinkState::Discard => {
                     discarded.store(true, Ordering::SeqCst);
                 }
-                _ => return (from, to),
+                _ => {
+                    aborted.send_replace(true);
+                    return (from, to);
+                }
             },
             read = from.read(&mut buffer), if reading => {
                 let now = tokio::time::Instant::now();
@@ -694,6 +702,38 @@ mod tests {
             "the reset waits the latency: {:?}",
             started.elapsed()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reset_met_on_a_write_resets_the_other_side_even_with_the_other_way_stuck(
+    ) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        relay.set_latency(Duration::from_millis(10));
+        let (client, server) = connected(&relay, &listener).await?;
+        // The server reads nothing, so the relay's line toward it fills and
+        // it stops reading the client; the client reads nothing either, so
+        // the relay's write toward it is pending when it resets.
+        let (_server_read, mut server_write) = server.into_split();
+        abort_on_close(&client);
+        let (client_read, mut client_write) = client.into_split();
+        let upload = tokio::spawn(async move {
+            let _ = client_write.write_all(&vec![1u8; 64 << 20]).await;
+        });
+        let flood = tokio::spawn(async move {
+            let chunk = vec![2u8; 64 << 10];
+            while server_write.write_all(&chunk).await.is_ok() {}
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!flood.is_finished(), "both ways are stuck before the reset");
+        upload.abort();
+        let _ = upload.await;
+        drop(client_read);
+        // Only the write toward the client meets its reset; the server must
+        // be reset too, or its writes block for good.
+        timeout(Duration::from_secs(10), flood).await??;
+        assert_eq!(relay.stats().reset, 1, "the connection ends in a reset");
         Ok(())
     }
 
