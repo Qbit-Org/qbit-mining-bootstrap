@@ -2291,7 +2291,19 @@ pub async fn run_gated_listener<B: MiningBackend>(
                         break;
                     }
                 }
-                accepted = listener.accept() => sessions.start(accepted?, &mut connections),
+                accepted = listener.accept() => {
+                    let accepted = accepted?;
+                    // The select is unbiased: a pending connection can win
+                    // the poll in which the decision goes stale or a newer
+                    // one withdraws. Only a decision that admits now starts
+                    // a session; otherwise the connection closes with the
+                    // listener.
+                    if !admission.borrow().admits_at(tokio::time::Instant::now(), stale_after) {
+                        drop(accepted);
+                        break;
+                    }
+                    sessions.start(accepted, &mut connections);
+                }
             }
         }
         drop(listener);

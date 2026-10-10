@@ -471,6 +471,42 @@ async fn a_decision_the_publisher_stops_renewing_closes_the_listener() {
     gate.stop().await;
 }
 
+/// A connection accepted on a decision that is no longer fresh is closed, never
+/// served, whichever branch woke the listener: its select can pick a pending
+/// connection in the same poll as the staleness timer or a withdrawal.
+#[tokio::test]
+async fn a_connection_accepted_on_a_stale_decision_is_closed_not_served() {
+    let stale_after = Duration::from_secs(60);
+    let gate = Gate::start(stale_after).await;
+    gate.admit(true);
+    // A session that answered: the listener has accepted it and is waiting
+    // again, its timer set by the fresh decision. Held open, since a session
+    // ending would wake the listener, which would then find the decision
+    // stale by its timer before the next connection.
+    let _first = subscribed(&gate).await;
+    // The decision goes stale without waking the listener: its timer is a
+    // minute away and no change is signalled, so only the accept can see it.
+    gate.decide.send_if_modified(|signal| {
+        *signal = AdmissionSignal::decided(
+            true,
+            Instant::now() - stale_after - Duration::from_millis(1),
+        );
+        false
+    });
+    let mut session = BufReader::new(
+        connect(gate.addr)
+            .await
+            .expect("the listener is still open"),
+    );
+    let _ = session
+        .get_mut()
+        .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"gate-test\"]}\n")
+        .await;
+    closed(&mut session, "a decision gone stale").await;
+    refusing(gate.addr).await;
+    gate.stop().await;
+}
+
 #[tokio::test]
 async fn shutdown_stops_a_listener_that_was_never_admitted() {
     let gate = Gate::start(Duration::from_secs(15)).await;
