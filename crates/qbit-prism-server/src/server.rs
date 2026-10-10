@@ -678,9 +678,11 @@ impl AdmissionPublisher {
 /// task, so a slow or hung database never holds the next publication, which
 /// is what withdraws the node. It is never cancelled while the publisher
 /// runs, so a slow heartbeat still lands. When the publisher returns it
-/// waits for it at most [`HEARTBEAT_SHUTDOWN_WAIT`], so it lands before the
-/// stopped marker without taking the shutdown's budget, then aborts it, as
-/// it does if the publisher is aborted itself.
+/// waits for it at most [`HEARTBEAT_SHUTDOWN_WAIT`], so it does not take the
+/// shutdown's budget, then aborts it, as it does if the publisher is aborted
+/// itself. An abandoned heartbeat's statement may already be sent, and the
+/// database may apply it after the stopped marker; it is written so that it
+/// never replaces that marker (`Ledger::health_heartbeat_unless_stopped`).
 struct HeartbeatTask {
     handle: tokio::task::JoinHandle<()>,
     started: Instant,
@@ -793,10 +795,13 @@ async fn publish_health(
                     tracing::debug!("cluster heartbeat skipped: the previous one is still running");
                 }
             } else {
+                // The previous one has finished: a new one that gets stuck
+                // warns at once.
+                stuck_warned = None;
                 let ledger = coordinator.ledger.clone();
                 heartbeat = Some(HeartbeatTask {
                     handle: tokio::spawn(async move {
-                        if let Err(error) = ledger.heartbeat(HeartbeatStatus::Health(health)).await {
+                        if let Err(error) = ledger.health_heartbeat_unless_stopped(health).await {
                             tracing::warn!(%error,"cluster heartbeat failed");
                         }
                     }),

@@ -302,6 +302,7 @@
     "ledger/submission_hold.rs::set_submission_hold#1::self .begin()": [1,"ledger"],
     "ledger/submission_hold.rs::clear_submission_hold#1::self .begin()": [1,"ledger"],
     "ledger/instances.rs::heartbeat#1::self .acquire()": [1,"ledger"],
+    "ledger/instances.rs::health_heartbeat_unless_stopped#1::self .acquire()": [1,"ledger"],
     "ledger/jobs.rs::save_job#1::self .begin()": [1,"ledger"],
     "ledger/jobs.rs::save_issued_job#1::self .begin()": [1,"ledger"],
     "ledger/jobs.rs::job#1::self .acquire()": [1,"ledger"],

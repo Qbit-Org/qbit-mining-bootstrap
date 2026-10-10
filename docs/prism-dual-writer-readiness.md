@@ -77,7 +77,9 @@ for neither longer than the probe's 2 s, and its
 heartbeat to the cluster table runs as a task of its own, one at a time, so
 the publications keep coming while the database is gone and a slow heartbeat
 still lands. One still running after 10 s logs a warning, at most once a
-minute, and at shutdown the frontend waits at most 5 s for it.
+minute, and at shutdown the frontend waits at most 5 s for it. A heartbeat
+abandoned then may still be applied after the frontend's stopped marker, but
+it never replaces that marker: the row stays `stopped`.
 
 ## Admission
 
