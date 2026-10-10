@@ -222,11 +222,11 @@ impl AdmissionSignal {
         }
     }
 
+    /// Whether the decision admits at `now`: it says so and is younger than
+    /// `stale_after`, so it admits strictly before [`Self::stale_at`] and not
+    /// at it. The readiness endpoint and the gated listeners both ask this.
     pub fn admits_at(&self, now: tokio::time::Instant, stale_after: Duration) -> bool {
-        self.admits
-            && self
-                .decided_at
-                .is_some_and(|at| now.saturating_duration_since(at) <= stale_after)
+        self.stale_at(stale_after).is_some_and(|stale| now < stale)
     }
 
     /// When an admitting decision goes stale; `None` when it admits nothing.
@@ -254,9 +254,12 @@ mod tests {
         assert_eq!(refused.stale_at(budget), None);
         let admitted = AdmissionSignal::decided(true, at);
         assert!(admitted.admits_at(at, budget));
-        assert!(admitted.admits_at(at + budget, budget));
-        assert!(!admitted.admits_at(at + budget + Duration::from_millis(1), budget));
+        assert!(admitted.admits_at(at + budget - Duration::from_millis(1), budget));
+        // Stale at exactly `stale_at`: a listener that sleeps until then
+        // closes instead of computing the same deadline again.
         assert_eq!(admitted.stale_at(budget), Some(at + budget));
+        assert!(!admitted.admits_at(at + budget, budget));
+        assert!(!admitted.admits_at(at + budget + Duration::from_millis(1), budget));
     }
 
     fn at(start: Instant, seconds: u64) -> Instant {
