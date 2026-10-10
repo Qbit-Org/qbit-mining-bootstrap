@@ -148,7 +148,8 @@ pub struct BalancerReport {
     pub failed_checks: Vec<FailedCheck>,
     /// Sessions routed to each node over the run.
     pub routed: BTreeMap<String, u64>,
-    /// Sessions refused because no node was up.
+    /// Sessions refused because no node was up, or reset because their node
+    /// was marked down as they connected.
     pub refused: u64,
 }
 
@@ -564,6 +565,11 @@ async fn session(client: TcpStream, shared: Arc<Shared>, index: usize) {
         }
         crate::relay::reset(client);
         crate::relay::reset(upstream);
+        shared.refused.fetch_add(1, Ordering::Relaxed);
+        shared.event(format!(
+            "a session to {} reset: its node was marked down as it connected",
+            backend.target.name
+        ));
         return;
     }
     backend.routed.fetch_add(1, Ordering::Relaxed);
