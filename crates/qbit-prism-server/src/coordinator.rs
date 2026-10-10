@@ -2820,12 +2820,15 @@ impl Coordinator {
         // overpay ceiling in the same transaction (#478). An unknown bound
         // is an error like any other here: nothing is reserved, nothing is
         // abandoned, and the claim is retried.
+        let mut reserved_current = false;
+        // The gate as the reservation finds it, at the latest.
+        let carry_generation = self.ledger.carry_gate_generation();
         match self
             .ledger
             .reserve_offer_within(claim, Some(self.config.capture_overpay_ceiling_bps))
             .await?
         {
-            OfferReservation::Reserved { bound: None } => {}
+            OfferReservation::Reserved { bound: None } => reserved_current = true,
             OfferReservation::Reserved { bound: Some(bound) } => {
                 self.metrics
                     .record_capture_decision(crate::metrics::CaptureDecision::Offered);
@@ -2901,6 +2904,27 @@ impl Coordinator {
         // Renewal failure cancels the attempt even between periodic ticks.
         // Recheck the strictly-live token at the external mutation boundary.
         self.renew_candidate(claim, lease).await?;
+        // 3.1 dual writer: the carry gate may have moved since the
+        // reservation took this carry-paying block for current work. Then
+        // nothing is sent: the reservation goes back to `pending`, due at
+        // once, and the next attempt's reservation takes the capture path
+        // (the bound, or abandonment with capture off). A leased candidate
+        // was reserved without a revision check, as before.
+        if reserved_current
+            && !candidate.leased
+            && self
+                .ledger
+                .carry_paying_unsendable(&candidate.window.prior_balances_digest, carry_generation)
+        {
+            let reason = format!(
+                "{}: the carry gate moved after this carry-paying block was reserved as current work; the reservation taken by {} was returned to pending for another attempt",
+                crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
+                self.config.instance_id
+            );
+            self.ledger.release_unmade_offer(claim, &reason).await?;
+            tracing::warn!(block = %candidate.block_hash, %reason, "the carry gate moved before the offer; the next attempt decides it again, through the capture path");
+            return Ok(());
+        }
         let (result, offered_at_ms) = self.submit_block(params).await?;
         // #522, #526: a call whose connection was never established, or
         // that the node answered from its warmup, provably did not run, so

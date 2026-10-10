@@ -250,12 +250,8 @@ impl Ledger {
         // yet fenced, carry-paying work is never current, whatever the
         // revision says; the gate's revision bump may not have committed
         // yet. It takes the capture path below.
-        let not_current = super::carry::carry_paying_not_current(
-            self.dual_writer(),
-            self.carry_paying(),
-            self.carry_fence_pending(),
-            &candidate.window.prior_balances_digest,
-        );
+        let not_current =
+            self.carry_paying_not_current_now(&candidate.window.prior_balances_digest);
         if observed_revision == candidate.payout_revision && !not_current {
             return self.reserve_in(tx, claim, None).await;
         }

@@ -57,6 +57,9 @@ pub struct CarryGate {
     /// A change whose revision bump has not committed yet. The guard retries
     /// the bump until it does.
     fence_pending: AtomicBool,
+    /// Counts every change of the gate, so an offer can tell that the gate
+    /// moved after its reservation, even back to where it was.
+    generation: std::sync::atomic::AtomicU64,
     /// The frontend's `extranonce2_size`, which locates extranonce1 in a
     /// coinbase ([`finder_node`]); set with the dual-writer identity.
     extranonce2_size: std::sync::OnceLock<usize>,
@@ -175,6 +178,7 @@ impl Ledger {
         }
         let changed = self.carry.paying.swap(paying, Ordering::SeqCst) != paying;
         if changed {
+            self.carry.generation.fetch_add(1, Ordering::SeqCst);
             self.carry.fence_pending.store(true, Ordering::SeqCst);
         }
         self.fence_carry_change().await?;
@@ -212,6 +216,39 @@ impl Ledger {
     /// Whether a carry change still waits for its revision bump.
     pub fn carry_fence_pending(&self) -> bool {
         self.carry.fence_pending.load(Ordering::SeqCst)
+    }
+
+    /// [`carry_paying_not_current`] for work built on
+    /// `prior_balances_digest`, with this node's gate as it is now: what an
+    /// offer must not take for current work.
+    pub fn carry_paying_not_current_now(&self, prior_balances_digest: &[u8; 32]) -> bool {
+        carry_paying_not_current(
+            self.dual_writer(),
+            self.carry_paying(),
+            self.carry_fence_pending(),
+            prior_balances_digest,
+        )
+    }
+
+    /// How many times the gate has changed ([`Ledger::set_carry_paying`]).
+    pub fn carry_gate_generation(&self) -> u64 {
+        self.carry.generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether a block on work built on `prior_balances_digest`, reserved
+    /// as current work with the gate at `generation`, must not be sent now:
+    /// carry-paying work behind a closed or unfenced gate, or after any gate
+    /// change since (a gate closed and reopened meanwhile included, as the
+    /// peer may have paid the same balances while it was closed).
+    pub fn carry_paying_unsendable(
+        &self,
+        prior_balances_digest: &[u8; 32],
+        generation: u64,
+    ) -> bool {
+        self.carry_paying_not_current_now(prior_balances_digest)
+            || (self.dual_writer()
+                && !carry_free_block(true, prior_balances_digest)
+                && self.carry_gate_generation() != generation)
     }
 }
 
@@ -364,6 +401,38 @@ mod tests {
         // A single writer pays carried balances for good.
         assert!(!carry_paying_not_current(false, false, true, &paying));
         assert!(!carry_paying_not_current(false, true, false, &paying));
+    }
+
+    #[tokio::test]
+    async fn carry_paying_work_reserved_as_current_is_unsendable_after_any_gate_change() {
+        let ledger = ledger();
+        let paying = [0x5a; 32];
+        let free = carry_free_prior_digest();
+        // A single writer sends whatever it reserved.
+        assert!(!ledger.carry_paying_unsendable(&paying, 0));
+        ledger
+            .set_dual_writer_identity(NodeIdentity {
+                node: NodeIndex::A,
+                carry_owner: true,
+            })
+            .unwrap();
+        // Open and fenced, as at the reservation.
+        ledger.carry.paying.store(true, Ordering::SeqCst);
+        let reserved = ledger.carry_gate_generation();
+        assert!(!ledger.carry_paying_unsendable(&paying, reserved));
+        // Closed and reopened since, both fenced: the peer may have paid the
+        // same balances while it was closed.
+        ledger.carry.generation.fetch_add(2, Ordering::SeqCst);
+        assert!(ledger.carry_paying_unsendable(&paying, reserved));
+        assert!(!ledger.carry_paying_unsendable(&free, reserved));
+        // Unfenced, or closed, at the send.
+        let now = ledger.carry_gate_generation();
+        ledger.carry.fence_pending.store(true, Ordering::SeqCst);
+        assert!(ledger.carry_paying_unsendable(&paying, now));
+        ledger.carry.fence_pending.store(false, Ordering::SeqCst);
+        ledger.carry.paying.store(false, Ordering::SeqCst);
+        assert!(ledger.carry_paying_unsendable(&paying, now));
+        assert!(!ledger.carry_paying_unsendable(&free, now));
     }
 
     #[test]
