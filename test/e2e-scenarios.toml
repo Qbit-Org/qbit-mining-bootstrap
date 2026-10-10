@@ -977,7 +977,7 @@ id = "dual-writer-s02-a-frozen-during-pulls"
 title = "S2, frozen mid-pull: A's frontend frozen 20 times while its puller works on B's database; B never stalls"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, each timed first to a moment its puller holds an advisory lock on B's database (the sync barrier is one), else to one it has a query or a transaction open there. During each of 16 freezes a new tip arrives and B records jobs on it within 15 s; during every fifth, B instead lands a block solved on work handed out before the freeze and builds work on it. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
+criteria = "Both nodes take miners. A's frontend is frozen 20 times for 1 to 4 s, new-tip rounds aimed first at a moment its puller holds D1's sync barrier on B's database, else at one it has a query or a transaction open there. During each of 16 freezes a new tip arrives and B records jobs on it within 15 s; during every fifth, B instead lands a block solved on work handed out before the freeze and builds work on it. A puller frozen holding the sync barrier would stall every job and landing on B. Invariants 1 to 4 hold."
 runs = false
 reason = "Needs the 3.1 stack: peer sync (D1, pushed) and readiness for the balancer's checks (D4)."
 
@@ -986,7 +986,7 @@ id = "dual-writer-s02-a-puller-dies-mid-read"
 title = "S2, A's puller dies mid-read unseen by B: no snapshot left on B, and B's share appends stay flat"
 owner = "#761"
 lanes = ["nightly"]
-criteria = "Both nodes take miners at 250 offered shares/s. Sampled every 10 ms for 20 s, B never shows A's peer backend idle in transaction (no pull holds a transaction across a round trip). A's database link discards (B's replies drain and no close reaches it, as when A's host dies), and A's frontend is killed while its puller is busy on B: A's backends on B hold no snapshot or transaction beyond 10 s; every miner session has shares accepted on B 45 to 60 s after the death, and the p95 answer latency of B's shares 45 to 60 s after the death is at most twice that 5 to 20 s after A was marked down, plus 50 ms. A then restarts and catches up; invariants 1 to 4 hold."
+criteria = "Both nodes take miners at 250 offered shares/s. Sampled every 10 ms for 20 s, B never shows A's peer backend idle in transaction (no pull holds a transaction across a round trip). A's database link discards (B's replies drain and no close reaches it, as when A's host dies), and A's frontend is killed while its puller has a transaction open on B: A's backends on B hold no snapshot, transaction or lock beyond 10 s; every miner session has shares accepted on B 45 to 60 s after the death, and the p95 answer latency of B's shares 45 to 60 s after the death is at most twice that 5 to 20 s after A was marked down, plus 50 ms. A then restarts and catches up; invariants 1 to 4 hold."
 runs = false
 reason = "Needs the 3.1 stack: D1's single-statement peer reads (its engine review, P1 2) and readiness for the balancer's checks (D4)."
 

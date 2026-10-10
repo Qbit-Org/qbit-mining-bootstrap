@@ -1211,7 +1211,11 @@ async fn hold_frozen(
 struct PullState {
     backends: i64,
     busy: i64,
+    /// Backends with a transaction open (a snapshot may be held).
+    in_transaction: i64,
     advisory_locks: i64,
+    /// Of those, D1's sync barrier (`SYNC_BARRIER_LOCK`).
+    barrier: i64,
 }
 
 impl PullState {
@@ -1221,24 +1225,35 @@ impl PullState {
 }
 
 async fn pull_state(pool: &sqlx::PgPool) -> Result<PullState> {
-    let (backends, busy, advisory_locks): (i64, i64, i64) = sqlx::query_as(
-        "SELECT count(*), \
-                count(*) FILTER (WHERE a.state IN ('active', 'idle in transaction', \
-                                                   'idle in transaction (aborted)')), \
-                coalesce(sum(held.locks), 0)::bigint \
-         FROM pg_stat_activity a \
-         LEFT JOIN LATERAL (SELECT count(*) AS locks FROM pg_locks l \
-                            WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted) held \
-           ON true \
-         WHERE a.usename = $1 AND a.datname = current_database()",
-    )
-    .bind(crate::sim::PEER_ROLE)
-    .fetch_one(pool)
-    .await?;
+    let (backends, busy, in_transaction, advisory_locks, barrier): (i64, i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT count(*), \
+                    count(*) FILTER (WHERE a.state IN ('active', 'idle in transaction', \
+                                                       'idle in transaction (aborted)')), \
+                    count(*) FILTER (WHERE a.xact_start IS NOT NULL), \
+                    coalesce(sum(held.locks), 0)::bigint, \
+                    coalesce(sum(held.barrier), 0)::bigint \
+             FROM pg_stat_activity a \
+             LEFT JOIN LATERAL ( \
+                 SELECT count(*) AS locks, \
+                        count(*) FILTER (WHERE l.classid::bigint = $2 AND l.objid::bigint = $3 \
+                                           AND l.objsubid = 1) AS barrier \
+                 FROM pg_locks l \
+                 WHERE l.pid = a.pid AND l.locktype = 'advisory' AND l.granted) held \
+               ON true \
+             WHERE a.usename = $1 AND a.datname = current_database()",
+        )
+        .bind(crate::sim::PEER_ROLE)
+        .bind((SYNC_BARRIER_KEY >> 32) as i64)
+        .bind((SYNC_BARRIER_KEY & 0xffff_ffff) as i64)
+        .fetch_one(pool)
+        .await?;
     Ok(PullState {
         backends,
         busy,
+        in_transaction,
         advisory_locks,
+        barrier,
     })
 }
 
@@ -1246,27 +1261,46 @@ async fn pull_state(pool: &sqlx::PgPool) -> Result<PullState> {
 /// `pg_locks` adds no contention to the database whose stalls it measures.
 const PULL_POLL: Duration = Duration::from_millis(20);
 
-/// What a freeze was timed to.
+/// D1's sync barrier key (`ledger::peer_sync::SYNC_BARRIER_LOCK`, cca56f14):
+/// `pg_locks` shows it as `classid` (the high half) and `objid` (the low
+/// half). Should D1 change it, a freeze aimed at the barrier falls back to
+/// a busy moment.
+const SYNC_BARRIER_KEY: u64 = 0x5052_4953_4d00_0008;
+
+/// What a freeze or a death was timed to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum PullMoment {
-    /// A's puller held an advisory lock on B (D1's sync barrier is one): the
-    /// moment a frozen puller can stall B's writes.
-    LockHeld,
+    /// A's puller held D1's sync barrier on B: the moment a frozen puller
+    /// stalls B's writes.
+    BarrierHeld,
+    /// A's puller had a transaction open on B: the moment a dead puller
+    /// leaves its snapshot behind.
+    InTransaction,
     /// A's puller had a query running or a transaction open on B.
     Busy,
-    /// Neither was seen within the wait: a random moment.
+    /// None of these was seen within the wait: a random moment.
     Unseen,
 }
 
-/// Wait for the most telling moment to freeze A: first, for up to two
-/// thirds of `limit`, one where its puller holds an advisory lock on B's
-/// database; then, for the rest, any moment it is busy there.
-async fn wait_for_a_pull(pool: &sqlx::PgPool, limit: Duration) -> Result<PullMoment> {
+/// Wait for the moment to freeze or kill A: first, for up to two thirds of
+/// `limit`, the moment `first` names (the barrier held, or a transaction
+/// open); then, for the rest, any moment A's puller is busy on B.
+async fn wait_for_a_pull(
+    pool: &sqlx::PgPool,
+    limit: Duration,
+    first: PullMoment,
+) -> Result<PullMoment> {
     let started = Instant::now();
     while started.elapsed() < limit * 2 / 3 {
-        if pull_state(pool).await?.advisory_locks > 0 {
-            return Ok(PullMoment::LockHeld);
+        let state = pull_state(pool).await?;
+        let found = match first {
+            PullMoment::BarrierHeld => state.barrier > 0,
+            PullMoment::InTransaction => state.in_transaction > 0,
+            PullMoment::Busy | PullMoment::Unseen => false,
+        };
+        if found {
+            return Ok(first);
         }
         tokio::time::sleep(PULL_POLL).await;
     }
@@ -1409,14 +1443,15 @@ async fn freeze_round(
 }
 
 /// S2, frozen mid-pull. Both nodes take miners. A's frontend is frozen
-/// `SHORT_FREEZES` times for 1 to 4 s, each time, where it can be seen
-/// within 3 s, the moment its puller is working on B's database (a query
-/// running, a transaction open or an advisory lock held there). While A is
-/// frozen a new tip arrives, and B must record jobs on it within the bound;
-/// every fifth time B instead lands a block solved on work it handed out
-/// before the freeze, and must build work on it. A puller frozen holding
-/// D1's sync barrier on B would stall exactly these writes. A round lasts
-/// longer than its target only while B is still at its work.
+/// `SHORT_FREEZES` times for 1 to 4 s. A new-tip round aims, for 2 s, at a
+/// moment A's puller holds D1's sync barrier on B, then for 1 s at any
+/// moment it is busy there (a query running or a transaction open). While
+/// A is frozen a new tip arrives, and B must record jobs on it within the
+/// bound. Every fifth round instead aims only at a busy moment, briefly,
+/// and B lands a block solved on work handed out just before the freeze
+/// and must build work on it. A puller frozen holding the barrier would
+/// stall exactly these writes. A round lasts longer than its target only
+/// while B is still at its work.
 async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.load()?.resume();
     steady(sim, 6).await;
@@ -1432,7 +1467,13 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
         if landing {
             prepare_finder(sim, Node::B).await?;
         }
-        let timed_to = wait_for_a_pull(&pool, Duration::from_secs(3)).await?;
+        // A landing round's finder work was handed out just before: aim at a
+        // busy moment, whose short wait keeps that work current.
+        let timed_to = if landing {
+            wait_for_a_pull(&pool, Duration::from_secs(1), PullMoment::Busy).await?
+        } else {
+            wait_for_a_pull(&pool, Duration::from_secs(3), PullMoment::BarrierHeld).await?
+        };
         let hold = Duration::from_millis(1_000 + schedule.below(3_000));
         let freeze = Fault::FrontendFreeze(Node::A);
         let at_ms = sim.inject(freeze).await?;
@@ -1486,15 +1527,15 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
         .count();
     let at_lock = rounds
         .iter()
-        .filter(|r| r.timed_to == PullMoment::LockHeld)
+        .filter(|r| r.timed_to == PullMoment::BarrierHeld)
         .count();
     let caught = rounds.iter().filter(|r| r.after_stop.mid_pull()).count();
     body.expect(
         "B records jobs and lands blocks while A is frozen mid-pull",
         stalled.is_empty() && !landings.is_empty(),
         format!(
-            "{} freezes ({timed} timed to one of A's pulls on B, {at_lock} of them to a lock it \
-             held there; {caught} left A with a query, a \
+            "{} freezes ({timed} timed to one of A's pulls on B, {at_lock} of them to D1's sync \
+             barrier held there; {caught} left A with a query, a \
              transaction or an advisory lock open there). New tips: B's first job on each after \
              {:?} ms (median) and {:?} ms (max) from the mint, bound {} s. Landings: {} blocks \
              found, landed and confirmed on B during freezes, as (ms from the solve request to \
@@ -1554,8 +1595,9 @@ fn answer_p95(
 /// 2. A's database link discards (B's replies drain and no close reaches
 ///    it, as when A's host or its VLAN dies; a plain kill -9 sends a FIN
 ///    that B handles at once), and A's frontend is killed, timed to a moment
-///    its puller is busy on B. A's backends on B must hold no snapshot and
-///    no open transaction beyond `IDLE_BOUND`.
+///    its puller has a transaction open on B (else to any busy moment). A's
+///    backends on B must hold no snapshot, open transaction or lock beyond
+///    `IDLE_BOUND`: a sync barrier left held would stall every writer on B.
 /// 3. B takes every miner meanwhile, and its share answer latency stays
 ///    flat: its p95 45 to 60 s after the death is at most twice its p95 5 to
 ///    20 s after A was marked down, plus 50 ms.
@@ -1593,7 +1635,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
         ),
     );
 
-    let timed = wait_for_a_pull(&pool, Duration::from_secs(5)).await?;
+    let timed = wait_for_a_pull(&pool, Duration::from_secs(5), PullMoment::InTransaction).await?;
     let cut_at = sim.clock.now_ms();
     sim.links.set("peer-a-to-b", LinkState::Discard)?;
     let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
@@ -1603,10 +1645,14 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
     let died = Instant::now();
     let (mut last_holding, mut most) = (None, 0i64);
     while died.elapsed() < LINGER_WATCH {
+        // A snapshot, an open transaction, or a lock left behind: a barrier
+        // held by a dead puller's backend would stall every writer on B.
         let holding: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE usename = $1 AND datname = current_database() \
-               AND (backend_xmin IS NOT NULL OR xact_start IS NOT NULL)",
+            "SELECT count(*) FROM pg_stat_activity a \
+             WHERE a.usename = $1 AND a.datname = current_database() \
+               AND (a.backend_xmin IS NOT NULL OR a.xact_start IS NOT NULL \
+                    OR EXISTS (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid \
+                                 AND l.locktype = 'advisory' AND l.granted))",
         )
         .bind(crate::sim::PEER_ROLE)
         .fetch_one(&pool)
@@ -1619,15 +1665,16 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
     }
     pool.close().await;
     body.expect(
-        "A's dead puller leaves B no snapshot and no open transaction beyond the bound",
+        "A's dead puller leaves B no snapshot, open transaction or lock beyond the bound",
         last_holding.is_none_or(|held| held <= IDLE_BOUND),
         format!(
-            "A was killed {}; up to {most} of A's backends on B held a snapshot or a transaction \
-             until {:?} after the death (bound {} s, watched {} s; the peer role's \
+            "A was killed {}; up to {most} of A's backends on B held a snapshot, a transaction or \
+             a lock until {:?} after the death (bound {} s, watched {} s; the peer role's \
              idle-in-transaction timeout is the one status/D1.md drafts)",
             match timed {
-                PullMoment::LockHeld => "while its puller held an advisory lock on B",
-                PullMoment::Busy => "while its puller had a query or a transaction open on B",
+                PullMoment::InTransaction => "while its puller had a transaction open on B",
+                PullMoment::BarrierHeld => "while its puller held D1's sync barrier on B",
+                PullMoment::Busy => "while its puller had a query running on B",
                 PullMoment::Unseen => "at a moment none of its pulls was seen on B",
             },
             last_holding,
