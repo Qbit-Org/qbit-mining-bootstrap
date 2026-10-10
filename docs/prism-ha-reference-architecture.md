@@ -625,7 +625,9 @@ bound and re-entry after two successes. This is the #186 carry-over to #291.
 PRISM 3.1 adds a readiness-only, token-protected endpoint for balancers that
 check each frontend on an address they can reach from outside, and a grace
 that keeps an ordinary rebuild from withdrawing a frontend; in dual-writer
-mode the Stratum listeners refuse connections while it is withdrawn. See
+mode the Stratum listeners refuse connections while it does not admit miners
+(before its first admission, after a withdrawal, or when its decision is
+stale). See
 [dual-writer readiness](prism-dual-writer-readiness.md).
 
 ## Self-check live instances

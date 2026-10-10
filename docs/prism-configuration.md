@@ -273,7 +273,7 @@ frontend starts anyway, with a warning. Only the deliberate rollback sets it.
 ## Readiness endpoint and admission (3.1)
 
 A readiness-only HTTP listener for a balancer's checks, meant for a node's
-public address (decision D-7); off unless `PRISM_READINESS_PORT` is set.
+public address; off unless `PRISM_READINESS_PORT` is set.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -283,11 +283,15 @@ public address (decision D-7); off unless `PRISM_READINESS_PORT` is set.
 | `PRISM_READINESS_GRACE_SECONDS` | `10` | how long readiness may stay false, as through a tip or payout-revision rebuild, before the frontend stops admitting miners; 0 to 120 |
 
 `GET /readyz` answers `200` while the frontend admits miners, `503` while it
-does not, `401` without the token and `404` for anything else. In dual-writer
+does not, `401` to any request without exactly the right token, whatever its
+path, and `404` to any other path or method that carries it. In dual-writer
 mode the Stratum listeners also accept connections only while it admits. With
-the port unset and `PRISM_DUAL_WRITER` off, nothing changes from 3.0. In
-dual-writer mode `qbit-prism-server healthcheck` reports liveness, not
-readiness, and needs the operator listener. See
+the port unset and `PRISM_DUAL_WRITER` off, `/healthz` and the Stratum
+listeners behave as in 3.0 and no readiness statement runs; the new metric
+families show only their HELP and TYPE lines, and
+`PRISM_READINESS_GRACE_SECONDS` is still validated at startup. In dual-writer
+mode `qbit-prism-server healthcheck` reports liveness, not readiness, and needs
+the operator listener. See
 [dual-writer readiness](prism-dual-writer-readiness.md).
 
 ## Preventing stale guidance

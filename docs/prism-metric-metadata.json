@@ -392,13 +392,13 @@
       "status": "Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. Only a known open wait attributes a deadline hit here (#493): while tracking is unknown and no known wait remains (a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation or lost ordering history), a deadline hit is an ordinary job_delivery_failures_total event, accepted_block_revision_work_tracking_unknown reports the unknown state and the pending gauge stays -1; it is not counted here and does not stamp a wait recovered after the deadline degraded; a wait recovered before the deadline counts and is degraded as usual."
     },
     "admission_admitting": {
-      "status": "Set by the health publisher at each publication (3.1, D4) once `PRISM_DUAL_WRITER` is on or `PRISM_READINESS_PORT` is set; it is 1 exactly while `qbit_prism_admission_state` reads `admitting` or `grace`. The readiness endpoint answers 200 only while it is 1 and the decision is younger than the health freshness budget. No firing rule of its own; the pair's monitoring pages on a preferred node that stays at 0."
+      "status": "Set by the health publisher at each publication (3.1) once `PRISM_DUAL_WRITER` is on or `PRISM_READINESS_PORT` is set; it is 1 exactly while `qbit_prism_admission_state` reads `admitting` or `grace`, and a stale snapshot serves it as 0, as the endpoint and the listeners treat a decision that old. The readiness endpoint answers 200 only while it is 1 and the decision is younger than the health freshness budget. No firing rule of its own; the pair's monitoring pages on a preferred node that stays at 0."
     },
     "admission_state": {
       "labels": {
         "state": "AdmissionStateLabel"
       },
-      "status": "Every state's series appears at zero, `starting` at one, when admission is first exposed. `starting`: never admitted since the process started (a restored node pulling its own log back stays here). `grace`: readiness is false but for less than `PRISM_READINESS_GRACE_SECONDS` (10 s by default), as through an ordinary tip or payout-revision rebuild. `withdrawn`: admitted once, then a hard fault (`own-log-behind`, `writer-not-local`) or a readiness dip longer than the grace."
+      "status": "Every state's series appears at zero, `starting` at one, when admission is first exposed. `starting`: never admitted since the process started (a restored node pulling its own log back stays here). `grace`: readiness is false, less than `PRISM_READINESS_GRACE_SECONDS` (10 s by default) after the last publication that found the frontend ready, as through an ordinary tip or payout-revision rebuild. A stale snapshot keeps the last decision's state. `withdrawn`: admitted once, then a hard fault (`own-log-behind`, `writer-not-local`) or a readiness dip longer than the grace."
     },
     "admission_withdrawals_total": {
       "labels": {
@@ -410,25 +410,25 @@
       "labels": {
         "listener": "StratumListenerName"
       },
-      "status": "Dual-writer mode only (3.1, D4): the listeners bind at startup without listening and listen only while the frontend admits, so a starting, restored or withdrawn node refuses connections (RST) instead of accepting TCP it cannot serve. `default` is the `PRISM_STRATUM_PORT` listener and `highdiff` the `PRISM_STRATUM_HIGHDIFF_PORT` one."
+      "status": "Dual-writer mode only (3.1): the listeners bind at startup without listening and listen only while the frontend admits, so a starting, restored or withdrawn node refuses connections (RST) instead of accepting TCP it cannot serve. `default` is the `PRISM_STRATUM_PORT` listener and `highdiff` the `PRISM_STRATUM_HIGHDIFF_PORT` one. A stale snapshot serves every listener as 0: a decision that old closes them."
     },
     "dual_writer_writer_path": {
       "labels": {
         "path": "WriterPathLabel"
       },
-      "status": "Probed at each health publication with one statement on the frontend's own pool (at most once a second, two-second timeout). `unanswered` withdraws the frontend once it has lasted four seconds; `remote`, `unidentified` and `read_only` withdraw it at once. The probe never reads the peer."
+      "status": "Probed at each health publication with one statement on the frontend's own pool (at most once a second, two-second timeout). `unanswered` withdraws the frontend once it has lasted four seconds at a publication; `remote`, `unidentified` and `read_only` withdraw it at once. The probe never reads the peer."
     },
     "dual_writer_node_index": {
       "status": "Published with the other dual-writer gauges at each health publication (3.1)."
     },
     "dual_writer_carry_owner": {
-      "status": "The configured flag only; whether this node is acting as the carry owner is the carry-owner guard's decision, reported by its own series."
+      "status": "PRISM_CARRY_OWNER as configured, published with the other dual-writer gauges at each health publication; it says nothing about what the node is doing with carried balances at the moment."
     },
     "readiness_requests_total": {
       "labels": {
         "result": "ReadinessAnswer"
       },
-      "status": "Every answer starts at zero once the endpoint is enabled (3.1, CONTRACT.md decision D-7). The token is checked first, so `unauthorized` also counts requests for unknown paths without the token; a steady `unauthorized` rate on a public address is scanning, not a fault. A connection closed unanswered past the 256-connection or 8-per-source cap, or cut at its two-second deadline, counts nothing."
+      "status": "Every answer starts at zero once the endpoint is enabled (3.1). The token is checked first, so `unauthorized` also counts requests for unknown paths without the token; a steady `unauthorized` rate on a public address is scanning, not a fault. A connection closed unanswered past the 256-connection or 8-per-source cap, or cut at its two-second deadline, counts nothing."
     }
   },
   "public": {

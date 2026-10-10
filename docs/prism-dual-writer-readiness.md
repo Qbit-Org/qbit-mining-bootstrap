@@ -8,8 +8,9 @@ This page is what a frontend tells that balancer, and how its Stratum
 listeners follow it.
 
 With `PRISM_DUAL_WRITER` off and `PRISM_READINESS_PORT` unset, the defaults,
-none of this runs: `/healthz`, the Stratum listeners and every statement are
-3.0's. The metric families below are declared and carry no samples.
+`/healthz` and the Stratum listeners behave as in 3.0 and no readiness
+statement runs; the metric families below show only their HELP and TYPE lines.
+`PRISM_READINESS_GRACE_SECONDS` is still validated at startup.
 
 ## When a dual-writer frontend is ready
 
@@ -17,24 +18,26 @@ none of this runs: `/healthz`, the Stratum listeners and every statement are
 and the database payout revision, a fresh tip poll, the CTV fee floor, job
 delivery). In dual mode `ok` and `ready` are also false unless both hold:
 
-- **The own log is caught up.** The peer sync's startup lineage latch
-  (decision D-8): false at start, and again on a detected local rollback,
-  until the node has verified that it holds every row it originated that the
-  peer holds, pulling back any it lacks. Losing the peer later never clears
-  it, so a broken link never withdraws a serving node. A node that starts
-  with the peer unreachable latches true unless its database shows evidence
-  of a rollback (decision D-17): a new system identifier or WAL timeline
-  since the last verification, or no verification recorded.
+- **The own log is caught up.** The peer sync's startup lineage latch:
+  false at start, and again on a detected local rollback, until the node has
+  verified that it holds every row it originated that the peer holds,
+  pulling back any it lacks. Losing the peer later never clears it, so a
+  broken link never withdraws a serving node. A node that starts with the
+  peer unreachable latches true unless its database shows evidence of a
+  rollback: a new system identifier or WAL timeline since the last
+  verification, or no verification recorded.
 - **The writer is local.** The database this frontend writes to is this
-  node's own writable primary: its never-copied `qbit_prism_node_identity`
-  row (decision D-9, set by `qbit-prism-server node-identity set`) names
-  `PRISM_NODE_INDEX`, it is not in recovery, and its sessions are not
+  node's own writable primary: its `qbit_prism_node_identity` row, which the
+  peer sync never copies (set by `qbit-prism-server node-identity set`),
+  names `PRISM_NODE_INDEX`, it is not in recovery, and its sessions are not
   read-only.
 
-`status` names the first that fails: `own-log-behind`, then
-`writer-not-local`; otherwise `unavailable` as in 3.0.
+`status` is `runtime-stalled` or `job-delivery-stalled` when those 3.0 checks
+fail; otherwise it names the first dual-writer check that fails,
+`own-log-behind` then `writer-not-local`, and otherwise `unavailable` as in
+3.0.
 
-`/healthz` gains a `dual_writer` object (CONTRACT.md §3):
+`/healthz` gains a `dual_writer` object:
 
 ```json
 "dual_writer": {
@@ -56,12 +59,12 @@ of the frontend's own pool:
 | `remote` | the identity row names the peer: a DSN left pointing at the other node | withdraws at once |
 | `unidentified` | no identity row: the database was never personalised | withdraws at once |
 | `read_only` | in recovery, or `default_transaction_read_only` on | withdraws at once |
-| `unanswered` | the probe failed or took over 2 s | withdraws once it has lasted 4 s |
-| `null` | no probe yet | not ready |
+| `unanswered` | the probe failed or took over 2 s | withdraws once it has lasted 4 s at a publication |
 
 The probe is one statement, `pg_is_in_recovery()`,
 `transaction_read_only` and the identity row, at most once a second however
-many health reads ask; it never reads the peer.
+many health reads ask; it never reads the peer. The first health read
+probes, so `/healthz` never reports a `writer_path` of `null`.
 
 ## Admission
 
@@ -79,17 +82,19 @@ the decision:
 | --- | --- | --- |
 | `starting` | no | never ready since the process started |
 | `admitting` | yes | ready |
-| `grace` | yes | readiness false for less than `PRISM_READINESS_GRACE_SECONDS` |
+| `grace` | yes | readiness false, less than `PRISM_READINESS_GRACE_SECONDS` after the last publication that found it ready |
 | `withdrawn` | no | admitted once, then withdrawn; `reason` says what blocks it now |
 
 Withdrawal reasons: `own-log-behind` and `writer-not-local` at once, whatever
-the grace; `not-ready` once readiness has stayed false for the whole grace
-(default 10 s, 0 to 120, the operator readiness contract's ten seconds in
+the grace; `not-ready` once readiness has stayed false for the whole grace,
+which runs from the last publication that found the frontend ready (default
+10 s, 0 to 120, the operator readiness contract's ten seconds in
 [the HA reference](prism-ha-reference-architecture.md#operator-tcp-load-balancer-readiness-contract)).
-The health publisher decides at each publication; a decision older than the
+The health publisher decides at each publication. A decision older than the
 health freshness budget, `max(15, 3 * PRISM_HEALTH_REFRESH_SECONDS)` seconds,
-admits nothing, so a stalled publisher withdraws the frontend as `/healthz`
-reports its snapshot stale.
+admits nothing, so a publisher stalled by a dead database withdraws the
+frontend at its next publication or when its decision goes stale, whichever
+comes first.
 
 ## Stratum gating (dual mode)
 
@@ -98,9 +103,10 @@ coordinator starts, as 3.0 does: a restart that loses the bind race to a
 listening predecessor still exits without writing cluster state. It listens
 only while it admits miners:
 
-- before its first admission, and after a withdrawal, the kernel refuses
-  every connection with a reset: no TCP handshake completes, so no check,
-  balancer or miner sees a frontend that cannot serve as up;
+- before its first admission, after a withdrawal, and while its decision is
+  stale, the kernel refuses every connection with a reset: no TCP handshake
+  completes, so no check, balancer or miner sees a frontend that cannot
+  serve as up;
 - withdrawing resets connections still queued unaccepted, so their miners
   reconnect elsewhere at once;
 - sessions already accepted carry on; the balancer closes them when it marks
@@ -111,7 +117,7 @@ readiness says. Linux lets a second socket bind an address that a reserved one
 holds while neither listens, so two frontends configured with one address
 both start, and the second to be admitted fails to listen and exits.
 
-## The readiness endpoint (decision D-7)
+## The readiness endpoint
 
 A readiness-only HTTP listener for the Hashbalancer's checks, meant for a
 node's public address. It is off unless `PRISM_READINESS_PORT` is set.
@@ -140,13 +146,13 @@ deadline, twice the balancer's check timeout. At most 256 connections are
 served at once, and at most 8 from one source address (an IPv6 source counts by
 its /64), so a client holding connections open cannot take the slots the
 balancer's checks need; a connection past either cap is closed at once,
-unanswered, which a checker reads as a failed probe. The operator listener
-(`PRISM_AUDIT_PORT`) stays private.
+unanswered, which a checker reads as a failed probe. A malformed or oversized
+request gets hyper's bare `400`, `414` or `431`, with no body, and is not
+counted. The operator listener (`PRISM_AUDIT_PORT`) stays private.
 
 On the pair, the endpoint is published on each node's public address under the
 same condition as public Stratum, with the Hashbalancer's health token; both
-nodes serve it before the Hashbalancer's PRISM routes switch to HTTP checks
-(the deploy order of decision D-7).
+nodes serve it before the Hashbalancer's PRISM routes switch to HTTP checks.
 
 ## The container healthcheck (dual mode)
 
@@ -155,8 +161,8 @@ Routing reads readiness from `/readyz`. The container healthcheck,
 converge that waits for a healthy container does not time out while a node
 catches up on its own log after a restart, restore or rebuild. Given a
 `/healthz` body that carries `dual_writer`, it passes while the frontend is
-ready, while its own log is behind (the D-8 catch-up), or while its admission
-is inside the grace. It fails on a fault:
+ready, while its own log is behind (the own-log catch-up), or while its
+admission is inside the grace. It fails on a fault:
 
 - no answer within 3 s, as when the process has exited (a cluster halted
   before the start refuses the frontend's start);
@@ -176,26 +182,30 @@ healthcheck, and `self-check` in either mode, keep 3.0's readiness rule.
 ## The balancer
 
 The Hashbalancer's `readiness` route policy (SwapLabsInc/qbit-tools,
-`services/hashbalancer`), with A the primary and B the backup:
-`GET /readyz` with the token on 9084 every 2 s (1 s once a check has
-failed), DOWN after 3 failures and UP after 2 passes;
-`observe layer4 error-limit 2 on-error mark-down`; `retries 3` with
-`option redispatch 1`; `on-marked-down shutdown-sessions` and the primary's
-`on-marked-up shutdown-backup-sessions`; `rate-limit sessions 25` on each
-HAProxy task, which paces failover and failback waves. A withdrawn
-frontend's refused connects mark it down after two failed connects, sooner
-than its checks. A rebuild shorter than the grace keeps `/readyz` at `200`,
-so an ordinary rebuild never ejects a frontend, whatever the check interval.
+`services/hashbalancer`), with A the primary and B the backup. Each origin's
+check is `GET /readyz` with the token on 9084, then a TCP connect to the
+origin's own Stratum port, so an endpoint that says ready while Stratum
+refuses reads DOWN instead of flapping. Checks run every 2 s, and every 1 s
+while a server's state is changing in either direction; a server is DOWN
+after 3 failed checks and UP after 2 passed.
+`observe layer4 error-limit 2 on-error sudden-death`: after two failed
+connects of live traffic, one more failed check marks the server DOWN.
+`retries 3` with `option redispatch 1`; `on-marked-down shutdown-sessions` and
+the primary's `on-marked-up shutdown-backup-sessions`;
+`rate-limit sessions 25` on each HAProxy task, which paces failover and
+failback waves. A withdrawn frontend's refused connects plus one failed check
+mark it down. A rebuild shorter than the grace keeps `/readyz` at `200`, so an
+ordinary rebuild never ejects a frontend, whatever the check interval.
 
 ## Metrics
 
 | Family | Labels | Meaning |
 | --- | --- | --- |
-| `qbit_prism_admission_admitting` | none | 1 while the frontend admits miners |
+| `qbit_prism_admission_admitting` | none | 1 while the frontend admits miners; 0 in a stale snapshot |
 | `qbit_prism_admission_state` | `state` | one-hot admission state |
 | `qbit_prism_admission_withdrawals_total` | `reason` | withdrawals since start |
-| `qbit_prism_stratum_listener_accepting` | `listener=default,highdiff` | dual mode: whether a listener accepts |
-| `qbit_prism_peer_sync_own_log_caught_up` | none | the D-8 latch, published by the peer sync |
+| `qbit_prism_stratum_listener_accepting` | `listener=default,highdiff` | dual mode: whether a listener accepts; 0 in a stale snapshot |
+| `qbit_prism_peer_sync_own_log_caught_up` | none | the own-log latch, published by the peer sync |
 | `qbit_prism_dual_writer_writer_path` | `path` | one-hot writer path |
 | `qbit_prism_dual_writer_node_index` | none | `PRISM_NODE_INDEX` |
 | `qbit_prism_dual_writer_carry_owner` | none | `PRISM_CARRY_OWNER` as configured |
@@ -207,10 +217,11 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
 
 ## Tests
 
-- Unit: the admission state machine, the signal's freshness, the endpoint's
-  token, answers and connection caps, the reserved address, the writer-path
-  classification,
-  the metrics, and the healthcheck's liveness rule.
+- Unit: the admission state machine (the grace runs from the last ready
+  publication), the signal's freshness, the endpoint's token, answers and
+  per-source and global connection caps, the reserved address, the
+  writer-path classification, the metrics and a stale snapshot's admission
+  samples, and the healthcheck's liveness rule.
 - `tests/healthcheck_cli.rs`: the healthcheck binary against canned
   `/healthz` answers: a dual-writer body catching up passes and one with a
   remote writer fails, a single writer keeps 3.0's rule, and dual mode
@@ -220,7 +231,8 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
   session is still served, and closes when its decision goes stale.
 - Gated, `tests/dual_writer_readiness.rs`: the latch and the identity at the
   coordinator, a database turning read-only and back, the peer lost after
-  the latch, and a single writer's unchanged health.
+  the latch, a database personalised as the peer (`remote`), and a single
+  writer's unchanged health.
 - Gated, `tests/readiness_frontend.rs`: the server binary in dual mode, not
   yet admitted, refuses Stratum and answers `503` and `401`; a single writer
   listens from startup and answers `200`; five payout revision bumps under
