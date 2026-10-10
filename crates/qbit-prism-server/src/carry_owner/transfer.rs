@@ -289,7 +289,7 @@ pub async fn scan_chain<C: ChainSource>(
     let hashes: Vec<&str> = pool.iter().map(|(_, hash)| hash.as_str()).collect();
     let rows: Vec<(String, String, bool)> = sqlx::query_as("SELECT block.block_hash,block.chain_state,EXISTS(SELECT 1 FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=block.block_hash) FROM qbit_pool_blocks block WHERE block.block_hash=ANY($1::text[])")
         .bind(&hashes)
-        .fetch_all(&ledger.pool)
+        .fetch_all(&mut *ledger.acquire().await?)
         .await?;
     let landed: BTreeMap<String, (String, bool)> = rows
         .into_iter()

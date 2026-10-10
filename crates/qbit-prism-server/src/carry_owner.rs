@@ -22,7 +22,10 @@
 //! know that its own journal is current (a restore from an old backup could
 //! have resurrected a claim the pair has since moved), so it waits,
 //! carry-free, for one live read. Whenever both nodes claim ownership, both
-//! go carry-free and alert.
+//! go carry-free and alert. A claim in the peer's live journal behind a
+//! newer row of the peer's this node holds (the peer's database was rolled
+//! back, or a lagging path answered) stops payments too: the peer may act on
+//! it until its own guard sees the rollback.
 //!
 //! Once the peer has released, only a claim that `carry-owner transfer`
 //! made after reading that release pays: transfer is what waits for the
@@ -143,6 +146,10 @@ pub enum CarryFreeReason {
     ClaimNotVetted,
     /// The peer claims ownership too.
     PeerClaimsOwnership,
+    /// The peer's live journal claims ownership behind, or against, a newer
+    /// row of the peer's this node holds: its database was rolled back, or a
+    /// lagging path answered. Carry-free until its journal catches up.
+    PeerJournalBehind,
     /// The peer answered but has never written a journal row, so it may be
     /// running without the dual-writer rules.
     PeerNotSeeded,
@@ -151,7 +158,7 @@ pub enum CarryFreeReason {
 }
 
 impl CarryFreeReason {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::NotOwner,
         Self::NodeUnidentified,
         Self::NoJournalRow,
@@ -161,6 +168,7 @@ impl CarryFreeReason {
         Self::OwnJournalRolledBack,
         Self::ClaimNotVetted,
         Self::PeerClaimsOwnership,
+        Self::PeerJournalBehind,
         Self::PeerNotSeeded,
         Self::PeerUnconfirmed,
     ];
@@ -176,6 +184,7 @@ impl CarryFreeReason {
             Self::OwnJournalRolledBack => "own_journal_rolled_back",
             Self::ClaimNotVetted => "claim_not_vetted",
             Self::PeerClaimsOwnership => "peer_claims_ownership",
+            Self::PeerJournalBehind => "peer_journal_behind",
             Self::PeerNotSeeded => "peer_not_seeded",
             Self::PeerUnconfirmed => "peer_unconfirmed",
         }
@@ -222,6 +231,7 @@ impl CarryDecision {
                 CarryFreeReason::OwnJournalRolledBack => CarryOwnerState::OwnJournalRolledBack,
                 CarryFreeReason::ClaimNotVetted => CarryOwnerState::ClaimNotVetted,
                 CarryFreeReason::PeerClaimsOwnership => CarryOwnerState::PeerClaimsOwnership,
+                CarryFreeReason::PeerJournalBehind => CarryOwnerState::PeerJournalBehind,
                 CarryFreeReason::PeerNotSeeded => CarryOwnerState::PeerNotSeeded,
                 CarryFreeReason::PeerUnconfirmed => CarryOwnerState::PeerUnconfirmed,
             },
@@ -307,21 +317,23 @@ impl Guard {
             }
             PeerRead::Failed => (None, false),
         };
-        // A live claim of the peer's counts even behind a newer row this node
-        // holds of it (the peer's database was rolled back): the peer may act
-        // on it until its own guard sees the rollback.
-        if peer_live.is_some_and(|row| row.carry_owner) {
-            self.peer_confirmed = false;
-            return CarryDecision::CarryFree(PeerClaimsOwnership);
-        }
         // The newest of the peer's rows this node can see, live or synced.
         let peer = [peer_live, inputs.peer_synced.as_ref()]
             .into_iter()
             .flatten()
             .max_by_key(|row| row.epoch);
-        if peer.is_some_and(|row| row.carry_owner) {
+        // A claim in the peer's live journal counts even behind a newer row
+        // this node holds of it (module comment).
+        let claim = if peer.is_some_and(|row| row.carry_owner) {
+            Some(PeerClaimsOwnership)
+        } else if peer_live.is_some_and(|row| row.carry_owner) {
+            Some(PeerJournalBehind)
+        } else {
+            None
+        };
+        if let Some(reason) = claim {
             self.peer_confirmed = false;
-            return CarryDecision::CarryFree(PeerClaimsOwnership);
+            return CarryDecision::CarryFree(reason);
         }
         if peer.is_some_and(|row| row.action == "release" && !own.acquired_after(row)) {
             return not_claiming(self, ClaimNotVetted);
@@ -1081,16 +1093,31 @@ mod tests {
             guard.decide(&inputs),
             CarryDecision::CarryFree(CarryFreeReason::PeerClaimsOwnership)
         );
-        // A live claim counts even behind the newer release this node's copy
-        // holds, which this node's transfer read: the peer's database was
-        // rolled back, and the peer may act on its claim until it sees that.
-        let mut rolled_back_peer = owner_inputs(answered(Some(row(1, 30, true, "acquire"))));
-        rolled_back_peer.own = Some(acquire(0, 32, 31));
-        rolled_back_peer.peer_synced = Some(row(1, 31, false, "release"));
+    }
+
+    #[test]
+    fn a_live_peer_claim_behind_its_synced_release_stops_payments() {
+        // This node acquired after the peer's release at 31, which its copy
+        // holds. The peer's database was rolled back to its claim at 30, and
+        // the peer may act on it until its own guard sees the rollback.
+        let mut inputs = owner_inputs(answered(Some(row(1, 30, true, "acquire"))));
+        inputs.own = Some(acquire(0, 32, 31));
+        inputs.peer_synced = Some(row(1, 31, false, "release"));
+        let mut guard = Guard::default();
         assert_eq!(
-            Guard::default().decide(&rolled_back_peer),
-            CarryDecision::CarryFree(CarryFreeReason::PeerClaimsOwnership)
+            guard.decide(&inputs),
+            CarryDecision::CarryFree(CarryFreeReason::PeerJournalBehind)
         );
+        assert!(!guard.peer_confirmed());
+        // At one epoch, a live claim against this node's copy: the same.
+        inputs.peer_read = answered(Some(row(1, 31, true, "acquire")));
+        assert_eq!(
+            Guard::default().decide(&inputs),
+            CarryDecision::CarryFree(CarryFreeReason::PeerJournalBehind)
+        );
+        // Once the peer's journal is back, this node pays again.
+        inputs.peer_read = answered(Some(row(1, 31, false, "release")));
+        assert!(guard.decide(&inputs).paying());
     }
 
     #[test]

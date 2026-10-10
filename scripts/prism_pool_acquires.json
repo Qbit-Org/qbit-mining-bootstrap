@@ -110,7 +110,7 @@
     "carry_owner.rs::every_answer#1::| pool | self .answer(pool , & read)": [1,"peer-journal"],
     "carry_owner.rs::answer#1::pool .acquire()": [1,"peer-journal"],
     "carry_owner.rs::check#1::ledger .acquire()": [2,"ledger"],
-    "carry_owner/transfer.rs::scan_chain#1::fetch_all(& ledger . pool)": [1,"operator"],
+    "carry_owner/transfer.rs::scan_chain#1::ledger .acquire()": [1,"ledger"],
     "carry_owner/transfer.rs::observe#1::ledger .acquire()": [1,"ledger"],
     "carry_owner/transfer.rs::transfer#1::ledger .acquire()": [2,"ledger"],
     "ledger/archive.rs::seal#1::maintenance_connection(ledger)": [1,"ledger"],

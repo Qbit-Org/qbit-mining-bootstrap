@@ -133,7 +133,8 @@ labels!(CarryOwnerState {
     SettingPending => "setting_pending",
     OwnJournalBehindPeer => "own_journal_behind_peer",
     OwnJournalRolledBack => "own_journal_rolled_back", ClaimNotVetted => "claim_not_vetted",
-    PeerClaimsOwnership => "peer_claims_ownership", PeerNotSeeded => "peer_not_seeded",
+    PeerClaimsOwnership => "peer_claims_ownership", PeerJournalBehind => "peer_journal_behind",
+    PeerNotSeeded => "peer_not_seeded",
     PeerUnconfirmed => "peer_unconfirmed"
 });
 // Whether the carry owner guard's live read of the peer's journal answered.

@@ -1747,6 +1747,7 @@ current one); `qbit_prism_carry_owner_alert` is 1 when it needs an operator.
 | `own_journal_rolled_back` | carry-free | yes | This node's latest journal row is older than one this frontend already read: its database was rolled back under it. Find out why, then restart the frontend: its own-log check at start pulls the lost rows back from the peer. |
 | `claim_not_vetted` | carry-free | yes | The peer released ownership, but this node's claim is not the `acquire` that `carry-owner transfer` wrote after that release. Run `carry-owner release` and then `carry-owner transfer` on this node. |
 | `peer_claims_ownership` | carry-free | yes | Both nodes claim ownership, so both build carry-free work. Run `carry-owner release` on both, then `carry-owner transfer` on the one that should own. |
+| `peer_journal_behind` | carry-free | yes | The peer's live journal claims ownership behind, or against, a newer row of the peer's this node holds: the peer's database was rolled back, or a lagging path answered. Do not release this node. Restart the peer's frontend, so its own-log check recovers its rows; this node pays again once the peer's journal is back. |
 | `peer_not_seeded` | carry-free | after start-up | The peer answers but has no journal row, so it may be running without the dual-writer rules. Start its frontend in dual-writer mode. |
 
 **Every state except `paying` is safe.** Carry-free work never reduces a
