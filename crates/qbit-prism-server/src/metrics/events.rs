@@ -424,6 +424,32 @@ impl Metrics {
             }
         }
     }
+    /// 3.1 dual writer (D1): when a dual-writer frontend starts its peer
+    /// sync, every counter of it exists at 0, one series per label value, so
+    /// that its first row, conflict, failure or offer wait is an increase an
+    /// alerting rule sees, not a series that begins at 1.
+    pub fn start_peer_sync(&self) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for table in PeerSyncTable::ALL {
+            let label = Labels::One(("table", table.as_str()));
+            registry.add(Family::PeerSyncRows, label.clone(), 0.);
+            registry.add(Family::PeerSyncConflicts, label, 0.);
+        }
+        for path in PeerSyncPath::ALL {
+            registry.add(
+                Family::PeerSyncFailures,
+                Labels::One(("path", path.as_str())),
+                0.,
+            );
+        }
+        for outcome in PeerIngestOutcome::ALL {
+            registry.add(
+                Family::PeerSyncOfferWaits,
+                Labels::One(("outcome", outcome.as_str())),
+                0.,
+            );
+        }
+    }
     /// 3.1 dual writer (D1): a failed peer sync pass on `path`.
     pub fn record_peer_sync_failure(&self, path: &str) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());

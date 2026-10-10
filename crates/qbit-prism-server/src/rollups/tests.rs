@@ -477,20 +477,19 @@ fn rollup_lag_is_unknown_until_a_caught_up_pass_and_only_such_a_pass_resets_it()
 }
 
 #[test]
-fn the_dual_writer_sweep_is_3_0s_with_its_batch_stopped_at_the_safe_peer_mark() {
-    assert_eq!(SWEEP.matches(BATCH_BOUND).count(), 1);
-    let split = SWEEP.find(BATCH_BOUND).unwrap() + BATCH_BOUND.len();
-    let dual = DUAL_WRITER_SWEEP.as_str();
-    // Only one clause inserted right after the batch bound; the rest is
-    // 3.0's text, which a single writer runs as it is.
-    assert!(dual.len() > SWEEP.len());
-    assert!(dual.starts_with(&SWEEP[..split]));
-    assert!(dual.ends_with(&SWEEP[split..]));
-    let clause = &dual[split..dual.len() - (SWEEP.len() - split)];
-    assert!(
-        clause.starts_with("\n      AND ledger.share_seq <= (") && clause.ends_with(')'),
-        "{clause}"
-    );
-    assert_eq!(clause.matches("qbit_prism_peer_share_mark()").count(), 1);
-    assert_eq!(clause.matches("peer_tail_lost_at IS NOT NULL").count(), 1);
+fn the_late_peer_fold_uses_the_sweeps_grains_and_buckets() {
+    // Compared with every run of whitespace as one space.
+    let squash = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    for part in [
+        "(VALUES (300), (3600), (86400)) AS grain(grain_seconds)",
+        "floor(extract(epoch FROM batch.accepted_at) / grains.grain_seconds)::bigint * grains.grain_seconds AS bucket_epoch",
+        "ON CONFLICT (grain_seconds, bucket_epoch) DO UPDATE",
+        "ON CONFLICT (grain_seconds, bucket_epoch, miner_id) DO UPDATE",
+        "qbit_hashrate_rollup_pool.accepted_share_count + EXCLUDED.accepted_share_count",
+        "qbit_hashrate_rollup_miner.accepted_share_difficulty + EXCLUDED.accepted_share_difficulty",
+    ] {
+        assert!(squash(SWEEP).contains(part), "rollups.sql lost {part}");
+        assert!(squash(LATE_PEER_SHARES).contains(part), "the late peer fold lost {part}");
+    }
+    assert!(squash(LATE_PEER_SHARES).contains(PROGRESS_LOCK.trim_start_matches("SELECT ")));
 }

@@ -7,7 +7,7 @@ use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
     ledger::{
         table_inventory::{self, LocalPart, Reset, TableClass, TABLE_INVENTORY},
-        IdentityCheck, Ledger, LineageEvidence, PeerSyncCursor, TableRows,
+        IdentityCheck, Ledger, LineageEvidence, PeerSyncCursor, RepersonaliseGuard, TableRows,
     },
     node_identity::NodeIndex,
     peer_sync::COPIED_TABLES,
@@ -410,7 +410,7 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
         sqlx::query("UPDATE qbit_prism_instances SET heartbeat_at=clock_timestamp() WHERE instance_id='node-a'")
             .execute(pool)
             .await?;
-        let error = error_of(b.repersonalise_node_identity(NodeIndex::B, "test")).await;
+        let error = error_of(b.repersonalise_node_identity(NodeIndex::B, "test", &RepersonaliseGuard::default())).await;
         ensure!(
             error.contains("refused, nothing was changed")
                 && error.contains("a frontend may be running on this database: node-a (starting")
@@ -429,7 +429,21 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
         .await?;
         ensure!(lineage_a == (2, 0), "node A's floors: {lineage_a:?}");
 
-        let done = b.repersonalise_node_identity(NodeIndex::B, "test-rebuild").await?;
+        // A physical copy promoted for B runs on a new timeline: A's last
+        // verification, carried in the copy, names A's own.
+        let LineageEvidence {
+            system_identifier,
+            timeline,
+        } = b.lineage_evidence().await?;
+        sqlx::query(
+            "UPDATE qbit_prism_node_lineage SET verified_system_identifier=$1,verified_timeline=$2,\
+             verified_at=clock_timestamp()",
+        )
+        .bind(system_identifier)
+        .bind(timeline - 1)
+        .execute(pool)
+        .await?;
+        let done = b.repersonalise_node_identity(NodeIndex::B, "test-rebuild", &RepersonaliseGuard::default()).await?;
         ensure!(done.copied_identity.node == NodeIndex::A, "{done:?}");
         ensure!(
             done.identity.node == NodeIndex::B && done.identity.recorded_by == "test-rebuild",
@@ -482,7 +496,7 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
                 == [
                     ("blocks".into(), 0, 0, None),
                     ("prepared".into(), 0, 0, None),
-                    ("shares".into(), 0, 18, Some(18)),
+                    ("shares".into(), 0, 18, None),
                 ],
             "{cursors:?}"
         );
@@ -495,7 +509,7 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
         ensure!(
             done.cursors
                 == [
-                    cursor("shares", 18, Some(18)),
+                    cursor("shares", 18, None),
                     cursor("blocks", 0, None),
                     cursor("prepared", 0, None),
                 ],
@@ -618,7 +632,7 @@ async fn rebuild_from(a: &PgPool, copy: &FixtureDatabase) -> Result<()> {
         // Setting the same node again changes nothing; repersonalising again
         // is refused.
         ensure!(b.set_node_identity(NodeIndex::B, "again").await? == done.identity);
-        let error = error_of(b.repersonalise_node_identity(NodeIndex::B, "again")).await;
+        let error = error_of(b.repersonalise_node_identity(NodeIndex::B, "again", &RepersonaliseGuard::default())).await;
         ensure!(error.contains("already dual-writer node B"), "{error}");
 
         // B's frontend appends B's shares, odd and after every row held.
@@ -692,7 +706,8 @@ async fn repersonalise_refuses_a_database_that_is_no_copy_of_the_peer() -> Resul
     let result = async {
         let ledger = &ledger;
         let pool = &ledger.pool;
-        let repersonalise = || ledger.repersonalise_node_identity(NodeIndex::B, "test");
+        let guard = RepersonaliseGuard::default();
+        let repersonalise = || ledger.repersonalise_node_identity(NodeIndex::B, "test", &guard);
         let error = error_of(repersonalise()).await;
         ensure!(error.contains("has no dual-writer node identity"), "{error}");
         ledger.set_node_identity(NodeIndex::A, "test").await?;
@@ -720,6 +735,27 @@ async fn repersonalise_refuses_a_database_that_is_no_copy_of_the_peer() -> Resul
         sqlx::query("UPDATE qbit_prism_instances SET status='{\"state\":\"stopped\"}' WHERE instance_id='live'")
             .execute(pool)
             .await?;
+        // No verification: nothing tells A's own database from a copy.
+        let error = error_of(repersonalise()).await;
+        ensure!(error.contains("carries no own-log verification of node A's"), "{error}");
+        unchanged().await?;
+        // Overridden, but the peer's server, read over its URL, is this one.
+        let here = ledger.lineage_evidence().await?;
+        let error = error_of(ledger.repersonalise_node_identity(
+            NodeIndex::B,
+            "test",
+            &RepersonaliseGuard {
+                unverified_copy: true,
+                peer_server: Some(here),
+            },
+        ))
+        .await;
+        ensure!(
+            error.contains("PRISM_PEER_DATABASE_URL reports this database's system identifier")
+                && !error.contains("carries no own-log verification"),
+            "{error}"
+        );
+        unchanged().await?;
         // The server node A last proved its own log on is A's own database.
         let LineageEvidence {
             system_identifier,
