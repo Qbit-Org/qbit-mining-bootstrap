@@ -1013,27 +1013,26 @@ async fn acked_shares_present(
 ) -> Result<Check> {
     let mut check = CheckBuilder::new("inv4-acked-shares-present");
     let acked: Vec<&ShareRecord> = shares.iter().filter(|record| record.accepted()).collect();
-    let headers: Vec<String> = acked
-        .iter()
-        .map(|record| record.header_hash().to_ascii_lowercase())
-        .collect();
+    // By the full share id the miner was answered for, worker and all: a row
+    // under the same header but another id is not this share.
+    let ids: Vec<String> = acked.iter().map(|record| record.share_id.clone()).collect();
     let mut excused_seen = BTreeMap::new();
     for (node, pool) in pools {
         if options.absent_ledgers.contains_key(node) {
             continue;
         }
         let missing: Vec<String> = sqlx::query_scalar(
-            "SELECT h.header_hash FROM unnest($1::text[]) AS h(header_hash) \
-             WHERE NOT EXISTS (SELECT 1 FROM qbit_prism_share_hashes m \
-                 JOIN qbit_share_ledger l ON l.share_id = m.share_id AND l.accepted \
-                 WHERE m.header_hash = h.header_hash)",
+            "SELECT s.share_id FROM unnest($1::text[]) AS s(share_id) \
+             WHERE NOT EXISTS (SELECT 1 FROM qbit_share_ledger l \
+                 JOIN qbit_prism_share_hashes m ON m.share_id = l.share_id \
+                 WHERE l.share_id = s.share_id AND l.accepted)",
         )
-        .bind(&headers)
+        .bind(&ids)
         .fetch_all(pool)
         .await?;
         let missing: BTreeSet<String> = missing.into_iter().collect();
         for record in &acked {
-            if !missing.contains(&record.header_hash().to_ascii_lowercase()) {
+            if !missing.contains(&record.share_id) {
                 continue;
             }
             match options.excused_missing.get(&record.share_id) {
