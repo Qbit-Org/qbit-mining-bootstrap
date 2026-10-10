@@ -94,6 +94,10 @@ mod settlement;
 pub mod window;
 pub use settlement::*;
 
+/// The per-node cut of a dual-writer payout window (PRISM 3.1).
+mod window_cut;
+pub use window_cut::{WindowCut, WindowCutError};
+
 pub const PRISM_WINDOW_MULTIPLIER: u128 = 8;
 pub const DEFAULT_P2MR_SPEND_INPUT_BYTES: u64 = 3_680;
 pub const DEFAULT_MIN_OUTPUT_FEERATE_SATS_PER_BYTE: u64 = 1;
@@ -130,6 +134,8 @@ pub enum PrismError {
     ZeroShareDifficulty { share_seq: u64 },
     #[error("duplicate share_id in PRISM window input: {share_id}")]
     DuplicateShareId { share_id: String },
+    #[error("share sequence {share_seq} is above every entry of the window cut")]
+    ShareOutsideWindowCut { share_seq: u64 },
     #[error("window arithmetic overflowed")]
     WindowOverflow,
     #[error("payout policy arithmetic overflowed")]
@@ -255,6 +261,11 @@ pub struct PrismRewardManifest {
     pub anchor_share_seq: u64,
     pub newest_share_seq: u64,
     pub oldest_share_seq: u64,
+    /// The dual-writer window's per-node cut ([`WindowCut`]), committed with
+    /// the rest of the manifest. Absent for every window without one, whose
+    /// bytes are therefore exactly 3.0's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<WindowCut>,
     pub included_share_count: usize,
     pub share_slice_digest_hex: String,
     pub shares: Vec<CountedShare>,
@@ -800,7 +811,19 @@ pub fn compute_prism_window(
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
 ) -> Result<PrismWindow, PrismError> {
-    let (eligible, requested_window_weight) = eligible_window(shares, found_block)?;
+    compute_prism_window_in_cut(shares, found_block, None)
+}
+
+/// [`compute_prism_window`] for a window with a dual-writer `cut`: the same
+/// fold, after refusing any share above the cut's highest entry
+/// ([`PrismError::ShareOutsideWindowCut`]). Without a cut it is exactly
+/// [`compute_prism_window`].
+fn compute_prism_window_in_cut(
+    shares: &[AcceptedShare],
+    found_block: &FoundBlock,
+    cut: Option<&WindowCut>,
+) -> Result<PrismWindow, PrismError> {
+    let (eligible, requested_window_weight) = eligible_window(shares, found_block, cut)?;
 
     let mut remaining = requested_window_weight;
     let mut counted_shares = Vec::new();
@@ -852,13 +875,22 @@ pub fn compute_prism_window(
 /// Validation, eligibility and newest-first ordering, shared by the serial
 /// fold and the builder's parallel fold so both take the same shares in the
 /// same order.
+///
+/// With a dual-writer `cut`, every share must be at or below the cut's highest
+/// entry. A bundle's shares carry no origin node, so this is the part of cut
+/// membership a bundle alone can prove; the ledger proves the rest when the
+/// block lands. Eligibility itself is unchanged: the anchor rule still decides
+/// it for every share, as the builder chose the cut so that it never excludes
+/// a share the cut admits (see [`WindowCut`]).
 fn eligible_window<'a>(
     shares: &'a [AcceptedShare],
     found_block: &FoundBlock,
+    cut: Option<&WindowCut>,
 ) -> Result<(Vec<&'a AcceptedShare>, u128), PrismError> {
     if found_block.network_difficulty == 0 {
         return Err(PrismError::ZeroNetworkDifficulty);
     }
+    let top = cut.map(WindowCut::top);
     let mut seen_share_ids = HashSet::with_capacity(shares.len());
     let mut eligible = Vec::with_capacity(shares.len());
     for share in shares {
@@ -866,6 +898,13 @@ fn eligible_window<'a>(
             return Err(PrismError::ZeroShareDifficulty {
                 share_seq: share.share_seq,
             });
+        }
+        if let Some(top) = top {
+            if top.is_none_or(|top| share.share_seq > top) {
+                return Err(PrismError::ShareOutsideWindowCut {
+                    share_seq: share.share_seq,
+                });
+            }
         }
         if !seen_share_ids.insert(share.share_id.as_str()) {
             return Err(PrismError::DuplicateShareId {
@@ -909,9 +948,10 @@ fn eligible_window<'a>(
 fn compute_prism_window_parallel(
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
+    cut: Option<&WindowCut>,
     parallelism: Parallelism,
 ) -> Result<(PrismWindow, String), PrismError> {
-    let (eligible, requested_window_weight) = eligible_window(shares, found_block)?;
+    let (eligible, requested_window_weight) = eligible_window(shares, found_block, cut)?;
     let mut remaining = requested_window_weight;
     let mut counted = Vec::with_capacity(eligible.len());
     for share in &eligible {
@@ -1019,19 +1059,20 @@ fn compute_prism_window_parallel(
     ))
 }
 
-/// [`build_prism_reward_manifest`] for the builder: serial parallelism is
-/// that function; anything wider folds through [`compute_prism_window_parallel`]
-/// and produces the identical manifest.
+/// [`build_prism_reward_manifest_with_cut`] for the builder: serial
+/// parallelism is that function; anything wider folds through
+/// [`compute_prism_window_parallel`] and produces the identical manifest.
 fn build_prism_reward_manifest_parallel(
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
+    cut: Option<WindowCut>,
     parallelism: Parallelism,
 ) -> Result<PrismRewardManifest, PrismError> {
     if parallelism.is_serial() {
-        return build_prism_reward_manifest(shares, found_block);
+        return build_prism_reward_manifest_with_cut(shares, found_block, cut);
     }
     let (window, share_slice_digest_hex) =
-        compute_prism_window_parallel(shares, found_block, parallelism)?;
+        compute_prism_window_parallel(shares, found_block, cut.as_ref(), parallelism)?;
     let newest_share_seq = window.shares[0].share_seq;
     let oldest_share_seq = window
         .shares
@@ -1050,6 +1091,7 @@ fn build_prism_reward_manifest_parallel(
         anchor_share_seq: window.anchor_share_seq,
         newest_share_seq,
         oldest_share_seq,
+        cut,
         included_share_count: window.shares.len(),
         share_slice_digest_hex,
         shares: window.shares,
@@ -1088,7 +1130,19 @@ pub fn build_prism_reward_manifest(
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
 ) -> Result<PrismRewardManifest, PrismError> {
-    let window = compute_prism_window(shares, found_block)?;
+    build_prism_reward_manifest_with_cut(shares, found_block, None)
+}
+
+/// [`build_prism_reward_manifest`] for a window with a dual-writer `cut`,
+/// which the manifest records and so commits. Every share must be at or below
+/// the cut's highest entry ([`PrismError::ShareOutsideWindowCut`]). With
+/// `None` it is exactly [`build_prism_reward_manifest`], byte for byte.
+pub fn build_prism_reward_manifest_with_cut(
+    shares: &[AcceptedShare],
+    found_block: &FoundBlock,
+    cut: Option<WindowCut>,
+) -> Result<PrismRewardManifest, PrismError> {
+    let window = compute_prism_window_in_cut(shares, found_block, cut.as_ref())?;
     let newest_share_seq = window.shares[0].share_seq;
     let oldest_share_seq = window
         .shares
@@ -1107,6 +1161,7 @@ pub fn build_prism_reward_manifest(
         anchor_share_seq: window.anchor_share_seq,
         newest_share_seq,
         oldest_share_seq,
+        cut,
         included_share_count: window.shares.len(),
         share_slice_digest_hex: share_slice_digest_hex(&window.shares),
         shares: window.shares,
@@ -1178,6 +1233,8 @@ pub struct PrismRewardManifestHeader {
     pub anchor_share_seq: u64,
     pub newest_share_seq: u64,
     pub oldest_share_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<WindowCut>,
     pub included_share_count: usize,
     pub share_slice_digest_hex: String,
     pub entitlements: Vec<WeightedEntitlement>,
@@ -1199,6 +1256,7 @@ impl PrismRewardManifest {
             anchor_share_seq,
             newest_share_seq,
             oldest_share_seq,
+            cut,
             included_share_count,
             share_slice_digest_hex,
             shares,
@@ -1217,6 +1275,7 @@ impl PrismRewardManifest {
                 anchor_share_seq,
                 newest_share_seq,
                 oldest_share_seq,
+                cut,
                 included_share_count,
                 share_slice_digest_hex,
                 entitlements,
@@ -1244,6 +1303,7 @@ impl PrismRewardManifestHeader {
             anchor_share_seq,
             newest_share_seq,
             oldest_share_seq,
+            cut,
             included_share_count,
             share_slice_digest_hex,
             entitlements,
@@ -1260,6 +1320,7 @@ impl PrismRewardManifestHeader {
             anchor_share_seq,
             newest_share_seq,
             oldest_share_seq,
+            cut,
             included_share_count,
             share_slice_digest_hex,
             shares,
@@ -1278,12 +1339,18 @@ impl PrismRewardManifestHeader {
 /// [`verify_audit_bundle`] raises for a bundle whose manifest does not match
 /// its shares. There is no way to obtain the rebuilt window without this
 /// check: the fold's own output is returned only once the header has matched.
+///
+/// A header with a dual-writer cut is rebuilt under that cut, so every share
+/// must fit it. The cut itself is taken from the header: whether it is the cut
+/// the block committed to is proved by the caller's check of the canonical
+/// bundle digest, which covers it, as it covers every other header field.
 pub fn restore_reward_manifest(
     header: PrismRewardManifestHeader,
     shares: &[AcceptedShare],
     found_block: &FoundBlock,
 ) -> Result<PrismRewardManifest, PrismError> {
-    let (rebuilt, window) = build_prism_reward_manifest(shares, found_block)?.into_parts();
+    let (rebuilt, window) =
+        build_prism_reward_manifest_with_cut(shares, found_block, header.cut)?.into_parts();
     if rebuilt != header {
         return Err(PrismError::AuditMismatch {
             artifact: "reward_manifest",
@@ -2044,6 +2111,7 @@ pub fn build_audit_bundle_body_with_coinbase_options(
     build_audit_bundle_body_with_coinbase_options_parallel(
         shares,
         found_block,
+        None,
         prior_balances,
         payout_policy,
         coinbase_script_sig_suffix_hex,
@@ -2058,10 +2126,15 @@ pub fn build_audit_bundle_body_with_coinbase_options(
 /// fold and the reward manifest's leaf digest spread over `parallelism`
 /// worker threads. The body is identical for every parallelism; verifiers
 /// never take this path.
+///
+/// `window_cut` is the dual-writer window's cut, recorded in (and so
+/// committed by) the reward manifest; `None`, as every single-writer and
+/// bootstrap window passes, builds exactly the 3.0 body.
 #[allow(clippy::too_many_arguments)]
 pub fn build_audit_bundle_body_with_coinbase_options_parallel(
     shares: &[AcceptedShare],
     found_block: FoundBlock,
+    window_cut: Option<WindowCut>,
     prior_balances: Vec<CarryForwardBalance>,
     payout_policy: PayoutPolicy,
     coinbase_script_sig_suffix_hex: Option<String>,
@@ -2077,7 +2150,7 @@ pub fn build_audit_bundle_body_with_coinbase_options_parallel(
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
     let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
-        build_prism_reward_manifest_parallel(shares, &found_block, parallelism)
+        build_prism_reward_manifest_parallel(shares, &found_block, window_cut, parallelism)
     })?;
     let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
         build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
@@ -2183,6 +2256,7 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options(
     build_audit_bundle_body_with_ctv_settlement_options_parallel(
         shares,
         found_block,
+        None,
         prior_balances,
         payout_policy,
         direct_floor_sats,
@@ -2201,10 +2275,15 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options(
 /// `parallelism` worker threads. The reward manifest is digested once for
 /// the commitment leaf and every fan-out precommitment; the body is
 /// identical for every parallelism, and verifiers never take this path.
+///
+/// `window_cut` is as for
+/// [`build_audit_bundle_body_with_coinbase_options_parallel`]: committed
+/// through the reward manifest, and `None` builds exactly the 3.0 body.
 #[allow(clippy::too_many_arguments)]
 pub fn build_audit_bundle_body_with_ctv_settlement_options_parallel(
     shares: &[AcceptedShare],
     found_block: FoundBlock,
+    window_cut: Option<WindowCut>,
     prior_balances: Vec<CarryForwardBalance>,
     payout_policy: PayoutPolicy,
     direct_floor_sats: u64,
@@ -2223,7 +2302,7 @@ pub fn build_audit_bundle_body_with_ctv_settlement_options_parallel(
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
     let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
-        build_prism_reward_manifest_parallel(shares, &found_block, parallelism)
+        build_prism_reward_manifest_parallel(shares, &found_block, window_cut, parallelism)
     })?;
     let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
         build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
@@ -2709,7 +2788,15 @@ fn verify_audit_view(
     verify_ledger_window_attestation(bundle, ledger_writer_public_key_hex)?;
     verify_signed_manifest(bundle.signed_coinbase_manifest)?;
 
-    let expected_reward_manifest = build_prism_reward_manifest(bundle.shares, bundle.found_block)?;
+    // A dual-writer manifest is rebuilt under its own cut. The cut is not
+    // taken on trust: the rebuilt manifest, cut included, feeds the commitment
+    // leaf the coinbase must match below, so a dropped or altered cut fails
+    // there even when every share fits it.
+    let expected_reward_manifest = build_prism_reward_manifest_with_cut(
+        bundle.shares,
+        bundle.found_block,
+        bundle.reward_manifest.cut,
+    )?;
     if expected_reward_manifest != *bundle.reward_manifest {
         return Err(PrismError::AuditMismatch {
             artifact: "reward_manifest",
@@ -3928,6 +4015,7 @@ mod tests {
             anchor_share_seq: 2,
             newest_share_seq: 2,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 2,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -3979,6 +4067,7 @@ mod tests {
             anchor_share_seq: 2,
             newest_share_seq: 2,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 2,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -4044,6 +4133,7 @@ mod tests {
             anchor_share_seq: 2,
             newest_share_seq: 2,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 2,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -4159,6 +4249,7 @@ mod tests {
             anchor_share_seq: 2,
             newest_share_seq: 2,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 2,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -4216,6 +4307,7 @@ mod tests {
             anchor_share_seq: 2,
             newest_share_seq: 2,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 2,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -4295,6 +4387,7 @@ mod tests {
             anchor_share_seq: 2,
             newest_share_seq: 2,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 2,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -4398,6 +4491,7 @@ mod tests {
             anchor_share_seq: 1,
             newest_share_seq: 1,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 1,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),
@@ -4436,6 +4530,7 @@ mod tests {
             anchor_share_seq: 1,
             newest_share_seq: 1,
             oldest_share_seq: 1,
+            cut: None,
             included_share_count: 1,
             share_slice_digest_hex: "00".repeat(32),
             shares: Vec::new(),

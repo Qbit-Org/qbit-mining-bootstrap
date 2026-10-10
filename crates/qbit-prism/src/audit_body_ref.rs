@@ -1,5 +1,5 @@
 use crate::{
-    build_prism_reward_manifest, canonical_audit_bundle_bytes, AcceptedShare, AuditBundle,
+    build_prism_reward_manifest_with_cut, canonical_audit_bundle_bytes, AcceptedShare, AuditBundle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -351,12 +351,16 @@ fn resolve_audit_bundle_v2(
         shares,
     )?;
     let bundle: AuditBundle = serde_json::from_value(bundle_value)?;
-    let expected_reward_manifest = build_prism_reward_manifest(&bundle.shares, &bundle.found_block)
-        .map_err(|err| {
-            AuditBodyRefError::Invalid(format!(
-                "audit-bundle.v2 reward manifest reconstruction failed: {err}"
-            ))
-        })?;
+    let expected_reward_manifest = build_prism_reward_manifest_with_cut(
+        &bundle.shares,
+        &bundle.found_block,
+        bundle.reward_manifest.cut,
+    )
+    .map_err(|err| {
+        AuditBodyRefError::Invalid(format!(
+            "audit-bundle.v2 reward manifest reconstruction failed: {err}"
+        ))
+    })?;
     if let Some(share_slice_digest_hex) = proof.share_slice_digest_hex {
         if !share_slice_digest_hex
             .eq_ignore_ascii_case(&expected_reward_manifest.share_slice_digest_hex)
