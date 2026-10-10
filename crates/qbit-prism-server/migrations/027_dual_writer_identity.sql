@@ -85,6 +85,15 @@ CREATE INDEX IF NOT EXISTS qbit_prism_jobs_prepared_origin_sync_idx
     ON qbit_prism_jobs (origin_node, sync_seq)
     WHERE sync_seq IS NOT NULL AND job_id LIKE 'prepared:%';
 
+--    Each node's expired jobs by its own range: a dual writer keeps the
+--    peer's prepared records a day past their expiry (CONTRACT D-3), so the
+--    expiry prune of one node's rows would otherwise walk the other's in the
+--    expiry index. The expiry prune keeps a single writer's table to its
+--    unexpired jobs, so the build is short, and the table is locked from the
+--    first ALTER above to the commit either way.
+CREATE INDEX IF NOT EXISTS qbit_prism_jobs_origin_expiry_idx
+    ON qbit_prism_jobs (origin_node, expires_at);
+
 -- 3. The carry-owner journal (CONTRACT D-4): which node pays down carried
 --    balances, as each node last recorded it. A node's current role is its
 --    highest-epoch row; epochs are pair-wide (a new row takes the highest

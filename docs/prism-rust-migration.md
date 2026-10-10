@@ -680,7 +680,12 @@ its partitions included, a `sync_seq` pull order on `qbit_pool_blocks` and
 node identity and lineage, and the peer sync's cursor and conflict tables.
 Every new column has a constant default or none, so no table is rewritten and
 no constraint is validated by a scan; each `ALTER` holds its table's lock only
-for the catalog change, until the migration commits. It is additive and
+for the catalog change, until the migration commits. Its three indexes are
+small: two are partial, over rows written after 027 only, and the third is
+`qbit_prism_jobs (origin_node, expires_at)` for the dual-mode expiry prune,
+built in the transaction over a table the expiry prune keeps to its unexpired
+jobs. The
+share ledger's index by origin is 031's, built online. It is additive and
 applied in the migration transaction, with no capability and no shutdown
 proof: an earlier binary accepts the unknown migration with a warning, and
 its inserts take the defaults. See
