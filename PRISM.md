@@ -120,6 +120,17 @@ These are pool/miner compatibility policies. The hard settlement ceiling is
 `PRISM_MAX_CTV_FANOUT_RECIPIENTS_PER_TRANSACTION`, and
 `PRISM_CTV_FANOUT_FEE_PREMIUM_BPS`.
 
+Each CTV fanout pays its own transaction fee, the market rate times the
+premium, charged to its recipients in proportion to their amounts. A recipient
+whose share would leave it below the payout floor pays only its amount above
+the floor, and the rest of the fee is spread over the fanout's other recipients
+the same way, so a recipient a few bits above the floor no longer refuses the
+whole template build. A build is still refused when a fanout's recipients
+together cannot pay its fee and all stay at the floor, or when a fanout holds a
+recipient already below the floor before any fee. A verifier from
+3.0.0-rc.6 or earlier rejects a bundle whose fee was capped this way, so
+upgrade every frontend and the audit CLI together.
+
 An explicit pool fee is governed by `PRISM_POOL_FEE_*`. Output order is
 `canonical` by default; `PRISM_COINBASE_OUTPUT_POLICY=pool-fee-first` requires a
 configured pool fee. Fee policy and output order are part of the shared cluster
