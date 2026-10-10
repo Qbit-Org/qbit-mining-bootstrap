@@ -3792,6 +3792,113 @@ refuses to start, naming each, until `node-identity set` runs again. A
 database with no identity, or the other node's, is reported: the frontend runs,
 but the peer sync does not, and the frontend admits no miners.
 
+### The peer sync
+
+With `PRISM_DUAL_WRITER` on, each frontend runs one peer sync task. It pulls
+the rows the peer originated, by identity, over `PRISM_PEER_DATABASE_URL` as
+the peer's read-only `prism_peer_sync` role, moving to
+`PRISM_PEER_DATABASE_URL_FALLBACK` when a path fails and back to the first path
+every 30 seconds. It passes every `PRISM_PEER_SYNC_INTERVAL_MS`, or at once
+while a batch of `PRISM_PEER_SYNC_BATCH_ROWS` was full; after a failed pass it
+waits longer each time, up to 5 seconds or the interval, whichever is longer. Every read on the peer is one
+statement: the peer session runs with an 8 s `statement_timeout`, under the
+client's 10 s bound, and never holds a transaction open, so a sync that dies
+mid-read leaves the peer no snapshot to hold (#738).
+
+Each pass first checks that this database is personalised as this node, that
+the peer's is personalised as the other node, that the peer runs this
+cluster's fingerprint, and that both carry the same columns of every copied
+table. If any check fails it syncs nothing, says why in an `ALERT` log line,
+and sets `qbit_prism_peer_sync_refused{reason}`. Then it pulls, in this order:
+
+1. **Shares** and their header mappings, in `share_seq` order. The pull scans
+   the peer's whole ledger from its cursor. Each node commits its own shares
+   in `share_seq` order under `ORDER_LOCK`, and raises its own sequence above
+   every peer share, under `ORDER_LOCK`, before it inserts it. So once a
+   position is visible on the peer, no share of the peer's below it can still
+   commit, and the cursor never passes a share the peer may yet commit. The
+   cursor is the safe peer mark, `qbit_prism_peer_share_mark()`: every peer
+   share at or below it is in this database, and none below it can arrive
+   later. Partitions are attached before a share beyond the lead is inserted.
+2. **The carry-owner journal**, re-read whole every pass.
+3. **Landed blocks**, each whole in one transaction, block row first: the
+   block with its audit snapshot and bundle, payout entries, carry rows and
+   CTV fanouts. Only the immutable landing facts are copied. The block lands
+   here `prepared`, its payouts and carry `immature`, and its fanouts
+   `awaiting_maturity` with no claim, so nothing counts until this node's own
+   reconciler confirms the block. A block whose hash this node already holds,
+   its own landing or an adoption, is skipped whole, and its facts are
+   compared. A block waits until the share mark covers its window.
+4. **Prepared jobs**, each with its template and balance blob, the blobs
+   first, in one transaction.
+
+Landed blocks and prepared jobs have no lock that orders their commits, so
+their pulls stop at the peer's sync barrier: every `sync_seq` is drawn under an
+advisory lock the drawing transaction holds shared until it ends. The puller's
+one statement, `qbit_prism_sync_barrier()`, tries the lock exclusively for its
+own transaction only, never waiting, and reads the sequence under it. Every
+row at or below that position has committed or never will, and a stalled
+puller can never leave the lock held.
+
+**Conflicts.** A pulled row under an identity this node holds with other
+content is never written over. Examples are a share whose header this node
+credits to another share, a block with other landing facts, or a payout or
+carry key reused. Each is recorded once in `qbit_prism_peer_sync_conflicts`,
+counted on every sighting in `qbit_prism_peer_sync_conflicts_total{table}`, and
+logged as an `ALERT`, and the stream moves past it. Any other failure to apply
+a row, such as a lock or statement timeout, keeps the cursor and the row is
+applied again on the next pass. In normal operation the table stays empty:
+investigate any row in it.
+
+**The own-log latch.** `qbit_prism_peer_sync_own_log_caught_up` is the peer
+sync's one readiness input. Until it is set, the Stratum listeners, the
+refresh and the submit loop wait. It is unset at start, and is set once this
+node holds every row it originated that the peer holds. The node pulls back
+any it lacks (its own shares, landings, prepared jobs and journal rows), then
+raises its own sequences and ledger clock above everything the peer has seen
+of it, and records the system identifier and WAL timeline it verified on in
+`qbit_prism_node_lineage`. If the peer cannot be reached or read at start, the
+latch is set when the database is still on that server, so a plain restart
+or a crash recovery serves. A new identifier or timeline, or no record, is
+rollback evidence: the latch stays unset, `qbit_prism_peer_sync_rollback_evidence`
+reads 1, and the node waits for the peer. If a row of this node's that the
+peer holds differs from the one here, the own log has diverged: the conflict
+is recorded, and the latch stays unset, with or without the peer, until an
+operator decides. Losing the peer later never clears the latch. A change of
+identifier or timeline while the frontend runs does.
+
+**Found blocks.** A dual-writer node has no failover standby, so
+`PRISM_OFFER_STANDBY_APPLICATION_NAME` and `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS`
+stay unset. Before a found block's
+`submitblock`, the node waits up to `PRISM_PEER_INGEST_WAIT_MS` (250 ms by
+default) for the peer's cursors to cover its shares through the block's window
+and the prepared record the block was built on: what the peer needs to adopt
+the block if this node dies. The block is offered whatever the wait finds,
+counted in `qbit_prism_peer_sync_offer_waits_total{outcome}`.
+
+**Watching it.** `qbit_prism_peer_sync_lag_rows{stream}` and
+`qbit_prism_peer_sync_lag_seconds{stream}` measure how far each stream is
+behind. `qbit_prism_peer_sync_peer_reachable`, `qbit_prism_peer_sync_path{path}`
+and `qbit_prism_peer_sync_failures_total{path}` show the peer and its paths.
+`qbit_prism_peer_sync_rows_total{table}` counts the rows inserted.
+
+### Restoring a node from its own backup
+
+Restore the node's own backup and start its frontend in dual mode as usual;
+nothing else is needed. The own-log latch keeps the node out of service until
+it has pulled back its own rows the peer holds. pgBackRest's normal restore
+recovers through the WAL archive and starts a new timeline, which the latch
+reads as rollback evidence even with the peer down, so the node waits for the
+peer. A restore that keeps the timeline, such as a base backup started without
+recovery or a filesystem snapshot rollback, is caught only when the peer is
+reachable at start. If the peer is down, clear the verification first, so
+the node waits for it:
+
+```sql
+UPDATE qbit_prism_node_lineage
+SET verified_system_identifier = NULL, verified_timeline = NULL, verified_at = NULL;
+```
+
 ### Rebuilding a node from its peer
 
 A node whose disk was replaced is rebuilt from a physical copy of its peer's
