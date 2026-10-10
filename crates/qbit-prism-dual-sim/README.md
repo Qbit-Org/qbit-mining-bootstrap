@@ -166,9 +166,9 @@ What each one does:
   few seconds; each must land and be followed by new jobs of B's before A
   thaws (a frozen peer must never stall the survivor's writes).
 - **S2, mid-pull:** both nodes take miners; A's frontend is frozen 20 times
-  for 1 to 4 s, each timed first to a moment its puller holds an advisory lock
-  on B's database (the sync barrier is one), else to one it has a query or a
-  transaction open there. During each freeze
+  for 1 to 4 s; new-tip rounds aim first at a moment its puller holds D1's sync
+  barrier on B's database, else at one it has a query or a transaction open
+  there. During each freeze
   B must keep writing: in 16 of them a new tip arrives and B must record jobs
   on it within 15 s; in every fifth, B lands a block solved on work handed out
   before the freeze and must build work on it. D1's sync barrier, held by a frozen
@@ -178,8 +178,9 @@ What each one does:
   250 shares/s. For 20 s, B is sampled every 10 ms and must never show A's
   peer backend idle in transaction. Then A's database link discards (B's
   replies drain and no close reaches it, as when A's host dies; a plain kill -9
-  sends a FIN), and A's frontend is killed while its puller is busy on B. A's
-  backends on B must hold no snapshot or transaction beyond 10 s, every miner
+  sends a FIN), and A's frontend is killed while its puller has a transaction
+  open on B. A's backends on B must hold no snapshot, transaction or lock beyond
+  10 s, every miner
   session must have shares accepted on B late in the minute after the death,
   and B's share answer latency must stay flat (p95 45 to 60 s
   after the death at most twice the p95 5 to 20 s after A's mark-down, plus
