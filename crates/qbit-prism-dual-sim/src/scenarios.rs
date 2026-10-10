@@ -635,10 +635,7 @@ async fn routing_settled(sim: &Sim) -> Result<()> {
 
 /// Accepted shares on jobs issued by `node`, answered after `after_ms`.
 fn accepted_from(records: &[ShareRecord], node: Node, after_ms: u64) -> usize {
-    records
-        .iter()
-        .filter(|r| r.accepted_on(node, after_ms))
-        .count()
+    crate::load::count_accepted_on(records, node, after_ms)
 }
 
 /// The `dual_writer` object of a node's `/healthz`, if it reports one.
@@ -1563,7 +1560,13 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
     );
     let died = Instant::now();
     let (mut last_holding, mut most) = (None, 0i64);
+    // Sessions routed to A when the balancer first had it down: none may
+    // follow while it is dead.
+    let mut routed_to_a_at_down: Option<u64> = None;
     while died.elapsed() < LINGER_WATCH {
+        if routed_to_a_at_down.is_none() && !sim.balancer.is_up("a") {
+            routed_to_a_at_down = sim.balancer.report().routed.get("a").copied();
+        }
         let holding: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
              WHERE usename = $1 AND datname = current_database() \
@@ -1602,6 +1605,11 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         .iter()
         .find(|t| t.backend == "a" && !t.up && t.at_ms >= cut_at)
         .map(|t| t.at_ms);
+    let routed_to_a = sim.balancer.report().routed.get("a").copied();
+    let routed_after_down = match (routed_to_a_at_down, routed_to_a) {
+        (Some(at_down), Some(now)) => Some(now.saturating_sub(at_down)),
+        _ => None,
+    };
     let records = sim.load()?.records();
     let flat = match marked_down {
         Some(down) if down + 20_000 <= fault_at + 45_000 => {
@@ -1609,9 +1617,10 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
             let (late, late_n) = answer_p95(&records, Node::B, fault_at + 45_000, fault_at + 60_000);
             let passed = matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50);
             (
-                passed,
+                passed && routed_after_down == Some(0),
                 format!(
-                    "p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares \
+                    "sessions routed to A after its mark-down: {routed_after_down:?}; \
+                     p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares \
                      5 to 20 s after A was marked down ({} ms after the death), {late:?} ms over \
                      {late_n} shares 45 to 60 s after the death (bound: twice the first, plus \
                      50 ms), at {PULLER_DEATH_RATE} offered shares/s",
@@ -1625,7 +1634,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim) -> Result<Body> {
         ),
     };
     body.expect(
-        "B's share appends stay flat while A's puller is dead",
+        "B takes every miner and its share appends stay flat while A's puller is dead",
         flat.0,
         flat.1,
     );
@@ -1841,7 +1850,9 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
         )
         .await?;
         // Each distinct (backend, statement start) of A's frontend seen
-        // waiting on the locked table is one attempt.
+        // waiting to INSERT into the locked table is one attempt. A finds no
+        // block of its own meanwhile, so only B's block's apply inserts
+        // there; A's own backfills of the table are UPDATEs.
         let mut attempts: std::collections::BTreeSet<WaitingApply> = Default::default();
         let holding = Instant::now();
         while holding.elapsed() < TRANSIENT_HOLD {
@@ -1851,7 +1862,8 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
                  WHERE NOT l.granted \
                    AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
                    AND l.relation = 'qbit_pool_audit_bundles'::regclass \
-                   AND a.usename = $1 AND a.query_start IS NOT NULL",
+                   AND a.usename = $1 AND a.query_start IS NOT NULL \
+                   AND ltrim(a.query) ILIKE 'insert%qbit_pool_audit_bundles%'",
             )
             .bind(crate::sim::OWNER_ROLE)
             .fetch_all(&a)
@@ -1868,9 +1880,21 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
         anyhow::Ok((block, attempts, on_a))
     }
     .await;
-    lock.rollback().await?;
+    let unlocked = lock.rollback().await;
+    let (block, attempts, held_while_locked) = match (held, unlocked) {
+        (Err(error), Err(unlock)) => {
+            return Err(error.context(format!(
+                "and unlocking A's audit bundles failed: {unlock:#}"
+            )))
+        }
+        (Err(error), Ok(())) => {
+            sim.mark("A's audit bundles unlocked");
+            return Err(error);
+        }
+        (Ok(_), Err(unlock)) => return Err(unlock.into()),
+        (Ok(held), Ok(())) => held,
+    };
     sim.mark("A's audit bundles unlocked");
-    let (block, attempts, held_while_locked) = held?;
     let landed = sim.wait_confirmed(&block, &[Node::A], CATCH_UP_BOUND).await;
     let conflicts: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT source_table, row_key, detail FROM qbit_prism_peer_sync_conflicts \
@@ -1884,7 +1908,7 @@ async fn s04_transient_apply(sim: &mut Sim) -> Result<Body> {
         "B's block, which A failed to apply while locked, lands on A once the lock clears",
         !attempts.is_empty() && !held_while_locked && landed.is_ok() && conflicts.is_empty(),
         format!(
-            "{} statements of A's frontend waited on the lock during the {} s hold (at least one \
+            "{} inserts of A's frontend waited on the lock during the {} s hold (at least one \
              must, or the retry was never exercised): {attempts:?}; on A while locked: \
              {held_while_locked} (the lock must keep it out); confirmed on A after the release: \
              {}; sync conflicts recorded for it: {conflicts:?}",
@@ -2224,10 +2248,13 @@ async fn s06_peer_unreadable(sim: &mut Sim, how: Unreadable) -> Result<Body> {
         (Err(error), Err(restore)) => {
             return Err(error.context(format!("and making B readable again failed: {restore:#}")))
         }
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) => {
+            sim.mark("B readable again");
+            return Err(error);
+        }
+        (Ok(()), Err(restore)) => return Err(restore),
+        (Ok(()), Ok(())) => sim.mark("B readable again"),
     }
-    sim.mark("B readable again");
     for node in Node::BOTH {
         if !sim.frontend(node).running() {
             sim.frontend_mut(node).start()?;
