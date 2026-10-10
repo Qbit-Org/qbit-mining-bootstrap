@@ -2045,7 +2045,9 @@ it:
   imported (a re-landing of that block filling its `found_block_bits`): it
   waits for that row's UPDATE to finish, and then goes first, because a poll
   that misses the lock and finds a session waiting for the importer rolls
-  the row back. Transaction-local timeouts bound each phase:
+  the row back. A stopped or killed importer's row is rolled back within a
+  second even mid-UPDATE: its transaction sets
+  `client_connection_check_interval`. Transaction-local timeouts bound each phase:
   `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS` (60 s) the write, and
   `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS` (5 s) the wait for the lock and,
   once it is held, any statement or client pause, after which PostgreSQL

@@ -762,7 +762,15 @@ fn stop_on_signals() -> Result<tokio::sync::watch::Receiver<bool>> {
     }
     #[cfg(not(unix))]
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        let mut signals = 0;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            signals += 1;
+            if signals > 1 {
+                refuse(
+                    1,
+                    "import-audits: a second stop signal; exiting now".to_owned(),
+                );
+            }
             stop.send_replace(true);
         }
     });

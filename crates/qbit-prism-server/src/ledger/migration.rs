@@ -3916,15 +3916,17 @@ impl Ledger {
         let mut imported = 0;
         let mut cursor = String::new();
         loop {
-            if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
-                return Err(ImportStopped { imported }.into());
-            }
             let started = std::time::Instant::now();
             // Decode only one historical window at a time, even when importing
             // years of inline JSON and canonical sidecars.
             let row = sqlx::query("SELECT block_hash,body_uri,audit_bundle,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1 ORDER BY block_hash LIMIT 1")
                 .bind(&cursor).fetch_optional(&mut *self.acquire().await?).await?;
             let Some(row) = row else { break };
+            // After the read, so a stop that lands once the last row is in
+            // still ends as a finished import.
+            if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+                return Err(ImportStopped { imported }.into());
+            }
             let hash: String = row.try_get("block_hash")?;
             cursor = hash.clone();
             let uri: Option<String> = row.try_get("body_uri")?;
@@ -4085,6 +4087,7 @@ impl Ledger {
             // The row changed after it was read; nothing to commit.
             tx.rollback().await?;
             row.total = started.elapsed();
+            let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
             return Ok(Some(row));
         }
         // Under SETTLEMENT_LOCK, a statement or a client gap that outlasts
@@ -4106,21 +4109,26 @@ impl Ledger {
             if granted {
                 break;
             }
-            ensure!(
-                !blocking,
-                "another session is waiting for this row while SETTLEMENT_LOCK is busy; the row is rolled back so it can go first, and nothing was stored"
-            );
-            ensure!(
-                asked.elapsed() < options.lock_timeout,
-                "SETTLEMENT_LOCK stayed busy for {} ms; the row is rolled back and nothing was stored",
-                options.lock_timeout.as_millis()
-            );
-            if until_stopped(stop, tokio::time::sleep(IMPORT_LOCK_RETRY))
-                .await
-                .is_none()
-            {
-                return Ok(None);
-            }
+            let refusal = if blocking {
+                "another session is waiting for a lock this row's write holds (the row, or its table) while SETTLEMENT_LOCK is busy; the row is rolled back so it can go first, and nothing was stored".to_owned()
+            } else if asked.elapsed() >= options.lock_timeout {
+                format!(
+                    "SETTLEMENT_LOCK stayed busy for {} ms; the row is rolled back and nothing was stored",
+                    options.lock_timeout.as_millis()
+                )
+            } else {
+                if until_stopped(stop, tokio::time::sleep(IMPORT_LOCK_RETRY))
+                    .await
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                continue;
+            };
+            // Release the row at once, and end the session cleanly.
+            tx.rollback().await?;
+            let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
+            bail!(refusal);
         }
         let granted = std::time::Instant::now();
         row.lock_wait = granted.duration_since(asked);
@@ -4385,6 +4393,9 @@ const IMPORT_REPOLL: Duration = Duration::from_millis(100);
 /// How long a committed row's connection may take to close before the
 /// importer drops it instead.
 const IMPORT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the server checks, while one of the importer's statements
+/// runs, that the importer is still connected.
+const IMPORT_CONNECTION_CHECK: Duration = Duration::from_secs(1);
 
 /// `future`'s output, or `None` once `stop` reads `true`. Without a stop
 /// signal, or once its sender is gone, just `future`'s output.
@@ -4428,15 +4439,19 @@ async fn repolled<F: std::future::Future>(future: F) -> F::Output {
 
 /// Set the transaction's `statement_timeout` and `lock_timeout` to
 /// `statement`, and its `idle_in_transaction_session_timeout` to `idle`.
-/// All three end with the transaction.
+/// While a statement runs, the server also checks every
+/// [`IMPORT_CONNECTION_CHECK`] that the client is still there, so an
+/// abandoned row (a stop drops its connection) is rolled back within that
+/// long even mid-UPDATE. All of these end with the transaction.
 async fn set_transaction_timeouts(
     tx: &mut Transaction<'_, Postgres>,
     statement: Duration,
     idle: Duration,
 ) -> Result<()> {
-    sqlx::query("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true),set_config('idle_in_transaction_session_timeout',$2,true)")
+    sqlx::query("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true),set_config('idle_in_transaction_session_timeout',$2,true),set_config('client_connection_check_interval',$3,true)")
         .bind(statement.as_millis().to_string())
         .bind(idle.as_millis().to_string())
+        .bind(IMPORT_CONNECTION_CHECK.as_millis().to_string())
         .execute(&mut **tx)
         .await?;
     Ok(())

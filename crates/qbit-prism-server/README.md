@@ -50,7 +50,7 @@ replace one frontend at a time. See the
 | `healthcheck [--url URL] [--public-api]` | Probe HTTP readiness, or identity-free Stratum readiness when audit HTTP is disabled |
 | `self-check` | Check a configured live deployment's node, database integrity/durability, and HTTP health |
 | `migrate` | Apply the additive PostgreSQL schema after stopping Python writers |
-| `import-audits [--root PATH]` | Verify and import database-referenced legacy filesystem bundles, one row per transaction. Each row is written before `SETTLEMENT_LOCK`, which covers only its write-guard check and commit; one line per row goes to stderr; SIGTERM or SIGINT stops it (exit 1) without committing the row in progress, and a second signal exits at once |
+| `import-audits [--root PATH]` | Verify and import database-referenced legacy filesystem bundles, one row per transaction. Each row is written before `SETTLEMENT_LOCK`, which covers only its write-guard check and commit; one line per row goes to stderr; SIGTERM or SIGINT stops it (exit 1) before the next row, rolling back a row not yet granted the lock (a row that holds it finishes its commit), and a second signal exits at once |
 | `backfill-ctv` | Reconstruct missing fanout sets from verified database audits |
 | `broadcast-ctv` | Process one batch of mature fanout claims |
 | `capacity-evidence FILE [options]` | Validate the strict v3 native load-evidence format |

@@ -882,7 +882,7 @@ async fn holder_waits_for_row(fixture: &Fixture) -> Result<()> {
         "the error does not name the row: {error}"
     );
     ensure!(
-        error.contains("another session is waiting for this row"),
+        error.contains("another session is waiting for a lock this row's write holds"),
         "{error}"
     );
     ensure!(
@@ -964,6 +964,93 @@ async fn stop_mid_write(fixture: &Fixture) -> Result<()> {
         "the abandoned row was stored"
     );
     fixture.relay.control.release();
+    let imported = fixture
+        .importer()
+        .import_legacy_audits_with(
+            Some(directory.path()),
+            &ledger_public_key(),
+            &options(None),
+            |_| {},
+        )
+        .await?;
+    ensure!(imported == 1, "the re-run imported {imported} rows");
+    ensure!(fixture.stored_digest(&block_hash).await?.as_deref() == Some(digest.as_str()));
+    Ok(())
+}
+
+/// A stop while the server is still running the row's UPDATE (here slowed
+/// by a test trigger) rolls it back within about a second: the importer's
+/// transaction asks the server to check that the client is still there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_while_the_server_runs_the_write_rolls_it_back_within_a_second() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = stop_mid_execution(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn stop_mid_execution(fixture: &Fixture) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = legacy_bundle(100, 10)?;
+    let (block_hash, digest) =
+        seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x56).await?;
+    sqlx::raw_sql(
+        "CREATE FUNCTION import765_slow() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.canonical_audit_bytes IS NOT NULL THEN PERFORM pg_sleep(30); END IF; \
+         RETURN NEW; END $$; \
+         CREATE TRIGGER import765_slow BEFORE UPDATE ON qbit_pool_audit_bundles \
+         FOR EACH ROW EXECUTE FUNCTION import765_slow();",
+    )
+    .execute(&fixture.ledger.pool)
+    .await?;
+    let (stop, stopping) = watch::channel(false);
+    let mut patient = options(Some(stopping));
+    // Only the stop can end this write.
+    patient.write_timeout = Duration::from_secs(600);
+    let importer = fixture.importer().clone();
+    let root = directory.path().to_path_buf();
+    let import = tokio::spawn(async move {
+        importer
+            .import_legacy_audits_with(Some(root.as_path()), &ledger_public_key(), &patient, |_| {})
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let running: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
+             AND state='active' AND wait_event='PgSleep' \
+             AND query LIKE 'UPDATE qbit_pool_audit_bundles SET schema_version%')",
+        )
+        .fetch_one(&fixture.ledger.pool)
+        .await?;
+        if running {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "the server never ran the write");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stopped = Instant::now();
+    stop.send_replace(true);
+    let failed = tokio::time::timeout(SLACK, import)
+        .await
+        .context("the import did not stop")??;
+    let error = failed.err().context("a stopped import succeeded")?;
+    ensure!(
+        error.downcast_ref::<ImportStopped>().is_some(),
+        "not a stop: {error:#}"
+    );
+    // Without the server's client check the trigger's 30 s would run out.
+    fixture.transactions_end(Duration::from_secs(5)).await?;
+    let ended = stopped.elapsed();
+    println!("stopped mid-execution; the server's transaction ended {ended:?} after the stop");
+    ensure!(
+        fixture.stored_digest(&block_hash).await?.is_none(),
+        "the abandoned row was stored"
+    );
+    sqlx::raw_sql("DROP TRIGGER import765_slow ON qbit_pool_audit_bundles")
+        .execute(&fixture.ledger.pool)
+        .await?;
     let imported = fixture
         .importer()
         .import_legacy_audits_with(
