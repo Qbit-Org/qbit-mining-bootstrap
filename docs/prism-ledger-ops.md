@@ -1666,7 +1666,10 @@ then.
   is always at a superseded revision: its shares are no longer credited, and a
   block on it is offered only through the #478 capture bound.
 - **The bump can fail** (for example while the cluster is halted). The change
-  then stays in force and the bump is retried every 2 s.
+  then stays in force and the bump is retried every 2 s. While the gate is
+  closed, or a change of it awaits its bump, an offer never takes a block on
+  carry-paying work for current work, whatever its revision: it goes through
+  the #478 capture bound, or is abandoned with capture off.
 - **Canonical balances elsewhere.** Landing, confirmation and the #478 records
   always measure against the canonical balances. The debt gauge
   (`qbit_prism_carry_forward_debt_sats`) is never fed from carry-free work.
@@ -1957,7 +1960,12 @@ fail after printing if a check refuses, or without `--confirm`.
    journals `acquire`, recording the peer epoch it read. With the copy, a peer
    rebuilt from this node's database gets its release back. The copy is the
    peer's own row, which the sync copies anyway, so it stands even if the
-   acquire is then refused.
+   acquire is then refused. Right before the acquire, under the lock, it
+   checks that the scanned tip is still on the active chain: after a
+   reorganisation, the new branch could hold a carry-paying block of the peer's
+   that the scan never saw, so nothing is acquired and the command asks to be
+   run again. Blocks found on top of the scanned tip are above the release
+   depth, so carry-free.
 4. **Finish the change.** Set `PRISM_CARRY_OWNER=true` on the new owner and
    `false` on the old one, and restart both frontends. Until then both report
    `setting_pending` and build carry-free work; nothing is paid twice.

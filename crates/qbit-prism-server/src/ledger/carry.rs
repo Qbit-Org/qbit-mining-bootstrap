@@ -232,6 +232,23 @@ pub(super) fn carry_free_block(dual_writer: bool, prior_balances_digest: &[u8; 3
     dual_writer && *prior_balances_digest == carry_free_prior_digest()
 }
 
+/// Whether a block built on `prior_balances_digest` paid carried balances
+/// while this dual-writer node's gate is closed, or a change of it still
+/// awaits its revision bump: work an offer must not take for current work
+/// whatever the payout revision says, since that bump may not have
+/// committed yet (it is retried until it does). A gate closed and reopened
+/// before either bump commits is still pending.
+pub(super) fn carry_paying_not_current(
+    dual_writer: bool,
+    gate_paying: bool,
+    fence_pending: bool,
+    prior_balances_digest: &[u8; 32],
+) -> bool {
+    dual_writer
+        && (!gate_paying || fence_pending)
+        && !carry_free_block(dual_writer, prior_balances_digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +346,24 @@ mod tests {
         assert!(ledger.found_here(Some(&coinbase(7)), false));
         assert!(!ledger.found_here(None, false));
         assert!(ledger.found_here(Some(&[0]), true));
+    }
+
+    #[test]
+    fn carry_paying_work_is_not_current_behind_a_closed_or_unfenced_dual_writer_gate() {
+        let free = carry_free_prior_digest();
+        let paying = [0x5a; 32];
+        // Closed, open with its change unfenced, open and fenced.
+        assert!(carry_paying_not_current(true, false, false, &paying));
+        assert!(carry_paying_not_current(true, false, true, &paying));
+        assert!(carry_paying_not_current(true, true, true, &paying));
+        assert!(!carry_paying_not_current(true, true, false, &paying));
+        // Carry-free work is always current.
+        for (open, pending) in [(false, false), (false, true), (true, true), (true, false)] {
+            assert!(!carry_paying_not_current(true, open, pending, &free));
+        }
+        // A single writer pays carried balances for good.
+        assert!(!carry_paying_not_current(false, false, true, &paying));
+        assert!(!carry_paying_not_current(false, true, false, &paying));
     }
 
     #[test]
