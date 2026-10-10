@@ -168,7 +168,10 @@ What each one does:
   whole network blackholed); miners reach B within 30 s, B finds two
   carry-free blocks, A's unsynced tail is measured, A returns, confirms B's
   blocks from its own chain view, and its next block pays the carry they
-  accrued (its priors equal the chain's sums).
+  accrued (its priors equal the chain's sums). With its PostgreSQL killed,
+  A's frontend is still up and must withdraw on its own: its first failed
+  readiness check must come within 10 s of the kill (D4 withdraws a writer
+  unanswered for 4 s), and the mark-down within 12 s of that.
 - **S2's freeze** holds A frozen for at least 60 s while B finds a block every
   few seconds; each must land and be followed by new jobs of B's before A
   thaws (a frozen peer must never stall the survivor's writes).
