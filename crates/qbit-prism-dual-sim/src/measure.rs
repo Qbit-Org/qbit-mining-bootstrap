@@ -139,6 +139,79 @@ pub fn lag_report(samples: &[LagSample]) -> LagReport {
     }
 }
 
+/// CONTRACT.md D-5: within a sync cycle shares are applied before
+/// landings, so a peer's block is never seen on a node before every share
+/// of its window is. While it runs, the sampler looks at one node for peer
+/// blocks it has not seen yet and, the moment each appears, counts its
+/// window's shares there against the recorded count.
+pub struct LandingOrderSampler {
+    stop: Arc<AtomicBool>,
+    task: JoinHandle<Result<Vec<LandingOrder>>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LandingOrder {
+    pub block: String,
+    pub seen_ms: u64,
+    pub window_shares: i64,
+    pub present: i64,
+}
+
+impl LandingOrder {
+    pub fn complete(&self) -> bool {
+        self.present == self.window_shares
+    }
+}
+
+impl LandingOrderSampler {
+    /// Watch `pool` (one node's database) for blocks of `peer` origin.
+    pub fn start(pool: PgPool, peer: Node, clock: RunClock) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                let mut seen: Vec<String> = Vec::new();
+                let mut samples = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    let rows: Vec<(String, String)> = sqlx::query_as(
+                        "SELECT b.block_hash, a.share_snapshot_sha256 \
+                         FROM qbit_pool_blocks b \
+                         JOIN qbit_pool_audit_bundles a ON a.block_hash = b.block_hash \
+                         WHERE b.origin_node = $1 AND NOT (b.block_hash = ANY($2))",
+                    )
+                    .bind(peer.index() as i16)
+                    .bind(&seen)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+                    for (block, snapshot) in rows {
+                        let seen_ms = clock.now_ms();
+                        let windows = crate::invariants::recorded_windows(&pool).await?;
+                        if let Some(window) = windows.iter().find(|w| w.snapshot == snapshot) {
+                            let (present, _) = crate::invariants::window_now(&pool, window).await?;
+                            samples.push(LandingOrder {
+                                block: block.clone(),
+                                seen_ms,
+                                window_shares: window.count,
+                                present,
+                            });
+                        }
+                        seen.push(block);
+                    }
+                    tokio::time::sleep(LAG_POLL).await;
+                }
+                Ok(samples)
+            }
+        });
+        Self { stop, task }
+    }
+
+    pub async fn stop(self) -> Result<Vec<LandingOrder>> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.task.await?
+    }
+}
+
 /// Every header hash a database credits now.
 pub async fn credited_headers(pool: &PgPool) -> Result<BTreeSet<String>> {
     Ok(

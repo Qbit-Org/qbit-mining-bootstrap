@@ -784,6 +784,8 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
         sim.pool(Node::B).await?,
         sim.clock,
     );
+    let order =
+        crate::measure::LandingOrderSampler::start(sim.pool(Node::B).await?, Node::A, sim.clock);
     for note in ["A's first block", "A's second block"] {
         let hash = find_block(sim, &mut body, Node::A, note, None).await?;
         let took = confirm_on_both(sim, &hash).await?;
@@ -794,6 +796,7 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
         steady(sim, 4).await;
     }
     let (lag, _) = sampler.stop().await?;
+    expect_landing_order(&mut body, order.stop().await?);
     body.expect(
         "A's shares reach B within the sync interval",
         lag.resolved > 0 && lag.p95_ms.is_some_and(|ms| ms <= SYNC_LAG_BOUND_MS),
@@ -815,6 +818,20 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
     );
     expect_dual_health(sim, &mut body).await?;
     Ok(body)
+}
+
+/// D-5: every peer block a sampler saw arrive had its whole window there.
+fn expect_landing_order(body: &mut Body, samples: Vec<crate::measure::LandingOrder>) {
+    let incomplete: Vec<&crate::measure::LandingOrder> =
+        samples.iter().filter(|sample| !sample.complete()).collect();
+    body.expect(
+        "a peer block never lands before its window's shares (D-5)",
+        !samples.is_empty() && incomplete.is_empty(),
+        format!(
+            "{} peer blocks seen arriving; incomplete windows: {incomplete:?}",
+            samples.len()
+        ),
+    );
 }
 
 /// S2. A dies (`death`) under load. Miners move to B within the failover
@@ -1027,6 +1044,10 @@ async fn s05_both_write(sim: &mut Sim) -> Result<Body> {
     let mut body = Body::default();
     sim.load()?.resume();
     steady(sim, 6).await;
+    let on_a =
+        crate::measure::LandingOrderSampler::start(sim.pool(Node::A).await?, Node::B, sim.clock);
+    let on_b =
+        crate::measure::LandingOrderSampler::start(sim.pool(Node::B).await?, Node::A, sim.clock);
     for (node, note) in [
         (Node::A, "A, both writing"),
         (Node::B, "B, both writing"),
@@ -1037,6 +1058,9 @@ async fn s05_both_write(sim: &mut Sim) -> Result<Body> {
         confirm_on_both(sim, &hash).await?;
         steady(sim, 3).await;
     }
+    let mut samples = on_a.stop().await?;
+    samples.extend(on_b.stop().await?);
+    expect_landing_order(&mut body, samples);
     sim.settle(SETTLE_BOUND).await?;
     let records = sim.load()?.records();
     for node in Node::BOTH {
