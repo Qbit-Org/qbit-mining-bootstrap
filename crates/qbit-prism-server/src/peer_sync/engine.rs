@@ -3,7 +3,10 @@
 //! batch. A pass whose peer reads fail is counted and logged, and the next
 //! one starts over on the other path; peer rows that fail to apply here fail
 //! only their stream, which tries them again next pass and alerts when that
-//! goes on. The loop ends only at shutdown.
+//! goes on. The loop ends at shutdown, or with [`OwnLogLostWhileRunning`]
+//! when the database was restored or promoted under the running frontend,
+//! which stops the frontend: its restart serves only once own-log recovery
+//! completes (D-8).
 //!
 //! Each pass, in order:
 //! 1. this database must be personalised as this node (D-9, checked every
@@ -154,6 +157,22 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// The database was restored or promoted under the running frontend (D-8,
+/// D-17): [`PeerSync::run`] ends with it, which stops the frontend.
+#[derive(Debug)]
+pub struct OwnLogLostWhileRunning;
+
+impl std::fmt::Display for OwnLogLostWhileRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this node's database was restored or promoted under the running frontend: it stops, \
+             and its restart serves only once own-log recovery completes (D-8)",
+        )
+    }
+}
+
+impl std::error::Error for OwnLogLostWhileRunning {}
+
 /// What one pass did.
 #[derive(Clone, Debug, Default)]
 pub struct PassReport {
@@ -208,8 +227,6 @@ pub struct PeerSync {
     paths: Vec<Path>,
     active: usize,
     on_fallback_since: Option<Instant>,
-    local_columns: Option<CarriedColumns>,
-    peer_columns_checked: Option<usize>,
     identity_checked: Option<Instant>,
     identity_refusal: Option<Refusal>,
     latch: Latch,
@@ -249,8 +266,6 @@ impl PeerSync {
                 .collect(),
             active: 0,
             on_fallback_since: None,
-            local_columns: None,
-            peer_columns_checked: None,
             identity_checked: None,
             identity_refusal: None,
             latch: Latch::default(),
@@ -268,9 +283,10 @@ impl PeerSync {
         self.publisher.subscribe()
     }
 
-    /// Pass until `shutdown` turns true. Never returns an error: a failed
-    /// pass is logged and counted, and the next one starts over on the other
-    /// path after a pause that grows with consecutive failures.
+    /// Pass until `shutdown` turns true. A failed pass is logged and counted,
+    /// and the next one starts over on the other path after a pause that
+    /// grows with consecutive failures. The one error it returns is
+    /// [`OwnLogLostWhileRunning`], which stops the frontend.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut failures: u32 = 0;
         loop {
@@ -285,6 +301,14 @@ impl PeerSync {
                     } else {
                         self.interval
                     }
+                }
+                Err(error) if error.downcast_ref::<OwnLogLostWhileRunning>().is_some() => {
+                    for path in &mut self.paths {
+                        if let Some(pool) = path.pool.take() {
+                            pool.close().await;
+                        }
+                    }
+                    return Err(error);
                 }
                 Err(error) => {
                     failures = failures.saturating_add(1);
@@ -336,7 +360,6 @@ impl PeerSync {
         if let Some(pool) = self.paths[self.active].pool.take() {
             tokio::spawn(async move { pool.close().await });
         }
-        self.peer_columns_checked = None;
         if self.paths.len() > 1 {
             self.active = (self.active + 1) % self.paths.len();
             self.on_fallback_since = (self.active != 0).then(Instant::now);
@@ -356,7 +379,6 @@ impl PeerSync {
             }
             self.active = 0;
             self.on_fallback_since = None;
-            self.peer_columns_checked = None;
         }
         let path = &mut self.paths[self.active];
         if path.pool.is_none() {
@@ -387,11 +409,11 @@ impl PeerSync {
     /// One pass. Public so that tests can drive the sync step by step.
     pub async fn pass(&mut self) -> Result<PassReport> {
         let mut report = PassReport::default();
-        if let Some(refusal) = self.check_local_identity().await? {
-            report.refused = Some(refusal.clone());
-            self.publish(false, Some(&refusal));
-            return Ok(report);
-        }
+        // First, before anything may refuse: a database restored or promoted
+        // under the running frontend stops it (D-8). Its restart serves
+        // nothing until own-log recovery completes, which no task started
+        // before the restore could guarantee; until it exits, no share is
+        // appended.
         if self.latch.caught_up {
             let now = self.ledger.lineage_evidence().await?;
             if Some(now) != self.latch.evidence {
@@ -399,12 +421,23 @@ impl PeerSync {
                     previous = ?self.latch.evidence,
                     now = ?now,
                     "ALERT: this database's system identifier or WAL timeline changed while the \
-                     frontend ran: a restore or promotion; the own log is checked against the peer \
-                     again before this node serves"
+                     frontend ran: a restore or promotion; the frontend stops, and serves again \
+                     only once its own log is checked against the peer"
                 );
+                self.ledger.set_own_log_lost(true);
                 self.latch = Latch::default();
+                self.publish(false, None);
+                return Err(OwnLogLostWhileRunning.into());
             }
         }
+        if let Some(refusal) = self.check_local_identity().await? {
+            report.refused = Some(refusal.clone());
+            self.publish(false, Some(&refusal));
+            return Ok(report);
+        }
+        // This database's copied columns, read before the peer is touched, so
+        // that a local failure fails the pass before any peer read.
+        let local_columns = self.ledger.carried_columns().await?;
         let mut connection = match self.peer_connection().await {
             Ok(connection) => connection,
             Err(error) => {
@@ -421,7 +454,9 @@ impl PeerSync {
         };
         report.reached_peer = true;
         report.path = Some(self.active);
-        let on_peer = self.pass_on_peer(&mut connection, &mut report).await;
+        let on_peer = self
+            .pass_on_peer(&mut connection, &mut report, &local_columns)
+            .await;
         if let Err(error) = on_peer {
             // A peer that answers the connection but cannot be read is as
             // good as unreachable for the latch (D-8): without it, the latch
@@ -446,9 +481,10 @@ impl PeerSync {
         &mut self,
         connection: &mut sqlx::PgConnection,
         report: &mut PassReport,
+        local_columns: &CarriedColumns,
     ) -> Result<()> {
         let facts = bounded(peer::facts(connection)).await?;
-        if let Some(refusal) = self.check_peer(connection, &facts).await? {
+        if let Some(refusal) = self.check_peer(connection, &facts, local_columns).await? {
             tracing::error!(%refusal, "ALERT: the peer sync refuses this peer");
             self.latch_without_peer().await?;
             report.own_log_caught_up = self.latch.caught_up;
@@ -501,9 +537,6 @@ impl PeerSync {
         if let Some(refusal) = &refusal {
             tracing::error!(%refusal, "ALERT: the peer sync does not run");
         }
-        if self.local_columns.is_none() && refusal.is_none() {
-            self.local_columns = Some(self.ledger.carried_columns().await?);
-        }
         self.identity_checked = Some(Instant::now());
         self.identity_refusal = refusal.clone();
         Ok(refusal)
@@ -516,6 +549,7 @@ impl PeerSync {
         &mut self,
         connection: &mut sqlx::PgConnection,
         facts: &PeerFacts,
+        ours: &CarriedColumns,
     ) -> Result<Option<Refusal>> {
         let peer = self.node.peer();
         match facts.node {
@@ -540,17 +574,13 @@ impl PeerSync {
         if self.ledger.stored_config_fingerprint().await? != facts.config_fingerprint {
             return Ok(Some(Refusal::Fingerprint));
         }
-        if self.peer_columns_checked != Some(self.active) {
-            let theirs = bounded(CarriedColumns::read(connection)).await?;
-            let ours = self
-                .local_columns
-                .as_ref()
-                .context("this database's carried columns were not read")?;
-            let differences = ours.differences(&theirs);
-            if !differences.is_empty() {
-                return Ok(Some(Refusal::Schema(differences)));
-            }
-            self.peer_columns_checked = Some(self.active);
+        // Both sides' columns, every pass, before any pull: a rolling
+        // migration that gives one node a copied column first stops the sync
+        // before a cursor passes rows whose new column this node would drop.
+        let theirs = bounded(CarriedColumns::read(connection)).await?;
+        let differences = ours.differences(&theirs);
+        if !differences.is_empty() {
+            return Ok(Some(Refusal::Schema(differences)));
         }
         Ok(None)
     }

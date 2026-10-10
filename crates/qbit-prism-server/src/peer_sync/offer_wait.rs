@@ -113,16 +113,28 @@ impl PeerIngestWait {
 
     /// Wait until the peer's cursors cover what `needs` resolves to, or the
     /// bound passes. The bound starts before `needs`, this node's own read,
-    /// so a busy local pool cannot hold the offer past it either. Returns
-    /// the time waited, the outcome, and the needs when they were read.
+    /// so a busy local pool cannot hold the offer past it either; a read
+    /// that fails ends the wait at once, unconfirmed, since nothing the peer
+    /// shows could confirm what this node could not read. Returns the time
+    /// waited, the outcome, and the needs when they were read.
     pub async fn wait(
         &self,
-        needs: impl Future<Output = AdoptionNeeds>,
+        needs: impl Future<Output = Result<AdoptionNeeds>>,
     ) -> (Duration, PeerIngest, Option<AdoptionNeeds>) {
         let started = Instant::now();
         let deadline = started + self.bound;
-        let Ok(needs) = tokio::time::timeout_at(deadline.into(), needs).await else {
-            return (started.elapsed(), PeerIngest::TimedOut, None);
+        let needs = match tokio::time::timeout_at(deadline.into(), needs).await {
+            Ok(Ok(needs)) => needs,
+            Ok(Err(error)) => {
+                return (
+                    started.elapsed(),
+                    PeerIngest::Unreachable(format!(
+                        "this node could not read what adopting the block needs: {error:#}"
+                    )),
+                    None,
+                )
+            }
+            Err(_) => return (started.elapsed(), PeerIngest::TimedOut, None),
         };
         let mut last_error = None;
         loop {

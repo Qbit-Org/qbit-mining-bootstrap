@@ -205,6 +205,7 @@ impl Ledger {
             metrics: None,
             config_fingerprint: std::sync::Arc::default(),
             dual_writer_identity: std::sync::Arc::default(),
+            own_log_lost: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
             compact_decode_hook: Default::default(),
@@ -439,6 +440,7 @@ impl Ledger {
             metrics,
             config_fingerprint: std::sync::Arc::default(),
             dual_writer_identity: std::sync::Arc::default(),
+            own_log_lost: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
             #[cfg(test)]
@@ -534,6 +536,23 @@ impl Ledger {
     /// writer, whose behaviour is 3.0's.
     pub fn dual_writer_identity(&self) -> Option<crate::node_identity::NodeIdentity> {
         self.dual_writer_identity.get().copied()
+    }
+
+    /// Record whether this node's own log is lost (D-8): the peer sync sets
+    /// it when the database showed rollback evidence while the frontend ran,
+    /// a restore under it, and then stops the frontend. Its sequences may sit
+    /// below rows of its own the peer holds, so until the process exits no
+    /// share is appended, a credited deferred share included. Only a running
+    /// peer sync sets it, so a ledger without one, a single writer's
+    /// included, never refuses.
+    pub fn set_own_log_lost(&self, lost: bool) {
+        self.own_log_lost
+            .store(lost, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this node's own log is lost; see [`Ledger::set_own_log_lost`].
+    pub fn own_log_lost(&self) -> bool {
+        self.own_log_lost.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The cluster fingerprint this frontend pinned or verified in

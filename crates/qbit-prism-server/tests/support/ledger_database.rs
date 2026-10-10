@@ -192,7 +192,27 @@ impl FixtureDatabase {
             armed: true,
             creation_unknown: false,
         };
-        let created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
+        let mut created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
+        // A copy refuses while a session is still connected to its template
+        // (55006), and a backend whose client has just closed its pool can
+        // linger a moment on a busy server, so a copy waits for it briefly.
+        // Nothing was created, so the retry cannot meet its own database.
+        if template.is_some() {
+            let mut attempts = 0;
+            while attempts < 50
+                && created.as_ref().err().is_some_and(|error| {
+                    error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .as_deref()
+                        == Some("55006")
+                })
+            {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                created = sqlx::raw_sql(&statement).execute(&mut *connection).await;
+            }
+        }
         // Return the pool's only connection before any cleanup needs it.
         drop(connection);
         if let Err(error) = created {

@@ -570,6 +570,20 @@ async fn the_own_log_latch_without_and_with_the_peer() -> Result<()> {
             .await?;
         let (mut rolled_back, _) = sync(&pair.a, NodeIndex::A, &dead);
         ensure!(!rolled_back.pass().await?.own_log_caught_up);
+        // While a frontend whose database was restored under it stops (the
+        // engine sets this when the evidence changes as it runs), no share is
+        // appended.
+        pair.a.set_own_log_lost(true);
+        let refused = append(&pair.a, &["while-lost"]).await;
+        ensure!(
+            refused.as_ref().is_err_and(|error| error
+                .downcast_ref::<qbit_prism_server::ledger::OwnLogLost>()
+                .is_some()),
+            "{refused:?}"
+        );
+        // The frontend stops with the flag set; its restart has a fresh one.
+        pair.a.set_own_log_lost(false);
+        append(&pair.a, &["after-restart"]).await?;
         let (mut recovering, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
         ensure!(recovering.pass().await?.own_log_caught_up);
         // 5. The peer lost later never clears the latch.
@@ -876,7 +890,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
             share_seq: Some(seqs[1]),
             prepared_sync_seq: prepared,
         };
-        let (waited, outcome, _) = wait.wait(std::future::ready(held)).await;
+        let (waited, outcome, _) = wait.wait(std::future::ready(Ok(held))).await;
         ensure!(
             outcome == PeerIngest::Confirmed && waited < bound,
             "{outcome:?} after {waited:?}"
@@ -885,7 +899,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
             share_seq: Some(seqs[1] + 1000),
             prepared_sync_seq: prepared,
         };
-        let (waited, outcome, _) = wait.wait(std::future::ready(beyond)).await;
+        let (waited, outcome, _) = wait.wait(std::future::ready(Ok(beyond))).await;
         ensure!(
             outcome == PeerIngest::TimedOut && waited >= bound.mul_f32(0.9),
             "{outcome:?} after {waited:?}"
@@ -893,13 +907,25 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         ensure!(waited < bound * 4, "the wait overran its bound: {waited:?}");
         let dead = PeerIngestWait::new(&config(NodeIndex::A, &dead_url(&pair.b_url)?, None))?
             .context("the wait is on by default")?;
-        let (_, outcome, _) = dead.wait(std::future::ready(held)).await;
+        let (_, outcome, _) = dead.wait(std::future::ready(Ok(held))).await;
         ensure!(matches!(outcome, PeerIngest::Unreachable(_)), "{outcome:?}");
+        // A local read that fails leaves the offer unconfirmed at once.
+        let started = std::time::Instant::now();
+        let (_, outcome, needs) = wait
+            .wait(std::future::ready(Err(anyhow::anyhow!(
+                "the local read failed"
+            ))))
+            .await;
+        ensure!(
+            matches!(outcome, PeerIngest::Unreachable(_)) && needs.is_none(),
+            "{outcome:?}"
+        );
+        ensure!(started.elapsed() < bound / 2, "it waited for nothing");
         // This node's own read of the needs is inside the bound too.
         let (waited, outcome, needs) = wait
             .wait(async {
                 tokio::time::sleep(bound * 2).await;
-                held
+                Ok(held)
             })
             .await;
         ensure!(
@@ -925,7 +951,7 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
         let fallback =
             PeerIngestWait::new(&config(NodeIndex::A, hung.as_str(), Some(&pair.b_url)))?
                 .context("the wait is on by default")?;
-        let (waited, outcome, _) = fallback.wait(std::future::ready(held)).await;
+        let (waited, outcome, _) = fallback.wait(std::future::ready(Ok(held))).await;
         held_sockets.abort();
         ensure!(
             outcome == PeerIngest::Confirmed && waited < bound,
@@ -1230,10 +1256,10 @@ async fn the_sync_needs_only_the_peer_roles_documented_grants() -> Result<()> {
                 .context("the offer wait is configured")?;
             let a_last = shares_of(&pair.a.pool, 0).await?.last().map(|(seq, _)| *seq);
             let (_, ingest, _) = wait
-                .wait(std::future::ready(AdoptionNeeds {
+                .wait(std::future::ready(Ok(AdoptionNeeds {
                     share_seq: a_last,
                     prepared_sync_seq: None,
-                }))
+                })))
                 .await;
             ensure!(ingest == PeerIngest::Confirmed, "{ingest:?}");
             Ok(())

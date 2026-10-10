@@ -2950,30 +2950,28 @@ impl Coordinator {
         wait: &crate::peer_sync::PeerIngestWait,
         candidate: &crate::ledger::Candidate,
     ) {
-        // This node's own read is inside the wait's bound too.
+        // This node's own read is inside the wait's bound too; if it fails,
+        // the offer goes unconfirmed at once.
         let needs = async {
             let prepared = match self.ledger.dual_writer_identity() {
-                Some(identity) => self
-                    .ledger
-                    .own_prepared_sync_seq(
-                        identity.node,
-                        candidate.window.anchor_ms,
-                        &hex::encode(candidate.window.prior_balances_digest),
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(block = %candidate.block_hash, error = %format!("{error:#}"), "the block's prepared record could not be read for the peer ingest wait");
-                        None
-                    }),
+                Some(identity) => {
+                    self.ledger
+                        .own_prepared_sync_seq(
+                            identity.node,
+                            candidate.window.anchor_ms,
+                            &hex::encode(candidate.window.prior_balances_digest),
+                        )
+                        .await?
+                }
                 None => None,
             };
-            crate::peer_sync::AdoptionNeeds {
+            Ok(crate::peer_sync::AdoptionNeeds {
                 share_seq: candidate
                     .window
                     .shares
                     .and_then(|range| i64::try_from(range.last_share_seq).ok()),
                 prepared_sync_seq: prepared,
-            }
+            })
         };
         let (waited, outcome, needs) = wait.wait(needs).await;
         let waited_us = waited.as_micros() as u64;
@@ -2986,6 +2984,11 @@ impl Coordinator {
             unconfirmed => tracing::warn!(
                 block = %candidate.block_hash,
                 outcome = unconfirmed.outcome(),
+                // The peer's, or this node's own read of the needs.
+                detail = match unconfirmed {
+                    crate::peer_sync::PeerIngest::Unreachable(detail) => detail.as_str(),
+                    _ => "",
+                },
                 waited_us,
                 needs = ?needs,
                 "block offer peer ingest wait unconfirmed: offering before the peer holds what adopting the block needs"

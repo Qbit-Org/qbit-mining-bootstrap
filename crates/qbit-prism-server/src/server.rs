@@ -368,6 +368,16 @@ pub async fn run(config: Config) -> Result<()> {
         result=tasks.join_next()=>{Some(match result {Some(Ok(Err(error)))=>error,Some(Err(error))=>error.into(),_=>anyhow::anyhow!("critical PRISM task exited")})}
     };
     shutdown.send_replace(true);
+    // A database restored under the running frontend (D-8): no task may
+    // commit another own row, so nothing drains; every task is cancelled at
+    // once, and its open transaction rolls back. The restart recovers first.
+    if failure.as_ref().is_some_and(|failure| {
+        failure
+            .downcast_ref::<crate::peer_sync::OwnLogLostWhileRunning>()
+            .is_some()
+    }) {
+        tasks.abort_all();
+    }
     // Connections drain before pooled DB handles close; queued block intents
     // remain durable and can be claimed immediately after their lease expires.
     if tokio::time::timeout(Duration::from_secs(30), async {

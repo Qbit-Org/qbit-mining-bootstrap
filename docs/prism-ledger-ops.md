@@ -3891,7 +3891,10 @@ even after a restore that kept the timeline. If a row of this node's that the
 peer holds differs from the one here, the own log has diverged: the conflict
 is recorded, and the latch stays unset, with or without the peer, until an
 operator decides. Losing the peer later never clears the latch. A change of
-identifier or timeline while the frontend runs does.
+identifier or timeline while the frontend runs, a restore or promotion under
+it, stops the frontend with an `ALERT`, refusing every share until it has
+exited. Its process manager restarts it, and the restart serves nothing until
+own-log recovery completes.
 
 **Found blocks.** A dual-writer node has no failover standby, so
 `PRISM_OFFER_STANDBY_APPLICATION_NAME` and `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS`
