@@ -100,8 +100,7 @@ pub struct Relay {
 impl Relay {
     /// A relay on a fresh loopback port, open, in front of `target`.
     pub async fn open(name: &str, target: u16) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
+        let listener = TcpListener::from_std(crate::postgres::fresh_listener()?)
             .with_context(|| format!("binding relay {name}"))?;
         let port = listener.local_addr()?.port();
         let target = Arc::new(AtomicU16::new(target));

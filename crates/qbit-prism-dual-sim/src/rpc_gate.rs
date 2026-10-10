@@ -72,8 +72,7 @@ impl RpcGate {
             arrivals: watch::channel(Vec::new()).0,
             answered: watch::channel(Vec::new()).0,
         });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
+        let listener = tokio::net::TcpListener::from_std(crate::postgres::fresh_listener()?)
             .context("binding the RPC gate")?;
         let port = listener.local_addr()?.port();
         let app = axum::Router::new()
