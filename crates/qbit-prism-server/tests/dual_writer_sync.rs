@@ -996,8 +996,9 @@ async fn a_peer_that_answers_but_cannot_be_read_leaves_the_latch_to_the_evidence
 
 /// A block whose insert fails for a passing reason (here a lock wait on its
 /// audit snapshot, which a local transaction is inserting) is never skipped:
-/// the pass fails with the cursor where it was, nothing is recorded as a
-/// conflict, and the block lands once the wait clears.
+/// only its stream fails, with the cursor where it was and nothing recorded
+/// as a conflict, while the pass and the other streams go on; the block
+/// lands once the wait clears.
 #[tokio::test]
 async fn a_block_that_fails_to_apply_for_a_passing_reason_is_retried() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -1015,17 +1016,11 @@ async fn a_block_that_fails_to_apply_for_a_passing_reason_is_retried() -> Result
             .execute(&mut *blocker)
             .await?;
         let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
-        let mut failed = false;
-        for _ in 0..200 {
-            match on_b.pass().await {
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
-                Ok(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
-        }
-        ensure!(failed, "the contended block never failed to apply");
+        let failed = pass_until(&mut on_b, async |report| {
+            Ok(report.failed_streams.contains(&"blocks"))
+        })
+        .await?;
+        ensure!(failed.reached_peer && failed.failed_streams == ["blocks"], "{failed:?}");
         ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_pool_blocks").await? == 0);
         ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 0);
         let cursor: Option<i64> = sqlx::query_scalar(
@@ -1035,6 +1030,16 @@ async fn a_block_that_fails_to_apply_for_a_passing_reason_is_retried() -> Result
         .await?;
         let sync_seq = count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_pool_blocks WHERE block_hash='{block}'")).await?;
         ensure!(cursor.is_none_or(|cursor| cursor < sync_seq), "the cursor passed the block: {cursor:?}");
+        // The other streams go on while the block waits.
+        append(&pair.a, &["c3"]).await?;
+        let job = prepare(&pair.a, "while the block waits").await?;
+        pass_until(&mut on_b, async |report| {
+            ensure!(report.failed_streams == ["blocks"], "{report:?}");
+            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{job}'")).await? == 1
+                && count(&pair.b.pool, "SELECT count(*) FROM qbit_share_ledger WHERE origin_node=0").await? == 3)
+        })
+        .await?;
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_pool_blocks").await? == 0);
         blocker.rollback().await?;
         pass_until(&mut on_b, async |_| {
             Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_pool_blocks WHERE block_hash='{block}'")).await? == 1)

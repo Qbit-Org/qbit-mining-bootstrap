@@ -1,7 +1,9 @@
 //! The supervised loop of the peer sync: one pass every
 //! `PRISM_PEER_SYNC_INTERVAL_MS`, or at once while a pass found a full
-//! batch. A failed pass is counted and logged, and the next one starts over
-//! on the other path; the loop ends only at shutdown.
+//! batch. A pass whose peer reads fail is counted and logged, and the next
+//! one starts over on the other path; peer rows that fail to apply here fail
+//! only their stream, which tries them again next pass and alerts when that
+//! goes on. The loop ends only at shutdown.
 //!
 //! Each pass, in order:
 //! 1. this database must be personalised as this node (D-9, checked every
@@ -64,6 +66,11 @@ const BLOCKS_PER_PASS: i64 = 20;
 const LAG_COUNT_CAP: i64 = 1_000_000;
 /// The longest pause after failed passes.
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// Consecutive passes in which a stream's next peer rows fail to apply here
+/// before the failure is alerted, and how often the alert repeats while it
+/// lasts. The stream tries them again every pass and never skips them.
+const STREAM_FAILURE_ALERT: u32 = 20;
+const STREAM_ALERT_REPEAT: Duration = Duration::from_secs(60);
 
 /// The streams, and the copied tables each carries, for the status.
 const STREAM_TABLES: &[(&str, &[&str])] = &[
@@ -144,6 +151,9 @@ pub struct PassReport {
     pub applied: Applied,
     /// A batch was full: pass again at once.
     pub more: bool,
+    /// Streams whose next peer rows could not be applied here; each keeps
+    /// its cursor and is tried again next pass, and the others went on.
+    pub failed_streams: Vec<&'static str>,
 }
 
 /// The own-log latch (D-8): false until this node's own rows are proved
@@ -166,6 +176,9 @@ struct StreamState {
     lag_rows: u64,
     caught_up_at: Option<Instant>,
     last_success: Option<chrono::DateTime<chrono::Utc>>,
+    /// Consecutive passes whose apply of this stream's rows failed.
+    failures: u32,
+    alerted_at: Option<Instant>,
 }
 
 /// The peer sync of one dual-writer frontend.
@@ -429,9 +442,7 @@ impl PeerSync {
         }
         report.own_log_caught_up = self.latch.caught_up;
         if self.latch.caught_up {
-            let (applied, more) = self.pull_peer(connection, &facts).await?;
-            report.applied.merge(applied);
-            report.more = more;
+            self.pull_peer(connection, &facts, report).await?;
         }
         Ok(())
     }
@@ -646,16 +657,15 @@ impl PeerSync {
     }
 
     /// Pull the peer's rows: shares, the journal, then landed blocks and
-    /// prepared jobs (D-5). Returns what was applied and whether a batch was
-    /// full.
+    /// prepared jobs (D-5), into `report`. A peer read that fails fails the
+    /// pass; rows that fail to apply here fail only their stream.
     async fn pull_peer(
         &mut self,
         connection: &mut sqlx::PgConnection,
         facts: &PeerFacts,
-    ) -> Result<(Applied, bool)> {
+        report: &mut PassReport,
+    ) -> Result<()> {
         let peer = self.node.peer();
-        let mut applied = Applied::default();
-        let mut more = false;
         // Shares.
         let cursor = match self.ledger.peer_sync_cursor(SHARES).await? {
             Some((position, _)) => position,
@@ -675,25 +685,35 @@ impl PeerSync {
             peer,
         ))
         .await?;
-        applied.merge(
-            self.ledger
-                .apply_share_batch(self.node, peer, &batch, Some(SHARES))
-                .await?,
-        );
-        more |= batch.scanned >= self.batch_rows;
-        let through = batch.through.unwrap_or(cursor);
-        let lag = bounded(peer::shares_beyond(
-            connection,
-            through,
-            peer,
-            LAG_COUNT_CAP,
-        ))
-        .await?;
-        self.stream_done(SHARES, u64::try_from(lag).unwrap_or_default());
+        match self
+            .ledger
+            .apply_share_batch(self.node, peer, &batch, Some(SHARES))
+            .await
+        {
+            Ok(applied) => {
+                report.applied.merge(applied);
+                report.more |= batch.scanned >= self.batch_rows;
+                let through = batch.through.unwrap_or(cursor);
+                let lag = bounded(peer::shares_beyond(
+                    connection,
+                    through,
+                    peer,
+                    LAG_COUNT_CAP,
+                ))
+                .await?;
+                self.stream_done(SHARES, u64::try_from(lag).unwrap_or_default());
+            }
+            Err(error) => self.stream_failed(SHARES, batch.row_count as u64, &error, report),
+        }
         // The carry-owner journal.
         let roles = bounded(peer::node_roles(connection, peer)).await?;
-        applied.merge(self.ledger.apply_node_roles(&roles, peer).await?);
-        self.stream_done(ROLES, 0);
+        match self.ledger.apply_node_roles(&roles, peer).await {
+            Ok(applied) => {
+                report.applied.merge(applied);
+                self.stream_done(ROLES, 0);
+            }
+            Err(error) => self.stream_failed(ROLES, 1, &error, report),
+        }
         // The sync_seq streams stop at the mark read at the sync barrier;
         // while a writer holds it, the last mark stands.
         if let Some(position) = bounded(peer::sync_barrier(connection)).await? {
@@ -702,9 +722,10 @@ impl PeerSync {
         let Some(safe) = self.safe_sync_mark else {
             self.stream_done(BLOCKS, 0);
             self.stream_done(PREPARED, 0);
-            return Ok((applied, more));
+            return Ok(());
         };
-        // Landed blocks, each whole.
+        // Landed blocks, each whole and in order: one that fails to apply
+        // stops the stream there, so the cursor never passes it.
         let cursor = self
             .sync_cursor(BLOCKS, peer, facts.sync_seq_floor, true)
             .await?;
@@ -727,11 +748,20 @@ impl PeerSync {
             .iter()
             .take_while(|block| window_covered(block, share_mark))
             .count();
-        for block in &blocks[..covered] {
-            applied.merge(self.ledger.apply_block(block, Some((BLOCKS, peer))).await?);
+        let mut failed = None;
+        for (index, block) in blocks[..covered].iter().enumerate() {
+            match self.ledger.apply_block(block, Some((BLOCKS, peer))).await {
+                Ok(applied) => report.applied.merge(applied),
+                Err(error) => {
+                    failed = Some((blocks.len() - index, error));
+                    break;
+                }
+            }
         }
-        if covered < blocks.len() {
-            more = true;
+        if let Some((pending, error)) = failed {
+            self.stream_failed(BLOCKS, pending as u64, &error, report);
+        } else if covered < blocks.len() {
+            report.more = true;
             self.stream_done(BLOCKS, (blocks.len() - covered) as u64);
         } else if (blocks.len() as i64) < BLOCKS_PER_PASS {
             self.ledger
@@ -739,7 +769,7 @@ impl PeerSync {
                 .await?;
             self.stream_done(BLOCKS, 0);
         } else {
-            more = true;
+            report.more = true;
             self.stream_done(BLOCKS, BLOCKS_PER_PASS as u64);
         }
         // Prepared jobs with their blobs.
@@ -754,21 +784,26 @@ impl PeerSync {
             self.batch_rows,
         ))
         .await?;
-        applied.merge(
-            self.ledger
-                .apply_prepared(&batch, peer, Some(PREPARED))
-                .await?,
-        );
-        if (batch.count as i64) < self.batch_rows {
-            self.ledger
-                .settle_peer_sync_cursor(PREPARED, peer, safe)
-                .await?;
-            self.stream_done(PREPARED, 0);
-        } else {
-            more = true;
-            self.stream_done(PREPARED, batch.count as u64);
+        match self
+            .ledger
+            .apply_prepared(&batch, peer, Some(PREPARED))
+            .await
+        {
+            Ok(applied) => {
+                report.applied.merge(applied);
+                if (batch.count as i64) < self.batch_rows {
+                    self.ledger
+                        .settle_peer_sync_cursor(PREPARED, peer, safe)
+                        .await?;
+                    self.stream_done(PREPARED, 0);
+                } else {
+                    report.more = true;
+                    self.stream_done(PREPARED, batch.count as u64);
+                }
+            }
+            Err(error) => self.stream_failed(PREPARED, batch.count as u64, &error, report),
         }
-        Ok((applied, more))
+        Ok(())
     }
 
     /// A `sync_seq` stream's cursor, started where the peer's rows begin if
@@ -794,10 +829,58 @@ impl PeerSync {
 
     fn stream_done(&mut self, stream: &'static str, lag_rows: u64) {
         let state = self.streams.entry(stream).or_default();
+        if state.failures >= STREAM_FAILURE_ALERT {
+            tracing::info!(
+                stream,
+                failures = state.failures,
+                "peer sync stream applies again"
+            );
+        }
         state.lag_rows = lag_rows;
         state.last_success = Some(chrono::Utc::now());
+        state.failures = 0;
+        state.alerted_at = None;
         if lag_rows == 0 {
             state.caught_up_at = Some(Instant::now());
+        }
+    }
+
+    /// A stream's next peer rows could not be applied here (a lock or
+    /// statement timeout, say). Nothing of the failed unit was kept and its
+    /// cursor stands, so the next pass applies it again; the other streams
+    /// go on. The stream counts as at least `pending` rows behind, so its
+    /// lag grows, and a run of failures is alerted.
+    fn stream_failed(
+        &mut self,
+        stream: &'static str,
+        pending: u64,
+        error: &anyhow::Error,
+        report: &mut PassReport,
+    ) {
+        report.failed_streams.push(stream);
+        let state = self.streams.entry(stream).or_default();
+        state.lag_rows = state.lag_rows.max(pending).max(1);
+        state.failures = state.failures.saturating_add(1);
+        let error = format!("{error:#}");
+        if state.failures >= STREAM_FAILURE_ALERT
+            && state
+                .alerted_at
+                .is_none_or(|at| at.elapsed() >= STREAM_ALERT_REPEAT)
+        {
+            state.alerted_at = Some(Instant::now());
+            tracing::error!(
+                stream,
+                failures = state.failures,
+                %error,
+                "ALERT: the peer sync cannot apply this stream's next peer rows; it tries them \
+                 again every pass and never skips them"
+            );
+        } else if state.failures == 1 {
+            tracing::warn!(
+                stream,
+                %error,
+                "peer sync could not apply a stream's next peer rows; the next pass tries again"
+            );
         }
     }
 
