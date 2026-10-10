@@ -1061,12 +1061,25 @@ pub async fn plan(ledger: &Ledger, options: &PlanOptions) -> Result<PlanReport> 
     .fetch_one(&mut *connection)
     .await
     .context("reading the payout window floor, the share sequence and the rollup watermark")?;
+    // A 3.1 dual-writer database (one `node-identity set` personalised)
+    // also receives the peer's rows, each with a share_seq this node's own
+    // sequence may long have passed, but never at or below the safe peer
+    // mark. Unless an operator declared the peer's unpulled rows lost, a
+    // partition leaves only once the mark has passed it too.
+    let (dual_writer, peer_mark, peer_tail_lost): (bool, Option<i64>, bool) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM qbit_prism_node_identity),qbit_prism_peer_share_mark(),\
+         EXISTS(SELECT 1 FROM qbit_prism_node_lineage WHERE peer_tail_lost_at IS NOT NULL)",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .context("reading whether this is a dual-writer database, and its safe peer mark")?;
     let horizon = Horizon {
         window_floor: floor_row.try_get("floor")?,
         window_short: floor_row.try_get("short")?,
         any_accepted: floor_row.try_get("any_accepted")?,
         next_share_seq: floor_row.try_get("next_seq")?,
         watermark: floor_row.try_get("watermark")?,
+        peer_mark: (dual_writer && !peer_tail_lost).then_some(peer_mark),
     };
     if horizon.window_floor.is_none() && horizon.any_accepted {
         unknowns.push(
@@ -1155,6 +1168,11 @@ struct Horizon {
     any_accepted: bool,
     next_share_seq: i64,
     watermark: Option<i64>,
+    /// On a dual-writer database, the safe peer mark (`None` before the
+    /// first pull): every peer row at or below it is here, and none below it
+    /// can still arrive. `None` on a single writer, and once an operator
+    /// declared the peer's unpulled rows lost.
+    peer_mark: Option<Option<i64>>,
 }
 
 async fn partition_plan(
@@ -1319,6 +1337,23 @@ async fn partition_plan(
                     horizon.next_share_seq, record.upper_seq
                 ),
             ),
+            // The rollup sweep stops at the same mark, so the watermark
+            // check above holds only for the rows already here.
+            _ if horizon
+                .peer_mark
+                .is_some_and(|mark| mark.is_none_or(|mark| mark < record.upper_seq - 1)) =>
+            {
+                Condition::blocked(
+                    "rollup_watermark",
+                    match horizon.peer_mark.flatten() {
+                        Some(mark) => format!(
+                            "the safe peer mark stands at {mark}, below this partition's last value {}, so the dual-writer peer's rows can still land in it",
+                            record.upper_seq - 1
+                        ),
+                        None => "this dual-writer database has not pulled the peer's shares yet, so the peer's rows can still land in it".into(),
+                    },
+                )
+            }
             (Some(last), Some(newest)) => Condition::clear(
                 "rollup_watermark",
                 format!(

@@ -1160,3 +1160,183 @@ async fn the_sync_needs_only_the_peer_roles_documented_grants() -> Result<()> {
     dropped?;
     Ok(())
 }
+
+/// Shares the hashrate rollups have folded, over every 5-minute bucket.
+async fn rolled_up(pool: &PgPool) -> Result<i64> {
+    count(
+        pool,
+        "SELECT COALESCE(sum(accepted_share_count),0)::bigint FROM qbit_hashrate_rollup_pool WHERE grain_seconds=300",
+    )
+    .await
+}
+
+async fn rollup_watermark(pool: &PgPool) -> Result<i64> {
+    count(
+        pool,
+        "SELECT COALESCE((SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton),0)",
+    )
+    .await
+}
+
+/// A dual writer's hashrate rollups stop at the safe peer mark, so a peer
+/// share pulled after this node's own newer ones, with a share_seq below
+/// them, is still folded, where 3.0's sweep would have passed it already.
+/// Nothing is folded before the first pull, and an operator's declaration
+/// that the peer's unpulled rows are lost lifts the stop.
+#[tokio::test]
+async fn a_late_peer_share_below_the_local_max_is_still_rolled_up() -> Result<()> {
+    use qbit_prism_server::rollups::advance_dual_writer;
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let b_seqs = append(&pair.b, &["late-b"]).await?;
+        let a_seqs = append(&pair.a, &["late-a1", "late-a2", "late-a3"]).await?;
+        ensure!(
+            b_seqs[0] < a_seqs[2],
+            "B's share {b_seqs:?} is not below A's {a_seqs:?}"
+        );
+        // Before A's first pull nothing is folded, not even A's own shares:
+        // 3.0's sweep would move the watermark to A's newest share here, and
+        // B's share would arrive below it.
+        ensure!(advance_dual_writer(&pair.a.pool, 1000).await?.scanned == 0);
+        ensure!(rollup_watermark(&pair.a.pool).await? == 0);
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut on_a, async |_| {
+            Ok(shares_of(&pair.a.pool, 1).await?.len() == 1)
+        })
+        .await?;
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        ensure!(rollup_watermark(&pair.a.pool).await? < a_seqs[2]);
+        // Once B holds A's shares, A's mark passes them and all four fold.
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| {
+            Ok(shares_of(&pair.b.pool, 0).await?.len() == 3)
+        })
+        .await?;
+        pass_until(&mut on_a, async |_| {
+            let mark: Option<i64> = sqlx::query_scalar("SELECT qbit_prism_peer_share_mark()")
+                .fetch_one(&pair.a.pool)
+                .await?;
+            Ok(mark >= Some(a_seqs[2]))
+        })
+        .await?;
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        ensure!(rollup_watermark(&pair.a.pool).await? == a_seqs[2]);
+        ensure!(
+            rolled_up(&pair.a.pool).await? == 4,
+            "{} folded",
+            rolled_up(&pair.a.pool).await?
+        );
+        // A share of A's above the mark waits, until the peer's tail is
+        // declared lost.
+        append(&pair.a, &["late-a4"]).await?;
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        ensure!(rolled_up(&pair.a.pool).await? == 4);
+        sqlx::query("UPDATE qbit_prism_node_lineage SET peer_tail_lost_at=clock_timestamp()")
+            .execute(&pair.a.pool)
+            .await?;
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        ensure!(rolled_up(&pair.a.pool).await? == 5);
+        Ok(())
+    })
+    .await
+}
+
+/// A share-ledger partition of a dual writer leaves only once the safe peer
+/// mark has passed it: the peer's rows can still land in it until then, even
+/// with every row it holds folded and this node's sequence past its bound.
+/// An operator's declaration that the peer's unpulled rows are lost lifts
+/// the condition.
+#[tokio::test]
+async fn a_partition_the_peer_mark_has_not_passed_never_leaves() -> Result<()> {
+    use qbit_prism_server::{ledger::archive, rollups::advance_dual_writer};
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let options = archive::PlanOptions {
+        network_difficulty: "1".into(),
+        retention_days: 30,
+        window_multiple: 4,
+        check_duplicates: false,
+    };
+    // The first partition's rollup condition on A.
+    let condition = async |ledger: &Ledger| -> Result<(String, String)> {
+        let report = archive::plan(ledger, &options).await?;
+        let first = report
+            .partitions
+            .iter()
+            .min_by_key(|plan| plan.record.upper_seq)
+            .context("no partition")?;
+        let rollup = first
+            .conditions
+            .iter()
+            .find(|condition| condition.name == "rollup_watermark")
+            .context("no rollup condition")?;
+        Ok((rollup.status.to_owned(), rollup.detail.clone()))
+    };
+    pair(&raw, async |pair| {
+        let a_seqs = append(&pair.a, &["leave-a1", "leave-a2"]).await?;
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| {
+            Ok(shares_of(&pair.b.pool, 0).await?.len() == 2)
+        })
+        .await?;
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut on_a, async |_| {
+            let mark: Option<i64> = sqlx::query_scalar("SELECT qbit_prism_peer_share_mark()")
+                .fetch_one(&pair.a.pool)
+                .await?;
+            Ok(mark >= Some(a_seqs[1]))
+        })
+        .await?;
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        ensure!(rollup_watermark(&pair.a.pool).await? == a_seqs[1]);
+        // A's sequence past the first partition's bound: on a single writer
+        // its rollup condition would now clear.
+        let upper = count(
+            &pair.a.pool,
+            "SELECT min(upper_seq) FROM qbit_prism_share_partitions",
+        )
+        .await?;
+        let past = upper + 10 - (upper + 10) % 2;
+        sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),$1)")
+            .bind(past)
+            .execute(&pair.a.pool)
+            .await?;
+        sqlx::raw_sql("SELECT qbit_prism_share_partition_ensure()")
+            .execute(&pair.a.pool)
+            .await?;
+        let (status, detail) = condition(&pair.a).await?;
+        ensure!(
+            status == "blocked" && detail.contains("safe peer mark"),
+            "{status}: {detail}"
+        );
+        // Declared lost, the peer's rows no longer hold it.
+        sqlx::query("UPDATE qbit_prism_node_lineage SET peer_tail_lost_at=clock_timestamp()")
+            .execute(&pair.a.pool)
+            .await?;
+        let (status, detail) = condition(&pair.a).await?;
+        ensure!(status == "clear", "{status}: {detail}");
+        sqlx::query("UPDATE qbit_prism_node_lineage SET peer_tail_lost_at=NULL")
+            .execute(&pair.a.pool)
+            .await?;
+        // A peer share above the bound moves A's mark past it.
+        let past_b = past + 1;
+        sqlx::query("SELECT setval(pg_get_serial_sequence('qbit_share_ledger','share_seq'),$1)")
+            .bind(past_b)
+            .execute(&pair.b.pool)
+            .await?;
+        let b_seqs = append(&pair.b, &["leave-b"]).await?;
+        ensure!(b_seqs[0] >= upper, "{b_seqs:?}");
+        pass_until(&mut on_a, async |_| {
+            Ok(shares_of(&pair.a.pool, 1).await?.len() == 1)
+        })
+        .await?;
+        advance_dual_writer(&pair.a.pool, 1000).await?;
+        let (status, detail) = condition(&pair.a).await?;
+        ensure!(status == "clear", "{status}: {detail}");
+        Ok(())
+    })
+    .await
+}

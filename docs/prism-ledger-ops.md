@@ -2892,7 +2892,9 @@ and a partition leaves only when all five clear.
    bound, the permanent rollup tables do not yet hold its whole contribution.
    The mark is the newest row, not the bound: the sweep advances only to rows
    that committed, and a `share_seq` an append drew and rolled back is never
-   folded.
+   folded. On a 3.1 dual writer the safe peer mark must also have passed the
+   partition, since the peer's rows can still land in it until then (see
+   "The peer sync").
 4. **A landed block's audit still depends on it**, that is, an audit row whose
    share snapshot intersects the partition and that has no stored
    `canonical_audit_bytes`. Sealing clears this condition.
@@ -3878,6 +3880,28 @@ default) for the peer's cursors to cover its shares through the block's window
 and the prepared record the block was built on: what the peer needs to adopt
 the block if this node dies. The block is offered whatever the wait finds,
 counted in `qbit_prism_peer_sync_offer_waits_total{outcome}`.
+
+**Hashrate rollups and the share archive.** Both assume a row never commits
+below one already folded, which holds for a node's own shares but not for
+the peer's: the sync inserts them later, below shares this node already
+holds. None arrives at or below the safe peer mark, so on a dual writer the
+rollup sweep stops there, and `share-archive plan` holds back every partition
+the mark has not passed (its `rollup_watermark` condition says so). In steady
+state the rollups trail by about two sync passes. While the peer is down they
+stop, `qbit_prism_hashrate_rollup_watermark_lag_seconds` grows, and the
+dashboards read the unfolded shares since. If the peer will be rebuilt from
+this node (below), its rows this node has not pulled are lost anyway; declare
+so, and the rollups and the archive go on without the mark:
+
+```sql
+UPDATE qbit_prism_node_lineage SET peer_tail_lost_at = clock_timestamp();
+```
+
+Clear it (`SET peer_tail_lost_at = NULL`) once the rebuilt peer syncs.
+`node-identity repersonalise` clears it on the rebuilt node. Never declare it
+for a peer that will come back with its own database: its unpulled shares
+would then arrive below the watermark, unfolded, or into a partition that has
+left, where the share stream stops until the partition is restored.
 
 **The peer's sync role.** Each node's database grants the other node's
 pulls one login role, `prism_peer_sync`, with no write right anywhere, and

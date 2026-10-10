@@ -282,6 +282,11 @@ pub async fn run(config: Config) -> Result<()> {
         config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
+        let settings = if config.dual_writer.is_some() {
+            settings.for_dual_writer()
+        } else {
+            settings
+        };
         tasks.spawn(runtime.track(
             TaskKind::Rollup,
             crate::rollups::run_with_metrics(

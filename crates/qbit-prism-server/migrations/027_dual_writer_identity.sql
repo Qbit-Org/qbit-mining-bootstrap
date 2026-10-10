@@ -135,7 +135,13 @@ CREATE TABLE IF NOT EXISTS qbit_prism_node_identity (
 --    timeline. A restore or promotion starts a new timeline and an initdb a
 --    new identifier; either, or no record, means the check must pass against
 --    the peer again before the node serves. A plain restart changes neither.
---    Local state, never copied; the peer's sync role reads the floors.
+--    peer_tail_lost_at is an operator's declaration, during a long peer
+--    outage, that the peer's rows this node has not pulled are lost and the
+--    peer will be rebuilt from this node (docs/prism-ledger-ops.md). Until it
+--    is set, the hashrate rollups and the share archive stop at the safe peer
+--    mark (6), since a peer row can still arrive above it; while it is set
+--    they do not. Local state, never copied; the peer's sync role reads the
+--    floors.
 CREATE TABLE IF NOT EXISTS qbit_prism_node_lineage (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     share_seq_floor bigint NOT NULL,
@@ -144,6 +150,7 @@ CREATE TABLE IF NOT EXISTS qbit_prism_node_lineage (
     verified_system_identifier bigint,
     verified_timeline integer,
     verified_at timestamptz,
+    peer_tail_lost_at timestamptz,
     CHECK (num_nulls(verified_system_identifier, verified_timeline, verified_at) IN (0, 3))
 );
 

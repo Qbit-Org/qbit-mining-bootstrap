@@ -140,7 +140,7 @@ async fn invalid_batch_and_unpolled_calls_emit_nothing() -> Result<()> {
     let metrics = Arc::new(Metrics::default());
     let before = family(&metrics);
     for batch in [0, 100_001, u32::MAX] {
-        let error = advance_with_metrics(&pool, batch, Some(&metrics))
+        let error = advance_with_metrics(&pool, batch, false, Some(&metrics))
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "rollup batch must be 1..100000");
@@ -150,7 +150,7 @@ async fn invalid_batch_and_unpolled_calls_emit_nothing() -> Result<()> {
         );
         assert_eq!(family(&metrics), before);
     }
-    drop(advance_with_metrics(&pool, 1, Some(&metrics)));
+    drop(advance_with_metrics(&pool, 1, false, Some(&metrics)));
     drop(advance(&pool, 1));
     let (_stop, shutdown) = watch::channel(false);
     drop(run_with_metrics(
@@ -158,6 +158,7 @@ async fn invalid_batch_and_unpolled_calls_emit_nothing() -> Result<()> {
         Settings {
             batch: 1,
             interval: Duration::from_secs(15),
+            dual_writer: false,
         },
         shutdown,
         Some(metrics.clone()),
@@ -171,7 +172,7 @@ async fn closed_pool_preserves_acquire_error_and_counts_once() -> Result<()> {
     let pool = PgPoolOptions::new().connect_lazy("postgresql://fixture@127.0.0.1:1/fixture")?;
     pool.close().await;
     let metrics = Metrics::default();
-    let error = advance_with_metrics(&pool, 1, Some(&metrics))
+    let error = advance_with_metrics(&pool, 1, false, Some(&metrics))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -195,7 +196,7 @@ async fn postgres_batch_and_no_work_each_count_one_checkout() -> Result<()> {
         insert_share(admin).await?;
         for expected_scanned in [1, 0] {
             let metrics = Metrics::default();
-            let progress = advance_with_metrics(pool, 10, Some(&metrics)).await?;
+            let progress = advance_with_metrics(pool, 10, false, Some(&metrics)).await?;
             assert_eq!(progress.scanned, expected_scanned);
             assert!(progress.advanced);
             assert!(progress.last_share_seq > 0);
@@ -223,7 +224,7 @@ async fn postgres_exhausted_checkout_errors_cancel_and_reuse() -> Result<()> {
         Box::pin(async move {
             let held = pool.acquire().await?;
             let metrics = Metrics::default();
-            let error = advance_with_metrics(pool, 1, Some(&metrics))
+            let error = advance_with_metrics(pool, 1, false, Some(&metrics))
                 .await
                 .unwrap_err();
             assert!(matches!(
@@ -232,7 +233,7 @@ async fn postgres_exhausted_checkout_errors_cancel_and_reuse() -> Result<()> {
             ));
             assert_eq!(counts(&metrics), (0., 1.));
             let cancelled = Metrics::default();
-            let mut pending = Box::pin(advance_with_metrics(pool, 1, Some(&cancelled)));
+            let mut pending = Box::pin(advance_with_metrics(pool, 1, false, Some(&cancelled)));
             assert!(futures_util::poll!(&mut pending).is_pending());
             assert_eq!(counts(&cancelled), (0., 0.));
             drop(pending);
@@ -303,7 +304,7 @@ async fn postgres_sql_wait_and_failure_keep_completed_checkout() -> Result<()> {
         let mut blocker = admin.begin().await?;
         sqlx::query("LOCK TABLE qbit_hashrate_rollup_pool IN ACCESS EXCLUSIVE MODE").execute(&mut *blocker).await?;
         let metrics = Metrics::default();
-        let mut attempt = Box::pin(advance_with_metrics(pool, 10, Some(&metrics)));
+        let mut attempt = Box::pin(advance_with_metrics(pool, 10, false, Some(&metrics)));
         tokio::select! {
             result = &mut attempt => anyhow::bail!("rollup completed before SQL barrier: {result:?}"),
             result = wait_for_sql(admin, application) => result?,
@@ -334,7 +335,7 @@ async fn postgres_sql_cancellation_retains_success_and_rolls_back() -> Result<()
         let mut blocker = admin.begin().await?;
         sqlx::query("LOCK TABLE qbit_hashrate_rollup_pool IN ACCESS EXCLUSIVE MODE").execute(&mut *blocker).await?;
         let metrics = Metrics::default();
-        let mut attempt = Box::pin(advance_with_metrics(pool, 10, Some(&metrics)));
+        let mut attempt = Box::pin(advance_with_metrics(pool, 10, false, Some(&metrics)));
         tokio::select! {
             result = &mut attempt => anyhow::bail!("rollup completed before SQL barrier: {result:?}"),
             result = wait_for_sql(admin, application) => result?,
@@ -356,7 +357,7 @@ async fn postgres_run_shutdown_cancels_checkout_once() -> Result<()> {
         let held = pool.acquire().await?;
         let metrics = Arc::new(Metrics::default());
         let (stop, shutdown) = watch::channel(false);
-        let mut task = Box::pin(run_with_metrics(pool.clone(), Settings { batch: 1, interval: Duration::from_secs(15) }, shutdown, Some(metrics.clone())));
+        let mut task = Box::pin(run_with_metrics(pool.clone(), Settings { batch: 1, interval: Duration::from_secs(15), dual_writer: false }, shutdown, Some(metrics.clone())));
         tokio::select! {
             result = &mut task => anyhow::bail!("rollup loop exited before shutdown: {result:?}"),
             _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -382,7 +383,7 @@ async fn postgres_run_shutdown_during_sql_preserves_success_and_compatibility() 
             sqlx::query("LOCK TABLE qbit_hashrate_rollup_pool IN ACCESS EXCLUSIVE MODE").execute(&mut *blocker).await?;
             let metrics = Arc::new(Metrics::default());
             let (stop, shutdown) = watch::channel(false);
-            let settings = Settings { batch: 10, interval: Duration::from_secs(15) };
+            let settings = Settings { batch: 10, interval: Duration::from_secs(15), dual_writer: false };
             let mut task: LocalBoxFuture<'_, Result<()>> = if attached {
                 Box::pin(run_with_metrics(pool.clone(), settings, shutdown, Some(metrics.clone())))
             } else {
@@ -473,4 +474,23 @@ fn rollup_lag_is_unknown_until_a_caught_up_pass_and_only_such_a_pass_resets_it()
     }
     metrics.record_hashrate_rollup_pass(idle.caught_up(8));
     assert!(lag(&metrics).unwrap() < 0.025);
+}
+
+#[test]
+fn the_dual_writer_sweep_is_3_0s_with_its_batch_stopped_at_the_safe_peer_mark() {
+    assert_eq!(SWEEP.matches(BATCH_BOUND).count(), 1);
+    let split = SWEEP.find(BATCH_BOUND).unwrap() + BATCH_BOUND.len();
+    let dual = DUAL_WRITER_SWEEP.as_str();
+    // Only one clause inserted right after the batch bound; the rest is
+    // 3.0's text, which a single writer runs as it is.
+    assert!(dual.len() > SWEEP.len());
+    assert!(dual.starts_with(&SWEEP[..split]));
+    assert!(dual.ends_with(&SWEEP[split..]));
+    let clause = &dual[split..dual.len() - (SWEEP.len() - split)];
+    assert!(
+        clause.starts_with("\n      AND ledger.share_seq <= (") && clause.ends_with(')'),
+        "{clause}"
+    );
+    assert_eq!(clause.matches("qbit_prism_peer_share_mark()").count(), 1);
+    assert_eq!(clause.matches("peer_tail_lost_at IS NOT NULL").count(), 1);
 }

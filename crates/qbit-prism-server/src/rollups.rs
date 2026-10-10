@@ -2,8 +2,36 @@
 use crate::metrics::{time_pool_acquire, Metrics};
 use anyhow::{ensure, Result};
 use sqlx::{PgPool, Transaction};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tokio::sync::watch;
+
+/// 3.0's sweep, which a single writer runs unchanged.
+const SWEEP: &str = include_str!("rollups.sql");
+
+/// The bound of the sweep's batch that the dual writer's sweep extends.
+const BATCH_BOUND: &str = "WHERE ledger.share_seq > (SELECT last_share_seq FROM progress)";
+
+/// The 3.1 dual writer's sweep. The watermark relies on rows committing in
+/// `share_seq` order, which holds for this node's own rows (ORDER_LOCK) but
+/// not for the peer's: the peer sync inserts them later, below shares this
+/// node already holds. None arrives at or below the safe peer mark
+/// (`qbit_prism_peer_share_mark()`, migration 027), so the batch stops
+/// there, and nothing rolls up before the first pull. An operator's
+/// declaration that the peer's unpulled rows are lost lifts the stop.
+static DUAL_WRITER_SWEEP: LazyLock<String> = LazyLock::new(|| {
+    SWEEP.replacen(
+        BATCH_BOUND,
+        &format!(
+            "{BATCH_BOUND}\n      AND ledger.share_seq <= (SELECT CASE WHEN EXISTS (SELECT 1 FROM \
+             qbit_prism_node_lineage WHERE peer_tail_lost_at IS NOT NULL) THEN 9223372036854775807 \
+             ELSE qbit_prism_peer_share_mark() END)"
+        ),
+        1,
+    )
+});
 
 #[derive(Debug, Clone, Copy)]
 pub struct Progress {
@@ -24,6 +52,18 @@ impl Progress {
 pub struct Settings {
     batch: u32,
     interval: Duration,
+    dual_writer: bool,
+}
+
+impl Settings {
+    /// The sweep of a 3.1 dual-writer frontend, which stops at the safe peer
+    /// mark.
+    pub fn for_dual_writer(self) -> Self {
+        Self {
+            dual_writer: true,
+            ..self
+        }
+    }
 }
 
 pub fn settings_from_env() -> Result<Option<Settings>> {
@@ -45,19 +85,30 @@ pub fn settings_from_env() -> Result<Option<Settings>> {
         !interval.is_zero(),
         "PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS is below timer precision"
     );
-    Ok(Some(Settings { batch, interval }))
+    Ok(Some(Settings {
+        batch,
+        interval,
+        dual_writer: false,
+    }))
 }
 
 /// One MVCC snapshot and guarded watermark advance atomically fold a bounded
 /// batch into all grains. A competing frontend can win; its loser adds nothing.
 /// This needs no lease or share-order lock and never changes accounting rows.
 pub async fn advance(pool: &PgPool, batch: u32) -> Result<Progress> {
-    advance_with_metrics(pool, batch, None).await
+    advance_with_metrics(pool, batch, false, None).await
+}
+
+/// [`advance`] for a 3.1 dual-writer database: the batch stops at the safe
+/// peer mark.
+pub async fn advance_dual_writer(pool: &PgPool, batch: u32) -> Result<Progress> {
+    advance_with_metrics(pool, batch, true, None).await
 }
 
 async fn advance_with_metrics(
     pool: &PgPool,
     batch: u32,
+    dual_writer: bool,
     metrics: Option<&Metrics>,
 ) -> Result<Progress> {
     ensure!(
@@ -69,11 +120,15 @@ async fn advance_with_metrics(
     sqlx::query("SET LOCAL statement_timeout = '10s'")
         .execute(&mut *transaction)
         .await?;
-    let (scanned, last_share_seq, advanced): (i64, i64, bool) =
-        sqlx::query_as(include_str!("rollups.sql"))
-            .bind(i64::from(batch))
-            .fetch_one(&mut *transaction)
-            .await?;
+    let sweep = if dual_writer {
+        DUAL_WRITER_SWEEP.as_str()
+    } else {
+        SWEEP
+    };
+    let (scanned, last_share_seq, advanced): (i64, i64, bool) = sqlx::query_as(sweep)
+        .bind(i64::from(batch))
+        .fetch_one(&mut *transaction)
+        .await?;
     transaction.commit().await?;
     Ok(Progress {
         scanned,
@@ -104,7 +159,7 @@ pub(crate) async fn run_with_metrics(
         }
         tokio::select! {
             _ = shutdown.changed() => break,
-            result = advance_with_metrics(&pool, settings.batch, metrics.as_deref()) => match result {
+            result = advance_with_metrics(&pool, settings.batch, settings.dual_writer, metrics.as_deref()) => match result {
                 Ok(progress) => {
                     if let Some(metrics) = metrics.as_deref() {
                         metrics.record_hashrate_rollup_pass(progress.caught_up(settings.batch));
