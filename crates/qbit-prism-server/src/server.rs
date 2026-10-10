@@ -492,8 +492,20 @@ pub async fn run(config: Config) -> Result<()> {
     // SessionOwner::stop() verifies that no active or pending guard remains.
     // Publish stopped first; only then is it safe to release this token's
     // reservations. On failure, retain reservations and close without a
-    // stopped marker so a replacement cannot reclaim live IDs.
-    if let Err(error) = coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await {
+    // stopped marker so a replacement cannot reclaim live IDs. A dual-writer
+    // frontend (3.1) writes it only over its own row: a replacement may have
+    // registered while it shut down, and its own reservations are released
+    // below either way.
+    let stopped = if coordinator.config.dual_writer.is_some() {
+        coordinator.ledger.stopped_unless_replaced().await.map(|written| {
+            if !written {
+                tracing::info!("stopped marker not written: the instance row is no longer this incarnation's (another with this PRISM_INSTANCE_ID, a replacement or a duplicate, wrote it)");
+            }
+        })
+    } else {
+        coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await
+    };
+    if let Err(error) = stopped {
         coordinator.close_health_pool().await;
         coordinator.ledger.pool.close().await;
         if let Some(failure) = failure {

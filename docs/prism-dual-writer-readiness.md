@@ -86,7 +86,8 @@ after a replacement registered, but it never replaces the frontend's own
 stopped marker, nor a row a replacement keeps fresh. A row another process
 with the same instance id wrote is taken over only once it has gone half the
 freshness budget without a heartbeat, so a frontend a duplicate wrote over is
-heard again before it reads as stale.
+heard again before it reads as stale. Its stopped marker, too, goes only over
+its own row: a replacement that registered while it shut down keeps its row.
 
 ## Admission
 
