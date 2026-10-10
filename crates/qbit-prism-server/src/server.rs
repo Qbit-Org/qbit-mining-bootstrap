@@ -677,15 +677,36 @@ impl AdmissionPublisher {
 /// A dual-writer frontend's cluster heartbeat in flight (3.1): its own
 /// task, so a slow or hung database never holds the next publication, which
 /// is what withdraws the node. It is never cancelled while the publisher
-/// runs, so a slow heartbeat still lands; the publisher awaits it before it
-/// returns, so it lands before the stopped marker, and aborts it only if the
-/// publisher is aborted itself.
-struct HeartbeatTask(tokio::task::JoinHandle<()>);
+/// runs, so a slow heartbeat still lands. When the publisher returns it
+/// waits for it at most [`HEARTBEAT_SHUTDOWN_WAIT`], so it lands before the
+/// stopped marker without taking the shutdown's budget, then aborts it, as
+/// it does if the publisher is aborted itself.
+struct HeartbeatTask {
+    handle: tokio::task::JoinHandle<()>,
+    started: Instant,
+}
 
 impl Drop for HeartbeatTask {
     fn drop(&mut self) {
-        self.0.abort();
+        self.handle.abort();
     }
+}
+
+/// How long the publisher, returning, waits for its heartbeat in flight.
+const HEARTBEAT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// A heartbeat running this long has a stuck instance row behind it.
+const HEARTBEAT_STUCK: Duration = Duration::from_secs(10);
+/// At most one warning about a stuck heartbeat this often.
+const HEARTBEAT_STUCK_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a publication that skips its heartbeat, because one that started
+/// `running` ago is still in flight, warns about it: only once that one has
+/// been running for [`HEARTBEAT_STUCK`], and at most once per
+/// [`HEARTBEAT_STUCK_WARNING_INTERVAL`].
+fn heartbeat_stuck_warning_due(running: Duration, warned: Option<Instant>, now: Instant) -> bool {
+    running >= HEARTBEAT_STUCK
+        && warned
+            .is_none_or(|at| now.saturating_duration_since(at) >= HEARTBEAT_STUCK_WARNING_INTERVAL)
 }
 
 async fn publish_health(
@@ -699,6 +720,7 @@ async fn publish_health(
     let mut missing_since = None::<Instant>;
     let dual_writer = coordinator.config.dual_writer.is_some();
     let mut heartbeat = None::<HeartbeatTask>;
+    let mut stuck_warned = None::<Instant>;
     let published = async {
         loop {
             tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
@@ -758,22 +780,43 @@ async fn publish_health(
                 {
                     tracing::warn!(%error,"cluster heartbeat failed");
                 }
-            } else if heartbeat.as_ref().is_some_and(|task| !task.0.is_finished()) {
-                tracing::debug!("cluster heartbeat skipped: the previous one is still running");
+            } else if let Some(task) = heartbeat.as_ref().filter(|task| !task.handle.is_finished()) {
+                let running = task.started.elapsed();
+                let now = Instant::now();
+                if heartbeat_stuck_warning_due(running, stuck_warned, now) {
+                    stuck_warned = Some(now);
+                    tracing::warn!(
+                        running_seconds = running.as_secs(),
+                        "cluster heartbeat stuck: the previous one is still running, so this instance's heartbeat_at is not advancing"
+                    );
+                } else {
+                    tracing::debug!("cluster heartbeat skipped: the previous one is still running");
+                }
             } else {
                 let ledger = coordinator.ledger.clone();
-                heartbeat = Some(HeartbeatTask(tokio::spawn(async move {
-                    if let Err(error) = ledger.heartbeat(HeartbeatStatus::Health(health)).await {
-                        tracing::warn!(%error,"cluster heartbeat failed");
-                    }
-                })));
+                heartbeat = Some(HeartbeatTask {
+                    handle: tokio::spawn(async move {
+                        if let Err(error) = ledger.heartbeat(HeartbeatStatus::Health(health)).await {
+                            tracing::warn!(%error,"cluster heartbeat failed");
+                        }
+                    }),
+                    started: Instant::now(),
+                });
             }
         }
         Ok(())
     }
     .await;
     if let Some(mut task) = heartbeat.take() {
-        let _ = (&mut task.0).await;
+        if tokio::time::timeout(HEARTBEAT_SHUTDOWN_WAIT, &mut task.handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                wait_seconds = HEARTBEAT_SHUTDOWN_WAIT.as_secs(),
+                "cluster heartbeat abandoned at shutdown: it did not finish in time"
+            );
+        }
     }
     published
 }
@@ -819,6 +862,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    #[test]
+    fn a_stuck_heartbeat_warns_after_ten_seconds_at_most_once_a_minute() {
+        let now = Instant::now();
+        assert!(!heartbeat_stuck_warning_due(
+            Duration::from_secs(9),
+            None,
+            now
+        ));
+        assert!(heartbeat_stuck_warning_due(HEARTBEAT_STUCK, None, now));
+        let warned = now - Duration::from_secs(59);
+        assert!(!heartbeat_stuck_warning_due(
+            Duration::from_secs(70),
+            Some(warned),
+            now
+        ));
+        let warned = now - HEARTBEAT_STUCK_WARNING_INTERVAL;
+        assert!(heartbeat_stuck_warning_due(
+            Duration::from_secs(70),
+            Some(warned),
+            now
+        ));
     }
 
     #[tokio::test]

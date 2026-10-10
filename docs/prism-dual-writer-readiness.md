@@ -76,7 +76,8 @@ one 2 s probe: each publication reads the database beside the probe and waits
 for neither longer than the probe's 2 s, and its
 heartbeat to the cluster table runs as a task of its own, one at a time, so
 the publications keep coming while the database is gone and a slow heartbeat
-still lands.
+still lands. One still running after 10 s logs a warning, at most once a
+minute, and at shutdown the frontend waits at most 5 s for it.
 
 ## Admission
 
