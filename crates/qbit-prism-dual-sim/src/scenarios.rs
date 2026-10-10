@@ -3166,6 +3166,51 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.settle(SETTLE_BOUND).await?;
     let before = ledger_digest(&sim.pool(Node::A).await?).await?;
     let cutover = sim.cutover_to_dual().await?;
+    // The prepared state the drain left (prepared records whole, their blobs,
+    // the journal) survives the promotion and the bootstrap on both
+    // databases, read before either frontend could write or prune any.
+    // Compared whole: a cutover that lost or damaged it the same way on both
+    // would pass every later cross-node check.
+    let (prepared_before, prepared_after) = sim
+        .cutover_prepared
+        .clone()
+        .context("the cutover read no prepared state")?;
+    for node in Node::BOTH {
+        let mut lost = Vec::new();
+        let mut changed = Vec::new();
+        let mut kept = 0;
+        for (table, rows) in &prepared_before {
+            let there = prepared_after.get(&node).and_then(|state| state.get(table));
+            for (key, row) in rows {
+                match there.and_then(|rows| rows.get(key)) {
+                    None => lost.push(format!("{table} {key}")),
+                    Some(other) if other != row => changed.push(format!(
+                        "{table} {key}: {}",
+                        invariants::json_differences(row, other).join("; ")
+                    )),
+                    Some(_) => kept += 1,
+                }
+            }
+        }
+        let count = |table: &str| {
+            prepared_before
+                .get(table)
+                .map_or(0, std::collections::BTreeMap::len)
+        };
+        body.expect(
+            &format!("the cutover kept the prepared state whole on node {node:?}"),
+            lost.is_empty() && changed.is_empty() && count("qbit_prism_jobs") > 0,
+            format!(
+                "{kept} rows from before the promotion kept whole ({} prepared records, {} \
+                 templates, {} balance snapshots, {} journal rows); lost: {lost:?}; changed: \
+                 {changed:?}",
+                count("qbit_prism_jobs"),
+                count("qbit_prism_templates"),
+                count("qbit_prism_balance_snapshots"),
+                count("qbit_prism_node_roles")
+            ),
+        );
+    }
     for node in Node::BOTH {
         let after = ledger_digest(&sim.pool(node).await?).await?;
         body.expect(

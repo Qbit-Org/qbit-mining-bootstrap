@@ -1194,7 +1194,7 @@ const DIFFERENCE_VALUE_CHARS: usize = 160;
 /// Where two renderings of one row (or of one landing's rows) disagree, each
 /// place by its path with both values, node A's first: depth first, the
 /// first [`DIFFERENCES_SHOWN`], each value cut to [`DIFFERENCE_VALUE_CHARS`].
-fn json_differences(a: &Value, b: &Value) -> Vec<String> {
+pub(crate) fn json_differences(a: &Value, b: &Value) -> Vec<String> {
     let mut differences = Vec::new();
     walk_differences("", Some(a), Some(b), &mut differences);
     if differences.len() > DIFFERENCES_SHOWN {
@@ -1839,8 +1839,8 @@ pub const COPIED_STATE_BOUND: Duration = Duration::from_secs(20);
 /// - **Blobs.** The template and balance snapshot of each record on both
 ///   nodes are on both, byte for byte.
 ///
-/// Rows written just before the check may still be in flight, so it is
-/// repeated for up to [`COPIED_STATE_BOUND`] before it fails.
+/// What each origin holds is read once, when the check begins; rows still
+/// in flight to the peer are waited for, up to [`COPIED_STATE_BOUND`].
 async fn copied_state_identical(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     const ID: &str = "copied-state-identical";
     if sim.config.topology != Topology::DualWriter || pools.len() < 2 {
@@ -1849,27 +1849,36 @@ async fn copied_state_identical(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             "no dual-writer pair with both databases checked: nothing is copied",
         ));
     }
-    // Each origin's highest prepared record when the check begins: every one
-    // up to it must reach the peer within the bound; later ones may not yet.
-    let mut highest = BTreeMap::new();
-    for (node, pool) in pools {
-        let seq: Option<i64> = sqlx::query_scalar(
-            "SELECT max(sync_seq) FROM qbit_prism_jobs \
-             WHERE origin_node = $1 AND job_id LIKE 'prepared:%'",
-        )
-        .bind(node.index() as i16)
-        .fetch_one(pool)
-        .await?;
-        highest.insert(*node, seq);
+    // What each origin holds when the check begins, fixed here: a record
+    // that ages during the retries stays required (its copy is kept 24 h
+    // past its expiry), and rows the origin lost while its peer kept them
+    // are found once, at the start.
+    let mut targets = Vec::new();
+    let mut lost = Vec::new();
+    for origin in Node::BOTH {
+        let peer = origin.peer();
+        let (Some(own), Some(copy)) = (pools.get(&origin), pools.get(&peer)) else {
+            continue;
+        };
+        targets.push(copied_state_target(own, copy, origin, &mut lost).await?);
     }
     let started = Instant::now();
     loop {
-        let (problems, compared) = copied_state_round(pools, &highest).await?;
+        let mut problems = lost.clone();
+        let mut compared = serde_json::Map::new();
+        for target in &targets {
+            let copy = &pools[&target.origin.peer()];
+            compared.insert(
+                target.origin.label().to_owned(),
+                copied_state_on_peer(copy, target, &mut problems).await?,
+            );
+        }
         if problems.is_empty() || started.elapsed() >= COPIED_STATE_BOUND {
             let mut check = CheckBuilder::new(ID);
             for problem in problems {
                 check.problem(problem);
             }
+            let compared = Value::Object(compared);
             check.data("compared", compared.clone());
             return Ok(check.finish(format!(
                 "prepared records, their blobs and the journal compared for both origins: {compared}"
@@ -1877,6 +1886,186 @@ async fn copied_state_identical(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// What an origin held at the start of [`copied_state_identical`], which its
+/// peer must hold too.
+struct CopiedStateTarget {
+    origin: Node,
+    highest: Option<i64>,
+    journal: BTreeMap<i64, Value>,
+    prepared: BTreeMap<String, (i64, Value)>,
+    templates: BTreeMap<String, String>,
+    balances: BTreeMap<String, String>,
+}
+
+/// Read `origin`'s target from its own database `own`, and record in `lost`
+/// each row its peer `copy` holds that `own` no longer does: an unexpired
+/// prepared copy (its original's expiry only extends, so the original was
+/// lost) or a journal row (the journal is append-only).
+async fn copied_state_target(
+    own: &PgPool,
+    copy: &PgPool,
+    origin: Node,
+    lost: &mut Vec<String>,
+) -> Result<CopiedStateTarget> {
+    let peer = origin.peer();
+    let highest: Option<i64> = sqlx::query_scalar(
+        "SELECT max(sync_seq) FROM qbit_prism_jobs \
+         WHERE origin_node = $1 AND job_id LIKE 'prepared:%'",
+    )
+    .bind(origin.index() as i16)
+    .fetch_one(own)
+    .await?;
+    let journal = journal_rows(own, origin).await?;
+    let originals = prepared_records(own, origin, false).await?;
+    let prepared: BTreeMap<String, (i64, Value)> = prepared_records(own, origin, true)
+        .await?
+        .into_iter()
+        .filter(|(_, (seq, _))| highest.is_some_and(|highest| *seq <= highest))
+        .collect();
+    for job in prepared_records(copy, origin, true).await?.keys() {
+        if !originals.contains_key(job) {
+            lost.push(format!(
+                "node {peer:?} holds node {origin:?}'s unexpired prepared record {job}, which \
+                 node {origin:?} no longer holds: an own row lost there (D-17)"
+            ));
+        }
+    }
+    for epoch in journal_rows(copy, origin).await?.keys() {
+        if !journal.contains_key(epoch) {
+            lost.push(format!(
+                "node {peer:?} holds node {origin:?}'s journal row of epoch {epoch}, which node \
+                 {origin:?} no longer holds: an own row lost there (D-17)"
+            ));
+        }
+    }
+    let referenced = |name: &str| -> Vec<String> {
+        prepared
+            .values()
+            .filter_map(|(_, doc)| doc.get(name).and_then(Value::as_str).map(str::to_owned))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let (template_keys, balance_keys) = (
+        referenced("template_sha256"),
+        referenced("window_prior_balances_sha256"),
+    );
+    let templates = blob_digests(
+        own,
+        "qbit_prism_templates",
+        "template_sha256",
+        "template_bytes",
+        &template_keys,
+    )
+    .await?;
+    let balances = blob_digests(
+        own,
+        "qbit_prism_balance_snapshots",
+        "prior_balances_digest",
+        "balances",
+        &balance_keys,
+    )
+    .await?;
+    for (table, keys, held) in [
+        ("qbit_prism_templates", &template_keys, &templates),
+        ("qbit_prism_balance_snapshots", &balance_keys, &balances),
+    ] {
+        for key in keys.iter().filter(|key| !held.contains_key(*key)) {
+            lost.push(format!(
+                "node {origin:?}'s prepared records reference {table} {key}, which node \
+                 {origin:?} does not hold"
+            ));
+        }
+    }
+    Ok(CopiedStateTarget {
+        origin,
+        highest,
+        journal,
+        prepared,
+        templates,
+        balances,
+    })
+}
+
+/// One pass of [`copied_state_identical`] over `target`'s peer `copy`:
+/// every target row there, the same. Returns what it compared.
+async fn copied_state_on_peer(
+    copy: &PgPool,
+    target: &CopiedStateTarget,
+    problems: &mut Vec<String>,
+) -> Result<Value> {
+    let origin = target.origin;
+    let peer = origin.peer();
+    let copies = prepared_records(copy, origin, false).await?;
+    for (job, (seq, doc)) in &target.prepared {
+        match copies.get(job) {
+            None => problems.push(format!(
+                "node {origin:?}'s prepared record {job} (sync_seq {seq}, unexpired when the \
+                 check began) is not on node {peer:?}"
+            )),
+            Some((_, other)) if other != doc => problems.push(format!(
+                "node {origin:?}'s prepared record {job} differs on node {peer:?}: {}",
+                json_differences(doc, other).join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    let journal = journal_rows(copy, origin).await?;
+    for (epoch, row) in &target.journal {
+        match journal.get(epoch) {
+            None => problems.push(format!(
+                "node {origin:?}'s journal row of epoch {epoch} is not on node {peer:?}"
+            )),
+            Some(other) if other != row => problems.push(format!(
+                "node {origin:?}'s journal row of epoch {epoch} differs on node {peer:?}: {}",
+                json_differences(row, other).join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    for (table, key, bytes, expected) in [
+        (
+            "qbit_prism_templates",
+            "template_sha256",
+            "template_bytes",
+            &target.templates,
+        ),
+        (
+            "qbit_prism_balance_snapshots",
+            "prior_balances_digest",
+            "balances",
+            &target.balances,
+        ),
+    ] {
+        let keys: Vec<String> = expected.keys().cloned().collect();
+        let there = blob_digests(copy, table, key, bytes, &keys).await?;
+        for (blob, digest) in expected {
+            if there.get(blob) != Some(digest) {
+                problems.push(format!(
+                    "{table} {blob}, referenced by node {origin:?}'s prepared records, is \
+                     {digest} there and {:?} on node {peer:?}",
+                    there.get(blob)
+                ));
+            }
+        }
+    }
+    let cursor: Option<i64> = sqlx::query_scalar(
+        "SELECT scanned_through FROM qbit_prism_peer_sync_cursors \
+         WHERE stream = 'prepared' AND peer_node = $1",
+    )
+    .bind(origin.index() as i16)
+    .fetch_optional(copy)
+    .await?;
+    Ok(json!({
+        "journal_rows": target.journal.len(),
+        "prepared_unexpired_at_start": target.prepared.len(),
+        "highest_at_start": target.highest,
+        "peer_cursor": cursor,
+        "templates": target.templates.len(),
+        "balance_snapshots": target.balances.len(),
+    }))
 }
 
 /// One node's prepared records of `origin`: `job_id -> (sync_seq, every
@@ -1947,126 +2136,6 @@ async fn blob_digests(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().collect())
-}
-
-/// One pass of [`copied_state_identical`]: its problems, and what it
-/// compared.
-async fn copied_state_round(
-    pools: &BTreeMap<Node, PgPool>,
-    highest: &BTreeMap<Node, Option<i64>>,
-) -> Result<(Vec<String>, Value)> {
-    let mut problems = Vec::new();
-    let mut compared = serde_json::Map::new();
-    for origin in Node::BOTH {
-        let peer = origin.peer();
-        let (Some(own), Some(copy)) = (pools.get(&origin), pools.get(&peer)) else {
-            continue;
-        };
-        let journal_own = journal_rows(own, origin).await?;
-        let journal_copy = journal_rows(copy, origin).await?;
-        if journal_own != journal_copy {
-            problems.push(format!(
-                "node {origin:?}'s carry-owner journal differs on node {peer:?}: {}",
-                json_differences(&json!(journal_own), &json!(journal_copy)).join("; ")
-            ));
-        }
-        let cursor: Option<i64> = sqlx::query_scalar(
-            "SELECT scanned_through FROM qbit_prism_peer_sync_cursors \
-             WHERE stream = 'prepared' AND peer_node = $1",
-        )
-        .bind(origin.index() as i16)
-        .fetch_optional(copy)
-        .await?;
-        let originals = prepared_records(own, origin, false).await?;
-        let unexpired_originals = prepared_records(own, origin, true).await?;
-        let copies = prepared_records(copy, origin, false).await?;
-        let unexpired_copies = prepared_records(copy, origin, true).await?;
-        let mut on_both = Vec::new();
-        let bound = highest.get(&origin).copied().flatten();
-        for (job, (seq, doc)) in &unexpired_originals {
-            if bound.is_none_or(|bound| *seq > bound) {
-                continue;
-            }
-            match copies.get(job) {
-                None => problems.push(format!(
-                    "node {origin:?}'s prepared record {job} (sync_seq {seq}) is not on node \
-                     {peer:?}, whose cursor over that stream is at {cursor:?}"
-                )),
-                Some((_, other)) if other != doc => problems.push(format!(
-                    "node {origin:?}'s prepared record {job} differs on node {peer:?}: {}",
-                    json_differences(doc, other).join("; ")
-                )),
-                Some(_) => on_both.push(job.clone()),
-            }
-        }
-        for job in unexpired_copies.keys() {
-            if !originals.contains_key(job) {
-                problems.push(format!(
-                    "node {peer:?} holds node {origin:?}'s unexpired prepared record {job}, which \
-                     node {origin:?} no longer holds: an own row lost there (D-17)"
-                ));
-            }
-        }
-        let field = |job: &String, name: &str| -> Option<String> {
-            originals
-                .get(job)
-                .and_then(|(_, doc)| doc.get(name))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        let templates: Vec<String> = on_both
-            .iter()
-            .filter_map(|job| field(job, "template_sha256"))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let balances: Vec<String> = on_both
-            .iter()
-            .filter_map(|job| field(job, "window_prior_balances_sha256"))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        for (table, key, bytes, keys) in [
-            (
-                "qbit_prism_templates",
-                "template_sha256",
-                "template_bytes",
-                &templates,
-            ),
-            (
-                "qbit_prism_balance_snapshots",
-                "prior_balances_digest",
-                "balances",
-                &balances,
-            ),
-        ] {
-            let here = blob_digests(own, table, key, bytes, keys).await?;
-            let there = blob_digests(copy, table, key, bytes, keys).await?;
-            for blob in keys {
-                if !here.contains_key(blob) || here.get(blob) != there.get(blob) {
-                    problems.push(format!(
-                        "{table} {blob}, referenced by node {origin:?}'s prepared records, is \
-                         {:?} on node {origin:?} and {:?} on node {peer:?}",
-                        here.get(blob),
-                        there.get(blob)
-                    ));
-                }
-            }
-        }
-        compared.insert(
-            origin.label().to_owned(),
-            json!({
-                "journal_rows": journal_own.len(),
-                "prepared_unexpired": unexpired_originals.len(),
-                "prepared_on_both": on_both.len(),
-                "highest_at_start": bound,
-                "peer_cursor": cursor,
-                "templates": templates.len(),
-                "balance_snapshots": balances.len(),
-            }),
-        );
-    }
-    Ok((problems, Value::Object(compared)))
 }
 
 fn short(program: &str) -> String {
