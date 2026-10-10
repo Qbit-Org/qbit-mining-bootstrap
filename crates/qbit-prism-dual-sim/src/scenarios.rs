@@ -2563,6 +2563,15 @@ async fn s07_disk_replaced(sim: &mut Sim, x: Node, body: &mut Body) -> Result<()
             .tool(&args, Duration::from_secs(120))
             .await?;
     }
+    sim.mark(&format!(
+        "node {x:?}'s copy repersonalised: {} after {:.0} s of the runbook's wait",
+        if repersonalise.success {
+            "done"
+        } else {
+            "refused"
+        },
+        waited.elapsed().as_secs_f64()
+    ));
     body.expect(
         "the rebuilt database is re-personalised (D-16)",
         repersonalise.success,
