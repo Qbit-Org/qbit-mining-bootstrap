@@ -45,13 +45,40 @@
 //! before the version is recorded. The next start plans afresh from what
 //! it finds and keeps that.
 //!
-//! `migrate --offline-indexes` (`IndexBuildMode::Offline`) builds 013's and
-//! 024's indexes the other way, for a migrate with no instance live, such as
-//! a cutover's (`apply_offline`). One transaction takes the migration lock,
+//! An index of a partitioned table, 031's on the share ledger 017
+//! partitions, cannot be built CONCURRENTLY, and a plain build of it holds
+//! every partition for the whole build. The scratch apply renders it as
+//! `CREATE INDEX <name> ON ONLY <table> ...`, and the runner builds it the
+//! way PostgreSQL documents for partitioned tables (`build_partitioned`):
+//! first one leaf index per partition with `CREATE INDEX CONCURRENTLY`, named
+//! `<partition><suffix>` (the suffix being the index's name past the
+//! table's), as `qbit_prism_share_partition_create` names every leaf; then
+//! the parent index ON ONLY, catalog work under a SHARE lock on the parent;
+//! then each leaf attached to it, catalog work under an ACCESS EXCLUSIVE lock
+//! on that leaf index alone. Both locks are taken with a short lock timeout
+//! and retried, as 017's swap takes its own, so no append or read queues
+//! behind a request that waits for a long transaction. PostgreSQL marks the
+//! parent valid when the last partition's leaf is attached. A partition
+//! created before the parent exists gets its leaf from the runner's next
+//! pass, and one created after it gets its leaf as it is attached, from the
+//! parent's definition. A partition that left while the parent waited for
+//! its leaf would leave the parent invalid for good, so the runner refuses,
+//! before any DDL, a partition that is still detaching, and holds the share
+//! archive's lifecycle lock for the whole build: no `share-archive` command
+//! runs until it has finished. Interrupted, it resumes from what it finds: a
+//! valid leaf of the declared definition is kept, an invalid one is dropped
+//! and built again, an attached one is skipped, and the parent, valid or
+//! not, is kept.
+//!
+//! `migrate --offline-indexes` (`IndexBuildMode::Offline`) builds 013's,
+//! 024's and 031's indexes the other way, for a migrate with no instance
+//! live, such as a cutover's (`apply_offline`). One transaction takes the
+//! migration lock,
 //! refuses an instance that has not reported drained or stopped and a live
 //! legacy writer lease before any DDL, and locks the tables ACCESS EXCLUSIVE
 //! with a 5 s lock timeout. It runs the same plan with a plain, parallel
-//! `CREATE INDEX` of the rendered definition and a plain `DROP INDEX`,
+//! `CREATE INDEX` of the rendered definition and a plain `DROP INDEX`, a
+//! partitioned index's leaves each with a plain `CREATE INDEX` of their own,
 //! verifies the declared set and records the version as it commits. A plain
 //! build reads the table once and waits for no other transaction, where a
 //! concurrent one reads it twice and waits for every transaction that could
@@ -65,12 +92,12 @@
 //! source (`share_hashes.rs`, #582). 002's file is applied in the migration
 //! transaction like any other; only the mapping of the legacy shares is
 //! left for after the commit, in batches, and that run records 2. It runs
-//! before 013, 017 and 024, so every version is still recorded after the
-//! ones below it. `migrate --defer-share-hashes` runs the backfill's recent
-//! range in that slot instead, before 013 drops the index that serves it,
-//! and 013, 017 and 024 follow with the backfill pending. Once serving is
-//! permitted, plain `migrate` maps the rest after them, throttled as
-//! `backfill-share-hashes` maps it, and 2 is recorded last.
+//! before 013, 017, 024 and 031, so every version is still recorded after
+//! the ones below it. `migrate --defer-share-hashes` runs the backfill's
+//! recent range in that slot instead, before 013 drops the index that serves
+//! it, and 013, 017, 024 and 031 follow with the backfill pending. Once
+//! serving is permitted, plain `migrate` maps the rest after them, throttled
+//! as `backfill-share-hashes` maps it, and 2 is recorded last.
 use super::*;
 use sqlx::{Connection, PgConnection};
 use std::time::{Duration, Instant};
@@ -78,8 +105,8 @@ use std::time::{Duration, Instant};
 /// One migration applied after the commit, by the runner its kind names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OnlineMigration {
-    /// Index creates and drops, applied with `CONCURRENTLY` (013, 024), or
-    /// with plain statements in one transaction under
+    /// Index creates and drops, applied with `CONCURRENTLY` (013, 024, and
+    /// 031 leaf by leaf), or with plain statements in one transaction under
     /// `migrate --offline-indexes` (`IndexBuildMode`).
     Indexes(IndexMigration),
     /// The share ledger partition conversion (017, `partition.rs`).
@@ -137,10 +164,36 @@ pub(super) fn derive(
             && before.other_relations == after.other_relations,
         "migration {version} is applied online and may only create and drop indexes, but its file changes other objects too; move those into a transactional migration"
     );
+    // Each partition by its partitioned table. The scratch schema's
+    // partitions are not the source's: an index created on a partitioned
+    // table is declared by its parent alone, and the runner builds one leaf
+    // for each partition it finds on the source.
+    let partition_of: BTreeMap<&str, &str> = after
+        .tables
+        .iter()
+        .filter_map(|(name, table)| {
+            table
+                .parents
+                .first()
+                .map(|parent| (name.as_str(), parent.as_str()))
+        })
+        .collect();
     let mut creates = BTreeMap::new();
     for (name, definition) in &after.indexes {
         match before.indexes.get(name) {
             None => {
+                if let Some(parent) = partition_of.get(definition.table.as_str()) {
+                    ensure!(
+                        after.indexes.iter().any(|(other, declared)| {
+                            !before.indexes.contains_key(other)
+                                && declared.table == *parent
+                                && partitioned_rest(other, declared).is_some()
+                        }),
+                        "migration {version} is applied online and creates index {name} on the partition {} directly; an online migration creates an index of a partitioned table on the table, and the runner builds its partitions' leaves",
+                        definition.table
+                    );
+                    continue;
+                }
                 creates.insert(name.clone(), definition.clone());
             }
             Some(previous) => ensure!(
@@ -155,6 +208,13 @@ pub(super) fn derive(
         .filter(|(name, _)| !after.indexes.contains_key(*name))
         .map(|(name, definition)| (name.clone(), definition.clone()))
         .collect();
+    for (name, definition) in &drops {
+        ensure!(
+            partitioned_rest(name, definition).is_none()
+                && !partition_of.contains_key(definition.table.as_str()),
+            "migration {version} is applied online and drops index {name} of a partitioned table, which DROP INDEX CONCURRENTLY cannot do; move the drop into a transactional migration"
+        );
+    }
     ensure!(
         !creates.is_empty() || !drops.is_empty(),
         "migration {version} is applied online but creates and drops no index"
@@ -166,7 +226,8 @@ pub(super) fn derive(
     })
 }
 
-/// How an index migration's builds and drops reach the source (013, 024).
+/// How an index migration's builds and drops reach the source (013, 024,
+/// 031).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexBuildMode {
     /// `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY`, statement
@@ -293,8 +354,14 @@ async fn plan<'a>(
     // changed, and that must be true.
     let mut plan = Vec::new();
     for (name, expected) in &migration.creates {
+        let partitioned = partitioned_rest(name, expected).is_some();
         match live_relation(connection, name).await? {
-            LiveRelation::Absent => plan.push(Step::Build(name, expected)),
+            LiveRelation::Absent => {
+                if partitioned {
+                    inspect_partitions(connection, version, name, expected).await?;
+                }
+                plan.push(Step::Build(name, expected));
+            }
             LiveRelation::Index {
                 valid,
                 definition,
@@ -302,6 +369,11 @@ async fn plan<'a>(
             } if table == expected.table && definition == expected.definition => {
                 plan.push(if valid {
                     Step::Keep(name)
+                } else if partitioned {
+                    // An interrupted run's parent, still waiting for leaves:
+                    // dropping it would drop every leaf attached to it.
+                    inspect_partitions(connection, version, name, expected).await?;
+                    Step::Build(name, expected)
                 } else {
                     Step::Rebuild(name, expected)
                 });
@@ -347,6 +419,26 @@ async fn apply_concurrently(
     migration: &IndexMigration,
     metrics: Option<&crate::metrics::Metrics>,
 ) -> Result<()> {
+    if migration
+        .creates
+        .iter()
+        .any(|(name, expected)| partitioned_rest(name, expected).is_some())
+    {
+        // Only the share archive detaches a partition, and a partition that
+        // leaves while a partitioned index waits for its leaf leaves that
+        // index invalid for good. Held, on this connection, until the run
+        // ends; a share-archive command already running finishes first.
+        tracing::info!(
+            version = migration.version,
+            "taking the share archive lifecycle lock: no share-archive command runs until the partitioned index is built"
+        );
+        super::super::connect::session_lock(
+            connection,
+            super::super::archive::LIFECYCLE_LOCK,
+            metrics,
+        )
+        .await?;
+    }
     let plan = plan(connection, migration).await?;
     let mut progress = Progress::default();
     run_plan(
@@ -487,7 +579,7 @@ async fn run_plan<'a>(
     version: i32,
     plan: Vec<Step<'a>>,
     mode: IndexBuildMode,
-    progress: &mut Progress<'a>,
+    progress: &mut Progress,
 ) -> Result<()> {
     let lasting = mode == IndexBuildMode::Concurrent;
     for step in plan {
@@ -498,9 +590,13 @@ async fn run_plan<'a>(
                 "index already built with the declared definition; keeping it"
             ),
             Step::Build(name, expected) => {
-                build(connection, version, name, expected, mode).await?;
+                if partitioned_rest(name, expected).is_some() {
+                    build_partitioned(connection, version, name, expected, mode, progress).await?;
+                } else {
+                    build(connection, version, name, expected, mode).await?;
+                }
                 if lasting {
-                    progress.built.push(name);
+                    progress.built.push(name.to_owned());
                 }
             }
             Step::Rebuild(name, expected) => {
@@ -521,7 +617,7 @@ async fn run_plan<'a>(
                 );
                 build(connection, version, name, expected, mode).await?;
                 if lasting {
-                    progress.built.push(name);
+                    progress.built.push(name.to_owned());
                 }
             }
             Step::Drop(name, expected) => {
@@ -536,7 +632,7 @@ async fn run_plan<'a>(
                 )
                 .await?;
                 if lasting {
-                    progress.dropped.push(name);
+                    progress.dropped.push(name.to_owned());
                 }
                 tracing::info!(version, index = %name, table = %expected.table, "dropped replaced index");
             }
@@ -551,7 +647,7 @@ async fn run_plan<'a>(
 async fn record(
     mut tx: sqlx::Transaction<'_, Postgres>,
     migration: &IndexMigration,
-    progress: &Progress<'_>,
+    progress: &Progress,
 ) -> Result<()> {
     let version = migration.version;
     verify_declared(&mut tx, migration, progress).await?;
@@ -607,8 +703,11 @@ impl LiveRelation {
     }
 }
 
+/// What `name` holds in the current schema. An index of a partitioned
+/// table (`I`) is an index here too, rendered `... ON ONLY <table> ...`, and
+/// valid once every partition's leaf is attached to it.
 async fn live_relation(connection: &mut PgConnection, name: &str) -> Result<LiveRelation> {
-    let row = sqlx::query("SELECT c.relkind::text AS kind,current_schema()::text AS schema,CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) END AS definition,x.indisvalid AS valid,t.relname::text AS table_name FROM pg_class c LEFT JOIN pg_index x ON x.indexrelid=c.oid LEFT JOIN pg_class t ON t.oid=x.indrelid WHERE c.relnamespace=current_schema()::regnamespace AND c.relname=$1")
+    let row = sqlx::query("SELECT c.relkind::text AS kind,current_schema()::text AS schema,CASE WHEN c.relkind IN ('i','I') THEN pg_get_indexdef(c.oid) END AS definition,x.indisvalid AS valid,t.relname::text AS table_name FROM pg_class c LEFT JOIN pg_index x ON x.indexrelid=c.oid LEFT JOIN pg_class t ON t.oid=x.indrelid WHERE c.relnamespace=current_schema()::regnamespace AND c.relname=$1")
         .bind(name)
         .fetch_optional(&mut *connection)
         .await?;
@@ -616,7 +715,7 @@ async fn live_relation(connection: &mut PgConnection, name: &str) -> Result<Live
         return Ok(LiveRelation::Absent);
     };
     let kind: String = row.try_get("kind")?;
-    if kind != "i" {
+    if kind != "i" && kind != "I" {
         return Ok(LiveRelation::Other(relation_kind(&kind).to_owned()));
     }
     let schema: String = row.try_get("schema")?;
@@ -733,6 +832,400 @@ fn create_statement(definition: &str, mode: IndexBuildMode) -> Result<String> {
     }
 }
 
+/// The kind (`CREATE INDEX ` or `CREATE UNIQUE INDEX `) and the rest of the
+/// rendering of an index of a partitioned table, `<kind><name> ON ONLY
+/// <table> <rest>`, which is how the scratch apply renders an index created
+/// on one; `None` for any other rendering.
+fn partitioned_rest<'a>(
+    name: &str,
+    declared: &'a IndexDefinition,
+) -> Option<(&'static str, &'a str)> {
+    CREATE_INDEX.iter().find_map(|kind| {
+        declared
+            .definition
+            .strip_prefix(format!("{kind}{name} ON ONLY {} ", declared.table).as_str())
+            .map(|rest| (*kind, rest))
+    })
+}
+
+/// A name PostgreSQL renders, and accepts, without quotes.
+fn plain_identifier(name: &str) -> bool {
+    name.starts_with(|first: char| first.is_ascii_lowercase() || first == '_')
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+/// One partition's leaf of a partitioned index: its name, and the plain
+/// index of the partition it must read back as.
+struct Leaf {
+    name: String,
+    declared: IndexDefinition,
+}
+
+/// The leaf of `name`, declared on a partitioned table, for `partition`:
+/// named `<partition><suffix>`, the suffix being `name` past the table's
+/// name, as `qbit_prism_share_partition_create` names the leaves of every
+/// partition it creates, with the parent's rendering on the partition.
+fn leaf_of(name: &str, declared: &IndexDefinition, partition: &str) -> Result<Leaf> {
+    let (kind, rest) = partitioned_rest(name, declared)
+        .with_context(|| format!("index {name} is not declared on a partitioned table"))?;
+    let suffix = name.strip_prefix(declared.table.as_str()).with_context(|| {
+        format!(
+            "index {name} of the partitioned table {} does not begin with the table's name, so its leaves cannot be named after their partitions",
+            declared.table
+        )
+    })?;
+    let leaf = format!("{partition}{suffix}");
+    ensure!(
+        plain_identifier(partition) && plain_identifier(&leaf) && leaf.len() <= 63,
+        "the leaf of index {name} for partition {partition} would be named {leaf}, which is not a plain identifier of at most 63 bytes"
+    );
+    Ok(Leaf {
+        declared: IndexDefinition {
+            table: partition.to_owned(),
+            definition: format!("{kind}{leaf} ON {partition} {rest}"),
+            ..declared.clone()
+        },
+        name: leaf,
+    })
+}
+
+/// One partition of the table a partitioned index is declared on, oldest
+/// first, and the valid leaf of that index attached for it, if any.
+struct Partition {
+    name: String,
+    attached: Option<String>,
+}
+
+/// The partitions of the table `name` is declared on, in the current
+/// schema, refusing one this runner cannot give a leaf that PostgreSQL then
+/// counts: a partition that is itself partitioned, one still detaching, and
+/// one whose attached leaf is not valid. PostgreSQL keeps the parent invalid
+/// for as long as any of these remains.
+async fn partitions(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    declared: &IndexDefinition,
+    progress: &Progress,
+) -> Result<Vec<Partition>> {
+    let table = &declared.table;
+    let rows = sqlx::query("SELECT c.relname::text AS name,c.relkind::text AS kind,h.inhdetachpending AS detaching,leaf.relname::text AS leaf,leaf.valid FROM pg_class p JOIN pg_inherits h ON h.inhparent=p.oid JOIN pg_class c ON c.oid=h.inhrelid LEFT JOIN LATERAL (SELECT i.relname,x.indisvalid AS valid FROM pg_class pi JOIN pg_inherits ih ON ih.inhparent=pi.oid JOIN pg_class i ON i.oid=ih.inhrelid JOIN pg_index x ON x.indexrelid=i.oid WHERE pi.relnamespace=p.relnamespace AND pi.relname=$2 AND x.indrelid=c.oid) leaf ON true WHERE p.relnamespace=current_schema()::regnamespace AND p.relname=$1 ORDER BY c.oid")
+        .bind(table)
+        .bind(name)
+        .fetch_all(&mut *connection)
+        .await?;
+    let mut found = Vec::with_capacity(rows.len());
+    for row in rows {
+        let partition: String = row.try_get("name")?;
+        let kind: String = row.try_get("kind")?;
+        ensure!(
+            kind == "r",
+            "refusing to apply migration {version}: partition {partition} of {table} is a {}, and the runner builds the leaves of {name} on table partitions only. The migration is not recorded. {}",
+            relation_kind(&kind),
+            progress.describe()
+        );
+        ensure!(
+            !row.try_get::<bool, _>("detaching")?,
+            "refusing to apply migration {version}: partition {partition} of {table} is still being detached (an interrupted DETACH PARTITION ... CONCURRENTLY), and PostgreSQL never marks {name} valid while it is. The migration is not recorded. {} Finish the detach with `qbit-prism-server share-archive detach {partition}`, then migrate again",
+            progress.describe()
+        );
+        let leaf: Option<String> = row.try_get("leaf")?;
+        let valid: Option<bool> = row.try_get("valid")?;
+        if let Some(leaf) = &leaf {
+            ensure!(
+                valid == Some(true),
+                "refusing to apply migration {version}: index {leaf} of partition {partition} is attached to {name} but is not valid, and PostgreSQL never marks {name} valid while it is. The migration is not recorded. {} Drop {name} with `DROP INDEX {name}`, which drops every leaf attached to it, then migrate again",
+                progress.describe()
+            );
+        }
+        found.push(Partition {
+            name: partition,
+            attached: leaf,
+        });
+    }
+    Ok(found)
+}
+
+/// Before any DDL, for a partitioned index the plan builds or resumes:
+/// every partition can take its leaf, and the leaf name of each partition
+/// with none attached is free or holds the leaf the migration declares, an
+/// earlier run's, valid or not. So a refusal leaves the database as it was.
+async fn inspect_partitions(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    declared: &IndexDefinition,
+) -> Result<()> {
+    let nothing = Progress::default();
+    for partition in partitions(connection, version, name, declared, &nothing).await? {
+        if partition.attached.is_some() {
+            continue;
+        }
+        let leaf = leaf_of(name, declared, &partition.name)?;
+        match live_relation(connection, &leaf.name).await? {
+            LiveRelation::Absent => {}
+            LiveRelation::Index {
+                definition, table, ..
+            } if table == leaf.declared.table && definition == leaf.declared.definition => {}
+            LiveRelation::Index {
+                definition, table, ..
+            } => bail!(
+                "refusing to apply migration {version}: index {} on {table} already exists with a different definition ({definition}); the migration declares {} as the leaf of {name} for partition {}. The migration is not recorded and nothing was changed by it. Check what that index serves, then rename or drop it and migrate again",
+                leaf.name,
+                leaf.declared.definition,
+                partition.name
+            ),
+            LiveRelation::Other(kind) => bail!(
+                "refusing to apply migration {version}: a {kind} named {} holds the name of the leaf of {name} this migration builds for partition {}. The migration is not recorded and nothing was changed by it. Check what it holds, then rename or move it aside and migrate again",
+                leaf.name,
+                partition.name
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Build the partitioned index `name` (see the module docs), in passes
+/// until PostgreSQL has marked it valid. Each pass builds, or keeps, the
+/// leaf of every partition with none attached, creates the parent ON ONLY
+/// when it is missing, and attaches those leaves. A partition attached
+/// before the parent exists has no leaf until the next pass; one attached
+/// after it gets its leaf from the parent's definition as it is attached.
+async fn build_partitioned(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    declared: &IndexDefinition,
+    mode: IndexBuildMode,
+    progress: &mut Progress,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let pending = partitions(connection, version, name, declared, progress)
+            .await?
+            .into_iter()
+            .filter(|partition| partition.attached.is_none())
+            .map(|partition| leaf_of(name, declared, &partition.name))
+            .collect::<Result<Vec<_>>>()?;
+        for leaf in &pending {
+            build_leaf(connection, version, name, leaf, mode, progress).await?;
+        }
+        match live_relation(connection, name).await? {
+            LiveRelation::Absent => create_parent(connection, version, name, declared, mode).await?,
+            LiveRelation::Index {
+                definition, table, ..
+            } if table == declared.table && definition == declared.definition => {}
+            other => bail!(
+                "refusing to continue migration {version}: {}, but the migration declares {} on {}. The migration is not recorded. {} Check what happened under that name, then migrate again; the next run plans afresh from what it finds",
+                other.describe(name),
+                declared.definition,
+                declared.table,
+                progress.describe()
+            ),
+        }
+        for leaf in &pending {
+            attach_leaf(connection, version, name, leaf, mode, progress).await?;
+        }
+        match live_relation(connection, name).await? {
+            LiveRelation::Index {
+                valid,
+                definition,
+                table,
+            } if table == declared.table && definition == declared.definition => {
+                if valid {
+                    break;
+                }
+                // Unless a partition was attached after this pass listed
+                // them, before the parent existed, whose leaf the next pass
+                // builds, every partition's leaf is attached.
+                ensure!(
+                    !pending.is_empty(),
+                    "refusing to record migration {version}: index {name} on {} is still not valid with every partition's leaf attached. PostgreSQL marks a partitioned index valid only as it attaches the last missing leaf, so a partition that had none left {} while this run built. The migration is not recorded. {} Drop {name} with `DROP INDEX {name}`, which drops every leaf attached to it, then migrate again",
+                    declared.table,
+                    declared.table,
+                    progress.describe()
+                );
+            }
+            other => bail!(
+                "refusing to continue migration {version}: {}, but the migration declares {} on {}. The name changed after this run's step for it. The migration is not recorded. {} Check what happened under that name, then migrate again; the next run plans afresh from what it finds",
+                other.describe(name),
+                declared.definition,
+                declared.table,
+                progress.describe()
+            ),
+        }
+    }
+    tracing::info!(
+        version,
+        index = %name,
+        table = %declared.table,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "partitioned index built: every partition's leaf is attached"
+    );
+    Ok(())
+}
+
+/// Build the leaf of `name` for one partition, or keep an earlier run's.
+/// The preflight saw its name free or holding this leaf, but the builds
+/// before it can take hours, so the name is looked up again: a valid leaf
+/// of the declared definition is kept, an invalid one is dropped and built
+/// again, and anything else is refused.
+async fn build_leaf(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    leaf: &Leaf,
+    mode: IndexBuildMode,
+    progress: &mut Progress,
+) -> Result<()> {
+    match live_relation(connection, &leaf.name).await? {
+        LiveRelation::Absent => {}
+        LiveRelation::Index {
+            valid: true,
+            definition,
+            table,
+        } if table == leaf.declared.table && definition == leaf.declared.definition => {
+            tracing::info!(
+                version,
+                index = %leaf.name,
+                table = %leaf.declared.table,
+                "leaf already built with the declared definition; keeping it"
+            );
+            return Ok(());
+        }
+        LiveRelation::Index {
+            valid: false,
+            definition,
+            table,
+        } if table == leaf.declared.table && definition == leaf.declared.definition => {
+            drop_planned(
+                connection,
+                version,
+                &leaf.name,
+                &leaf.declared,
+                Planned::InvalidBuild,
+                progress,
+                mode,
+            )
+            .await?;
+            tracing::warn!(
+                version,
+                index = %leaf.name,
+                "dropped the invalid leaf an interrupted build left; building again"
+            );
+        }
+        other => bail!(
+            "refusing to continue migration {version}: {}, where the migration builds {} as the leaf of {name}. The migration is not recorded. {} Check what that index serves, then rename or drop it and migrate again",
+            other.describe(&leaf.name),
+            leaf.declared.definition,
+            progress.describe()
+        ),
+    }
+    build(connection, version, &leaf.name, &leaf.declared, mode).await?;
+    if mode == IndexBuildMode::Concurrent {
+        progress.built.push(leaf.name.clone());
+    }
+    Ok(())
+}
+
+/// Create the partitioned index ON ONLY its table, from the rendering as it
+/// is. Catalog work, but under a SHARE lock on the table, which waits for
+/// every open append: concurrently the lock is taken with a short lock
+/// timeout and retried; offline the run already holds the table.
+async fn create_parent(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    declared: &IndexDefinition,
+    mode: IndexBuildMode,
+) -> Result<()> {
+    match mode {
+        IndexBuildMode::Concurrent => {
+            super::partition::with_lock_retries(
+                connection,
+                version,
+                &format!("creating index {name} ON ONLY {}", declared.table),
+                &declared.table,
+                &declared.definition,
+            )
+            .await?;
+        }
+        IndexBuildMode::Offline { .. } => {
+            sqlx::raw_sql(&declared.definition)
+                .execute(&mut *connection)
+                .await
+                .with_context(|| format!("creating index {name} for migration {version} offline; this migration's changes roll back with its transaction, and the next migrate plans afresh"))?;
+        }
+    }
+    tracing::info!(
+        version,
+        index = %name,
+        table = %declared.table,
+        "partitioned index created ON ONLY its table; attaching the leaves"
+    );
+    Ok(())
+}
+
+/// Attach a leaf to the partitioned index, after looking it up again: it
+/// was built or kept earlier in this pass, possibly hours before. Catalog
+/// work, but under an ACCESS EXCLUSIVE lock on the leaf index, which waits
+/// for every open read of its partition: concurrently the lock is taken with
+/// a short lock timeout and retried; offline no read is open.
+async fn attach_leaf(
+    connection: &mut PgConnection,
+    version: i32,
+    name: &str,
+    leaf: &Leaf,
+    mode: IndexBuildMode,
+    progress: &Progress,
+) -> Result<()> {
+    match live_relation(connection, &leaf.name).await? {
+        LiveRelation::Index {
+            valid: true,
+            definition,
+            table,
+        } if table == leaf.declared.table && definition == leaf.declared.definition => {}
+        other => bail!(
+            "refusing to continue migration {version}: {}, but this run left a valid {} there to attach to {name}. The name changed after this run's step for it. The migration is not recorded. {} Check what happened under that name, then migrate again; the next run plans afresh from what it finds",
+            other.describe(&leaf.name),
+            leaf.declared.definition,
+            progress.describe()
+        ),
+    }
+    let statement = format!(
+        "ALTER INDEX {} ATTACH PARTITION {}",
+        quote_identifier(name),
+        quote_identifier(&leaf.name)
+    );
+    match mode {
+        IndexBuildMode::Concurrent => {
+            super::partition::with_lock_retries(
+                connection,
+                version,
+                &format!("attaching leaf {} to {name}", leaf.name),
+                &leaf.declared.table,
+                &statement,
+            )
+            .await?;
+        }
+        IndexBuildMode::Offline { .. } => {
+            sqlx::raw_sql(&statement)
+                .execute(&mut *connection)
+                .await
+                .with_context(|| {
+                    format!(
+                        "attaching leaf {} to {name} for migration {version} offline",
+                        leaf.name
+                    )
+                })?;
+        }
+    }
+    tracing::info!(version, index = %name, leaf = %leaf.name, "leaf attached");
+    Ok(())
+}
+
 /// What the plan saw under a name it is about to drop.
 #[derive(Clone, Copy)]
 enum Planned {
@@ -745,14 +1238,15 @@ enum Planned {
 
 /// What this run has changed so far. A refusal after the plan was made
 /// says so: unlike the preflight refusals, "nothing was changed" is only
-/// true until the first build or drop.
+/// true until the first build or drop. A partitioned index's leaves are
+/// named after partitions the run finds, so names are owned.
 #[derive(Default)]
-struct Progress<'a> {
-    built: Vec<&'a str>,
-    dropped: Vec<&'a str>,
+struct Progress {
+    built: Vec<String>,
+    dropped: Vec<String>,
 }
 
-impl Progress<'_> {
+impl Progress {
     /// The sentence for a refusal, which must stay true of the next run: a
     /// built index is valid with the declared definition, so it is kept,
     /// and a dropped one is absent, so it is skipped.
@@ -793,7 +1287,7 @@ async fn drop_planned(
     name: &str,
     expected: &IndexDefinition,
     planned: Planned,
-    progress: &Progress<'_>,
+    progress: &Progress,
     mode: IndexBuildMode,
 ) -> Result<()> {
     let found = match live_relation(connection, name).await? {
@@ -841,7 +1335,7 @@ async fn drop_planned(
 async fn verify_declared(
     connection: &mut PgConnection,
     migration: &IndexMigration,
-    progress: &Progress<'_>,
+    progress: &Progress,
 ) -> Result<()> {
     let version = migration.version;
     let refuse = |found: String, declared: String| -> Result<()> {
@@ -1014,13 +1508,13 @@ mod tests {
     fn a_refusal_after_the_plan_says_what_the_run_changed() {
         let mut progress = Progress::default();
         assert_eq!(progress.describe(), "Nothing was changed by it.");
-        progress.built.push("a");
-        progress.built.push("b");
+        progress.built.push("a".into());
+        progress.built.push("b".into());
         assert_eq!(
             progress.describe(),
             "It had already built a, b; what it built stays, and the next run keeps it."
         );
-        progress.dropped.push("c");
+        progress.dropped.push("c".into());
         assert_eq!(
             progress.describe(),
             "It had already built a, b and dropped c; both stay as they are, and the next run keeps what was built and skips what was dropped."
@@ -1065,6 +1559,134 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("creates and drops no index"));
+    }
+
+    fn table(parents: &[&str], children: &[&str]) -> TableDefinition {
+        TableDefinition {
+            persistence: "p".into(),
+            row_security: false,
+            force_row_security: false,
+            parents: parents.iter().map(|name| (*name).to_owned()).collect(),
+            children: children.iter().map(|name| (*name).to_owned()).collect(),
+            columns: BTreeMap::new(),
+        }
+    }
+
+    /// A ledger partitioned as 017 leaves it, in the scratch schema.
+    fn partitioned() -> SchemaFingerprint {
+        let mut schema = SchemaFingerprint::default();
+        schema
+            .tables
+            .insert("t".into(), table(&[], &["t_p0", "t_p1"]));
+        for partition in ["t_p0", "t_p1"] {
+            schema.tables.insert(partition.into(), table(&["t"], &[]));
+        }
+        schema
+    }
+
+    const ORIGIN: &str = "CREATE INDEX t_origin_idx ON ONLY t USING btree (node, seq)";
+
+    /// 031's shape: an index created on a partitioned table is declared by
+    /// its parent alone, whatever leaves the scratch's partitions got.
+    #[test]
+    fn derivation_declares_an_index_of_a_partitioned_table_by_its_parent_alone() {
+        let before = partitioned();
+        let mut after = partitioned();
+        after
+            .indexes
+            .insert("t_origin_idx".into(), index("t", ORIGIN));
+        for partition in ["t_p0", "t_p1"] {
+            after.indexes.insert(
+                format!("{partition}_origin_idx"),
+                index(
+                    partition,
+                    &format!("CREATE INDEX {partition}_origin_idx ON {partition} USING btree (node, seq)"),
+                ),
+            );
+        }
+        let migration = derive(31, &before, &after).unwrap();
+        assert_eq!(
+            migration.creates,
+            BTreeMap::from([("t_origin_idx".to_owned(), index("t", ORIGIN))])
+        );
+        assert!(migration.drops.is_empty());
+        // A leaf without its parent is an index created on a partition.
+        after.indexes.remove("t_origin_idx");
+        let error = derive(31, &before, &after).unwrap_err().to_string();
+        assert!(
+            error.contains("creates index t_p0_origin_idx on the partition t_p0 directly"),
+            "{error}"
+        );
+        // DROP INDEX CONCURRENTLY refuses a partitioned index and its leaves.
+        let error = derive(31, &after, &before).unwrap_err().to_string();
+        assert!(
+            error.contains("drops index t_p0_origin_idx of a partitioned table"),
+            "{error}"
+        );
+        let mut with_parent = partitioned();
+        with_parent
+            .indexes
+            .insert("t_origin_idx".into(), index("t", ORIGIN));
+        let error = derive(31, &with_parent, &before).unwrap_err().to_string();
+        assert!(
+            error.contains("drops index t_origin_idx of a partitioned table"),
+            "{error}"
+        );
+    }
+
+    /// Each leaf is named after its partition and the parent past the
+    /// table's name, as qbit_prism_share_partition_create names leaves, and
+    /// reads back as the parent's rendering on the partition.
+    #[test]
+    fn a_leaf_is_named_and_rendered_after_its_partition() {
+        let declared = index(
+            "qbit_share_ledger",
+            "CREATE INDEX qbit_share_ledger_origin_seq_idx ON ONLY qbit_share_ledger USING btree (origin_node, share_seq)",
+        );
+        assert_eq!(
+            partitioned_rest("qbit_share_ledger_origin_seq_idx", &declared),
+            Some(("CREATE INDEX ", "USING btree (origin_node, share_seq)"))
+        );
+        let leaf = leaf_of(
+            "qbit_share_ledger_origin_seq_idx",
+            &declared,
+            "qbit_share_ledger_p12",
+        )
+        .unwrap();
+        assert_eq!(leaf.name, "qbit_share_ledger_p12_origin_seq_idx");
+        assert_eq!(leaf.declared.table, "qbit_share_ledger_p12");
+        assert_eq!(
+            leaf.declared.definition,
+            "CREATE INDEX qbit_share_ledger_p12_origin_seq_idx ON qbit_share_ledger_p12 USING btree (origin_node, share_seq)"
+        );
+        // A plain table's index is not partitioned; a parent whose name does
+        // not begin with its table's cannot name its leaves; a partition
+        // whose name needs quoting is refused rather than misrendered.
+        let plain = index("t", "CREATE INDEX t_idx ON t USING btree (x)");
+        assert_eq!(partitioned_rest("t_idx", &plain), None);
+        assert!(leaf_of("t_idx", &plain, "t_p0").is_err());
+        let foreign = index("t", "CREATE INDEX other_idx ON ONLY t USING btree (x)");
+        let error = leaf_of("other_idx", &foreign, "t_p0")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("does not begin with the table's name"),
+            "{error}"
+        );
+        let error = leaf_of("qbit_share_ledger_origin_seq_idx", &declared, "Odd")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("not a plain identifier"), "{error}");
+        let unique = index("t", "CREATE UNIQUE INDEX t_key ON ONLY t USING btree (seq)");
+        assert_eq!(
+            leaf_of("t_key", &unique, "t_p3")
+                .unwrap()
+                .declared
+                .definition,
+            "CREATE UNIQUE INDEX t_p3_key ON t_p3 USING btree (seq)"
+        );
     }
 
     #[test]

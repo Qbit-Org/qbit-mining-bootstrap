@@ -2467,7 +2467,7 @@ matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is
    Run `time qbit-prism-server migrate --offline-indexes` then
    `time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit`.
    Nothing else runs against the isolated restore, so `--offline-indexes`
-   builds 013's and 024's indexes with a plain `CREATE INDEX`
+   builds 013's, 024's and 031's indexes with a plain `CREATE INDEX`
    ([migration 013](prism-rust-migration.md#migration-013-the-share-ledger-index-trim-applied-online)).
    If import stops on a legacy body with `audit body ref hash mismatch`
    because a range's shares carry non-ASCII text,
@@ -2645,6 +2645,18 @@ and a header hash it does not hold is a new share.
 | `qbit_share_ledger_accepted_recent_idx` | `(accepted_at DESC) INCLUDE (share_difficulty, miner_id, share_seq) WHERE accepted` | pool hashrate series, leaderboard window, pool snapshot rollups, the miner summary's pool figure, evidence counts | index-only |
 | `qbit_share_ledger_accepted_miner_history_idx` (013) | `(miner_id, accepted_at DESC) INCLUDE (share_difficulty, share_seq, share_id) WHERE accepted` | miner share summary, worker rows (`share_id` carries the worker name), miner hashrate series and rollups (`share_seq` against the watermark) | index-only |
 | `qbit_share_ledger_accepted_block_suffix_idx` | `((lower(right(share_id, 64))), accepted_at DESC, share_seq DESC) INCLUDE (miner_id, share_difficulty, network_difficulty) WHERE accepted AND length(share_id) >= 65` | the block-solver lookup in blocks, leaderboard, reward leaderboard and pool snapshot | index scan, one row per block |
+| `qbit_share_ledger_origin_seq_idx` (031) | `(origin_node, share_seq)` | the 3.1 dual writer only: the peer sync's share pull (the other node's rows after its cursor, in `share_seq` order) and the window cut (this node's newest share, under `ORDER_LOCK`) | index scan within one node, bounded by the cursor or a backward probe |
+
+Migration 031 (CONTRACT D-14) builds its index online, but not as 013 built
+its own: PostgreSQL cannot build an index of a partitioned table
+`CONCURRENTLY`. `migrate` builds one leaf per partition with
+`CREATE INDEX CONCURRENTLY`, named `<partition>_origin_seq_idx` as every
+later partition names its own, then creates the index `ON ONLY` the parent and
+attaches each leaf, catalog work whose locks it takes with a 2 s lock timeout
+and retries, and records 31 once PostgreSQL has marked the index valid. No
+`share-archive` command runs while it builds. The
+[migration guide](prism-rust-migration.md#migration-031-the-share-ledgers-origin-index-applied-online)
+describes the run, its refusals and how it resumes.
 
 Dropped by 013, with no native reader:
 
@@ -3755,6 +3767,10 @@ every ledger for it, whether or not the dual writer is ever turned on:
   every peer share row at or below it is committed here, and none below it can
   arrive later. `qbit_prism_peer_sync_conflicts` holds rows the peer sync found
   under an identity this node already holds with other content.
+
+Migration 031 adds the index the peer sync's share pulls and the window cuts
+read, `qbit_share_ledger_origin_seq_idx` on `(origin_node, share_seq)`, built
+online leaf by leaf ([share ledger indexes](#share-ledger-indexes)).
 
 The identity, lineage, cursors and conflicts are local state and never copied.
 With `PRISM_DUAL_WRITER` off nothing reads or writes any of this except the

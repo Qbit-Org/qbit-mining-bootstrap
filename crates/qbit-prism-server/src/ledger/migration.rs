@@ -32,15 +32,18 @@ pub use share_hashes::{
 /// additive, and a release whose format an older binary must not touch
 /// declares a capability, which `migrate_schema` refuses before any DDL and
 /// `require_known_capabilities` refuses again at connect. Existing native
-/// ledgers apply 013, 017 and 024 online (`ONLINE_MIGRATIONS`) and record
-/// each after its last change, so a start refuses the database until that
-/// has completed. A populated 2.x.x source records 2 the same way, after its
+/// ledgers apply 013, 017, 024 and 031 online (`ONLINE_MIGRATIONS`) and
+/// record each after its last change, so a start refuses the database until
+/// that has completed. Versions 28 to 30 are reserved for the rest of the
+/// 3.1 dual writer; each version is checked on its own, so 31 needs none of
+/// them. A populated 2.x.x source records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582); once
 /// `migrate --defer-share-hashes` has mapped the backfill's recent range
 /// and permitted serving, every start accepts the database without 2 until
 /// plain `migrate` records it.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    31,
 ];
 
 /// The schema migrations a start requires: `REQUIRED_SCHEMA_VERSIONS`, but
@@ -2264,6 +2267,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         27,
         include_str!("../../migrations/027_dual_writer_identity.sql"),
     ),
+    (
+        31,
+        include_str!("../../migrations/031_share_ledger_origin_index.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -2280,7 +2287,11 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// (#668) the way 013 does: a plain `CREATE INDEX` would hold every write
 /// to `qbit_ctv_fanout_artifacts` for the build, a found block's landing
 /// included, on a ledger whose other frontends keep running, since 024
-/// needs no shutdown proof. Each is recorded last, so the startup gate refuses
+/// needs no shutdown proof. 031 creates the share ledger's (origin_node,
+/// share_seq) index for the 3.1 dual writer (CONTRACT D-14) on the table 017
+/// partitioned, which PostgreSQL cannot build CONCURRENTLY: the runner builds
+/// one leaf per partition CONCURRENTLY and attaches each to the parent it
+/// creates ON ONLY (`online.rs`). Each is recorded last, so the startup gate refuses
 /// the database until it has completed. Fresh and empty 2.x.x sources apply
 /// these inside the transaction while holding the cutover locks that
 /// exclude writers. A later transactional migration must not depend on an
@@ -2289,10 +2300,11 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
 /// version order, and 016 is transactional. 002 is not listed: its file is
 /// always transactional, and only its share-hash backfill on a populated
 /// 2.x.x source runs after the commit, ahead of these (`share_hashes.rs`).
-/// `migrate --offline-indexes` builds 013's and 024's indexes plainly
-/// instead, each migration's in one transaction, once no instance is live
-/// (`IndexBuildMode::Offline`).
-pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 24];
+/// 031 depends on 017's partitions and 027's column, both applied before it
+/// by version order. `migrate --offline-indexes` builds 013's, 024's and
+/// 031's indexes plainly instead, each migration's in one transaction, once
+/// no instance is live (`IndexBuildMode::Offline`).
+pub(super) const ONLINE_MIGRATIONS: &[i32] = &[13, 17, 24, 31];
 
 /// The online migration a version declares, from the scratch apply's
 /// before and after readings.
@@ -2302,7 +2314,7 @@ fn derive_online(
     after: &SchemaFingerprint,
 ) -> Result<OnlineMigration> {
     match version {
-        13 | 24 => Ok(OnlineMigration::Indexes(online::derive(
+        13 | 24 | 31 => Ok(OnlineMigration::Indexes(online::derive(
             version, before, after,
         )?)),
         17 => Ok(OnlineMigration::Partitions(partition::derive(
@@ -3019,7 +3031,7 @@ pub(super) async fn migrate_schema(
                     .await?;
             } else {
                 // The legacy shares are mapped after the commit, in batches,
-                // before 013, 017 and 024, and that run records 2 (#582).
+                // before 013, 017, 024 and 031, and that run records 2 (#582).
                 // Deferred, only the recent range is mapped there, and
                 // serving is permitted with the rest pending. The fence this
                 // transaction declares below is 1 either way.
@@ -3130,7 +3142,7 @@ pub(super) async fn migrate_schema(
             ) {
                 // Serving is permitted, so of the connects only `migrate`
                 // maps the rest, as `backfill-share-hashes` does, throttled,
-                // and after 013, 017 and 024: serving needs them, and the
+                // and after 013, 017, 024 and 031: serving needs them, and the
                 // recent range, which had to precede 013, is mapped.
                 (Some(share_hashes::FENCE_SERVING), ShareHashBackfill::Finish) => {
                     tracing::info!(

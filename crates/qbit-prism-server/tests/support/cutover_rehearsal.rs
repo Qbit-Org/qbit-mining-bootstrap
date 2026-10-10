@@ -318,7 +318,17 @@ fn classify(query: &str, previous: &str) -> String {
         ),
         (
             "create index concurrently",
-            "migrate: 013 and 024 concurrent indexes",
+            "migrate: 013, 024 and 031 concurrent indexes",
+        ),
+        // 031's catalog steps after its leaves: the parent ON ONLY, under a
+        // SHARE lock on the ledger, and each leaf's attachment.
+        (
+            "create index qbit_share_ledger_origin_seq_idx on only",
+            "migrate: 031 parent index and leaf attachments",
+        ),
+        (
+            "alter index \"qbit_share_ledger_origin_seq_idx\" attach partition",
+            "migrate: 031 parent index and leaf attachments",
         ),
         ("drop index concurrently", "migrate: 013 concurrent indexes"),
         // One batch of 002's backfill (#582); the migration transaction no

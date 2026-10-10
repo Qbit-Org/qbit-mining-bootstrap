@@ -168,7 +168,7 @@ pub struct MigrateOptions {
     /// [`ShareHashBackfill::Finish`] or, with `--defer-share-hashes`,
     /// [`ShareHashBackfill::Defer`].
     pub share_hashes: ShareHashBackfill,
-    /// How 013's and 024's indexes are built: concurrently, or for
+    /// How 013's, 024's and 031's indexes are built: concurrently, or for
     /// `migrate --offline-indexes` plainly in one transaction, which
     /// refuses a live instance.
     pub index_build: IndexBuildMode,
@@ -317,8 +317,8 @@ impl Ledger {
     /// is `options.share_hashes`'s ([`ShareHashBackfill::Finish`] or, with
     /// `--defer-share-hashes`, [`ShareHashBackfill::Defer`]), so it is the
     /// one connect that finishes a backfill that permits serving, and with
-    /// `--offline-indexes` it builds 013's and 024's indexes plainly, once
-    /// no instance is live.
+    /// `--offline-indexes` it builds 013's, 024's and 031's indexes plainly,
+    /// once no instance is live.
     pub async fn connect_migrate(url: &str, options: impl Into<MigrateOptions>) -> Result<Self> {
         Self::connect_as_operator(url, true, options.into()).await
     }
@@ -409,7 +409,7 @@ impl Ledger {
             // database with 2 unrecorded once that has permitted serving;
             // the operator's plain `migrate` maps the rest after the others.
             for pending in &online {
-                // 013 and 024 build concurrently unless `migrate
+                // 013, 024 and 031 build concurrently unless `migrate
                 // --offline-indexes` asked for plain builds (`connect_migrate`).
                 migration::apply_online_migration(
                     &pool,

@@ -98,7 +98,7 @@ enum Command {
         /// PRISM_POSTGRES_INIT_SCHEMA=1 migrate too.
         #[arg(long)]
         defer_share_hashes: bool,
-        /// Build the indexes of migrations 13 and 24 with a plain, parallel
+        /// Build the indexes of migrations 13, 24 and 31 with a plain, parallel
         /// CREATE INDEX in one transaction instead of CONCURRENTLY: quicker,
         /// but appends and reads wait for it, so stop every frontend and tool
         /// first. An instance that has not reported drained or stopped is
