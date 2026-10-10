@@ -5,7 +5,9 @@
 //! connection at the socket (no handshake completes), its readiness endpoint
 //! answers 503 to the token and 401 without it, and `/healthz` says why. A
 //! single writer with the endpoint on listens from startup, as 3.0 does, and
-//! its endpoint answers 200 once it is ready.
+//! its endpoint answers 200 once it is ready. A rebuild after a payout
+//! revision bump leaves the endpoint at 200 for the whole admission grace,
+//! and one held past it withdraws the frontend until its work is rebuilt.
 //!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
@@ -13,13 +15,17 @@
 //! ```
 use anyhow::{ensure, Context, Result};
 use qbit_pool_builder::ManifestSigningKey;
-use qbit_prism_server::{ledger::Ledger, node_identity::NodeIndex};
+use qbit_prism_server::{
+    ledger::Ledger, node_identity::NodeIndex, readiness::admission::DEFAULT_GRACE,
+};
 use qbit_prism_test_gate as gate;
 use serde_json::Value;
 use std::{
+    future::Future,
     io,
     net::TcpListener,
     process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -192,10 +198,54 @@ async fn refused(port: u16) -> Result<bool> {
     }
 }
 
+/// Bump the payout revision, as every landed block does; returns the new
+/// revision.
+async fn bump_payout_revision(pool: &sqlx::PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 \
+         WHERE singleton RETURNING payout_revision",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Run `work` while polling the readiness endpoint every 100 ms. Returns
+/// its output and every answer that was not 200, with when it came.
+async fn polling_readiness<T>(
+    client: &reqwest::Client,
+    ports: &Ports,
+    work: impl Future<Output = Result<T>>,
+) -> Result<(T, Vec<(Duration, u16)>)> {
+    let readyz = format!("http://127.0.0.1:{}/readyz", ports.readiness);
+    let started = Instant::now();
+    let done = AtomicBool::new(false);
+    let poll = async {
+        let mut refusals = Vec::new();
+        while !done.load(Ordering::Relaxed) {
+            // 0: no answer at all.
+            let status = get(client, &readyz, Some(TOKEN))
+                .await
+                .map_or(0, |(status, _)| status);
+            if status != 200 {
+                refusals.push((started.elapsed(), status));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        refusals
+    };
+    let work = async {
+        let output = work.await;
+        done.store(true, Ordering::Relaxed);
+        output
+    };
+    let (output, refusals) = tokio::join!(work, poll);
+    Ok((output?, refusals))
+}
+
 async fn with_server(
     database_url: &str,
     dual_writer: bool,
-    check: impl AsyncFnOnce(&reqwest::Client, &Ports, &mut Child) -> Result<()>,
+    check: impl AsyncFnOnce(&reqwest::Client, &Ports, &mut Child, &FakeNode) -> Result<()>,
 ) -> Result<()> {
     let node = FakeNode::open().await?;
     let (ports, held) = reserve_ports()?;
@@ -204,7 +254,7 @@ async fn with_server(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
-    let result = check(&client, &ports, &mut server).await;
+    let result = check(&client, &ports, &mut server, &node).await;
     let _ = server.start_kill();
     let _ = server.wait().await;
     result.map_err(|error| {
@@ -235,7 +285,7 @@ async fn a_dual_writer_frontend_that_is_not_ready_refuses_stratum_and_answers_no
     };
     let outcome = async {
         ledger.set_node_identity(NodeIndex::B, "d4-test").await?;
-        with_server(&database.url, true, async |client, ports, server| {
+        with_server(&database.url, true, async |client, ports, server, _| {
             // The publisher has run: the frontend is not ready, and says why.
             let health = health_until(client, ports, server, "a published health", |health| {
                 health.get("admission").is_some()
@@ -338,7 +388,7 @@ async fn a_single_writer_frontend_listens_from_startup_and_its_endpoint_answers_
         Ok(ledger) => ledger,
         Err(error) => return Err(database.abandon(error).await),
     };
-    let outcome = with_server(&database.url, false, async |client, ports, server| {
+    let outcome = with_server(&database.url, false, async |client, ports, server, _| {
         // 3.0's listener: accepting whatever readiness says.
         let started = Instant::now();
         loop {
@@ -389,6 +439,109 @@ async fn a_single_writer_frontend_listens_from_startup_and_its_endpoint_answers_
                 .any(|line| line.starts_with("qbit_prism_dual_writer_") && !line.starts_with('#')),
             "a single writer reports no dual-writer state"
         );
+        Ok(())
+    })
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebuild_inside_the_grace_keeps_the_endpoint_ready_and_a_longer_one_withdraws(
+) -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_frontend_grace_").await?;
+    let ledger = match Ledger::connect_tool(
+        &database.url,
+        "d4-frontend-fixture".into(),
+        2,
+        true,
+        None,
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(database.abandon(error).await),
+    };
+    let pool = &ledger.pool;
+    let outcome = with_server(&database.url, false, async |client, ports, server, node| {
+        health_until(client, ports, server, "admitting", |health| {
+            health["admission"]["admitting"] == true
+        })
+        .await?;
+
+        // Every landed block bumps the payout revision, and readiness stays
+        // false until the frontend's work is rebuilt on it (D6's flapping
+        // /healthz). Polled through five bumps, the endpoint never leaves 200.
+        let ((), refusals) = polling_readiness(client, ports, async {
+            for _ in 0..5 {
+                let revision = bump_payout_revision(pool).await?;
+                health_until(client, ports, server, "rebuilt on the bump", |health| {
+                    health["payout_state_generation"] == revision
+                })
+                .await?;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(())
+        })
+        .await?;
+        ensure!(
+            refusals.is_empty(),
+            "revision bumps turned the endpoint away: {refusals:?}"
+        );
+
+        // A rebuild held open: every refresh fetches a template first, so
+        // with the next fetch unanswered the work stays on the old revision.
+        let mut held = node.pause_next("getblocktemplate")?;
+        tokio::time::timeout(DEADLINE, held.entered()).await??;
+        // Taken before the bump commits, so the frontend cannot have seen
+        // the bump, and started its grace, any earlier.
+        let bumped = Instant::now();
+        let revision = bump_payout_revision(pool).await?;
+        let readyz = format!("http://127.0.0.1:{}/readyz", ports.readiness);
+        let healthz = format!("http://127.0.0.1:{}/healthz", ports.audit);
+        let mut dipped = false;
+        let withdrawn_after = loop {
+            alive(server)?;
+            let (status, body) = get(client, &readyz, Some(TOKEN)).await?;
+            if status != 200 {
+                ensure!(status == 503 && body == "not ready\n", "{status} {body:?}");
+                break bumped.elapsed();
+            }
+            if !dipped {
+                let (_, body) = get(client, &healthz, None).await?;
+                let health: Value = serde_json::from_str(&body)?;
+                dipped = health["ok"] == false && health["admission"]["state"] == "grace";
+            }
+            ensure!(
+                bumped.elapsed() < DEADLINE,
+                "a rebuild held past the grace never withdrew the frontend"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        ensure!(dipped, "readiness never dipped while the rebuild was held");
+        ensure!(
+            withdrawn_after >= DEFAULT_GRACE,
+            "withdrawn {withdrawn_after:?} after the bump, inside the {DEFAULT_GRACE:?} grace"
+        );
+        let health = health_until(client, ports, server, "withdrawn", |health| {
+            health["admission"]["state"] == "withdrawn"
+        })
+        .await?;
+        ensure!(health["admission"]["reason"] == "not-ready", "{health}");
+
+        // Released, the work is rebuilt on the bump and the frontend
+        // admits miners again.
+        held.release();
+        health_until(client, ports, server, "readmitted", |health| {
+            health["admission"]["state"] == "admitting"
+                && health["payout_state_generation"] == revision
+        })
+        .await?;
+        let (status, _) = get(client, &readyz, Some(TOKEN)).await?;
+        ensure!(status == 200, "{status}");
         Ok(())
     })
     .await;
