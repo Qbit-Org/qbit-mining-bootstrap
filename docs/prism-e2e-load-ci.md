@@ -477,8 +477,10 @@ by the native shards:
 Both prove execution with `scripts/check_gate_manifest.py`, and upload every
 scenario's `report.md`, `report.json`, `invariants.json`, `shares.jsonl`, the
 audit bundles it verified and every process's log (`prism-dual-writer` and
-`prism-dual-writer-nightly` artifacts). The nightly job writes the matrix
-table (`scripts/dual_writer_matrix_summary.py`) to its summary.
+`prism-dual-writer-nightly` artifacts). Both write the matrix table
+(`scripts/dual_writer_matrix_summary.py`) to their summary, followed by every
+scenario of their lane that does not run yet (`runs = false` in the manifest,
+waiting on the 3.1 stack's code), each also raised as a warning annotation.
 
 **Proves:** each scenario's own expectations (the miner-visible gap after a
 fault, which node took the miners, catch-up, the documented tail of a dead

@@ -231,6 +231,30 @@ impl FrontendSpec {
     }
 }
 
+/// One operator subcommand's run.
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolRun {
+    pub args: Vec<String>,
+    pub success: bool,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl ToolRun {
+    /// stdout as JSON, for the commands that print one report.
+    pub fn json(&self) -> Result<Value> {
+        serde_json::from_str(self.stdout.trim()).with_context(|| {
+            format!(
+                "qbit-prism-server {} printed no JSON report: {} {}",
+                self.args.join(" "),
+                self.stdout.trim(),
+                self.stderr.trim()
+            )
+        })
+    }
+}
+
 /// A frontend across its starts, kills and freezes.
 pub struct Frontend {
     pub spec: FrontendSpec,
@@ -368,6 +392,26 @@ impl Frontend {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// Run an operator subcommand (`node-identity set`, `carry-owner
+    /// transfer`, ...) with exactly this frontend's environment, as an
+    /// operator runs it on the node; its exit status, stdout and stderr.
+    /// Bounded: a hung command fails the scenario rather than the job.
+    pub async fn tool(&self, args: &[&str], limit: Duration) -> Result<ToolRun> {
+        let mut command = tokio::process::Command::from(self.spec.command(args));
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(limit, command.output())
+            .await
+            .with_context(|| format!("qbit-prism-server {} ran over {limit:?}", args.join(" ")))?
+            .with_context(|| format!("running qbit-prism-server {}", args.join(" ")))?;
+        Ok(ToolRun {
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            success: output.status.success(),
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
     }
 
     /// `GET /readyz` on the readiness listener: the status code, with the

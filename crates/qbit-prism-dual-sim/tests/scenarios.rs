@@ -16,9 +16,10 @@
 //! `target/dual-sim-reports/<scenario>/`; CI uploads that directory.
 
 use anyhow::{bail, Context, Result};
+use qbit_prism_dual_sim::frontend::Node;
 use qbit_prism_dual_sim::{
     report::ScenarioReport,
-    scenarios::{self, Death, Scenario},
+    scenarios::{self, Death, DeathAtFind, Scenario},
     sim::{self, Inputs},
 };
 use qbit_prism_test_gate as gate;
@@ -185,4 +186,82 @@ async fn s05_both_nodes_writing_at_once_keep_every_invariant_and_b_stays_carry_f
 {
     let gated = gated!();
     run(Scenario::S05BothWrite, gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s06_a_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_ready() -> Result<()>
+{
+    let gated = gated!();
+    run(Scenario::S06Restore(Node::A), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s06_b_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_ready() -> Result<()>
+{
+    let gated = gated!();
+    run(Scenario::S06Restore(Node::B), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s07_b_disk_replaced_is_rebuilt_from_its_peer_and_loses_only_its_unsynced_tail(
+) -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S07DiskReplaced(Node::B), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s07_a_disk_replaced_is_rebuilt_from_its_peer_and_loses_only_its_unsynced_tail(
+) -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S07DiskReplaced(Node::A), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s08_a_block_lost_with_its_dying_node_is_never_paid() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S08BlockAtDeath(DeathAtFind::Lost), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s08_a_block_accepted_as_its_node_dies_is_adopted_by_the_survivor_and_landed_once(
+) -> Result<()> {
+    let gated = gated!();
+    run(
+        Scenario::S08BlockAtDeath(DeathAtFind::Accepted { wait: true }),
+        gated,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s08_without_the_peer_ingest_wait_a_block_accepted_as_its_node_dies_is_landed_once(
+) -> Result<()> {
+    let gated = gated!();
+    run(
+        Scenario::S08BlockAtDeath(DeathAtFind::Accepted { wait: false }),
+        gated,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s09_a_3_0_ledger_cut_over_to_dual_mode_keeps_its_balances_and_audits() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S09Migration, gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s11_carry_owner_transfer_is_refused_while_an_own_block_is_unknown_then_succeeds(
+) -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S11CarryOwnerTransfer, gated).await
 }
