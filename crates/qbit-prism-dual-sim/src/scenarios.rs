@@ -2802,11 +2802,13 @@ pub const ADOPTION_BOUND: Duration = Duration::from_secs(90);
 /// at most the tip's height minus this), so its finder has time to land and
 /// sync it first. S8 mints this many external blocks on top of it.
 pub const ADOPT_DEPTH: u64 = 60;
-/// How long a returned node may take to land the block it died offering:
-/// the dead frontend's claim on the candidate holds for PRISM's 120 s
-/// candidate lease from its last renewal, then the restarted frontend
-/// recovers the reservation as unknown, finds the block on the chain and
-/// lands it (or skips it, if the peer's adoption reached it first).
+/// How long a returned node may take to land the block it died offering.
+/// The restarted frontend takes the dead frontend's claim on the candidate
+/// over only once it has watched the claim go unrenewed for PRISM's whole
+/// 120 s candidate lease on its own clock, from its start (migration 021's
+/// claim observer); it then recovers the reservation as unknown, finds the
+/// block on the chain after a reconciliation backoff and lands it (or skips
+/// it, if the peer's adoption reached it first).
 pub const RECOVERED_LANDING_BOUND: Duration = Duration::from_secs(180);
 
 /// How many of A's prepared records on `parent` each node holds, as text:

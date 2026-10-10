@@ -613,14 +613,16 @@ impl Sim {
             Option<f64>,
             Option<f64>,
         );
-        // A parked row's next attempt is 'infinity', which PostgreSQL 16
-        // cannot subtract from.
+        // An unclaimed row's expiry is NULL, and a parked row's next attempt
+        // 'infinity', which PostgreSQL 16 cannot subtract from.
         let row: Result<Option<Row>, _> = sqlx::query_as(
             "SELECT state, offer_outcome, last_error, attempt_count, claim_instance_id, \
-                    CASE WHEN isfinite(claim_expires_at) \
+                    CASE WHEN claim_expires_at IS NULL THEN NULL \
+                      WHEN isfinite(claim_expires_at) \
                       THEN EXTRACT(EPOCH FROM claim_expires_at - clock_timestamp())::float8 \
                       ELSE 'Infinity'::float8 END, \
-                    CASE WHEN isfinite(next_attempt_at) \
+                    CASE WHEN next_attempt_at IS NULL THEN NULL \
+                      WHEN isfinite(next_attempt_at) \
                       THEN EXTRACT(EPOCH FROM next_attempt_at - clock_timestamp())::float8 \
                       ELSE 'Infinity'::float8 END \
              FROM qbit_block_candidate_outbox WHERE block_hash = $1",
@@ -632,8 +634,9 @@ impl Sim {
         match row {
             Ok(Some((state, outcome, error, attempts, holder, expires_in, next_in))) => format!(
                 "candidate {state}, outcome {outcome:?}, {attempts} attempts, last error \
-                 {error:?}, claimed by {holder:?} for {expires_in:?} s more, next attempt in \
-                 {next_in:?} s"
+                 {error:?}, claimed by {holder:?} with its expiry {expires_in:?} s away by \
+                 the database's clock (a takeover waits a whole unrenewed lease on the \
+                 taker's own clock), next attempt in {next_in:?} s"
             ),
             Ok(None) => "no candidate row".into(),
             Err(error) => format!("candidate unreadable: {error}"),
