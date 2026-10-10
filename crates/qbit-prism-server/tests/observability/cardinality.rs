@@ -5,10 +5,11 @@ use super::{
 use qbit_prism_server::{
     api::router,
     metrics::{
-        AckResult, BlockAckPath, CaptureDecision, Collector, ConnectionRefusalReason,
-        DatabaseMetrics, DeliveryMetrics, JobDeferral, LockKind, Metrics, NodeObservation,
-        OrderLockHolder, Outcome, ProcessMetrics, RefreshAcquisition, RefreshTrigger, RejectReason,
-        StaleJobCause, StandbyWaitOutcome, TaskKind, WindowAcquisition,
+        AckResult, BlockAckPath, CaptureDecision, CarryOwnerState, Collector,
+        ConnectionRefusalReason, DatabaseMetrics, DeliveryMetrics, JobDeferral, LockKind, Metrics,
+        NodeObservation, OrderLockHolder, Outcome, PeerCheckResult, ProcessMetrics,
+        RefreshAcquisition, RefreshTrigger, RejectReason, StaleJobCause, StandbyWaitOutcome,
+        TaskKind, WindowAcquisition,
     },
     stratum::StratumStats,
 };
@@ -29,7 +30,7 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     assert!(!startup_census
         .series
         .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
-    assert_eq!(startup_census.families.len(), 92);
+    assert_eq!(startup_census.families.len(), 95);
     assert_eq!(startup_census.series.len(), 314);
     assert_eq!(sample(&startup, "qbit_prism_tip_poll_age_seconds"), -1.);
     assert_eq!(sample(&startup, "qbit_prism_node_peers"), -1.);
@@ -86,6 +87,12 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         }
         for outcome in StandbyWaitOutcome::ALL {
             metrics.record_offer_standby_wait(*outcome);
+        }
+        for state in CarryOwnerState::ALL {
+            metrics.record_carry_owner_state(*state, iteration % 2 == 0);
+        }
+        for result in PeerCheckResult::ALL {
+            metrics.record_carry_owner_peer_check(*result);
         }
         metrics.record_divergent_landing(iteration * 1_000);
         metrics.record_carry_forward_debt(iteration);
@@ -162,10 +169,11 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 92);
+        assert_eq!(populated.families.len(), 95);
         // 981 since the 3.1 dual writer's peer_sync ORDER_LOCK holder: one
-        // more holder's hold histogram, 16 series.
-        assert_eq!(populated.series.len(), 981);
+        // more holder's hold histogram, 16 series; 996 with the carry owner
+        // guard's state (12), alert (1) and peer check (2) series.
+        assert_eq!(populated.series.len(), 996);
         assert_eq!(
             sample(&body, "qbit_prism_tip_poll_age_seconds"),
             if known { elapsed.as_secs_f64() } else { -1. }

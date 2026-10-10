@@ -170,6 +170,33 @@ impl Metrics {
             pool_debt_sats as f64,
         );
     }
+    /// Dual writer: the carry owner guard's current state, every state's
+    /// sample at once, and whether it needs an operator.
+    pub fn record_carry_owner_state(&self, current: CarryOwnerState, alert: bool) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for state in CarryOwnerState::ALL {
+            registry.set(
+                Family::CarryOwnerState,
+                Labels::One(("state", state.as_str())),
+                f64::from(u8::from(*state == current)),
+            );
+        }
+        registry.set(
+            Family::CarryOwnerAlert,
+            Labels::Empty,
+            f64::from(u8::from(alert)),
+        );
+    }
+    /// Dual writer: one live read of the peer's node-role journal.
+    pub fn record_carry_owner_peer_check(&self, result: PeerCheckResult) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::CarryOwnerPeerChecks,
+                Labels::One(("result", result.as_str())),
+            );
+    }
     pub fn record_candidate_orphaned(&self) {
         self.inner
             .lock()

@@ -29,6 +29,9 @@ pub(super) struct ReconcileEffects {
     /// #478: each confirmation's divergence, and every account's debt after
     /// the balance changes, for metrics once the transaction commits.
     divergences: Vec<super::divergence::LandingDivergence>,
+    /// Dual writer: first confirmations of peer-origin blocks, which this
+    /// node did not find.
+    peer_first_confirmations: u64,
     debt: Option<u64>,
 }
 
@@ -61,8 +64,14 @@ impl Ledger {
         claim: &CandidateClaim,
         ledger_public_key: &str,
     ) -> Result<AuditVerificationReport> {
-        self.land_candidate_checked(claim, ledger_public_key, None)
-            .await
+        self.land_candidate_checked(
+            claim,
+            ledger_public_key,
+            LandingFence::Claim {
+                expected_revision: None,
+            },
+        )
+        .await
     }
 
     /// Recovery for an already-active block independently proved at this
@@ -73,7 +82,36 @@ impl Ledger {
         ledger_public_key: &str,
         expected_revision: i64,
     ) -> Result<AuditVerificationReport> {
-        self.land_candidate_checked(claim, ledger_public_key, Some(expected_revision))
+        self.land_candidate_checked(
+            claim,
+            ledger_public_key,
+            LandingFence::Claim {
+                expected_revision: Some(expected_revision),
+            },
+        )
+        .await
+    }
+
+    /// Dual writer (S8): land a pool block that is on the active chain with
+    /// no landing rows anywhere this node can see, adopted from the prepared
+    /// record of the work it was found on. `claim` is built in memory from
+    /// that record and the block; no outbox row exists, so no claim fences
+    /// the landing and no payout revision is the block's (it was issued
+    /// elsewhere). Everything else is the ordinary landing: the rebuilt audit
+    /// must verify and its coinbase must be the block's, byte for byte, or
+    /// nothing lands; an existing audit row is compared, never rewritten; and
+    /// the rows land `prepared`, for the reconciler to confirm from the
+    /// chain like any other block.
+    pub async fn land_adopted_block(
+        &self,
+        claim: &CandidateClaim,
+        ledger_public_key: &str,
+    ) -> Result<AuditVerificationReport> {
+        ensure!(
+            self.dual_writer(),
+            "only a dual-writer node adopts a block without a candidate row"
+        );
+        self.land_candidate_checked(claim, ledger_public_key, LandingFence::Adopted)
             .await
     }
 
@@ -81,7 +119,7 @@ impl Ledger {
         &self,
         claim: &CandidateClaim,
         ledger_public_key: &str,
-        expected_revision: Option<i64>,
+        fence: LandingFence,
     ) -> Result<AuditVerificationReport> {
         let parts = claim.parts.clone().context(
             "candidate claim carries no rebuilt audit parts; rebuild its window before landing",
@@ -139,10 +177,18 @@ impl Ledger {
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
-        let state = require_claim(&mut tx, claim).await?;
-        if let Some(expected) = expected_revision {
-            require_revision(&mut tx, expected).await?;
-        }
+        // An adopted block is on the active chain already, like an offered
+        // one: it lands as issued, never refused as superseded work.
+        let (state, expected_revision) = match fence {
+            LandingFence::Claim { expected_revision } => {
+                let state = require_claim(&mut tx, claim).await?;
+                if let Some(expected) = expected_revision {
+                    require_revision(&mut tx, expected).await?;
+                }
+                (state, expected_revision)
+            }
+            LandingFence::Adopted => (CandidateState::Offered, None),
+        };
         let existing: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT audit_bundle_sha256,found_block_bits FROM qbit_pool_audit_bundles WHERE block_hash=$1",
         )
@@ -168,14 +214,17 @@ impl Ledger {
             tx.commit().await?;
             return Ok(landing.report);
         }
-        let revision: i64 =
-            sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
-                .fetch_one(&mut *tx)
-                .await?;
-        ensure!(
-            revision == expected_revision.unwrap_or(candidate.payout_revision),
-            "candidate payout revision was superseded"
-        );
+        if matches!(fence, LandingFence::Claim { .. }) {
+            let revision: i64 = sqlx::query_scalar(
+                "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            ensure!(
+                revision == expected_revision.unwrap_or(candidate.payout_revision),
+                "candidate payout revision was superseded"
+            );
+        }
         // The parts were built on the as-issued set the reference names
         // (`landing_from_parts` proved the digest tie), which is the set the
         // block's coinbase commits to. Whether the current canonical balances
@@ -202,8 +251,21 @@ impl Ledger {
             )
         })
         .await?;
-        let divergent = current != landing.prior_balances_digest;
-        if divergent {
+        // Dual writer: carry-free work paid no carried balance, so it is
+        // never a divergent landing, whatever the canonical balances are
+        // (`carry.rs`). Single-writer mode compares exactly as before.
+        let divergent = current != landing.prior_balances_digest
+            && !super::carry::carry_free_block(self.dual_writer(), &landing.prior_balances_digest);
+        if divergent && matches!(fence, LandingFence::Adopted) {
+            // Another node's carry-paying work, built on that node's view:
+            // its prior is not expected to match these balances.
+            tracing::info!(
+                block = %candidate.block_hash,
+                as_issued_balances = %hex::encode(landing.prior_balances_digest),
+                current_balances = %hex::encode(current),
+                "landing an adopted block as issued; its prior balances are its builder's"
+            );
+        } else if divergent {
             ensure!(
                 state != CandidateState::Pending,
                 "candidate prior balances differ from current canonical balances"
@@ -319,6 +381,8 @@ impl Ledger {
                 &mut tx,
                 &claim.candidate.block_hash,
                 Some(&claim.candidate),
+                self.dual_writer()
+                    .then_some(super::divergence::DualScope { ledger: self }),
             )
             .await?;
             let changed = sqlx::query("UPDATE qbit_pool_blocks SET chain_state='confirmed',inactive_since=NULL WHERE block_hash=$1 AND chain_state IN ('prepared','inactive') AND maturity_state='immature'").bind(&claim.candidate.block_hash).execute(&mut *tx).await?.rows_affected();
@@ -472,6 +536,18 @@ impl Ledger {
         Ok(())
     }
 
+    /// Whether `block_hash` has landing rows here (a `qbit_pool_blocks`
+    /// row, own or a peer's), and whether this node holds an unfinished
+    /// candidate row for it, whose claim lands it. A finished row whose block
+    /// has no landing rows (abandoned, then reactivated by a reorganisation)
+    /// has released its payload, and only adoption can land it.
+    pub async fn block_rows_present(&self, block_hash: &str) -> Result<(bool, bool)> {
+        Ok(sqlx::query_as(&format!("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_hash=$1),EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1 AND state IN {})", CandidateState::UNFINISHED_SQL))
+            .bind(block_hash)
+            .fetch_one(&mut *self.acquire().await?)
+            .await?)
+    }
+
     pub async fn pool_blocks_for_reconcile(&self) -> Result<Vec<PoolBlock>> {
         sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state FROM qbit_pool_blocks WHERE (maturity_state='immature' AND chain_state IN ('prepared','confirmed','inactive')) OR block_hash=(SELECT block_hash FROM qbit_pool_blocks WHERE chain_state='confirmed' AND maturity_state='mature' ORDER BY block_height DESC,block_hash DESC LIMIT 1) ORDER BY block_height,block_hash")
             .fetch_all(&mut *self.acquire().await?).await?.into_iter().map(|row| Ok(PoolBlock {
@@ -502,7 +578,9 @@ impl Ledger {
     /// including confirmations while an outbox row is still unfinished. The
     /// publication ordinal is assigned on first confirmation and never cleared;
     /// settlement and reconciliation therefore share one durable counting rule.
-    /// Later disconnect/reconnect cycles do not count again.
+    /// Later disconnect/reconnect cycles do not count again. In dual-writer
+    /// mode a peer's blocks are confirmed here too but not counted: this node
+    /// did not find them.
     pub async fn reconcile_blocks_at_revision(
         &self,
         observations: &[BlockObservation],
@@ -547,7 +625,7 @@ impl Ledger {
         if let Some(message) = fatal {
             bail!(message);
         }
-        Ok(effects.first_confirmations.len() as u64)
+        Ok(effects.first_confirmations.len() as u64 - effects.peer_first_confirmations)
     }
 
     // The caller owns settlement/order locks and decides whether a fatal result
@@ -569,7 +647,13 @@ impl Ledger {
             "duplicate block observations"
         );
         let hashes: Vec<&str> = observed.keys().copied().collect();
-        let rows = sqlx::query("SELECT block_hash,block_height,chain_state,maturity_state,audit_publication_sequence FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE").bind(&hashes).fetch_all(&mut **tx).await?;
+        // A single writer runs 3.0's statement; dual mode reads the origin too.
+        let own_node = self.own_node();
+        let rows = sqlx::query(if own_node.is_some() {
+            "SELECT block.block_hash,block.block_height,block.chain_state,block.maturity_state,block.audit_publication_sequence,block.origin_node,(SELECT audit.coinbase_tx_hex FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=block.block_hash) AS coinbase_tx_hex FROM qbit_pool_blocks block WHERE block.chain_state IN ('prepared','confirmed','inactive') AND block.block_hash=ANY($1::text[]) ORDER BY block.block_height,block.block_hash FOR UPDATE OF block"
+        } else {
+            "SELECT block_hash,block_height,chain_state,maturity_state,audit_publication_sequence FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE"
+        }).bind(&hashes).fetch_all(&mut **tx).await?;
         for row in rows {
             let hash: String = row.try_get("block_hash")?;
             let Some(&active) = observed.get(hash.as_str()) else {
@@ -591,11 +675,30 @@ impl Ledger {
                     .is_none()
                 {
                     effects.first_confirmations.insert(hash.clone());
+                    // Dual writer: a block found on the peer's work (synced,
+                    // or adopted here in S8) is not this node's find.
+                    if own_node.is_some() {
+                        let origin_is_own = row
+                            .try_get::<i16, _>("origin_node")
+                            .is_ok_and(|origin| Some(origin) == own_node);
+                        let coinbase = row
+                            .try_get::<Option<String>, _>("coinbase_tx_hex")?
+                            .and_then(|coinbase| hex::decode(coinbase).ok());
+                        if !self.found_here(coinbase.as_deref(), origin_is_own) {
+                            effects.peer_first_confirmations += 1;
+                        }
+                    }
                 }
                 // #478: the rows count from here; record the debt they
                 // create against the balances they meet, in height order.
-                if let Some(divergence) =
-                    super::divergence::record_confirmation(tx, &hash, None).await?
+                if let Some(divergence) = super::divergence::record_confirmation(
+                    tx,
+                    &hash,
+                    None,
+                    self.dual_writer()
+                        .then_some(super::divergence::DualScope { ledger: self }),
+                )
+                .await?
                 {
                     effects.divergences.push(divergence);
                 }
@@ -756,6 +859,16 @@ impl Ledger {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// What fences a landing.
+#[derive(Clone, Copy, Debug)]
+enum LandingFence {
+    /// The outbox row's live claim, and the candidate's issued revision or
+    /// the one the caller proved the block active at.
+    Claim { expected_revision: Option<i64> },
+    /// A block adopted from a prepared record (S8): no outbox row exists.
+    Adopted,
 }
 
 /// What one landing binds, produced off the runtime from the claim's parts.

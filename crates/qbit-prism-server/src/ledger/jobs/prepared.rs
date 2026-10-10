@@ -276,6 +276,38 @@ impl Ledger {
             .map(BlockingDrop::into_inner))
     }
 
+    /// Dual writer (S8): every compact prepared record built on
+    /// `parent_hash`, expired or not, with both blobs, newest first: the
+    /// work a block on that parent may have been found on. A record that
+    /// does not decode, or whose blobs are gone, cannot be adopted from and
+    /// is skipped with a warning.
+    pub async fn compact_prepared_on_parent(
+        &self,
+        parent_hash: &str,
+    ) -> Result<Vec<(String, StoredCompactPrepared)>> {
+        let rows = sqlx::query("SELECT j.job_id,j.parent_hash,j.payout_revision,j.payload,j.expires_at,j.window_anchor_ms,j.window_prior_balances_sha256,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,j.window_snapshot_sha256,j.template_sha256,t.template_bytes,b.balances FROM qbit_prism_jobs j LEFT JOIN qbit_prism_templates t ON t.template_sha256=j.template_sha256 LEFT JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.parent_hash=$1 AND j.template_sha256 IS NOT NULL ORDER BY j.created_at DESC,j.job_id")
+            .bind(parent_hash)
+            .fetch_all(&mut *self.acquire().await?)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let mut records = Vec::new();
+            for row in rows {
+                let key: String = row.try_get("job_id")?;
+                match decode_row(row) {
+                    Ok(Some(stored)) => records.push((key, stored)),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        prepared = %key,
+                        error = %format!("{error:#}"),
+                        "a prepared record on this parent cannot be decoded; it cannot be adopted from"
+                    ),
+                }
+            }
+            Ok(records)
+        })
+        .await?
+    }
+
     /// Runtime admission follows the SQL row, decoder, returned metadata and
     /// cancellation cleanup. The caller supplies capacity; no nested permit.
     pub(crate) async fn compact_prepared_with_admission(

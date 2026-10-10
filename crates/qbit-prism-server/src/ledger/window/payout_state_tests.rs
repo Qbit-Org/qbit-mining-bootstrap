@@ -142,7 +142,7 @@ async fn revision_cutoff_and_digest_share_one_snapshot_with_weaker_isolation_con
                 let mut tx = source.begin().await?;
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *tx).await?;
                 let (payout_revision, timeline, _) = refresh_revision(&mut tx, false).await?;
-                let (accepted_share_seq, prior_balances_digest) = refresh_balances(&mut tx, &ReadAdmission::default()).await?;
+                let (accepted_share_seq, prior_balances_digest) = refresh_balances(&mut tx, PRIOR_BALANCE_SQL, &ReadAdmission::default()).await?;
                 tx.commit().await?;
                 Ok(RefreshProbe { payout_state: PayoutState { payout_revision, prior_balances_digest }, accepted_share_seq, timeline, peer_mark: None })
             }));
