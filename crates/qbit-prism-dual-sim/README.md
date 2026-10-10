@@ -119,7 +119,7 @@ block whose coinbase carries `/PRISM/`), never from a database's
 | `inv3-audits-verify` | each node serves the block's bundle, `qbit-prism-audit-verify` accepts it against the chain's coinbase with the pinned ledger key, the manifest key is the pinned one, and both nodes serve the same bundle |
 | `inv3-fanouts-identical` | each database holds the bundle's fanout transactions byte for byte |
 | `inv4-acked-shares-present` | every share a miner saw accepted is in every database, except a documented tail the scenario names |
-| `inv4-no-double-credit` | one row per share id and per header, every row mapped to its header, and a header's row identical on both nodes |
+| `inv4-no-double-credit` | one row per share id and per header, every row mapped to its own header (the mapping's header is its share id's hash), and a header's row identical on both nodes in every column, provenance included |
 | `inv4-windows-unchanged` | every recorded window still has exactly its shares, and no newer share is eligible for it |
 | `inv4-windows-reproducible` | every recorded window recomputes to its digest from every database |
 | `ledger-integrity` | `qbit_carry_forward_integrity_report()` is clean everywhere |
