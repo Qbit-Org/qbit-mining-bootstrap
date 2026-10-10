@@ -778,9 +778,9 @@ jobs:
   # Stratum load), injects its fault and checks the payout invariants; a
   # failing scenario does not stop the others. The matrix summary goes to the
   # job summary, and every report and log to the prism-dual-writer-nightly
-  # artifact. About 3 minutes a scenario on this runner, so the 22 the stack
-  # runs take about 70; the limit leaves room for scenarios that fail slowly,
-  # waiting out their bounds.
+  # artifact. About 3 minutes a scenario on this runner, so all 24 take about
+  # 75; the limit leaves room for scenarios that fail slowly, waiting out
+  # their bounds.
   #
   # Before anything of the 3.1 stack merges, the matrix must have run on it,
   # and a schedule or a dispatch runs only from the default branch. So

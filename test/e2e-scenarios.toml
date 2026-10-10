@@ -1050,8 +1050,8 @@ title = "S7: a node's disk replaced and rebuilt from its peer"
 owner = "#761"
 lanes = ["nightly"]
 criteria = "The node is rebuilt from its peer and re-personalised; only its own unsynced tail at the moment it died is lost, measured and reported; every other acknowledged share and every pool block's landing rows are on both nodes."
-runs = false
-reason = "Needs D-16's `qbit-prism-server node-identity repersonalise`, which the 3.1 stack does not have yet; on the stack both variants stop there (unrecognized subcommand)."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s07_b_disk_replaced_is_rebuilt_from_its_peer_and_loses_only_its_unsynced_tail", "qbit-prism-dual-sim::scenarios::s07_a_disk_replaced_is_rebuilt_from_its_peer_and_loses_only_its_unsynced_tail"]
 
 [[scenario]]
 id = "dual-writer-s08-block-at-death"
