@@ -492,8 +492,20 @@ pub async fn run(config: Config) -> Result<()> {
     // SessionOwner::stop() verifies that no active or pending guard remains.
     // Publish stopped first; only then is it safe to release this token's
     // reservations. On failure, retain reservations and close without a
-    // stopped marker so a replacement cannot reclaim live IDs.
-    if let Err(error) = coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await {
+    // stopped marker so a replacement cannot reclaim live IDs. A dual-writer
+    // frontend (3.1) writes it only over its own row: a replacement may have
+    // registered while it shut down, and its own reservations are released
+    // below either way.
+    let stopped = if coordinator.config.dual_writer.is_some() {
+        coordinator.ledger.stopped_unless_replaced().await.map(|written| {
+            if !written {
+                tracing::info!("stopped marker not written: the instance row is no longer this incarnation's (another with this PRISM_INSTANCE_ID, a replacement or a duplicate, wrote it)");
+            }
+        })
+    } else {
+        coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await
+    };
+    if let Err(error) = stopped {
         coordinator.close_health_pool().await;
         coordinator.ledger.pool.close().await;
         if let Some(failure) = failure {
@@ -730,8 +742,10 @@ impl AdmissionPublisher {
 /// waits for it at most [`HEARTBEAT_SHUTDOWN_WAIT`], so it does not take the
 /// shutdown's budget, then aborts it, as it does if the publisher is aborted
 /// itself. An abandoned heartbeat's statement may already be sent, and the
-/// database may apply it after the stopped marker; it is written so that it
-/// never replaces that marker (`Ledger::health_heartbeat_unless_stopped`).
+/// database may apply it after the stopped marker, or after a replacement
+/// registered; it is written so that it never replaces this incarnation's
+/// stopped marker, nor a row another incarnation keeps fresh
+/// (`Ledger::health_heartbeat_unless_stopped`).
 struct HeartbeatTask {
     handle: tokio::task::JoinHandle<()>,
     started: Instant,
@@ -772,6 +786,11 @@ async fn publish_health(
     let dual_writer = coordinator.config.dual_writer.is_some();
     let mut heartbeat = None::<HeartbeatTask>;
     let mut stuck_warned = None::<Instant>;
+    // A dual-writer heartbeat takes over a row another incarnation with this
+    // instance id wrote once that row has gone half the freshness budget
+    // without a heartbeat: a live one heartbeats every publication.
+    let take_over_after = state.config.health_stale_after() / 2;
+    let row_held_elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let published = async {
         loop {
             tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
@@ -848,10 +867,27 @@ async fn publish_health(
                 // warns at once.
                 stuck_warned = None;
                 let ledger = coordinator.ledger.clone();
+                let row_held_elsewhere = row_held_elsewhere.clone();
                 heartbeat = Some(HeartbeatTask {
                     handle: tokio::spawn(async move {
-                        if let Err(error) = ledger.health_heartbeat_unless_stopped(health).await {
-                            tracing::warn!(%error,"cluster heartbeat failed");
+                        match ledger
+                            .health_heartbeat_unless_stopped(health, take_over_after)
+                            .await
+                        {
+                            Ok(true) => {
+                                if row_held_elsewhere.swap(false, Ordering::Relaxed) {
+                                    tracing::info!("cluster heartbeat written again: this incarnation holds its instance row");
+                                }
+                            }
+                            Ok(false) => {
+                                if !row_held_elsewhere.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        take_over_seconds = take_over_after.as_secs_f64(),
+                                        "cluster heartbeat not written: another incarnation with this PRISM_INSTANCE_ID holds the instance row and heartbeated it within the take-over time; it is taken over once that row goes that long without one"
+                                    );
+                                }
+                            }
+                            Err(error) => tracing::warn!(%error,"cluster heartbeat failed"),
                         }
                     }),
                     started: Instant::now(),

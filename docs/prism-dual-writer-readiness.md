@@ -81,8 +81,13 @@ heartbeat to the cluster table runs as a task of its own, one at a time, so
 the publications keep coming while the database is gone and a slow heartbeat
 still lands. One still running after 10 s logs a warning, at most once a
 minute, and at shutdown the frontend waits at most 5 s for it. A heartbeat
-abandoned then may still be applied after the frontend's stopped marker, but
-it never replaces that marker: the row stays `stopped`.
+abandoned then may still be applied after the frontend's stopped marker, or
+after a replacement registered, but it never replaces the frontend's own
+stopped marker, nor a row a replacement keeps fresh. A row another process
+with the same instance id wrote is taken over only once it has gone half the
+freshness budget without a heartbeat, so a frontend a duplicate wrote over is
+heard again before it reads as stale. Its stopped marker, too, goes only over
+its own row: a replacement that registered while it shut down keeps its row.
 
 ## Admission
 
