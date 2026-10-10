@@ -450,6 +450,9 @@ impl Config {
             coinbase_tag.len() <= 40 && coinbase_tag.bytes().all(|b| (0x20..=0x7e).contains(&b)),
             "PRISM_COINBASE_TAG must be at most 40 printable ASCII bytes"
         );
+        if dual_writer.is_some() {
+            check_dual_writer_coinbase_tag(&coinbase_tag)?;
+        }
         let extranonce2_size = bounded_usize("PRISM_STRATUM_EXTRANONCE2_SIZE", 8, 1, 32)?;
         let mut payout_policy = PayoutPolicy::day_one_default();
         payout_policy.p2mr_spend_input_bytes =
@@ -775,9 +778,30 @@ impl Config {
     }
 }
 
+/// 3.1 dual writer: which node found a block is read right after the
+/// coinbase tag (`ledger/carry.rs`, `finder_node`), so the tag must be there
+/// to be found. An empty tag would verify nothing, and a very short one could
+/// match by chance.
+pub(crate) fn check_dual_writer_coinbase_tag(tag: &str) -> Result<()> {
+    ensure!(
+        tag.len() >= 4,
+        "PRISM_DUAL_WRITER needs a PRISM_COINBASE_TAG of at least 4 bytes ({tag:?} has {}): which node found a block is read right after it",
+        tag.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dual_writer_needs_a_coinbase_tag_of_four_bytes_or_more() {
+        assert!(check_dual_writer_coinbase_tag("").is_err());
+        assert!(check_dual_writer_coinbase_tag("/P/").is_err());
+        assert!(check_dual_writer_coinbase_tag("/PR/").is_ok());
+        assert!(check_dual_writer_coinbase_tag("/PRISM/").is_ok());
+    }
 
     fn automatic_ctv_config() -> Config {
         Config {

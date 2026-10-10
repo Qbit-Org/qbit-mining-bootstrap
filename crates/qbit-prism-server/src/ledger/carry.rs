@@ -57,21 +57,33 @@ pub struct CarryGate {
     /// A change whose revision bump has not committed yet. The guard retries
     /// the bump until it does.
     fence_pending: AtomicBool,
-    /// The frontend's `extranonce2_size`, which locates extranonce1 in a
-    /// coinbase ([`finder_node`]); set with the dual-writer identity.
-    extranonce2_size: std::sync::OnceLock<usize>,
+    /// Counts every change of the gate, so an offer can tell that the gate
+    /// moved after its reservation, even back to where it was.
+    generation: std::sync::atomic::AtomicU64,
+    /// The frontend's coinbase tag and `extranonce2_size`, which locate
+    /// extranonce1 in a coinbase ([`finder_node`]); set with the dual-writer
+    /// identity.
+    coinbase_layout: std::sync::OnceLock<(Vec<u8>, usize)>,
 }
 
 /// The node whose half of the extranonce1 space a coinbase's extranonce1 is
 /// in (D1: node A `[1, 2^31-1]`, node B `[2^31, 2^32-1]`): the node that
 /// issued the work the block was found on, whichever node landed its rows.
-/// The scriptSig ends with extranonce1 (four bytes, big-endian, as Stratum
-/// sends it) and extranonce2 (`extranonce2_size` bytes). `None` when the
-/// coinbase does not parse or extranonce1 is 0, which no session is given.
-pub fn finder_node(coinbase_tx: &[u8], extranonce2_size: usize) -> Option<i16> {
+/// The scriptSig ends with the coinbase tag, extranonce1 (four bytes,
+/// big-endian, as Stratum sends it) and extranonce2 (`extranonce2_size`
+/// bytes, this node's width). The pair need not share that width, so
+/// extranonce1 is read only where `tag` sits right before it: work issued
+/// with another width names no node here, whatever its bytes say. `None`
+/// when the coinbase does not parse, the tag is not there, or extranonce1
+/// is 0, which no session is given. An empty tag verifies nothing, so a
+/// dual writer refuses to start with one (`config.rs`).
+pub fn finder_node(coinbase_tx: &[u8], tag: &[u8], extranonce2_size: usize) -> Option<i16> {
     let script_sig = crate::codec::coinbase_script_sig(coinbase_tx).ok()?;
     let end = script_sig.len().checked_sub(extranonce2_size)?;
     let start = end.checked_sub(4)?;
+    if !script_sig[..start].ends_with(tag) {
+        return None;
+    }
     let extranonce1 = u32::from_be_bytes(script_sig[start..end].try_into().ok()?);
     crate::node_identity::NodeIndex::ALL
         .into_iter()
@@ -92,14 +104,19 @@ impl Ledger {
             .map(|identity| identity.node.index())
     }
 
-    /// Record the frontend's `extranonce2_size`, so the ledger can tell which
-    /// node's work a block was found on. Set once, with the dual-writer
-    /// identity; a second, different value is refused.
-    pub fn set_extranonce2_size(&self, size: usize) -> Result<()> {
-        let recorded = *self.carry.extranonce2_size.get_or_init(|| size);
+    /// Record the frontend's coinbase tag and `extranonce2_size`, so the
+    /// ledger can tell which node's work a block was found on. Set once, with
+    /// the dual-writer identity; a second, different layout is refused.
+    pub fn set_coinbase_layout(&self, tag: &[u8], extranonce2_size: usize) -> Result<()> {
+        let recorded = self
+            .carry
+            .coinbase_layout
+            .get_or_init(|| (tag.to_vec(), extranonce2_size));
         ensure!(
-            recorded == size,
-            "this ledger already reads extranonce2 as {recorded} bytes"
+            recorded.0 == tag && recorded.1 == extranonce2_size,
+            "this ledger already reads coinbases with tag {:?} and a {}-byte extranonce2",
+            String::from_utf8_lossy(&recorded.0),
+            recorded.1
         );
         Ok(())
     }
@@ -107,17 +124,20 @@ impl Ledger {
     /// Dual writer: whether this node issued the work a block with this
     /// coinbase was found on ([`finder_node`]). A block adopted from the
     /// peer's work (S8) carries this node as its origin, but was found by
-    /// the peer. Without a recorded extranonce2 size, or for a coinbase that
-    /// names no node, `origin_is_own` decides.
+    /// the peer. A coinbase that names no node is not this node's: every
+    /// coinbase it builds names it, so such a block was issued elsewhere
+    /// (with another extranonce2 width or tag, adopted here among them) and
+    /// is sponsored here only by takeover. Without a recorded coinbase
+    /// layout, or without the coinbase, `origin_is_own` decides.
     pub fn found_here(&self, coinbase_tx: Option<&[u8]>, origin_is_own: bool) -> bool {
-        let (Some(own), Some(size), Some(coinbase)) = (
+        let (Some(own), Some((tag, size)), Some(coinbase)) = (
             self.own_node(),
-            self.carry.extranonce2_size.get(),
+            self.carry.coinbase_layout.get(),
             coinbase_tx,
         ) else {
             return origin_is_own;
         };
-        finder_node(coinbase, *size).map_or(origin_is_own, |finder| finder == own)
+        finder_node(coinbase, tag, *size) == Some(own)
     }
 
     /// Whether work built now pays carried balances: always in single-writer
@@ -175,6 +195,7 @@ impl Ledger {
         }
         let changed = self.carry.paying.swap(paying, Ordering::SeqCst) != paying;
         if changed {
+            self.carry.generation.fetch_add(1, Ordering::SeqCst);
             self.carry.fence_pending.store(true, Ordering::SeqCst);
         }
         self.fence_carry_change().await?;
@@ -213,6 +234,39 @@ impl Ledger {
     pub fn carry_fence_pending(&self) -> bool {
         self.carry.fence_pending.load(Ordering::SeqCst)
     }
+
+    /// [`carry_paying_not_current`] for work built on
+    /// `prior_balances_digest`, with this node's gate as it is now: what an
+    /// offer must not take for current work.
+    pub fn carry_paying_not_current_now(&self, prior_balances_digest: &[u8; 32]) -> bool {
+        carry_paying_not_current(
+            self.dual_writer(),
+            self.carry_paying(),
+            self.carry_fence_pending(),
+            prior_balances_digest,
+        )
+    }
+
+    /// How many times the gate has changed ([`Ledger::set_carry_paying`]).
+    pub fn carry_gate_generation(&self) -> u64 {
+        self.carry.generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether a block on work built on `prior_balances_digest`, reserved
+    /// as current work with the gate at `generation`, must not be sent now:
+    /// carry-paying work behind a closed or unfenced gate, or after any gate
+    /// change since (a gate closed and reopened meanwhile included, as the
+    /// peer may have paid the same balances while it was closed).
+    pub fn carry_paying_unsendable(
+        &self,
+        prior_balances_digest: &[u8; 32],
+        generation: u64,
+    ) -> bool {
+        self.carry_paying_not_current_now(prior_balances_digest)
+            || (self.dual_writer()
+                && !carry_free_block(true, prior_balances_digest)
+                && self.carry_gate_generation() != generation)
+    }
 }
 
 /// Bump the payout revision in a transaction that holds `SETTLEMENT_LOCK`
@@ -230,6 +284,23 @@ pub async fn bump_payout_revision(tx: &mut Transaction<'_, Postgres>) -> Result<
 /// confirmation or capture of it can create debt (module comment).
 pub(super) fn carry_free_block(dual_writer: bool, prior_balances_digest: &[u8; 32]) -> bool {
     dual_writer && *prior_balances_digest == carry_free_prior_digest()
+}
+
+/// Whether a block built on `prior_balances_digest` paid carried balances
+/// while this dual-writer node's gate is closed, or a change of it still
+/// awaits its revision bump: work an offer must not take for current work
+/// whatever the payout revision says, since that bump may not have
+/// committed yet (it is retried until it does). A gate closed and reopened
+/// before either bump commits is still pending.
+pub(super) fn carry_paying_not_current(
+    dual_writer: bool,
+    gate_paying: bool,
+    fence_pending: bool,
+    prior_balances_digest: &[u8; 32],
+) -> bool {
+    dual_writer
+        && (!gate_paying || fence_pending)
+        && !carry_free_block(dual_writer, prior_balances_digest)
 }
 
 #[cfg(test)]
@@ -275,14 +346,21 @@ mod tests {
         assert_eq!(ledger.job_prior_balance_sql(), window::PRIOR_BALANCE_SQL);
     }
 
+    const TAG: &[u8] = b"/PRISM/";
+
     /// A coinbase whose scriptSig is a height push, the tag, extranonce1 and
     /// eight bytes of extranonce2.
     fn coinbase(extranonce1: u32) -> Vec<u8> {
+        coinbase_with(extranonce1, 8)
+    }
+
+    /// The same with `width` bytes of extranonce2.
+    fn coinbase_with(extranonce1: u32, width: usize) -> Vec<u8> {
         let script_sig = [
             &[0x03, 0x01, 0x02, 0x03][..],
-            b"/PRISM/",
+            TAG,
             &extranonce1.to_be_bytes(),
-            &[0xee; 8],
+            &vec![0xee; width],
         ]
         .concat();
         [
@@ -300,14 +378,27 @@ mod tests {
 
     #[test]
     fn the_finder_is_the_node_whose_extranonce1_half_the_coinbase_carries() {
-        assert_eq!(finder_node(&coinbase(1), 8), Some(0));
-        assert_eq!(finder_node(&coinbase(0x7fff_ffff), 8), Some(0));
-        assert_eq!(finder_node(&coinbase(0x8000_0000), 8), Some(1));
-        assert_eq!(finder_node(&coinbase(u32::MAX), 8), Some(1));
+        assert_eq!(finder_node(&coinbase(1), TAG, 8), Some(0));
+        assert_eq!(finder_node(&coinbase(0x7fff_ffff), TAG, 8), Some(0));
+        assert_eq!(finder_node(&coinbase(0x8000_0000), TAG, 8), Some(1));
+        assert_eq!(finder_node(&coinbase(u32::MAX), TAG, 8), Some(1));
         // No session is given extranonce1 0; a wrong layout names nobody.
-        assert_eq!(finder_node(&coinbase(0), 8), None);
-        assert_eq!(finder_node(&[1, 2, 3], 8), None);
-        assert_eq!(finder_node(&coinbase(5), 64), None);
+        assert_eq!(finder_node(&coinbase(0), TAG, 8), None);
+        assert_eq!(finder_node(&[1, 2, 3], TAG, 8), None);
+        assert_eq!(finder_node(&coinbase(5), TAG, 64), None);
+    }
+
+    /// Work the peer issued with another extranonce2 width names no node
+    /// here: read at this node's width, the four bytes before extranonce2
+    /// are not preceded by the tag. Without the check, `ISM/` would read as
+    /// node A's extranonce1. An empty tag verifies nothing.
+    #[test]
+    fn work_issued_with_another_extranonce2_width_names_no_finder() {
+        assert_eq!(finder_node(&coinbase_with(u32::MAX, 4), TAG, 8), None);
+        assert_eq!(finder_node(&coinbase_with(1, 12), TAG, 8), None);
+        assert_eq!(finder_node(&coinbase(u32::MAX), b"/OTHER/", 8), None);
+        assert_eq!(finder_node(&coinbase(u32::MAX), b"", 8), Some(1));
+        assert_eq!(finder_node(&coinbase_with(u32::MAX, 4), b"", 8), Some(0));
     }
 
     #[tokio::test]
@@ -322,13 +413,70 @@ mod tests {
             })
             .unwrap();
         assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true));
-        ledger.set_extranonce2_size(8).unwrap();
-        assert!(ledger.set_extranonce2_size(4).is_err());
+        ledger.set_coinbase_layout(TAG, 8).unwrap();
+        assert!(ledger.set_coinbase_layout(TAG, 4).is_err());
+        assert!(ledger.set_coinbase_layout(b"/OTHER/", 8).is_err());
         // Adopted from B's work: this node's rows, B's block.
         assert!(!ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        // B's block issued with another width names nobody, so it is never
+        // taken for this node's.
+        assert!(!ledger.found_here(Some(&coinbase_with(7, 4)), false));
         assert!(ledger.found_here(Some(&coinbase(7)), false));
         assert!(!ledger.found_here(None, false));
-        assert!(ledger.found_here(Some(&[0]), true));
+        // A coinbase that names no node is not this node's, whatever the
+        // origin: B's block issued with another width and adopted here.
+        assert!(!ledger.found_here(Some(&coinbase_with(u32::MAX, 4)), true));
+        assert!(!ledger.found_here(Some(&[0]), true));
+    }
+
+    #[test]
+    fn carry_paying_work_is_not_current_behind_a_closed_or_unfenced_dual_writer_gate() {
+        let free = carry_free_prior_digest();
+        let paying = [0x5a; 32];
+        // Closed, open with its change unfenced, open and fenced.
+        assert!(carry_paying_not_current(true, false, false, &paying));
+        assert!(carry_paying_not_current(true, false, true, &paying));
+        assert!(carry_paying_not_current(true, true, true, &paying));
+        assert!(!carry_paying_not_current(true, true, false, &paying));
+        // Carry-free work is always current.
+        for (open, pending) in [(false, false), (false, true), (true, true), (true, false)] {
+            assert!(!carry_paying_not_current(true, open, pending, &free));
+        }
+        // A single writer pays carried balances for good.
+        assert!(!carry_paying_not_current(false, false, true, &paying));
+        assert!(!carry_paying_not_current(false, true, false, &paying));
+    }
+
+    #[tokio::test]
+    async fn carry_paying_work_reserved_as_current_is_unsendable_after_any_gate_change() {
+        let ledger = ledger();
+        let paying = [0x5a; 32];
+        let free = carry_free_prior_digest();
+        // A single writer sends whatever it reserved.
+        assert!(!ledger.carry_paying_unsendable(&paying, 0));
+        ledger
+            .set_dual_writer_identity(NodeIdentity {
+                node: NodeIndex::A,
+                carry_owner: true,
+            })
+            .unwrap();
+        // Open and fenced, as at the reservation.
+        ledger.carry.paying.store(true, Ordering::SeqCst);
+        let reserved = ledger.carry_gate_generation();
+        assert!(!ledger.carry_paying_unsendable(&paying, reserved));
+        // Closed and reopened since, both fenced: the peer may have paid the
+        // same balances while it was closed.
+        ledger.carry.generation.fetch_add(2, Ordering::SeqCst);
+        assert!(ledger.carry_paying_unsendable(&paying, reserved));
+        assert!(!ledger.carry_paying_unsendable(&free, reserved));
+        // Unfenced, or closed, at the send.
+        let now = ledger.carry_gate_generation();
+        ledger.carry.fence_pending.store(true, Ordering::SeqCst);
+        assert!(ledger.carry_paying_unsendable(&paying, now));
+        ledger.carry.fence_pending.store(false, Ordering::SeqCst);
+        ledger.carry.paying.store(false, Ordering::SeqCst);
+        assert!(ledger.carry_paying_unsendable(&paying, now));
+        assert!(!ledger.carry_paying_unsendable(&free, now));
     }
 
     #[test]
