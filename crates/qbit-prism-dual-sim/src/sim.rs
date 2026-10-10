@@ -796,7 +796,10 @@ impl Sim {
                 }
                 Err(_) => {
                     close_all(pools).await;
-                    anyhow::bail!("connecting to node {node:?} outlived the {limit:?} bound");
+                    anyhow::bail!(
+                        "connecting to the two databases outlived the {limit:?} bound (still \
+                         connecting to node {node:?})"
+                    );
                 }
             }
         }
@@ -856,12 +859,14 @@ impl Sim {
                 let mut conflicts = Vec::new();
                 for (node, pool) in &pools {
                     // Every conflict, and those seen during the wait: a row
-                    // refused before it stays missing just the same.
-                    let since = since.get(node).copied().unwrap_or_else(chrono::Utc::now);
+                    // refused before it stays missing just the same. Without
+                    // the database's clock at the start, the second is unread.
+                    let since = since.get(node).copied();
                     let count = tokio::time::timeout(
                         Duration::from_secs(5),
-                        sqlx::query_as::<_, (i64, i64)>(
+                        sqlx::query_as::<_, (i64, Option<i64>)>(
                             "SELECT count(*), count(*) FILTER (WHERE last_seen_at >= $1) \
+                                                  + CASE WHEN $1 IS NULL THEN NULL ELSE 0 END \
                              FROM qbit_prism_peer_sync_conflicts",
                         )
                         .bind(since)
@@ -869,8 +874,11 @@ impl Sim {
                     )
                     .await;
                     conflicts.push(match count {
-                        Ok(Ok((all, recent))) => {
+                        Ok(Ok((all, Some(recent)))) => {
                             format!("node {node:?}: {all} ({recent} seen during the wait)")
+                        }
+                        Ok(Ok((all, None))) => {
+                            format!("node {node:?}: {all} (during the wait: unread)")
                         }
                         Ok(Err(error)) => format!("node {node:?}: unread ({error})"),
                         Err(_) => format!("node {node:?}: unread (timed out)"),

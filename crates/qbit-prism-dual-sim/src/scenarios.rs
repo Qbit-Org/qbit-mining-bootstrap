@@ -1630,7 +1630,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
                 .collect();
             let passed = matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50);
             (
-                passed && on_b.len() == sessions,
+                passed && (0..sessions).all(|session| on_b.contains(&session)),
                 format!(
                     "sessions with shares accepted on B 45 to 60 s after the death: {} of \
                      {sessions}; p95 answer latency of shares on B's jobs: {early:?} ms over \
