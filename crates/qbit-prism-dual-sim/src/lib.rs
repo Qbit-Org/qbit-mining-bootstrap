@@ -23,5 +23,6 @@ pub mod postgres;
 pub mod process;
 pub mod relay;
 pub mod report;
+pub mod rpc_gate;
 pub mod scenarios;
 pub mod sim;

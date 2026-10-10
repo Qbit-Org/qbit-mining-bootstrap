@@ -140,6 +140,9 @@ struct Backend {
 
 struct Shared {
     config: BalancerConfig,
+    /// What each check requests, which a cutover changes mid-run (the 3.0
+    /// pair's `/healthz` to the 3.1 pair's `/readyz`).
+    probe: std::sync::RwLock<Probe>,
     backends: Vec<Backend>,
     started: Instant,
     events: Mutex<Vec<BalancerEvent>>,
@@ -154,6 +157,14 @@ impl Shared {
             events.push(BalancerEvent { at_ms, event });
         }
     }
+}
+
+/// The request a health check makes.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub path: String,
+    pub require_ok: bool,
+    pub token: Option<String>,
 }
 
 pub struct Balancer {
@@ -175,7 +186,13 @@ impl Balancer {
             .await
             .context("binding the balancer")?;
         let port = listener.local_addr()?.port();
+        let probe = std::sync::RwLock::new(Probe {
+            path: config.check_path.clone(),
+            require_ok: config.require_ok,
+            token: config.check_token.clone(),
+        });
         let shared = Arc::new(Shared {
+            probe,
             config,
             backends: backends
                 .into_iter()
@@ -257,6 +274,15 @@ impl Balancer {
         Ok(())
     }
 
+    /// Change what every later check requests, and through which port of
+    /// each node (`health_ports`, in backend order).
+    pub fn set_probe(&self, probe: Probe) {
+        if let Ok(mut current) = self.shared.probe.write() {
+            *current = probe;
+        }
+        self.shared.event("checks reconfigured".into());
+    }
+
     pub fn report(&self) -> BalancerReport {
         BalancerReport {
             config: self.shared.config.clone(),
@@ -299,10 +325,10 @@ impl Drop for Balancer {
 
 /// One check: whether the node answered 200 (and `ok: true` when required),
 /// with the reason when it did not.
-async fn check(client: &reqwest::Client, config: &BalancerConfig, port: u16) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}{}", config.check_path);
+async fn check(client: &reqwest::Client, probe: &Probe, port: u16) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}{}", probe.path);
     let mut request = client.get(&url);
-    if let Some(token) = &config.check_token {
+    if let Some(token) = &probe.token {
         request = request.header(TOKEN_HEADER, token);
     }
     let response = request.send().await.map_err(|error| {
@@ -316,7 +342,7 @@ async fn check(client: &reqwest::Client, config: &BalancerConfig, port: u16) -> 
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
-    if config.require_ok {
+    if probe.require_ok {
         let body: serde_json::Value = response
             .json()
             .await
@@ -336,7 +362,14 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        let result = check(&client, &shared.config, backend.target.health_port).await;
+        let probe = shared
+            .probe
+            .read()
+            .map(|probe| probe.clone())
+            .map_err(|_| ())
+            .ok();
+        let Some(probe) = probe else { return };
+        let result = check(&client, &probe, backend.target.health_port).await;
         let up = *backend.up.borrow();
         match result {
             Ok(()) => {

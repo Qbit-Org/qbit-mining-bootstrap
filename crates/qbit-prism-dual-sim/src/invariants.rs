@@ -171,6 +171,26 @@ pub struct CheckOptions {
     /// Databases whose landing rows are not expected yet (a node still
     /// down), with why. Its other checks still run where they can.
     pub absent_ledgers: BTreeMap<Node, String>,
+    /// Who owned the carry from which height, oldest first, when it is not
+    /// the dual-writer pair's A from the start: the 3.0 epoch before a
+    /// cutover has no owner (S9), and a transfer moves it (S11). Empty means
+    /// the topology's default.
+    pub ownership: Vec<(u64, Option<Node>)>,
+}
+
+impl CheckOptions {
+    /// The carry owner when a block at `height` was built: `None` in a
+    /// single-writer epoch.
+    pub fn owner_at(&self, topology: Topology, height: u64) -> Option<Node> {
+        if self.ownership.is_empty() {
+            return (topology == Topology::DualWriter).then_some(Node::A);
+        }
+        self.ownership
+            .iter()
+            .take_while(|(from, _)| *from <= height)
+            .last()
+            .and_then(|(_, owner)| *owner)
+    }
 }
 
 /// One pool block of the active chain.
@@ -195,9 +215,14 @@ pub fn ledger_nodes(sim: &Sim) -> Vec<Node> {
     }
 }
 
-/// The owner and the non-owner, in dual-writer mode.
-pub fn roles(sim: &Sim) -> Option<(Node, Node)> {
-    (sim.config.topology == Topology::DualWriter).then_some((Node::A, Node::B))
+/// The owner at the census's newest block, whose balance view the checker
+/// holds to the chain: the dual-writer owner, or in the 3.0 pair the one
+/// database (A's).
+fn current_owner(sim: &Sim, options: &CheckOptions, census: &[CensusBlock]) -> Node {
+    let tip = census.last().map_or(sim.start_height, |block| block.height);
+    options
+        .owner_at(sim.config.topology, tip)
+        .unwrap_or(Node::A)
 }
 
 /// Run every check.
@@ -215,9 +240,9 @@ pub async fn check(
     }
     let census = census(sim, &pools, shares).await?;
     let mut checks = Vec::new();
-    checks.push(no_overpay(sim, &pools, &census).await?);
-    checks.push(owner_balances_match_chain(sim, &pools, &census).await?);
-    checks.push(non_owner_carry_free(sim, &pools, &census).await?);
+    checks.push(no_overpay(sim, &pools, &census, options).await?);
+    checks.push(owner_balances_match_chain(sim, &pools, &census, options).await?);
+    checks.push(non_owner_carry_free(sim, &pools, &census, options).await?);
     checks.push(landing_rows(&pools, &census, options).await?);
     checks.push(audits_verify(sim, &census, options).await?);
     checks.push(fanouts_identical(&pools, &census).await?);
@@ -421,9 +446,9 @@ async fn no_overpay(
     sim: &Sim,
     pools: &BTreeMap<Node, PgPool>,
     census: &[CensusBlock],
+    options: &CheckOptions,
 ) -> Result<Check> {
     let mut check = CheckBuilder::new("inv1-no-overpay");
-    let owner = roles(sim).map(|(owner, _)| owner);
     let mut blocks = Vec::new();
     for block in census {
         let Some((_, pool)) = source_of(block, pools) else {
@@ -436,9 +461,9 @@ async fn no_overpay(
         };
         let carry = carry_rows(pool, &block.hash).await?;
         // The #478 race is recorded by the database that confirmed the
-        // block; in dual-writer mode only the owner's own blocks may carry
-        // it.
-        let recorder = match owner {
+        // block; in a dual-writer epoch only the owner's own blocks may
+        // carry it.
+        let recorder = match options.owner_at(sim.config.topology, block.height) {
             Some(owner) => (block.origin == Some(owner))
                 .then(|| pools.get(&owner))
                 .flatten(),
@@ -526,9 +551,10 @@ async fn owner_balances_match_chain(
     sim: &Sim,
     pools: &BTreeMap<Node, PgPool>,
     census: &[CensusBlock],
+    options: &CheckOptions,
 ) -> Result<Check> {
     let mut check = CheckBuilder::new("owner-balances-match-chain");
-    let owner = roles(sim).map_or(Node::A, |(owner, _)| owner);
+    let owner = current_owner(sim, options, census);
     let Some(pool) = pools.get(&owner) else {
         return Ok(Check::skip(
             "owner-balances-match-chain",
@@ -582,18 +608,25 @@ async fn non_owner_carry_free(
     sim: &Sim,
     pools: &BTreeMap<Node, PgPool>,
     census: &[CensusBlock],
+    options: &CheckOptions,
 ) -> Result<Check> {
-    let Some((_, non_owner)) = roles(sim) else {
+    // A block is the non-owner's when its origin is not the owner of its
+    // height's epoch; a single-writer epoch has none.
+    let blocks: Vec<&CensusBlock> = census
+        .iter()
+        .filter(|block| {
+            options
+                .owner_at(sim.config.topology, block.height)
+                .is_some_and(|owner| block.origin.is_some_and(|origin| origin != owner))
+        })
+        .collect();
+    if sim.config.topology != Topology::DualWriter && options.ownership.is_empty() {
         return Ok(Check::skip(
             "inv2-non-owner-carry-free",
             "single-writer topology: there is no non-owner",
         ));
-    };
+    }
     let mut check = CheckBuilder::new("inv2-non-owner-carry-free");
-    let blocks: Vec<&CensusBlock> = census
-        .iter()
-        .filter(|block| block.origin == Some(non_owner))
-        .collect();
     for block in &blocks {
         for node in &block.landed_in {
             let Some(pool) = pools.get(node) else {
@@ -640,7 +673,7 @@ async fn non_owner_carry_free(
         }
     }
     Ok(check.finish(format!(
-        "{} blocks issued by the non-owner (node {non_owner:?})",
+        "{} blocks issued by a non-owner of their epoch",
         blocks.len()
     )))
 }
@@ -670,6 +703,8 @@ async fn landing_rows(
                     f.block_hash IS NOT NULL AS has_fanout_set, \
                     (SELECT count(*) FROM qbit_ctv_fanout_artifacts fa WHERE fa.block_hash = h.block_hash) AS fanout_artifacts, \
                     a.audit_bundle_sha256, a.share_snapshot_sha256, \
+                    b.block_height, b.parent_hash, b.coinbase_txid, b.payout_manifest_sha256, \
+                    b.as_issued_audit_sha256, \
                     (SELECT md5(string_agg(concat_ws('|', p.miner_id, p.payout_order_key, encode(p.p2mr_program, 'hex'), \
                          p.onchain_amount_sats, p.carry_forward_balance_sats, p.action), ',' \
                          ORDER BY p.payout_order_key, p.miner_id, p.p2mr_program)) \
@@ -733,15 +768,34 @@ async fn landing_rows(
                     "{artifacts} fanout artifacts for {expected} manifests"
                 ));
             }
+            // The landed coinbase must be the chain's: the census read it
+            // from C, never from a database.
+            let coinbase_txid: Option<String> = row.try_get("coinbase_txid")?;
+            if let Some(block) = census.iter().find(|block| block.hash == hash) {
+                if coinbase_txid.as_deref() != Some(block.coinbase_txid.as_str()) {
+                    faults.push(format!(
+                        "coinbase txid {coinbase_txid:?}, the chain's is {}",
+                        block.coinbase_txid
+                    ));
+                }
+            }
             if !faults.is_empty() {
                 check.problem(format!(
                     "pool block {hash} on node {node:?}: {}",
                     faults.join("; ")
                 ));
             }
+            // CONTRACT.md D-1 and D-10: every immutable landing fact is the
+            // same on both nodes; only local columns (chain and maturity
+            // state, publication order, claims) may differ.
             fingerprints.entry(hash).or_default().insert(
                 *node,
                 json!({
+                    "height": row.try_get::<Option<i64>, _>("block_height")?,
+                    "parent": row.try_get::<Option<String>, _>("parent_hash")?,
+                    "coinbase_txid": coinbase_txid,
+                    "payout_manifest": row.try_get::<Option<String>, _>("payout_manifest_sha256")?,
+                    "as_issued_audit": row.try_get::<Option<String>, _>("as_issued_audit_sha256")?,
                     "audit": row.try_get::<Option<String>, _>("audit_bundle_sha256")?,
                     "snapshot": row.try_get::<Option<String>, _>("share_snapshot_sha256")?,
                     "payouts": row.try_get::<Option<String>, _>("payout_fp")?,
@@ -1056,37 +1110,134 @@ async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     )))
 }
 
-async fn windows_unchanged(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+/// Which shape of window a database records: 3.0's anchored range, or the
+/// 3.1 range with a per-node cut (CONTRACT.md D-13, migration 028).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowShape {
+    Anchored,
+    Cut,
+}
+
+/// Whether the database's audit snapshots carry D-13's cut columns.
+pub async fn window_shape(pool: &PgPool) -> Result<WindowShape> {
+    let cut: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'qbit_prism_audit_snapshots' \
+           AND column_name = 'cut_seq_0')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(if cut {
+        WindowShape::Cut
+    } else {
+        WindowShape::Anchored
+    })
+}
+
+/// One recorded window: its range, anchor and cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedWindow {
+    pub snapshot: String,
+    pub first: i64,
+    pub last: i64,
+    pub anchor_ms: i64,
+    pub count: i64,
+    /// `(cut[0], cut[1])`, `None` when the window has no cut.
+    pub cut: Option<(Option<i64>, Option<i64>)>,
+}
+
+/// One `qbit_prism_audit_snapshots` row as `recorded_windows` reads it:
+/// digest, first and last share_seq, anchor, count, and the cut.
+type SnapshotRow = (String, i64, i64, i64, i64, Option<i64>, Option<i64>);
+
+/// Every non-bootstrap window a database recorded.
+pub async fn recorded_windows(pool: &PgPool) -> Result<Vec<RecordedWindow>> {
+    let shape = window_shape(pool).await?;
+    let cuts = match shape {
+        WindowShape::Cut => "cut_seq_0, cut_seq_1",
+        WindowShape::Anchored => "NULL::bigint, NULL::bigint",
+    };
+    let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
+        "SELECT snapshot_sha256, first_share_seq, last_share_seq, anchor_ms, \
+                    share_count::bigint, {cuts} \
+             FROM qbit_prism_audit_snapshots WHERE inline_shares IS NULL"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(snapshot, first, last, anchor_ms, count, cut0, cut1)| RecordedWindow {
+                snapshot,
+                first,
+                last,
+                anchor_ms,
+                count,
+                cut: (cut0.is_some() || cut1.is_some()).then_some((cut0, cut1)),
+            },
+        )
+        .collect())
+}
+
+/// D-13's eligibility predicate over ledger rows `l`, with `$1` the anchor
+/// in milliseconds and `$2`, `$3` the cut: today's anchored predicate when
+/// the window has no cut, otherwise also each node's rows up to its cut (a
+/// null entry admits none of that node's rows).
+fn eligible_sql(window: &RecordedWindow) -> &'static str {
+    match window.cut {
+        // $2 and $3 are bound as NULL here; naming them with their type keeps
+        // PostgreSQL from refusing parameters it cannot type.
+        None => {
+            "l.accepted \
+             AND l.accepted_at <= to_timestamp($1::double precision / 1000) \
+             AND l.job_issued_at <= to_timestamp($1::double precision / 1000) \
+             AND $2::bigint IS NULL AND $3::bigint IS NULL"
+        }
+        Some(_) => {
+            "l.accepted \
+             AND l.accepted_at <= to_timestamp($1::double precision / 1000) \
+             AND l.job_issued_at <= to_timestamp($1::double precision / 1000) \
+             AND ((l.origin_node = 0 AND l.share_seq <= $2) \
+                  OR (l.origin_node = 1 AND l.share_seq <= $3))"
+        }
+    }
+}
+
+/// How a recorded window reads in a ledger now: the eligible rows in its
+/// range, and the lowest eligible row above it, if any.
+pub async fn window_now(pool: &PgPool, window: &RecordedWindow) -> Result<(i64, Option<i64>)> {
+    let eligible = eligible_sql(window);
+    let (cut0, cut1) = window.cut.unwrap_or((None, None));
+    Ok(sqlx::query_as(&format!(
+        "SELECT (SELECT count(*) FROM qbit_share_ledger l \
+                  WHERE {eligible} AND l.share_seq BETWEEN $4 AND $5), \
+                (SELECT min(l.share_seq) FROM qbit_share_ledger l \
+                  WHERE {eligible} AND l.share_seq > $5)"
+    ))
+    .bind(window.anchor_ms)
+    .bind(cut0)
+    .bind(cut1)
+    .bind(window.first)
+    .bind(window.last)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// CONTRACT.md §4.4: a window, once built, never changes. Every recorded
+/// window must still hold exactly its shares, and no row above it may be
+/// eligible for it (a late row that would have joined it).
+pub async fn windows_unchanged(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     let mut check = CheckBuilder::new("inv4-windows-unchanged");
     let mut windows = 0;
     for (node, pool) in pools {
-        let rows = sqlx::query(
-            "SELECT s.snapshot_sha256, s.first_share_seq, s.last_share_seq, s.share_count, \
-                    (SELECT count(*) FROM qbit_share_ledger l \
-                      WHERE l.accepted AND l.share_seq BETWEEN s.first_share_seq AND s.last_share_seq \
-                        AND l.accepted_at <= to_timestamp(s.anchor_ms::double precision / 1000) \
-                        AND l.job_issued_at <= to_timestamp(s.anchor_ms::double precision / 1000)) AS durable_count, \
-                    (SELECT min(l.share_seq) FROM qbit_share_ledger l \
-                      WHERE l.accepted AND l.share_seq > s.last_share_seq \
-                        AND l.accepted_at <= to_timestamp(s.anchor_ms::double precision / 1000) \
-                        AND l.job_issued_at <= to_timestamp(s.anchor_ms::double precision / 1000)) AS newer_eligible \
-             FROM qbit_prism_audit_snapshots s WHERE s.inline_shares IS NULL",
-        )
-        .fetch_all(pool)
-        .await?;
-        for row in rows {
+        for window in recorded_windows(pool).await? {
             windows += 1;
-            let snapshot: String = row.try_get("snapshot_sha256")?;
-            let count: i64 = row
-                .try_get::<i32, _>("share_count")
-                .map(i64::from)
-                .or_else(|_| row.try_get("share_count"))?;
-            let durable: i64 = row.try_get("durable_count")?;
-            let newer: Option<i64> = row.try_get("newer_eligible")?;
-            if durable != count || newer.is_some() {
+            let (durable, newer) = window_now(pool, &window).await?;
+            if durable != window.count || newer.is_some() {
                 check.problem(format!(
-                    "window {snapshot} on node {node:?} recorded {count} shares; the ledger now \
-                     holds {durable} in its range, and a newer eligible share at {newer:?}"
+                    "window {} on node {node:?} recorded {} shares; the ledger now holds \
+                     {durable} in its range, and a newer eligible share at {newer:?}",
+                    window.snapshot, window.count
                 ));
             }
         }
@@ -1104,23 +1255,18 @@ async fn windows_reproducible(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     let mut check = CheckBuilder::new("inv4-windows-reproducible");
     let mut compared = 0;
     for (node, pool) in pools {
-        let snapshots: Vec<(String, i64, i64, i64)> = sqlx::query_as(
-            "SELECT snapshot_sha256, first_share_seq, last_share_seq, anchor_ms \
-             FROM qbit_prism_audit_snapshots WHERE inline_shares IS NULL",
-        )
-        .fetch_all(pool)
-        .await?;
-        for (snapshot, first, last, anchor) in snapshots {
+        for window in recorded_windows(pool).await? {
             for (other, other_pool) in pools {
                 if other == node {
                     continue;
                 }
                 compared += 1;
-                let digest = window_digest(other_pool, first, last, anchor).await?;
-                if digest.as_deref() != Some(snapshot.as_str()) {
+                let digest = window_digest(other_pool, &window).await?;
+                if digest.as_deref() != Some(window.snapshot.as_str()) {
                     check.problem(format!(
-                        "window {snapshot} built on node {node:?} recomputes on node {other:?} as \
-                         {digest:?}"
+                        "window {} built on node {node:?} recomputes on node {other:?} as \
+                         {digest:?}",
+                        window.snapshot
                     ));
                 }
             }
@@ -1129,17 +1275,14 @@ async fn windows_reproducible(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     Ok(check.finish(format!("{compared} cross-node window recomputations")))
 }
 
-/// The snapshot digest of a recorded range, recomputed from a ledger
+/// The snapshot digest of a recorded window, recomputed from a ledger
 /// (`window.rs`'s `snapshot_sha256`: sha256 of the serde_json share array).
-pub async fn window_digest(
-    pool: &PgPool,
-    first: i64,
-    last: i64,
-    anchor_ms: i64,
-) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar(
+pub async fn window_digest(pool: &PgPool, window: &RecordedWindow) -> Result<Option<String>> {
+    let eligible = eligible_sql(window);
+    let (cut0, cut1) = window.cut.unwrap_or((None, None));
+    Ok(sqlx::query_scalar(&format!(
         "SELECT encode(sha256(convert_to('[' || string_agg( \
-             '{\"share_seq\":' || l.share_seq \
+             '{{\"share_seq\":' || l.share_seq \
              || ',\"share_id\":' || to_json(l.share_id)::text \
              || ',\"miner_id\":' || to_json(l.miner_id)::text \
              || ',\"order_key\":' || to_json(l.payout_order_key)::text \
@@ -1152,15 +1295,15 @@ pub async fn window_digest(
              || ',\"accepted_at_ms\":' || floor(extract(epoch FROM l.accepted_at) * 1000)::bigint \
              || ',\"ntime\":' || l.ntime \
              || COALESCE(',\"credit_policy\":' || to_json(l.credit_policy)::text, '') \
-             || '}', ',' ORDER BY l.share_seq) || ']', 'UTF8')), 'hex') \
+             || '}}', ',' ORDER BY l.share_seq) || ']', 'UTF8')), 'hex') \
          FROM qbit_share_ledger l \
-         WHERE l.accepted AND l.share_seq BETWEEN $1 AND $2 \
-           AND l.accepted_at <= to_timestamp($3::double precision / 1000) \
-           AND l.job_issued_at <= to_timestamp($3::double precision / 1000)",
-    )
-    .bind(first)
-    .bind(last)
-    .bind(anchor_ms)
+         WHERE {eligible} AND l.share_seq BETWEEN $4 AND $5"
+    ))
+    .bind(window.anchor_ms)
+    .bind(cut0)
+    .bind(cut1)
+    .bind(window.first)
+    .bind(window.last)
     .fetch_one(pool)
     .await?)
 }
@@ -1270,6 +1413,25 @@ mod tests {
                 .map(|(program, sats)| ((*program).to_owned(), *sats))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn ownership_epochs_name_the_owner_by_height() {
+        let default = CheckOptions::default();
+        assert_eq!(default.owner_at(Topology::DualWriter, 5), Some(Node::A));
+        assert_eq!(default.owner_at(Topology::SingleWriter, 5), None);
+        let cutover = CheckOptions {
+            ownership: vec![(100, Some(Node::A))],
+            ..CheckOptions::default()
+        };
+        assert_eq!(cutover.owner_at(Topology::DualWriter, 99), None);
+        assert_eq!(cutover.owner_at(Topology::DualWriter, 100), Some(Node::A));
+        let transfer = CheckOptions {
+            ownership: vec![(0, Some(Node::A)), (200, Some(Node::B))],
+            ..CheckOptions::default()
+        };
+        assert_eq!(transfer.owner_at(Topology::DualWriter, 199), Some(Node::A));
+        assert_eq!(transfer.owner_at(Topology::DualWriter, 200), Some(Node::B));
     }
 
     #[test]

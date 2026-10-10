@@ -401,6 +401,16 @@ jobs:
             --manifest "${PRISM_TEST_GATE_MANIFEST}" \
             --expected test/prism-dual-writer-gated-tests.txt \
             --log "${PRISM_TEST_LOG}"
+      # Lists every fast-lane scenario the branch cannot run yet (planned in
+      # test/e2e-scenarios.toml with runs = false) in the summary and as a
+      # warning, so a partial lane never reads as the whole one.
+      - name: Summarise the fast lane
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/dual_writer_matrix_summary.py target/dual-sim-reports \
+            --manifest test/e2e-scenarios.toml --lane pr \
+            --out target/dual-sim-reports/matrix.md
+          cat target/dual-sim-reports/matrix.md >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the scenario reports, logs and gate manifest
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7

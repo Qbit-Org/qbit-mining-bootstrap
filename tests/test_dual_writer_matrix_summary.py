@@ -69,5 +69,49 @@ class MatrixSummary(unittest.TestCase):
         self.assertIn("s10-single-writer", out.read_text(encoding="utf-8"))
 
 
+    def test_the_pending_scenarios_of_a_lane_are_listed_and_annotated(self) -> None:
+        manifest = self.root / "e2e-scenarios.toml"
+        manifest.write_text(
+            """
+[[scenario]]
+id = "dual-writer-s01-steady-state"
+lanes = ["nightly", "pr"]
+runs = false
+reason = "Needs the 3.1 stack."
+
+[[scenario]]
+id = "dual-writer-s03-b-dies"
+lanes = ["nightly"]
+runs = false
+reason = "Needs D1."
+
+[[scenario]]
+id = "dual-writer-s10-single-writer"
+lanes = ["nightly", "pr"]
+runs = true
+
+[[scenario]]
+id = "lost-race"
+lanes = ["pr"]
+runs = false
+reason = "Not ours."
+""",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            summary.pending(manifest, "pr"),
+            [("dual-writer-s01-steady-state", "Needs the 3.1 stack.")],
+        )
+        self.write(report("s10-single-writer", True))
+        out = self.root / "matrix.md"
+        self.assertEqual(
+            summary.main([str(self.root), "--out", str(out), "--manifest", str(manifest), "--lane", "nightly"]),
+            0,
+        )
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("### Not run yet in the `nightly` lane", text)
+        self.assertIn("- `dual-writer-s03-b-dies`: Needs D1.", text)
+
+
 if __name__ == "__main__":
     unittest.main()

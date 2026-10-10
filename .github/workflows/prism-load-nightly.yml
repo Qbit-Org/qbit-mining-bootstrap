@@ -850,6 +850,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 scripts/dual_writer_matrix_summary.py target/dual-sim-reports \
+            --manifest test/e2e-scenarios.toml --lane nightly \
             --out target/dual-sim-reports/matrix.md
           cat target/dual-sim-reports/matrix.md >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the reports, logs and gate manifest

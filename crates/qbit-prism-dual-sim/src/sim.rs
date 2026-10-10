@@ -31,6 +31,7 @@ use crate::{
     load::{Load, LoadPlan, RunClock},
     postgres::PgNode,
     relay::{LinkState, Relay, RelayStats},
+    rpc_gate::RpcGate,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
@@ -98,6 +99,8 @@ pub struct SimConfig {
     pub load: LoadPlan,
     pub balancer: BalancerConfig,
     pub readiness: Readiness,
+    /// Put an [`RpcGate`] between each frontend and its `qbitd` (S8).
+    pub rpc_gates: bool,
     pub sync_interval_ms: u64,
     pub sync_batch_rows: u64,
     /// Extra frontend settings, per node, applied last.
@@ -135,6 +138,7 @@ impl SimConfig {
                 Topology::DualWriter => Readiness::Readyz,
                 Topology::SingleWriter | Topology::Unsynced => Readiness::Healthz,
             },
+            rpc_gates: false,
             sync_interval_ms: 250,
             sync_batch_rows: 5_000,
             overrides: BTreeMap::new(),
@@ -226,6 +230,8 @@ pub struct Sim {
     pub links: Links,
     pub balancer: Balancer,
     pub load: Option<Load>,
+    /// Each frontend's gate to its `qbitd`, with `rpc_gates`.
+    pub gates: BTreeMap<Node, RpcGate>,
     timeline: Mutex<Vec<TimelineEvent>>,
     /// Base backups taken during the run, by name.
     pub backups: BTreeMap<String, PathBuf>,
@@ -320,6 +326,15 @@ impl Sim {
             config.balancer.require_ok = false;
             config.balancer.check_token = Some(token.clone());
         }
+        let mut gates = BTreeMap::new();
+        if config.rpc_gates {
+            for node in Node::BOTH {
+                gates.insert(
+                    node,
+                    RpcGate::open(chain.node(qbitd_of(node)).rpc_port()).await?,
+                );
+            }
+        }
         let mut frontends = BTreeMap::new();
         for node in Node::BOTH {
             let stratum_port = crate::postgres::free_port()?;
@@ -349,7 +364,9 @@ impl Sim {
                 node,
                 server_bin: inputs.server.clone(),
                 database_url,
-                qbitd_rpc_port: chain.node(qbitd_of(node)).rpc_port(),
+                qbitd_rpc_port: gates
+                    .get(&node)
+                    .map_or_else(|| chain.node(qbitd_of(node)).rpc_port(), RpcGate::port),
                 stratum_port,
                 api_port,
                 share_difficulty: config.load.share_difficulty,
@@ -372,20 +389,24 @@ impl Sim {
         }
         let links = Links { relays };
 
-        // A migrates its database first; in the 3.0 pair B then finds the
-        // schema in place.
         let ready_limit = Duration::from_secs(180);
-        frontends.get_mut(&Node::A).context("frontend a")?.start()?;
-        if config.topology != Topology::DualWriter {
-            frontends[&Node::A].wait_ready(ready_limit).await?;
-        }
-        frontends.get_mut(&Node::B).context("frontend b")?.start()?;
         if config.topology == Topology::DualWriter {
-            // The peer role reads tables the frontends' migrations create.
-            for node in Node::BOTH {
-                wait_schema(&pg[&node]).await?;
-                grant_peer_role(&pg[&node]).await?;
+            // The bootstrap a fresh pair runs (CONTRACT.md D-9): migrate
+            // each database, personalise it as its node, then let the peer
+            // role read it. B starts before A, as the cutover does (D-4), so
+            // A's guard reads B's seeded journal on its first look.
+            for node in [Node::B, Node::A] {
+                bootstrap_node(&frontends[&node], &pg[&node]).await?;
             }
+            for node in [Node::B, Node::A] {
+                frontends.get_mut(&node).context("frontend")?.start()?;
+            }
+        } else {
+            // A migrates its database first; in the 3.0 pair B then finds
+            // the schema in place.
+            frontends.get_mut(&Node::A).context("frontend a")?.start()?;
+            frontends[&Node::A].wait_ready(ready_limit).await?;
+            frontends.get_mut(&Node::B).context("frontend b")?.start()?;
         }
         for node in Node::BOTH {
             frontends[&node].wait_ready(ready_limit).await?;
@@ -441,6 +462,7 @@ impl Sim {
             links,
             balancer,
             load: Some(load),
+            gates,
             timeline: Mutex::new(Vec::new()),
             backups: BTreeMap::new(),
         };
@@ -506,10 +528,15 @@ impl Sim {
         let started = Instant::now();
         let mut last = String::new();
         let result = loop {
-            let unfinished: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",
-                qbit_prism_server::ledger::CandidateState::UNFINISHED_SQL
-            ))
+            // In flight, or a reconciliation attempt claimed or due (the
+            // live fixtures' quiesce rule): a released attempt scheduled for
+            // later is bookkeeping, and waiting for it can take minutes.
+            let unfinished: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM qbit_block_candidate_outbox \
+                 WHERE state IN ('pending', 'offer_reserved', 'offered') \
+                    OR (state = 'reconciliation' AND (claim_expires_at > clock_timestamp() \
+                        OR next_attempt_at <= clock_timestamp()))",
+            )
             .fetch_one(&pool)
             .await?;
             let revision: i64 = sqlx::query_scalar(
@@ -730,6 +757,85 @@ impl Sim {
         }
     }
 
+    /// The 3.0 to 3.1 cutover (S9), as the cutover playbook runs it: drain
+    /// both frontends, let B's standby replay everything, promote it into an
+    /// independent primary, link the two databases both ways, point B's
+    /// frontend at its own database, bootstrap both (migrate, node identity,
+    /// peer grants; D-9), and start B, then A, in dual mode (D-4), checked
+    /// by `/readyz` from then on (D-7). Returns the chain height at the
+    /// cutover: every pool block above it is the dual-writer pair's.
+    pub async fn cutover_to_dual(&mut self) -> Result<u64> {
+        ensure!(
+            self.config.topology == Topology::SingleWriter,
+            "a cutover starts from the 3.0 pair"
+        );
+        let load = self.load()?;
+        load.pause();
+        load.wait_answered(Duration::from_secs(40)).await?;
+        for node in [Node::B, Node::A] {
+            self.frontend_mut(node).stop(Duration::from_secs(30))?;
+        }
+        self.mark("drained: both frontends stopped");
+        self.wait_standby_replayed(Duration::from_secs(60)).await?;
+        self.pg[&Node::B].promote().await?;
+        self.mark("B's standby promoted into an independent primary");
+        for name in ["writer-b-to-a", "replication-b-from-a"] {
+            self.links.relays.remove(name);
+        }
+        for node in Node::BOTH {
+            let name = format!("peer-{}-to-{}", node.label(), node.peer().label());
+            let relay = Relay::open(&name, self.pg[&node.peer()].port()).await?;
+            self.links.relays.insert(name, relay);
+        }
+        let token = format!("dual-sim-{}", uuid::Uuid::new_v4().simple());
+        for node in Node::BOTH {
+            let readiness_port = crate::postgres::free_port()?;
+            let peer_link = self
+                .links
+                .get(&format!("peer-{}-to-{}", node.label(), node.peer().label()))?
+                .port();
+            let database_url = self.pg[&node].url(OWNER_ROLE, DATABASE);
+            let (interval, batch) = (self.config.sync_interval_ms, self.config.sync_batch_rows);
+            let spec = &mut self.frontend_mut(node).spec;
+            spec.database_url = database_url;
+            spec.dual = Some(DualSettings {
+                node_index: node.index() as u8,
+                carry_owner: node == Node::A,
+                peer_database_url: format!(
+                    "postgresql://{PEER_ROLE}@127.0.0.1:{peer_link}/{DATABASE}"
+                ),
+                peer_database_url_fallback: None,
+                sync_interval_ms: interval,
+                sync_batch_rows: batch,
+            });
+            spec.readiness = Some((readiness_port, token.clone()));
+            self.links
+                .get(&format!("public-health-{}", node.label()))?
+                .retarget(readiness_port);
+        }
+        self.balancer.set_probe(crate::balancer::Probe {
+            path: "/readyz".into(),
+            require_ok: false,
+            token: Some(token),
+        });
+        self.config.topology = Topology::DualWriter;
+        self.config.readiness = Readiness::Readyz;
+        for node in [Node::B, Node::A] {
+            bootstrap_node(&self.frontends[&node], &self.pg[&node]).await?;
+        }
+        for node in [Node::B, Node::A] {
+            self.frontend_mut(node).start()?;
+        }
+        for node in Node::BOTH {
+            self.frontend(node)
+                .wait_ready(Duration::from_secs(180))
+                .await?;
+        }
+        let (height, _, _) = self.chain.c.tip().await?;
+        self.mark(&format!("cut over to dual mode at height {height}"));
+        Ok(height)
+    }
+
     /// A superuser pool on `node`'s PRISM database.
     pub async fn pool(&self, node: Node) -> Result<PgPool> {
         PgPoolOptions::new()
@@ -797,48 +903,69 @@ async fn create_owner(node: &PgNode) -> Result<()> {
     sqlx::query(&format!("CREATE DATABASE {DATABASE} OWNER {OWNER_ROLE}"))
         .execute(&pool)
         .await?;
-    sqlx::query(&format!("CREATE ROLE {PEER_ROLE} LOGIN"))
-        .execute(&pool)
-        .await?;
+    // The peer role as D1 specifies it for the pair (status/D1.md, "the
+    // read-only peer role"), less the password: the harness's loopback
+    // logins are `trust`.
+    for statement in [
+        format!(
+            "CREATE ROLE {PEER_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION \
+             NOBYPASSRLS NOINHERIT CONNECTION LIMIT 4"
+        ),
+        format!("ALTER ROLE {PEER_ROLE} SET default_transaction_read_only = on"),
+        format!("ALTER ROLE {PEER_ROLE} SET statement_timeout = '30s'"),
+        format!("ALTER ROLE {PEER_ROLE} SET lock_timeout = '5s'"),
+        format!("ALTER ROLE {PEER_ROLE} SET idle_in_transaction_session_timeout = '60s'"),
+    ] {
+        sqlx::query(&statement).execute(&pool).await?;
+    }
     pool.close().await;
     Ok(())
 }
 
-/// Wait until the frontend's migration has created the share ledger.
-async fn wait_schema(node: &PgNode) -> Result<()> {
-    let pool = node.admin_pool(DATABASE).await?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let exists: bool =
-            sqlx::query_scalar("SELECT to_regclass('public.qbit_share_ledger') IS NOT NULL")
-                .fetch_one(&pool)
-                .await?;
-        if exists {
-            pool.close().await;
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "node {}'s schema did not appear within 120 s",
-            node.name()
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
+/// The peer role's grants on a migrated database, exactly D1's list, so a
+/// pull that needs more than D1 documents for D5 fails here first.
+pub const PEER_ROLE_GRANTS: &[&str] = &[
+    "GRANT CONNECT ON DATABASE prism TO prism_peer_sync",
+    "GRANT USAGE ON SCHEMA public TO prism_peer_sync",
+    "GRANT SELECT ON qbit_share_ledger, qbit_prism_share_hashes, qbit_pool_blocks, \
+     qbit_prism_audit_snapshots, qbit_pool_audit_bundles, qbit_pool_payout_entries, \
+     qbit_payout_carry_forward, qbit_ctv_fanout_sets, qbit_ctv_fanout_artifacts, \
+     qbit_prism_templates, qbit_prism_balance_snapshots, qbit_prism_jobs, \
+     qbit_prism_node_roles TO prism_peer_sync",
+    "GRANT SELECT ON qbit_prism_node_identity, qbit_prism_node_lineage, \
+     qbit_prism_peer_sync_cursors TO prism_peer_sync",
+    "GRANT SELECT (config_fingerprint) ON qbit_prism_cluster TO prism_peer_sync",
+    "GRANT SELECT ON SEQUENCE qbit_prism_sync_seq, qbit_share_ledger_share_seq_seq \
+     TO prism_peer_sync",
+];
 
-/// Read-only access for the peer pull. Until D1 documents the exact grants
-/// (CONTRACT.md §6, D1 task 3), every table in the schema is readable.
-async fn grant_peer_role(node: &PgNode) -> Result<()> {
-    let pool = node.admin_pool(DATABASE).await?;
-    for statement in [
-        format!("GRANT CONNECT ON DATABASE {DATABASE} TO {PEER_ROLE}"),
-        format!("GRANT USAGE ON SCHEMA public TO {PEER_ROLE}"),
-        format!("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {PEER_ROLE}"),
-        format!(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE {OWNER_ROLE} IN SCHEMA public GRANT SELECT ON TABLES TO {PEER_ROLE}"
-        ),
+/// Bring a fresh database to the dual-writer pair's starting state, as the
+/// bootstrap does: `qbit-prism-server migrate`, then `node-identity set`
+/// (D-9), then the peer role's grants. Each command runs with the node's
+/// own frontend environment.
+pub async fn bootstrap_node(frontend: &Frontend, pg: &PgNode) -> Result<()> {
+    let node = frontend.node();
+    let index = if node == Node::A { "0" } else { "1" };
+    for args in [
+        vec!["migrate"],
+        vec!["node-identity", "set", "--index", index],
     ] {
-        sqlx::query(&statement).execute(&pool).await?;
+        let run = frontend.tool(&args, Duration::from_secs(300)).await?;
+        ensure!(
+            run.success,
+            "qbit-prism-server {} on node {node:?} failed ({:?}): {} {}",
+            args.join(" "),
+            run.code,
+            run.stdout.trim(),
+            run.stderr.trim()
+        );
+    }
+    let pool = pg.admin_pool(DATABASE).await?;
+    for statement in PEER_ROLE_GRANTS {
+        sqlx::query(statement)
+            .execute(&pool)
+            .await
+            .with_context(|| format!("node {node:?}: {statement}"))?;
     }
     pool.close().await;
     Ok(())

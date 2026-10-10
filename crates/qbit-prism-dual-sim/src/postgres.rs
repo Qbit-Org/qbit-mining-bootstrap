@@ -302,13 +302,104 @@ impl PgNode {
 
     /// Replace the data directory with a copy of `backup` and start it: the
     /// node comes back as it was when the backup was taken.
-    pub fn restore_from(&mut self, backup: &Path) -> Result<()> {
+    ///
+    /// With `new_timeline`, the copy is recovered the way a point-in-time
+    /// restore (pgBackRest's) recovers it: archive recovery to the backup's
+    /// consistent point, then promotion onto a new timeline. Without it the
+    /// copy only replays its own WAL and stays on the old timeline, which no
+    /// real restore does; CONTRACT.md D-17's rollback evidence keys on the
+    /// new timeline.
+    pub async fn restore_from(&mut self, backup: &Path, new_timeline: bool) -> Result<()> {
         self.stop_immediate()?;
         std::fs::remove_dir_all(&self.data)
             .with_context(|| format!("removing node {}'s data", self.name))?;
         copy_dir(backup, &self.data)?;
         set_private(&self.data)?;
-        self.start()
+        if new_timeline {
+            // No archive: every WAL segment the backup needs is in its
+            // pg_wal (-X stream), so restore_command finds nothing and
+            // recovery uses those.
+            let mut auto = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.data.join("postgresql.auto.conf"))?;
+            use std::io::Write;
+            writeln!(auto, "restore_command = 'false'")?;
+            writeln!(auto, "recovery_target = 'immediate'")?;
+            writeln!(auto, "recovery_target_action = 'promote'")?;
+            std::fs::write(self.data.join("recovery.signal"), "")?;
+        }
+        self.start()?;
+        if new_timeline {
+            self.wait_out_of_recovery(Duration::from_secs(60)).await?;
+        }
+        Ok(())
+    }
+
+    /// The cluster's timeline and system identifier
+    /// (`pg_control_checkpoint`, `pg_control_system`).
+    pub async fn lineage(&self) -> Result<(i64, String)> {
+        let pool = self.admin_pool("postgres").await?;
+        let lineage: (i64, String) = sqlx::query_as(
+            "SELECT (SELECT timeline_id::bigint FROM pg_control_checkpoint()), \
+                    (SELECT system_identifier::text FROM pg_control_system())",
+        )
+        .fetch_one(&pool)
+        .await?;
+        pool.close().await;
+        Ok(lineage)
+    }
+
+    async fn wait_out_of_recovery(&self, limit: Duration) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            if let Ok(pool) = self.admin_pool("postgres").await {
+                let in_recovery: bool = sqlx::query_scalar("SELECT pg_is_in_recovery()")
+                    .fetch_one(&pool)
+                    .await?;
+                pool.close().await;
+                if !in_recovery {
+                    return Ok(());
+                }
+            }
+            ensure!(
+                started.elapsed() < limit,
+                "node {} was still in recovery {limit:?} after a restore",
+                self.name
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// CONTRACT.md D-16: rebuild this node's wiped disk from a physical copy
+    /// of `peer` (through `link_port`), started as its standby and promoted
+    /// into an independent primary on a new timeline. Re-personalising it is
+    /// the caller's next step.
+    pub async fn rebuild_from_peer(&mut self, peer_user: &str, link_port: u16) -> Result<()> {
+        ensure!(
+            !self.data.exists() || std::fs::read_dir(&self.data)?.next().is_none(),
+            "node {}'s data directory is not empty; wipe it first",
+            self.name
+        );
+        let conninfo = format!("host=127.0.0.1 port={link_port} user={peer_user}");
+        run(
+            &self.bin.join("pg_basebackup"),
+            &[
+                "-D",
+                path_str(&self.data)?,
+                "-d",
+                &conninfo,
+                "-X",
+                "stream",
+                "-R",
+                "-c",
+                "fast",
+            ],
+        )
+        .with_context(|| format!("copying node {}'s disk from its peer", self.name))?;
+        set_private(&self.data)?;
+        self.start()?;
+        self.promote().await?;
+        Ok(())
     }
 
     /// Stop and delete the data directory: the disk is gone.

@@ -77,6 +77,23 @@ impl Death {
     }
 }
 
+/// Where a block found by a dying node got to (S8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathAtFind {
+    /// The node died with the block's `submitblock` in flight: it never
+    /// reached the chain.
+    Lost,
+    /// The node's `qbitd` accepted the block and the node died before it
+    /// heard: the block is on the chain and its finder never landed it. With
+    /// D-19's peer-ingest wait on (the default) or off.
+    Accepted { wait: bool },
+}
+
+/// CONTRACT.md D-19's peer-ingest wait before a found block's submitblock,
+/// in milliseconds (default 250 in dual mode, 0 turns it off). D1 names the
+/// setting in status/D1.md.
+pub const PEER_INGEST_WAIT_SETTING: &str = "PRISM_PEER_INGEST_WAIT_MS";
+
 /// Every scenario the harness runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
@@ -95,6 +112,18 @@ pub enum Scenario {
     S04LinkCut,
     /// S5: both nodes take miners and write at once.
     S05BothWrite,
+    /// S6: a node restored from an older base backup recovers its own rows
+    /// from the peer before it is ready.
+    S06Restore(Node),
+    /// S7: a node's disk replaced and rebuilt from its peer.
+    S07DiskReplaced(Node),
+    /// S8: a block found at the instant its node dies.
+    S08BlockAtDeath(DeathAtFind),
+    /// S9: a 3.0 single-writer ledger with history, carry and blocks cut
+    /// over to dual mode.
+    S09Migration,
+    /// S11: the carry-owner transfer drill.
+    S11CarryOwnerTransfer,
     /// S10: dual mode off, the 3.0 pair, A's frontend killed under load.
     S10SingleWriter,
 }
@@ -117,6 +146,17 @@ impl Scenario {
             Scenario::S03BDies => "s03-b-dies".into(),
             Scenario::S04LinkCut => "s04-link-cut".into(),
             Scenario::S05BothWrite => "s05-both-write".into(),
+            Scenario::S06Restore(node) => format!("s06-restore-{}", node.label()),
+            Scenario::S07DiskReplaced(node) => format!("s07-disk-replaced-{}", node.label()),
+            Scenario::S08BlockAtDeath(DeathAtFind::Lost) => "s08-block-at-death-lost".into(),
+            Scenario::S08BlockAtDeath(DeathAtFind::Accepted { wait: true }) => {
+                "s08-block-at-death-accepted".into()
+            }
+            Scenario::S08BlockAtDeath(DeathAtFind::Accepted { wait: false }) => {
+                "s08-block-at-death-accepted-no-wait".into()
+            }
+            Scenario::S09Migration => "s09-migration".into(),
+            Scenario::S11CarryOwnerTransfer => "s11-carry-owner-transfer".into(),
             Scenario::S10SingleWriter => "s10-single-writer".into(),
         }
     }
@@ -140,6 +180,21 @@ impl Scenario {
             Scenario::S05BothWrite => {
                 "Both nodes write at once: invariants hold and B's blocks stay carry-free".into()
             }
+            Scenario::S06Restore(node) => format!(
+                "Node {node:?} restored from an older base backup recovers its own rows before it is ready"
+            ),
+            Scenario::S07DiskReplaced(node) => format!(
+                "Node {node:?}'s disk replaced: rebuilt from its peer, only its unsynced tail lost"
+            ),
+            Scenario::S08BlockAtDeath(case) => format!(
+                "A block found at the instant its node dies ({case:?}) is landed or adopted once, never paid twice"
+            ),
+            Scenario::S09Migration => {
+                "3.0 to 3.1 cutover: balances and audits unchanged, then dual-mode mining".into()
+            }
+            Scenario::S11CarryOwnerTransfer => {
+                "Carry-owner transfer: refused while an own block is unknown, done once it is landed".into()
+            }
             Scenario::S10SingleWriter => {
                 "Single-writer regression: the 3.0 pair keeps every share and pays exactly through a frontend kill".into()
             }
@@ -149,14 +204,34 @@ impl Scenario {
     fn topology(self) -> Topology {
         match self {
             Scenario::CheckerControl => Topology::Unsynced,
-            Scenario::S10SingleWriter => Topology::SingleWriter,
+            Scenario::S10SingleWriter | Scenario::S09Migration => Topology::SingleWriter,
             _ => Topology::DualWriter,
         }
     }
 
     fn config(self) -> Result<SimConfig> {
         let mut config = SimConfig::new(&self.id(), self.topology())?;
-        if matches!(self, Scenario::CheckerControl | Scenario::S05BothWrite) {
+        if let Scenario::S08BlockAtDeath(case) = self {
+            config.rpc_gates = true;
+            if case == (DeathAtFind::Accepted { wait: false }) {
+                for node in Node::BOTH {
+                    config
+                        .overrides
+                        .entry(node)
+                        .or_default()
+                        .push((PEER_INGEST_WAIT_SETTING.into(), "0".into()));
+                }
+            }
+        }
+        // Both nodes originate rows where the scenario needs each to have
+        // its own (S6, S7), or where both writing is the point (S5).
+        if matches!(
+            self,
+            Scenario::CheckerControl
+                | Scenario::S05BothWrite
+                | Scenario::S06Restore(_)
+                | Scenario::S07DiskReplaced(_)
+        ) {
             config.balancer.routing = Routing::RoundRobin;
         }
         Ok(config)
@@ -209,12 +284,21 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
             Scenario::S03BDies => s03_b_dies(&mut sim).await?,
             Scenario::S04LinkCut => s04_link_cut(&mut sim).await?,
             Scenario::S05BothWrite => s05_both_write(&mut sim).await?,
+            Scenario::S06Restore(node) => s06_restore(&mut sim, node).await?,
+            Scenario::S07DiskReplaced(node) => s07_disk_replaced(&mut sim, node).await?,
+            Scenario::S08BlockAtDeath(case) => s08_block_at_death(&mut sim, case).await?,
+            Scenario::S09Migration => s09_migration(&mut sim).await?,
+            Scenario::S11CarryOwnerTransfer => s11_carry_owner_transfer(&mut sim).await?,
             Scenario::S10SingleWriter => s10_single_writer(&mut sim).await?,
         };
         let records = sim.load()?.records();
         let invariants = invariants::check(&sim, &records, &body.options).await?;
         invariants::write(&invariants, &sim.report_dir)?;
         judge_invariants(&mut body, &invariants);
+        if scenario == Scenario::CheckerControl {
+            // Last, since it tampers with A's ledger.
+            late_row_control(&sim, &mut body).await?;
+        }
         anyhow::Ok((body, records, invariants))
     }
     .await;
@@ -555,7 +639,16 @@ async fn expect_dual_health(sim: &Sim, body: &mut Body) -> Result<()> {
 /// block below `height` in the owner's database: R1's prior at a block of
 /// that height, which the owner's work must have used.
 async fn truth_below(sim: &Sim, height: i64) -> Result<std::collections::BTreeMap<String, i128>> {
-    let pool = sim.pool(Node::A).await?;
+    truth_below_on(sim, Node::A, height).await
+}
+
+/// [`truth_below`], from `ledger`'s confirmed set.
+async fn truth_below_on(
+    sim: &Sim,
+    ledger: Node,
+    height: i64,
+) -> Result<std::collections::BTreeMap<String, i128>> {
+    let pool = sim.pool(ledger).await?;
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT encode(c.p2mr_program, 'hex'), \
                 sum(c.gross_amount_sats::numeric - c.onchain_amount_sats::numeric)::text \
@@ -575,6 +668,62 @@ async fn truth_below(sim: &Sim, height: i64) -> Result<std::collections::BTreeMa
         }
     }
     Ok(truth)
+}
+
+/// The owner's block `hash` paid from exactly the chain's balances below
+/// it: its priors equal R1's sum.
+async fn expect_owner_priors_are_truth(sim: &Sim, body: &mut Body, hash: &str) -> Result<()> {
+    expect_priors_are_truth(sim, body, Node::A, hash).await
+}
+
+/// `owner`'s block `hash` paid from exactly the chain's balances below it,
+/// as `owner`'s ledger holds them.
+async fn expect_priors_are_truth(
+    sim: &Sim,
+    body: &mut Body,
+    owner: Node,
+    hash: &str,
+) -> Result<()> {
+    let (issued, truth, height) = owner_priors_on(sim, owner, hash).await?;
+    body.expect(
+        "the owner paid from the chain's balances",
+        issued == truth,
+        format!("block {hash} at {height}: issued priors {issued:?}, chain sums {truth:?}"),
+    );
+    Ok(())
+}
+
+type Balances = std::collections::BTreeMap<String, i128>;
+
+/// A block's issued priors (from its audit) and R1's sums below it, both
+/// read from `owner`'s ledger.
+async fn owner_priors_on(sim: &Sim, owner: Node, hash: &str) -> Result<(Balances, Balances, i64)> {
+    let pool = sim.pool(owner).await?;
+    let (height, priors): (i64, serde_json::Value) = sqlx::query_as(
+        "SELECT b.block_height, a.audit_bundle->'prior_balances' FROM qbit_pool_blocks b \
+         JOIN qbit_pool_audit_bundles a ON a.block_hash = b.block_hash WHERE b.block_hash = $1",
+    )
+    .bind(hash)
+    .fetch_one(&pool)
+    .await?;
+    pool.close().await;
+    let mut issued = Balances::new();
+    for prior in priors.as_array().cloned().unwrap_or_default() {
+        let program = prior["p2mr_program_hex"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let sats: i128 = prior["balance_sats"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| prior["balance_sats"].to_string())
+            .parse()
+            .unwrap_or(0);
+        if sats != 0 {
+            *issued.entry(program).or_insert(0) += sats;
+        }
+    }
+    Ok((issued, truth_below_on(sim, owner, height).await?, height))
 }
 
 /// The owner's block `hash` paid from exactly the chain's balances below
@@ -902,6 +1051,681 @@ async fn s05_both_write(sim: &mut Sim) -> Result<Body> {
     }
     expect_dual_health(sim, &mut body).await?;
     Ok(body)
+}
+
+/// Whether `node` admits miners now: its `/readyz` answers 200 (D-7), or,
+/// without a readiness listener, its `/healthz` says `ok`.
+async fn node_ready(sim: &Sim, node: Node) -> bool {
+    let frontend = sim.frontend(node);
+    match frontend.readyz(true).await {
+        Ok(Some(status)) => status == 200,
+        Ok(None) => matches!(frontend.health().await, Ok((200, ref body)) if body["ok"] == true),
+        Err(_) => false,
+    }
+}
+
+/// The share ids and pool blocks a database holds that `origin` originated
+/// (CONTRACT.md §3, `origin_node`).
+async fn origin_rows(sim: &Sim, ledger: Node, origin: Node) -> Result<(Vec<String>, Vec<String>)> {
+    let pool = sim.pool(ledger).await?;
+    let shares: Vec<String> = sqlx::query_scalar(
+        "SELECT share_id FROM qbit_share_ledger WHERE origin_node = $1 ORDER BY share_seq",
+    )
+    .bind(origin.index() as i16)
+    .fetch_all(&pool)
+    .await
+    .context("reading origin_node: the 3.1 stack's migration 027 is required")?;
+    let blocks: Vec<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_pool_blocks WHERE origin_node = $1 ORDER BY block_hash",
+    )
+    .bind(origin.index() as i16)
+    .fetch_all(&pool)
+    .await?;
+    pool.close().await;
+    Ok((shares, blocks))
+}
+
+/// How long a node restored with the peer unreachable must stay unready to
+/// show it does not serve on a rolled-back log (D-8, D-17): several health
+/// publications and balancer checks.
+pub const UNREADY_HOLD: Duration = Duration::from_secs(20);
+/// How long a restored node may take to pull its own rows back and report
+/// ready once its peer is reachable.
+pub const RECOVERY_BOUND: Duration = Duration::from_secs(120);
+
+/// S6. Node `x` is restored from a base backup older than its newest rows,
+/// which only its peer holds. With both nodes writing:
+///
+/// 1. a plain PostgreSQL restart of `x` with the peer unreachable is not a
+///    rollback, so `x` serves again (D-17);
+/// 2. a restore onto a new timeline with the peer unreachable is, so `x`
+///    stays unready (D-8, D-17);
+/// 3. once the peer is reachable, `x` pulls its own missing rows back, and
+///    only then reports ready: at its first ready reading it holds every own
+///    row the peer holds. Nothing is lost or duplicated afterwards.
+async fn s06_restore(sim: &mut Sim, x: Node) -> Result<Body> {
+    let mut body = Body::default();
+    let y = x.peer();
+    sim.load()?.resume();
+    steady(sim, 5).await;
+    let before = find_block(sim, &mut body, x, "before the backup", Some(&[x])).await?;
+    confirm_on_both(sim, &before).await?;
+    sim.base_backup(x, "old")?;
+    steady(sim, 5).await;
+    let after = find_block(sim, &mut body, x, "after the backup", Some(&[x])).await?;
+    confirm_on_both(sim, &after).await?;
+    sim.wait_synced(CATCH_UP_BOUND).await?;
+    // Nothing originates while the restarts and the restore run, so every
+    // own row of x is on y when x's database goes back in time.
+    sim.load()?.pause();
+    sim.load()?.wait_answered(Duration::from_secs(40)).await?;
+    sim.wait_synced(CATCH_UP_BOUND).await?;
+
+    let cut = Fault::LinkCut(LinkState::Reset);
+    sim.inject(cut).await?;
+    sim.frontend_mut(x).kill9()?;
+    sim.pg_mut(x).stop_fast()?;
+    sim.pg_mut(x).start()?;
+    sim.frontend_mut(x).start()?;
+    let restarted = sim.frontend(x).wait_ready(Duration::from_secs(120)).await;
+    body.expect(
+        "a plain restart with the peer unreachable serves (D-17)",
+        restarted.is_ok() && node_ready(sim, x).await,
+        format!("{restarted:?}"),
+    );
+
+    sim.frontend_mut(x).kill9()?;
+    let backup = sim.backups.get("old").context("the old backup")?.clone();
+    sim.pg_mut(x).restore_from(&backup, true).await?;
+    let (timeline, _) = sim.pg[&x].lineage().await?;
+    sim.mark(&format!(
+        "node {x:?} restored from the old backup onto timeline {timeline}"
+    ));
+    sim.frontend_mut(x).start()?;
+    let held_from = Instant::now();
+    let mut served = Vec::new();
+    while held_from.elapsed() < UNREADY_HOLD {
+        if node_ready(sim, x).await {
+            served.push(sim.clock.now_ms());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    body.expect(
+        "a restore with the peer unreachable stays unready (D-8, D-17)",
+        served.is_empty(),
+        format!("ready at {served:?} ms during the {UNREADY_HOLD:?} hold"),
+    );
+
+    sim.heal(cut).await?;
+    let started = Instant::now();
+    while !node_ready(sim, x).await {
+        anyhow::ensure!(
+            started.elapsed() < RECOVERY_BOUND,
+            "node {x:?} did not become ready within {RECOVERY_BOUND:?} of the heal"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (own_on_x, own_blocks_on_x) = origin_rows(sim, x, x).await?;
+    let (own_on_y, own_blocks_on_y) = origin_rows(sim, y, x).await?;
+    let missing: Vec<&String> = own_on_y
+        .iter()
+        .filter(|id| !own_on_x.contains(id))
+        .collect();
+    let missing_blocks: Vec<&String> = own_blocks_on_y
+        .iter()
+        .filter(|hash| !own_blocks_on_x.contains(hash))
+        .collect();
+    body.expect(
+        "the restored node held every own row of the peer's before it was ready",
+        missing.is_empty() && missing_blocks.is_empty(),
+        format!(
+            "ready {:.1} s after the heal; {} own shares and {} own blocks on the peer, {} and {} of them missing on node {x:?}",
+            started.elapsed().as_secs_f64(),
+            own_on_y.len(),
+            own_blocks_on_y.len(),
+            missing.len(),
+            missing_blocks.len()
+        ),
+    );
+    sim.load()?.resume();
+    steady(sim, 5).await;
+    find_block(sim, &mut body, x, "after the restore", None).await?;
+    steady(sim, 2).await;
+    sim.settle(SETTLE_BOUND).await?;
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// S7. Node `x`'s host dies (frontend and PostgreSQL at once) with both
+/// nodes writing, and its disk is replaced: the database is rebuilt from a
+/// physical copy of the peer, promoted and re-personalised (D-16), and the
+/// node starts. What x had acknowledged but the peer had not pulled when it
+/// died is its unsynced tail: measured, reported and excused, and nothing
+/// else may be missing.
+async fn s07_disk_replaced(sim: &mut Sim, x: Node) -> Result<Body> {
+    let mut body = Body::default();
+    let y = x.peer();
+    sim.load()?.resume();
+    steady(sim, 6).await;
+    let early = find_block(sim, &mut body, x, "before the disk is lost", Some(&[x])).await?;
+    confirm_on_both(sim, &early).await?;
+    steady(sim, 4).await;
+
+    let fault_at = sim.inject(Fault::FrontendKill9(x)).await?;
+    sim.inject(Fault::PostgresKill(x)).await?;
+    tokio::time::sleep(Duration::from_millis(2 * sim.config.sync_interval_ms + 500)).await;
+    let held = crate::measure::credited_headers(&sim.pool(y).await?).await?;
+    steady(sim, 6).await;
+    find_block(sim, &mut body, y, "while x is gone", Some(&[y])).await?;
+
+    sim.pg_mut(x).wipe()?;
+    sim.mark(&format!("node {x:?}'s disk replaced"));
+    let link = sim
+        .links
+        .get(&format!("peer-{}-to-{}", x.label(), y.label()))?
+        .port();
+    let user = sim.pg[&y].superuser().to_owned();
+    sim.pg_mut(x).rebuild_from_peer(&user, link).await?;
+    let repersonalise = sim
+        .frontend(x)
+        .tool(
+            &[
+                "node-identity",
+                "repersonalise",
+                "--index",
+                &x.index().to_string(),
+            ],
+            Duration::from_secs(120),
+        )
+        .await?;
+    body.expect(
+        "the rebuilt database is re-personalised (D-16)",
+        repersonalise.success,
+        format!(
+            "exit {:?}: {} {}",
+            repersonalise.code,
+            repersonalise.stdout.trim(),
+            repersonalise.stderr.trim()
+        ),
+    );
+    sim.frontend_mut(x).start()?;
+    sim.frontend(x).wait_ready(RECOVERY_BOUND).await?;
+    sim.mark(&format!("node {x:?} rebuilt from its peer and serving"));
+
+    let records = sim.load()?.records();
+    let tail = crate::measure::tail(&records, x, fault_at, &held);
+    body.expect(
+        "only the dead node's unsynced tail is lost (measured)",
+        true,
+        format!(
+            "{} shares node {x:?} acknowledged were not on its peer when it died (answered {:?}..{:?} ms); they are excused, and any other missing acknowledged share fails invariant 4",
+            tail.count, tail.first_answered_ms, tail.last_answered_ms
+        ),
+    );
+    body.options.excused_missing = crate::measure::excuse(
+        &tail,
+        "S7: the replaced disk's unsynced tail when its node died",
+    );
+    sim.balancer
+        .wait_state(x.label(), true, Duration::from_secs(60))
+        .await?;
+    steady(sim, 4).await;
+    find_block(sim, &mut body, x, "after the rebuild", None).await?;
+    steady(sim, 2).await;
+    sim.settle(SETTLE_BOUND).await?;
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// What a ledger holds that a cutover must not change: balances, the
+/// integrity and divergence reports, and a digest of every landing and share
+/// table over its immutable columns.
+async fn ledger_digest(pool: &sqlx::PgPool) -> Result<serde_json::Value> {
+    let mut digest = serde_json::Map::new();
+    let balances: Vec<(String, String)> = sqlx::query_as(
+        "SELECT encode(p2mr_program, 'hex'), balance_sats::text \
+         FROM qbit_current_carry_forward_balances() ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    digest.insert("balances".into(), json!(balances));
+    let integrity: serde_json::Value =
+        sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
+            .fetch_one(pool)
+            .await?;
+    digest.insert(
+        "integrity".into(),
+        json!({"mismatch_count": integrity["mismatch_count"], "current_drift_count": integrity["current_drift_count"]}),
+    );
+    for (name, sql) in [
+        ("shares", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', share_seq, share_id, miner_id, share_difficulty, floor(extract(epoch FROM accepted_at) * 1000)), ',' ORDER BY share_seq)), '') FROM qbit_share_ledger"),
+        ("share_hashes", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(header_hash || share_id, ',' ORDER BY header_hash)), '') FROM qbit_prism_share_hashes"),
+        ("blocks", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', block_hash, block_height, coinbase_txid, payout_manifest_sha256, as_issued_audit_sha256), ',' ORDER BY block_hash)), '') FROM qbit_pool_blocks"),
+        ("audits", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(block_hash || audit_bundle_sha256, ',' ORDER BY block_hash)), '') FROM qbit_pool_audit_bundles"),
+        ("snapshots", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', snapshot_sha256, first_share_seq, last_share_seq, share_count), ',' ORDER BY snapshot_sha256)), '') FROM qbit_prism_audit_snapshots"),
+        ("payouts", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', block_hash, miner_id, encode(p2mr_program, 'hex'), onchain_amount_sats, carry_forward_balance_sats, action), ',' ORDER BY block_hash, miner_id, p2mr_program)), '') FROM qbit_pool_payout_entries"),
+        ("carry", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', block_hash, encode(p2mr_program, 'hex'), gross_amount_sats, prior_balance_sats, onchain_amount_sats, carry_forward_balance_sats), ',' ORDER BY block_hash, p2mr_program, miner_id)), '') FROM qbit_payout_carry_forward"),
+        ("fanouts", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(fanout_txid || md5(fanout_tx_hex), ',' ORDER BY fanout_txid)), '') FROM qbit_ctv_fanout_artifacts"),
+    ] {
+        let value: String = sqlx::query_scalar(sql).fetch_one(pool).await?;
+        digest.insert(name.into(), json!(value));
+    }
+    Ok(serde_json::Value::Object(digest))
+}
+
+/// CONTRACT.md D-12: once a database is a dual-writer node's, a
+/// single-writer start on it is refused unless the downgrade flag is set.
+/// The node's frontend is stopped, started once in single-writer mode (it
+/// must exit, refusing), then started again as it was.
+async fn expect_single_writer_refused(sim: &mut Sim, node: Node, body: &mut Body) -> Result<()> {
+    sim.frontend_mut(node).stop(Duration::from_secs(30))?;
+    let mut spec = sim.frontend(node).spec.clone();
+    spec.dual = None;
+    spec.readiness = None;
+    let probe = crate::frontend::Frontend::new(spec, &sim.logs)?;
+    let attempt = probe.tool(&["run"], Duration::from_secs(45)).await;
+    let refused = match &attempt {
+        Ok(run) => !run.success,
+        // Still serving after 45 s: it did not refuse.
+        Err(_) => false,
+    };
+    body.expect(
+        "a single-writer start on a dual-mode database is refused (D-12)",
+        refused,
+        match attempt {
+            Ok(run) => format!(
+                "exit {:?}: {}",
+                run.code,
+                run.stderr.trim().lines().last().unwrap_or("")
+            ),
+            Err(error) => format!("{error:#}"),
+        },
+    );
+    sim.frontend_mut(node).start()?;
+    sim.frontend(node)
+        .wait_ready(Duration::from_secs(120))
+        .await?;
+    Ok(())
+}
+
+/// S9. The 3.0 pair (one writer, B its standby) mines a history with carry
+/// and blocks on both frontends, then is cut over to dual mode as the
+/// playbook does it. Both nodes' ledgers then equal the 3.0 writer's (every
+/// balance, report, landing and share), every pre-cutover row is node 0, a
+/// single-writer start on either database is refused (D-12), the owner's
+/// first block pays from the 3.0 balances, and the pair mines in dual mode
+/// with every invariant holding across the cutover.
+async fn s09_migration(sim: &mut Sim) -> Result<Body> {
+    let mut body = Body::default();
+    sim.load()?.resume();
+    steady(sim, 8).await;
+    for (node, note) in [
+        (Node::A, "3.0 history on A"),
+        (Node::B, "3.0 history on B"),
+        (Node::A, "3.0 history on A again"),
+    ] {
+        find_block(sim, &mut body, node, note, None).await?;
+        steady(sim, 3).await;
+    }
+    sim.load()?.pause();
+    sim.settle(SETTLE_BOUND).await?;
+    let before = ledger_digest(&sim.pool(Node::A).await?).await?;
+    let cutover = sim.cutover_to_dual().await?;
+    for node in Node::BOTH {
+        let after = ledger_digest(&sim.pool(node).await?).await?;
+        body.expect(
+            &format!("node {node:?}'s ledger is the 3.0 writer's after the cutover"),
+            after == before,
+            if after == before {
+                format!(
+                    "{} balances; {}",
+                    before["balances"].as_array().map_or(0, Vec::len),
+                    before["blocks"]
+                )
+            } else {
+                format!("before {before}, after {after}")
+            },
+        );
+        let pool = sim.pool(node).await?;
+        let mut foreign = 0i64;
+        for table in [
+            "qbit_share_ledger",
+            "qbit_prism_share_hashes",
+            "qbit_pool_blocks",
+            "qbit_pool_audit_bundles",
+            "qbit_prism_audit_snapshots",
+            "qbit_pool_payout_entries",
+            "qbit_payout_carry_forward",
+            "qbit_ctv_fanout_sets",
+            "qbit_ctv_fanout_artifacts",
+        ] {
+            foreign += sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT count(*) FROM {table} WHERE origin_node <> 0"
+            ))
+            .fetch_one(&pool)
+            .await?;
+        }
+        body.expect(
+            &format!("every pre-cutover row on node {node:?} is node 0's"),
+            foreign == 0,
+            format!("{foreign} rows of another origin"),
+        );
+        pool.close().await;
+    }
+    expect_single_writer_refused(sim, Node::B, &mut body).await?;
+    sim.load()?.resume();
+    steady(sim, 5).await;
+    let first = find_block(
+        sim,
+        &mut body,
+        Node::A,
+        "the owner's first block after the cutover",
+        None,
+    )
+    .await?;
+    confirm_on_both(sim, &first).await?;
+    expect_owner_priors_are_truth(sim, &mut body, &first).await?;
+    steady(sim, 3).await;
+    let b = find_block(
+        sim,
+        &mut body,
+        Node::B,
+        "B's first block in dual mode",
+        Some(&[Node::B]),
+    )
+    .await?;
+    confirm_on_both(sim, &b).await?;
+    steady(sim, 3).await;
+    sim.settle(SETTLE_BOUND).await?;
+    body.options.ownership = vec![(cutover + 1, Some(Node::A))];
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// How long the survivor may take to adopt a dead node's block that the
+/// chain holds (D-10, D-11): its reconciler's next look at the chain, the
+/// synced prepared record, a landing.
+pub const ADOPTION_BOUND: Duration = Duration::from_secs(90);
+
+/// S8. Node A finds a block and dies at that instant, with its
+/// `submitblock` held at the gate in front of its `qbitd`:
+///
+/// - [`DeathAtFind::Lost`]: the call never reaches the node. The block never
+///   reaches the chain; whatever A's restart does with its candidate, it is
+///   never paid twice.
+/// - [`DeathAtFind::Accepted`]: the node accepts the block and A dies before
+///   it hears. B adopts the block from A's synced prepared record (D-10,
+///   D-11, with D-19's wait on, or measured with it off); when A returns with
+///   its disk, its own landing and B's adoption leave one set of landing
+///   rows per node, identical, and the block's deltas count once.
+async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind) -> Result<Body> {
+    let mut body = Body::default();
+    sim.load()?.resume();
+    steady(sim, 5).await;
+    let warm = find_block(sim, &mut body, Node::A, "A before it dies", None).await?;
+    confirm_on_both(sim, &warm).await?;
+    routing_settled(sim).await?;
+    sim.wait_node_settled(Node::A, NODE_SETTLE_BOUND).await?;
+    sim.load()?
+        .refresh_finder(Node::A, Duration::from_secs(30))
+        .await?;
+    let gate = sim.gates.get(&Node::A).context("S8 runs with RPC gates")?;
+    gate.set_mode(match case {
+        DeathAtFind::Lost => crate::rpc_gate::GateMode::Hold,
+        DeathAtFind::Accepted { .. } => crate::rpc_gate::GateMode::Withhold,
+    });
+    let seen = gate.submissions();
+    let record = sim.load()?.find_block(Node::A, LANDING_BOUND).await?;
+    anyhow::ensure!(
+        record.accepted(),
+        "A refused its own block: {:?}",
+        record.reason
+    );
+    let hash = gate.next_submission(seen, Duration::from_secs(60)).await?;
+    if matches!(case, DeathAtFind::Accepted { .. }) {
+        gate.node_answered(&hash, Duration::from_secs(30)).await?;
+    }
+    let fault_at = sim.inject(Fault::FrontendKill9(Node::A)).await?;
+    sim.gates[&Node::A].discard_held();
+    sim.mark(&format!("A died at the instant it found {hash}"));
+    sim.balancer.wait_state("a", false, MARK_DOWN_BOUND).await?;
+    steady(sim, 6).await;
+    let on_chain = sim
+        .chain
+        .c
+        .rpc("getblockheader", json!([hash]))
+        .await
+        .is_ok();
+    match case {
+        DeathAtFind::Lost => body.expect(
+            "the lost block never reached the chain",
+            !on_chain,
+            format!("{hash} known to the network: {on_chain}"),
+        ),
+        DeathAtFind::Accepted { wait } => {
+            let adopted = sim.wait_confirmed(&hash, &[Node::B], ADOPTION_BOUND).await;
+            body.expect(
+                &format!(
+                    "the survivor adopts the dying node's block ({} wait)",
+                    if wait { "with the" } else { "without the" }
+                ),
+                adopted.is_ok() || !wait,
+                match &adopted {
+                    Ok(took) => format!("confirmed on B {:.1} s after A died", took.as_secs_f64()),
+                    Err(error) => format!("not adoptable: {error:#}"),
+                },
+            );
+        }
+    }
+    find_block(
+        sim,
+        &mut body,
+        Node::B,
+        "B while A is down",
+        Some(&[Node::B]),
+    )
+    .await?;
+    sim.heal(Fault::FrontendKill9(Node::A)).await?;
+    sim.balancer
+        .wait_state("a", true, Duration::from_secs(60))
+        .await?;
+    if on_chain {
+        sim.wait_confirmed(&hash, &Node::BOTH, CATCH_UP_BOUND)
+            .await?;
+        for node in Node::BOTH {
+            let pool = sim.pool(node).await?;
+            let (blocks, carry): (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM qbit_pool_blocks WHERE block_hash = $1), \
+                        (SELECT count(*) FROM qbit_payout_carry_forward WHERE block_hash = $1)",
+            )
+            .bind(&hash)
+            .fetch_one(&pool)
+            .await?;
+            pool.close().await;
+            body.expect(
+                &format!("node {node:?} holds one landing of the block (D-10)"),
+                blocks == 1,
+                format!("{blocks} block rows, {carry} carry rows"),
+            );
+        }
+    }
+    let records = sim.load()?.records();
+    body.gaps.push(report::gap(&records, fault_at));
+    steady(sim, 3).await;
+    sim.settle(SETTLE_BOUND).await?;
+    expect_dual_health(sim, &mut body).await?;
+    Ok(body)
+}
+
+/// S11. The carry-owner transfer drill (D3's operator CLI, status/D3.md).
+/// With B's frontend (and so its sync) stopped, the owner A lands an own
+/// block B lacks and releases ownership; six blocks later B's
+/// `carry-owner transfer` is refused, its chain scan naming that block.
+/// Once B is back and has landed it, the transfer succeeds, the operator
+/// swaps `PRISM_CARRY_OWNER` and restarts both, and from then on B pays
+/// carry and A builds carry-free work.
+async fn s11_carry_owner_transfer(sim: &mut Sim) -> Result<Body> {
+    let mut body = Body::default();
+    let tool_bound = Duration::from_secs(180);
+    sim.load()?.resume();
+    steady(sim, 6).await;
+    let early = find_block(sim, &mut body, Node::A, "carry accrues under A", None).await?;
+    confirm_on_both(sim, &early).await?;
+    steady(sim, 3).await;
+
+    sim.frontend_mut(Node::B).stop(Duration::from_secs(30))?;
+    sim.mark("B stopped: its ledger stops learning A's landings");
+    let unknown = find_block(
+        sim,
+        &mut body,
+        Node::A,
+        "an own block B lacks",
+        Some(&[Node::A]),
+    )
+    .await?;
+    let release = sim
+        .frontend(Node::A)
+        .tool(
+            &[
+                "carry-owner",
+                "release",
+                "--reason",
+                "S11 drill",
+                "--confirm",
+            ],
+            tool_bound,
+        )
+        .await?;
+    body.expect(
+        "the owner releases ownership",
+        release.success,
+        format!("exit {:?}: {}", release.code, release.stdout.trim()),
+    );
+    sim.chain.mint(7).await?;
+    let refused = sim
+        .frontend(Node::B)
+        .tool(
+            &[
+                "carry-owner",
+                "transfer",
+                "--reason",
+                "S11 drill",
+                "--confirm",
+            ],
+            tool_bound,
+        )
+        .await?;
+    body.expect(
+        "the transfer is refused while an own block is unknown to the new owner",
+        !refused.success
+            && refused.stdout.contains("chain_scan")
+            && refused.stdout.contains(&unknown),
+        format!("exit {:?}: {}", refused.code, refused.stdout.trim()),
+    );
+
+    sim.frontend_mut(Node::B).start()?;
+    sim.frontend(Node::B)
+        .wait_ready(Duration::from_secs(120))
+        .await?;
+    sim.wait_confirmed(&unknown, &[Node::B], CATCH_UP_BOUND)
+        .await?;
+    let transferred = sim
+        .frontend(Node::B)
+        .tool(
+            &[
+                "carry-owner",
+                "transfer",
+                "--reason",
+                "S11 drill",
+                "--confirm",
+            ],
+            tool_bound,
+        )
+        .await?;
+    body.expect(
+        "the transfer succeeds once the block is landed",
+        transferred.success,
+        format!("exit {:?}: {}", transferred.code, transferred.stdout.trim()),
+    );
+    let (transfer_height, _, _) = sim.chain.c.tip().await?;
+
+    for (node, owner) in [(Node::A, false), (Node::B, true)] {
+        let frontend = sim.frontend_mut(node);
+        frontend.stop(Duration::from_secs(30))?;
+        if let Some(dual) = frontend.spec.dual.as_mut() {
+            dual.carry_owner = owner;
+        }
+    }
+    for node in [Node::A, Node::B] {
+        sim.frontend_mut(node).start()?;
+    }
+    for node in Node::BOTH {
+        sim.frontend(node)
+            .wait_ready(Duration::from_secs(120))
+            .await?;
+    }
+    sim.mark(&format!("ownership moved to B at height {transfer_height}"));
+    routing_settled(sim).await?;
+    steady(sim, 4).await;
+    let b_block = find_block(sim, &mut body, Node::B, "B as the new owner", None).await?;
+    confirm_on_both(sim, &b_block).await?;
+    expect_priors_are_truth(sim, &mut body, Node::B, &b_block).await?;
+    let a_block = find_block(sim, &mut body, Node::A, "A as the non-owner", None).await?;
+    confirm_on_both(sim, &a_block).await?;
+    steady(sim, 2).await;
+    sim.settle(SETTLE_BOUND).await?;
+    body.options.ownership = vec![(0, Some(Node::A)), (transfer_height + 1, Some(Node::B))];
+    Ok(body)
+}
+
+/// CONTRACT.md §4.4 and D-14's negative control: a row that arrives after a
+/// window was built, and is eligible for it, must be caught. A copy of one of
+/// A's shares is planted above A's newest recorded window with a stamp at
+/// that window's anchor (a late row that would have joined it), and the
+/// windows check must name that window. The planted row breaks A's ledger
+/// for anything after this, so this runs last.
+async fn late_row_control(sim: &Sim, body: &mut Body) -> Result<()> {
+    let pool = sim.pool(Node::A).await?;
+    let windows = invariants::recorded_windows(&pool).await?;
+    let window = windows
+        .iter()
+        .max_by_key(|window| window.last)
+        .context("A recorded no window to plant a late row against")?
+        .clone();
+    let planted: i64 = sqlx::query_scalar(
+        "INSERT INTO qbit_share_ledger (share_seq, share_id, miner_id, payout_order_key, \
+             p2mr_program, share_difficulty, network_difficulty, template_height, job_id, \
+             job_issued_at, ntime, accepted_at, accepted, writer_id, writer_epoch) \
+         SELECT (SELECT max(share_seq) + 1 FROM qbit_share_ledger), 'late-row-control:' || share_id, \
+                miner_id, payout_order_key, p2mr_program, share_difficulty, network_difficulty, \
+                template_height, job_id, to_timestamp($1::double precision / 1000), ntime, \
+                to_timestamp($1::double precision / 1000), true, writer_id, writer_epoch \
+         FROM qbit_share_ledger WHERE accepted AND share_seq = $2 \
+         RETURNING share_seq",
+    )
+    .bind(window.anchor_ms)
+    .bind(window.last)
+    .fetch_one(&pool)
+    .await
+    .context("planting the late row")?;
+    sim.mark(&format!(
+        "planted a late row at share_seq {planted}, eligible for window {}",
+        window.snapshot
+    ));
+    let pools = std::collections::BTreeMap::from([(Node::A, pool)]);
+    let check = invariants::windows_unchanged(&pools).await?;
+    let named = check.problems.iter().any(|problem| {
+        problem.contains(&window.snapshot) && problem.contains(&planted.to_string())
+    });
+    body.expect(
+        "checker: a late row eligible for a built window is caught (D-14)",
+        check.status == Status::Fail && named,
+        format!("{:?}: {:?}", check.status, check.problems),
+    );
+    for pool in pools.values() {
+        pool.close().await;
+    }
+    Ok(())
 }
 
 // --- S10 ---------------------------------------------------------------------
