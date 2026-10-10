@@ -995,48 +995,70 @@ fn expect_landing_order(body: &mut Body, on: Node, report: crate::measure::Landi
 }
 
 /// S2 with A's PostgreSQL killed: A's frontend, up without its database,
-/// stops answering ready for good within [`SELF_WITHDRAWAL_BOUND`] of the
-/// kill, as sampled from just before it, and the balancer marks it down
-/// within [`MARK_DOWN_BOUND`] of that.
+/// stops answering ready within [`SELF_WITHDRAWAL_BOUND`] of the kill and
+/// stays withdrawn until the heal (sampled from just before the kill), and
+/// the balancer marks it down within [`MARK_DOWN_BOUND`] of that and never
+/// marks it up again while its database is dead.
 fn expect_self_withdrawal(
     sim: &Sim,
     body: &mut Body,
     fault_at: u64,
     trace: &crate::measure::ReadinessTrace,
 ) {
-    let marked_down = sim
-        .balancer
-        .report()
+    let until = sim.clock.now_ms();
+    let report = sim.balancer.report();
+    let transitions: Vec<(u64, bool)> = report
         .transitions
         .iter()
-        .find(|t| t.backend == "a" && !t.up && t.at_ms >= fault_at)
-        .map(|t| t.at_ms);
+        .filter(|t| t.backend == "a" && t.at_ms >= fault_at)
+        .map(|t| (t.at_ms, t.up))
+        .collect();
+    let marked_down = transitions.iter().find(|(_, up)| !up).map(|(at, _)| *at);
+    let marked_up_again = marked_down.and_then(|down| {
+        transitions
+            .iter()
+            .find(|(at, up)| *up && *at > down)
+            .map(|(at, _)| *at)
+    });
     let since_kill = |at: u64| at.saturating_sub(fault_at);
     let first_ms = trace.first_not_ready(fault_at).map(since_kill);
     let withdrawn_ms = trace
         .withdrawn_since()
         .filter(|at| *at >= fault_at)
         .map(since_kill);
-    let followed_ms = marked_down
-        .zip(trace.withdrawn_since())
-        .map(|(down, since)| down.saturating_sub(since));
+    // Timed from the not-ready stretch the mark-down came in.
+    let followed_ms = marked_down.and_then(|down| {
+        trace
+            .not_ready_since(down)
+            .map(|since| down.saturating_sub(since))
+    });
     sim.mark(&format!(
         "A stopped answering ready {first_ms:?} ms after its PostgreSQL died, for good \
          {withdrawn_ms:?} ms after"
     ));
     body.expect(
-        "A withdrew on its own soon after its PostgreSQL died, and the balancer followed",
+        "A withdrew on its own soon after its PostgreSQL died and stayed out until the heal",
         withdrawn_ms.is_some_and(|ms| ms <= SELF_WITHDRAWAL_BOUND.as_millis() as u64)
-            && followed_ms.is_some_and(|ms| ms <= MARK_DOWN_BOUND.as_millis() as u64),
+            && followed_ms.is_some_and(|ms| ms <= MARK_DOWN_BOUND.as_millis() as u64)
+            && marked_up_again.is_none(),
         format!(
-            "A first stopped answering ready {first_ms:?} ms after the kill, and for good \
-             {withdrawn_ms:?} ms after it, answering ready again {} times in between; bound \
-             {} ms (D4: the writer probe gives up after 2 s and a writer unanswered for 4 s \
-             withdraws). The balancer marked A down {followed_ms:?} ms after that, bound {} \
-             ms. {} samples every {} ms; the answers: {:?}",
+            "A first stopped answering ready {first_ms:?} ms after the kill, and for good (until \
+             the heal, {} ms after the kill) {withdrawn_ms:?} ms after it, answering ready \
+             again {} times in between; bound {} ms (D4: the writer probe gives up after 2 s \
+             and a writer unanswered for 4 s withdraws). The balancer marked A down \
+             {followed_ms:?} ms into the not-ready stretch it came in, bound {} ms, and \
+             marked it up again while its database was dead at {:?} ms after the kill (it must \
+             not). A's marks since the kill (ms after it, up): {:?}. {} samples every {} ms; \
+             the answers: {:?}",
+            since_kill(until),
             trace.readmissions(fault_at),
             SELF_WITHDRAWAL_BOUND.as_millis(),
             MARK_DOWN_BOUND.as_millis(),
+            marked_up_again.map(since_kill),
+            transitions
+                .iter()
+                .map(|(at, up)| (since_kill(*at), *up))
+                .collect::<Vec<_>>(),
             trace.samples,
             crate::measure::READINESS_SAMPLE.as_millis(),
             trace
@@ -1081,12 +1103,16 @@ async fn s02_a_dies(sim: &mut Sim, death: Death, body: &mut Body) -> Result<()> 
         _ => MARK_DOWN_BOUND,
     };
     let marked_down = sim.balancer.wait_state("a", false, mark_down_wait).await;
-    if let Some(readiness) = readiness {
-        // Recorded whether or not the balancer followed, so a withdrawal too
-        // slow for the wait is still measured.
-        let trace = readiness.finish().await?;
-        expect_self_withdrawal(sim, body, fault_at, &trace);
-    }
+    // Sampled until the heal, so A must also stay withdrawn while its
+    // database is dead; measured at once if the balancer never followed.
+    let readiness = match readiness {
+        Some(sampler) if marked_down.is_err() => {
+            let trace = sampler.finish().await?;
+            expect_self_withdrawal(sim, body, fault_at, &trace);
+            None
+        }
+        sampler => sampler,
+    };
     marked_down.context("the balancer kept A up")?;
     sim.mark("balancer marked A down");
     steady(sim, 8).await;
@@ -1112,6 +1138,10 @@ async fn s02_a_dies(sim: &mut Sim, death: Death, body: &mut Body) -> Result<()> 
         ),
     );
 
+    if let Some(sampler) = readiness {
+        let trace = sampler.finish().await?;
+        expect_self_withdrawal(sim, body, fault_at, &trace);
+    }
     sim.heal(fault).await?;
     if !sim.frontend(Node::A).running() {
         // A frontend that lost its database may have exited: start it.

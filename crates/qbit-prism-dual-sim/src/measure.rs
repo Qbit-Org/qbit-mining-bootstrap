@@ -129,6 +129,17 @@ impl ReadinessTrace {
             .map(|change| change.at_ms)
     }
 
+    /// When the not-ready stretch that held at `at_ms` began, if the node
+    /// was not answering ready then.
+    pub fn not_ready_since(&self, at_ms: u64) -> Option<u64> {
+        self.changes
+            .iter()
+            .rev()
+            .find(|change| change.at_ms <= at_ms)
+            .filter(|change| !change.ready)
+            .map(|change| change.at_ms)
+    }
+
     /// The first time, at or after `from_ms`, that the node did not answer
     /// ready.
     pub fn first_not_ready(&self, from_ms: u64) -> Option<u64> {
@@ -571,6 +582,9 @@ mod tests {
             samples: 120,
         };
         assert_eq!(flapping.first_not_ready(1_000), Some(4_000));
+        assert_eq!(flapping.not_ready_since(5_000), Some(4_000));
+        assert_eq!(flapping.not_ready_since(7_000), None, "ready again then");
+        assert_eq!(flapping.not_ready_since(25_000), Some(20_000));
         assert_eq!(flapping.withdrawn_since(), Some(20_000));
         assert_eq!(flapping.readmissions(1_000), 1);
         let back = ReadinessTrace {

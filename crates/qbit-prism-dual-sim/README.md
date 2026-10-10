@@ -170,10 +170,11 @@ What each one does:
   blocks from its own chain view, and its next block pays the carry they
   accrued (its priors equal the chain's sums). With its PostgreSQL killed,
   A's frontend is still up and must withdraw on its own: sampled every
-  200 ms from before the kill, it must stop answering ready for good within
-  12 s (D4 withdraws a writer unanswered for 4 s; its stale-decision
-  backstop would take 14 to 15 s), and the mark-down must follow within
-  12 s.
+  200 ms from before the kill until the heal, it must stop answering ready
+  within 12 s (D4 withdraws a writer unanswered for 4 s; its stale-decision
+  backstop would take 14 to 15 s) and stay withdrawn until the heal; the
+  mark-down must follow within 12 s, and the balancer must not mark A up
+  again while its database is dead.
 - **S2's freeze** holds A frozen for at least 60 s while B finds a block every
   few seconds; each must land and be followed by new jobs of B's before A
   thaws (a frozen peer must never stall the survivor's writes).
