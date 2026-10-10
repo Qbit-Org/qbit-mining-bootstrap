@@ -115,8 +115,11 @@ pub async fn run(config: Config) -> Result<()> {
                     node = %node,
                     database_node = %record.node,
                     "ALERT: PRISM_DATABASE_URL names dual-writer node {}'s database, not this \
-                     node's; the peer sync does not run and this frontend admits no miners",
-                    record.node
+                     node's; the peer sync does not run and this frontend admits no miners. If \
+                     it is a physical copy of that database rebuilt for this node, stop this \
+                     frontend and run `qbit-prism-server node-identity repersonalise --index {}`",
+                    record.node,
+                    node.index()
                 ),
             }
         }

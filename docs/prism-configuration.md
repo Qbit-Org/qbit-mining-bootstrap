@@ -251,6 +251,9 @@ the columns and tables the dual writer needs, and
 `qbit-prism-server node-identity set --index N` personalises each database
 before its first dual-writer start; see
 [dual-writer node identity](prism-ledger-ops.md#dual-writer-node-identity-027).
+A node rebuilt from a physical copy of its peer's database is re-personalised
+instead, with `node-identity repersonalise --index N`
+([rebuilding a node](prism-ledger-ops.md#rebuilding-a-node-from-its-peer)).
 
 A dual-writer node has no failover standby, so `PRISM_OFFER_STANDBY_APPLICATION_NAME`
 and `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` are left unset there. Its peer adopts a

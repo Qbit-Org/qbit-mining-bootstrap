@@ -116,6 +116,7 @@
     "ledger/node_identity.rs::node_lineage#1::self .acquire()": [1,"ledger"],
     "ledger/node_identity.rs::recorded_node_identity#1::self .acquire()": [1,"ledger"],
     "ledger/node_identity.rs::refuse_single_writer_on_dual_ledger#1::self .acquire()": [1,"ledger"],
+    "ledger/node_identity.rs::repersonalise_node_identity#1::self .begin()": [1,"ledger"],
     "ledger/node_identity.rs::set_node_identity#1::self .begin()": [1,"ledger"],
     "ledger/peer_sync.rs::apply_block#1::begin(& mut * tx as & mut PgConnection)": [1,"transaction"],
     "ledger/peer_sync.rs::apply_block#1::self .begin()": [1,"ledger"],

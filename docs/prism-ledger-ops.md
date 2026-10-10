@@ -3782,13 +3782,77 @@ in one transaction:
 
 Run again on a database that is already node `N`'s, it restores anything lost
 since and changes nothing else. A database that is the other node's is
-refused. `node-identity show` prints the identity and lineage as JSON.
+refused: a physical copy of the peer's database is re-personalised instead
+([below](#rebuilding-a-node-from-its-peer)). `node-identity show` prints the
+identity and lineage as JSON.
 
 A dual-writer frontend checks its database at start. If a default, a key
 sequence's parity or the session range was changed after personalisation, it
 refuses to start, naming each, until `node-identity set` runs again. A
 database with no identity, or the other node's, is reported: the frontend runs,
 but the peer sync does not, and the frontend admits no miners.
+
+### Rebuilding a node from its peer
+
+A node whose disk was replaced is rebuilt from a physical copy of its peer's
+database (`pg_basebackup`, then promoted). The copy says it is the peer, so
+before the rebuilt node's frontend first starts,
+`qbit-prism-server node-identity repersonalise --index N` makes it node `N`'s.
+Run it with `PRISM_DATABASE_URL` naming the rebuilt node's database, once it is
+promoted, with every PRISM process that uses that database stopped. It
+refuses, changing nothing:
+
+- unless the database's identity names the other node;
+- while an instance row that is neither `drained` nor `stopped` has a
+  heartbeat younger than 60 seconds by the database's clock: a frontend may be
+  running on it. The rows the copy carried from the peer's own frontends stop
+  counting 60 seconds after the copy stopped following the peer;
+- on the server the peer last proved its own log on (the same system
+  identifier and timeline): that is the peer's own database, not a promoted
+  copy;
+- while the schema holds a table that the dual-writer table inventory
+  (`crates/qbit-prism-server/src/ledger/table_inventory.rs`) does not
+  classify, or lacks one it names.
+
+In one transaction, under `SETTLEMENT_LOCK` and `ORDER_LOCK`, it resets what
+the inventory classifies as the peer's own state, and keeps the rest:
+
+- **Cleared**, the peer's in-flight work, which this node must neither settle
+  nor credit a second time: its found-block candidates and their deferred
+  shares, its sessions' reservations, its frontends' registrations, its CPFP
+  funding and retired funding, its sync conflicts, and its issued jobs (the
+  prepared records stay). The peer's fanout claims are handed back, due at once
+  unless held.
+- **Kept**, what is derived from rows both nodes hold, or is history this
+  database carries: the block, payout and carry states and the publication
+  ordinals, the balance summary, the cluster row (payout revision, chain epoch,
+  ledger clock, chain view, fingerprint, and any halt), the divergences, the
+  broadcast history, the rollups and vardiff hints, the submission hold, the
+  operator journals, the partition catalog and the schema record. Cleared, these
+  would change balances or audits; this node's workers move them on from the
+  copy's values, as after any restart. A halt or a submission hold the peer
+  recorded therefore holds here too: check `fatal-state show` and
+  `submission-hold show`.
+- **Rewritten**, this node's identity and keys: the personalisation `set`
+  performs, with every key above every key the database holds and above every
+  position the peer reached in this node's old streams, so the peer pulls every
+  row this node writes from now on; the floors, with no own-log verification,
+  so the check runs before the node serves; and the sync cursors. The shares
+  cursor starts at the peer's newest share in the copy, which holds every peer
+  share at or below it (each node's own shares commit in `share_seq` order).
+  The block and prepared-record cursors start at the peer's floor: those rows
+  commit in no `sync_seq` order, so the first pull reads them again, skipping
+  each one the copy holds.
+
+It prints the identity and lineage, and under `repersonalised` the identity the
+copy carried, the floors, the rows cleared and reset in each table, and the
+cursors. Only the rows this node wrote that the peer had not pulled before the
+disk failed are lost; the peer never had them.
+
+A node restored from its own backup is not a copy of its peer: its identity is
+its own, so the command refuses it, and its own-log recovery completes it. A
+new, empty database followed by a full pull is not supported: rows from before
+3.1 are never pulled.
 
 ## Health, diagnostics, and validation
 

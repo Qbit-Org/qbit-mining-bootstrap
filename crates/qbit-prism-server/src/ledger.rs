@@ -73,8 +73,12 @@ pub use jobs::{
 };
 mod node_identity;
 pub mod peer_sync;
-pub use node_identity::{IdentityCheck, LineageEvidence, NodeIdentityRecord, NodeLineage};
+pub use node_identity::{
+    IdentityCheck, LineageEvidence, NodeIdentityRecord, NodeLineage, PeerSyncCursor,
+    Repersonalisation, TableRows,
+};
 mod migration;
+pub mod table_inventory;
 pub use migration::{
     required_schema_versions, schema_version_list, IndexBuildMode, MigrationSource,
     ShareHashBackfill, SourceState, SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS,

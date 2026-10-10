@@ -68,7 +68,7 @@ enum Command {
         #[command(subcommand)]
         command: SubmissionHoldCommand,
     },
-    /// Show or set which 3.1 dual-writer node this database is (bootstrap and cutover steps).
+    /// Show, set or re-personalise which 3.1 dual-writer node this database is.
     NodeIdentity {
         #[command(subcommand)]
         command: NodeIdentityCommand,
@@ -339,7 +339,8 @@ enum SubmissionHoldCommand {
 }
 
 /// 3.1 dual writer: which node a database is (CONTRACT D-9). Only the
-/// bootstrap and cutover steps set it; a frontend never writes it.
+/// bootstrap and cutover steps set it, and the rebuild of a node from its
+/// peer's database re-personalises it (D-16); a frontend never writes it.
 #[derive(Subcommand)]
 enum NodeIdentityCommand {
     /// Print the database's node identity and lineage as JSON. Needs only PRISM_DATABASE_URL.
@@ -347,6 +348,13 @@ enum NodeIdentityCommand {
     /// Make this database node A's (0) or node B's (1), once, before its first dual-writer start.
     Set {
         /// 0 for node A, 1 for node B.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
+        index: u8,
+    },
+    /// Make a promoted physical copy of the peer's database this node's, rebuilding a node whose
+    /// disk was replaced, before its first start; every PRISM process using it must be stopped.
+    Repersonalise {
+        /// The node being rebuilt: 0 for node A, 1 for node B. The copy must say it is the other.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
         index: u8,
     },
@@ -767,28 +775,49 @@ async fn fatal_state(command: FatalStateCommand) -> Result<()> {
     }
 }
 
-/// 3.1 dual writer (CONTRACT D-9): reads only the database URL, so it runs
-/// before any dual-writer setting exists. `set` personalises the database as
-/// the given node (`Ledger::set_node_identity`) on the operator connection,
-/// which writes no heartbeat; run again on the same node it restores only what
-/// the database lost, and it refuses a database that is the other node's.
-/// Both print the identity and lineage that result as JSON.
+/// 3.1 dual writer (CONTRACT D-9, D-16): reads only the database URL, so it
+/// runs before any dual-writer setting exists. `set` personalises the
+/// database as the given node (`Ledger::set_node_identity`) on the operator
+/// connection, which writes no heartbeat; run again on the same node it
+/// restores only what the database lost, and it refuses a database that is
+/// the other node's. `repersonalise` makes a promoted physical copy of the
+/// other node's database the given node's
+/// (`Ledger::repersonalise_node_identity`) and adds what it did under
+/// `repersonalised`. Each prints the identity and lineage that result as JSON.
 async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
     let url = config::DatabaseConfig::url_from_env()?;
     let ledger = crate::ledger::Ledger::connect_operator(&url, false).await?;
     let result = async {
-        if let NodeIdentityCommand::Set { index } = command {
-            let node = crate::node_identity::NodeIndex::from_index(index.into())
-                .context("--index must be 0 (node A) or 1 (node B)")?;
-            ledger
-                .set_node_identity(node, "qbit-prism-server node-identity set")
-                .await?;
-        }
-        Ok::<_, anyhow::Error>(json!({
+        let node = |index: u8| {
+            crate::node_identity::NodeIndex::from_index(index.into())
+                .context("--index must be 0 (node A) or 1 (node B)")
+        };
+        let repersonalised = match command {
+            NodeIdentityCommand::Show => None,
+            NodeIdentityCommand::Set { index } => {
+                ledger
+                    .set_node_identity(node(index)?, "qbit-prism-server node-identity set")
+                    .await?;
+                None
+            }
+            NodeIdentityCommand::Repersonalise { index } => Some(
+                ledger
+                    .repersonalise_node_identity(
+                        node(index)?,
+                        "qbit-prism-server node-identity repersonalise",
+                    )
+                    .await?,
+            ),
+        };
+        let mut report = json!({
             "schema": "qbit.prism.node-identity.v1",
             "identity": ledger.recorded_node_identity().await?,
             "lineage": ledger.node_lineage().await?,
-        }))
+        });
+        if let Some(repersonalised) = repersonalised {
+            report["repersonalised"] = serde_json::to_value(repersonalised)?;
+        }
+        Ok::<_, anyhow::Error>(report)
     }
     .await;
     ledger.pool.close().await;
