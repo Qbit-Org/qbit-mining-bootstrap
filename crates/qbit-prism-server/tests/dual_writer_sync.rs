@@ -962,6 +962,8 @@ async fn the_sync_refuses_wrong_identities_and_fingerprints() -> Result<()> {
 /// peer's cursors cover this node's shares through the window and the
 /// prepared record the block was built on, times out within its bound when
 /// they do not, and reports an unreachable peer; it never holds the block.
+/// The record is the one the block's issued job names, even when a newer one
+/// was prepared over the same window.
 #[tokio::test]
 async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
     use qbit_prism_server::peer_sync::{AdoptionNeeds, PeerIngest, PeerIngestWait};
@@ -970,19 +972,50 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
     };
     pair(&raw, async |pair| {
         let seqs = append(&pair.a, &["w1", "w2"]).await?;
-        prepare(&pair.a, "w").await?;
-        let prepared = pair
-            .a
-            .own_prepared_sync_seq(NodeIndex::A, 1000, &hex("balances w"))
-            .await?;
+        let record = prepare(&pair.a, "w").await?;
+        let issued = format!("{}-{}", pair.a.instance_id, hex("issued w"));
+        sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at) VALUES($1,$2,$3,0,$4,clock_timestamp()+interval '1 hour')")
+            .bind(&issued).bind(&pair.a.instance_id).bind(hex("parent w"))
+            .bind(serde_json::json!({"compact": true, "prepared_key": record, "expires_at_ms": 0}))
+            .execute(&pair.a.pool).await?;
+        // A newer record over the same window: another template, the same
+        // anchor and balances.
+        let newer = format!("prepared:{}:{}", pair.a.instance_id, hex("w again"));
+        sqlx::query("INSERT INTO qbit_prism_templates(template_sha256,template_bytes) VALUES($1,$2)")
+            .bind(hex("template w again")).bind("w again".as_bytes()).execute(&pair.a.pool).await?;
+        sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,window_anchor_ms,window_prior_balances_sha256,template_sha256) VALUES($1,$2,$3,0,'{\"compact\":true}'::jsonb,clock_timestamp()+interval '1 hour',1000,$4,$5)")
+            .bind(&newer).bind(&pair.a.instance_id).bind(hex("parent w"))
+            .bind(hex("balances w")).bind(hex("template w again")).execute(&pair.a.pool).await?;
+        let sync_seq_of = async |job: &str| -> Result<i64> {
+            count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_prism_jobs WHERE job_id='{job}'")).await
+        };
+        ensure!(sync_seq_of(&newer).await? > sync_seq_of(&record).await?);
+        let prepared = pair.a.own_prepared_sync_seq(NodeIndex::A, &issued).await?;
         ensure!(
-            prepared.is_some(),
-            "the prepared record was not found by its window"
+            prepared == Some(sync_seq_of(&record).await?),
+            "the block's record is the one its job names, not the newest over its window: {prepared:?}"
         );
+        let gone = pair.a.own_prepared_sync_seq(NodeIndex::A, "no-such-job").await;
+        ensure!(gone.is_err(), "{gone:?}");
+        // A record the peer holds anyway is no need: the peer's own, or one
+        // from before 027, which both nodes started from.
+        let record_seq = sync_seq_of(&record).await?;
+        for (change, undo) in [
+            ("origin_node=1", "origin_node=0".to_owned()),
+            ("sync_seq=NULL", format!("sync_seq={record_seq}")),
+        ] {
+            sqlx::query(&format!("UPDATE qbit_prism_jobs SET {change} WHERE job_id=$1"))
+                .bind(&record).execute(&pair.a.pool).await?;
+            let held = pair.a.own_prepared_sync_seq(NodeIndex::A, &issued).await?;
+            ensure!(held.is_none(), "{change}: {held:?}");
+            sqlx::query(&format!("UPDATE qbit_prism_jobs SET {undo} WHERE job_id=$1"))
+                .bind(&record).execute(&pair.a.pool).await?;
+        }
+        ensure!(pair.a.own_prepared_sync_seq(NodeIndex::A, &issued).await? == Some(record_seq));
         let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
         pass_until(&mut on_b, async |_| {
             Ok(shares_of(&pair.b.pool, 0).await?.len() == 2
-                && count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_jobs").await? == 1)
+                && count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_jobs").await? == 2)
         })
         .await?;
         let on_a = config(NodeIndex::A, &pair.b_url, None);

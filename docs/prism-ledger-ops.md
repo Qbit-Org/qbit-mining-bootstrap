@@ -3925,19 +3925,18 @@ own-log recovery completes.
 
 **Found blocks.** A dual-writer node has no failover standby, so
 `PRISM_OFFER_STANDBY_APPLICATION_NAME` and `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS`
-stay unset. Before a found block's
-`submitblock`, the node waits up to `PRISM_PEER_INGEST_WAIT_MS` (250 ms by
-default) for the peer's cursors to cover its shares through the block's window
-and the prepared record the block was built on, with none of them
-quarantined there as a conflict: what the peer needs to adopt the block if
-this node dies. The bound covers the node's own read of those
-needs too; if that read fails, or the prepared record is no longer held here
-(pruned while the block waited), the block is offered at once, counted
-`unreachable`. The wait keeps one connection open to the peer on each path, tries
-the path that answered last first, and gives each path an even share of the
-time left, so a path that hangs cannot use up the other's. The block is
-offered whatever the wait finds, counted in
-`qbit_prism_peer_sync_offer_waits_total{outcome}`.
+stay unset. Before a found block's `submitblock`, the node waits up to
+`PRISM_PEER_INGEST_WAIT_MS` (250 ms by default) for the peer's cursors to cover
+its shares through the block's window and the prepared record the block was
+built on, the one its issued job names, with none of them quarantined there as
+a conflict: what the peer needs to adopt the block if this node dies. The bound
+covers the node's own read of those needs too; if that read fails, or the
+issued job or its prepared record is no longer held here (pruned while the
+block waited), the block is offered at once, counted `unreachable`. The wait
+keeps one connection open to the peer on each path, tries the path that
+answered last first, and gives each path an even share of the time left, so a
+path that hangs cannot use up the other's. The block is offered whatever the
+wait finds, counted in `qbit_prism_peer_sync_offer_waits_total{outcome}`.
 
 **Hashrate rollups and the share archive.** Both assume a row never commits
 below one already folded, which holds for a node's own shares but not for

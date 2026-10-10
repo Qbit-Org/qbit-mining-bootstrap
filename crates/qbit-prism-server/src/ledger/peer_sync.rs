@@ -692,24 +692,27 @@ impl Ledger {
         )
     }
 
-    /// The `sync_seq` of this node's own prepared record that a found block
-    /// was built on, matched by its window's anchor and as-issued balances
-    /// (D-19), if this database still holds it.
+    /// The `sync_seq` of the prepared record a block found on the issued job
+    /// `job_id` was built on, the one the job's `prepared_key` names, when
+    /// this node originated it (D-19). `None` when the peer holds it anyway:
+    /// it is the peer's own, or it predates migration 027, which both
+    /// databases of a pair started from. An error when the job or its record
+    /// is no longer held here: nothing then proves the peer holds it.
     pub async fn own_prepared_sync_seq(
         &self,
         node: NodeIndex,
-        anchor_ms: i64,
-        prior_balances_digest: &str,
+        job_id: &str,
     ) -> Result<Option<i64>> {
-        Ok(sqlx::query_scalar(
-            "SELECT max(sync_seq) FROM qbit_prism_jobs WHERE origin_node=$1 AND job_id LIKE 'prepared:%' \
-             AND window_anchor_ms=$2 AND window_prior_balances_sha256=$3",
+        let record: Option<(i16, Option<i64>)> = sqlx::query_as(
+            "SELECT p.origin_node,p.sync_seq FROM qbit_prism_jobs i JOIN qbit_prism_jobs p \
+             ON p.job_id=i.payload->>'prepared_key' WHERE i.job_id=$1",
         )
-        .bind(node.index())
-        .bind(anchor_ms)
-        .bind(prior_balances_digest)
-        .fetch_one(&mut *self.acquire().await?)
-        .await?)
+        .bind(job_id)
+        .fetch_optional(&mut *self.acquire().await?)
+        .await?;
+        let (origin, sync_seq) = record
+            .context("the block's issued job or its prepared record is no longer held here")?;
+        Ok(sync_seq.filter(|_| origin == node.index()))
     }
 
     /// This node's cursor over the peer's `stream`, if it has pulled it.
