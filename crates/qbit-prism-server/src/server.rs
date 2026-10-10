@@ -7,7 +7,7 @@ use crate::{
     metrics::{self, TaskKind},
     readiness::{
         admission::{Admission, AdmissionChange, AdmissionSignal},
-        dual_writer::{DualWriterReport, WriterPath, WRITER_PROBE_TIMEOUT},
+        dual_writer::{DualWriterReport, WriterPath},
         endpoint,
     },
     stratum::{run_gated_listener, run_listener, StratumConfig, StratumStats},
@@ -670,29 +670,17 @@ impl AdmissionPublisher {
     }
 }
 
-/// How a publication's cluster heartbeat may wait on the database.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeartbeatWait {
-    /// As long as the write takes: a single writer, as in 3.0.
-    Unbounded,
-    /// At most the writer probe's budget, then retried at the next
-    /// publication: a dual-writer frontend whose database answered.
-    Bounded,
-    /// Not sent: a dual-writer frontend whose database did not answer its
-    /// writer probe, which a heartbeat would only wait out.
-    Skipped,
-}
+/// A dual-writer frontend's cluster heartbeat in flight (3.1): its own
+/// task, so a slow or hung database never holds the next publication, which
+/// is what withdraws the node. It is never cancelled while the publisher
+/// runs, so a slow heartbeat still lands; the publisher awaits it before it
+/// returns, so it lands before the stopped marker, and aborts it only if the
+/// publisher is aborted itself.
+struct HeartbeatTask(tokio::task::JoinHandle<()>);
 
-impl HeartbeatWait {
-    /// 3.1: a dual-writer frontend's publications must keep their cadence
-    /// while its database is dead or hung, since the next one is what
-    /// withdraws it.
-    fn for_report(dual: Option<&DualWriterReport>) -> Self {
-        match dual {
-            None => Self::Unbounded,
-            Some(dual) if dual.writer_path == Some(WriterPath::Unanswered) => Self::Skipped,
-            Some(_) => Self::Bounded,
-        }
+impl Drop for HeartbeatTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -705,75 +693,85 @@ async fn publish_health(
 ) -> Result<()> {
     let mut tick = publication_ticks(&state);
     let mut missing_since = None::<Instant>;
-    loop {
-        tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-        let (health, heartbeat) = with_health_publication_progress(&state, async {
-            let (mut health, dual) = coordinator.health_report().await;
-            let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
-            if snapshot.authorized_missing_current_work == 0 {
-                missing_since = None;
+    let dual_writer = coordinator.config.dual_writer.is_some();
+    let mut heartbeat = None::<HeartbeatTask>;
+    let published = async {
+        loop {
+            tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
+            let health = with_health_publication_progress(&state, async {
+                let (mut health, dual) = coordinator.health_report().await;
+                let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
+                if snapshot.authorized_missing_current_work == 0 {
+                    missing_since = None;
+                } else {
+                    missing_since.get_or_insert_with(Instant::now);
+                }
+                let delivery_stalled = missing_since
+                    .is_some_and(|at| at.elapsed() > coordinator.config.health_timeout)
+                    && snapshot
+                        .last_delivery_progress_age_seconds
+                        .is_none_or(|age| age > coordinator.config.health_timeout.as_secs_f64());
+                if delivery_stalled {
+                    health["ok"] = false.into();
+                    health["ready"] = false.into();
+                    health["status"] = "job-delivery-stalled".into();
+                }
+                health["stratum"] = serde_json::to_value(&snapshot)?;
+                metrics::add_known_health_fields(&mut health);
+                let registry = state.metrics();
+                admission.publish(
+                    &mut health,
+                    dual.as_ref(),
+                    registry.runtime().snapshot().stalled(),
+                    &registry,
+                );
+                state.publish_health(health.clone());
+                registry.publish_stratum(
+                    &snapshot,
+                    health["ok"] == true,
+                    coordinator.config.runtime_workers,
+                    coordinator.blocks.load(Ordering::Relaxed),
+                );
+                registry.publish_delivery(stats.delivery_metrics());
+                // #664: the switch, and the cluster hold as this publication read it.
+                registry.publish_block_submission(
+                    coordinator.config.block_submit_enabled,
+                    health["block_submission_hold"]["held"].as_bool(),
+                );
+                registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
+                registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
+                state.publish_metrics(registry.render())?;
+                Ok(health)
+            })
+            .await?;
+            let health: HeartbeatHealth = serde_json::from_value(health)?;
+            if !dual_writer {
+                // A single writer's heartbeat, as in 3.0: in line.
+                if let Err(error) = coordinator
+                    .ledger
+                    .heartbeat(HeartbeatStatus::Health(health))
+                    .await
+                {
+                    tracing::warn!(%error,"cluster heartbeat failed");
+                }
+            } else if heartbeat.as_ref().is_some_and(|task| !task.0.is_finished()) {
+                tracing::debug!("cluster heartbeat skipped: the previous one is still running");
             } else {
-                missing_since.get_or_insert_with(Instant::now);
+                let ledger = coordinator.ledger.clone();
+                heartbeat = Some(HeartbeatTask(tokio::spawn(async move {
+                    if let Err(error) = ledger.heartbeat(HeartbeatStatus::Health(health)).await {
+                        tracing::warn!(%error,"cluster heartbeat failed");
+                    }
+                })));
             }
-            let delivery_stalled = missing_since
-                .is_some_and(|at| at.elapsed() > coordinator.config.health_timeout)
-                && snapshot
-                    .last_delivery_progress_age_seconds
-                    .is_none_or(|age| age > coordinator.config.health_timeout.as_secs_f64());
-            if delivery_stalled {
-                health["ok"] = false.into();
-                health["ready"] = false.into();
-                health["status"] = "job-delivery-stalled".into();
-            }
-            health["stratum"] = serde_json::to_value(&snapshot)?;
-            metrics::add_known_health_fields(&mut health);
-            let registry = state.metrics();
-            admission.publish(
-                &mut health,
-                dual.as_ref(),
-                registry.runtime().snapshot().stalled(),
-                &registry,
-            );
-            state.publish_health(health.clone());
-            registry.publish_stratum(
-                &snapshot,
-                health["ok"] == true,
-                coordinator.config.runtime_workers,
-                coordinator.blocks.load(Ordering::Relaxed),
-            );
-            registry.publish_delivery(stats.delivery_metrics());
-            // #664: the switch, and the cluster hold as this publication read it.
-            registry.publish_block_submission(
-                coordinator.config.block_submit_enabled,
-                health["block_submission_hold"]["held"].as_bool(),
-            );
-            registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
-            registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
-            state.publish_metrics(registry.render())?;
-            Ok((health, HeartbeatWait::for_report(dual.as_ref())))
-        })
-        .await?;
-        let health: HeartbeatHealth = serde_json::from_value(health)?;
-        let beat = coordinator
-            .ledger
-            .heartbeat(HeartbeatStatus::Health(health));
-        let result = match heartbeat {
-            HeartbeatWait::Unbounded => beat.await,
-            HeartbeatWait::Bounded => tokio::time::timeout(WRITER_PROBE_TIMEOUT, beat)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "timed out after {} ms",
-                        WRITER_PROBE_TIMEOUT.as_millis()
-                    ))
-                }),
-            HeartbeatWait::Skipped => Ok(()),
-        };
-        if let Err(error) = result {
-            tracing::warn!(%error,"cluster heartbeat failed");
         }
+        Ok(())
     }
-    Ok(())
+    .await;
+    if let Some(mut task) = heartbeat.take() {
+        let _ = (&mut task.0).await;
+    }
+    published
 }
 
 pub(crate) async fn signal() -> Result<()> {
@@ -817,35 +815,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-    }
-
-    /// 3.1: a dual-writer frontend's heartbeat never holds the next
-    /// publication on a dead or hung database; a single writer's waits as in
-    /// 3.0.
-    #[test]
-    fn a_dual_writer_heartbeat_is_bounded_and_skipped_without_an_answer() {
-        let report = |path| DualWriterReport {
-            identity: crate::node_identity::NodeIdentity {
-                node: crate::node_identity::NodeIndex::B,
-                carry_owner: false,
-            },
-            own_log_caught_up: true,
-            writer_path: Some(path),
-            withdrawal: None,
-            value: json!({}),
-        };
-        assert_eq!(HeartbeatWait::for_report(None), HeartbeatWait::Unbounded);
-        assert_eq!(
-            HeartbeatWait::for_report(Some(&report(WriterPath::Unanswered))),
-            HeartbeatWait::Skipped
-        );
-        for path in [WriterPath::Local, WriterPath::Remote, WriterPath::ReadOnly] {
-            assert_eq!(
-                HeartbeatWait::for_report(Some(&report(path))),
-                HeartbeatWait::Bounded,
-                "{path:?}"
-            );
-        }
     }
 
     #[tokio::test]

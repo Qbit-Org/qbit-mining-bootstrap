@@ -72,9 +72,9 @@ database is not read as `unanswered`. A database that stops answering, dead
 or hung, withdraws the frontend about 4 s after its last answer, plus at most
 one 2 s probe: each publication reads the database beside the probe and waits
 for neither longer than the probe's 2 s, and its
-heartbeat to the cluster table is bounded the same way, or skipped when the
-probe went unanswered, so the publications keep coming while the database is
-gone.
+heartbeat to the cluster table runs as a task of its own, one at a time, so
+the publications keep coming while the database is gone and a slow heartbeat
+still lands.
 
 ## Admission
 
