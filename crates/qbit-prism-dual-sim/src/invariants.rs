@@ -36,8 +36,9 @@
 //!    every checked database, except shares a scenario excuses as a dead
 //!    node's documented tail (reported with the reason).
 //!    `inv4-no-double-credit`: one ledger row per share id and per header in
-//!    each database, every row mapped to its header, and a header present in
-//!    both databases has the same row in both. `inv4-windows-unchanged`: every
+//!    each database, every row mapped to its own header, and a header present
+//!    in both databases has the same row in both, in every column.
+//!    `inv4-windows-unchanged`: every
 //!    window a landing recorded still has exactly its shares, with no newer
 //!    eligible share. `inv4-windows-reproducible`: each recorded window,
 //!    recomputed from every database, gives the recorded digest.
@@ -1056,9 +1057,31 @@ async fn acked_shares_present(
     )))
 }
 
+/// The columns two renderings of one row disagree on, each with both
+/// values: node A's first.
+fn differing_columns(a: &Value, b: &Value) -> Vec<String> {
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return vec![format!("node A {a}, node B {b}")];
+    };
+    let mut columns: Vec<&String> = a.keys().chain(b.keys()).collect();
+    columns.sort();
+    columns.dedup();
+    columns
+        .into_iter()
+        .filter(|column| a.get(*column) != b.get(*column))
+        .map(|column| {
+            format!(
+                "{column}: node A {}, node B {}",
+                a.get(column).unwrap_or(&Value::Null),
+                b.get(column).unwrap_or(&Value::Null)
+            )
+        })
+        .collect()
+}
+
 async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     let mut check = CheckBuilder::new("inv4-no-double-credit");
-    let mut rows_by_node: BTreeMap<Node, BTreeMap<String, String>> = BTreeMap::new();
+    let mut rows_by_node: BTreeMap<Node, BTreeMap<String, Value>> = BTreeMap::new();
     for (node, pool) in pools {
         let problems: Vec<(String, String)> = sqlx::query_as(
             "SELECT 'duplicate share id', share_id FROM qbit_share_ledger GROUP BY share_id HAVING count(*) > 1 \
@@ -1075,6 +1098,10 @@ async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
              SELECT 'header without its ledger row', h.header_hash FROM qbit_prism_share_hashes h \
               WHERE NOT EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_id = h.share_id AND l.accepted) \
              UNION ALL \
+             SELECT 'header mapped to another share', h.header_hash || ' -> ' || h.share_id \
+              FROM qbit_prism_share_hashes h \
+              WHERE h.share_id ~ '[0-9A-Fa-f]{64}$' AND h.header_hash <> lower(right(h.share_id, 64)) \
+             UNION ALL \
              SELECT 'job issued after acceptance', share_seq::text FROM qbit_share_ledger \
               WHERE accepted AND job_issued_at > accepted_at",
         )
@@ -1083,20 +1110,23 @@ async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
         for (kind, key) in problems {
             check.problem(format!("node {node:?}: {kind}: {key}"));
         }
-        // What a header's row says, for the cross-node comparison: every
-        // copied row must keep the origin's identity and content, its
-        // provenance (`origin_node`, which owns the sequence) included.
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT lower(right(share_id, 64)), \
-                    concat_ws('|', origin_node, share_id, share_seq, miner_id, \
-                              encode(p2mr_program, 'hex'), \
-                              share_difficulty, network_difficulty, job_id, \
-                              floor(extract(epoch FROM job_issued_at) * 1000)::bigint, \
-                              floor(extract(epoch FROM accepted_at) * 1000)::bigint, ntime) \
-             FROM qbit_share_ledger WHERE accepted AND share_id ~ '[0-9A-Fa-f]{64}$'",
+        // Every column of a header's row, for the cross-node comparison. The
+        // ledger is append-only and copied whole (D1's table inventory copies
+        // `qbit_share_ledger` with no column left out), so a copy must equal
+        // its origin in every column: provenance (`origin_node`), payout order
+        // and credit policy included. Timestamps are read in UTC, so both
+        // databases render them alike whatever their own time zone.
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+            .execute(&mut *tx)
+            .await?;
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT lower(right(share_id, 64)), to_jsonb(l) \
+             FROM qbit_share_ledger l WHERE accepted AND share_id ~ '[0-9A-Fa-f]{64}$'",
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows_by_node.insert(*node, rows.into_iter().collect());
     }
     let mut shared = 0;
@@ -1106,7 +1136,8 @@ async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
                 shared += 1;
                 if other != row {
                     check.problem(format!(
-                        "header {header} has different rows: node A {row}, node B {other}"
+                        "header {header} has different rows on the two nodes: {}",
+                        differing_columns(row, other).join("; ")
                     ));
                 }
             }
@@ -1557,6 +1588,17 @@ pub fn write(report: &InvariantReport, dir: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn differing_columns_names_each_disagreement_with_both_values() {
+        let a = serde_json::json!({"origin_node": 0, "share_seq": 7, "credit_policy": "full"});
+        let b = serde_json::json!({"origin_node": 1, "share_seq": 7, "credit_policy": "full"});
+        assert_eq!(
+            super::differing_columns(&a, &b),
+            vec!["origin_node: node A 0, node B 1".to_owned()]
+        );
+        assert!(super::differing_columns(&a, &a).is_empty());
+    }
+
     use super::*;
 
     #[test]
