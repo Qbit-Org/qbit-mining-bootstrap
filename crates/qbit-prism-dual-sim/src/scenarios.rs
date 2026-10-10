@@ -23,6 +23,7 @@ use crate::{
     sim::{Inputs, Sim, SimConfig, Topology},
 };
 use anyhow::{Context, Result};
+use qbit_prism_server::ledger::peer_sync::CarriedColumns;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -2640,19 +2641,48 @@ async fn ledger_digest(pool: &sqlx::PgPool) -> Result<serde_json::Value> {
             .fetch_one(pool)
             .await?;
     digest.insert("divergence".into(), divergence);
-    for (name, sql) in [
-        ("shares", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', share_seq, share_id, miner_id, share_difficulty, floor(extract(epoch FROM accepted_at) * 1000)), ',' ORDER BY share_seq)), '') FROM qbit_share_ledger"),
-        ("share_hashes", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(header_hash || share_id, ',' ORDER BY header_hash)), '') FROM qbit_prism_share_hashes"),
-        ("blocks", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', block_hash, block_height, coinbase_txid, payout_manifest_sha256, as_issued_audit_sha256), ',' ORDER BY block_hash)), '') FROM qbit_pool_blocks"),
-        ("audits", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(block_hash || audit_bundle_sha256, ',' ORDER BY block_hash)), '') FROM qbit_pool_audit_bundles"),
-        ("snapshots", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', snapshot_sha256, first_share_seq, last_share_seq, share_count), ',' ORDER BY snapshot_sha256)), '') FROM qbit_prism_audit_snapshots"),
-        ("payouts", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', block_hash, miner_id, encode(p2mr_program, 'hex'), onchain_amount_sats, carry_forward_balance_sats, action), ',' ORDER BY block_hash, miner_id, p2mr_program)), '') FROM qbit_pool_payout_entries"),
-        ("carry", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', block_hash, encode(p2mr_program, 'hex'), gross_amount_sats, prior_balance_sats, onchain_amount_sats, carry_forward_balance_sats), ',' ORDER BY block_hash, p2mr_program, miner_id)), '') FROM qbit_payout_carry_forward"),
-        ("fanouts", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(fanout_txid || md5(fanout_tx_hex), ',' ORDER BY fanout_txid)), '') FROM qbit_ctv_fanout_artifacts"),
+    // Every row of every copied table whole: the columns the peer sync
+    // carries of it, as this database's catalog has them (D1's
+    // `CarriedColumns`), and a snapshot by its content-determined facts. Left
+    // out are only each node's own columns (chain and maturity states,
+    // claims, schedules), which the cutover's restarts may move on.
+    // Timestamps are read in UTC.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let carried = CarriedColumns::read(&mut tx).await?;
+    for (name, table) in [
+        ("shares", "qbit_share_ledger"),
+        ("share_hashes", "qbit_prism_share_hashes"),
+        ("blocks", "qbit_pool_blocks"),
+        ("audits", "qbit_pool_audit_bundles"),
+        ("snapshots", "qbit_prism_audit_snapshots"),
+        ("payouts", "qbit_pool_payout_entries"),
+        ("carry", "qbit_payout_carry_forward"),
+        ("fanout_sets", "qbit_ctv_fanout_sets"),
+        ("fanouts", "qbit_ctv_fanout_artifacts"),
     ] {
-        let value: String = sqlx::query_scalar(sql).fetch_one(pool).await?;
+        let columns: Vec<String> = if table == "qbit_prism_audit_snapshots" {
+            crate::invariants::SNAPSHOT_FACTS
+                .iter()
+                .map(|fact| (*fact).to_owned())
+                .collect()
+        } else {
+            carried.of(table).to_vec()
+        };
+        let value: String = sqlx::query_scalar(&format!(
+            "SELECT count(*)::text || ':' || coalesce(md5(string_agg(r::text, ',' ORDER BY r::text)), '') \
+             FROM (SELECT (SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(to_jsonb(t)) e \
+                           WHERE e.key = ANY($1)) AS r \
+                   FROM {table} t) x"
+        ))
+        .bind(&columns)
+        .fetch_one(&mut *tx)
+        .await?;
         digest.insert(name.into(), json!(value));
     }
+    tx.commit().await?;
     Ok(serde_json::Value::Object(digest))
 }
 
@@ -2732,7 +2762,8 @@ async fn expect_single_writer_refused(sim: &mut Sim, node: Node, body: &mut Body
 /// S9. The 3.0 pair (one writer, B its standby) mines a history with carry
 /// and blocks on both frontends, then is cut over to dual mode as the
 /// playbook does it. Both nodes' ledgers then equal the 3.0 writer's (every
-/// balance, report, landing and share), every pre-cutover row is node 0, a
+/// balance and report, and every landing and share row in every column the
+/// peer sync carries), every pre-cutover row is node 0, a
 /// single-writer start on either database is refused (D-12), the owner's
 /// first block pays from the 3.0 balances, and the pair mines in dual mode
 /// with every invariant holding across the cutover.

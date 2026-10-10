@@ -844,7 +844,7 @@ pub fn landing_whole(block_hash: &str) -> String {
 /// The content-determined columns of an audit snapshot (D-15, D1's
 /// `SNAPSHOT_FACTS`): windows with one share array share one row, and its
 /// anchor, cut, origin and creation time are whichever node wrote it first.
-const SNAPSHOT_FACTS: &[&str] = &[
+pub const SNAPSHOT_FACTS: &[&str] = &[
     "snapshot_sha256",
     "first_share_seq",
     "last_share_seq",
@@ -1607,6 +1607,12 @@ async fn candidates_settled(
 ///   (disjoint extranonce ranges), so a block in both outboxes is a copy,
 ///   unless the second row was made on its own, as S8's adoption may.
 ///   Copying the outbox or its deferred shares would credit twice.
+/// - **Deferred shares.** A candidate's deferred solving share is its
+///   node's to credit (D1's table inventory clears the peer's on
+///   re-personalise), and its foreign key ties it to a candidate in the
+///   same node's outbox. So no deferred share since the epoch is on both
+///   nodes: a copy of one is caught here even when the copied candidate
+///   carries no claim and fresh timestamps.
 /// - **Offer decisions.** Only the offering frontend records one, in its own
 ///   database (`ledger/divergence.rs`). So a divergence row with a decision
 ///   is copied when its node never had the block as a candidate, or when
@@ -1636,6 +1642,9 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
     // the epoch, and (block, offer_decided_at) of each offer decision.
     let mut outboxes: BTreeMap<Node, BTreeSet<(String, i64)>> = BTreeMap::new();
     let mut decisions: BTreeMap<Node, BTreeSet<(String, i64)>> = BTreeMap::new();
+    // Per node: (block, share digest) of each deferred share whose candidate
+    // is from the epoch on.
+    let mut deferred: BTreeMap<Node, BTreeSet<(String, String)>> = BTreeMap::new();
     for (node, pool) in pools {
         let peer = node.peer();
         let rows: Vec<(String, i64)> = sqlx::query_as(
@@ -1683,6 +1692,15 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
         .fetch_all(pool)
         .await?;
         decisions.insert(*node, rows.into_iter().collect());
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT d.block_hash, d.share_sha256 FROM qbit_prism_deferred_shares d \
+             JOIN qbit_block_candidate_outbox o ON o.block_hash = d.block_hash \
+             WHERE o.created_at >= $1",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        deferred.insert(*node, rows.into_iter().collect());
         let orphaned: Vec<(String, String)> = sqlx::query_as(
             "SELECT d.block_hash, d.offer_decision FROM qbit_prism_payout_divergences d \
              WHERE d.offer_decision IS NOT NULL AND d.offer_decided_at >= $1 \
@@ -1723,6 +1741,14 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             ));
         }
     }
+    if let (Some(a), Some(b)) = (deferred.get(&Node::A), deferred.get(&Node::B)) {
+        for (hash, share) in a.intersection(b) {
+            check.problem(format!(
+                "the deferred solving share {share} of block {hash} is on both nodes, so both \
+                 could credit it: {copied}"
+            ));
+        }
+    }
     check.data("since", json!(since));
     check.data(
         "candidates_since",
@@ -1731,8 +1757,16 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             .map(|(node, rows)| (node.label(), rows.len()))
             .collect::<BTreeMap<_, _>>()),
     );
+    check.data(
+        "deferred_shares_since",
+        json!(deferred
+            .iter()
+            .map(|(node, rows)| (node.label(), rows.len()))
+            .collect::<BTreeMap<_, _>>()),
+    );
     Ok(check.finish(format!(
-        "candidates, offer decisions and identities since {since} are each node's own"
+        "candidates, deferred shares, offer decisions and identities since {since} are each \
+         node's own"
     )))
 }
 
