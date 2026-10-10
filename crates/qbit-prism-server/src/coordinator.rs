@@ -3366,18 +3366,6 @@ impl Coordinator {
         self.health_report().await.0
     }
 
-    /// 3.1: read the peer sync's status from the engine's channel for
-    /// dual-writer readiness. Until one is attached a dual-writer frontend reads its own
-    /// log as not caught up, so it does not serve; a single writer ignores it.
-    pub fn attach_peer_sync(
-        &self,
-        status: tokio::sync::watch::Receiver<crate::peer_sync::PeerSyncStatus>,
-    ) {
-        if let Some(dual) = &self.dual_writer {
-            dual.attach_peer_sync(status);
-        }
-    }
-
     /// `health`, and in dual-writer mode (3.1) the report it was read with,
     /// for admission and the metrics. A dual-writer frontend is ready only
     /// while its own log is caught up and its writer is local; a single
@@ -3414,7 +3402,7 @@ impl Coordinator {
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
         let dual = match &self.dual_writer {
-            Some(dual) => Some(dual.report(&self.ledger.pool).await),
+            Some(dual) => Some(dual.report(&self.ledger.pool, self.peer_sync.get()).await),
             None => None,
         };
         let ready = ready

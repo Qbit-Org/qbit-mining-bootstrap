@@ -281,7 +281,7 @@ async fn a_dual_writer_frontend_that_is_not_ready_refuses_stratum_and_answers_no
                 ),
                 ("qbit_prism_admission_admitting", 0.),
                 ("qbit_prism_admission_state{state=\"starting\"}", 1.),
-                ("qbit_prism_dual_writer_own_log_caught_up", 0.),
+                ("qbit_prism_peer_sync_own_log_caught_up", 0.),
                 ("qbit_prism_dual_writer_writer_path{path=\"local\"}", 1.),
                 ("qbit_prism_dual_writer_node_index", 1.),
                 ("qbit_prism_dual_writer_carry_owner", 0.),

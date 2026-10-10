@@ -122,11 +122,11 @@ impl DualWriterReport {
     }
 }
 
-/// A dual-writer frontend's readiness inputs.
+/// A dual-writer frontend's readiness inputs, besides the peer sync's status
+/// (`Coordinator::peer_sync`, attached where the sync starts).
 #[derive(Debug)]
 pub struct DualWriterReadiness {
     identity: NodeIdentity,
-    peer_sync: std::sync::RwLock<Option<watch::Receiver<PeerSyncStatus>>>,
     writer: tokio::sync::Mutex<WriterProbe>,
 }
 
@@ -134,32 +134,18 @@ impl DualWriterReadiness {
     pub fn new(identity: NodeIdentity) -> Self {
         Self {
             identity,
-            peer_sync: std::sync::RwLock::new(None),
             writer: tokio::sync::Mutex::new(WriterProbe::default()),
         }
     }
 
-    /// Read the peer sync's status from `status`, the engine's channel,
-    /// from now on. Until a sync is attached the own log reads as not caught
-    /// up, so the node does not serve.
-    pub fn attach_peer_sync(&self, status: watch::Receiver<PeerSyncStatus>) {
-        *self
-            .peer_sync
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status);
-    }
-
-    fn peer_sync_status(&self) -> PeerSyncStatus {
-        self.peer_sync
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(|status| status.borrow().clone())
-            .unwrap_or_default()
-    }
-
     /// Probe the writer if the last probe is not recent, then report.
-    pub async fn report(&self, pool: &PgPool) -> DualWriterReport {
+    /// `peer_sync` is the sync's status channel; until it is attached the own
+    /// log reads as not caught up, so the node does not serve.
+    pub async fn report(
+        &self,
+        pool: &PgPool,
+        peer_sync: Option<&watch::Receiver<PeerSyncStatus>>,
+    ) -> DualWriterReport {
         let writer = {
             let mut probe = self.writer.lock().await;
             if probe.due(Instant::now()) {
@@ -168,7 +154,10 @@ impl DualWriterReadiness {
             }
             *probe
         };
-        self.assemble(writer, self.peer_sync_status(), Instant::now())
+        let peer = peer_sync
+            .map(|status| status.borrow().clone())
+            .unwrap_or_default();
+        self.assemble(writer, peer, Instant::now())
     }
 
     fn assemble(
@@ -358,17 +347,6 @@ mod tests {
                 "writer_path": "local",
             })
         );
-    }
-
-    #[test]
-    fn an_attached_sync_supplies_the_latch() {
-        let readiness = DualWriterReadiness::new(IDENTITY);
-        assert_eq!(readiness.peer_sync_status(), PeerSyncStatus::default());
-        let (publisher, status) = crate::peer_sync::PeerSyncPublisher::new();
-        readiness.attach_peer_sync(status);
-        assert!(!readiness.peer_sync_status().own_log_caught_up);
-        publisher.update(|status| status.own_log_caught_up = true);
-        assert!(readiness.peer_sync_status().own_log_caught_up);
     }
 
     #[test]

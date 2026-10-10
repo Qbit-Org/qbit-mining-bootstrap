@@ -401,7 +401,6 @@ pub fn expected(populated: bool) -> Census {
         ("admission_state", "gauge"),
         ("admission_withdrawals_total", "counter"),
         ("stratum_listener_accepting", "gauge"),
-        ("dual_writer_own_log_caught_up", "gauge"),
         ("dual_writer_writer_path", "gauge"),
         ("dual_writer_node_index", "gauge"),
         ("dual_writer_carry_owner", "gauge"),

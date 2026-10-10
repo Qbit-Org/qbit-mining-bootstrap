@@ -152,7 +152,7 @@ async fn latch_and_identity(database: &FixtureDatabase, ledger: &Ledger) -> Resu
 
     // The latch alone is not enough while the database is unidentified.
     let (sync, status) = PeerSyncPublisher::new();
-    frontend.attach_peer_sync(status);
+    frontend.peer_sync.set(status).expect("attached once");
     sync.update(|status| {
         status.peer_reachable = true;
         status.own_log_caught_up = true;
@@ -241,7 +241,7 @@ async fn a_database_personalised_as_the_peer_keeps_the_frontend_out() -> Result<
         )
         .await?;
         let (sync, status) = PeerSyncPublisher::new();
-        frontend.attach_peer_sync(status);
+        frontend.peer_sync.set(status).expect("attached once");
         sync.update(|status| status.own_log_caught_up = true);
         let health = frontend.health().await;
         ensure!(health["ok"] == false, "{health}");
@@ -279,7 +279,7 @@ async fn a_single_writer_health_carries_no_dual_writer_state() -> Result<()> {
         let frontend = frontend(&database, &node, "d4-single", None).await?;
         // A latch reported to a single writer changes nothing.
         let (_sync, status) = PeerSyncPublisher::new();
-        frontend.attach_peer_sync(status);
+        frontend.peer_sync.set(status).expect("attached once");
         let health = frontend.health().await;
         ensure!(health["ok"] == true && health["status"] == "ok", "{health}");
         ensure!(health.get("dual_writer").is_none(), "{health}");

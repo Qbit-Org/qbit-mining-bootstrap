@@ -412,9 +412,6 @@
       },
       "status": "Dual-writer mode only (3.1, D4): the listeners bind at startup without listening and listen only while the frontend admits, so a starting, restored or withdrawn node refuses connections (RST) instead of accepting TCP it cannot serve. `default` is the `PRISM_STRATUM_PORT` listener and `highdiff` the `PRISM_STRATUM_HIGHDIFF_PORT` one."
     },
-    "dual_writer_own_log_caught_up": {
-      "status": "Read from the peer sync's status at each health publication (3.1). The latch is false at start and after a detected local rollback, until the node holds every own-origin row the peer holds, then stays true for the life of the process, whatever happens to the link to the peer (CONTRACT.md decision D-8)."
-    },
     "dual_writer_writer_path": {
       "labels": {
         "path": "WriterPathLabel"

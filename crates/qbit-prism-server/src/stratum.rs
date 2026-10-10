@@ -2212,9 +2212,10 @@ pub async fn run_gated_listener<B: MiningBackend>(
         if *shutdown.borrow() {
             break;
         }
-        let admits = admission
-            .borrow_and_update()
-            .admits_at(tokio::time::Instant::now(), stale_after);
+        let admits = decisions
+            && admission
+                .borrow_and_update()
+                .admits_at(tokio::time::Instant::now(), stale_after);
         if !admits {
             tokio::select! {
                 changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }

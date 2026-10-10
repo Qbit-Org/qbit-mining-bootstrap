@@ -66,13 +66,13 @@ impl Metrics {
         );
     }
 
-    /// Dual-writer mode: the configured identity, the own-log latch, and the
-    /// writer path as last probed (`None` before the first probe).
+    /// Dual-writer mode: the configured identity and the writer path as last
+    /// probed (`None` before the first probe). The own-log latch is the peer
+    /// sync's `qbit_prism_peer_sync_own_log_caught_up`.
     pub fn publish_dual_writer(
         &self,
         node_index: i16,
         carry_owner: bool,
-        own_log_caught_up: bool,
         writer_path: Option<WriterPathLabel>,
     ) {
         let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -85,11 +85,6 @@ impl Metrics {
             Family::DualWriterCarryOwner,
             Labels::Empty,
             f64::from(carry_owner),
-        );
-        registry.set(
-            Family::DualWriterOwnLogCaughtUp,
-            Labels::Empty,
-            f64::from(own_log_caught_up),
         );
         for path in WriterPathLabel::ALL {
             registry.set(
@@ -197,16 +192,15 @@ mod tests {
     }
 
     #[test]
-    fn dual_writer_series_report_identity_latch_and_one_writer_path() {
+    fn dual_writer_series_report_identity_and_one_writer_path() {
         let metrics = Metrics::default();
-        metrics.publish_dual_writer(1, false, true, Some(WriterPathLabel::Local));
+        metrics.publish_dual_writer(1, false, Some(WriterPathLabel::Local));
         metrics.publish_stratum_listener_accepting("highdiff", true);
         metrics.publish_stratum_listener_accepting("default", false);
         let body = metrics.render();
         for expected in [
             "qbit_prism_dual_writer_node_index 1",
             "qbit_prism_dual_writer_carry_owner 0",
-            "qbit_prism_dual_writer_own_log_caught_up 1",
             "qbit_prism_dual_writer_writer_path{path=\"local\"} 1",
             "qbit_prism_dual_writer_writer_path{path=\"remote\"} 0",
             "qbit_prism_stratum_listener_accepting{listener=\"highdiff\"} 1",
@@ -217,7 +211,7 @@ mod tests {
                 "missing {expected}"
             );
         }
-        metrics.publish_dual_writer(1, false, true, None);
+        metrics.publish_dual_writer(1, false, None);
         assert_eq!(
             samples(&metrics.render(), "qbit_prism_dual_writer_writer_path")
                 .iter()

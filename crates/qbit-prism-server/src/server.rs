@@ -659,7 +659,6 @@ impl AdmissionPublisher {
             registry.publish_dual_writer(
                 dual.identity.node.index(),
                 dual.identity.carry_owner,
-                dual.own_log_caught_up,
                 dual.writer_path.map(WriterPath::label),
             );
         }
