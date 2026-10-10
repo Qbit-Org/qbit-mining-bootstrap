@@ -2396,14 +2396,16 @@ fn apply_ctv_fanout_fee_accounting(
     let mut recipients_by_key = BTreeMap::new();
     for chunk in &settlement_mode_decision.fanout_chunks {
         let fanout_fee_sats = estimate_ctv_fanout_fee_sats(chunk.recipients.len(), fee_policy)?;
-        let fee_decision = apply_proportional_fanout_fee(
+        let fee_decision = apply_floor_capped_fanout_fee(
             &chunk.recipients,
             fanout_fee_sats,
             policy_manifest.min_output_sats,
         )?;
+        // The capped split refuses rather than carry a recipient; a carried one
+        // must never leave its fanout silently.
         if !fee_decision.carry_forward_recipients.is_empty() {
             return Err(PrismError::SettlementModeSelection {
-                reason: "fanout fee would push a recipient below the payout floor".to_string(),
+                reason: settlement::FANOUT_FEE_BELOW_FLOOR.to_string(),
             });
         }
         for recipient in fee_decision.payable_recipients {
@@ -5708,6 +5710,9 @@ mod tests {
             max_fanout_recipients_per_transaction: 10,
             reserved_coinbase_outputs: 0,
         };
+        // The pool fee's 20,000 sats are alone in their chunk and cannot pay
+        // its 134,000-sat fee at any split: capping a share at the slack above
+        // the floor (here 5,280 sats) cannot cover it, so the build refuses.
         let fee_policy = FanoutFeeRatePolicy::new(1_000_000, 10_000);
         let mut payout_policy = PayoutPolicy::day_one_default();
         payout_policy.pool_fee_policy = Some(PoolFeePolicy {
@@ -5756,6 +5761,9 @@ mod tests {
             max_fanout_recipients_per_transaction: 10,
             reserved_coinbase_outputs: 0,
         };
+        // miner-b's 40,000 sats are alone in the fanout and its 134,000-sat fee
+        // exceeds them, so even a share capped at the 25,280-sat slack above
+        // the floor cannot pay it and the build still refuses.
         let fee_policy = FanoutFeeRatePolicy::new(1_000_000, 10_000);
 
         let err = build_audit_bundle_with_ctv_settlement_options(
