@@ -1126,13 +1126,17 @@ impl Ledger {
             // node's sweep has passed and never reads again: folded here, in
             // this transaction, under the sweep's progress row. A sweep
             // running now holds that row, so this waits for it, one sweep
-            // statement at most.
+            // statement at most. Before the first sweep there is no row: the
+            // table is locked against that sweep until this pull commits, and
+            // the fold runs again against any sweep that committed first.
             if !inserted.is_empty() {
-                let folded: i64 = sqlx::query_scalar(crate::rollups::LATE_PEER_SHARES)
-                    .bind(&batch.rows)
-                    .bind(&inserted)
-                    .fetch_one(&mut *tx)
-                    .await?;
+                let (mut folded, held) = fold_late_peer_shares(&mut tx, batch, &inserted).await?;
+                if !held {
+                    sqlx::query(crate::rollups::PROGRESS_TABLE_LOCK)
+                        .execute(&mut *tx)
+                        .await?;
+                    (folded, _) = fold_late_peer_shares(&mut tx, batch, &inserted).await?;
+                }
                 if folded > 0 {
                     tracing::debug!(folded, "peer shares below the rollup watermark folded");
                 }
@@ -1677,6 +1681,20 @@ fn acceptable_highest(rows: &Value, ceiling: i64) -> Result<Option<i64>> {
         }
     }
     Ok(highest)
+}
+
+/// Run [`crate::rollups::LATE_PEER_SHARES`] for the `inserted` rows of
+/// `batch`: the shares folded, and whether a progress row was there.
+async fn fold_late_peer_shares(
+    tx: &mut Transaction<'_, Postgres>,
+    batch: &ShareBatch,
+    inserted: &[String],
+) -> Result<(i64, bool)> {
+    Ok(sqlx::query_as(crate::rollups::LATE_PEER_SHARES)
+        .bind(&batch.rows)
+        .bind(inserted)
+        .fetch_one(&mut **tx)
+        .await?)
 }
 
 /// `a,b` with each name prefixed: `l.a,l.b`.

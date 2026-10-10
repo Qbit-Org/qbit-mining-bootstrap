@@ -249,6 +249,7 @@ qbit-prism-server::dual_writer_sync::a_frontend_whose_identity_changes_while_it_
 qbit-prism-server::dual_writer_sync::a_late_peer_share_below_the_local_max_is_still_rolled_up
 qbit-prism-server::dual_writer_sync::a_partition_the_peer_mark_has_not_passed_never_leaves
 qbit-prism-server::dual_writer_sync::a_peer_that_answers_but_cannot_be_read_leaves_the_latch_to_the_evidence
+qbit-prism-server::dual_writer_sync::a_pull_that_found_no_progress_row_folds_against_the_first_sweep
 qbit-prism-server::dual_writer_sync::a_restored_node_recovers_its_own_log_from_the_peer
 qbit-prism-server::dual_writer_sync::a_stalled_puller_never_holds_the_sync_barrier
 qbit-prism-server::dual_writer_sync::conflicts_are_recorded_and_never_written_over
@@ -259,6 +260,7 @@ qbit-prism-server::dual_writer_sync::recovery_finds_an_own_block_held_with_other
 qbit-prism-server::dual_writer_sync::recovery_leaves_own_prepared_jobs_pruned_at_expiry
 qbit-prism-server::dual_writer_sync::recovery_refuses_an_own_row_beyond_the_peers_cursor
 qbit-prism-server::dual_writer_sync::steady_sync_copies_each_nodes_rows_to_the_other
+qbit-prism-server::dual_writer_sync::the_first_sweep_waits_for_a_pull_that_found_no_progress_row
 qbit-prism-server::dual_writer_sync::the_offer_wait_reads_the_peers_cursors
 qbit-prism-server::dual_writer_sync::the_origin_share_reads_never_walk_the_other_nodes_rows
 qbit-prism-server::dual_writer_sync::the_own_log_latch_without_and_with_the_peer

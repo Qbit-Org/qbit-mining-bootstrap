@@ -2212,3 +2212,77 @@ async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
     })
     .await
 }
+
+/// Before the first sweep there is no rollup progress row to lock. A pull
+/// that finds none locks the table until it commits, and the sweep on a
+/// dual-writer database creates the row first, so the first sweep waits for
+/// a pull still open with a late peer share and then counts it.
+#[tokio::test]
+async fn the_first_sweep_waits_for_a_pull_that_found_no_progress_row() -> Result<()> {
+    use qbit_prism_server::rollups::advance_dual_writer;
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let own = append(&pair.b, &["first-b1", "first-b2"]).await?;
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_hashrate_rollup_progress").await? == 0);
+        // A pull, still open: it found no progress row and locked the table,
+        // as a pull does, and inserted a share of A's below B's newest.
+        let late = own[0] + 1;
+        ensure!(late < own[1] && late % 2 == 0, "{own:?}");
+        let mut pull = pair.b.pool.begin().await?;
+        sqlx::query("LOCK TABLE qbit_hashrate_rollup_progress IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *pull).await?;
+        sqlx::query("INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch,origin_node) VALUES($1,$2,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(0.001),1,clock_timestamp(),'node-a',0,0)")
+            .bind(late).bind(format!("worker:{}", hex("first late"))).execute(&mut *pull).await?;
+        let sweep = tokio::spawn({
+            let pool = pair.b.pool.clone();
+            async move { advance_dual_writer(&pool, 1000).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ensure!(!sweep.is_finished(), "the first sweep did not wait for the open pull");
+        pull.commit().await?;
+        sweep.await??;
+        let counted = rolled_up(&pair.b.pool).await?;
+        ensure!(counted == 3, "the first sweep counted {counted} of 3 shares");
+        Ok(())
+    })
+    .await
+}
+
+/// The other order: the first sweep has created the progress row and
+/// advanced it past a share of the peer's it could not see, and is still
+/// open, when the pull inserting that share finds no row. The pull waits for
+/// that sweep, folds the share against its watermark, and never writes the
+/// row itself.
+#[tokio::test]
+async fn a_pull_that_found_no_progress_row_folds_against_the_first_sweep() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let theirs = append(&pair.a, &["sweep-race-a"]).await?;
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_hashrate_rollup_progress").await? == 0);
+        // The first sweep on B, still open, has passed A's share.
+        let mut sweep = pair.b.pool.begin().await?;
+        sqlx::query("INSERT INTO qbit_hashrate_rollup_progress (singleton, last_share_seq) VALUES (true, $1)")
+            .bind(theirs[0] + 100)
+            .execute(&mut *sweep)
+            .await?;
+        let pull = tokio::spawn({
+            let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+            async move { on_b.pass().await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        ensure!(!pull.is_finished(), "the pull did not wait for the open first sweep");
+        sweep.commit().await?;
+        let report = pull.await??;
+        ensure!(report.own_log_caught_up, "{report:?}");
+        ensure!(shares_of(&pair.b.pool, 0).await?.len() == 1);
+        let counted = rolled_up(&pair.b.pool).await?;
+        ensure!(counted == 1, "the pull folded {counted} of A's 1 share");
+        ensure!(rollup_watermark(&pair.b.pool).await? == theirs[0] + 100);
+        Ok(())
+    })
+    .await
+}

@@ -17,6 +17,20 @@ const SWEEP: &str = include_str!("rollups.sql");
 /// transaction that inserted it, never neither.
 pub(crate) const PROGRESS_LOCK: &str =
     "SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton FOR UPDATE";
+/// Before the first sweep there is no progress row to lock. The sweep on a
+/// dual-writer database creates it first, at 0, as a sweep reads a missing
+/// row (and as its own statement would create it): a pull that found no row
+/// holds [`PROGRESS_TABLE_LOCK`] until it commits, and this waits for it.
+pub(crate) const SEED_PROGRESS: &str =
+    "INSERT INTO qbit_hashrate_rollup_progress (singleton, last_share_seq) \
+     VALUES (true, 0) ON CONFLICT (singleton) DO NOTHING";
+/// What a pull takes when [`LATE_PEER_SHARES`] found no progress row: no
+/// sweep has created it yet, and none can until this pull commits, so the
+/// first sweep's snapshot includes the shares it inserted. A sweep that
+/// created the row meanwhile is waited for, and the fold runs again. A pull
+/// never writes the row: a missing one still means no sweep has run.
+pub(crate) const PROGRESS_TABLE_LOCK: &str =
+    "LOCK TABLE qbit_hashrate_rollup_progress IN SHARE ROW EXCLUSIVE MODE";
 
 /// Fold the peer shares a pull inserts at or below the sweep's watermark,
 /// which the sweep has passed and never reads again, into the rollup
@@ -25,7 +39,7 @@ pub(crate) const PROGRESS_LOCK: &str =
 /// `miner_rollup`. Peer shares arrive below shares this node already holds,
 /// so the watermark can be past them; a share above it is the sweep's. `$1`
 /// is the pulled rows as JSON, `$2` the share IDs inserted. Returns the
-/// shares folded.
+/// shares folded, and whether there was a progress row to fold against.
 pub(crate) const LATE_PEER_SHARES: &str = "WITH progress AS (SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton FOR UPDATE),\
  batch AS (SELECT i.accepted_at,i.miner_id,i.share_difficulty FROM jsonb_populate_recordset(NULL::qbit_share_ledger,$1) i \
    WHERE i.share_id=ANY($2) AND i.accepted AND i.share_seq<=(SELECT last_share_seq FROM progress)),\
@@ -40,7 +54,8 @@ pub(crate) const LATE_PEER_SHARES: &str = "WITH progress AS (SELECT last_share_s
    batch.miner_id,count(*),sum(batch.share_difficulty) FROM batch, grains GROUP BY grains.grain_seconds, bucket_epoch, batch.miner_id \
    ON CONFLICT (grain_seconds, bucket_epoch, miner_id) DO UPDATE SET accepted_share_count = qbit_hashrate_rollup_miner.accepted_share_count + EXCLUDED.accepted_share_count,\
    accepted_share_difficulty = qbit_hashrate_rollup_miner.accepted_share_difficulty + EXCLUDED.accepted_share_difficulty RETURNING 1) \
- SELECT (SELECT count(*) FROM batch)+0*(SELECT count(*) FROM pool_rollup)+0*(SELECT count(*) FROM miner_rollup)";
+ SELECT (SELECT count(*) FROM batch)+0*(SELECT count(*) FROM pool_rollup)+0*(SELECT count(*) FROM miner_rollup),\
+ EXISTS (SELECT 1 FROM progress)";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Progress {
@@ -130,6 +145,9 @@ async fn advance_with_metrics(
         .execute(&mut *transaction)
         .await?;
     if dual_writer {
+        sqlx::query(SEED_PROGRESS)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(PROGRESS_LOCK)
             .execute(&mut *transaction)
             .await?;

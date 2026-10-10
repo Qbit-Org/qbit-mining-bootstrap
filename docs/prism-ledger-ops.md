@@ -3945,7 +3945,10 @@ holds. The rollup sweep runs as on a single writer, and a peer share that
 lands below its watermark is folded into the rollups by the pull that
 inserts it, in the same transaction; the two serialise on the rollup progress
 row, which every frontend on a personalised database takes before its sweep,
-`PRISM_DUAL_WRITER` on or not. So the rollups never wait for the peer. The
+`PRISM_DUAL_WRITER` on or not. Before the first sweep there is no row: that
+sweep creates it first, and a pull that finds none locks the table against
+it until the pull commits, so the two serialise from the start. A pull never
+writes the row, so a missing row still means no sweep has run. So the rollups never wait for the peer. The
 archive does: `share-archive
 plan` holds back every partition the safe peer mark has not passed (its
 `rollup_watermark` condition says so), since the peer's rows can still land
