@@ -7,6 +7,7 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 mod block_solvers;
 mod online;
@@ -3873,14 +3874,50 @@ impl Ledger {
         })?
     }
 
+    /// [`Ledger::import_legacy_audits_with`] with the default bounds, no stop
+    /// signal and no per-row report.
     pub async fn import_legacy_audits(
         &self,
         root_dir: Option<&Path>,
         ledger_key: &str,
     ) -> Result<usize> {
+        self.import_legacy_audits_with(
+            root_dir,
+            ledger_key,
+            &ImportAuditsOptions::default(),
+            |_| {},
+        )
+        .await
+    }
+
+    /// `qbit-prism-server import-audits`: verify every legacy audit body that
+    /// has no canonical bytes yet and store them, one row per transaction,
+    /// calling `report` after each row. Returns how many rows it stored.
+    ///
+    /// SETTLEMENT_LOCK covers only the commit (#765). A row is written first,
+    /// holding just its own row lock: every parameter is encoded off the
+    /// runtime before the transaction opens, then the UPDATE is sent and run.
+    /// Only then is SETTLEMENT_LOCK taken, the write guard checked under it,
+    /// and the transaction committed, so every other SETTLEMENT_LOCK holder
+    /// still sees a row either committed before it took the lock or not at
+    /// all. `options` bounds each phase with transaction-local timeouts; a row
+    /// that exceeds one is rolled back and the import fails, naming it, and a
+    /// re-run resumes from it.
+    pub async fn import_legacy_audits_with(
+        &self,
+        root_dir: Option<&Path>,
+        ledger_key: &str,
+        options: &ImportAuditsOptions,
+        mut report: impl FnMut(&ImportAuditRow),
+    ) -> Result<usize> {
+        let mut stop = options.stop.clone();
         let mut imported = 0;
         let mut cursor = String::new();
         loop {
+            if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+                return Err(ImportStopped { imported }.into());
+            }
+            let started = std::time::Instant::now();
             // Decode only one historical window at a time, even when importing
             // years of inline JSON and canonical sidecars.
             let row = sqlx::query("SELECT block_hash,body_uri,audit_bundle,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1 ORDER BY block_hash LIMIT 1")
@@ -3893,100 +3930,195 @@ impl Ledger {
             let expected_digest: String = row.try_get("audit_bundle_sha256")?;
             let coinbase: String = row.try_get("coinbase_tx_hex")?;
             let root = root_dir.map(Path::to_path_buf);
-            let source_uri = uri.clone();
+            let source_uri = uri;
             let source_hash = hash.clone();
-            let source_digest = expected_digest.clone();
+            let source_digest = expected_digest;
             let key = ledger_key.to_owned();
-            let (metadata, canonical_bytes) =
-                tokio::task::spawn_blocking(move || -> Result<(ImportedAudit, Vec<u8>)> {
-                    let sidecar = legacy_canonical_sidecar(
-                        root.as_deref(),
-                        source_uri.as_deref(),
-                        &source_hash,
-                        &source_digest,
-                    )?;
-                    let (bundle, exact) = if let Some(path) = sidecar {
-                        let mut exact = Vec::new();
-                        flate2::read::GzDecoder::new(std::fs::File::open(&path)?)
-                            .read_to_end(&mut exact)
-                            .with_context(|| {
-                                format!(
-                                    "canonical audit sidecar cannot decompress: {}",
-                                    path.display()
-                                )
-                            })?;
-                        ensure!(
-                            hex::encode(Sha256::digest(&exact)) == source_digest,
-                            "canonical audit sidecar digest mismatch: {}",
-                            path.display()
-                        );
-                        let bundle = qbit_prism::parse_audit_bundle_value(
-                            serde_json::from_slice(&exact)?,
-                            None,
-                        )?;
-                        (bundle, Some(exact))
-                    } else if let Some(inline) = inline {
-                        (
-                            qbit_prism::parse_audit_bundle_value(inline, root.as_deref())?,
-                            None,
-                        )
-                    } else {
-                        let uri = source_uri
-                            .as_deref()
-                            .context("legacy audit has neither body nor canonical sidecar")?;
-                        let path = resolve_import_path(root.as_deref(), uri)?;
-                        (qbit_prism::load_audit_bundle_from_path(&path)?, None)
-                    };
-                    let report = qbit_prism::verify_audit_bundle_against_coinbase_tx_hex(
-                        &bundle, &coinbase, &key,
-                    )?;
+            let prepared = tokio::task::spawn_blocking(move || -> Result<EncodedImport> {
+                let sidecar = legacy_canonical_sidecar(
+                    root.as_deref(),
+                    source_uri.as_deref(),
+                    &source_hash,
+                    &source_digest,
+                )?;
+                let (bundle, exact) = if let Some(path) = sidecar {
+                    let mut exact = Vec::new();
+                    flate2::read::GzDecoder::new(std::fs::File::open(&path)?)
+                        .read_to_end(&mut exact)
+                        .with_context(|| {
+                            format!(
+                                "canonical audit sidecar cannot decompress: {}",
+                                path.display()
+                            )
+                        })?;
                     ensure!(
-                        report.audit_bundle_sha256_hex == source_digest,
-                        "legacy audit digest mismatch for {source_hash}"
+                        hex::encode(Sha256::digest(&exact)) == source_digest,
+                        "canonical audit sidecar digest mismatch: {}",
+                        path.display()
                     );
-                    let canonical_bytes = match exact {
-                        Some(bytes) => bytes,
-                        None => qbit_prism::canonical_audit_bundle_bytes(&bundle)?,
-                    };
-                    ensure!(
-                        hex::encode(Sha256::digest(&canonical_bytes)) == source_digest,
-                        "legacy canonical audit bytes mismatch"
-                    );
-                    // The parsed window is dropped here, off the runtime
-                    // threads and before the write transaction opens.
-                    Ok((
-                        ImportedAudit {
-                            schema: bundle.schema,
-                            network_difficulty: bundle.found_block.network_difficulty.to_string(),
-                            coinbase_value_sats: i64::try_from(
-                                bundle.found_block.coinbase_value_sats,
-                            )?,
-                            audit_commitment_leaves_hex: serde_json::to_value(
-                                &bundle.audit_commitment_leaves_hex,
-                            )?,
-                            witness_merkle_leaves_hex: serde_json::to_value(
-                                &bundle.witness_merkle_leaves_hex,
-                            )?,
-                        },
-                        canonical_bytes,
-                    ))
-                })
-                .await??;
-            let mut tx = self.begin().await?;
-            self.lock(&mut tx, SETTLEMENT_LOCK).await?;
-            writable(&mut tx).await?;
-            // Store the exact canonical bytes and the non-share metadata only;
-            // readers decode the bytes. A two-copy inline JSONB body would cross
-            // PostgreSQL's container limit at production window sizes. Inline
-            // bodies already stored on rows without a body_uri are left as they
-            // are: the body-present CHECK needs one of the two.
-            let updated = sqlx::query("UPDATE qbit_pool_audit_bundles SET schema_version=$2,found_block_network_difficulty=$3::text::numeric,found_block_coinbase_value_sats=$4,audit_commitment_leaves_hex=$5,witness_merkle_leaves_hex=$6,canonical_audit_bytes=$9 WHERE block_hash=$1 AND canonical_audit_bytes IS NULL AND body_uri IS NOT DISTINCT FROM $7 AND audit_bundle_sha256=$8")
-                .bind(&hash).bind(&metadata.schema).bind(&metadata.network_difficulty).bind(metadata.coinbase_value_sats)
-                .bind(&metadata.audit_commitment_leaves_hex).bind(&metadata.witness_merkle_leaves_hex).bind(&uri).bind(expected_digest).bind(canonical_bytes).execute(&mut *tx).await?.rows_affected();
-            tx.commit().await?;
-            imported += usize::try_from(updated)?;
+                    let bundle = qbit_prism::parse_audit_bundle_value(
+                        serde_json::from_slice(&exact)?,
+                        None,
+                    )?;
+                    (bundle, Some(exact))
+                } else if let Some(inline) = inline {
+                    (
+                        qbit_prism::parse_audit_bundle_value(inline, root.as_deref())?,
+                        None,
+                    )
+                } else {
+                    let uri = source_uri
+                        .as_deref()
+                        .context("legacy audit has neither body nor canonical sidecar")?;
+                    let path = resolve_import_path(root.as_deref(), uri)?;
+                    (qbit_prism::load_audit_bundle_from_path(&path)?, None)
+                };
+                let report = qbit_prism::verify_audit_bundle_against_coinbase_tx_hex(
+                    &bundle, &coinbase, &key,
+                )?;
+                ensure!(
+                    report.audit_bundle_sha256_hex == source_digest,
+                    "legacy audit digest mismatch for {source_hash}"
+                );
+                let canonical_bytes = match exact {
+                    Some(bytes) => bytes,
+                    None => qbit_prism::canonical_audit_bundle_bytes(&bundle)?,
+                };
+                ensure!(
+                    hex::encode(Sha256::digest(&canonical_bytes)) == source_digest,
+                    "legacy canonical audit bytes mismatch"
+                );
+                let metadata = ImportedAudit {
+                    schema: bundle.schema.clone(),
+                    network_difficulty: bundle.found_block.network_difficulty.to_string(),
+                    coinbase_value_sats: i64::try_from(bundle.found_block.coinbase_value_sats)?,
+                    audit_commitment_leaves_hex: serde_json::to_string(
+                        &bundle.audit_commitment_leaves_hex,
+                    )?,
+                    witness_merkle_leaves_hex: serde_json::to_string(
+                        &bundle.witness_merkle_leaves_hex,
+                    )?,
+                };
+                // The parsed window is dropped here, and every parameter
+                // is encoded, off the runtime threads and before the
+                // write transaction opens.
+                drop(bundle);
+                metadata.encode(source_hash, source_uri, source_digest, canonical_bytes)
+            });
+            let Some(prepared) = until_stopped(&mut stop, prepared).await else {
+                return Err(ImportStopped { imported }.into());
+            };
+            let encoded = prepared?.with_context(|| format!("importing legacy audit {hash}"))?;
+            let Some(row) = self
+                .write_legacy_audit(&hash, encoded, options, &mut stop, started)
+                .await
+                .with_context(|| format!("importing legacy audit {hash}"))?
+            else {
+                return Err(ImportStopped { imported }.into());
+            };
+            report(&row);
+            imported += usize::from(row.imported);
         }
         Ok(imported)
+    }
+
+    /// One legacy audit's transaction (#765): write the row before
+    /// SETTLEMENT_LOCK, then take the lock only to check the write guard and
+    /// commit. `None` when `stop` abandoned the row before the lock was
+    /// granted, which rolls it back.
+    async fn write_legacy_audit(
+        &self,
+        hash: &str,
+        encoded: EncodedImport,
+        options: &ImportAuditsOptions,
+        stop: &mut Option<tokio::sync::watch::Receiver<bool>>,
+        started: std::time::Instant,
+    ) -> Result<Option<ImportAuditRow>> {
+        use sqlx::Connection as _;
+        let prepare = started.elapsed();
+        let EncodedImport {
+            arguments,
+            parameter_bytes,
+        } = encoded;
+        // A connection of its own, never returned to the pool. Abandoning the
+        // row (a stop, a timeout, an error) drops it, which closes the socket,
+        // and the server rolls the transaction back at once. A pooled
+        // connection dropped with half a statement sent would be pinged on
+        // its way back to the pool instead, with the transaction still open.
+        let mut connection = self.acquire().await?.detach();
+        let mut tx = connection.begin().await?;
+        // The write runs before SETTLEMENT_LOCK, so these bound only how
+        // long the row stays locked and the import waits: the server ends a
+        // session that sends the statement for longer than the write timeout
+        // (it is idle in transaction until the whole statement has arrived),
+        // and cancels the UPDATE if it runs or waits for the row that long.
+        set_transaction_timeouts(&mut tx, options.write_timeout, options.write_timeout).await?;
+        let write_started = std::time::Instant::now();
+        // Store the exact canonical bytes and the non-share metadata only;
+        // readers decode the bytes. A two-copy inline JSONB body would cross
+        // PostgreSQL's container limit at production window sizes. Inline
+        // bodies already stored on rows without a body_uri are left as they
+        // are: the body-present CHECK needs one of the two.
+        let write = sqlx::query_with("UPDATE qbit_pool_audit_bundles SET schema_version=$2,found_block_network_difficulty=$3::text::numeric,found_block_coinbase_value_sats=$4,audit_commitment_leaves_hex=$5::jsonb,witness_merkle_leaves_hex=$6::jsonb,canonical_audit_bytes=$9 WHERE block_hash=$1 AND canonical_audit_bytes IS NULL AND body_uri IS NOT DISTINCT FROM $7 AND audit_bundle_sha256=$8", arguments)
+            .execute(&mut *tx);
+        let Some(written) = until_stopped(stop, repolled(write)).await else {
+            return Ok(None);
+        };
+        let updated = written?.rows_affected();
+        let write = write_started.elapsed();
+        let mut row = ImportAuditRow {
+            block_hash: hash.to_owned(),
+            parameter_bytes,
+            imported: updated == 1,
+            prepare,
+            write,
+            lock_wait: Duration::ZERO,
+            lock_held: Duration::ZERO,
+            total: Duration::ZERO,
+        };
+        if updated == 0 {
+            // The row changed after it was read; nothing to commit.
+            tx.rollback().await?;
+            row.total = started.elapsed();
+            return Ok(Some(row));
+        }
+        // Under SETTLEMENT_LOCK, a statement or a client gap that outlasts
+        // the lock timeout ends the session, which releases the lock.
+        set_transaction_timeouts(&mut tx, options.lock_timeout, options.lock_timeout).await?;
+        let asked = std::time::Instant::now();
+        // Polled, never queued: the transaction already holds the row's lock,
+        // and a queued wait could close a deadlock cycle with a SETTLEMENT_LOCK
+        // holder waiting for that row (a landing that fills a legacy row's
+        // found_block_bits). Settlement work queued for the lock goes first.
+        loop {
+            let granted: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                .bind(SETTLEMENT_LOCK)
+                .fetch_one(&mut *tx)
+                .await?;
+            if granted {
+                break;
+            }
+            ensure!(
+                asked.elapsed() < options.lock_timeout,
+                "SETTLEMENT_LOCK stayed busy for {} ms; the row is rolled back and nothing was stored",
+                options.lock_timeout.as_millis()
+            );
+            if until_stopped(stop, tokio::time::sleep(IMPORT_LOCK_RETRY))
+                .await
+                .is_none()
+            {
+                return Ok(None);
+            }
+        }
+        let granted = std::time::Instant::now();
+        row.lock_wait = granted.duration_since(asked);
+        // The lock is held: finish quickly, whatever `stop` says.
+        writable(&mut tx).await?;
+        tx.commit().await?;
+        row.lock_held = granted.elapsed();
+        row.total = started.elapsed();
+        let _ = connection.close().await;
+        Ok(Some(row))
     }
 
     /// Recover missing sets or individual fanouts from trusted audit evidence.
@@ -4046,13 +4178,251 @@ impl Ledger {
 }
 
 /// The non-share metadata the legacy import stores beside an audit's
-/// canonical bytes, so the parsed window need not outlive verification.
+/// canonical bytes, so the parsed window need not outlive verification. The
+/// leaves arrays are already JSON text.
 struct ImportedAudit {
     schema: String,
     network_difficulty: String,
     coinbase_value_sats: i64,
-    audit_commitment_leaves_hex: Value,
-    witness_merkle_leaves_hex: Value,
+    audit_commitment_leaves_hex: String,
+    witness_merkle_leaves_hex: String,
+}
+
+/// The names of the import UPDATE's parameters, `$1` to `$9`.
+const IMPORT_PARAMETERS: [&str; 9] = [
+    "block_hash",
+    "schema_version",
+    "network_difficulty",
+    "coinbase_value_sats",
+    "audit_commitment_leaves_hex",
+    "witness_merkle_leaves_hex",
+    "body_uri",
+    "audit_bundle_sha256",
+    "canonical_audit_bytes",
+];
+
+/// One row's UPDATE parameters, encoded, and the size of each.
+struct EncodedImport {
+    arguments: sqlx::postgres::PgArguments,
+    parameter_bytes: [usize; 9],
+}
+
+impl ImportedAudit {
+    /// Encode the import UPDATE's parameters, in order. This copies the
+    /// canonical bytes into the statement's buffer, so it belongs on a
+    /// blocking thread.
+    fn encode(
+        self,
+        hash: String,
+        uri: Option<String>,
+        digest: String,
+        canonical_bytes: Vec<u8>,
+    ) -> Result<EncodedImport> {
+        use sqlx::Arguments as _;
+        let parameter_bytes = [
+            hash.len(),
+            self.schema.len(),
+            self.network_difficulty.len(),
+            std::mem::size_of::<i64>(),
+            self.audit_commitment_leaves_hex.len(),
+            self.witness_merkle_leaves_hex.len(),
+            uri.as_ref().map_or(0, String::len),
+            digest.len(),
+            canonical_bytes.len(),
+        ];
+        let mut arguments = sqlx::postgres::PgArguments::default();
+        let encoded = (|| {
+            arguments.add(hash)?;
+            arguments.add(self.schema)?;
+            arguments.add(self.network_difficulty)?;
+            arguments.add(self.coinbase_value_sats)?;
+            arguments.add(self.audit_commitment_leaves_hex)?;
+            arguments.add(self.witness_merkle_leaves_hex)?;
+            arguments.add(uri)?;
+            arguments.add(digest)?;
+            arguments.add(canonical_bytes)
+        })();
+        encoded.map_err(|error| anyhow::anyhow!("encoding the import parameters: {error}"))?;
+        Ok(EncodedImport {
+            arguments,
+            parameter_bytes,
+        })
+    }
+}
+
+/// The bounds and the stop signal of one `import-audits` run (#765).
+#[derive(Clone, Debug)]
+pub struct ImportAuditsOptions {
+    /// How long one row may take before SETTLEMENT_LOCK, the transaction's
+    /// `idle_in_transaction_session_timeout`, `statement_timeout` and
+    /// `lock_timeout` while its UPDATE is sent, waits for the row and runs.
+    /// No other writer waits for this phase.
+    pub write_timeout: Duration,
+    /// How long the importer waits for SETTLEMENT_LOCK; once it holds it,
+    /// also the transaction's `idle_in_transaction_session_timeout` and
+    /// `statement_timeout`, so a client that stops or a statement that hangs
+    /// ends the session, and with it the lock, within this long.
+    pub lock_timeout: Duration,
+    /// Reads `true` to stop the import: before the next row, or by
+    /// abandoning (rolling back) a row that has not been granted
+    /// SETTLEMENT_LOCK yet. A row that holds the lock finishes.
+    pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl ImportAuditsOptions {
+    pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+}
+
+impl Default for ImportAuditsOptions {
+    fn default() -> Self {
+        Self {
+            write_timeout: Self::DEFAULT_WRITE_TIMEOUT,
+            lock_timeout: Self::DEFAULT_LOCK_TIMEOUT,
+            stop: None,
+        }
+    }
+}
+
+/// What `import-audits` did with one legacy audit row, and how long each
+/// phase took (#765).
+#[derive(Clone, Debug)]
+pub struct ImportAuditRow {
+    pub block_hash: String,
+    /// The encoded size in bytes of each UPDATE parameter, `$1` to `$9`, in
+    /// the order of [`ImportAuditRow::parameters`].
+    pub parameter_bytes: [usize; 9],
+    /// `false` when the row changed after it was read and nothing was stored.
+    pub imported: bool,
+    /// Loading, verifying and canonicalizing the body and encoding the
+    /// parameters, off the runtime and outside any transaction.
+    pub prepare: Duration,
+    /// Sending the UPDATE and the server running it, before SETTLEMENT_LOCK.
+    pub write: Duration,
+    /// Waiting for SETTLEMENT_LOCK.
+    pub lock_wait: Duration,
+    /// From SETTLEMENT_LOCK's grant to the commit's reply.
+    pub lock_held: Duration,
+    pub total: Duration,
+}
+
+impl ImportAuditRow {
+    /// The parameter names, in the order of `parameter_bytes`.
+    pub fn parameters(&self) -> impl Iterator<Item = (&'static str, usize)> + '_ {
+        IMPORT_PARAMETERS
+            .iter()
+            .copied()
+            .zip(self.parameter_bytes.iter().copied())
+    }
+}
+
+impl std::fmt::Display for ImportAuditRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let millis = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        write!(
+            f,
+            "block_hash={} {} parameter_bytes=",
+            self.block_hash,
+            if self.imported {
+                "imported"
+            } else {
+                "unchanged"
+            }
+        )?;
+        for (index, (name, bytes)) in self.parameters().enumerate() {
+            write!(f, "{}{name}:{bytes}", if index == 0 { "" } else { "," })?;
+        }
+        write!(
+            f,
+            " total_parameter_bytes={} prepare_ms={:.0} write_ms={:.0} lock_wait_ms={:.1} lock_held_ms={:.1} total_ms={:.0}",
+            self.parameter_bytes.iter().sum::<usize>(),
+            millis(self.prepare),
+            millis(self.write),
+            millis(self.lock_wait),
+            millis(self.lock_held),
+            millis(self.total)
+        )
+    }
+}
+
+/// `import-audits` stopped on request (#765): before a row, or by rolling
+/// back a row that had not been granted SETTLEMENT_LOCK.
+#[derive(Debug)]
+pub struct ImportStopped {
+    pub imported: usize,
+}
+
+impl std::fmt::Display for ImportStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "import-audits stopped on request after importing {} audit bodies; no row it was writing was committed, and a re-run resumes",
+            self.imported
+        )
+    }
+}
+
+impl std::error::Error for ImportStopped {}
+
+/// How often the importer retries SETTLEMENT_LOCK while it is busy.
+const IMPORT_LOCK_RETRY: Duration = Duration::from_millis(10);
+/// The longest a legacy audit's UPDATE goes unpolled; see [`repolled`].
+const IMPORT_REPOLL: Duration = Duration::from_millis(100);
+
+/// `future`'s output, or `None` once `stop` reads `true`. Without a stop
+/// signal, or once its sender is gone, just `future`'s output.
+async fn until_stopped<F: std::future::Future>(
+    stop: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    future: F,
+) -> Option<F::Output> {
+    let Some(stop) = stop else {
+        return Some(future.await);
+    };
+    tokio::pin!(future);
+    // The watch guard is dropped before any await, so this future stays Send.
+    let stopped = async { stop.wait_for(|stopped| *stopped).await.is_ok() };
+    tokio::select! {
+        output = &mut future => Some(output),
+        stopped = stopped => if stopped { None } else { Some(future.await) },
+    }
+}
+
+/// `future`, polled at least every [`IMPORT_REPOLL`] whether or not it asked
+/// to be woken.
+///
+/// SQLx 0.8.6's rustls stream can lose the wakeup of a write that the
+/// socket blocked. It then waits for the socket to become readable, and the
+/// server sends nothing until it has the whole statement: the session sits
+/// `idle in transaction` on `ClientRead`, as the pair's did (#765;
+/// launchbadge/sqlx#4248, fixed after 0.8.6 by #4251). A poll retries the
+/// write, so a statement as large as a legacy audit body cannot stall there.
+async fn repolled<F: std::future::Future>(future: F) -> F::Output {
+    tokio::pin!(future);
+    let mut tick = tokio::time::interval(IMPORT_REPOLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut future => return output,
+            _ = tick.tick() => {}
+        }
+    }
+}
+
+/// Set the transaction's `statement_timeout` and `lock_timeout` to
+/// `statement`, and its `idle_in_transaction_session_timeout` to `idle`.
+/// All three end with the transaction.
+async fn set_transaction_timeouts(
+    tx: &mut Transaction<'_, Postgres>,
+    statement: Duration,
+    idle: Duration,
+) -> Result<()> {
+    sqlx::query("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true),set_config('idle_in_transaction_session_timeout',$2,true)")
+        .bind(statement.as_millis().to_string())
+        .bind(idle.as_millis().to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn legacy_canonical_sidecar(

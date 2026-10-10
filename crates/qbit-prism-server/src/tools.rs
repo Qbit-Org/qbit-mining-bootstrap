@@ -603,6 +603,27 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
         }
         Command::ImportAudits { root } => {
             let root = audit_root(root);
+            // SIGTERM or SIGINT stops the import (#765): before the next row,
+            // or by rolling back a row not yet granted SETTLEMENT_LOCK. In a
+            // container this runs as PID 1, which ignores a SIGTERM it has no
+            // handler for, so without one `docker stop` could only kill it.
+            let (stop, stopped) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                if crate::server::signal().await.is_ok() {
+                    stop.send_replace(true);
+                }
+            });
+            let options = crate::ledger::ImportAuditsOptions {
+                write_timeout: import_timeout(
+                    "PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS",
+                    crate::ledger::ImportAuditsOptions::DEFAULT_WRITE_TIMEOUT,
+                )?,
+                lock_timeout: import_timeout(
+                    "PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS",
+                    crate::ledger::ImportAuditsOptions::DEFAULT_LOCK_TIMEOUT,
+                )?,
+                stop: Some(stopped),
+            };
             let config = config::DatabaseConfig::from_env()?;
             let ledger_public_key = config::DatabaseConfig::ledger_public_key()?;
             let ledger = crate::ledger::Ledger::connect_tool(
@@ -614,7 +635,9 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
             )
             .await?;
             let count = ledger
-                .import_legacy_audits(root.as_deref(), &ledger_public_key)
+                .import_legacy_audits_with(root.as_deref(), &ledger_public_key, &options, |row| {
+                    eprintln!("import-audits: {row}")
+                })
                 .await;
             // Preserve the remaining-work counts even when import stopped on
             // an unverifiable or missing historical artifact.
@@ -625,9 +648,22 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
                 "Audit completeness: {}",
                 serde_json::to_string(&completeness)?
             );
-            let count = count?;
-            println!("Imported {count} audit bodies");
-            completeness.require_complete()
+            match count {
+                // A stop can leave a body still being verified on a blocking
+                // thread, which runtime shutdown would wait for: exit now.
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::ledger::ImportStopped>()
+                        .is_some() =>
+                {
+                    refuse(1, format!("Error: {error:?}"))
+                }
+                count => {
+                    let count = count?;
+                    println!("Imported {count} audit bodies");
+                    completeness.require_complete()
+                }
+            }
         }
         Command::BackfillCtv => {
             let config = config::DatabaseConfig::from_env()?;
@@ -679,6 +715,18 @@ async fn run(command: Command, transition: Option<(Config, Config)>) -> Result<(
 
 fn audit_root(root: Option<PathBuf>) -> Option<PathBuf> {
     root.or_else(|| config::optional("PRISM_AUDIT_DIR").map(PathBuf::from))
+}
+
+/// One of `import-audits`' bounds (#765), in milliseconds from `name`, with
+/// the range of the database timeouts.
+fn import_timeout(name: &str, default: Duration) -> Result<Duration> {
+    let default = u64::try_from(default.as_millis())?;
+    let millis = config::number(name, default)?;
+    ensure!(
+        (1..=600_000).contains(&millis),
+        "{name} must be between 1 and 600000 milliseconds"
+    );
+    Ok(Duration::from_millis(millis))
 }
 
 /// What `signing-transition` prints, and all it does, without `--confirm`.
