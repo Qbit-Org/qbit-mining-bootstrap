@@ -1802,10 +1802,16 @@ claims and leases are per database, and each attempt re-verifies the chain.
 A zero-fee fanout needs a CPFP child funded from a wallet. Only one node
 sponsors it: the node whose work its block was found on. That node is read from
 the extranonce1 in the block's coinbase, since each node hands out its own half
-of the extranonce1 space; it does not matter which node landed the rows. Keep
-`PRISM_STRATUM_EXTRANONCE2_SIZE` the same on both nodes: extranonce1 is read at
-this node's width, and the pair's fingerprint does not compare it. (Adoption
-reads a peer record's own width, so it lands either way.) The other node only
+of the extranonce1 space; it does not matter which node landed the rows.
+Extranonce1 is read at this node's `PRISM_STRATUM_EXTRANONCE2_SIZE`, and only
+where the coinbase tag sits right before it. A block issued with another width
+therefore names no finder here; its origin decides, so a peer's block is never
+taken for this node's own. Keep the width, and a `PRISM_COINBASE_TAG` of several
+bytes (the default `/PRISM/` has 7), the same on both nodes; the pair's
+fingerprint compares neither. Change either only while both nodes are up and
+landing their blocks, as for adoption below, and give one-shot commands the
+frontends' values. (Adoption reads a peer record's own width, so it lands
+either way.) The other node only
 watches the fanout until it is overdue for a takeover (below),
 so the two nodes do not fund conflicting children, which would leave a wallet
 coin locked.

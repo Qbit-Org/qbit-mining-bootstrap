@@ -959,7 +959,7 @@ impl Coordinator {
         }
         if let Some(dual) = &config.dual_writer {
             ledger.set_dual_writer_identity(dual.identity)?;
-            ledger.set_extranonce2_size(config.extranonce2_size)?;
+            ledger.set_coinbase_layout(config.coinbase_tag.as_bytes(), config.extranonce2_size)?;
         }
         // Keep a frontend's initial heartbeat non-quiescent if configuration
         // fails. Another live incarnation may share this instance ID, so this
