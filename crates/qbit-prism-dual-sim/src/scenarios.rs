@@ -2610,6 +2610,13 @@ async fn ledger_digest(pool: &sqlx::PgPool) -> Result<serde_json::Value> {
         "integrity".into(),
         json!({"mismatch_count": integrity["mismatch_count"], "current_drift_count": integrity["current_drift_count"]}),
     );
+    // Counts and sums only (#478's divergent landings, abandoned and refused
+    // offers, debtors), so a stable whole.
+    let divergence: serde_json::Value =
+        sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
+            .fetch_one(pool)
+            .await?;
+    digest.insert("divergence".into(), divergence);
     for (name, sql) in [
         ("shares", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(concat_ws('|', share_seq, share_id, miner_id, share_difficulty, floor(extract(epoch FROM accepted_at) * 1000)), ',' ORDER BY share_seq)), '') FROM qbit_share_ledger"),
         ("share_hashes", "SELECT count(*)::text || ':' || coalesce(md5(string_agg(header_hash || share_id, ',' ORDER BY header_hash)), '') FROM qbit_prism_share_hashes"),
