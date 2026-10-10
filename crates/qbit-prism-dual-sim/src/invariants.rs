@@ -1829,9 +1829,10 @@ pub const COPIED_STATE_BOUND: Duration = Duration::from_secs(20);
 ///
 /// - **The journal.** Append-only and copied whole, so the origin's rows are
 ///   the same on both nodes, in every column.
-/// - **Prepared records.** Every unexpired one the origin wrote, up to the
-///   peer's cursor over that stream, is on the peer (the pull takes them all,
-///   expired or not), equal in every carried column but `expires_at`, which
+/// - **Prepared records.** Every unexpired one the origin had written when
+///   the check began is on the peer (the pull takes them all, expired or
+///   not; a stream that stopped leaves them missing, whatever its cursor
+///   says), equal in every carried column but `expires_at`, which
 ///   each node keeps for itself (D1's own comparison). Every unexpired copy
 ///   the peer holds is still on the origin: its own expiry only extends, so
 ///   such a record was lost there, which own-log recovery must prevent.
@@ -1848,9 +1849,22 @@ async fn copied_state_identical(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             "no dual-writer pair with both databases checked: nothing is copied",
         ));
     }
+    // Each origin's highest prepared record when the check begins: every one
+    // up to it must reach the peer within the bound; later ones may not yet.
+    let mut highest = BTreeMap::new();
+    for (node, pool) in pools {
+        let seq: Option<i64> = sqlx::query_scalar(
+            "SELECT max(sync_seq) FROM qbit_prism_jobs \
+             WHERE origin_node = $1 AND job_id LIKE 'prepared:%'",
+        )
+        .bind(node.index() as i16)
+        .fetch_one(pool)
+        .await?;
+        highest.insert(*node, seq);
+    }
     let started = Instant::now();
     loop {
-        let (problems, compared) = copied_state_round(pools).await?;
+        let (problems, compared) = copied_state_round(pools, &highest).await?;
         if problems.is_empty() || started.elapsed() >= COPIED_STATE_BOUND {
             let mut check = CheckBuilder::new(ID);
             for problem in problems {
@@ -1937,7 +1951,10 @@ async fn blob_digests(
 
 /// One pass of [`copied_state_identical`]: its problems, and what it
 /// compared.
-async fn copied_state_round(pools: &BTreeMap<Node, PgPool>) -> Result<(Vec<String>, Value)> {
+async fn copied_state_round(
+    pools: &BTreeMap<Node, PgPool>,
+    highest: &BTreeMap<Node, Option<i64>>,
+) -> Result<(Vec<String>, Value)> {
     let mut problems = Vec::new();
     let mut compared = serde_json::Map::new();
     for origin in Node::BOTH {
@@ -1965,8 +1982,9 @@ async fn copied_state_round(pools: &BTreeMap<Node, PgPool>) -> Result<(Vec<Strin
         let copies = prepared_records(copy, origin, false).await?;
         let unexpired_copies = prepared_records(copy, origin, true).await?;
         let mut on_both = Vec::new();
+        let bound = highest.get(&origin).copied().flatten();
         for (job, (seq, doc)) in &unexpired_originals {
-            if cursor.is_none_or(|cursor| *seq > cursor) {
+            if bound.is_none_or(|bound| *seq > bound) {
                 continue;
             }
             match copies.get(job) {
@@ -2041,6 +2059,7 @@ async fn copied_state_round(pools: &BTreeMap<Node, PgPool>) -> Result<(Vec<Strin
                 "journal_rows": journal_own.len(),
                 "prepared_unexpired": unexpired_originals.len(),
                 "prepared_on_both": on_both.len(),
+                "highest_at_start": bound,
                 "peer_cursor": cursor,
                 "templates": templates.len(),
                 "balance_snapshots": balances.len(),
