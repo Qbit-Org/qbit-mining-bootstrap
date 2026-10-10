@@ -400,6 +400,7 @@
     "readiness/dual_writer.rs::probe_writer#1::ledger .acquire_from(pool)": [1,"ledger"],
     "readiness/dual_writer.rs::report#1::ledger .health_reads_on(pool)": [1,"ledger"],
     "readiness/dual_writer.rs::report#1::probe_writer(ledger , pool , self . identity)": [1,"ledger"],
+    "readiness/endpoint.rs::serve_with#1::endpoint .answer(request . method ( ) , request . uri ( ) . path ( ) , request . headers ( ))": [1,"non-database"],
     "readiness/endpoint.rs::serve_with#1::sources .acquire(peer . ip ( ) , limits . per_source)": [1,"non-database"],
     "stratum.rs::start#1::config . connection_limit .try_acquire()": [1,"non-database"],
     "stratum.rs::timed_out#1::database(message)": [1,"non-database"],
