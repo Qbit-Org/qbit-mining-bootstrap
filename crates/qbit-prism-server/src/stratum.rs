@@ -2181,8 +2181,11 @@ pub async fn run_listener<B: MiningBackend>(
 /// withdrawal the address refuses every connection, so no handshake, check
 /// or balancer sees a frontend that must not serve as up; a decision older
 /// than `stale_after` admits nothing, so a stalled health publisher closes
-/// it too. Withdrawing resets connections still queued unaccepted; sessions
-/// already accepted carry on until they end or the balancer closes them.
+/// it too. Withdrawing resets connections still queued unaccepted. Sessions
+/// already accepted carry on until they end or the balancer closes them,
+/// unless the withdrawal is hard (the own log behind, or a database that is
+/// not this node's): then they are closed at once, so none of them writes
+/// another share to a database that is not this node's.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_gated_listener<B: MiningBackend>(
     mut address: crate::listen::ReservedAddress,
@@ -2212,11 +2215,19 @@ pub async fn run_gated_listener<B: MiningBackend>(
         if *shutdown.borrow() {
             break;
         }
-        let admits = decisions
-            && admission
-                .borrow_and_update()
-                .admits_at(tokio::time::Instant::now(), stale_after);
+        let decision = *admission.borrow_and_update();
+        let admits = decisions && decision.admits_at(tokio::time::Instant::now(), stale_after);
         if !admits {
+            // A hard fault closes the sessions already accepted too, whether
+            // it withdrew an admitting frontend or found one that a
+            // not-ready withdrawal had left them on.
+            if let Some(reason) = decision.hard_withdrawal() {
+                if !connections.is_empty() {
+                    tracing::warn!(listener = %config.listener_name, reason = reason.as_str(), sessions = connections.len(), "Stratum sessions closed: the frontend withdrew for a fault that forbids serving, so none of them writes another share");
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                }
+            }
             tokio::select! {
                 changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
                 _ = connections.join_next(), if !connections.is_empty() => {}

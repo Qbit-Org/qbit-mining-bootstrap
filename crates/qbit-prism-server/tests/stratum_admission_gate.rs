@@ -1,15 +1,16 @@
 //! 3.1 dual-writer Stratum gating (D4): a listener accepts connections only
 //! while the frontend admits miners. A frontend that is not ready refuses
 //! every connection at the socket, so no TCP check, balancer or miner can see
-//! it as up; withdrawing refuses again while established sessions carry on;
-//! and a decision the health publisher stops renewing closes the listener by
-//! itself. These tests read no environment input, so they are not gated.
+//! it as up; a not-ready withdrawal refuses again while established sessions
+//! carry on, and a hard one closes them too; and a decision the health
+//! publisher stops renewing closes the listener by itself. These tests read
+//! no environment input, so they are not gated.
 use qbit_prism_server::{
     codec,
     ledger::SessionId,
     listen::reserve_address,
     metrics::Metrics,
-    readiness::admission::AdmissionSignal,
+    readiness::admission::{AdmissionSignal, AdmissionState, Withdrawal},
     stratum::{
         run_gated_listener, MiningBackend, MiningJob, StaleGrace, StratumConfig, StratumError,
         Worker,
@@ -246,6 +247,76 @@ async fn a_frontend_that_does_not_admit_refuses_connections_at_the_socket() {
     // Readmitted on the same address.
     gate.admit(true);
     drop(connected(gate.addr).await);
+    gate.stop().await;
+}
+
+/// A hard withdrawal, here a database that turned out not to be this node's,
+/// closes the sessions already accepted as well as the listener, so none of
+/// them writes another share there.
+#[tokio::test]
+async fn a_hard_withdrawal_closes_established_sessions_too() {
+    let gate = Gate::start(Duration::from_secs(15)).await;
+    gate.admit(true);
+    let mut session = BufReader::new(connected(gate.addr).await);
+    let subscribed = exchange(
+        &mut session,
+        json!({"id":1,"method":"mining.subscribe","params":["gate-test"]}),
+    )
+    .await;
+    assert!(subscribed["error"].is_null(), "{subscribed}");
+    gate.decide.send_replace(AdmissionSignal::of(
+        AdmissionState::Withdrawn {
+            reason: Withdrawal::WriterNotLocal,
+        },
+        Instant::now(),
+    ));
+    refusing(gate.addr).await;
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(5), session.read_line(&mut line))
+        .await
+        .expect("a session outlived a hard withdrawal");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the session was still served: {read:?} {line:?}"
+    );
+
+    // A session a not-ready withdrawal left in place is closed when a hard
+    // fault turns up later.
+    gate.admit(true);
+    let mut session = BufReader::new(connected(gate.addr).await);
+    let subscribed = exchange(
+        &mut session,
+        json!({"id":1,"method":"mining.subscribe","params":["gate-test"]}),
+    )
+    .await;
+    assert!(subscribed["error"].is_null(), "{subscribed}");
+    gate.decide.send_replace(AdmissionSignal::of(
+        AdmissionState::Withdrawn {
+            reason: Withdrawal::NotReady,
+        },
+        Instant::now(),
+    ));
+    refusing(gate.addr).await;
+    let health = exchange(
+        &mut session,
+        json!({"id":2,"method":"mining.get_health","params":[]}),
+    )
+    .await;
+    assert!(health["error"].is_null(), "{health}");
+    gate.decide.send_replace(AdmissionSignal::of(
+        AdmissionState::Withdrawn {
+            reason: Withdrawal::OwnLogBehind,
+        },
+        Instant::now(),
+    ));
+    let mut line = String::new();
+    let read = timeout(Duration::from_secs(5), session.read_line(&mut line))
+        .await
+        .expect("a session outlived a later hard withdrawal");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the session was still served: {read:?} {line:?}"
+    );
     gate.stop().await;
 }
 

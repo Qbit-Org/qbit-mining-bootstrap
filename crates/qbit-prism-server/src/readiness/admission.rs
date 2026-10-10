@@ -58,6 +58,12 @@ impl Withdrawal {
     pub fn as_str(self) -> &'static str {
         self.label().as_str()
     }
+
+    /// A fault that says this node must not serve at all, whatever its work:
+    /// it withdraws at once, and closes the sessions already accepted too.
+    pub fn is_hard(self) -> bool {
+        !matches!(self, Self::NotReady)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +201,8 @@ impl Admission {
 pub struct AdmissionSignal {
     admits: bool,
     decided_at: Option<tokio::time::Instant>,
+    /// The hard withdrawal this decision carries, if any.
+    hard: Option<Withdrawal>,
 }
 
 impl AdmissionSignal {
@@ -202,13 +210,30 @@ impl AdmissionSignal {
     pub const UNDECIDED: Self = Self {
         admits: false,
         decided_at: None,
+        hard: None,
     };
 
     pub fn decided(admits: bool, at: tokio::time::Instant) -> Self {
         Self {
             admits,
             decided_at: Some(at),
+            hard: None,
         }
+    }
+
+    /// The decision `state` makes at `at`.
+    pub fn of(state: AdmissionState, at: tokio::time::Instant) -> Self {
+        Self {
+            admits: state.admits(),
+            decided_at: Some(at),
+            hard: state.reason().filter(|reason| reason.is_hard()),
+        }
+    }
+
+    /// The hard withdrawal this decision carries: the gated listeners close
+    /// their accepted sessions on it, not only their listening sockets.
+    pub fn hard_withdrawal(&self) -> Option<Withdrawal> {
+        self.hard
     }
 
     /// Whether the decision admits at `now`: it says so and is younger than
@@ -231,6 +256,34 @@ mod tests {
     use super::*;
 
     const GRACE: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn a_signal_carries_only_a_hard_withdrawal() {
+        let at = tokio::time::Instant::now();
+        for reason in [Withdrawal::OwnLogBehind, Withdrawal::WriterNotLocal] {
+            let signal = AdmissionSignal::of(AdmissionState::Withdrawn { reason }, at);
+            assert_eq!(signal.hard_withdrawal(), Some(reason));
+            assert!(!signal.admits_at(at, Duration::from_secs(15)));
+        }
+        let soft = AdmissionSignal::of(
+            AdmissionState::Withdrawn {
+                reason: Withdrawal::NotReady,
+            },
+            at,
+        );
+        assert_eq!(soft.hard_withdrawal(), None);
+        for state in [
+            AdmissionState::Starting,
+            AdmissionState::Admitting,
+            AdmissionState::Grace {
+                since: Instant::now(),
+            },
+        ] {
+            assert_eq!(AdmissionSignal::of(state, at).hard_withdrawal(), None);
+        }
+        assert!(AdmissionSignal::of(AdmissionState::Admitting, at)
+            .admits_at(at, Duration::from_secs(15)));
+    }
 
     #[test]
     fn a_signal_admits_only_while_its_decision_is_fresh() {

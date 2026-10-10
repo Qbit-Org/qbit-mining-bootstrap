@@ -116,8 +116,13 @@ only while it admits miners:
   serve as up;
 - withdrawing resets connections still queued unaccepted, so their miners
   reconnect elsewhere at once;
-- sessions already accepted carry on; the balancer closes them when it marks
-  the node down (`on-marked-down shutdown-sessions`).
+- after a `not-ready` withdrawal, sessions already accepted carry on until
+  the balancer closes them when it marks the node down
+  (`on-marked-down shutdown-sessions`);
+- a hard withdrawal (`own-log-behind`, `writer-not-local`) closes them at
+  once too, also when it comes after a `not-ready` one, so no share is
+  written to a database that is not this node's, or before its own log is
+  caught up.
 
 A single writer's listeners are 3.0's: listening from startup, whatever
 readiness says. Linux lets a second socket bind an address that a reserved one
@@ -234,8 +239,10 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
   remote writer fails, a single writer keeps 3.0's rule, and dual mode
   without the operator listener refuses to probe Stratum.
 - `tests/stratum_admission_gate.rs`: a gated listener refuses at the socket
-  until admitted, refuses again after a withdrawal while an established
-  session is still served, and closes when its decision goes stale.
+  until admitted, refuses again after a `not-ready` withdrawal while an
+  established session is still served, closes established sessions too on a
+  hard withdrawal (also one that follows a `not-ready` withdrawal), and closes
+  when its decision goes stale.
 - Gated, `tests/dual_writer_readiness.rs`: the latch and the identity at the
   coordinator, a database turning read-only and back, the peer lost after
   the latch, a database personalised as the peer (`remote`), and a single

@@ -639,8 +639,7 @@ impl AdmissionPublisher {
             self.admission
                 .observe(now.into_std(), ready, dual.and_then(|dual| dual.withdrawal));
         let state = self.admission.state();
-        self.decisions
-            .send_replace(AdmissionSignal::decided(state.admits(), now));
+        self.decisions.send_replace(AdmissionSignal::of(state, now));
         match change {
             Some(AdmissionChange::Admitted) => {
                 tracing::info!("PRISM admits miners: readiness endpoint ready, dual-writer Stratum listeners accepting")
