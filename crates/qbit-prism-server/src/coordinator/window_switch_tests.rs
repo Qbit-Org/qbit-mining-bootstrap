@@ -2007,13 +2007,6 @@ impl Fixture {
             node: crate::node_identity::NodeIndex::A,
             carry_owner: true,
         })?;
-        // Migration 031's index, which a dual-writer snapshot requires, under
-        // 031's name: a no-op once the schema carries it.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
-        )
-        .execute(&ledger.pool)
-        .await?;
         for seq in peer {
             sqlx::query(
                 "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch,origin_node) \

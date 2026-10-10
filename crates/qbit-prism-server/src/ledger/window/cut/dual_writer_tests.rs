@@ -40,20 +40,15 @@ async fn open(
         node: NodeIndex::from_index(node.into()).context("node index")?,
         carry_owner: node == 0,
     };
-    let ready = async {
-        ledger.set_dual_writer_identity(identity)?;
-        origin_index(&ledger).await
-    }
-    .await;
-    if let Err(error) = ready {
+    if let Err(error) = ledger.set_dual_writer_identity(identity) {
         ledger.pool.close().await;
         return Err(fixture.abandon(error).await);
     }
     Ok((fixture, ledger))
 }
 
-/// Migration 031's `(origin_node, share_seq)` index, which a dual-writer
-/// snapshot requires, under 031's name: a no-op once the schema carries it.
+/// Restore migration 031's `(origin_node, share_seq)` index, under its
+/// name, after a test dropped it.
 async fn origin_index(ledger: &Ledger) -> Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
@@ -545,7 +540,6 @@ async fn the_own_cut_probes_only_the_partitions_at_or_above_the_retained_entry()
             )
             .execute(&ledger.pool)
             .await?;
-            origin_index(ledger).await?;
             let mut rows: Vec<Row> = [2, 50, 120, 180, 250, 320, 400]
                 .into_iter()
                 .map(|seq| row(0, seq, 1))
