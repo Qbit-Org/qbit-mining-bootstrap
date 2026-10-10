@@ -1886,14 +1886,17 @@ fail after printing if a check refuses, or without `--confirm`.
 1. **On the current owner:**
    `qbit-prism-server carry-owner release --reason <text> --confirm`.
    - Checks: the node identity matches, and this node holds ownership.
-   - In one transaction it journals `release` (with the tip height) and bumps
-     the payout revision, superseding its carry-paying work. Its guard turns
-     carry-free at its next check, within about 2 s. Work built in between is
-     still the only carry-paying work: the other node cannot acquire until the
-     release is buried (step 2).
+   - In one transaction under `SETTLEMENT_LOCK` it journals `release`, with the
+     tip height read under the lock, and bumps the payout revision,
+     superseding its carry-paying work.
+   - Work is carry-free from the release's commit, because every snapshot
+     reads this node's journal under that lock. Its guard closes the carry
+     gate at its next check, within about 2 s.
+   - Work built just before the release can still find a block on the next
+     tip, so step 2 waits.
 2. **Wait for the release to be buried.** The tip must be at least
-   `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (6) blocks past the release height, and
-   the old owner's last blocks must have synced.
+   `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` (6, and never fewer than 2) blocks
+   past the release height, and the old owner's last blocks must have synced.
 3. **On the new owner:**
    `qbit-prism-server carry-owner transfer --reason <text> [--from-height H] --confirm`.
    It refuses unless all of these pass:
