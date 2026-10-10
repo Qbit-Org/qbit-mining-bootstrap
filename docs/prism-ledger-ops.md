@@ -4197,7 +4197,11 @@ Empty-window (bootstrap) work is the exception, as in 3.0: it is replaced at
 once by the first share, and whenever the peer's mark has moved, labelled
 `shares`, until a window holds shares. A cached window is not reused for a new
 template once the peer's mark has moved, because the peer's newer rows can all
-lie below this node's cutoff. The incremental advance reads each node's rows
+lie below this node's cutoff. Nor is it reused while an accepted peer row at or
+below the mark waits above the peer's entry, stamped after the anchor by a peer
+clock running ahead: a later anchor admits that row with no new row and no move
+of the mark, so the next template's window is read afresh and the row is not
+held back to the reanchor. The incremental advance reads each node's rows
 between the retired window's cut and the fresh one, at or above the retired
 window's first row, and merges the peer's late rows into it in `share_seq`
 order, so a late peer row costs a merge, not a full scan (about 0.1 s against
