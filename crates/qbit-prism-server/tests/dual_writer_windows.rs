@@ -6,7 +6,9 @@
 //! above it, stamped before its anchor: the case a timestamp-only window
 //! cannot survive. The landing's durable-range proof, its in-lock count, the
 //! #619 holding probe at enqueue and the audit reconstruction afterwards must
-//! all read the window the coinbase paid.
+//! all read the window the coinbase paid. Each block lands as the coordinator
+//! lands it after the offer: from the audit rebuilt out of the candidate's
+//! stored inputs, which must commit the same cut as the coinbase.
 //!
 //! ```text
 //! PRISM_TEST_DATABASE_URL=... \
@@ -21,7 +23,8 @@ use qbit_prism::{
     Parallelism, PayoutPolicy, WindowCut,
 };
 use qbit_prism_server::ledger::{
-    audit_canonical_bytes, Candidate, CandidateClaim, Ledger, SignerKeys, Snapshot, WindowRef,
+    audit_canonical_bytes, build_claim_parts, BalanceSource, Candidate, CandidateClaim, Ledger,
+    SignerKeys, Snapshot, WindowError, WindowRef,
 };
 use qbit_prism_server::node_identity::{NodeIdentity, NodeIndex};
 use qbit_prism_test_gate as gate;
@@ -49,20 +52,13 @@ async fn open() -> Result<Option<(FixtureDatabase, Ledger)>> {
     let ready = async {
         ledger.set_dual_writer_identity(identity)?;
         // Migration 031's (origin_node, share_seq) index, which a dual-writer
-        // snapshot requires, where this branch's migrations do not create it
-        // yet.
-        let indexed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
-             JOIN pg_attribute b ON b.attrelid=i.indrelid AND b.attnum=i.indkey[1] \
-             WHERE i.indrelid='qbit_share_ledger'::regclass AND i.indisvalid AND a.attname='origin_node' AND b.attname='share_seq')",
+        // snapshot requires, under 031's name: a no-op once the schema
+        // carries it.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
         )
-        .fetch_one(&ledger.pool)
+        .execute(&ledger.pool)
         .await?;
-        if !indexed {
-            sqlx::query("CREATE INDEX qbit_share_ledger_origin_seq_until_031 ON qbit_share_ledger (origin_node, share_seq)")
-                .execute(&ledger.pool)
-                .await?;
-        }
         anyhow::Ok(())
     }
     .await;
@@ -208,7 +204,47 @@ async fn enqueue_and_claim(ledger: &Ledger, block: &TestCandidate) -> Result<Can
         claim.candidate.block_hash == block.candidate.block_hash,
         "claimed another candidate"
     );
-    Ok(claim.with_bundle(block.bundle.clone()))
+    Ok(claim)
+}
+
+/// Land `claim` as the coordinator does after the offer
+/// (`Coordinator::land_offered`): read the window its reference names, at
+/// the as-issued balances or else the current ones, rebuild the audit from
+/// the candidate's stored inputs, and land those parts. The rebuilt body must
+/// be the one the block's coinbase committed to, cut included.
+async fn rebuild_and_land(
+    ledger: &Ledger,
+    claim: CandidateClaim,
+    block: &TestCandidate,
+) -> Result<()> {
+    let reference = &claim.candidate.window;
+    let window = match ledger.read_window(reference, BalanceSource::AsIssued).await {
+        Err(WindowError::BalanceSnapshotMissing { .. }) => {
+            ledger
+                .read_window(reference, BalanceSource::Current)
+                .await?
+        }
+        window => window?,
+    };
+    let (manifest_key, ledger_key) = keys();
+    let parts = build_claim_parts(
+        &claim.candidate,
+        window.shares,
+        window.prior_balances,
+        &manifest_key,
+        &ledger_key,
+    )?;
+    let (committed, _) = block.bundle.clone().into_parts();
+    ensure!(
+        *parts.body == committed,
+        "the rebuilt audit is not the one the coinbase committed to (cut {:?}, committed {:?})",
+        parts.body.reward_manifest.cut,
+        committed.reward_manifest.cut
+    );
+    ledger
+        .land_candidate(&claim.with_parts(parts), &ledger_public_key())
+        .await?;
+    Ok(())
 }
 
 /// The landed block's audit, read back through reconstruction, is the bundle
@@ -255,12 +291,42 @@ async fn a_block_lands_after_late_peer_rows_arrive_inside_its_window() -> Result
         // under its first row and above its top.
         rows(&ledger, 1, [first + 7, 79, 81]).await?;
         mark(&ledger, 1, 81).await?;
-        ledger.land_candidate(&claim, &ledger_public_key()).await?;
+        rebuild_and_land(&ledger, claim, &block).await?;
         audit_reads_back(&ledger, &block).await?;
         // The next window holds them.
         let next = ledger.snapshot(network).await?;
         assert_eq!(next.cut, Some(WindowCut::new(Some(80), Some(81))?));
         assert!(next.shares.iter().any(|share| share.share_seq == 81));
+        Ok(())
+    }
+    .await;
+    close(fixture, ledger, result).await
+}
+
+/// D6's S1: the peer has not been pulled yet, so there is no mark and the
+/// cut admits none of the peer's rows, though some are already here. The
+/// window, the coinbase and the rebuilt audit all carry the cut with the
+/// peer's entry empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_lands_while_the_peer_is_idle_and_its_entry_is_empty() -> Result<()> {
+    let Some((fixture, ledger)) = open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        rows(&ledger, 0, (1..=30).map(|i| 2 * i)).await?;
+        rows(&ledger, 1, [3, 9, 61]).await?;
+        let network = 3;
+        let snapshot = ledger.snapshot(network).await?;
+        let cut = snapshot.cut.context("dual-writer snapshot has no cut")?;
+        assert_eq!(cut, WindowCut::new(Some(60), None)?);
+        assert!(snapshot.shares.iter().all(|share| share.share_seq % 2 == 0));
+        let block = candidate(&snapshot, network, None, 4)?;
+        assert_eq!(block.bundle.reward_manifest.cut, Some(cut));
+        let claim = enqueue_and_claim(&ledger, &block).await?;
+        // The first pull lands between the claim and the landing.
+        mark(&ledger, 1, 61).await?;
+        rebuild_and_land(&ledger, claim, &block).await?;
+        audit_reads_back(&ledger, &block).await?;
         Ok(())
     }
     .await;
@@ -302,7 +368,7 @@ async fn a_dual_writer_bootstrap_block_lands_after_peer_rows_arrive() -> Result<
         // incomplete; the cut says it saw none of them.
         rows(&ledger, 1, [1, 3, 5]).await?;
         mark(&ledger, 1, 5).await?;
-        ledger.land_candidate(&claim, &ledger_public_key()).await?;
+        rebuild_and_land(&ledger, claim, &block).await?;
         audit_reads_back(&ledger, &block).await?;
         Ok(())
     }
@@ -327,7 +393,11 @@ async fn a_window_whose_cut_disagrees_with_its_bundle_is_never_landed() -> Resul
         uncut.cut = None;
         let mut block = candidate(&uncut, network, None, 3)?;
         block.candidate.window = WindowRef::from_snapshot(&snapshot)?;
-        let claim = enqueue_and_claim(&ledger, &block).await?;
+        // Landed with the bundle it was found on, not a rebuild, which would
+        // commit the reference's cut and so a different coinbase.
+        let claim = enqueue_and_claim(&ledger, &block)
+            .await?
+            .with_bundle(block.bundle.clone());
         let error = ledger
             .land_candidate(&claim, &ledger_public_key())
             .await

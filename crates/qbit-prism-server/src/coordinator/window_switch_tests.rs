@@ -355,23 +355,28 @@ impl Fixture {
         ctv: Option<CandidateCtv>,
     ) -> Result<Found> {
         let (manifest_key, ledger_key) = self.keys();
+        // The coinbase commits the snapshot's cut, as `bundle_build` builds
+        // it: none for a single writer's window.
         let bundle = match &ctv {
             Some(ctv) => self.ctv_bundle_on(snapshot, height, ctv)?,
-            None => qbit_prism::build_audit_bundle_with_coinbase_options(
-                snapshot.shares.clone(),
+            None => qbit_prism::build_audit_bundle_body_with_coinbase_options_parallel(
+                &snapshot.shares,
                 FoundBlock {
                     block_height: height,
                     coinbase_value_sats: 500_000_000,
                     network_difficulty: 100,
                     anchor_job_issued_at_ms: snapshot.anchor_ms,
                 },
+                snapshot.cut,
                 snapshot.prior_balances.clone(),
                 qbit_prism::PayoutPolicy::day_one_default(),
                 Some("00".repeat(12)),
                 vec![],
                 &manifest_key,
                 &ledger_key,
-            )?,
+                qbit_prism::Parallelism::serial(),
+            )?
+            .into_bundle(snapshot.shares.clone()),
         };
         let template = json!({"version":0x20000000u32,"bits":"207fffff","curtime":1_800_000_000u32,
             "previousblockhash":parent,"transactions":[]});
@@ -437,24 +442,29 @@ impl Fixture {
         ctv: &CandidateCtv,
     ) -> Result<AuditBundle> {
         let (manifest_key, ledger_key) = self.keys();
-        Ok(qbit_prism::build_audit_bundle_with_ctv_settlement_options(
-            snapshot.shares.clone(),
-            FoundBlock {
-                block_height: height,
-                coinbase_value_sats: 500_000_000,
-                network_difficulty: 100,
-                anchor_job_issued_at_ms: snapshot.anchor_ms,
-            },
-            snapshot.prior_balances.clone(),
-            qbit_prism::PayoutPolicy::day_one_default(),
-            ctv.direct_floor_sats,
-            ctv.settlement_config,
-            ctv.fanout_fee_policy,
-            Some("00".repeat(12)),
-            vec![],
-            &manifest_key,
-            &ledger_key,
-        )?)
+        Ok(
+            qbit_prism::build_audit_bundle_body_with_ctv_settlement_options_parallel(
+                &snapshot.shares,
+                FoundBlock {
+                    block_height: height,
+                    coinbase_value_sats: 500_000_000,
+                    network_difficulty: 100,
+                    anchor_job_issued_at_ms: snapshot.anchor_ms,
+                },
+                snapshot.cut,
+                snapshot.prior_balances.clone(),
+                qbit_prism::PayoutPolicy::day_one_default(),
+                ctv.direct_floor_sats,
+                ctv.settlement_config,
+                ctv.fanout_fee_policy,
+                Some("00".repeat(12)),
+                vec![],
+                &manifest_key,
+                &ledger_key,
+                qbit_prism::Parallelism::serial(),
+            )?
+            .into_bundle(snapshot.shares.clone()),
+        )
     }
 
     async fn enqueue_and_claim(&self, found: &Found) -> Result<CandidateClaim> {
@@ -1975,6 +1985,215 @@ async fn a_parent_landing_late_diverges_the_child_which_lands_as_issued_with_add
             "{reason}"
         );
         Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Dual-writer windows (PRISM 3.1)
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Make this frontend node A of a dual-writer pair and take a window on
+    /// its ledger: the fixture's own rows (node 0's), node B's rows at
+    /// `peer`, stamped in the past as the peer sync copies them, and the
+    /// sync's safe mark at `mark`, or no mark while B has not been pulled
+    /// (an idle or unreachable peer).
+    async fn dual_writer_snapshot(&self, peer: &[i64], mark: Option<i64>) -> Result<Snapshot> {
+        let ledger = &self.coordinator.ledger;
+        ledger.set_dual_writer_identity(crate::node_identity::NodeIdentity {
+            node: crate::node_identity::NodeIndex::A,
+            carry_owner: true,
+        })?;
+        // Migration 031's index, which a dual-writer snapshot requires, under
+        // 031's name: a no-op once the schema carries it.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
+        )
+        .execute(&ledger.pool)
+        .await?;
+        for seq in peer {
+            sqlx::query(
+                "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch,origin_node) \
+                 VALUES($1,'peer:'||lpad(to_hex($1),64,'0'),'peer-miner','peer-miner',decode(repeat('33',32),'hex'),100,100,100,'peer',to_timestamp(1),1800000000,to_timestamp(2),true,'peer',0,1)",
+            )
+            .bind(seq)
+            .execute(&ledger.pool)
+            .await?;
+        }
+        if let Some(mark) = mark {
+            sqlx::query(
+                "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) VALUES('shares',1,$1,$1)",
+            )
+            .bind(mark)
+            .execute(&ledger.pool)
+            .await?;
+        }
+        ledger.snapshot(100).await
+    }
+
+    /// Process `found`'s claim through its offer and the post-offer landing,
+    /// which rebuilds the audit from the candidate's stored inputs, and check
+    /// that the block finished submitted with the audit its coinbase
+    /// committed to.
+    async fn offer_and_land(&self, found: &Found) -> Result<()> {
+        let claim = self.enqueue_and_claim(found).await?;
+        tokio::time::timeout(Duration::from_secs(30), self.process(&claim)).await???;
+        self.finished_with(found).await
+    }
+
+    /// The row of `found` finished submitted, offered once, with the audit
+    /// its coinbase committed to landed.
+    async fn finished_with(&self, found: &Found) -> Result<()> {
+        let hash = &found.candidate.block_hash;
+        let (state, _, error) = self.row(hash).await?;
+        ensure!(
+            state == "submitted",
+            "the dual-writer candidate finished as {state}: {error:?}"
+        );
+        ensure!(
+            self.landed(hash).await?,
+            "the dual-writer candidate did not land"
+        );
+        ensure!(self.submissions().await == 1, "the block was offered again");
+        let report = qbit_prism::verify_audit_bundle_with_ledger_public_key(
+            &found.bundle,
+            &self.coordinator.config.ledger_public_key,
+        )?;
+        let landed: String = sqlx::query_scalar(
+            "SELECT audit_bundle_sha256 FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        )
+        .bind(hash)
+        .fetch_one(&self.coordinator.ledger.pool)
+        .await?;
+        ensure!(
+            landed == report.audit_bundle_sha256_hex,
+            "the landed audit is not the bundle the block was found on"
+        );
+        Ok(())
+    }
+}
+
+/// D6's S1 (PRISM 3.1): a dual-writer frontend whose peer has not been
+/// pulled yet finds a block. Its window's cut admits none of the peer's rows,
+/// the coinbase commits that cut, and the post-offer rebuild must reproduce
+/// it for the block to land; one that drops it never lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dual_writer_block_lands_through_its_rebuilt_audit_with_an_idle_peer() -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        // B's rows are here, but no pull has marked them: none is eligible.
+        let snapshot = fixture.dual_writer_snapshot(&[5, 7], None).await?;
+        let cut = snapshot.cut.context("a dual-writer window has no cut")?;
+        ensure!(cut == qbit_prism::WindowCut::new(Some(3), None)?, "{cut:?}");
+        ensure!(snapshot.shares.iter().all(|share| share.share_seq <= 3));
+        let found = fixture.found_on(&snapshot, 101, &PARENT.repeat(32), 0)?;
+        ensure!(found.bundle.reward_manifest.cut == Some(cut));
+        fixture.offer_and_land(&found).await
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+/// D6's S5: both nodes' rows in the window, under CTV settlement, which
+/// rebuilds through the other builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dual_writer_ctv_block_lands_through_its_rebuilt_audit_with_both_nodes_rows() -> Result<()>
+{
+    let _serial = TEST_LOCK.lock().await;
+    let fee = FanoutFeeRatePolicy::new(1000, 12000);
+    let Some(fixture) = Fixture::open_with(|config| {
+        config.ctv_enabled = true;
+        config.ctv_fee = Some(fee);
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let result = async {
+        // B's row 9 is above the mark: outside this window, in the next.
+        let snapshot = fixture.dual_writer_snapshot(&[5, 7, 9], Some(7)).await?;
+        let cut = snapshot.cut.context("a dual-writer window has no cut")?;
+        ensure!(
+            cut == qbit_prism::WindowCut::new(Some(3), Some(7))?,
+            "{cut:?}"
+        );
+        let seqs: Vec<u64> = snapshot
+            .shares
+            .iter()
+            .map(|share| share.share_seq)
+            .collect();
+        ensure!(seqs == [1, 2, 3, 5, 7], "{seqs:?}");
+        let config = &fixture.coordinator.config;
+        let ctv = CandidateCtv {
+            direct_floor_sats: config.ctv_direct_floor,
+            settlement_config: config.ctv_config,
+            fanout_fee_policy: Some(fee),
+        };
+        let found = fixture.found_with(&snapshot, 101, &PARENT.repeat(32), 0, Some(ctv))?;
+        ensure!(found.bundle.reward_manifest.cut == Some(cut));
+        fixture.offer_and_land(&found).await
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+/// Invariant 3: a dual-writer block whose landing failed after its offer
+/// (as every one did while the rebuild dropped the cut) keeps every input
+/// in reconciliation and lands on its retry, without a second offer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dual_writer_block_whose_landing_failed_lands_on_its_reconciliation_retry() -> Result<()>
+{
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let snapshot = fixture.dual_writer_snapshot(&[5, 7], Some(7)).await?;
+        let found = fixture.found_on(&snapshot, 101, &PARENT.repeat(32), 0)?;
+        let hash = found.candidate.block_hash.clone();
+        // The first landing fails after the node took the block: the only
+        // window-read permit is held, so the rebuild never starts and its
+        // deadline expires.
+        let held = fixture
+            .coordinator
+            .window_reads
+            .clone()
+            .acquire_owned()
+            .await?;
+        let claim = fixture.enqueue_and_claim(&found).await?;
+        let lease = CandidateLease {
+            rebuild_deadline: Duration::from_millis(500),
+            ..CANDIDATE_LEASE
+        };
+        tokio::time::timeout(Duration::from_secs(10), fixture.process_with(&claim, lease))
+            .await???;
+        assert_reconciled(&fixture, &hash, "deadline").await?;
+        ensure!(!fixture.landed(&hash).await?, "the failed attempt landed");
+        drop(held);
+        // The retry, once due, recovers the offered row.
+        sqlx::query(
+            "UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1",
+        )
+        .bind(&hash)
+        .execute(&fixture.coordinator.ledger.pool)
+        .await?;
+        let claim = fixture
+            .coordinator
+            .ledger
+            .claim_candidate(120)
+            .await?
+            .context("the reconciliation row was not claimed again")?;
+        ensure!(claim.candidate.block_hash == hash, "claimed another row");
+        tokio::time::timeout(Duration::from_secs(30), fixture.process(&claim)).await???;
+        fixture.finished_with(&found).await
     }
     .await;
     fixture.close().await?;

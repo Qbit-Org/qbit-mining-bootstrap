@@ -44,16 +44,19 @@ async fn open(
 }
 
 /// Migration 031's `(origin_node, share_seq)` index, which a dual-writer
-/// snapshot requires, where this branch's migrations do not create it yet.
+/// snapshot requires, under 031's name: a no-op once the schema carries it.
 async fn origin_index(ledger: &Ledger) -> Result<()> {
-    let indexed: bool = sqlx::query_scalar(ORIGIN_INDEX_SQL)
-        .fetch_one(&ledger.pool)
-        .await?;
-    if !indexed {
-        sqlx::query("CREATE INDEX qbit_share_ledger_origin_seq_until_031 ON qbit_share_ledger (origin_node, share_seq)")
-            .execute(&ledger.pool)
-            .await?;
-    }
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (origin_node, share_seq)",
+    )
+    .execute(&ledger.pool)
+    .await?;
+    ensure!(
+        sqlx::query_scalar::<_, bool>(ORIGIN_INDEX_SQL)
+            .fetch_one(&ledger.pool)
+            .await?,
+        "the origin index does not satisfy the snapshot's check"
+    );
     Ok(())
 }
 
@@ -421,7 +424,8 @@ async fn the_same_window_reproduces_on_the_other_nodes_database() -> Result<()> 
     fixture_b.close(closed).await
 }
 
-/// The two cut reads probe the `(origin_node, share_seq)` index and never walk
+/// The two cut reads probe migration 031's `(origin_node, share_seq)` index,
+/// `qbit_share_ledger_origin_seq_idx` (or its partitions'), and never walk
 /// the other node's rows: on a ledger where node 1's rows all lie under a run
 /// of node 0's, as on a node that idled while its peer served, neither plan
 /// filters rows out of a primary-key walk, with custom or generic plans.
@@ -458,10 +462,30 @@ async fn the_cut_reads_probe_the_origin_index_and_never_walk_the_other_nodes_run
                     }
                     let plan = explain.fetch_all(&mut *tx).await?.join("\n");
                     ensure!(
-                        plan.contains("origin")
-                            && !plan.contains("pkey")
-                            && !plan.contains("Rows Removed by Filter"),
+                        !plan.contains("pkey") && !plan.contains("Rows Removed by Filter"),
                         "{label} under {mode} walks rows:\n{plan}"
+                    );
+                    // Every index the plan reads is 031's or a partition of it.
+                    let mut used: Vec<String> = plan
+                        .split(" using ")
+                        .skip(1)
+                        .filter_map(|rest| rest.split_whitespace().next())
+                        .map(str::to_owned)
+                        .collect();
+                    used.sort();
+                    used.dedup();
+                    let pinned: bool = sqlx::query_scalar(
+                        "SELECT count(*)=cardinality($1::text[]) FROM pg_class c \
+                         WHERE c.relname=ANY($1) AND (c.relname='qbit_share_ledger_origin_seq_idx' \
+                           OR EXISTS(SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid=h.inhparent \
+                                     WHERE h.inhrelid=c.oid AND p.relname='qbit_share_ledger_origin_seq_idx'))",
+                    )
+                    .bind(&used)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    ensure!(
+                        !used.is_empty() && pinned,
+                        "{label} under {mode} reads {used:?}, not migration 031's index:\n{plan}"
                     );
                 }
                 tx.rollback().await?;
