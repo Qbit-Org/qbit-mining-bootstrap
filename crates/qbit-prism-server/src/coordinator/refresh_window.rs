@@ -67,6 +67,9 @@ pub(super) struct RefreshWindow {
     /// The dual-writer peer mark the window's cut was taken at; `None` for a
     /// single writer.
     peer_mark: Option<i64>,
+    /// Whether an accepted peer row at or below that mark waits for a later
+    /// anchor (a peer clock running ahead); `false` for a single writer.
+    peer_pending: bool,
     anchored: Instant,
 }
 
@@ -98,6 +101,9 @@ impl RefreshWindow {
     /// (#619). Nor is a dual-writer window once the peer sync's mark has
     /// moved: the peer's newer rows can all lie below this node's cutoff, so
     /// an equal cutoff does not prove that nothing arrived (CONTRACT D-13).
+    /// Nor is one with a peer row pending: stamped after its anchor by a peer
+    /// clock running ahead, the row joins a later anchor's window with no new
+    /// row and no move of the mark.
     pub fn reusable(
         &self,
         network: u128,
@@ -111,6 +117,7 @@ impl RefreshWindow {
             && self.timeline == timeline
             && self.snapshot.share_seq == share_seq
             && self.peer_mark == peer_mark
+            && !self.peer_pending
             && self.snapshot.payout_revision == state.payout_revision
             && self.reference.prior_balances_digest == state.prior_balances_digest
             && self.within_reanchor_interval(interval)
@@ -188,6 +195,7 @@ impl Coordinator {
                     acquisition,
                     timeline,
                     peer_mark,
+                    peer_pending,
                 } = Arc::try_unwrap(capture)
                     .ok()
                     .expect("both borrowed computations have finished");
@@ -200,6 +208,7 @@ impl Coordinator {
                     leaf,
                     timeline,
                     peer_mark,
+                    peer_pending,
                     anchored,
                 });
                 // Keep the original cache behavior even when body preparation failed.
@@ -233,6 +242,10 @@ mod peer_mark_tests {
     use super::*;
 
     fn window(peer_mark: Option<i64>) -> RefreshWindow {
+        pending_window(peer_mark, false)
+    }
+
+    fn pending_window(peer_mark: Option<i64>, peer_pending: bool) -> RefreshWindow {
         let snapshot = Snapshot {
             anchor_ms: 10,
             share_seq: 40,
@@ -251,6 +264,7 @@ mod peer_mark_tests {
             leaf: None,
             timeline: crate::ledger::WriterTimeline::new(1),
             peer_mark,
+            peer_pending,
             anchored: Instant::now(),
         }
     }
@@ -273,5 +287,9 @@ mod peer_mark_tests {
         assert!(dual.reusable(7, 40, state(&dual), timeline, Some(21), interval));
         assert!(!dual.reusable(7, 40, state(&dual), timeline, Some(23), interval));
         assert!(!dual.reusable(7, 40, state(&dual), timeline, None, interval));
+        // Nor while a peer row below the mark waits for a later anchor: it
+        // joins the next window with nothing else changed.
+        let pending = pending_window(Some(21), true);
+        assert!(!pending.reusable(7, 40, state(&pending), timeline, Some(21), interval));
     }
 }

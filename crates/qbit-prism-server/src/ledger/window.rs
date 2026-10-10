@@ -1330,20 +1330,21 @@ impl Ledger {
         let timeline = WriterTimeline::read(&mut tx).await?;
         // A dual-writer window's cut: the own entry read under ORDER_LOCK
         // above, and the peer's, chosen against this anchor (`window/cut.rs`).
-        // The peer mark the window's cut used, which the refresh compares.
-        let (cut, peer_mark) = match dual_writer_node {
+        // The peer mark the window's cut used, and whether a peer row below
+        // it waits for a later anchor, which the refresh compares.
+        let (cut, peer) = match dual_writer_node {
             Some(node) => {
                 let own = own_bound.map_or(Ok(None), cut::positive_entry)?;
-                let (peer, used) =
+                let peer =
                     cut::read_peer_cut(&mut tx, 1 - node, peer_high_water, anchor_ms).await?;
                 let cut = if node == 0 {
-                    WindowCut::new(own, peer)?
+                    WindowCut::new(own, peer.entry)?
                 } else {
-                    WindowCut::new(peer, own)?
+                    WindowCut::new(peer.entry, own)?
                 };
-                (Some(cut), used)
+                (Some(cut), peer)
             }
-            None => (None, None),
+            None => (None, cut::PeerCut::default()),
         };
         let cursor = cutoff.checked_add(1).context("share sequence exhausted")?;
         // Without a retired window there is nothing to advance from; the
@@ -1391,7 +1392,8 @@ impl Ledger {
                                 leaf: Some(leaf),
                                 acquisition: report,
                                 timeline,
-                                peer_mark,
+                                peer_mark: peer.mark,
+                                peer_pending: peer.pending,
                             })
                         })
                         .await;
@@ -1494,7 +1496,8 @@ impl Ledger {
                     leaf,
                     acquisition: report,
                     timeline,
-                    peer_mark,
+                    peer_mark: peer.mark,
+                    peer_pending: peer.pending,
                 })
             })
             .await

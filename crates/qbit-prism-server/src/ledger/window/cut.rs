@@ -235,8 +235,28 @@ pub(crate) const PEER_HIGH_WATER_SQL: &str = "SELECT qbit_prism_peer_share_mark(
 /// this database no longer holds. The second column is the mark the entry
 /// used, the lower of the two; a NULL mark either time admits no row and
 /// uses none.
+///
+/// The third is the peer's newest accepted row under the same bounds,
+/// whatever its stamps, by the same walk, which stops there. Above the entry
+/// it is a row stamped after the anchor, by a peer clock running ahead, that
+/// a later anchor admits with no new row and no move of the mark.
 const PEER_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 AND share_seq<=$2 AND share_seq<=qbit_prism_peer_share_mark() AND accepted AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY origin_node DESC, share_seq DESC LIMIT 1),\
-     CASE WHEN qbit_prism_peer_share_mark() IS NOT NULL THEN LEAST($2, qbit_prism_peer_share_mark()) END";
+     CASE WHEN qbit_prism_peer_share_mark() IS NOT NULL THEN LEAST($2, qbit_prism_peer_share_mark()) END,\
+     (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 AND share_seq<=$2 AND share_seq<=qbit_prism_peer_share_mark() AND accepted ORDER BY origin_node DESC, share_seq DESC LIMIT 1)";
+
+/// The peer's side of a dual-writer window's cut ([`read_peer_cut`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PeerCut {
+    /// The peer's entry: its newest row the window admits, if any.
+    pub entry: Option<u64>,
+    /// The peer mark the entry used, which the refresh compares.
+    pub mark: Option<i64>,
+    /// Whether an accepted peer row at or below that mark lies above the
+    /// entry, stamped after the anchor: it joins a window anchored once this
+    /// node's clock has passed its stamps, with no new row and no move of
+    /// the mark, so the refresh does not reuse this one for a new template.
+    pub pending: bool,
+}
 
 /// The peer's entry for a window anchored at `anchor_ms`, and the peer mark
 /// it used ([`PEER_CUT_SQL`]): its newest synced row at or below both the
@@ -245,25 +265,33 @@ const PEER_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHER
 /// this database, but one the sync quarantined, and is stamped at or before
 /// the anchor too (a node's stamps rise with its `share_seq`), so the anchor
 /// rule never removes a row the cut admits, and the peer's rows above it
-/// join the next windows.
+/// join the next windows. Whether one of those already waits for this
+/// node's clock is [`PeerCut::pending`].
 pub(crate) async fn read_peer_cut(
     connection: &mut sqlx::PgConnection,
     peer: i16,
     high_water: Option<i64>,
     anchor_ms: i64,
-) -> Result<(Option<u64>, Option<i64>), WindowError> {
+) -> Result<PeerCut, WindowError> {
     let Some(high_water) = high_water else {
-        return Ok((None, None));
+        return Ok(PeerCut::default());
     };
-    let (entry, used): (Option<i64>, Option<i64>) = sqlx::query_as(PEER_CUT_SQL)
-        // Planned with its values, as every bounded ledger read here is.
-        .persistent(false)
-        .bind(peer)
-        .bind(high_water)
-        .bind(anchor_ms)
-        .fetch_one(&mut *connection)
-        .await?;
-    Ok((entry.map_or(Ok(None), positive_entry)?, used))
+    let (entry, mark, newest): (Option<i64>, Option<i64>, Option<i64>) =
+        sqlx::query_as(PEER_CUT_SQL)
+            // Planned with its values, as every bounded ledger read here is.
+            .persistent(false)
+            .bind(peer)
+            .bind(high_water)
+            .bind(anchor_ms)
+            .fetch_one(&mut *connection)
+            .await?;
+    Ok(PeerCut {
+        entry: entry.map_or(Ok(None), positive_entry)?,
+        mark,
+        // The entry is itself an accepted row under the same bounds, so the
+        // newest one is it or above it.
+        pending: newest.is_some_and(|newest| entry.is_none_or(|entry| newest > entry)),
+    })
 }
 
 /// Two more columns for [the holding probe](super::probe_window_holding) of

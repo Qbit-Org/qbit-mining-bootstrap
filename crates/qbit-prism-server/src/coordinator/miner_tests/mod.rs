@@ -58,6 +58,8 @@ pub(crate) struct MemoryLedger {
     /// The dual-writer peer sync's mark the refresh probe and snapshots
     /// report (3.1); `None`, as for a single writer, unless a test sets it.
     pub peer_mark: StdMutex<Option<i64>>,
+    /// Whether the snapshots report a peer row pending a later anchor (3.1).
+    pub peer_pending: StdMutex<bool>,
     /// Full originals belong to the fixture, never to runtime Prepared views.
     originals: StdMutex<HashMap<String, Arc<StoredPrepared>>>,
     pub snapshots: StdMutex<Vec<Snapshot>>,
