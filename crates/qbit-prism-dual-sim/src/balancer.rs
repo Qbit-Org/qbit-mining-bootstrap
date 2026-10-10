@@ -128,13 +128,6 @@ pub struct Transition {
     pub up: bool,
 }
 
-/// A session the balancer routed, when it chose the node.
-#[derive(Clone, Debug, Serialize)]
-pub struct RoutedSession {
-    pub at_ms: u64,
-    pub backend: String,
-}
-
 /// A check that failed, and whether its node was up (serving) then.
 #[derive(Clone, Debug, Serialize)]
 pub struct FailedCheck {
@@ -153,10 +146,6 @@ pub struct BalancerReport {
     pub transitions: Vec<Transition>,
     /// Every failed check, in order.
     pub failed_checks: Vec<FailedCheck>,
-    /// Every session routed, in order. Kept out of the written report: S2
-    /// reads it, and a run's reconnects make it long.
-    #[serde(skip)]
-    pub routings: Vec<RoutedSession>,
     /// Sessions routed to each node over the run.
     pub routed: BTreeMap<String, u64>,
     /// Sessions refused because no node was up.
@@ -210,7 +199,6 @@ struct Shared {
     events: Mutex<Vec<BalancerEvent>>,
     transitions: Mutex<Vec<Transition>>,
     failed_checks: Mutex<Vec<FailedCheck>>,
-    routings: Mutex<Vec<RoutedSession>>,
     next_session: AtomicU64,
     refused: AtomicU64,
 }
@@ -299,7 +287,6 @@ impl Balancer {
             events: Mutex::new(Vec::new()),
             transitions: Mutex::new(Vec::new()),
             failed_checks: Mutex::new(Vec::new()),
-            routings: Mutex::new(Vec::new()),
             next_session: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         });
@@ -398,12 +385,6 @@ impl Balancer {
                 .failed_checks
                 .lock()
                 .map(|f| f.clone())
-                .unwrap_or_default(),
-            routings: self
-                .shared
-                .routings
-                .lock()
-                .map(|r| r.clone())
                 .unwrap_or_default(),
             routed: self
                 .shared
@@ -504,11 +485,8 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
                 failures += 1;
                 shared.failed_check(&backend.target.name, up, &reason);
                 if up && failures >= shared.config.fall {
-                    // Recorded after the state is published, so every session
-                    // routed to the node is dated before its mark-down (a
-                    // routing is dated before it reads the state).
-                    backend.up.send_replace(false);
                     shared.transition(&backend.target.name, false);
+                    backend.up.send_replace(false);
                     let closed = close_all(backend);
                     shared.event(format!(
                         "{} marked down after {failures} failed checks ({reason}); closed {closed} sessions",
@@ -538,9 +516,6 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     let mut turn = 0usize;
     while let Ok((client, _)) = listener.accept().await {
         let _ = client.set_nodelay(true);
-        // Dated before the state is read: a session routed to a node is then
-        // always dated before that node's mark-down.
-        let at_ms = shared.now_ms();
         let up: Vec<usize> = shared
             .backends
             .iter()
@@ -561,12 +536,6 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             crate::relay::reset(client);
             continue;
         };
-        if let Ok(mut routings) = shared.routings.lock() {
-            routings.push(RoutedSession {
-                at_ms,
-                backend: shared.backends[index].target.name.clone(),
-            });
-        }
         let shared = shared.clone();
         tokio::spawn(async move {
             session(client, shared, index).await;
@@ -584,7 +553,12 @@ async fn session(client: TcpStream, shared: Arc<Shared>, index: usize) {
     let id = shared.next_session.fetch_add(1, Ordering::Relaxed);
     let (closer, mut closed) = watch::channel(false);
     if let Ok(mut sessions) = backend.sessions.lock() {
-        sessions.insert(id, closer);
+        sessions.insert(id, closer.clone());
+    }
+    // A session chosen just before its node's mark-down can register after
+    // the mark-down closed every session: close it as the mark-down would.
+    if !*backend.up.borrow() {
+        closer.send_replace(true);
     }
     backend.routed.fetch_add(1, Ordering::Relaxed);
     let (mut client, mut upstream) = (client, upstream);
@@ -734,7 +708,6 @@ mod tests {
                 })
                 .collect(),
             failed_checks: Vec::new(),
-            routings: Vec::new(),
             routed: BTreeMap::new(),
             refused: 0,
         };
