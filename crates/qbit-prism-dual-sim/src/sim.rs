@@ -782,6 +782,25 @@ impl Sim {
             self.frontend_mut(node).stop(Duration::from_secs(30))?;
         }
         self.mark("drained: both frontends stopped");
+        // The drain's precondition: no candidate that can still be offered.
+        // After the promotion both databases hold every candidate, so one
+        // left unfinished could be offered by both nodes (D-2).
+        let pool = self.pool(Node::A).await?;
+        let (offerable, bookkeeping): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE state IN ('pending', 'offer_reserved', 'offered')), \
+                    count(*) FILTER (WHERE state = 'reconciliation') \
+             FROM qbit_block_candidate_outbox",
+        )
+        .fetch_one(&pool)
+        .await?;
+        pool.close().await;
+        ensure!(
+            offerable == 0,
+            "the drain left {offerable} candidates that could still be offered; the cutover must not start"
+        );
+        self.mark(&format!(
+            "no candidate can still be offered; {bookkeeping} landed blocks await their reconciliation bookkeeping"
+        ));
         self.wait_standby_replayed(Duration::from_secs(60)).await?;
         self.pg[&Node::B].promote().await?;
         self.mark("B's standby promoted into an independent primary");

@@ -109,20 +109,23 @@ block whose coinbase carries `/PRISM/`), never from a database's
 | `inv4-windows-reproducible` | every recorded window recomputes to its digest from every database |
 | `ledger-integrity` | `qbit_carry_forward_integrity_report()` is clean everywhere |
 | `candidates-settled` | no block candidate is left unfinished |
-| `d2-local-state-not-copied` | dual-writer pairs, for rows written since the pair began writing as two primaries: no node holds a candidate claimed or reserved by its peer's frontend, or an offer decision for a block it never had as a candidate (only the offering frontend records one, so such a divergence row was copied); each database identifies as its own node (D-2, D-9). After S7's rebuild this is D-16's reset |
+| `d2-local-state-not-copied` | dual-writer pairs, for rows written since the pair began writing as two primaries: no node holds a candidate its peer's frontend claimed or reserved; no candidate or offer decision is the same row on both nodes (same insert timestamp); no node holds an offer decision for a block it never had as a candidate (only the offering frontend records one); no candidate from before a cutover was reserved after it; each database identifies as its own node (D-2, D-9). After S7's rebuild this is D-16's reset |
 
 The negative control (`checker-control`) runs two unsynced single writers
 that both mine and checks that the checker fails exactly the checks that must
 fail and passes the rest.
 
-S1 and S5 also sample the sync order (D-5) while they run. A sampler polls a
-node every 100 ms for peer blocks that have arrived and, in the same
-statement, counts each one's window shares there. A block counted short
-fails, and each direction needs at least one block counted complete as it
-arrived. A block whose window record arrived after it is counted then: short
-still fails (shares only accumulate), complete is reported as unresolved.
-Failed polls are counted and listed. The sampler cannot see an out-of-order
-landing shorter than its poll interval.
+S1 and S5 also sample the sync order while they run (D-5: shares before
+landings; D-10: a block arrives with all its child rows). A sampler takes the
+peer blocks already on a node as its baseline before the scenario goes on,
+then polls every 100 ms for new ones and, in the same statement, counts each
+one's window shares there. A block counted short fails (shares only
+accumulate, so a later short count proves it too), and so does a block seen
+without its audit bundle or window snapshot. Each direction needs at least
+one block seen whole on a poll that followed a good one. A block first seen
+after a failed poll may have arrived during it, so a complete count then is
+reported as unresolved; failed polls are counted and listed. The sampler
+cannot see an out-of-order landing shorter than its poll interval.
 
 ## Scenarios (CONTRACT.md §5)
 
@@ -154,9 +157,11 @@ What each one does:
 - **S3:** B's host dies (frontend and PostgreSQL); A's miners see no gap above
   2 s, and B catches up on return.
 - **S4:** the databases' link blackholed with both nodes up: no gap at the cut
-  or the heal, the balancer withdraws neither node (D-8: a later link loss
-  never withdraws a serving node), A's block is absent from B until the heal,
-  then the sync catches up.
+  or the heal, the balancer keeps both nodes up from the cut until a full
+  mark-down's worth of checks after the catch-up (D-8: a later link loss never
+  withdraws a serving node; checks that failed while a node stayed up are
+  counted), A's block is absent from B until the heal, then the sync catches
+  up.
 - **S5:** round-robin routing, both nodes write; four interleaved blocks land
   on both nodes, each window complete on arrival, B's blocks carry-free.
 - **S6:** a plain PostgreSQL restart with the peer unreachable serves (D-17); a
@@ -170,8 +175,9 @@ What each one does:
   (the block never reaches the chain) or answered by the node and withheld
   (B adopts it; once A returns each node holds one landing of it), with D-19's
   wait on and off.
-- **S9:** the 3.0 pair mines a history, is cut over live (drain, promote B,
-  migrate, identity, B then A in dual mode); both ledgers equal the 3.0
+- **S9:** the 3.0 pair mines a history, is cut over live (drain, with no
+  candidate left that could still be offered, promote B, migrate, identity,
+  B then A in dual mode); both ledgers equal the 3.0
   writer's, every pre-cutover row is node 0, a single-writer start is refused
   (D-12), the owner's first block pays from the 3.0 balances.
 - **S11:** A releases ownership while B lacks one of A's blocks; B's transfer is

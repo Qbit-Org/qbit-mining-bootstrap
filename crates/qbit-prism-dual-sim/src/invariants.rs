@@ -1180,27 +1180,35 @@ pub async fn recorded_windows(pool: &PgPool) -> Result<Vec<RecordedWindow>> {
         .collect())
 }
 
-/// D-13's eligibility predicate over ledger rows `l`, with `$1` the anchor
-/// in milliseconds and `$2`, `$3` the cut: today's anchored predicate when
-/// the window has no cut, otherwise also each node's rows up to its cut (a
-/// null entry admits none of that node's rows).
-fn eligible_sql(window: &RecordedWindow) -> &'static str {
+/// D-13's eligibility predicate over ledger rows `l`, from SQL expressions:
+/// accepted, and accepted and issued no later than `anchor_ms` (in
+/// milliseconds); with `cut`, also each node's rows up to that node's cut.
+/// A cut whose entries are both NULL is no cut (a window recorded before
+/// D-13); a single NULL entry admits none of that node's rows. Without
+/// `cut` the predicate never names `origin_node`, so it reads a 3.0 schema.
+pub(crate) fn eligibility(anchor_ms: &str, cut: Option<(&str, &str)>) -> String {
+    let mut sql = format!(
+        "l.accepted \
+         AND l.accepted_at <= to_timestamp(({anchor_ms})::double precision / 1000) \
+         AND l.job_issued_at <= to_timestamp(({anchor_ms})::double precision / 1000)"
+    );
+    if let Some((cut0, cut1)) = cut {
+        sql.push_str(&format!(
+            " AND ((({cut0}) IS NULL AND ({cut1}) IS NULL) \
+                   OR (l.origin_node = 0 AND l.share_seq <= ({cut0})) \
+                   OR (l.origin_node = 1 AND l.share_seq <= ({cut1})))"
+        ));
+    }
+    sql
+}
+
+/// The predicate for one recorded window, with `$1` the anchor and `$2`,
+/// `$3` the cut (bound as NULL for a window without one; naming them with
+/// their type keeps PostgreSQL from refusing parameters it cannot type).
+fn eligible_sql(window: &RecordedWindow) -> String {
     match window.cut {
-        // $2 and $3 are bound as NULL here; naming them with their type keeps
-        // PostgreSQL from refusing parameters it cannot type.
-        None => {
-            "l.accepted \
-             AND l.accepted_at <= to_timestamp($1::double precision / 1000) \
-             AND l.job_issued_at <= to_timestamp($1::double precision / 1000) \
-             AND $2::bigint IS NULL AND $3::bigint IS NULL"
-        }
-        Some(_) => {
-            "l.accepted \
-             AND l.accepted_at <= to_timestamp($1::double precision / 1000) \
-             AND l.job_issued_at <= to_timestamp($1::double precision / 1000) \
-             AND ((l.origin_node = 0 AND l.share_seq <= $2) \
-                  OR (l.origin_node = 1 AND l.share_seq <= $3))"
-        }
+        None => eligibility("$1", None) + " AND $2::bigint IS NULL AND $3::bigint IS NULL",
+        Some(_) => eligibility("$1", Some(("$2::bigint", "$3::bigint"))),
     }
 }
 
@@ -1371,20 +1379,27 @@ async fn candidates_settled(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
     )))
 }
 
-/// CONTRACT.md D-2 and D-9: what is never copied holds only this node's
-/// own rows. In dual-writer mode, on each node, for rows written since the
-/// pair began writing as two primaries (`Sim::dual_since`; older rows are
-/// the history both databases share after a 3.0 cutover):
+/// CONTRACT.md D-2 and D-9: what is never copied holds only each node's own
+/// rows. In dual-writer mode, for rows written since the pair began writing
+/// as two primaries (`Sim::dual_since`; older rows are the history both
+/// databases share after a 3.0 cutover):
 ///
-/// - no block candidate was claimed or reserved by the peer's frontend: the
-///   outbox and its deferred shares are local, and copying them would credit
-///   twice;
-/// - no offer decision is recorded for a block this node never had as a
-///   candidate. Only the offering frontend records one, in its own database
-///   (`ledger/divergence.rs`), so such a divergence row was copied. A row
+/// - **Candidates.** No node holds one its peer's frontend claimed or
+///   reserved, and no candidate is in both outboxes as the same row (the same
+///   `created_at`, which its insert stamps). Each node finds its own blocks
+///   (disjoint extranonce ranges), so a block in both outboxes is a copy,
+///   unless the second row was made on its own, as S8's adoption may.
+///   Copying the outbox or its deferred shares would credit twice.
+/// - **Offer decisions.** Only the offering frontend records one, in its own
+///   database (`ledger/divergence.rs`). So a divergence row with a decision
+///   is copied when its node never had the block as a candidate, or when
+///   both nodes hold the same decision (the same `offer_decided_at`). A row
 ///   without one is the local reconciler's, which records divergences for
-///   every block it confirms, the peer's included;
-/// - the database identifies as its own node.
+///   every block it confirms, the peer's included.
+/// - **The cutover's history.** No candidate from before the cutover was
+///   reserved after it: the drain must leave none unfinished, or both nodes
+///   could offer it.
+/// - **Identity.** Each database identifies as its own node.
 ///
 /// A disk rebuilt from the peer (S7) holds the peer's local rows until D-16's
 /// re-personalise resets them, so there this also checks that reset.
@@ -1398,17 +1413,22 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             ))
         }
     };
+    let copied = "copied (D-2), or left by a rebuild that re-personalise did not reset (D-16)";
     let mut check = CheckBuilder::new("d2-local-state-not-copied");
-    let mut candidates = BTreeMap::new();
+    // Per node: (block, created_at in microseconds) of each candidate since
+    // the epoch, and (block, offer_decided_at) of each offer decision.
+    let mut outboxes: BTreeMap<Node, BTreeSet<(String, i64)>> = BTreeMap::new();
+    let mut decisions: BTreeMap<Node, BTreeSet<(String, i64)>> = BTreeMap::new();
     for (node, pool) in pools {
         let peer = node.peer();
-        let own: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM qbit_block_candidate_outbox WHERE created_at >= $1",
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT block_hash, (extract(epoch FROM created_at) * 1000000)::bigint \
+             FROM qbit_block_candidate_outbox WHERE created_at >= $1",
         )
         .bind(since)
-        .fetch_one(pool)
+        .fetch_all(pool)
         .await?;
-        candidates.insert(node.label(), own);
+        outboxes.insert(*node, rows.into_iter().collect());
         let peers: Vec<(String, String)> = sqlx::query_as(
             "SELECT block_hash, state FROM qbit_block_candidate_outbox \
              WHERE created_at >= $2 AND (offer_reserved_by = $1 OR claim_instance_id = $1) \
@@ -1421,11 +1441,32 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
         for (hash, state) in peers {
             check.problem(format!(
                 "node {node:?} holds candidate {hash} ({state}), claimed or reserved by node \
-                 {peer:?}'s frontend: copied (D-2), or left by a rebuild that re-personalise \
-                 did not reset (D-16)"
+                 {peer:?}'s frontend: {copied}"
             ));
         }
-        let decisions: Vec<(String, String)> = sqlx::query_as(
+        let reoffered: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT block_hash, offer_reserved_by FROM qbit_block_candidate_outbox \
+             WHERE created_at < $1 AND offer_reserved_at >= $1 ORDER BY offer_reserved_at",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        for (hash, by) in reoffered {
+            check.problem(format!(
+                "node {node:?} reserved candidate {hash} from before the cutover after it (by \
+                 {by:?}): the drain left it unfinished, so both nodes could offer it"
+            ));
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT block_hash, (extract(epoch FROM offer_decided_at) * 1000000)::bigint \
+             FROM qbit_prism_payout_divergences \
+             WHERE offer_decision IS NOT NULL AND offer_decided_at >= $1",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        decisions.insert(*node, rows.into_iter().collect());
+        let orphaned: Vec<(String, String)> = sqlx::query_as(
             "SELECT d.block_hash, d.offer_decision FROM qbit_prism_payout_divergences d \
              WHERE d.offer_decision IS NOT NULL AND d.offer_decided_at >= $1 \
                AND NOT EXISTS (SELECT 1 FROM qbit_block_candidate_outbox o \
@@ -1435,11 +1476,10 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
         .bind(since)
         .fetch_all(pool)
         .await?;
-        for (hash, decision) in decisions {
+        for (hash, decision) in orphaned {
             check.problem(format!(
                 "node {node:?} records an offer decision ({decision}) for block {hash}, which it \
-                 never had as a candidate: a divergence row copied (D-2), or left by a rebuild \
-                 that re-personalise did not reset (D-16)"
+                 never had as a candidate: {copied}"
             ));
         }
         let identity: Option<i16> =
@@ -1452,8 +1492,28 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             ));
         }
     }
+    if let (Some(a), Some(b)) = (outboxes.get(&Node::A), outboxes.get(&Node::B)) {
+        for (hash, _) in a.intersection(b) {
+            check.problem(format!(
+                "candidate {hash} is the same row in both outboxes: {copied}"
+            ));
+        }
+    }
+    if let (Some(a), Some(b)) = (decisions.get(&Node::A), decisions.get(&Node::B)) {
+        for (hash, _) in a.intersection(b) {
+            check.problem(format!(
+                "the offer decision for block {hash} is the same row on both nodes: {copied}"
+            ));
+        }
+    }
     check.data("since", json!(since));
-    check.data("own_candidates_since", json!(candidates));
+    check.data(
+        "candidates_since",
+        json!(outboxes
+            .iter()
+            .map(|(node, rows)| (node.label(), rows.len()))
+            .collect::<BTreeMap<_, _>>()),
+    );
     Ok(check.finish(format!(
         "candidates, offer decisions and identities since {since} are each node's own"
     )))
@@ -1473,6 +1533,30 @@ pub fn write(report: &InvariantReport, dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eligibility_names_the_cut_only_with_one_and_treats_two_nulls_as_none() {
+        let anchored = eligibility("$1", None);
+        assert!(anchored.contains("l.accepted_at <= to_timestamp(($1)::double precision / 1000)"));
+        assert!(!anchored.contains("origin_node"), "reads a 3.0 schema");
+        let cut = eligibility("s.anchor_ms", Some(("s.cut_seq_0", "s.cut_seq_1")));
+        assert!(cut.contains("((s.cut_seq_0) IS NULL AND (s.cut_seq_1) IS NULL)"));
+        assert!(cut.contains("(l.origin_node = 1 AND l.share_seq <= (s.cut_seq_1))"));
+        let recorded = RecordedWindow {
+            snapshot: String::new(),
+            first: 1,
+            last: 2,
+            anchor_ms: 3,
+            count: 2,
+            cut: None,
+        };
+        assert!(eligible_sql(&recorded).ends_with("AND $2::bigint IS NULL AND $3::bigint IS NULL"));
+        let cut_window = RecordedWindow {
+            cut: Some((Some(5), None)),
+            ..recorded
+        };
+        assert!(eligible_sql(&cut_window).contains("l.share_seq <= ($2::bigint)"));
+    }
 
     #[test]
     fn the_pinned_keys_are_the_test_seeds_keys() -> Result<()> {

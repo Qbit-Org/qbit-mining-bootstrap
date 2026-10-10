@@ -120,14 +120,52 @@ pub struct BalancerEvent {
     pub event: String,
 }
 
+/// A node marked up or down by its checks.
+#[derive(Clone, Debug, Serialize)]
+pub struct Transition {
+    pub at_ms: u64,
+    pub backend: String,
+    pub up: bool,
+}
+
+/// A check that failed, and whether its node was up (serving) then.
+#[derive(Clone, Debug, Serialize)]
+pub struct FailedCheck {
+    pub at_ms: u64,
+    pub backend: String,
+    pub while_up: bool,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BalancerReport {
     pub config: BalancerConfig,
+    /// What happened, as text, for the scenario's timeline.
     pub events: Vec<BalancerEvent>,
+    /// Every mark-up and mark-down, in order.
+    pub transitions: Vec<Transition>,
+    /// Every failed check, in order.
+    pub failed_checks: Vec<FailedCheck>,
     /// Sessions routed to each node over the run.
     pub routed: BTreeMap<String, u64>,
     /// Sessions refused because no node was up.
     pub refused: u64,
+}
+
+impl BalancerReport {
+    /// Whether `backend` was up for the whole of `from_ms..=to_ms`: marked up
+    /// at or before `from_ms`, and not marked down again until `to_ms`.
+    pub fn up_throughout(&self, backend: &str, from_ms: u64, to_ms: u64) -> bool {
+        let mut up = false;
+        for transition in self.transitions.iter().filter(|t| t.backend == backend) {
+            if transition.at_ms <= from_ms {
+                up = transition.up;
+            } else if transition.at_ms <= to_ms && !transition.up {
+                return false;
+            }
+        }
+        up
+    }
 }
 
 struct Backend {
@@ -146,15 +184,44 @@ struct Shared {
     backends: Vec<Backend>,
     started: Instant,
     events: Mutex<Vec<BalancerEvent>>,
+    transitions: Mutex<Vec<Transition>>,
+    failed_checks: Mutex<Vec<FailedCheck>>,
     next_session: AtomicU64,
     refused: AtomicU64,
 }
 
 impl Shared {
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
     fn event(&self, event: String) {
-        let at_ms = self.started.elapsed().as_millis() as u64;
+        let at_ms = self.now_ms();
         if let Ok(mut events) = self.events.lock() {
             events.push(BalancerEvent { at_ms, event });
+        }
+    }
+
+    fn transition(&self, backend: &str, up: bool) {
+        let at_ms = self.now_ms();
+        if let Ok(mut transitions) = self.transitions.lock() {
+            transitions.push(Transition {
+                at_ms,
+                backend: backend.to_owned(),
+                up,
+            });
+        }
+    }
+
+    fn failed_check(&self, backend: &str, while_up: bool, reason: &str) {
+        let at_ms = self.now_ms();
+        if let Ok(mut failed) = self.failed_checks.lock() {
+            failed.push(FailedCheck {
+                at_ms,
+                backend: backend.to_owned(),
+                while_up,
+                reason: reason.to_owned(),
+            });
         }
     }
 }
@@ -205,6 +272,8 @@ impl Balancer {
                 .collect(),
             started,
             events: Mutex::new(Vec::new()),
+            transitions: Mutex::new(Vec::new()),
+            failed_checks: Mutex::new(Vec::new()),
             next_session: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         });
@@ -292,6 +361,18 @@ impl Balancer {
                 .lock()
                 .map(|e| e.clone())
                 .unwrap_or_default(),
+            transitions: self
+                .shared
+                .transitions
+                .lock()
+                .map(|t| t.clone())
+                .unwrap_or_default(),
+            failed_checks: self
+                .shared
+                .failed_checks
+                .lock()
+                .map(|f| f.clone())
+                .unwrap_or_default(),
             routed: self
                 .shared
                 .backends
@@ -377,6 +458,7 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
                 passes += 1;
                 if !up && passes >= shared.config.rise {
                     backend.up.send_replace(true);
+                    shared.transition(&backend.target.name, true);
                     shared.event(format!(
                         "{} marked up after {passes} passing checks",
                         backend.target.name
@@ -386,8 +468,10 @@ async fn check_loop(shared: Arc<Shared>, index: usize, client: reqwest::Client) 
             Err(reason) => {
                 passes = 0;
                 failures += 1;
+                shared.failed_check(&backend.target.name, up, &reason);
                 if up && failures >= shared.config.fall {
                     backend.up.send_replace(false);
+                    shared.transition(&backend.target.name, false);
                     let closed = close_all(backend);
                     shared.event(format!(
                         "{} marked down after {failures} failed checks ({reason}); closed {closed} sessions",
@@ -590,6 +674,47 @@ mod tests {
         Ok((String::from_utf8_lossy(&name).into_owned(), stream))
     }
 
+    #[test]
+    fn up_throughout_needs_an_up_mark_before_the_span_and_no_down_mark_inside_it() {
+        let marks = |marks: &[(u64, &str, bool)]| BalancerReport {
+            config: BalancerConfig::default(),
+            events: Vec::new(),
+            transitions: marks
+                .iter()
+                .map(|&(at_ms, backend, up)| Transition {
+                    at_ms,
+                    backend: backend.into(),
+                    up,
+                })
+                .collect(),
+            failed_checks: Vec::new(),
+            routed: BTreeMap::new(),
+            refused: 0,
+        };
+        let report = marks(&[
+            (100, "a", true),
+            (500, "a", false),
+            (900, "a", true),
+            (50, "b", true),
+        ]);
+        assert!(report.up_throughout("a", 100, 499));
+        assert!(
+            !report.up_throughout("a", 100, 500),
+            "marked down inside the span"
+        );
+        assert!(
+            !report.up_throughout("a", 600, 800),
+            "down when the span starts"
+        );
+        assert!(report.up_throughout("a", 900, 5_000));
+        assert!(
+            !report.up_throughout("a", 50, 200),
+            "not yet up when the span starts"
+        );
+        assert!(report.up_throughout("b", 50, 5_000));
+        assert!(!report.up_throughout("c", 0, 1), "never marked up");
+    }
+
     #[tokio::test]
     async fn sessions_prefer_a_move_to_b_when_a_fails_and_fail_back_at_the_paced_rate() -> Result<()>
     {
@@ -668,6 +793,23 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // The same run, as structured records: A went up, down and up again,
+        // and the checks that took it down failed while it was serving.
+        let report = balancer.report();
+        let a: Vec<bool> = report
+            .transitions
+            .iter()
+            .filter(|t| t.backend == "a")
+            .map(|t| t.up)
+            .collect();
+        assert_eq!(a, vec![true, false, true]);
+        let serving_failures = report
+            .failed_checks
+            .iter()
+            .filter(|f| f.backend == "a" && f.while_up)
+            .count();
+        // At least fall (3); a check timing out on a busy host adds more.
+        assert!(serving_failures >= 3, "{:?}", report.failed_checks);
         Ok(())
     }
 
