@@ -1768,7 +1768,11 @@ pub async fn local_state_check(
             ));
         }
     }
+    // The cross-node findings, counted too: the problem list is capped, and
+    // they come after every node's own.
+    let mut on_both = BTreeMap::new();
     if let (Some(a), Some(b)) = (outboxes.get(&Node::A), outboxes.get(&Node::B)) {
+        on_both.insert("candidates", a.intersection(b).count());
         for (hash, _) in a.intersection(b) {
             check.problem(format!(
                 "candidate {hash} is the same row in both outboxes: {copied}"
@@ -1776,6 +1780,7 @@ pub async fn local_state_check(
         }
     }
     if let (Some(a), Some(b)) = (decisions.get(&Node::A), decisions.get(&Node::B)) {
+        on_both.insert("offer_decisions", a.intersection(b).count());
         for (hash, _) in a.intersection(b) {
             check.problem(format!(
                 "the offer decision for block {hash} is the same row on both nodes: {copied}"
@@ -1783,6 +1788,7 @@ pub async fn local_state_check(
         }
     }
     if let (Some(a), Some(b)) = (deferred.get(&Node::A), deferred.get(&Node::B)) {
+        on_both.insert("deferred_shares", a.intersection(b).count());
         for (hash, share) in a.intersection(b) {
             check.problem(format!(
                 "the deferred solving share {share} of block {hash} is on both nodes, so both \
@@ -1791,6 +1797,7 @@ pub async fn local_state_check(
         }
     }
     check.data("since", json!(since));
+    check.data("same_rows_on_both_nodes", json!(on_both));
     check.data(
         "candidates_since",
         json!(outboxes
