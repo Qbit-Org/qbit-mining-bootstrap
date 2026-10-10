@@ -135,10 +135,13 @@ cannot see an out-of-order landing shorter than its poll interval.
 | S1 | `s01_steady_state_*` | PR, nightly | the 3.1 stack |
 | S2 | `s02_a_frontend_killed_*` (PR), `s02_a_postgres_killed_*`, `s02_a_frozen_*`, `s02_a_network_dropped_*` | PR, nightly | the 3.1 stack |
 | S2, mid-pull | `s02_a_frozen_again_and_again_mid_pull_*` | nightly | the 3.1 stack |
+| S2, puller death | `s02_a_puller_dying_mid_read_*` | nightly | single-statement peer reads (D1) |
 | S3 | `s03_b_dies_*` | nightly | the 3.1 stack |
 | S4 | `s04_link_cut_*` | PR, nightly | the 3.1 stack |
+| S4, transient apply | `s04_a_transient_failure_applying_bs_block_*` | nightly | retried peer blocks (D1) |
 | S5 | `s05_both_nodes_writing_*` | PR, nightly | the 3.1 stack |
 | S6 | `s06_a_restored_*`, `s06_b_restored_*` | nightly | own-log recovery and the D-8 latch |
+| S6, unreadable peer | `s06_a_restarts_and_serves_while_b_answers_*` (locked, refused) | nightly | the latch without a readable peer (D1) |
 | S7 | `s07_b_disk_replaced_*`, `s07_a_disk_replaced_*` | nightly | `node-identity repersonalise` (D-16) |
 | S8 | `s08_a_block_lost_*`, `s08_a_block_accepted_*`, `s08_without_the_peer_ingest_wait_*` | nightly | adoption (D-10, D-11) and the D-19 wait |
 | S9 | `s09_a_3_0_ledger_cut_over_*` | nightly | the 3.1 stack |
@@ -165,6 +168,13 @@ What each one does:
   B also finds a block, which must land. D1's sync barrier, held by a frozen
   puller, would stall exactly these writes. The schedule's seed and every
   round are in `freezes.json`.
+- **S2, puller death** (D1 engine review, P1 2): both nodes take miners at
+  250 shares/s. For 20 s, B is sampled every 10 ms and must never show A's
+  peer backend idle in transaction. Then A's database link is blackholed, so
+  B never sees the close (as when A's host dies; a plain kill -9 sends a FIN),
+  and A's frontend is killed while its puller is busy on B. A's backends on B
+  must hold no snapshot or transaction beyond 10 s, and B's share answer
+  latency must stay flat (late p95 at most twice the early p95, plus 50 ms).
 - **S3:** B's host dies (frontend and PostgreSQL); A's miners see no gap above
   2 s, and B catches up on return.
 - **S4:** the databases' link blackholed with both nodes up: no gap at the cut
@@ -173,12 +183,21 @@ What each one does:
   withdraws a serving node; checks that failed while a node stayed up are
   counted), A's block is absent from B until the heal, then the sync catches
   up.
+- **S4, transient apply** (D1 engine review, P1 3): A holds EXCLUSIVE on its
+  audit bundles (landing inserts time out at 5 s, reads go on) while B lands a
+  block, and for 12 s more. Once the lock clears, the block must land and
+  confirm on A, with no sync conflict recorded for it: retried, never skipped.
 - **S5:** round-robin routing, both nodes write; four interleaved blocks land
   on both nodes, each window complete on arrival, B's blocks carry-free.
 - **S6:** a plain PostgreSQL restart with the peer unreachable serves (D-17); a
   restore onto a new timeline with the peer unreachable stays unready for
   20 s (D-8, D-17); after the heal the node holds every own row the peer
   holds at its first ready reading.
+- **S6, unreadable peer** (D1 engine review, P1 1): B accepts the peer role
+  but every read of its share ledger hangs (an ACCESS EXCLUSIVE lock) or fails
+  (SELECT revoked). A is restarted with its database untouched and must report
+  ready and take miners within 120 s (D-8, D-17); then B is healed and the
+  pair catches up.
 - **S7:** the node's host dies, its disk is wiped and rebuilt as a promoted
   physical copy of the peer, re-personalised (D-16); only its measured tail is
   excused.

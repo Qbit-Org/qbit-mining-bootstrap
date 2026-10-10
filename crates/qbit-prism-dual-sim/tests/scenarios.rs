@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use qbit_prism_dual_sim::frontend::Node;
 use qbit_prism_dual_sim::{
     report::ScenarioReport,
-    scenarios::{self, Death, DeathAtFind, Scenario},
+    scenarios::{self, Death, DeathAtFind, Scenario, Unreadable},
     sim::{self, Inputs},
 };
 use qbit_prism_test_gate as gate;
@@ -168,6 +168,13 @@ async fn s02_a_frozen_again_and_again_mid_pull_never_stalls_b() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s02_a_puller_dying_mid_read_leaves_b_no_snapshot_and_flat_appends() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S02PullerDiesMidRead, gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
 async fn s02_a_network_dropped_miners_move_to_b_and_a_merges_on_heal() -> Result<()> {
     let gated = gated!();
     run(Scenario::S02ADies(Death::NetworkDrop), gated).await
@@ -185,6 +192,13 @@ async fn s03_b_dies_a_is_unaffected_and_b_catches_up_on_return() -> Result<()> {
 async fn s04_link_cut_with_both_alive_costs_no_mining_and_sync_catches_up_on_heal() -> Result<()> {
     let gated = gated!();
     run(Scenario::S04LinkCut, gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s04_a_transient_failure_applying_bs_block_is_retried_until_it_lands() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S04TransientApply, gated).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -209,6 +223,20 @@ async fn s06_b_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_re
 {
     let gated = gated!();
     run(Scenario::S06Restore(Node::B), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s06_a_restarts_and_serves_while_b_answers_but_its_ledger_is_locked() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S06PeerUnreadable(Unreadable::Locked), gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s06_a_restarts_and_serves_while_b_answers_but_refuses_its_reads() -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S06PeerUnreadable(Unreadable::Refused), gated).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
