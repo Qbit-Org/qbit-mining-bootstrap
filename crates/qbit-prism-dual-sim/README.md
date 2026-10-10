@@ -119,7 +119,7 @@ block whose coinbase carries `/PRISM/`), never from a database's
 | `inv4-windows-unchanged` | every recorded window still has exactly its shares, and no newer share is eligible for it |
 | `inv4-windows-reproducible` | every recorded window recomputes to its digest from every database |
 | `ledger-integrity` | `qbit_carry_forward_integrity_report()` is clean everywhere |
-| `candidates-settled` | no block candidate is left unfinished, except one a scenario names as kept for reconciliation with no landing (S8's lost block) |
+| `candidates-settled` | no block candidate is left unfinished, except one a scenario names as kept for reconciliation with its block never confirmed (S8's lost block) |
 | `d2-local-state-not-copied` | dual-writer pairs, for rows written since the pair began writing as two primaries: no node holds a candidate its peer's frontend claimed or reserved; no candidate or offer decision is the same row on both nodes (same insert timestamp); no node holds an offer decision for a block it never had as a candidate (only the offering frontend records one); no candidate from before a cutover was reserved after it; each database identifies as its own node (D-2, D-9). After S7's rebuild this is D-16's reset |
 
 The negative control (`checker-control`) runs two unsynced single writers
