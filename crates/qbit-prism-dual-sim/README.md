@@ -272,10 +272,11 @@ prescribes (below):
   (refused as `stale-job`, or accepted under the stale grace without
   becoming a candidate). Each retry is on the scenario's timeline.
 - **A runbook's wait.** S7 retries `node-identity repersonalise` every 5 s,
-  for at most 90 s, while it refuses only because the rebuilt copy's carried
-  frontend rows still look alive: D1's runbook says they stop counting 60 s
-  after the copy stopped following its peer. Any other refusal fails at once;
-  the wait is on the timeline and in the expectation.
+  for at most 90 s, while its refusal names the rebuilt copy's carried
+  frontend rows, which D1's runbook says stop counting 60 s after the copy
+  stopped following its peer. A refusal without that reason fails at once;
+  one that names it beside others is retried until the rows age out, then
+  fails on the rest. The wait is on the timeline and in the expectation.
 - **Clocks.** Only C runs on a mock clock, during the ramp and the catch-up
   that walks a cached chain up to the wall clock. A and B keep the wall
   clock: a jump of theirs would expire their block downloads and drop the

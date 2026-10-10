@@ -587,23 +587,47 @@ fn run(program: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Every loopback port this process has handed out ([`free_port`]) or bound
+/// and kept ([`fresh_listener`]). A port handed out is unbound until its
+/// user binds it, so without this the kernel could offer it again in the
+/// meantime, to the next draw or to a relay's own listener, and two parts of
+/// one scenario would collide.
+static PORTS: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Record `port` as this process's; `false` if it already was.
+fn claim(port: u16) -> Result<bool> {
+    Ok(PORTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the port registry is poisoned"))?
+        .insert(port))
+}
+
 /// A port nobody listens on now, and one this process has not handed out
-/// before. The listener is dropped before the port's user binds it, so two
-/// ports taken in a row could otherwise come back the same and collide
-/// within one scenario. A collision with another process still fails the
-/// start loudly, never silently.
+/// or bound before. The listener is dropped before the port's user binds
+/// it. A collision with another process still fails the start loudly,
+/// never silently.
 pub fn free_port() -> Result<u16> {
-    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
     for _ in 0..64 {
         let port = std::net::TcpListener::bind("127.0.0.1:0")?
             .local_addr()?
             .port();
-        let mut handed_out = HANDED_OUT
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the port registry is poisoned"))?;
-        if handed_out.insert(port) {
+        if claim(port)? {
             return Ok(port);
+        }
+    }
+    anyhow::bail!("no port this process has not handed out already, in 64 tries")
+}
+
+/// A loopback listener, non-blocking and kept, on a port no other part of
+/// this process was given: for the relays, the balancer and the RPC gates,
+/// which bind their own port and hold it.
+pub fn fresh_listener() -> Result<std::net::TcpListener> {
+    for _ in 0..64 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        if claim(listener.local_addr()?.port())? {
+            listener.set_nonblocking(true)?;
+            return Ok(listener);
         }
     }
     anyhow::bail!("no port this process has not handed out already, in 64 tries")
@@ -638,8 +662,10 @@ pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn free_ports_are_never_handed_out_twice() {
-        let ports: Vec<u16> = (0..200).map(|_| super::free_port().unwrap()).collect();
+    fn free_ports_and_kept_listeners_never_share_a_port() {
+        let mut ports: Vec<u16> = (0..200).map(|_| super::free_port().unwrap()).collect();
+        let kept: Vec<_> = (0..50).map(|_| super::fresh_listener().unwrap()).collect();
+        ports.extend(kept.iter().map(|l| l.local_addr().unwrap().port()));
         let distinct: std::collections::BTreeSet<_> = ports.iter().collect();
         assert_eq!(distinct.len(), ports.len());
     }
