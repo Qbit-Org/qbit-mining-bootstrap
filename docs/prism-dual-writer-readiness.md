@@ -184,8 +184,10 @@ admission is inside the grace. It fails on a fault:
   before the start refuses the frontend's start);
 - a stale snapshot or a stalled runtime (the body's `error`), or
   `job-delivery-stalled`;
-- a `writer_path` other than `local`: the database unreachable, read-only,
-  never personalised or the peer's;
+- a `writer_path` of `remote`, `unidentified` or `read_only`: a database that
+  is the peer's, never personalised or read-only, at once;
+- a `writer_path` of `unanswered` once admission has withdrawn the frontend:
+  a slow probe that the frontend rides out does not fail it;
 - readiness lost for longer than the grace, or not yet gained after the
   catch-up. A cluster halted at runtime shows this way: its payout revision
   is no longer served, so the frontend withdraws once the grace has run out.

@@ -37,8 +37,10 @@ pub fn readiness(status: StatusCode, health: serde_json::Result<Value>) -> Resul
 /// itself: the own-log catch-up (D-8) and a dip inside the admission grace.
 /// Everything else is a fault: a stale snapshot or stalled runtime (the
 /// handler's `error`), stalled job delivery, a database that is not this
-/// node's local writable primary or does not answer (`writer_path`, D-9),
-/// and readiness lost for longer than the grace, which is also how a
+/// node's local writable primary (`writer_path` remote, unidentified,
+/// read-only or none), one that has stopped answering for long enough to
+/// withdraw the frontend (a slow probe that admission rides out is not a
+/// fault yet), and readiness lost for longer than the grace, which is also how a
 /// cluster halted at runtime shows (its payout revision is no longer
 /// served). A halted cluster refuses the frontend's start, so no answer at
 /// all is the other way it shows.
@@ -52,15 +54,13 @@ pub fn dual_writer_liveness(health: &Value) -> Result<()> {
         "PRISM is unhealthy: {status}"
     );
     let writer = &health["dual_writer"]["writer_path"];
+    let admitting = health["admission"]["admitting"] == true;
     ensure!(
-        writer == "local",
+        writer == "local" || (writer == "unanswered" && admitting),
         "PRISM is unhealthy: its database is not this node's local writable primary \
          (dual_writer.writer_path {writer})"
     );
-    if health["ok"] == true
-        || health["dual_writer"]["own_log_caught_up"] == false
-        || health["admission"]["admitting"] == true
-    {
+    if health["ok"] == true || health["dual_writer"]["own_log_caught_up"] == false || admitting {
         return Ok(());
     }
     bail!(
@@ -124,6 +124,11 @@ mod tests {
                 UNAVAILABLE,
                 dual(false, true, json!("local"), "grace"),
             ),
+            (
+                "one slow probe that admission rides out",
+                UNAVAILABLE,
+                dual(false, true, json!("unanswered"), "grace"),
+            ),
         ] {
             judge(status, &health).unwrap_or_else(|error| panic!("{case}: {error:#}"));
         }
@@ -143,6 +148,26 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("writer_path"), "{writer}: {error}");
+        }
+        // A database that has stopped answering fails once it has withdrawn
+        // the frontend; any other wrong writer fails at once, grace or not.
+        let error = judge(
+            UNAVAILABLE,
+            &dual(false, true, json!("unanswered"), "withdrawn"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("writer_path"), "{error}");
+        for writer in [
+            json!("remote"),
+            json!("unidentified"),
+            json!("read_only"),
+            Value::Null,
+        ] {
+            assert!(
+                judge(UNAVAILABLE, &dual(false, true, writer.clone(), "grace")).is_err(),
+                "{writer} inside the grace"
+            );
         }
         let mut stale = dual(true, true, json!("local"), "admitting");
         stale["ok"] = json!(false);
