@@ -420,6 +420,17 @@ impl SchemaCoverage {
     }
 }
 
+/// The columns of copied `table` that are each node's own: the peer sync
+/// never compares them, and carries none but a prepared job's `expires_at`
+/// (its value as the peer held it when pulled, D-11).
+pub fn local_columns(table: &str) -> Vec<&'static str> {
+    named_columns()
+        .into_iter()
+        .filter(|(named, _)| *named == table)
+        .map(|(_, column)| column)
+        .collect()
+}
+
 /// Every column the inventory names, as `(table, column)`.
 fn named_columns() -> Vec<(&'static str, &'static str)> {
     let mut named = Vec::new();

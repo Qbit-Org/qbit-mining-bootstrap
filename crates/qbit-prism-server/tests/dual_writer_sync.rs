@@ -848,3 +848,43 @@ async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
     })
     .await
 }
+
+/// The sync carries exactly the columns of each copied table that the table
+/// inventory does not name as a node's own (ledger/table_inventory.rs), but
+/// a prepared job's `expires_at`, which it copies as the peer held it, so
+/// that a column a migration adds to a copied table is either carried or
+/// named local, never both and never neither.
+#[tokio::test]
+async fn the_sync_carries_every_column_the_inventory_does_not_keep_local() -> Result<()> {
+    use qbit_prism_server::{ledger::table_inventory, peer_sync::COPIED_TABLES};
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = FixtureDatabase::open(&raw, "sync_columns_").await?;
+    let ledger = Ledger::connect(&db.url, "columns".into(), 4, true).await?;
+    let result = async {
+        let carried = ledger.carried_columns().await?;
+        for table in COPIED_TABLES {
+            let all: Vec<String> = sqlx::query_scalar(
+                "SELECT attname::text FROM pg_attribute WHERE attrelid=$1::regclass AND attnum>0 AND NOT attisdropped ORDER BY attname",
+            )
+            .bind(table)
+            .fetch_all(&ledger.pool)
+            .await?;
+            let local = table_inventory::local_columns(table);
+            for column in &all {
+                let is_carried = carried.of(table).contains(column);
+                let is_local = local.contains(&column.as_str());
+                let copied_as_held = *table == "qbit_prism_jobs" && column == "expires_at";
+                ensure!(
+                    is_carried != is_local || copied_as_held,
+                    "{table}.{column} is carried {is_carried} and local {is_local}"
+                );
+            }
+        }
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    db.close(result).await
+}

@@ -98,6 +98,9 @@ fn carried(table: &str) -> Carried {
         "qbit_pool_payout_entries" | "qbit_payout_carry_forward" => {
             Carried::AllBut(&["maturity_state"])
         }
+        // Stored when this database seals a share partition, so it follows
+        // this database's partitions (table_inventory.rs).
+        "qbit_pool_audit_bundles" => Carried::AllBut(&["canonical_audit_bytes"]),
         _ => Carried::AllBut(&[]),
     }
 }
@@ -167,7 +170,8 @@ impl CarriedColumns {
         Ok(Self(carried_columns))
     }
 
-    fn of(&self, table: &str) -> &[String] {
+    /// The carried columns of `table`.
+    pub fn of(&self, table: &str) -> &[String] {
         self.0.get(table).map(Vec::as_slice).unwrap_or_default()
     }
 
@@ -1371,7 +1375,7 @@ mod tests {
             if let Carried::AllBut(local) = carried(table) {
                 for column in local {
                     assert!(
-                        ["maturity_state"].contains(column),
+                        ["maturity_state", "canonical_audit_bytes"].contains(column),
                         "{table}.{column} is excluded but not a known derived column"
                     );
                 }
