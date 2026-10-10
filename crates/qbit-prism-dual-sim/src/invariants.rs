@@ -26,7 +26,8 @@
 //! 3. `inv3-landing-rows`: every census block has its landing rows in every
 //!    checked database (block, audit bundle and snapshot, one payout entry
 //!    per manifest account, one carry row per miner account, its CTV fanout
-//!    set and artifacts), identical across databases.
+//!    set and artifacts), the same in every database in every column the
+//!    peer sync carries (provenance included; a snapshot by its content).
 //!    `inv3-audits-verify`: each node's frontend serves the block's bundle,
 //!    `qbit-prism-audit-verify` accepts it against the coinbase from the
 //!    chain with the pinned ledger key, its manifest key is the pinned one,
@@ -52,6 +53,7 @@ use crate::{
     sim::{Sim, Topology},
 };
 use anyhow::{bail, Context, Result};
+use qbit_prism_server::ledger::peer_sync::CarriedColumns;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -695,7 +697,7 @@ async fn landing_rows(
 ) -> Result<Check> {
     let mut check = CheckBuilder::new("inv3-landing-rows");
     let hashes: Vec<String> = census.iter().map(|block| block.hash.clone()).collect();
-    let mut fingerprints: BTreeMap<String, BTreeMap<Node, Value>> = BTreeMap::new();
+    let mut landings: BTreeMap<Node, BTreeMap<String, Value>> = BTreeMap::new();
     for (node, pool) in pools {
         let rows = sqlx::query(
             "SELECT h.block_hash, b.block_hash IS NOT NULL AS has_block, b.chain_state, \
@@ -710,18 +712,7 @@ async fn landing_rows(
                     COALESCE(jsonb_array_length(a.audit_bundle #> '{ctv_fanout_manifest_set,manifests}'), 0) AS expected_fanouts, \
                     f.block_hash IS NOT NULL AS has_fanout_set, \
                     (SELECT count(*) FROM qbit_ctv_fanout_artifacts fa WHERE fa.block_hash = h.block_hash) AS fanout_artifacts, \
-                    a.audit_bundle_sha256, a.share_snapshot_sha256, \
-                    b.block_height, b.parent_hash, b.coinbase_txid, b.payout_manifest_sha256, \
-                    b.as_issued_audit_sha256, \
-                    (SELECT md5(string_agg(concat_ws('|', p.miner_id, p.payout_order_key, encode(p.p2mr_program, 'hex'), \
-                         p.onchain_amount_sats, p.carry_forward_balance_sats, p.action), ',' \
-                         ORDER BY p.payout_order_key, p.miner_id, p.p2mr_program)) \
-                       FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash) AS payout_fp, \
-                    (SELECT md5(string_agg(concat_ws('|', c.miner_id, c.payout_order_key, encode(c.p2mr_program, 'hex'), \
-                         c.gross_amount_sats, c.prior_balance_sats, c.candidate_balance_sats, c.onchain_amount_sats, \
-                         c.settlement_fee_sats, c.carry_forward_balance_sats, c.action), ',' \
-                         ORDER BY c.payout_order_key, c.miner_id, c.p2mr_program)) \
-                       FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash) AS carry_fp \
+                    b.coinbase_txid \
              FROM unnest($1::text[]) AS h(block_hash) \
              LEFT JOIN qbit_pool_blocks b ON b.block_hash = h.block_hash \
              LEFT JOIN qbit_pool_audit_bundles a ON a.block_hash = h.block_hash \
@@ -793,41 +784,130 @@ async fn landing_rows(
                     faults.join("; ")
                 ));
             }
-            // CONTRACT.md D-1 and D-10: every immutable landing fact is the
-            // same on both nodes; only local columns (chain and maturity
-            // state, publication order, claims) may differ.
-            fingerprints.entry(hash).or_default().insert(
-                *node,
-                json!({
-                    "height": row.try_get::<Option<i64>, _>("block_height")?,
-                    "parent": row.try_get::<Option<String>, _>("parent_hash")?,
-                    "coinbase_txid": coinbase_txid,
-                    "payout_manifest": row.try_get::<Option<String>, _>("payout_manifest_sha256")?,
-                    "as_issued_audit": row.try_get::<Option<String>, _>("as_issued_audit_sha256")?,
-                    "audit": row.try_get::<Option<String>, _>("audit_bundle_sha256")?,
-                    "snapshot": row.try_get::<Option<String>, _>("share_snapshot_sha256")?,
-                    "payouts": row.try_get::<Option<String>, _>("payout_fp")?,
-                    "carry": row.try_get::<Option<String>, _>("carry_fp")?,
-                }),
-            );
+        }
+        if pools.len() > 1 {
+            landings.insert(*node, carried_landings(pool, &hashes).await?);
         }
     }
-    for (hash, by_node) in &fingerprints {
-        let mut values = by_node.values();
-        if let Some(first) = values.next() {
-            if values.any(|other| other != first) {
-                check.problem(format!(
-                    "pool block {hash}'s landing rows differ between nodes: {}",
-                    json!(by_node)
-                ));
+    // CONTRACT.md D-1 and D-10: the peer sync copies a landing whole, so a
+    // block both nodes hold has the same rows on both in every column the
+    // sync carries, its provenance (`origin_node`, `sync_seq`, `found_at`,
+    // the solver) as much as its facts. Only the columns the sync leaves to
+    // each node (chain and maturity state, publication order, claims) may
+    // differ.
+    let mut compared = 0;
+    if let (Some(a), Some(b)) = (landings.get(&Node::A), landings.get(&Node::B)) {
+        for (hash, landing) in a {
+            if let Some(other) = b.get(hash) {
+                compared += 1;
+                if other != landing {
+                    check.problem(format!(
+                        "pool block {hash}'s landing rows differ between nodes: {}",
+                        json_differences(landing, other).join("; ")
+                    ));
+                }
             }
         }
     }
+    check.data("landings_on_both_nodes", json!(compared));
     Ok(check.finish(format!(
-        "{} pool blocks in {} databases",
+        "{} pool blocks in {} databases; {compared} held by both compared in every carried column",
         census.len(),
         pools.len()
     )))
+}
+
+/// An SQL condition: the landing of the block `block_hash` names is whole,
+/// with its audit bundle joined as `a` and the bundle's window snapshot as
+/// `s`. That is the bundle, the snapshot, one payout entry per manifest
+/// account, one carry row per miner account, and the CTV fanout set and one
+/// artifact per manifest when the bundle names any: what
+/// `inv3-landing-rows` requires of a landed block. A landing writes all of
+/// them in one transaction, and so does the peer sync's apply of a peer's
+/// block (D-10), so no statement may see part of one.
+pub fn landing_whole(block_hash: &str) -> String {
+    format!(
+        "(a.block_hash IS NOT NULL AND s.snapshot_sha256 IS NOT NULL \
+          AND (SELECT count(*) FROM qbit_pool_payout_entries p WHERE p.block_hash = {block_hash}) \
+              = COALESCE(jsonb_array_length(a.audit_bundle #> '{{payout_policy_manifest,accounts}}'), -1) \
+          AND (SELECT count(*) FROM qbit_payout_carry_forward c WHERE c.block_hash = {block_hash}) \
+              = (SELECT count(*) FROM jsonb_array_elements(COALESCE( \
+                     a.audit_bundle #> '{{payout_policy_manifest,accounts}}', '[]'::jsonb)) acc \
+                 WHERE COALESCE(acc->>'account_type', 'miner') = 'miner') \
+          AND EXISTS (SELECT 1 FROM qbit_ctv_fanout_sets f WHERE f.block_hash = {block_hash}) \
+              = (COALESCE(jsonb_array_length(a.audit_bundle #> '{{ctv_fanout_manifest_set,manifests}}'), 0) > 0) \
+          AND (SELECT count(*) FROM qbit_ctv_fanout_artifacts r WHERE r.block_hash = {block_hash}) \
+              = COALESCE(jsonb_array_length(a.audit_bundle #> '{{ctv_fanout_manifest_set,manifests}}'), 0))"
+    )
+}
+
+/// The content-determined columns of an audit snapshot (D-15, D1's
+/// `SNAPSHOT_FACTS`): windows with one share array share one row, and its
+/// anchor, cut, origin and creation time are whichever node wrote it first.
+const SNAPSHOT_FACTS: &[&str] = &[
+    "snapshot_sha256",
+    "first_share_seq",
+    "last_share_seq",
+    "share_count",
+    "inline_shares",
+];
+
+/// The landing of each of `hashes` this database holds, as one document per
+/// block: every row of the landing with exactly the columns D1's peer sync
+/// carries of its table, as this database's catalog has them
+/// ([`CarriedColumns`]), and the snapshot by its [`SNAPSHOT_FACTS`].
+/// Timestamps are read in UTC, so both databases render them alike.
+async fn carried_landings(pool: &PgPool, hashes: &[String]) -> Result<BTreeMap<String, Value>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let carried = CarriedColumns::read(&mut tx).await?;
+    let columns = |table: &str| carried.of(table).to_vec();
+    let facts: Vec<String> = SNAPSHOT_FACTS
+        .iter()
+        .map(|fact| (*fact).to_owned())
+        .collect();
+    let rows: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT h.block_hash, jsonb_build_object( \
+             'qbit_pool_blocks', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(b)) e WHERE e.key = ANY($2)), \
+             'qbit_pool_audit_bundles', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(a)) e WHERE e.key = ANY($3)), \
+             'qbit_prism_audit_snapshots', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(s)) e WHERE e.key = ANY($4)), \
+             'qbit_pool_payout_entries', (SELECT jsonb_agg((SELECT jsonb_object_agg(e.key, e.value) \
+                     FROM jsonb_each(to_jsonb(p)) e WHERE e.key = ANY($5)) \
+                   ORDER BY p.payout_order_key, p.miner_id, p.p2mr_program) \
+                 FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash), \
+             'qbit_payout_carry_forward', (SELECT jsonb_agg((SELECT jsonb_object_agg(e.key, e.value) \
+                     FROM jsonb_each(to_jsonb(c)) e WHERE e.key = ANY($6)) \
+                   ORDER BY c.payout_order_key, c.miner_id, c.p2mr_program) \
+                 FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash), \
+             'qbit_ctv_fanout_sets', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(f)) e WHERE e.key = ANY($7)), \
+             'qbit_ctv_fanout_artifacts', (SELECT jsonb_agg((SELECT jsonb_object_agg(e.key, e.value) \
+                     FROM jsonb_each(to_jsonb(r)) e WHERE e.key = ANY($8)) \
+                   ORDER BY r.chunk_index, r.fanout_txid) \
+                 FROM qbit_ctv_fanout_artifacts r WHERE r.block_hash = h.block_hash)) \
+         FROM unnest($1::text[]) AS h(block_hash) \
+         JOIN qbit_pool_blocks b ON b.block_hash = h.block_hash \
+         LEFT JOIN qbit_pool_audit_bundles a ON a.block_hash = h.block_hash \
+         LEFT JOIN qbit_prism_audit_snapshots s ON s.snapshot_sha256 = a.share_snapshot_sha256 \
+         LEFT JOIN qbit_ctv_fanout_sets f ON f.block_hash = h.block_hash",
+    )
+    .bind(hashes)
+    .bind(columns("qbit_pool_blocks"))
+    .bind(columns("qbit_pool_audit_bundles"))
+    .bind(facts)
+    .bind(columns("qbit_pool_payout_entries"))
+    .bind(columns("qbit_payout_carry_forward"))
+    .bind(columns("qbit_ctv_fanout_sets"))
+    .bind(columns("qbit_ctv_fanout_artifacts"))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// The keys the test signing seeds give (`PRISM_ALLOW_TEST_SIGNING_SEEDS`):
@@ -1056,26 +1136,71 @@ async fn acked_shares_present(
     )))
 }
 
-/// The columns two renderings of one row disagree on, each with both
-/// values: node A's first.
-fn differing_columns(a: &Value, b: &Value) -> Vec<String> {
-    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
-        return vec![format!("node A {a}, node B {b}")];
+/// How many of two documents' differences [`json_differences`] names.
+const DIFFERENCES_SHOWN: usize = 12;
+/// How much of each value a named difference shows.
+const DIFFERENCE_VALUE_CHARS: usize = 160;
+
+/// Where two renderings of one row (or of one landing's rows) disagree, each
+/// place by its path with both values, node A's first: depth first, the
+/// first [`DIFFERENCES_SHOWN`], each value cut to [`DIFFERENCE_VALUE_CHARS`].
+fn json_differences(a: &Value, b: &Value) -> Vec<String> {
+    let mut differences = Vec::new();
+    walk_differences("", Some(a), Some(b), &mut differences);
+    if differences.len() > DIFFERENCES_SHOWN {
+        let more = differences.len() - DIFFERENCES_SHOWN;
+        differences.truncate(DIFFERENCES_SHOWN);
+        differences.push(format!("and {more} more"));
+    }
+    differences
+}
+
+fn walk_differences(path: &str, a: Option<&Value>, b: Option<&Value>, out: &mut Vec<String>) {
+    if a == b {
+        return;
+    }
+    let place = if path.is_empty() {
+        "the whole row"
+    } else {
+        path
     };
-    let mut columns: Vec<&String> = a.keys().chain(b.keys()).collect();
-    columns.sort();
-    columns.dedup();
-    columns
-        .into_iter()
-        .filter(|column| a.get(*column) != b.get(*column))
-        .map(|column| {
-            format!(
-                "{column}: node A {}, node B {}",
-                a.get(column).unwrap_or(&Value::Null),
-                b.get(column).unwrap_or(&Value::Null)
-            )
-        })
-        .collect()
+    match (a, b) {
+        (Some(Value::Object(x)), Some(Value::Object(y))) => {
+            let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+            for key in keys {
+                let inner = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                walk_differences(&inner, x.get(key), y.get(key), out);
+            }
+        }
+        (Some(Value::Array(x)), Some(Value::Array(y))) if x.len() == y.len() => {
+            for (index, (u, v)) in x.iter().zip(y).enumerate() {
+                walk_differences(&format!("{path}[{index}]"), Some(u), Some(v), out);
+            }
+        }
+        (Some(Value::Array(x)), Some(Value::Array(y))) => out.push(format!(
+            "{place}: node A {} entries, node B {} entries",
+            x.len(),
+            y.len()
+        )),
+        _ => out.push(format!("{place}: node A {}, node B {}", shown(a), shown(b))),
+    }
+}
+
+/// One side of a named difference, cut to [`DIFFERENCE_VALUE_CHARS`].
+fn shown(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "absent".to_owned();
+    };
+    let text = value.to_string();
+    if text.chars().count() <= DIFFERENCE_VALUE_CHARS {
+        return text;
+    }
+    let cut: String = text.chars().take(DIFFERENCE_VALUE_CHARS).collect();
+    format!("{cut}…")
 }
 
 async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
@@ -1136,7 +1261,7 @@ async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
                 if other != row {
                     check.problem(format!(
                         "header {header} has different rows on the two nodes: {}",
-                        differing_columns(row, other).join("; ")
+                        json_differences(row, other).join("; ")
                     ));
                 }
             }
@@ -1588,14 +1713,68 @@ pub fn write(report: &InvariantReport, dir: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn differing_columns_names_each_disagreement_with_both_values() {
+    fn json_differences_names_each_disagreement_with_both_values() {
         let a = serde_json::json!({"origin_node": 0, "share_seq": 7, "credit_policy": "full"});
         let b = serde_json::json!({"origin_node": 1, "share_seq": 7, "credit_policy": "full"});
         assert_eq!(
-            super::differing_columns(&a, &b),
+            super::json_differences(&a, &b),
             vec!["origin_node: node A 0, node B 1".to_owned()]
         );
-        assert!(super::differing_columns(&a, &a).is_empty());
+        assert!(super::json_differences(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn json_differences_follows_a_landing_down_to_the_column() {
+        let a = serde_json::json!({
+            "qbit_pool_blocks": {"origin_node": 0, "sync_seq": 4, "block_height": 210},
+            "qbit_pool_payout_entries": [{"miner_id": "m1", "action": "pay"}, {"miner_id": "m2", "action": "pay"}],
+            "qbit_payout_carry_forward": [{"miner_id": "m1"}],
+            "qbit_ctv_fanout_sets": {"fanout_count": 1, "settlement_mode": "ctv"},
+        });
+        let b = serde_json::json!({
+            "qbit_pool_blocks": {"origin_node": 1, "sync_seq": 4, "block_height": 210},
+            "qbit_pool_payout_entries": [{"miner_id": "m1", "action": "pay"}, {"miner_id": "m2", "action": "carry"}],
+            "qbit_payout_carry_forward": [],
+            "qbit_ctv_fanout_sets": {"fanout_count": 1},
+        });
+        assert_eq!(
+            super::json_differences(&a, &b),
+            vec![
+                "qbit_ctv_fanout_sets.settlement_mode: node A \"ctv\", node B absent".to_owned(),
+                "qbit_payout_carry_forward: node A 1 entries, node B 0 entries".to_owned(),
+                "qbit_pool_blocks.origin_node: node A 0, node B 1".to_owned(),
+                "qbit_pool_payout_entries[1].action: node A \"pay\", node B \"carry\"".to_owned(),
+            ]
+        );
+        // A part one node lacks altogether is named whole.
+        let missing = serde_json::json!({"qbit_pool_blocks": {"origin_node": 0}, "qbit_ctv_fanout_sets": null});
+        let present = serde_json::json!({"qbit_pool_blocks": {"origin_node": 0}, "qbit_ctv_fanout_sets": {"fanout_count": 1}});
+        assert_eq!(
+            super::json_differences(&missing, &present),
+            vec!["qbit_ctv_fanout_sets: node A null, node B {\"fanout_count\":1}".to_owned()]
+        );
+    }
+
+    #[test]
+    fn json_differences_cuts_long_values_and_counts_what_it_leaves_out() {
+        let long = "x".repeat(super::DIFFERENCE_VALUE_CHARS + 40);
+        let a = serde_json::json!({ "audit_bundle": long });
+        let b = serde_json::json!({ "audit_bundle": "y" });
+        let named = super::json_differences(&a, &b);
+        assert_eq!(named.len(), 1);
+        assert!(named[0].starts_with("audit_bundle: node A \"xxx"));
+        assert!(named[0].contains("…, node B \"y\""));
+        assert!(named[0].chars().count() < super::DIFFERENCE_VALUE_CHARS + 60);
+
+        let many_a: serde_json::Map<String, serde_json::Value> = (0..super::DIFFERENCES_SHOWN + 3)
+            .map(|i| (format!("c{i:02}"), serde_json::json!(0)))
+            .collect();
+        let many_b: serde_json::Map<String, serde_json::Value> = (0..super::DIFFERENCES_SHOWN + 3)
+            .map(|i| (format!("c{i:02}"), serde_json::json!(1)))
+            .collect();
+        let named = super::json_differences(&many_a.into(), &many_b.into());
+        assert_eq!(named.len(), super::DIFFERENCES_SHOWN + 1);
+        assert_eq!(named.last().map(String::as_str), Some("and 3 more"));
     }
 
     use super::*;
