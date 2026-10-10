@@ -44,8 +44,10 @@
 //!    eligible share. `inv4-windows-reproducible`: each recorded window,
 //!    recomputed from every database, gives the recorded digest.
 //!
-//! Plus `ledger-integrity` (`qbit_carry_forward_integrity_report()` clean)
-//! and `candidates-settled` (no candidate left unfinished).
+//! Plus `ledger-integrity` (`qbit_carry_forward_integrity_report()` clean),
+//! `candidates-settled` (no candidate left unfinished), `d2-local-state-not-
+//! copied` and `copied-state-identical` (the copied tables beyond shares and
+//! landings: prepared records with their blobs, and the carry-owner journal).
 
 use crate::{
     frontend::Node,
@@ -60,6 +62,7 @@ use sqlx::{PgPool, Row};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// `hex("/PRISM/")`, the default `PRISM_COINBASE_TAG`.
@@ -262,6 +265,7 @@ pub async fn check(
     checks.push(ledger_integrity(&pools).await?);
     checks.push(candidates_settled(&pools, options).await?);
     checks.push(local_state_not_copied(sim, &pools).await?);
+    checks.push(copied_state_identical(sim, &pools).await?);
     for pool in pools.values() {
         pool.close().await;
     }
@@ -936,7 +940,16 @@ async fn audits_verify(sim: &Sim, census: &[CensusBlock], options: &CheckOptions
     for block in census {
         let mut digests = BTreeMap::new();
         for node in Node::BOTH {
-            if options.absent_ledgers.contains_key(&node) || !sim.frontend(node).running() {
+            if options.absent_ledgers.contains_key(&node) {
+                continue;
+            }
+            // A frontend down at the end is not one that serves its node's
+            // audits: unless the scenario says the node is away, it fails.
+            if !sim.frontend(node).running() {
+                check.problem(format!(
+                    "node {node:?}'s frontend is not running, so it serves no audit of {}",
+                    block.hash
+                ));
                 continue;
             }
             if sim.config.topology == Topology::Unsynced && !block.landed_in.contains(&node) {
@@ -1613,6 +1626,10 @@ async fn candidates_settled(
 ///   same node's outbox. So no deferred share since the epoch is on both
 ///   nodes: a copy of one is caught here even when the copied candidate
 ///   carries no claim and fresh timestamps.
+/// - **Issued jobs.** Only prepared records are copied (D-3, D-11). An
+///   issued job of the peer's, by origin or by its frontend's instance,
+///   could be resumed here (`resume_job` reads any stored job) with the
+///   peer's extranonce1 and credit a share the peer credited.
 /// - **Offer decisions.** Only the offering frontend records one, in its own
 ///   database (`ledger/divergence.rs`). So a divergence row with a decision
 ///   is copied when its node never had the block as a candidate, or when
@@ -1627,15 +1644,22 @@ async fn candidates_settled(
 /// A disk rebuilt from the peer (S7) holds the peer's local rows until D-16's
 /// re-personalise resets them, so there this also checks that reset.
 async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
-    let since = match (sim.config.topology, sim.dual_since) {
-        (Topology::DualWriter, Some(since)) => since,
-        _ => {
-            return Ok(Check::skip(
-                "d2-local-state-not-copied",
-                "no dual-writer pair: nothing is copied",
-            ))
-        }
-    };
+    match (sim.config.topology, sim.dual_since) {
+        (Topology::DualWriter, Some(since)) => local_state_check(pools, since).await,
+        _ => Ok(Check::skip(
+            "d2-local-state-not-copied",
+            "no dual-writer pair: nothing is copied",
+        )),
+    }
+}
+
+/// [`local_state_not_copied`]'s check over `pools` for rows since `since`:
+/// the checker control runs it on one database in both slots, where every
+/// local row is a copy, to show it fails.
+pub async fn local_state_check(
+    pools: &BTreeMap<Node, PgPool>,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<Check> {
     let copied = "copied (D-2), or left by a rebuild that re-personalise did not reset (D-16)";
     let mut check = CheckBuilder::new("d2-local-state-not-copied");
     // Per node: (block, created_at in microseconds) of each candidate since
@@ -1701,6 +1725,23 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
         .fetch_all(pool)
         .await?;
         deferred.insert(*node, rows.into_iter().collect());
+        let jobs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT job_id, instance_id FROM qbit_prism_jobs \
+             WHERE job_id NOT LIKE 'prepared:%' AND created_at >= $1 \
+               AND (origin_node = $2 OR instance_id = $3) \
+             ORDER BY created_at",
+        )
+        .bind(since)
+        .bind(peer.index() as i16)
+        .bind(peer.instance_id())
+        .fetch_all(pool)
+        .await?;
+        for (job, instance) in jobs {
+            check.problem(format!(
+                "node {node:?} holds job {job}, issued by node {peer:?}'s frontend ({instance}), \
+                 which resume_job could replay with the peer's extranonce1: {copied}"
+            ));
+        }
         let orphaned: Vec<(String, String)> = sqlx::query_as(
             "SELECT d.block_hash, d.offer_decision FROM qbit_prism_payout_divergences d \
              WHERE d.offer_decision IS NOT NULL AND d.offer_decided_at >= $1 \
@@ -1765,9 +1806,241 @@ async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Re
             .collect::<BTreeMap<_, _>>()),
     );
     Ok(check.finish(format!(
-        "candidates, deferred shares, offer decisions and identities since {since} are each \
-         node's own"
+        "candidates, deferred shares, issued jobs, offer decisions and identities since {since} \
+         are each node's own"
     )))
+}
+
+/// How long `copied-state-identical` waits for rows still in flight (a
+/// prepared record or journal row written just before the check) to settle.
+pub const COPIED_STATE_BOUND: Duration = Duration::from_secs(20);
+
+/// CONTRACT.md D-1, D-11 and D-17 for the copied tables the other checks do
+/// not compare: prepared records with the template and balance blobs they
+/// reference, and the carry-owner journal. For each origin node, against
+/// its peer:
+///
+/// - **The journal.** Append-only and copied whole, so the origin's rows are
+///   the same on both nodes, in every column.
+/// - **Prepared records.** Every unexpired one the origin wrote, up to the
+///   peer's cursor over that stream, is on the peer (the pull takes them all,
+///   expired or not), equal in every carried column but `expires_at`, which
+///   each node keeps for itself (D1's own comparison). Every unexpired copy
+///   the peer holds is still on the origin: its own expiry only extends, so
+///   such a record was lost there, which own-log recovery must prevent.
+/// - **Blobs.** The template and balance snapshot of each record on both
+///   nodes are on both, byte for byte.
+///
+/// Rows written just before the check may still be in flight, so it is
+/// repeated for up to [`COPIED_STATE_BOUND`] before it fails.
+async fn copied_state_identical(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    const ID: &str = "copied-state-identical";
+    if sim.config.topology != Topology::DualWriter || pools.len() < 2 {
+        return Ok(Check::skip(
+            ID,
+            "no dual-writer pair with both databases checked: nothing is copied",
+        ));
+    }
+    let started = Instant::now();
+    loop {
+        let (problems, compared) = copied_state_round(pools).await?;
+        if problems.is_empty() || started.elapsed() >= COPIED_STATE_BOUND {
+            let mut check = CheckBuilder::new(ID);
+            for problem in problems {
+                check.problem(problem);
+            }
+            check.data("compared", compared.clone());
+            return Ok(check.finish(format!(
+                "prepared records, their blobs and the journal compared for both origins: {compared}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// One node's prepared records of `origin`: `job_id -> (sync_seq, every
+/// carried column but expires_at)`, the unexpired ones only when `unexpired`.
+pub(crate) async fn prepared_records(
+    pool: &PgPool,
+    origin: Node,
+    unexpired: bool,
+) -> Result<BTreeMap<String, (i64, Value)>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let carried = CarriedColumns::read(&mut tx).await?;
+    let columns: Vec<String> = carried
+        .of("qbit_prism_jobs")
+        .iter()
+        .filter(|column| column.as_str() != "expires_at")
+        .cloned()
+        .collect();
+    let rows: Vec<(String, i64, Value)> = sqlx::query_as(
+        "SELECT j.job_id, j.sync_seq, (SELECT jsonb_object_agg(e.key, e.value) \
+                FROM jsonb_each(to_jsonb(j)) e WHERE e.key = ANY($3)) \
+         FROM qbit_prism_jobs j \
+         WHERE j.origin_node = $1 AND j.job_id LIKE 'prepared:%' AND j.sync_seq IS NOT NULL \
+           AND (NOT $2 OR j.expires_at > clock_timestamp() + interval '5 seconds')",
+    )
+    .bind(origin.index() as i16)
+    .bind(unexpired)
+    .bind(&columns)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|(job, seq, doc)| (job, (seq, doc)))
+        .collect())
+}
+
+/// One node's carry-owner journal rows of `origin`, by epoch, whole.
+pub(crate) async fn journal_rows(pool: &PgPool, origin: Node) -> Result<BTreeMap<i64, Value>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let rows: Vec<(i64, Value)> = sqlx::query_as(
+        "SELECT r.epoch, to_jsonb(r) FROM qbit_prism_node_roles r WHERE r.origin_node = $1",
+    )
+    .bind(origin.index() as i16)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// md5 of each blob of `table` (keyed by `key`, bytes in `bytes`) among `keys`.
+async fn blob_digests(
+    pool: &PgPool,
+    table: &str,
+    key: &str,
+    bytes: &str,
+    keys: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT {key}, md5({bytes}) FROM {table} WHERE {key} = ANY($1)"
+    ))
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// One pass of [`copied_state_identical`]: its problems, and what it
+/// compared.
+async fn copied_state_round(pools: &BTreeMap<Node, PgPool>) -> Result<(Vec<String>, Value)> {
+    let mut problems = Vec::new();
+    let mut compared = serde_json::Map::new();
+    for origin in Node::BOTH {
+        let peer = origin.peer();
+        let (Some(own), Some(copy)) = (pools.get(&origin), pools.get(&peer)) else {
+            continue;
+        };
+        let journal_own = journal_rows(own, origin).await?;
+        let journal_copy = journal_rows(copy, origin).await?;
+        if journal_own != journal_copy {
+            problems.push(format!(
+                "node {origin:?}'s carry-owner journal differs on node {peer:?}: {}",
+                json_differences(&json!(journal_own), &json!(journal_copy)).join("; ")
+            ));
+        }
+        let cursor: Option<i64> = sqlx::query_scalar(
+            "SELECT scanned_through FROM qbit_prism_peer_sync_cursors \
+             WHERE stream = 'prepared' AND peer_node = $1",
+        )
+        .bind(origin.index() as i16)
+        .fetch_optional(copy)
+        .await?;
+        let originals = prepared_records(own, origin, false).await?;
+        let unexpired_originals = prepared_records(own, origin, true).await?;
+        let copies = prepared_records(copy, origin, false).await?;
+        let unexpired_copies = prepared_records(copy, origin, true).await?;
+        let mut on_both = Vec::new();
+        for (job, (seq, doc)) in &unexpired_originals {
+            if cursor.is_none_or(|cursor| *seq > cursor) {
+                continue;
+            }
+            match copies.get(job) {
+                None => problems.push(format!(
+                    "node {origin:?}'s prepared record {job} (sync_seq {seq}) is not on node \
+                     {peer:?}, whose cursor over that stream is at {cursor:?}"
+                )),
+                Some((_, other)) if other != doc => problems.push(format!(
+                    "node {origin:?}'s prepared record {job} differs on node {peer:?}: {}",
+                    json_differences(doc, other).join("; ")
+                )),
+                Some(_) => on_both.push(job.clone()),
+            }
+        }
+        for job in unexpired_copies.keys() {
+            if !originals.contains_key(job) {
+                problems.push(format!(
+                    "node {peer:?} holds node {origin:?}'s unexpired prepared record {job}, which \
+                     node {origin:?} no longer holds: an own row lost there (D-17)"
+                ));
+            }
+        }
+        let field = |job: &String, name: &str| -> Option<String> {
+            originals
+                .get(job)
+                .and_then(|(_, doc)| doc.get(name))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let templates: Vec<String> = on_both
+            .iter()
+            .filter_map(|job| field(job, "template_sha256"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let balances: Vec<String> = on_both
+            .iter()
+            .filter_map(|job| field(job, "window_prior_balances_sha256"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for (table, key, bytes, keys) in [
+            (
+                "qbit_prism_templates",
+                "template_sha256",
+                "template_bytes",
+                &templates,
+            ),
+            (
+                "qbit_prism_balance_snapshots",
+                "prior_balances_digest",
+                "balances",
+                &balances,
+            ),
+        ] {
+            let here = blob_digests(own, table, key, bytes, keys).await?;
+            let there = blob_digests(copy, table, key, bytes, keys).await?;
+            for blob in keys {
+                if !here.contains_key(blob) || here.get(blob) != there.get(blob) {
+                    problems.push(format!(
+                        "{table} {blob}, referenced by node {origin:?}'s prepared records, is \
+                         {:?} on node {origin:?} and {:?} on node {peer:?}",
+                        here.get(blob),
+                        there.get(blob)
+                    ));
+                }
+            }
+        }
+        compared.insert(
+            origin.label().to_owned(),
+            json!({
+                "journal_rows": journal_own.len(),
+                "prepared_unexpired": unexpired_originals.len(),
+                "prepared_on_both": on_both.len(),
+                "peer_cursor": cursor,
+                "templates": templates.len(),
+                "balance_snapshots": balances.len(),
+            }),
+        );
+    }
+    Ok((problems, Value::Object(compared)))
 }
 
 fn short(program: &str) -> String {

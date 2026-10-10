@@ -581,6 +581,29 @@ pub fn tail(
     }
 }
 
+/// The shares of `tail` answered before `cutoff_ms`, each with when: older
+/// than an unsynced tail can be (the peer pulls within the steady-state sync
+/// lag), so a sync that had fallen behind, not the death, kept them from
+/// the peer.
+pub fn answered_before(
+    records: &[ShareRecord],
+    tail: &TailReport,
+    cutoff_ms: u64,
+) -> Vec<(String, u64)> {
+    let ids: BTreeSet<&str> = tail.share_ids.iter().map(String::as_str).collect();
+    let mut stale: Vec<(String, u64)> = records
+        .iter()
+        .filter(|record| ids.contains(record.share_id.as_str()))
+        .filter_map(|record| {
+            let at = record.answered_ms?;
+            (at < cutoff_ms).then(|| (record.share_id.clone(), at))
+        })
+        .collect();
+    stale.sort_by_key(|(_, at)| *at);
+    stale.dedup();
+    stale
+}
+
 /// `excused_missing` for the checker: each tail share, with why.
 pub fn excuse(tail: &TailReport, why: &str) -> BTreeMap<String, String> {
     tail.share_ids
@@ -592,6 +615,43 @@ pub fn excuse(tail: &TailReport, why: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{ReadinessChange, ReadinessTrace};
+
+    #[test]
+    fn a_tail_share_older_than_the_sync_lag_is_not_an_unsynced_tail() {
+        use super::{answered_before, TailReport};
+        use crate::{frontend::Node, load::ShareRecord};
+        let share = |id: &str, answered: u64| ShareRecord {
+            share_id: id.to_owned(),
+            session: 0,
+            account: "a".into(),
+            job_id: "dual-sim-a-x".into(),
+            issuer: Some(Node::A),
+            outcome: "accepted".into(),
+            reason: None,
+            sent_ms: answered - 5,
+            answered_ms: Some(answered),
+            scheduled_block: false,
+        };
+        let records = vec![
+            share("u:old", 6_000),
+            share("u:new", 9_900),
+            share("u:other", 5_000),
+        ];
+        let tail = TailReport {
+            node: Some(Node::A),
+            fault_at_ms: 10_000,
+            count: 2,
+            first_answered_ms: Some(6_000),
+            last_answered_ms: Some(9_900),
+            share_ids: vec!["u:old".into(), "u:new".into()],
+        };
+        // The death at 10 000 with a 2 000 ms lag bound: 6 000 is too old.
+        assert_eq!(
+            answered_before(&records, &tail, 8_000),
+            vec![("u:old".to_owned(), 6_000)]
+        );
+        assert!(answered_before(&records, &tail, 6_000).is_empty());
+    }
 
     fn change(at_ms: u64, ready: bool) -> ReadinessChange {
         ReadinessChange {
