@@ -2936,6 +2936,14 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
             }
         }
         DeathAtFind::Accepted { wait } => {
+            // The variant's premise, which only the chain proves: the gate
+            // records an answer even when forwarding the call failed. Only
+            // the adoption's timing is left ungated without the wait.
+            body.expect(
+                "the node accepted the block before A died",
+                on_chain,
+                format!("{hash} known to the network: {on_chain}"),
+            );
             let parent = sim
                 .chain
                 .c

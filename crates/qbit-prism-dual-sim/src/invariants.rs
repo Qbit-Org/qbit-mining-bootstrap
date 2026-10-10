@@ -1096,7 +1096,7 @@ async fn acked_shares_present(
     // By the full share id the miner was answered for, worker and all: a row
     // under the same header but another id is not this share.
     let ids: Vec<String> = acked.iter().map(|record| record.share_id.clone()).collect();
-    let mut excused_seen = BTreeMap::new();
+    let mut missing_by_node = BTreeMap::new();
     for (node, pool) in pools {
         if options.absent_ledgers.contains_key(node) {
             continue;
@@ -1110,30 +1110,67 @@ async fn acked_shares_present(
         .bind(&ids)
         .fetch_all(pool)
         .await?;
-        let missing: BTreeSet<String> = missing.into_iter().collect();
-        for record in &acked {
-            if !missing.contains(&record.share_id) {
-                continue;
-            }
-            match options.excused_missing.get(&record.share_id) {
-                Some(reason) => {
-                    *excused_seen.entry(reason.clone()).or_insert(0u64) += 1;
-                }
-                None => check.problem(format!(
-                    "acknowledged share {} (issued by {:?}, answered at {:?} ms) is missing on \
-                     node {node:?}",
-                    record.share_id, record.issuer, record.answered_ms
-                )),
-            }
+        missing_by_node.insert(*node, missing.into_iter().collect());
+    }
+    let tally = tally_missing(&missing_by_node, &options.excused_missing);
+    // One problem per lost share, however many databases lack it: the
+    // report counts the problems as shares lost.
+    for record in &acked {
+        if let Some(nodes) = tally.lost.get(&record.share_id) {
+            check.problem(format!(
+                "acknowledged share {} (issued by {:?}, answered at {:?} ms) is missing on \
+                 {nodes:?}",
+                record.share_id, record.issuer, record.answered_ms
+            ));
         }
     }
+    let excused: BTreeMap<&String, usize> = tally
+        .excused
+        .iter()
+        .map(|(reason, shares)| (reason, shares.len()))
+        .collect();
     check.data("acknowledged", json!(acked.len()));
-    check.data("excused_missing", json!(excused_seen));
+    check.data("excused_missing", json!(excused));
     Ok(check.finish(format!(
         "{} acknowledged shares checked in {} databases",
         acked.len(),
         pools.len()
     )))
+}
+
+/// The acknowledged shares missing from the checked databases, each counted
+/// once however many databases lack it: an excused one under its reason, any
+/// other with the databases that lack it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MissingShares {
+    excused: BTreeMap<String, BTreeSet<String>>,
+    lost: BTreeMap<String, Vec<Node>>,
+}
+
+/// Sort the share ids each database lacks into excused and lost shares
+/// (`excused` maps a share id to why it may be missing). A share neither
+/// node holds, such as a node's unsynced tail after its disk was rebuilt
+/// from the other (S7), is one share, not one per database.
+fn tally_missing(
+    missing_by_node: &BTreeMap<Node, BTreeSet<String>>,
+    excused: &BTreeMap<String, String>,
+) -> MissingShares {
+    let mut tally = MissingShares::default();
+    for (node, missing) in missing_by_node {
+        for share in missing {
+            match excused.get(share) {
+                Some(reason) => {
+                    tally
+                        .excused
+                        .entry(reason.clone())
+                        .or_default()
+                        .insert(share.clone());
+                }
+                None => tally.lost.entry(share.clone()).or_default().push(*node),
+            }
+        }
+    }
+    tally
 }
 
 /// How many of two documents' differences [`json_differences`] names.
@@ -1721,6 +1758,40 @@ mod tests {
             vec!["origin_node: node A 0, node B 1".to_owned()]
         );
         assert!(super::json_differences(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn a_share_missing_from_both_databases_counts_once() {
+        use crate::frontend::Node;
+        use std::collections::{BTreeMap, BTreeSet};
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+        // S7: B's unsynced tail (t1, t2) is on neither database after B's
+        // disk was rebuilt from A; l1 is lost on both, l2 on B only.
+        let missing = BTreeMap::from([
+            (Node::A, set(&["t1", "t2", "l1"])),
+            (Node::B, set(&["t1", "t2", "l1", "l2"])),
+        ]);
+        let excused = BTreeMap::from([
+            ("t1".to_owned(), "B's unsynced tail".to_owned()),
+            ("t2".to_owned(), "B's unsynced tail".to_owned()),
+        ]);
+        let tally = super::tally_missing(&missing, &excused);
+        assert_eq!(
+            tally.excused,
+            BTreeMap::from([("B's unsynced tail".to_owned(), set(&["t1", "t2"]))])
+        );
+        assert_eq!(
+            tally.lost,
+            BTreeMap::from([
+                ("l1".to_owned(), vec![Node::A, Node::B]),
+                ("l2".to_owned(), vec![Node::B]),
+            ])
+        );
+        assert_eq!(
+            super::tally_missing(&BTreeMap::new(), &excused),
+            super::MissingShares::default()
+        );
     }
 
     #[test]
