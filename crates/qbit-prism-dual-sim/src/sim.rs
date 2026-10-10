@@ -1,0 +1,908 @@
+//! The whole simulated pair, assembled for one scenario.
+//!
+//! **Topologies.**
+//!
+//! - [`Topology::SingleWriter`], the 3.0 pair: A's PostgreSQL is the one
+//!   writer, B's is its asynchronous streaming standby, and both frontends
+//!   write to A's (B's across the writer link). Dual-writer mode is off.
+//! - [`Topology::DualWriter`], the 3.1 pair: each node's PostgreSQL is an
+//!   independent primary, each frontend writes only to its own, and each
+//!   pulls the rows its peer originated over the peer link. A is node 0 and
+//!   the carry owner.
+//! - [`Topology::Unsynced`]: two independent single-writer nodes with no
+//!   link between their databases. Nothing in production runs this; it is
+//!   the checker's negative control, which must fail invariant 3.
+//!
+//! **Links.** Every path a fault can cut is a [`Relay`]: the balancer's
+//! Stratum and health routes to each node (`public-stratum-*`,
+//! `public-health-*`), each node's pull from its peer (`peer-a-to-b` is A's
+//! frontend reading B's database), and in the 3.0 pair B's writer link to
+//! A's database and the standby's replication link. A frontend reaches its
+//! own database and its own `qbitd` directly, as on one host.
+//!
+//! **Roles.** Each database is owned by a plain login role, `prism`, which
+//! the frontends use; the dual-writer peer pull uses `prism_peer_sync`,
+//! read-only. Both log in without a password over loopback (`trust`).
+
+use crate::{
+    balancer::{BackendTarget, Balancer, BalancerConfig},
+    chain::{self, Chain},
+    frontend::{DualSettings, Frontend, FrontendSpec, Node, Settlement},
+    load::{Load, LoadPlan, RunClock},
+    postgres::PgNode,
+    relay::{LinkState, Relay, RelayStats},
+};
+use anyhow::{bail, ensure, Context, Result};
+use serde::Serialize;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+/// The database every node's PRISM ledger lives in.
+pub const DATABASE: &str = "prism";
+/// The frontends' login role, owner of [`DATABASE`].
+pub const OWNER_ROLE: &str = "prism";
+/// The read-only role a node's peer pull logs in as.
+pub const PEER_ROLE: &str = "prism_peer_sync";
+/// The 3.0 standby's physical replication slot.
+pub const STANDBY_SLOT: &str = "prism_standby_b";
+
+/// What the balancer stand-in checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    /// `/healthz` with `ok: true`: 3.0's only readiness signal.
+    Healthz,
+    /// CONTRACT.md D-7: the token-protected `GET /readyz` on
+    /// `PRISM_READINESS_PORT`, as the Hashbalancer checks the pair.
+    Readyz,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Topology {
+    SingleWriter,
+    DualWriter,
+    Unsynced,
+}
+
+/// Where the harness's inputs are: the gate's two plus the binaries it
+/// built, and the directories it writes.
+#[derive(Clone, Debug)]
+pub struct Inputs {
+    pub pg_bin: PathBuf,
+    pub qbitd: PathBuf,
+    pub server: PathBuf,
+    /// Holds `qbit-prism-audit-verify`.
+    pub verifier_dir: PathBuf,
+    /// Short and on a real disk: data directories, the ramp cache.
+    pub work_root: PathBuf,
+    /// Where each scenario's report and logs go.
+    pub report_root: PathBuf,
+    /// Keep the scenario's data directories after a pass.
+    pub keep: bool,
+}
+
+/// What one scenario runs.
+#[derive(Clone, Debug, Serialize)]
+pub struct SimConfig {
+    pub scenario: String,
+    pub topology: Topology,
+    pub settlement: Settlement,
+    /// The payout window's length in shares at the ramped difficulty.
+    pub window_shares: u64,
+    pub load: LoadPlan,
+    pub balancer: BalancerConfig,
+    pub readiness: Readiness,
+    pub sync_interval_ms: u64,
+    pub sync_batch_rows: u64,
+    /// Extra frontend settings, per node, applied last.
+    pub overrides: BTreeMap<Node, Vec<(String, String)>>,
+}
+
+impl SimConfig {
+    /// The defaults every scenario starts from: four accounts of different
+    /// sizes (16, 8, 4 and 1 sessions), so the smallest accrues carry and is
+    /// paid down while the others are paid at once; 20 shares/s; a
+    /// 2,000-share window; CTV settlement; the balancer's default checks.
+    pub fn new(scenario: &str, topology: Topology) -> Result<Self> {
+        let window_shares = 2_000;
+        let bits = u32::from_str_radix(chain::RAMP_BITS, 16)?;
+        let solution = qbit_prism_load::window::solve_window(bits, window_shares)?;
+        Ok(Self {
+            scenario: scenario.to_owned(),
+            topology,
+            settlement: Settlement::Ctv,
+            window_shares,
+            load: LoadPlan {
+                accounts: vec![
+                    crate::load::Account::derived("big", 16),
+                    crate::load::Account::derived("mid", 8),
+                    crate::load::Account::derived("small", 4),
+                    crate::load::Account::derived("tiny", 1),
+                ],
+                rate: 20.0,
+                share_difficulty: solution.share_difficulty,
+            },
+            balancer: BalancerConfig::default(),
+            // The dual-writer pair is checked as the Hashbalancer will check
+            // it; the 3.0 pair keeps 3.0's signal.
+            readiness: match topology {
+                Topology::DualWriter => Readiness::Readyz,
+                Topology::SingleWriter | Topology::Unsynced => Readiness::Healthz,
+            },
+            sync_interval_ms: 250,
+            sync_batch_rows: 5_000,
+            overrides: BTreeMap::new(),
+        })
+    }
+}
+
+/// One thing that happened, on the run's clock.
+#[derive(Clone, Debug, Serialize)]
+pub struct TimelineEvent {
+    pub at_ms: u64,
+    pub event: String,
+}
+
+/// The relays of one run, by name.
+pub struct Links {
+    relays: BTreeMap<String, Relay>,
+}
+
+impl Links {
+    pub fn get(&self, name: &str) -> Result<&Relay> {
+        self.relays
+            .get(name)
+            .with_context(|| format!("no link named {name}"))
+    }
+
+    pub fn set(&self, name: &str, state: LinkState) -> Result<()> {
+        self.get(name)?.set(state);
+        Ok(())
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.relays.keys().cloned().collect()
+    }
+
+    pub fn stats(&self) -> Vec<RelayStats> {
+        self.relays.values().map(Relay::stats).collect()
+    }
+
+    /// The links a cut of `node`'s whole network breaks: its public routes,
+    /// both directions of the peer pull, and in the 3.0 pair the writer and
+    /// replication links that cross to or from it.
+    pub fn of_node(&self, node: Node) -> Vec<String> {
+        let label = node.label();
+        let peer = node.peer().label();
+        self.relays
+            .keys()
+            .filter(|name| {
+                name.as_str() == format!("public-stratum-{label}")
+                    || name.as_str() == format!("public-health-{label}")
+                    || name.as_str() == format!("peer-{label}-to-{peer}")
+                    || name.as_str() == format!("peer-{peer}-to-{label}")
+                    || name.as_str() == "writer-b-to-a"
+                    || name.as_str() == "replication-b-from-a"
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The links between the two databases: the peer pulls, or in the 3.0
+    /// pair the writer and replication links.
+    pub fn between_nodes(&self) -> Vec<String> {
+        self.relays
+            .keys()
+            .filter(|name| {
+                name.starts_with("peer-")
+                    || name.as_str() == "writer-b-to-a"
+                    || name.as_str() == "replication-b-from-a"
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+pub struct Sim {
+    pub config: SimConfig,
+    pub inputs: Inputs,
+    pub clock: RunClock,
+    /// The chain's height when the scenario began: the census starts above
+    /// it.
+    pub start_height: u64,
+    /// The scenario's data root (short) and its report directory.
+    pub root: PathBuf,
+    pub report_dir: PathBuf,
+    pub logs: PathBuf,
+    pub chain: Chain,
+    pub pg: BTreeMap<Node, PgNode>,
+    pub frontends: BTreeMap<Node, Frontend>,
+    pub links: Links,
+    pub balancer: Balancer,
+    pub load: Option<Load>,
+    timeline: Mutex<Vec<TimelineEvent>>,
+    /// Base backups taken during the run, by name.
+    pub backups: BTreeMap<String, PathBuf>,
+}
+
+impl Sim {
+    /// Build and start everything, and wait until both frontends are ready
+    /// and the balancer has marked them up. The load is started but not yet
+    /// offered: call `load().resume()`.
+    pub async fn start(config: SimConfig, inputs: Inputs) -> Result<Self> {
+        let clock = RunClock {
+            started: Instant::now(),
+        };
+        let run = format!(
+            "{}-{}",
+            config.scenario,
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let root = inputs.work_root.join(&run);
+        let report_dir = inputs.report_root.join(&config.scenario);
+        let logs = report_dir.join("logs");
+        if report_dir.exists() {
+            std::fs::remove_dir_all(&report_dir)?;
+        }
+        std::fs::create_dir_all(&logs)?;
+        std::fs::create_dir_all(&root)?;
+        let template =
+            chain::ramped_template(&inputs.qbitd, &inputs.work_root.join("ramp-cache")).await?;
+        let chain = Chain::start(&inputs.qbitd, &template, &root.join("chain"), &logs).await?;
+        let (start_height, _, _) = chain.c.tip().await?;
+
+        // --- databases ---------------------------------------------------
+        let mut pg = BTreeMap::new();
+        let settings: Vec<String> = Vec::new();
+        let node_a = PgNode::init(
+            "a",
+            &inputs.pg_bin,
+            &root.join("pg-a"),
+            &logs.join("postgres-a.log"),
+            &settings,
+        )?;
+        create_owner(&node_a).await?;
+        let mut relays = BTreeMap::new();
+        let node_b = match config.topology {
+            Topology::SingleWriter => {
+                let replication = Relay::open("replication-b-from-a", node_a.port()).await?;
+                let mut node_b = PgNode::adopt(
+                    "b",
+                    &inputs.pg_bin,
+                    &root.join("pg-b"),
+                    &logs.join("postgres-b.log"),
+                    &settings,
+                )?;
+                node_b.clone_as_standby(&node_a, replication.port(), STANDBY_SLOT)?;
+                relays.insert(replication.name().to_owned(), replication);
+                node_b
+            }
+            Topology::DualWriter | Topology::Unsynced => {
+                let node_b = PgNode::init(
+                    "b",
+                    &inputs.pg_bin,
+                    &root.join("pg-b"),
+                    &logs.join("postgres-b.log"),
+                    &settings,
+                )?;
+                create_owner(&node_b).await?;
+                node_b
+            }
+        };
+        pg.insert(Node::A, node_a);
+        pg.insert(Node::B, node_b);
+
+        // --- links -------------------------------------------------------
+        if config.topology == Topology::SingleWriter {
+            let writer = Relay::open("writer-b-to-a", pg[&Node::A].port()).await?;
+            relays.insert(writer.name().to_owned(), writer);
+        }
+        if config.topology == Topology::DualWriter {
+            for node in Node::BOTH {
+                let name = format!("peer-{}-to-{}", node.label(), node.peer().label());
+                let relay = Relay::open(&name, pg[&node.peer()].port()).await?;
+                relays.insert(name, relay);
+            }
+        }
+
+        // --- frontends ---------------------------------------------------
+        let mut config = config;
+        // One token for both nodes, as the pair shares the Hashbalancer's.
+        let token = format!("dual-sim-{}", uuid::Uuid::new_v4().simple());
+        if config.readiness == Readiness::Readyz {
+            config.balancer.check_path = "/readyz".into();
+            config.balancer.require_ok = false;
+            config.balancer.check_token = Some(token.clone());
+        }
+        let mut frontends = BTreeMap::new();
+        for node in Node::BOTH {
+            let stratum_port = crate::postgres::free_port()?;
+            let api_port = crate::postgres::free_port()?;
+            let readiness = (config.readiness == Readiness::Readyz)
+                .then(|| Ok::<_, anyhow::Error>((crate::postgres::free_port()?, token.clone())))
+                .transpose()?;
+            let database_url = match (config.topology, node) {
+                (Topology::SingleWriter, Node::B) => format!(
+                    "postgresql://{OWNER_ROLE}@127.0.0.1:{}/{DATABASE}",
+                    relays["writer-b-to-a"].port()
+                ),
+                _ => pg[&node].url(OWNER_ROLE, DATABASE),
+            };
+            let dual = (config.topology == Topology::DualWriter).then(|| DualSettings {
+                node_index: node.index() as u8,
+                carry_owner: node == Node::A,
+                peer_database_url: format!(
+                    "postgresql://{PEER_ROLE}@127.0.0.1:{}/{DATABASE}",
+                    relays[&format!("peer-{}-to-{}", node.label(), node.peer().label())].port()
+                ),
+                peer_database_url_fallback: None,
+                sync_interval_ms: config.sync_interval_ms,
+                sync_batch_rows: config.sync_batch_rows,
+            });
+            let spec = FrontendSpec {
+                node,
+                server_bin: inputs.server.clone(),
+                database_url,
+                qbitd_rpc_port: chain.node(qbitd_of(node)).rpc_port(),
+                stratum_port,
+                api_port,
+                share_difficulty: config.load.share_difficulty,
+                settlement: config.settlement,
+                dual,
+                stratum_max_connections: 512,
+                readiness: readiness.clone(),
+                overrides: config.overrides.get(&node).cloned().unwrap_or_default(),
+            };
+            let public_stratum =
+                Relay::open(&format!("public-stratum-{}", node.label()), stratum_port).await?;
+            // The balancer's checks reach the readiness listener when there
+            // is one, else `/healthz` on the operator listener.
+            let health_port = readiness.as_ref().map_or(api_port, |(port, _)| *port);
+            let public_health =
+                Relay::open(&format!("public-health-{}", node.label()), health_port).await?;
+            relays.insert(public_stratum.name().to_owned(), public_stratum);
+            relays.insert(public_health.name().to_owned(), public_health);
+            frontends.insert(node, Frontend::new(spec, &logs)?);
+        }
+        let links = Links { relays };
+
+        // A migrates its database first; in the 3.0 pair B then finds the
+        // schema in place.
+        let ready_limit = Duration::from_secs(180);
+        frontends.get_mut(&Node::A).context("frontend a")?.start()?;
+        if config.topology != Topology::DualWriter {
+            frontends[&Node::A].wait_ready(ready_limit).await?;
+        }
+        frontends.get_mut(&Node::B).context("frontend b")?.start()?;
+        if config.topology == Topology::DualWriter {
+            // The peer role reads tables the frontends' migrations create.
+            for node in Node::BOTH {
+                wait_schema(&pg[&node]).await?;
+                grant_peer_role(&pg[&node]).await?;
+            }
+        }
+        for node in Node::BOTH {
+            frontends[&node].wait_ready(ready_limit).await?;
+        }
+
+        // --- balancer and load ------------------------------------------
+        let backends = Node::BOTH
+            .iter()
+            .map(|node| {
+                Ok(BackendTarget {
+                    name: node.label().to_owned(),
+                    stratum_port: links
+                        .get(&format!("public-stratum-{}", node.label()))?
+                        .port(),
+                    health_port: links
+                        .get(&format!("public-health-{}", node.label()))?
+                        .port(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let balancer = Balancer::start(config.balancer.clone(), backends, clock.started).await?;
+        for node in Node::BOTH {
+            balancer
+                .wait_state(node.label(), true, Duration::from_secs(30))
+                .await?;
+        }
+        let finders: Vec<(Node, u16)> = Node::BOTH
+            .iter()
+            .map(|node| {
+                Ok((
+                    *node,
+                    links
+                        .get(&format!("public-stratum-{}", node.label()))?
+                        .port(),
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let load = Load::start(&config.load, balancer.port(), &finders, clock)?;
+        let sessions: usize = config.load.accounts.iter().map(|a| a.sessions).sum();
+        load.wait_holding(sessions, Duration::from_secs(60)).await?;
+
+        let sim = Self {
+            config,
+            inputs,
+            clock,
+            start_height,
+            root,
+            report_dir,
+            logs,
+            chain,
+            pg,
+            frontends,
+            links,
+            balancer,
+            load: Some(load),
+            timeline: Mutex::new(Vec::new()),
+            backups: BTreeMap::new(),
+        };
+        sim.mark(&format!(
+            "started: {:?} pair, {} sessions through the balancer",
+            sim.config.topology, sessions
+        ));
+        Ok(sim)
+    }
+
+    /// Record an event on the run's timeline.
+    pub fn mark(&self, event: &str) {
+        let at_ms = self.clock.now_ms();
+        if let Ok(mut timeline) = self.timeline.lock() {
+            timeline.push(TimelineEvent {
+                at_ms,
+                event: event.to_owned(),
+            });
+        }
+    }
+
+    pub fn timeline(&self) -> Vec<TimelineEvent> {
+        self.timeline.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    pub fn load(&self) -> Result<&Load> {
+        self.load.as_ref().context("the load has stopped")
+    }
+
+    pub fn frontend(&self, node: Node) -> &Frontend {
+        &self.frontends[&node]
+    }
+
+    pub fn frontend_mut(&mut self, node: Node) -> &mut Frontend {
+        self.frontends.get_mut(&node).expect("both frontends exist")
+    }
+
+    /// The database a node's own frontend writes: its own, or in the 3.0
+    /// pair A's for both.
+    pub fn ledger_node(&self, node: Node) -> Node {
+        match self.config.topology {
+            Topology::SingleWriter => Node::A,
+            _ => node,
+        }
+    }
+
+    pub fn pg_mut(&mut self, node: Node) -> &mut PgNode {
+        self.pg.get_mut(&node).expect("both databases exist")
+    }
+
+    /// The databases the invariants are checked in: the 3.0 pair's one
+    /// writer, otherwise both.
+    pub fn ledgers(&self) -> Vec<Node> {
+        crate::invariants::ledger_nodes(self)
+    }
+
+    /// Wait until `node` serves work on its own `qbitd`'s tip at its
+    /// database's payout revision, with no block candidate of its ledger on
+    /// its way to the chain: the state in which a block it finds is built on
+    /// current work (`Fixture::settled` in `live_regtest.rs`).
+    pub async fn wait_node_settled(&self, node: Node, limit: Duration) -> Result<()> {
+        let pool = self.pool(self.ledger_node(node)).await?;
+        let started = Instant::now();
+        let mut last = String::new();
+        let result = loop {
+            let unfinished: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",
+                qbit_prism_server::ledger::CandidateState::UNFINISHED_SQL
+            ))
+            .fetch_one(&pool)
+            .await?;
+            let revision: i64 = sqlx::query_scalar(
+                "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await?;
+            let tip = self.chain.node(qbitd_of(node)).best().await?;
+            if let Ok((_, health)) = self.frontend(node).health().await {
+                if unfinished == 0
+                    && health["ok"] == true
+                    && health["observed_tip"] == tip.as_str()
+                    && health["payout_state_generation"] == revision
+                {
+                    break Ok(());
+                }
+                last = format!(
+                    "{unfinished} unfinished candidates; health ok {}, observed tip {}, generation {} (database revision {revision}, node tip {tip})",
+                    health["ok"], health["observed_tip"], health["payout_state_generation"]
+                );
+            }
+            if started.elapsed() > limit {
+                break Err(anyhow::anyhow!(
+                    "node {node:?} did not settle within {limit:?}: {last}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        pool.close().await;
+        result
+    }
+
+    /// Whether `hash` became a block candidate (or a landed block) in
+    /// `node`'s ledger within `limit`.
+    pub async fn wait_candidate(&self, node: Node, hash: &str, limit: Duration) -> Result<bool> {
+        let pool = self.pool(self.ledger_node(node)).await?;
+        let started = Instant::now();
+        let found = loop {
+            let known: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash = $1) \
+                     OR EXISTS (SELECT 1 FROM qbit_pool_blocks WHERE block_hash = $1)",
+            )
+            .bind(hash)
+            .fetch_one(&pool)
+            .await?;
+            if known || started.elapsed() > limit {
+                break known;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        pool.close().await;
+        Ok(found)
+    }
+
+    /// A block candidate's row, for a failure message.
+    pub async fn candidate_state(&self, node: Node, hash: &str) -> String {
+        let Ok(pool) = self.pool(node).await else {
+            return "database unreachable".into();
+        };
+        let row: Option<(String, Option<String>, Option<String>, i32)> = sqlx::query_as(
+            "SELECT state, offer_outcome, last_error, attempt_count \
+             FROM qbit_block_candidate_outbox WHERE block_hash = $1",
+        )
+        .bind(hash)
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+        pool.close().await;
+        match row {
+            Some((state, outcome, error, attempts)) => format!(
+                "candidate {state}, outcome {outcome:?}, {attempts} attempts, last error {error:?}"
+            ),
+            None => "no candidate row".into(),
+        }
+    }
+
+    /// Wait until `hash` is landed and confirmed in each of `nodes`'
+    /// databases. Returns how long it took.
+    pub async fn wait_confirmed(
+        &self,
+        hash: &str,
+        nodes: &[Node],
+        limit: Duration,
+    ) -> Result<Duration> {
+        let started = Instant::now();
+        for node in nodes {
+            let pool = self.pool(*node).await?;
+            loop {
+                let state: Option<String> = sqlx::query_scalar(
+                    "SELECT chain_state FROM qbit_pool_blocks WHERE block_hash = $1",
+                )
+                .bind(hash)
+                .fetch_optional(&pool)
+                .await?;
+                if state.as_deref() == Some("confirmed") {
+                    break;
+                }
+                if started.elapsed() > limit {
+                    pool.close().await;
+                    let candidate = self.candidate_state(*node, hash).await;
+                    bail!(
+                        "block {hash} is {state:?} on node {node:?}, not confirmed, after {limit:?} ({candidate})"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            pool.close().await;
+        }
+        Ok(started.elapsed())
+    }
+
+    /// Bring the run to rest for the checker: stop offering shares and wait
+    /// for every answer, let every node's chain converge, wait until no
+    /// database holds an unfinished block candidate, and until the
+    /// databases agree (the 3.0 standby has replayed the primary; in the 3.1
+    /// pair both hold the same shares and blocks).
+    pub async fn settle(&self, limit: Duration) -> Result<()> {
+        let started = Instant::now();
+        let load = self.load()?;
+        load.pause();
+        load.wait_answered(Duration::from_secs(40)).await?;
+        self.chain.converged().await?;
+        for node in self.ledgers() {
+            let pool = self.pool(node).await?;
+            loop {
+                let unfinished: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM qbit_block_candidate_outbox \
+                     WHERE state IN ('pending', 'offer_reserved', 'offered') \
+                        OR (state = 'reconciliation' AND (claim_expires_at > clock_timestamp() \
+                            OR next_attempt_at <= clock_timestamp()))",
+                )
+                .fetch_one(&pool)
+                .await?;
+                if unfinished == 0 {
+                    break;
+                }
+                ensure!(
+                    started.elapsed() < limit,
+                    "node {node:?} still holds {unfinished} unfinished block candidates after {limit:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            pool.close().await;
+        }
+        match self.config.topology {
+            Topology::SingleWriter => {
+                self.wait_standby_replayed(limit - started.elapsed().min(limit))
+                    .await?
+            }
+            Topology::DualWriter => {
+                self.wait_synced(limit - started.elapsed().min(limit))
+                    .await?
+            }
+            Topology::Unsynced => {}
+        }
+        self.mark("settled");
+        Ok(())
+    }
+
+    /// Wait until the 3.0 standby has replayed everything the primary had
+    /// written when the wait began.
+    pub async fn wait_standby_replayed(&self, limit: Duration) -> Result<()> {
+        let primary = self.pg[&Node::A].admin_pool("postgres").await?;
+        let standby = self.pg[&Node::B].admin_pool("postgres").await?;
+        let target: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
+            .fetch_one(&primary)
+            .await?;
+        let started = Instant::now();
+        loop {
+            let caught_up: bool =
+                sqlx::query_scalar("SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn")
+                    .bind(&target)
+                    .fetch_one(&standby)
+                    .await?;
+            if caught_up {
+                break;
+            }
+            ensure!(
+                started.elapsed() < limit,
+                "the standby did not replay to {target} within {limit:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        primary.close().await;
+        standby.close().await;
+        Ok(())
+    }
+
+    /// Wait until both databases hold the same shares and pool blocks, as
+    /// two readings a second apart agree: the peer pulls have caught up.
+    pub async fn wait_synced(&self, limit: Duration) -> Result<()> {
+        let started = Instant::now();
+        let mut last = None;
+        loop {
+            let mut reading = Vec::new();
+            for node in Node::BOTH {
+                let pool = self.pool(node).await?;
+                let counts: (i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT count(*) FROM qbit_prism_share_hashes), \
+                            (SELECT count(*) FROM qbit_pool_blocks)",
+                )
+                .fetch_one(&pool)
+                .await?;
+                pool.close().await;
+                reading.push(counts);
+            }
+            if reading[0] == reading[1] && last.as_ref() == Some(&reading) {
+                return Ok(());
+            }
+            ensure!(
+                started.elapsed() < limit,
+                "the databases did not converge within {limit:?}: (shares, blocks) A {:?}, B {:?}",
+                reading[0],
+                reading[1]
+            );
+            last = Some(reading);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// A superuser pool on `node`'s PRISM database.
+    pub async fn pool(&self, node: Node) -> Result<PgPool> {
+        PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(Duration::from_secs(20))
+            .connect(&self.pg[&node].admin_url(DATABASE))
+            .await
+            .with_context(|| format!("connecting to node {node:?}'s ledger"))
+    }
+
+    /// Take a base backup of `node`'s database now, kept as `name`.
+    pub fn base_backup(&mut self, node: Node, name: &str) -> Result<()> {
+        let dest = self.root.join("backups").join(name);
+        std::fs::create_dir_all(dest.parent().context("backup dir")?)?;
+        self.pg[&node].base_backup(&dest)?;
+        self.backups.insert(name.to_owned(), dest);
+        self.mark(&format!("base backup {name} of node {node:?}"));
+        Ok(())
+    }
+
+    /// Stop the load, every frontend, the balancer's sessions and the chain,
+    /// and remove the data directories unless asked to keep them.
+    pub async fn shutdown(mut self, keep: bool) -> Result<()> {
+        if let Some(mut load) = self.load.take() {
+            let _ = load.stop().await;
+        }
+        for frontend in self.frontends.values_mut() {
+            let _ = frontend.stop(Duration::from_secs(10));
+        }
+        for node in self.pg.values_mut() {
+            let _ = node.stop_fast();
+        }
+        self.chain.stop().await;
+        if !keep && !self.inputs.keep {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+        Ok(())
+    }
+
+    /// The ports and paths a person reproducing a failure needs.
+    pub fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "root": self.root,
+            "report_dir": self.report_dir,
+            "postgres": self.pg.iter().map(|(node, pg)| (node.label(), pg.port())).collect::<BTreeMap<_, _>>(),
+            "links": self.links.names(),
+            "balancer_port": self.balancer.port(),
+        })
+    }
+}
+
+/// The `qbitd` a node's frontend uses: its own host's.
+pub fn qbitd_of(node: Node) -> chain::NodeName {
+    match node {
+        Node::A => chain::NodeName::A,
+        Node::B => chain::NodeName::B,
+    }
+}
+
+async fn create_owner(node: &PgNode) -> Result<()> {
+    let pool = node.admin_pool("postgres").await?;
+    sqlx::query(&format!("CREATE ROLE {OWNER_ROLE} LOGIN"))
+        .execute(&pool)
+        .await?;
+    sqlx::query(&format!("CREATE DATABASE {DATABASE} OWNER {OWNER_ROLE}"))
+        .execute(&pool)
+        .await?;
+    sqlx::query(&format!("CREATE ROLE {PEER_ROLE} LOGIN"))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    Ok(())
+}
+
+/// Wait until the frontend's migration has created the share ledger.
+async fn wait_schema(node: &PgNode) -> Result<()> {
+    let pool = node.admin_pool(DATABASE).await?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.qbit_share_ledger') IS NOT NULL")
+                .fetch_one(&pool)
+                .await?;
+        if exists {
+            pool.close().await;
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "node {}'s schema did not appear within 120 s",
+            node.name()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Read-only access for the peer pull. Until D1 documents the exact grants
+/// (CONTRACT.md §6, D1 task 3), every table in the schema is readable.
+async fn grant_peer_role(node: &PgNode) -> Result<()> {
+    let pool = node.admin_pool(DATABASE).await?;
+    for statement in [
+        format!("GRANT CONNECT ON DATABASE {DATABASE} TO {PEER_ROLE}"),
+        format!("GRANT USAGE ON SCHEMA public TO {PEER_ROLE}"),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {PEER_ROLE}"),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {OWNER_ROLE} IN SCHEMA public GRANT SELECT ON TABLES TO {PEER_ROLE}"
+        ),
+    ] {
+        sqlx::query(&statement).execute(&pool).await?;
+    }
+    pool.close().await;
+    Ok(())
+}
+
+/// The binaries the harness runs, built into this workspace's target
+/// directory by a nested `cargo build` exactly as `qbit-prism-load`'s tests
+/// build the server (`crates/qbit-prism-load/tests/faults.rs`): the server
+/// and the audit verifier.
+pub fn build_binaries(manifest_dir: &Path, profile_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let target = profile_dir
+        .parent()
+        .context("profile directory has no parent")?;
+    let mut command =
+        std::process::Command::new(std::env::var_os("CARGO").unwrap_or("cargo".into()));
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy().into_owned();
+        if [
+            "CARGO_PKG_",
+            "CARGO_MANIFEST_",
+            "CARGO_CRATE_",
+            "CARGO_BIN_",
+            "CARGO_PRIMARY_PACKAGE",
+            "CARGO_TARGET_TMPDIR",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        {
+            command.env_remove(name);
+        }
+    }
+    let release = profile_dir
+        .file_name()
+        .is_some_and(|name| name == "release");
+    command.args([
+        "build",
+        "--locked",
+        "-p",
+        "qbit-prism-server",
+        "--bin",
+        "qbit-prism-server",
+        "-p",
+        "qbit-prism",
+        "--bin",
+        "qbit-prism-audit-verify",
+    ]);
+    if release {
+        command.arg("--release");
+    }
+    let status = command
+        .env("CARGO_TARGET_DIR", target)
+        .current_dir(manifest_dir)
+        .status()
+        .context("running cargo build for the server and the verifier")?;
+    ensure!(
+        status.success(),
+        "cargo build of the server and the verifier: {status}"
+    );
+    let server = profile_dir.join("qbit-prism-server");
+    let verifier = profile_dir.join("qbit-prism-audit-verify");
+    for binary in [&server, &verifier] {
+        if !binary.exists() {
+            bail!("{} was not built", binary.display());
+        }
+    }
+    Ok((server, profile_dir.to_owned()))
+}

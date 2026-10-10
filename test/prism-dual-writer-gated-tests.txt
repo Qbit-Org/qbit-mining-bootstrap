@@ -1,0 +1,12 @@
+# The dual-writer scenarios (crates/qbit-prism-dual-sim, CONTRACT.md §5 of
+# the 3.1 effort) the PR fast lane runs: the prism-dual-writer job of
+# .github/workflows/ci.yml runs qbit-prism-dual-sim::scenarios once with
+# these ids, --ignored --exact --test-threads=1, in required integration mode,
+# and proves each executed with scripts/check_gate_manifest.py. They are
+# #[ignore]d, so the prism-native-postgres shards never run them, and they
+# are not in test/prism-gated-tests.txt. One `<package>::<binary>::<test>` id
+# per line, sorted; every id is also in
+# test/prism-dual-writer-nightly-gated-tests.txt and named in
+# test/e2e-scenarios.toml.
+qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks
+qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill

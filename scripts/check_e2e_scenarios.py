@@ -11,7 +11,11 @@ evidence, and the evidence decides its lanes:
   `prism-native-postgres` shards prove it executed); one in
   `test/prism-nightly-gated-tests.txt` runs in `nightly`, and one in
   `test/prism-weekly-gated-tests.txt` in `weekly` (the live-weekly job, #487
-  L4).
+  L4). The dual-writer scenarios (3.1) have two lists of their own:
+  `test/prism-dual-writer-gated-tests.txt` runs in `pr` (the required
+  `prism-dual-writer` job of ci.yml) and
+  `test/prism-dual-writer-nightly-gated-tests.txt` in `nightly` (its
+  `dual-writer-nightly` job); every fast-lane id must also run nightly.
 - `presets`: load-harness presets in `crates/qbit-prism-load/presets`. A
   `nightly` preset runs in `nightly`, a `weekly` one (the long soak, #575)
   in `weekly`, a `manual` one in `dispatch`, and a `smoke` preset in `pr`
@@ -38,7 +42,9 @@ This check fails when:
   reason; the owner is the linked issue);
 - a lane runs a scenario the manifest does not name: a gated test in one of
   the end-to-end binaries (`SCENARIO_BINARIES`), an opt-in nightly or weekly
-  test, a preset, a suite, or an L6 check that no running scenario cites;
+  test, a dual-writer scenario, a preset, a suite, or an L6 check that no
+  running scenario cites;
+- the dual-writer fast lane runs a scenario the nightly matrix does not;
 - a lane the manifest marks as running no longer has the workflow wiring
   that runs it.
 
@@ -71,6 +77,9 @@ SCHEMA = "qbit.e2e-scenarios.v1"
 PR_LIST = Path("test/prism-gated-tests.txt")
 NIGHTLY_LIST = Path("test/prism-nightly-gated-tests.txt")
 WEEKLY_LIST = Path("test/prism-weekly-gated-tests.txt")
+# The dual-writer scenarios (3.1): the PR fast lane and the nightly matrix.
+DUAL_WRITER_PR_LIST = Path("test/prism-dual-writer-gated-tests.txt")
+DUAL_WRITER_NIGHTLY_LIST = Path("test/prism-dual-writer-nightly-gated-tests.txt")
 PRESETS = Path("crates/qbit-prism-load/presets")
 L6_DRIVER = Path("scripts/prism_shipped_image_lane.py")
 # Gated test binaries whose every test is an end-to-end scenario and so must
@@ -90,7 +99,11 @@ SMOKE_BINARIES = ("qbit-prism-load::load_smoke::", "qbit-prism-load::faults::")
 LANE_WIRING = {
     "pr": (
         ".github/workflows/ci.yml",
-        ("--expected test/prism-gated-tests.txt", "scripts/run_rust_test_shard.py"),
+        (
+            "--expected test/prism-gated-tests.txt",
+            "scripts/run_rust_test_shard.py",
+            f"--expected {DUAL_WRITER_PR_LIST}",
+        ),
     ),
     "nightly": (
         ".github/workflows/prism-load-nightly.yml",
@@ -98,6 +111,7 @@ LANE_WIRING = {
             "cron:",
             "--expected test/prism-nightly-gated-tests.txt",
             "scripts/prism_load_matrix.py",
+            f"--expected {DUAL_WRITER_NIGHTLY_LIST}",
         ),
     ),
     "dispatch": (
@@ -154,15 +168,17 @@ class Lanes:
         self.pr = read_expected(root / PR_LIST)
         self.nightly = read_expected(root / NIGHTLY_LIST)
         self.weekly = read_expected(root / WEEKLY_LIST)
+        self.dual_writer_pr = read_expected(root / DUAL_WRITER_PR_LIST)
+        self.dual_writer_nightly = read_expected(root / DUAL_WRITER_NIGHTLY_LIST)
         self.presets = load_presets(root / PRESETS)
         self.l6_checks = read_lane_checks(root / L6_DRIVER)
         self.suites = load_suites(root / PRESETS, self.presets)
 
     def test_lanes(self, test_id: str) -> set[str]:
         lanes = set()
-        if test_id in self.pr:
+        if test_id in self.pr or test_id in self.dual_writer_pr:
             lanes.add("pr")
-        if test_id in self.nightly:
+        if test_id in self.nightly or test_id in self.dual_writer_nightly:
             lanes.add("nightly")
         if test_id in self.weekly:
             lanes.add("weekly")
@@ -349,8 +365,9 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
             found = lanes_run.test_lanes(test_id)
             if not found:
                 problems.append(
-                    f"{where}: {test_id} is in none of {PR_LIST}, {NIGHTLY_LIST} "
-                    f"or {WEEKLY_LIST}, so no lane runs it"
+                    f"{where}: {test_id} is in none of {PR_LIST}, {NIGHTLY_LIST}, "
+                    f"{WEEKLY_LIST}, {DUAL_WRITER_PR_LIST} or {DUAL_WRITER_NIGHTLY_LIST}, "
+                    "so no lane runs it"
                 )
             derived |= found
         for preset in evidence["presets"]:
@@ -403,6 +420,17 @@ def check(manifest: dict, lanes_run: Lanes, root: Path) -> list[str]:
     for test_id in lanes_run.weekly:
         if test_id not in cited["tests"]:
             problems.append(f"weekly runs {test_id}, which no running scenario names")
+    for test_id in lanes_run.dual_writer_pr:
+        if test_id not in cited["tests"]:
+            problems.append(f"pr runs {test_id}, which no running scenario names")
+        if test_id not in lanes_run.dual_writer_nightly:
+            problems.append(
+                f"the dual-writer fast lane runs {test_id}, which the nightly matrix "
+                f"({DUAL_WRITER_NIGHTLY_LIST}) does not"
+            )
+    for test_id in lanes_run.dual_writer_nightly:
+        if test_id not in cited["tests"]:
+            problems.append(f"nightly runs {test_id}, which no running scenario names")
     for name in lanes_run.l6_checks:
         if name not in cited["lane_checks"]:
             problems.append(f"L6 runs check {name}, which no running scenario names")
