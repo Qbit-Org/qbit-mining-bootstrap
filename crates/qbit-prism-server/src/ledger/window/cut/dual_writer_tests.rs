@@ -117,11 +117,11 @@ async fn insert(ledger: &Ledger, rows: &[Row]) -> Result<()> {
 }
 
 /// Where the peer sync stands for `peer`'s shares: every peer row at or
-/// below `through` is here.
+/// below `through` is here, and the pull refused none.
 async fn mark(ledger: &Ledger, peer: i16, through: i64) -> Result<()> {
     sqlx::query(
-        "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) VALUES('shares',$1,$2,$2)
-         ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through,ingested_through=EXCLUDED.ingested_through",
+        "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) VALUES('shares',$1,$2)
+         ON CONFLICT(stream) DO UPDATE SET peer_node=EXCLUDED.peer_node,scanned_through=EXCLUDED.scanned_through",
     )
     .bind(peer)
     .bind(through)
