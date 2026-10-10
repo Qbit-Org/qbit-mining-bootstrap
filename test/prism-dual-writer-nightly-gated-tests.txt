@@ -8,4 +8,24 @@
 # `<package>::<binary>::<test>` id per line, sorted; each is named in
 # test/e2e-scenarios.toml.
 qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks
+qbit-prism-dual-sim::scenarios::s01_steady_state_copies_a_shares_and_blocks_to_b_within_the_sync_interval
+qbit-prism-dual-sim::scenarios::s02_a_frontend_killed_miners_move_to_b_which_mines_carry_free_and_a_pays_down_on_return
+qbit-prism-dual-sim::scenarios::s02_a_frozen_again_and_again_mid_pull_never_stalls_b
+qbit-prism-dual-sim::scenarios::s02_a_frozen_miners_move_to_b_and_a_resumes_without_double_pay
+qbit-prism-dual-sim::scenarios::s02_a_network_dropped_miners_move_to_b_and_a_merges_on_heal
+qbit-prism-dual-sim::scenarios::s02_a_postgres_killed_miners_move_to_b_and_a_recovers_its_tail_on_return
+qbit-prism-dual-sim::scenarios::s02_a_puller_dying_mid_read_leaves_b_no_snapshot_and_flat_appends
+qbit-prism-dual-sim::scenarios::s03_b_dies_a_is_unaffected_and_b_catches_up_on_return
+qbit-prism-dual-sim::scenarios::s04_a_transient_failure_applying_bs_block_is_retried_until_it_lands
+qbit-prism-dual-sim::scenarios::s04_link_cut_with_both_alive_costs_no_mining_and_sync_catches_up_on_heal
+qbit-prism-dual-sim::scenarios::s05_both_nodes_writing_at_once_keep_every_invariant_and_b_stays_carry_free
+qbit-prism-dual-sim::scenarios::s06_a_restarts_and_serves_while_b_answers_but_its_ledger_is_locked
+qbit-prism-dual-sim::scenarios::s06_a_restarts_and_serves_while_b_answers_but_refuses_its_reads
+qbit-prism-dual-sim::scenarios::s06_a_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_ready
+qbit-prism-dual-sim::scenarios::s06_b_restored_from_an_old_backup_recovers_its_own_rows_before_it_is_ready
+qbit-prism-dual-sim::scenarios::s08_a_block_accepted_as_its_node_dies_is_adopted_by_the_survivor_and_landed_once
+qbit-prism-dual-sim::scenarios::s08_a_block_lost_with_its_dying_node_is_never_paid
+qbit-prism-dual-sim::scenarios::s08_without_the_peer_ingest_wait_a_block_accepted_as_its_node_dies_is_landed_once
+qbit-prism-dual-sim::scenarios::s09_a_3_0_ledger_cut_over_to_dual_mode_keeps_its_balances_and_audits
 qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill
+qbit-prism-dual-sim::scenarios::s11_carry_owner_transfer_is_refused_while_an_own_block_is_unknown_then_succeeds

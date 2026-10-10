@@ -9,4 +9,8 @@
 # test/prism-dual-writer-nightly-gated-tests.txt and named in
 # test/e2e-scenarios.toml.
 qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks
+qbit-prism-dual-sim::scenarios::s01_steady_state_copies_a_shares_and_blocks_to_b_within_the_sync_interval
+qbit-prism-dual-sim::scenarios::s02_a_frontend_killed_miners_move_to_b_which_mines_carry_free_and_a_pays_down_on_return
+qbit-prism-dual-sim::scenarios::s04_link_cut_with_both_alive_costs_no_mining_and_sync_catches_up_on_heal
+qbit-prism-dual-sim::scenarios::s05_both_nodes_writing_at_once_keep_every_invariant_and_b_stays_carry_free
 qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill
