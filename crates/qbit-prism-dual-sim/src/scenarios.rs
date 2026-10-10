@@ -2793,9 +2793,15 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
 }
 
 /// How long the survivor may take to adopt a dead node's block that the
-/// chain holds (D-10, D-11): its reconciler's next look at the chain, the
-/// synced prepared record, a landing.
+/// chain holds (D-10, D-11), once it is [`ADOPT_DEPTH`] deep: two of D3's
+/// adoption passes (every 30 s; the first reads up to 1,440 recent blocks'
+/// coinbases), the synced prepared record, a landing.
 pub const ADOPTION_BOUND: Duration = Duration::from_secs(90);
+/// How deep a dead node's block must be before the survivor adopts it
+/// (`ADOPT_AFTER_CONFIRMATIONS` in D3's `coordinator/adoption.rs`: a block
+/// at most the tip's height minus this), so its finder has time to land and
+/// sync it first. S8 mints this many external blocks on top of it.
+pub const ADOPT_DEPTH: u64 = 60;
 /// How long a returned node may take to land the block it died offering:
 /// the dead frontend's claim on the candidate holds for PRISM's 120 s
 /// candidate lease from its last renewal, then the restarted frontend
@@ -2902,6 +2908,10 @@ async fn s08_block_at_death(sim: &mut Sim, case: DeathAtFind, body: &mut Body) -
                 .and_then(|header| header["previousblockhash"].as_str().map(str::to_owned))
                 .unwrap_or_default();
             let held = prepared_on_parent(sim, &parent).await;
+            sim.chain.mint(ADOPT_DEPTH).await?;
+            sim.mark(&format!(
+                "{ADOPT_DEPTH} external blocks minted on top of A's block, for adoption"
+            ));
             let adopted = sim.wait_confirmed(&hash, &[Node::B], ADOPTION_BOUND).await;
             body.expect(
                 &format!(
