@@ -1511,10 +1511,9 @@ impl Ledger {
             .map(|(hash, digest)| (hash.as_str(), digest.as_str()))
             .unzip();
         Ok(sqlx::query_as(&format!(
-            "SELECT u.h,EXISTS (SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=u.h) \
-             FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS u(h,d,n) \
-             WHERE NOT EXISTS (SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=u.h AND {}=u.d) \
-             ORDER BY u.n",
+            "SELECT u.h,b.block_hash IS NOT NULL FROM unnest($1::text[],$2::text[]) \
+             WITH ORDINALITY AS u(h,d,n) LEFT JOIN qbit_pool_blocks b ON b.block_hash=u.h \
+             WHERE b.block_hash IS NULL OR {} IS DISTINCT FROM u.d ORDER BY u.n",
             block_facts_digest()
         ))
         .bind(&hashes)

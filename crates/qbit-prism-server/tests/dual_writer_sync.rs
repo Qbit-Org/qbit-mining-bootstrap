@@ -2018,7 +2018,8 @@ async fn recovery_refuses_an_own_row_beyond_the_peers_cursor() -> Result<()> {
 /// Own-log recovery compares each own landed block the peer holds and this
 /// database holds too by a digest of its immutable facts: one held here
 /// with other facts is read whole and recorded as a conflict, the own log
-/// has diverged, and the latch stays down.
+/// has diverged, and the latch stays down. The verification goes too, so a
+/// restart without the peer stays down as well.
 #[tokio::test]
 async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -2032,19 +2033,21 @@ async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
             Ok(count(&pair.b.pool, "SELECT count(*) FROM qbit_pool_blocks").await? == 1)
         })
         .await?;
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut on_a, async |report| Ok(report.own_log_caught_up)).await?;
         // A's own row of the block now names another coinbase.
         sqlx::query("UPDATE qbit_pool_blocks SET coinbase_txid=$2 WHERE block_hash=$1")
             .bind(&block)
             .bind(hex("another coinbase"))
             .execute(&pair.a.pool)
             .await?;
-        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
-        let refused = on_a.pass().await;
+        let (mut restarted, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let refused = restarted.pass().await;
         ensure!(
             refused.as_ref().is_err_and(|error| format!("{error:#}").contains("diverged")),
             "{refused:?}"
         );
-        ensure!(!on_a.subscribe().borrow().own_log_caught_up);
+        ensure!(!restarted.subscribe().borrow().own_log_caught_up);
         ensure!(
             count(
                 &pair.a.pool,
@@ -2053,6 +2056,12 @@ async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
             .await?
                 == 1
         );
+        ensure!(
+            pair.a.node_lineage().await?.and_then(|lineage| lineage.verified).is_none(),
+            "the verification outlived a diverged own log"
+        );
+        let (mut cut_off, _) = sync(&pair.a, NodeIndex::A, &dead_url(&pair.b_url)?);
+        ensure!(!cut_off.pass().await?.own_log_caught_up);
         Ok(())
     })
     .await

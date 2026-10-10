@@ -3901,7 +3901,8 @@ missing, the node first forgets its last verification, so a recovery cut
 short (a peer that fails partway, a crash) leaves it waiting for the peer
 even after a restore that kept the timeline. If an own row that recovery
 compares differs from the one here, the own log has diverged: the
-conflict is recorded, and the latch stays unset, with or without the peer, until an
+conflict is recorded, the verification is forgotten, and the latch stays
+unset, with or without the peer, until an
 operator decides. Losing the peer later never clears the latch. A change of
 identifier or timeline while the frontend runs, a restore or promotion under
 it, stops the frontend with an `ALERT`, refusing every share until it has
