@@ -69,6 +69,8 @@ struct Counters {
 pub struct RelayStats {
     pub name: String,
     pub state: LinkState,
+    /// The one-way latency added to every chunk, in milliseconds.
+    pub latency_ms: u64,
     pub accepted: u64,
     pub reset: u64,
     pub upstream_failures: u64,
@@ -79,6 +81,8 @@ pub struct Relay {
     port: u16,
     target: Arc<AtomicU16>,
     state: watch::Sender<LinkState>,
+    /// One-way latency, in milliseconds, added to every chunk forwarded.
+    latency_ms: Arc<AtomicU64>,
     counters: Arc<Counters>,
     task: JoinHandle<()>,
 }
@@ -92,11 +96,13 @@ impl Relay {
         let port = listener.local_addr()?.port();
         let target = Arc::new(AtomicU16::new(target));
         let (state, _) = watch::channel(LinkState::Open);
+        let latency_ms = Arc::new(AtomicU64::new(0));
         let counters = Arc::new(Counters::default());
         let task = tokio::spawn(accept_loop(
             listener,
             target.clone(),
             state.subscribe(),
+            latency_ms.clone(),
             counters.clone(),
         ));
         Ok(Self {
@@ -104,6 +110,7 @@ impl Relay {
             port,
             target,
             state,
+            latency_ms,
             counters,
             task,
         })
@@ -126,6 +133,14 @@ impl Relay {
         self.state.send_replace(state);
     }
 
+    /// Delay every chunk either side sends by `latency` before it is
+    /// forwarded, on connections old and new: a path between two sites.
+    /// Chunks are forwarded one at a time, so bulk transfer slows too.
+    pub fn set_latency(&self, latency: std::time::Duration) {
+        self.latency_ms
+            .store(latency.as_millis() as u64, Ordering::SeqCst);
+    }
+
     /// Point new connections at another port (a restarted child's, say).
     pub fn retarget(&self, target: u16) {
         self.target.store(target, Ordering::SeqCst);
@@ -135,6 +150,7 @@ impl Relay {
         RelayStats {
             name: self.name.clone(),
             state: self.state(),
+            latency_ms: self.latency_ms.load(Ordering::Relaxed),
             accepted: self.counters.accepted.load(Ordering::Relaxed),
             reset: self.counters.reset.load(Ordering::Relaxed),
             upstream_failures: self.counters.upstream_failures.load(Ordering::Relaxed),
@@ -153,6 +169,7 @@ async fn accept_loop(
     listener: TcpListener,
     target: Arc<AtomicU16>,
     state: watch::Receiver<LinkState>,
+    latency_ms: Arc<AtomicU64>,
     counters: Arc<Counters>,
 ) {
     while let Ok((client, _)) = listener.accept().await {
@@ -160,9 +177,10 @@ async fn accept_loop(
         let _ = client.set_nodelay(true);
         let state = state.clone();
         let target = target.clone();
+        let latency_ms = latency_ms.clone();
         let counters = counters.clone();
         tokio::spawn(async move {
-            connection(client, target, state, counters).await;
+            connection(client, target, state, latency_ms, counters).await;
         });
     }
 }
@@ -207,6 +225,7 @@ async fn connection(
     client: TcpStream,
     target: Arc<AtomicU16>,
     mut state: watch::Receiver<LinkState>,
+    latency_ms: Arc<AtomicU64>,
     counters: Arc<Counters>,
 ) {
     // A connection accepted while blackholed is held with no upstream.
@@ -232,12 +251,14 @@ async fn connection(
         client_read,
         upstream_write,
         state.clone(),
+        latency_ms.clone(),
         discarded.clone(),
     ));
     let inbound = tokio::spawn(pump(
         upstream_read,
         client_write,
         state.clone(),
+        latency_ms.clone(),
         discarded.clone(),
     ));
     // Each pump hands its halves back when it ends, so a reset can abort
@@ -303,7 +324,20 @@ async fn forward(
     to: &mut OwnedWriteHalf,
     chunk: &[u8],
     state: &mut watch::Receiver<LinkState>,
+    latency: std::time::Duration,
 ) -> Forwarded {
+    // The path's latency, before the chunk moves; a state change still acts
+    // at once, and the loop below re-checks it.
+    if !latency.is_zero() {
+        tokio::select! {
+            () = tokio::time::sleep(latency) => {}
+            changed = state.changed() => {
+                if changed.is_err() {
+                    return Forwarded::Ended;
+                }
+            }
+        }
+    }
     let mut sent = 0;
     while sent < chunk.len() {
         match flowing(state).await {
@@ -339,6 +373,7 @@ async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
     mut state: watch::Receiver<LinkState>,
+    latency_ms: Arc<AtomicU64>,
     discarded: Arc<AtomicBool>,
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
     let mut buffer = vec![0u8; 16 * 1024];
@@ -375,7 +410,8 @@ async fn pump(
             }
             Ok(count) => count,
         };
-        match forward(&mut to, &buffer[..count], &mut state).await {
+        let latency = std::time::Duration::from_millis(latency_ms.load(Ordering::SeqCst));
+        match forward(&mut to, &buffer[..count], &mut state, latency).await {
             Forwarded::Written => {}
             Forwarded::Dropped => discarded.store(true, Ordering::SeqCst),
             Forwarded::Ended => return (from, to),
@@ -459,6 +495,25 @@ mod tests {
         let mut five = [0u8; 5];
         timeout(Duration::from_secs(5), held.read_exact(&mut five)).await??;
         assert_eq!(&five, b"three");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latency_delays_each_way_and_can_be_lifted() -> Result<()> {
+        let relay = Relay::open("test", echo_server().await?).await?;
+        let mut stream = TcpStream::connect(("127.0.0.1", relay.port())).await?;
+        relay.set_latency(Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        assert_eq!(round_trip(&mut stream, b"slow").await?, b"slow");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "both ways wait: {:?}",
+            started.elapsed()
+        );
+        relay.set_latency(Duration::ZERO);
+        let started = std::time::Instant::now();
+        assert_eq!(round_trip(&mut stream, b"fast").await?, b"fast");
+        assert!(started.elapsed() < Duration::from_millis(300));
         Ok(())
     }
 

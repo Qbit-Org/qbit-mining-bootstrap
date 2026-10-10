@@ -1211,7 +1211,8 @@ async fn hold_frozen(
 struct PullState {
     backends: i64,
     busy: i64,
-    /// Backends with a transaction open (a snapshot may be held).
+    /// Backends idle in an explicit transaction, between its statements:
+    /// open across a round trip (and with a snapshot, if it holds one).
     in_transaction: i64,
     advisory_locks: i64,
     /// Of those, D1's sync barrier (`SYNC_BARRIER_LOCK`).
@@ -1230,7 +1231,7 @@ async fn pull_state(pool: &sqlx::PgPool) -> Result<PullState> {
             "SELECT count(*), \
                     count(*) FILTER (WHERE a.state IN ('active', 'idle in transaction', \
                                                        'idle in transaction (aborted)')), \
-                    count(*) FILTER (WHERE a.xact_start IS NOT NULL), \
+                    count(*) FILTER (WHERE a.state LIKE 'idle in transaction%'), \
                     coalesce(sum(held.locks), 0)::bigint, \
                     coalesce(sum(held.barrier), 0)::bigint \
              FROM pg_stat_activity a \
@@ -1261,11 +1262,16 @@ async fn pull_state(pool: &sqlx::PgPool) -> Result<PullState> {
 /// `pg_locks` adds no contention to the database whose stalls it measures.
 const PULL_POLL: Duration = Duration::from_millis(20);
 
-/// D1's sync barrier key (`ledger::peer_sync::SYNC_BARRIER_LOCK`, cca56f14):
-/// `pg_locks` shows it as `classid` (the high half) and `objid` (the low
-/// half). Should D1 change it, a freeze aimed at the barrier falls back to
-/// a busy moment.
-const SYNC_BARRIER_KEY: u64 = 0x5052_4953_4d00_0008;
+/// D1's sync barrier key, as `pg_locks` shows it: `classid` the high half,
+/// `objid` the low half. Taken from D1's constant, so a change to it cannot
+/// leave the freezes aimed at a lock nobody takes.
+const SYNC_BARRIER_KEY: u64 = qbit_prism_server::ledger::peer_sync::SYNC_BARRIER_LOCK as u64;
+
+/// The latency S2's freeze and puller-death checks put on A's link to B: a
+/// path between two sites. A pull that holds the barrier, or a transaction,
+/// across round trips then holds it long enough to be caught, as on the
+/// pair; one done in a single statement is not stretched by it.
+pub const PEER_LINK_LATENCY: Duration = Duration::from_millis(40);
 
 /// What a freeze or a death was timed to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -1292,7 +1298,8 @@ async fn wait_for_a_pull(
     first: PullMoment,
 ) -> Result<PullMoment> {
     let started = Instant::now();
-    while started.elapsed() < limit * 2 / 3 {
+    let aimed = matches!(first, PullMoment::BarrierHeld | PullMoment::InTransaction);
+    while aimed && started.elapsed() < limit * 2 / 3 {
         let state = pull_state(pool).await?;
         let found = match first {
             PullMoment::BarrierHeld => state.barrier > 0,
@@ -1456,6 +1463,11 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.load()?.resume();
     steady(sim, 6).await;
     routing_settled(sim).await?;
+    sim.links.get("peer-a-to-b")?.set_latency(PEER_LINK_LATENCY);
+    sim.mark(&format!(
+        "A's link to B's database at {} ms each way",
+        PEER_LINK_LATENCY.as_millis()
+    ));
     let pool = sim.pool(Node::B).await?;
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -1498,6 +1510,7 @@ async fn s02_frozen_during_pulls(sim: &mut Sim, body: &mut Body) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500 + schedule.below(2_500))).await;
     }
     pool.close().await;
+    sim.links.get("peer-a-to-b")?.set_latency(Duration::ZERO);
     std::fs::write(
         sim.report_dir.join("freezes.json"),
         serde_json::to_vec_pretty(&json!({"seed": seed, "rounds": rounds}))?,
@@ -1607,6 +1620,11 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
     sim.load()?.resume();
     steady(sim, 8).await;
     routing_settled(sim).await?;
+    sim.links.get("peer-a-to-b")?.set_latency(PEER_LINK_LATENCY);
+    sim.mark(&format!(
+        "A's link to B's database at {} ms each way",
+        PEER_LINK_LATENCY.as_millis()
+    ));
     let pool = sim.pool(Node::B).await?;
 
     let sampling = Instant::now();
@@ -1674,7 +1692,9 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
             match timed {
                 PullMoment::InTransaction => "while its puller had a transaction open on B",
                 PullMoment::BarrierHeld => "while its puller held D1's sync barrier on B",
-                PullMoment::Busy => "while its puller had a query running on B",
+                PullMoment::Busy => {
+                    "while its puller was busy on B (a query, a transaction or a lock)"
+                }
                 PullMoment::Unseen => "at a moment none of its pulls was seen on B",
             },
             last_holding,
@@ -1739,6 +1759,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
     body.gaps.push(report::gap(&records, fault_at));
 
     sim.links.set("peer-a-to-b", LinkState::Open)?;
+    sim.links.get("peer-a-to-b")?.set_latency(Duration::ZERO);
     sim.heal(Fault::FrontendKill9(Node::A)).await?;
     sim.balancer
         .wait_state("a", true, Duration::from_secs(60))
