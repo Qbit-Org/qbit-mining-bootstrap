@@ -3879,6 +3879,34 @@ and the prepared record the block was built on: what the peer needs to adopt
 the block if this node dies. The block is offered whatever the wait finds,
 counted in `qbit_prism_peer_sync_offer_waits_total{outcome}`.
 
+**The peer's sync role.** Each node's database grants the other node's
+pulls one login role, `prism_peer_sync`, with no write right anywhere, and
+these grants only. `tests/dual_writer_sync.rs` runs every read of the sync,
+the own-log check and the found-block wait as a role holding exactly these:
+
+```sql
+GRANT CONNECT ON DATABASE <prism database> TO prism_peer_sync;
+GRANT USAGE ON SCHEMA <prism schema> TO prism_peer_sync;
+GRANT SELECT ON qbit_share_ledger, qbit_prism_share_hashes, qbit_pool_blocks,
+    qbit_prism_audit_snapshots, qbit_pool_audit_bundles, qbit_pool_payout_entries,
+    qbit_payout_carry_forward, qbit_ctv_fanout_sets, qbit_ctv_fanout_artifacts,
+    qbit_prism_templates, qbit_prism_balance_snapshots, qbit_prism_jobs,
+    qbit_prism_node_roles TO prism_peer_sync;
+GRANT SELECT ON qbit_prism_node_identity, qbit_prism_node_lineage,
+    qbit_prism_peer_sync_cursors TO prism_peer_sync;
+GRANT SELECT (config_fingerprint) ON qbit_prism_cluster TO prism_peer_sync;
+GRANT SELECT ON SEQUENCE qbit_prism_sync_seq, qbit_share_ledger_share_seq_seq TO prism_peer_sync;
+```
+
+Reads of the share ledger go through its parent, so new partitions need no
+grant. The sync also calls `qbit_prism_sync_barrier()` and reads the catalogs,
+which every role may do by default. The role's settings bound what a dead
+puller can hold on the peer: `default_transaction_read_only = on`,
+`statement_timeout = '8s'`, `lock_timeout = '2s'`,
+`idle_in_transaction_session_timeout = '5s'`, and TCP keepalives with a 10 s
+`tcp_user_timeout`. Every frontend also sends these settings when it
+connects.
+
 **Watching it.** `qbit_prism_peer_sync_lag_rows{stream}` and
 `qbit_prism_peer_sync_lag_seconds{stream}` measure how far each stream is
 behind. `qbit_prism_peer_sync_peer_reachable`, `qbit_prism_peer_sync_path{path}`

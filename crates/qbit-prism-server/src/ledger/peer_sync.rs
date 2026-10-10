@@ -299,11 +299,13 @@ fn array_len(value: &Value) -> usize {
 pub mod peer {
     use super::*;
 
-    /// The peer's identity, fingerprint and floors.
+    /// The peer's identity, fingerprint and floors. The cluster row is read
+    /// without a predicate: the table holds one row (its key is the
+    /// singleton), and the sync role may read only `config_fingerprint`.
     pub async fn facts(connection: &mut PgConnection) -> Result<PeerFacts> {
         let row = sqlx::query(
             "SELECT (SELECT node_index FROM qbit_prism_node_identity WHERE singleton) AS node_index,\
-             (SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton) AS config_fingerprint,\
+             (SELECT config_fingerprint FROM qbit_prism_cluster) AS config_fingerprint,\
              (SELECT share_seq_floor FROM qbit_prism_node_lineage WHERE singleton) AS share_seq_floor,\
              (SELECT sync_seq_floor FROM qbit_prism_node_lineage WHERE singleton) AS sync_seq_floor",
         )

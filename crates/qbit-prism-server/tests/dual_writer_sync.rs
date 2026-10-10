@@ -1051,3 +1051,112 @@ async fn a_block_that_fails_to_apply_for_a_passing_reason_is_retried() -> Result
     })
     .await
 }
+
+/// The grants of the peer's sync role on one database, exactly as
+/// docs/prism-ledger-ops.md lists them for the pair's provisioning.
+async fn grant_peer_role(ledger: &Ledger, role: &str) -> Result<()> {
+    let (database, schema): (String, String) =
+        sqlx::query_as("SELECT current_database()::text,current_schema()::text")
+            .fetch_one(&ledger.pool)
+            .await?;
+    sqlx::raw_sql(&format!(
+        "GRANT CONNECT ON DATABASE \"{database}\" TO {role}; \
+         GRANT USAGE ON SCHEMA \"{schema}\" TO {role}; \
+         GRANT SELECT ON qbit_share_ledger, qbit_prism_share_hashes, qbit_pool_blocks, \
+             qbit_prism_audit_snapshots, qbit_pool_audit_bundles, qbit_pool_payout_entries, \
+             qbit_payout_carry_forward, qbit_ctv_fanout_sets, qbit_ctv_fanout_artifacts, \
+             qbit_prism_templates, qbit_prism_balance_snapshots, qbit_prism_jobs, \
+             qbit_prism_node_roles TO {role}; \
+         GRANT SELECT ON qbit_prism_node_identity, qbit_prism_node_lineage, \
+             qbit_prism_peer_sync_cursors TO {role}; \
+         GRANT SELECT (config_fingerprint) ON qbit_prism_cluster TO {role}; \
+         GRANT SELECT ON SEQUENCE qbit_prism_sync_seq, qbit_share_ledger_share_seq_seq TO {role}"
+    ))
+    .execute(&ledger.pool)
+    .await?;
+    Ok(())
+}
+
+/// Every read the peer sync makes on the peer runs as the peer's sync role,
+/// which holds the documented grants and nothing more (D5 provisions it):
+/// here each node pulls the other's rows, recovers its own log and waits for
+/// the peer's ingest as such a role, so a read that needs any other right
+/// fails this test rather than a pair's first start.
+#[tokio::test]
+async fn the_sync_needs_only_the_peer_roles_documented_grants() -> Result<()> {
+    use qbit_prism_server::peer_sync::{AdoptionNeeds, PeerIngest, PeerIngestWait};
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let role = format!("peer_sync_{}", uuid::Uuid::new_v4().simple());
+    let result = pair(&raw, async |pair| {
+        sqlx::raw_sql(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'peer-sync' NOSUPERUSER NOCREATEDB NOCREATEROLE \
+             NOREPLICATION NOBYPASSRLS NOINHERIT"
+        ))
+        .execute(&pair.a.pool)
+        .await?;
+        grant_peer_role(&pair.a, &role).await?;
+        grant_peer_role(&pair.b, &role).await?;
+        {
+            let as_role = |url: &str| -> Result<String> {
+                let mut url = url::Url::parse(url)?;
+                url.set_username(&role)
+                    .ok()
+                    .context("the role as the URL's user")?;
+                url.set_password(Some("peer-sync"))
+                    .ok()
+                    .context("the role's password in the URL")?;
+                Ok(url.to_string())
+            };
+            let (a_as_role, b_as_role) = (as_role(&pair.a_url)?, as_role(&pair.b_url)?);
+            append(&pair.a, &["granted-a1", "granted-a2"]).await?;
+            let block = land(&pair.a, "granted", 300).await?;
+            let job = prepare(&pair.a, "granted").await?;
+            sqlx::query("INSERT INTO qbit_prism_node_roles(epoch,carry_owner,action,recorded_by) VALUES(0,true,'seed','test')")
+                .execute(&pair.a.pool)
+                .await?;
+            // B pulls A's rows, its own-log check reading A first.
+            let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &a_as_role);
+            let report = pass_until(&mut on_b, async |report| {
+                ensure!(report.refused.is_none() && report.failed_streams.is_empty(), "{report:?}");
+                Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_pool_blocks WHERE block_hash='{block}'")).await? == 1
+                    && count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{job}'")).await? == 1
+                    && count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_node_roles WHERE origin_node=0").await? == 1)
+            })
+            .await?;
+            ensure!(report.own_log_caught_up && report.reached_peer, "{report:?}");
+            ensure!(shares_of(&pair.b.pool, 0).await?.len() == 2);
+            // A pulls B's rows the same way.
+            append(&pair.b, &["granted-b1"]).await?;
+            let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &b_as_role);
+            pass_until(&mut on_a, async |report| {
+                ensure!(report.refused.is_none() && report.failed_streams.is_empty(), "{report:?}");
+                Ok(report.own_log_caught_up && shares_of(&pair.a.pool, 1).await?.len() == 1)
+            })
+            .await?;
+            // The offer wait reads B's cursors over A's streams as the role.
+            let wait = PeerIngestWait::new(&config(NodeIndex::A, &b_as_role, None))
+                .context("the offer wait is configured")?;
+            let a_last = shares_of(&pair.a.pool, 0).await?.last().map(|(seq, _)| *seq);
+            let (_, ingest) = wait
+                .wait(AdoptionNeeds {
+                    share_seq: a_last,
+                    prepared_sync_seq: None,
+                })
+                .await;
+            ensure!(ingest == PeerIngest::Confirmed, "{ingest:?}");
+            Ok(())
+        }
+    })
+    .await;
+    // The role's grants went with the two databases, so it holds nothing.
+    let admin = sqlx::PgPool::connect(&raw).await?;
+    let dropped = sqlx::raw_sql(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    result?;
+    dropped?;
+    Ok(())
+}
