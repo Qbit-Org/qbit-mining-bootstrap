@@ -19,6 +19,34 @@ pub(in crate::coordinator) fn refresh_parallelism() -> qbit_prism::Parallelism {
     *DETECTED.get_or_init(qbit_prism::Parallelism::detect)
 }
 
+/// At most one alert a minute, for a refusal every refresh repeats until an
+/// operator acts: a dual-writer ledger without migration 031's index
+/// refuses each snapshot, on every tick and wake.
+#[derive(Default)]
+pub(super) struct AlertEveryMinute {
+    last: Option<Instant>,
+}
+
+impl AlertEveryMinute {
+    const INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Whether to alert at `now`; when it is, the minute starts again.
+    pub(super) fn due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= Self::INTERVAL);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+
+    /// The cause cleared, so its next occurrence alerts at once.
+    pub(super) fn clear(&mut self) {
+        self.last = None;
+    }
+}
+
 pub(super) type CachedWindow = Arc<RefreshWindow>;
 type CapturedWindow = CompactOwner<(
     CachedWindow,
@@ -173,6 +201,24 @@ impl Coordinator {
                 Ok(CompactOwner::new((window, body, admission)))
             })
             .await?
+    }
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_refusal_alerts_once_a_minute_and_again_once_cleared() {
+        let start = Instant::now();
+        let mut alert = AlertEveryMinute::default();
+        assert!(alert.due(start));
+        assert!(!alert.due(start + Duration::from_secs(1)));
+        assert!(!alert.due(start + Duration::from_millis(59_999)));
+        assert!(alert.due(start + Duration::from_secs(60)));
+        assert!(!alert.due(start + Duration::from_secs(61)));
+        alert.clear();
+        assert!(alert.due(start + Duration::from_secs(62)));
     }
 }
 

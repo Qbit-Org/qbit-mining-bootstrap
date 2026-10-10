@@ -176,6 +176,14 @@ pub(crate) const ORIGIN_INDEX_SQL: &str = "SELECT EXISTS(SELECT 1 FROM pg_index 
      WHERE i.indrelid='qbit_share_ledger'::regclass AND i.indnkeyatts>=2 AND i.indisvalid \
        AND i.indpred IS NULL AND a.attname='origin_node' AND b.attname='share_seq')";
 
+/// A dual-writer snapshot's refusal on a ledger without that index
+/// ([`ORIGIN_INDEX_SQL`]). Every refresh repeats it until the index is
+/// valid, so it is typed: the refresh loop alerts on it once a minute, and
+/// the `dual_writer_origin_index_missing` gauge holds 1 meanwhile.
+#[derive(Debug, thiserror::Error)]
+#[error("a dual-writer window cut needs a valid (origin_node, share_seq) index on qbit_share_ledger (migration 031); refusing to take one without it")]
+pub struct OriginIndexMissing;
+
 /// The peer's share-stream high-water mark (CONTRACT D-14, migration 027):
 /// every row the peer originated with `share_seq` at or below it is committed
 /// in this database, and none can arrive later, because the peer sync pulls
