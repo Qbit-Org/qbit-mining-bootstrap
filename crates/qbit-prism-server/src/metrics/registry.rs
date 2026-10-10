@@ -131,6 +131,7 @@ families! {
     PeerSyncRows: Counter, "peer_sync_rows_total", "3.1 dual writer: rows the peer sync inserted, by copied table, the peer's rows and this node's own rows pulled back after a restore alike.";
     PeerSyncConflicts: Counter, "peer_sync_conflicts_total", "3.1 dual writer: rows the peer sync found under an identity this node holds with other content, or could not insert, by copied table; each is kept out, recorded in qbit_prism_peer_sync_conflicts and alerted.";
     PeerSyncFailures: Counter, "peer_sync_failures_total", "3.1 dual writer: peer sync passes that failed, by the path they used; the next pass tries the other path.";
+    PeerSyncOfferWaits: Counter, "peer_sync_offer_waits_total", "3.1 dual writer (D-19): found-block offers that first waited, up to PRISM_PEER_INGEST_WAIT_MS, for the peer to hold this node's shares through the block's window and its prepared record, by how the wait ended; every one was offered.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.

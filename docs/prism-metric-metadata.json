@@ -248,6 +248,11 @@
         "table": "PeerSyncTable"
       }
     },
+    "peer_sync_offer_waits_total": {
+      "labels": {
+        "outcome": "PeerIngestOutcome"
+      }
+    },
     "peer_sync_failures_total": {
       "labels": {
         "path": "PeerSyncPath"

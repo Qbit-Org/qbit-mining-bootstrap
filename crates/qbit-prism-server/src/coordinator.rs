@@ -344,6 +344,10 @@ pub struct Coordinator {
     /// `own_log_caught_up` is the readiness input (D-8).
     pub peer_sync:
         std::sync::OnceLock<tokio::sync::watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    /// 3.1 dual writer (D-19): the wait before a found block's offer for the
+    /// peer to hold what adopting it needs; `None` on a single writer or
+    /// with `PRISM_PEER_INGEST_WAIT_MS=0`.
+    peer_ingest: Option<crate::peer_sync::PeerIngestWait>,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -984,6 +988,10 @@ impl Coordinator {
             .filter(|millis| *millis > 0)
             .map(Duration::from_millis);
         let (refresh, _) = watch::channel(0);
+        let peer_ingest = config
+            .dual_writer
+            .as_ref()
+            .and_then(crate::peer_sync::PeerIngestWait::new);
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
@@ -1024,6 +1032,7 @@ impl Coordinator {
             landing_trim: Default::default(),
             submission_hold: Default::default(),
             peer_sync: Default::default(),
+            peer_ingest,
         }))
     }
 
@@ -2854,6 +2863,13 @@ impl Coordinator {
         if let Some(wait) = &self.config.offer_standby {
             self.await_offer_standby(wait, &candidate.block_hash).await;
         }
+        // CONTRACT D-19: a dual-writer node has no failover standby. Its peer
+        // adopts a block this node found if this node dies (S8), so the peer
+        // should hold what adoption needs before the block leaves. Bounded,
+        // and the block is offered whatever the wait finds.
+        if let Some(wait) = &self.peer_ingest {
+            self.await_peer_ingest(wait, candidate).await;
+        }
         #[cfg(test)]
         self.offer_probe().await;
         // Renewal failure cancels the attempt even between periodic ticks.
@@ -2924,6 +2940,55 @@ impl Coordinator {
             );
         }
         self.metrics.record_offer_standby_wait(outcome);
+    }
+
+    /// D-19: wait for the peer to hold this node's shares through the block's
+    /// window and the prepared record it was built on, then count and log how
+    /// the wait ended.
+    async fn await_peer_ingest(
+        &self,
+        wait: &crate::peer_sync::PeerIngestWait,
+        candidate: &crate::ledger::Candidate,
+    ) {
+        let prepared = match self.ledger.dual_writer_identity() {
+            Some(identity) => self
+                .ledger
+                .own_prepared_sync_seq(
+                    identity.node,
+                    candidate.window.anchor_ms,
+                    &hex::encode(candidate.window.prior_balances_digest),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(block = %candidate.block_hash, error = %format!("{error:#}"), "the block's prepared record could not be read for the peer ingest wait");
+                    None
+                }),
+            None => None,
+        };
+        let needs = crate::peer_sync::AdoptionNeeds {
+            share_seq: candidate
+                .window
+                .shares
+                .and_then(|range| i64::try_from(range.last_share_seq).ok()),
+            prepared_sync_seq: prepared,
+        };
+        let (waited, outcome) = wait.wait(needs).await;
+        let waited_us = waited.as_micros() as u64;
+        match &outcome {
+            crate::peer_sync::PeerIngest::Confirmed => tracing::info!(
+                block = %candidate.block_hash,
+                waited_us,
+                "block offer peer ingest wait confirmed: the peer holds what adopting the block needs"
+            ),
+            unconfirmed => tracing::warn!(
+                block = %candidate.block_hash,
+                outcome = unconfirmed.outcome(),
+                waited_us,
+                needs = ?needs,
+                "block offer peer ingest wait unconfirmed: offering before the peer holds what adopting the block needs"
+            ),
+        }
+        self.metrics.record_peer_ingest_wait(outcome.outcome());
     }
 
     /// A pending block the chain already holds, found by the pre-offer

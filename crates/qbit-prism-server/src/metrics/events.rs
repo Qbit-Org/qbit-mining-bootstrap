@@ -427,6 +427,18 @@ impl Metrics {
             }
         }
     }
+    /// 3.1 dual writer (D-19): how a found block's peer ingest wait ended.
+    pub fn record_peer_ingest_wait(&self, outcome: &str) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for value in PeerIngestOutcome::ALL {
+            if value.as_str() == outcome {
+                registry.increment(
+                    Family::PeerSyncOfferWaits,
+                    Labels::One(("outcome", value.as_str())),
+                );
+            }
+        }
+    }
     /// One ORDER_LOCK hold, from the grant to the end of its transaction.
     pub fn observe_order_lock_hold(&self, holder: OrderLockHolder, elapsed: Duration) {
         self.observe(

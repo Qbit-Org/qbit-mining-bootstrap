@@ -548,6 +548,7 @@ impl Fixture {
             landing_trim: Default::default(),
             submission_hold: Default::default(),
             peer_sync: Default::default(),
+            peer_ingest: None,
         });
         let fixture = Self {
             coordinator,

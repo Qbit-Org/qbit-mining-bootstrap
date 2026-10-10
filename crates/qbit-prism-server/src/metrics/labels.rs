@@ -163,6 +163,9 @@ labels!(PeerSyncStream {
     Shares => "shares", Blocks => "blocks", Prepared => "prepared", Roles => "roles"
 });
 labels!(PeerSyncPath { Primary => "primary", Fallback => "fallback" });
+labels!(PeerIngestOutcome {
+    Confirmed => "confirmed", TimedOut => "timed_out", Unreachable => "unreachable"
+});
 labels!(PeerSyncRefusal {
     LocalIdentity => "local_identity", PeerIdentity => "peer_identity",
     Fingerprint => "fingerprint", Schema => "schema"

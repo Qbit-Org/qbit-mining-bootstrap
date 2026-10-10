@@ -598,6 +598,26 @@ impl Ledger {
         )
     }
 
+    /// The `sync_seq` of this node's own prepared record that a found block
+    /// was built on, matched by its window's anchor and as-issued balances
+    /// (D-19), if this database still holds it.
+    pub async fn own_prepared_sync_seq(
+        &self,
+        node: NodeIndex,
+        anchor_ms: i64,
+        prior_balances_digest: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT max(sync_seq) FROM qbit_prism_jobs WHERE origin_node=$1 AND job_id LIKE 'prepared:%' \
+             AND window_anchor_ms=$2 AND window_prior_balances_sha256=$3",
+        )
+        .bind(node.index())
+        .bind(anchor_ms)
+        .bind(prior_balances_digest)
+        .fetch_one(&mut *self.acquire().await?)
+        .await?)
+    }
+
     /// This node's cursor over the peer's `stream`, if it has pulled it.
     pub async fn peer_sync_cursor(&self, stream: &str) -> Result<Option<(i64, Option<i64>)>> {
         Ok(sqlx::query_as(

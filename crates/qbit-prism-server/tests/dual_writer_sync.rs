@@ -68,6 +68,7 @@ fn config(node: NodeIndex, peer: &str, fallback: Option<&str>) -> DualWriterConf
         peer_database_url_fallback: fallback.map(str::to_owned),
         peer_sync_interval: Duration::from_millis(10),
         peer_sync_batch_rows: 5000,
+        peer_ingest_wait: Duration::from_millis(250),
     }
 }
 
@@ -782,6 +783,67 @@ async fn the_sync_refuses_wrong_identities_and_fingerprints() -> Result<()> {
             .render()
             .contains("qbit_prism_peer_sync_refused{reason=\"fingerprint\"} 1"));
         ensure!(shares_of(&pair.b.pool, 0).await?.is_empty());
+        Ok(())
+    })
+    .await
+}
+
+/// CONTRACT D-19: the wait before a found block's offer confirms once the
+/// peer's cursors cover this node's shares through the window and the
+/// prepared record the block was built on, times out within its bound when
+/// they do not, and reports an unreachable peer; it never holds the block.
+#[tokio::test]
+async fn the_offer_wait_reads_the_peers_cursors() -> Result<()> {
+    use qbit_prism_server::peer_sync::{AdoptionNeeds, PeerIngest, PeerIngestWait};
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let seqs = append(&pair.a, &["w1", "w2"]).await?;
+        prepare(&pair.a, "w").await?;
+        let prepared = pair
+            .a
+            .own_prepared_sync_seq(NodeIndex::A, 1000, &hex("balances w"))
+            .await?;
+        ensure!(
+            prepared.is_some(),
+            "the prepared record was not found by its window"
+        );
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| {
+            Ok(shares_of(&pair.b.pool, 0).await?.len() == 2
+                && count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_jobs").await? == 1)
+        })
+        .await?;
+        let on_a = config(NodeIndex::A, &pair.b_url, None);
+        let wait = PeerIngestWait::new(&on_a).context("the wait is on by default")?;
+        let bound = wait.bound();
+        let held = AdoptionNeeds {
+            share_seq: Some(seqs[1]),
+            prepared_sync_seq: prepared,
+        };
+        let (waited, outcome) = wait.wait(held).await;
+        ensure!(
+            outcome == PeerIngest::Confirmed && waited < bound,
+            "{outcome:?} after {waited:?}"
+        );
+        let beyond = AdoptionNeeds {
+            share_seq: Some(seqs[1] + 1000),
+            prepared_sync_seq: prepared,
+        };
+        let (waited, outcome) = wait.wait(beyond).await;
+        ensure!(
+            outcome == PeerIngest::TimedOut && waited >= bound.mul_f32(0.9),
+            "{outcome:?} after {waited:?}"
+        );
+        ensure!(waited < bound * 4, "the wait overran its bound: {waited:?}");
+        let dead = PeerIngestWait::new(&config(NodeIndex::A, &dead_url(&pair.b_url)?, None))
+            .context("the wait is on by default")?;
+        let (_, outcome) = dead.wait(held).await;
+        ensure!(matches!(outcome, PeerIngest::Unreachable(_)), "{outcome:?}");
+        let mut off = on_a.clone();
+        off.peer_ingest_wait = Duration::ZERO;
+        ensure!(PeerIngestWait::new(&off).is_none(), "0 turns the wait off");
         Ok(())
     })
     .await

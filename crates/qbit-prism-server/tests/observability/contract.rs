@@ -356,6 +356,7 @@ pub fn expected(populated: bool) -> Census {
         ("peer_sync_rows_total", "counter"),
         ("peer_sync_conflicts_total", "counter"),
         ("peer_sync_failures_total", "counter"),
+        ("peer_sync_offer_waits_total", "counter"),
     ] {
         result.family(name, kind, &[], &[]);
     }

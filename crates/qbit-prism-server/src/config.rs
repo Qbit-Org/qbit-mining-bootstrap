@@ -13,8 +13,8 @@ mod environment;
 mod policy_transition;
 pub use database::{public_database_options_from_env, DatabaseConfig};
 pub use dual_writer::{
-    dual_writer_downgrade, DualWriterConfig, DEFAULT_PEER_SYNC_BATCH_ROWS,
-    DEFAULT_PEER_SYNC_INTERVAL_MS,
+    dual_writer_downgrade, DualWriterConfig, DEFAULT_PEER_INGEST_WAIT_MS,
+    DEFAULT_PEER_SYNC_BATCH_ROWS, DEFAULT_PEER_SYNC_INTERVAL_MS,
 };
 pub use environment::check_environment;
 pub(crate) use policy_transition::transition_configs;

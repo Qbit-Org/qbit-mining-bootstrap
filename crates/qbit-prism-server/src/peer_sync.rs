@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use tokio::sync::watch;
 
 mod engine;
+mod offer_wait;
 pub use engine::{PassReport, PeerSync, Refusal};
+pub use offer_wait::{AdoptionNeeds, PeerIngest, PeerIngestWait};
 
 /// Every table the peer sync copies, in the order a pull inserts them
 /// (parents before the rows that reference them). Each has an

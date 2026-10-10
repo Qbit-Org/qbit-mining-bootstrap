@@ -241,6 +241,7 @@ impl Metrics {
             Family::PeerSyncRows,
             Family::PeerSyncConflicts,
             Family::PeerSyncFailures,
+            Family::PeerSyncOfferWaits,
         ] {
             registry.declare(family);
         }

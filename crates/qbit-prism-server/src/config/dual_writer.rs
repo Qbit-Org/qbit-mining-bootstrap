@@ -15,6 +15,11 @@ const PEER_SYNC_INTERVAL_MS: std::ops::RangeInclusive<u64> = 10..=60_000;
 /// pull reads from the peer and inserts in one local transaction.
 pub const DEFAULT_PEER_SYNC_BATCH_ROWS: u32 = 5000;
 const PEER_SYNC_BATCH_ROWS: std::ops::RangeInclusive<u32> = 1..=100_000;
+/// `PRISM_PEER_INGEST_WAIT_MS` when unset (CONTRACT D-19): how long a found
+/// block's offer waits for the peer to hold what adopting the block needs.
+pub const DEFAULT_PEER_INGEST_WAIT_MS: u64 = 250;
+/// The largest accepted bound: every found block's offer may wait this long.
+const PEER_INGEST_WAIT_MAX_MS: u64 = 10_000;
 
 /// This node's dual-writer configuration: which node it is, whether it pays
 /// down carried balances, and how it reaches the peer's database.
@@ -29,6 +34,11 @@ pub struct DualWriterConfig {
     pub peer_database_url_fallback: Option<String>,
     pub peer_sync_interval: Duration,
     pub peer_sync_batch_rows: u32,
+    /// `PRISM_PEER_INGEST_WAIT_MS` (D-19): before a found block's
+    /// `submitblock`, wait up to this long for the peer to hold the block's
+    /// prepared record and its window's own shares, so the peer can adopt
+    /// the block if this node dies. Zero turns the wait off.
+    pub peer_ingest_wait: Duration,
 }
 
 impl std::fmt::Debug for DualWriterConfig {
@@ -45,6 +55,7 @@ impl std::fmt::Debug for DualWriterConfig {
             )
             .field("peer_sync_interval", &self.peer_sync_interval)
             .field("peer_sync_batch_rows", &self.peer_sync_batch_rows)
+            .field("peer_ingest_wait", &self.peer_ingest_wait)
             .finish()
     }
 }
@@ -101,12 +112,21 @@ impl DualWriterConfig {
                     PEER_SYNC_BATCH_ROWS.end()
                 )
             })?;
+        let ingest_wait_ms = number("PRISM_PEER_INGEST_WAIT_MS", DEFAULT_PEER_INGEST_WAIT_MS)
+            .ok()
+            .filter(|ms| *ms <= PEER_INGEST_WAIT_MAX_MS)
+            .with_context(|| {
+                format!(
+                    "PRISM_PEER_INGEST_WAIT_MS must be 0..{PEER_INGEST_WAIT_MAX_MS} milliseconds"
+                )
+            })?;
         Ok(Some(Self {
             identity: NodeIdentity { node, carry_owner },
             peer_database_url,
             peer_database_url_fallback,
             peer_sync_interval: Duration::from_millis(interval_ms),
             peer_sync_batch_rows: batch_rows,
+            peer_ingest_wait: Duration::from_millis(ingest_wait_ms),
         }))
     }
 
@@ -293,6 +313,7 @@ mod tests {
             peer_database_url_fallback: Some(PEER.replace("db-b", "db-b-tailnet")),
             peer_sync_interval: Duration::from_millis(250),
             peer_sync_batch_rows: 5000,
+            peer_ingest_wait: Duration::from_millis(250),
         };
         let debug = format!("{config:?}");
         assert!(!debug.contains("secret"), "{debug}");

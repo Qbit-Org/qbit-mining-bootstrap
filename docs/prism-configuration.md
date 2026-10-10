@@ -238,6 +238,7 @@ on. While it is off, no setting below is read and a frontend behaves exactly as
 | `PRISM_PEER_DATABASE_URL_FALLBACK` | unset | a second network path to the same database, tried when the first fails |
 | `PRISM_PEER_SYNC_INTERVAL_MS` | `250` | wait between pulls that found nothing new, 10 to 60000 |
 | `PRISM_PEER_SYNC_BATCH_ROWS` | `5000` | most rows of one stream a pull reads and inserts at once, 1 to 100000 |
+| `PRISM_PEER_INGEST_WAIT_MS` | `250` | before a found block's `submitblock`, the most it waits for the peer to hold what adopting the block needs, 0 (off) to 10000 |
 
 Each error names its setting and never prints a value: the peer DSNs carry the
 sync role's credentials. A peer DSN must use `postgres` or `postgresql`, name
@@ -250,6 +251,15 @@ the columns and tables the dual writer needs, and
 `qbit-prism-server node-identity set --index N` personalises each database
 before its first dual-writer start; see
 [dual-writer node identity](prism-ledger-ops.md#dual-writer-node-identity-027).
+
+A dual-writer node has no failover standby, so `PRISM_OFFER_STANDBY_APPLICATION_NAME`
+and `PRISM_OFFER_STANDBY_FLUSH_WAIT_MS` are left unset there. Its peer adopts a
+block it found if it dies, and `PRISM_PEER_INGEST_WAIT_MS` takes the standby
+wait's place: before the block leaves, the node reads the peer's cursors over
+its own rows until they cover its shares through the block's window and the
+prepared record the block was built on. The block is offered when the bound
+passes or the peer cannot be read, as before; each outcome is counted in
+`qbit_prism_peer_sync_offer_waits_total{outcome}`.
 
 `PRISM_DUAL_WRITER_DOWNGRADE` (boolean, default `0`) belongs to the rollback
 to one writer. A single-writer frontend refuses a database that has run as a
