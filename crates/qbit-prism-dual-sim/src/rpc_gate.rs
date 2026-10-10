@@ -48,7 +48,8 @@ struct GateState {
     discard: std::sync::atomic::AtomicBool,
     /// The block hash of every `submitblock`, in arrival order.
     arrivals: watch::Sender<Vec<String>>,
-    /// The blocks the node answered, in answer order.
+    /// The blocks whose `submitblock` the gate forwarded, in the order the
+    /// forward ended: with the node's answer, or with a failure to reach it.
     answered: watch::Sender<Vec<String>>,
 }
 
@@ -125,7 +126,9 @@ impl RpcGate {
         Ok(found[seen].clone())
     }
 
-    /// Wait until the node has answered the `submitblock` of `block`.
+    /// Wait until the gate's forward of `block`'s `submitblock` has ended:
+    /// the node answered, or could not be reached. Only the chain shows
+    /// whether the node accepted the block.
     pub async fn node_answered(&self, block: &str, limit: Duration) -> Result<()> {
         let mut answered = self.state.answered.subscribe();
         tokio::time::timeout(
