@@ -553,6 +553,7 @@ impl Fixture {
             peer_sync: Default::default(),
             peer_ingest: None,
             finder_liveness: Default::default(),
+            dual_writer: None,
         });
         let fixture = Self {
             coordinator,

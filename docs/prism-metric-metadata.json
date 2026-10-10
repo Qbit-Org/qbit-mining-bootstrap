@@ -390,6 +390,48 @@
         "qbit_prism_accepted_parent_preview_wait_timeouts_total"
       ],
       "status": "Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. Only a known open wait attributes a deadline hit here (#493): while tracking is unknown and no known wait remains (a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation or lost ordering history), a deadline hit is an ordinary job_delivery_failures_total event, accepted_block_revision_work_tracking_unknown reports the unknown state and the pending gauge stays -1; it is not counted here and does not stamp a wait recovered after the deadline degraded; a wait recovered before the deadline counts and is degraded as usual."
+    },
+    "admission_admitting": {
+      "status": "Set by the health publisher at each publication (3.1, D4) once `PRISM_DUAL_WRITER` is on or `PRISM_READINESS_PORT` is set; it is 1 exactly while `qbit_prism_admission_state` reads `admitting` or `grace`. The readiness endpoint answers 200 only while it is 1 and the decision is younger than the health freshness budget. No firing rule of its own; the pair's monitoring pages on a preferred node that stays at 0."
+    },
+    "admission_state": {
+      "labels": {
+        "state": "AdmissionStateLabel"
+      },
+      "status": "Every state's series appears at zero, `starting` at one, when admission is first exposed. `starting`: never admitted since the process started (a restored node pulling its own log back stays here). `grace`: readiness is false but for less than `PRISM_READINESS_GRACE_SECONDS` (10 s by default), as through an ordinary tip or payout-revision rebuild. `withdrawn`: admitted once, then a hard fault (`own-log-behind`, `writer-not-local`) or a readiness dip longer than the grace."
+    },
+    "admission_withdrawals_total": {
+      "labels": {
+        "reason": "WithdrawalReason"
+      },
+      "status": "Counted once per transition from admitting (or grace) to withdrawn, by the reason at that moment; every reason starts at zero when admission is exposed. `own-log-behind` and `writer-not-local` withdraw at once, `not-ready` after the grace. A withdrawn dual-writer frontend closes its Stratum listeners, so the Hashbalancer's layer-4 observation and readiness check move its miners to the other node."
+    },
+    "stratum_listener_accepting": {
+      "labels": {
+        "listener": "StratumListenerName"
+      },
+      "status": "Dual-writer mode only (3.1, D4): the listeners bind at startup without listening and listen only while the frontend admits, so a starting, restored or withdrawn node refuses connections (RST) instead of accepting TCP it cannot serve. `default` is the `PRISM_STRATUM_PORT` listener and `highdiff` the `PRISM_STRATUM_HIGHDIFF_PORT` one."
+    },
+    "dual_writer_own_log_caught_up": {
+      "status": "Read from the peer sync's status at each health publication (3.1). The latch is false at start and after a detected local rollback, until the node holds every own-origin row the peer holds, then stays true for the life of the process, whatever happens to the link to the peer (CONTRACT.md decision D-8)."
+    },
+    "dual_writer_writer_path": {
+      "labels": {
+        "path": "WriterPathLabel"
+      },
+      "status": "Probed at each health publication with one statement on the frontend's own pool (at most once a second, two-second timeout). `unanswered` withdraws the frontend once it has lasted four seconds; `remote`, `unidentified` and `read_only` withdraw it at once. The probe never reads the peer."
+    },
+    "dual_writer_node_index": {
+      "status": "Published with the other dual-writer gauges at each health publication (3.1)."
+    },
+    "dual_writer_carry_owner": {
+      "status": "The configured flag only; whether this node is acting as the carry owner is the carry-owner guard's decision, reported by its own series."
+    },
+    "readiness_requests_total": {
+      "labels": {
+        "result": "ReadinessAnswer"
+      },
+      "status": "Every answer starts at zero once the endpoint is enabled (3.1, CONTRACT.md decision D-7). The token is checked first, so `unauthorized` also counts requests for unknown paths without the token; a steady `unauthorized` rate on a public address is scanning, not a fault. A connection dropped at the 32-connection cap or cut at its five-second deadline counts nothing."
     }
   },
   "public": {

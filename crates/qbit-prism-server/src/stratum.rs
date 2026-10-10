@@ -2155,6 +2155,13 @@ pub async fn run_listener<B: MiningBackend>(
     // Both listeners share this one limit, so either may report its capacity.
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
     let mut connections = JoinSet::new();
+    let sessions = Sessions {
+        config: config.clone(),
+        backend: backend.clone(),
+        refresh: refresh.clone(),
+        shutdown: shutdown.clone(),
+        metrics: metrics.clone(),
+    };
     loop {
         if *shutdown.borrow() {
             break;
@@ -2162,39 +2169,167 @@ pub async fn run_listener<B: MiningBackend>(
         tokio::select! {
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
             _ = connections.join_next(), if !connections.is_empty() => {}
-            accepted = listener.accept() => {
-                let (stream,peer) = accepted?;
-                // Decided from the observed peer address at accept, before any
-                // permit, task or allocation, so a refused source costs one
-                // in-memory lookup and never reaches the database.
-                let ip_permit = match config.try_acquire_ip(peer.ip()) {
-                    Ok(permit) => permit,
-                    Err(IpLimitExceeded) => {
-                        metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::IpLimit);
-                        // The address belongs in the log, never in a label.
-                        tracing::warn!(peer = %peer, limit = config.max_connections_per_ip, listener = %config.listener_name, "Stratum connection refused by the per-source limit");
-                        drop(stream);
-                        continue;
-                    }
-                };
-                let Some(permit) = config.connection_limit.try_acquire() else {
-                    metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::GlobalLimit);
-                    drop(stream);
-                    continue;
-                };
-                let (backend,config,refresh,shutdown) = (backend.clone(),config.clone(),refresh.clone(),shutdown.clone());
-                let metrics = metrics.clone();
-                let runtime = metrics.runtime();
-                connections.spawn(runtime.track(crate::metrics::TaskKind::StratumSession, async move {
-                    let _permit = permit;
-                    let _ip_permit = ip_permit;
-                    if let Err(error) = session(stream,backend,config,refresh,shutdown,metrics).await {
-                        tracing::warn!(error = %format_args!("{error:#}"), "Stratum connection ended");
-                    }
-                }));
-            }
+            accepted = listener.accept() => sessions.start(accepted?, &mut connections),
         }
     }
+    drain_sessions(connections).await;
+    Ok(())
+}
+
+/// A dual-writer Stratum listener (3.1): bound from startup, listening only
+/// while the frontend admits miners. Before the first admission and after a
+/// withdrawal the address refuses every connection, so no handshake, check
+/// or balancer sees a frontend that must not serve as up; a decision older
+/// than `stale_after` admits nothing, so a stalled health publisher closes
+/// it too. Withdrawing resets connections still queued unaccepted; sessions
+/// already accepted carry on until they end or the balancer closes them.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_gated_listener<B: MiningBackend>(
+    mut address: crate::listen::ReservedAddress,
+    config: StratumConfig,
+    backend: Arc<B>,
+    refresh: watch::Receiver<u64>,
+    mut shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
+    mut admission: watch::Receiver<crate::readiness::admission::AdmissionSignal>,
+    stale_after: Duration,
+) -> Result<()> {
+    config.validate()?;
+    metrics.set_stratum_connection_limit(config.connection_limit.capacity());
+    metrics.publish_stratum_listener_accepting(&config.listener_name, false);
+    let mut connections = JoinSet::new();
+    let sessions = Sessions {
+        config: config.clone(),
+        backend: backend.clone(),
+        refresh: refresh.clone(),
+        shutdown: shutdown.clone(),
+        metrics: metrics.clone(),
+    };
+    // The health publisher holds the sender for the life of the process; if
+    // it is gone nothing can admit again, so the listener stays closed.
+    let mut decisions = true;
+    'gate: loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let admits = admission
+            .borrow_and_update()
+            .admits_at(tokio::time::Instant::now(), stale_after);
+        if !admits {
+            tokio::select! {
+                changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
+                _ = connections.join_next(), if !connections.is_empty() => {}
+                changed = admission.changed(), if decisions => decisions = changed.is_ok(),
+            }
+            continue;
+        }
+        let listener = address.listen(config.listen_backlog).with_context(|| {
+            format!(
+                "listen on the {} Stratum address {}",
+                config.listener_name,
+                address.local_addr()
+            )
+        })?;
+        metrics.publish_stratum_listener_accepting(&config.listener_name, true);
+        tracing::info!(listener = %config.listener_name, address = %address.local_addr(), "Stratum listener accepting: the frontend admits miners");
+        loop {
+            let stale_at = admission
+                .borrow()
+                .stale_at(stale_after)
+                .unwrap_or_else(tokio::time::Instant::now);
+            tokio::select! {
+                changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break 'gate; } }
+                _ = connections.join_next(), if !connections.is_empty() => {}
+                changed = admission.changed(), if decisions => {
+                    decisions = changed.is_ok();
+                    if !decisions || !admission.borrow_and_update().admits_at(tokio::time::Instant::now(), stale_after) {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep_until(stale_at) => {
+                    if !admission.borrow().admits_at(tokio::time::Instant::now(), stale_after) {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => sessions.start(accepted?, &mut connections),
+            }
+        }
+        drop(listener);
+        address.reserve().with_context(|| {
+            format!(
+                "hold the {} Stratum address {} after closing its listener",
+                config.listener_name,
+                address.local_addr()
+            )
+        })?;
+        metrics.publish_stratum_listener_accepting(&config.listener_name, false);
+        tracing::warn!(listener = %config.listener_name, address = %address.local_addr(), "Stratum listener refusing connections: the frontend withdrew");
+    }
+    metrics.publish_stratum_listener_accepting(&config.listener_name, false);
+    drain_sessions(connections).await;
+    Ok(())
+}
+
+/// What every accepted Stratum connection's session needs from its listener.
+struct Sessions<B> {
+    config: StratumConfig,
+    backend: Arc<B>,
+    refresh: watch::Receiver<u64>,
+    shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl<B: MiningBackend> Sessions<B> {
+    /// Admit one accepted connection under the per-source and global limits
+    /// and start its session, or refuse it.
+    fn start(
+        &self,
+        (stream, peer): (TcpStream, std::net::SocketAddr),
+        connections: &mut JoinSet<()>,
+    ) {
+        let (config, metrics) = (&self.config, &self.metrics);
+        // Decided from the observed peer address at accept, before any
+        // permit, task or allocation, so a refused source costs one
+        // in-memory lookup and never reaches the database.
+        let ip_permit = match config.try_acquire_ip(peer.ip()) {
+            Ok(permit) => permit,
+            Err(IpLimitExceeded) => {
+                metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::IpLimit);
+                // The address belongs in the log, never in a label.
+                tracing::warn!(peer = %peer, limit = config.max_connections_per_ip, listener = %config.listener_name, "Stratum connection refused by the per-source limit");
+                drop(stream);
+                return;
+            }
+        };
+        let Some(permit) = config.connection_limit.try_acquire() else {
+            metrics.record_connection_refusal(crate::metrics::ConnectionRefusalReason::GlobalLimit);
+            drop(stream);
+            return;
+        };
+        let (backend, config, refresh, shutdown) = (
+            self.backend.clone(),
+            config.clone(),
+            self.refresh.clone(),
+            self.shutdown.clone(),
+        );
+        let metrics = metrics.clone();
+        let runtime = metrics.runtime();
+        connections.spawn(
+            runtime.track(crate::metrics::TaskKind::StratumSession, async move {
+                let _permit = permit;
+                let _ip_permit = ip_permit;
+                if let Err(error) =
+                    session(stream, backend, config, refresh, shutdown, metrics).await
+                {
+                    tracing::warn!(error = %format_args!("{error:#}"), "Stratum connection ended");
+                }
+            }),
+        );
+    }
+}
+
+/// Let sessions finish after the listener stops, for at most ten seconds.
+async fn drain_sessions(mut connections: JoinSet<()>) {
     if timeout(Duration::from_secs(10), async {
         while connections.join_next().await.is_some() {}
     })
@@ -2204,7 +2339,6 @@ pub async fn run_listener<B: MiningBackend>(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
-    Ok(())
 }
 
 /// Subscribe and authorize exactly like a miner, then inspect the first

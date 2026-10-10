@@ -3,16 +3,26 @@ use crate::{
     config::{self, Config},
     coordinator::Coordinator,
     ledger::{HeartbeatHealth, HeartbeatStatus},
-    listen::{bind_listener, HTTP_LISTEN_BACKLOG},
+    listen::{bind_listener, reserve_address, ReservedAddress, HTTP_LISTEN_BACKLOG},
     metrics::{self, TaskKind},
-    stratum::{run_listener, StratumConfig, StratumStats},
+    readiness::{
+        admission::{Admission, AdmissionChange, AdmissionSignal},
+        dual_writer::{DualWriterReport, WriterPath},
+        endpoint,
+    },
+    stratum::{run_gated_listener, run_listener, StratumConfig, StratumStats},
 };
 use anyhow::{Context, Result};
 use std::{
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    net::{TcpListener, ToSocketAddrs},
+    sync::watch,
+    task::JoinSet,
+};
 
 const BLOB_PRUNE_BUDGET: Duration = Duration::from_secs(5);
 
@@ -30,19 +40,27 @@ pub async fn run(config: Config) -> Result<()> {
     // because it serves the coordinator's ledger.
     let highdiff = stratum_config.highdiff_config()?;
     let mut api_config = ApiConfig::from_env()?;
-    let primary = bind_listener(
+    // 3.1: the readiness endpoint (decision D-7) and the grace that it and
+    // the dual-writer Stratum gate decide admission with.
+    let readiness_endpoint = endpoint::EndpointConfig::from_env()?;
+    let admission_grace = crate::readiness::admission::grace_from_env()?;
+    // 3.1: a dual-writer frontend binds its Stratum addresses without
+    // listening; they accept connections only while it admits miners.
+    let gated = config.dual_writer.is_some();
+    let primary = StratumAddress::bind(
         (
             config::value("PRISM_STRATUM_BIND", "127.0.0.1"),
             config::number("PRISM_STRATUM_PORT", 3340u16)?,
         ),
         stratum_config.listen_backlog,
+        gated,
     )
     .await
     .context("bind primary Stratum listener")?;
     // The kernel caps every listen backlog at the namespace's somaxconn
     // without an error, so say what the Stratum listeners actually got.
     let somaxconn = crate::listen::somaxconn();
-    tracing::info!(address=%primary.local_addr()?,instance=%config.instance_id,workers=config.runtime_workers,listen_backlog=stratum_config.listen_backlog,somaxconn=?somaxconn,"PRISM listening");
+    tracing::info!(address=%primary.local_addr()?,instance=%config.instance_id,workers=config.runtime_workers,listen_backlog=stratum_config.listen_backlog,somaxconn=?somaxconn,gated,"PRISM listening");
     if let Some(cap) = somaxconn.filter(|cap| *cap < stratum_config.listen_backlog) {
         tracing::warn!(
             requested = stratum_config.listen_backlog,
@@ -52,19 +70,28 @@ pub async fn run(config: Config) -> Result<()> {
     }
     let high_listener = if highdiff.is_some() {
         Some(
-            bind_listener(
+            StratumAddress::bind(
                 (
                     config::optional("PRISM_STRATUM_HIGHDIFF_BIND")
                         .unwrap_or_else(|| config::value("PRISM_STRATUM_BIND", "127.0.0.1")),
                     config::number("PRISM_STRATUM_HIGHDIFF_PORT", 4334u16)?,
                 ),
                 stratum_config.listen_backlog,
+                gated,
             )
             .await
             .context("bind high difficulty Stratum listener")?,
         )
     } else {
         None
+    };
+    let readiness_listener = match &readiness_endpoint {
+        Some(endpoint) => Some(
+            bind_listener((endpoint.bind.as_str(), endpoint.port), HTTP_LISTEN_BACKLOG)
+                .await
+                .context("bind readiness endpoint listener")?,
+        ),
+        None => None,
     };
     let registry = Arc::new(metrics::Metrics::default());
     // #291: 0 from the start with the switch off. With it on, unknown until
@@ -169,6 +196,14 @@ pub async fn run(config: Config) -> Result<()> {
     );
     let metrics = api_state.metrics();
     let runtime = metrics.runtime();
+    // 3.1: admission is decided only where something reads it, so a single
+    // writer without the readiness endpoint runs as 3.0 did.
+    let admission_exposed = gated || readiness_endpoint.is_some();
+    if admission_exposed {
+        registry.enable_admission();
+    }
+    let stale_after = api_state.config.health_stale_after();
+    let (admission_decisions, admission) = watch::channel(AdmissionSignal::UNDECIDED);
     let api_listener = if config.audit_port > 0 {
         Some(
             bind_listener(
@@ -183,11 +218,12 @@ pub async fn run(config: Config) -> Result<()> {
     };
     let mut tasks = JoinSet::new();
     // 3.1 dual writer: the peer sync, and the own-log latch (D-8) that the
-    // tasks writing this node's own rows wait for: the Stratum listeners
-    // (share appends), the refresh (prepared work, reconciliation) and the
-    // submit loop (landings). A node restored from an old backup pulls its
-    // own rows back from the peer first, so none of them reuses a key the
-    // peer already holds. A single writer waits for nothing.
+    // tasks writing this node's own rows wait for: the refresh (prepared
+    // work, reconciliation) and the submit loop (landings). A node restored
+    // from an old backup pulls its own rows back from the peer first, so none
+    // of them reuses a key the peer already holds. The Stratum listeners
+    // (share appends) wait through admission, which needs the latch too. A
+    // single writer waits for nothing.
     let own_log = match &config.dual_writer {
         Some(dual) => {
             let (sync, status) = crate::peer_sync::PeerSync::new(
@@ -201,41 +237,39 @@ pub async fn run(config: Config) -> Result<()> {
         }
         None => None,
     };
-    tasks.spawn(runtime.track(TaskKind::StratumListener, {
-        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
-        let listener = run_listener(
-            primary,
+    tasks.spawn(runtime.track(
+        TaskKind::StratumListener,
+        primary.serve(
             stratum_config,
             coordinator.clone(),
             coordinator.refresh.subscribe(),
             shutdown_rx.clone(),
             registry.clone(),
-        );
-        async move {
-            if !caught_up.await {
-                return Ok(());
-            }
-            listener.await
-        }
-    }));
+            admission.clone(),
+            stale_after,
+        ),
+    ));
     if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
-        tasks.spawn(runtime.track(TaskKind::StratumListener, {
-            let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
-            let listener = run_listener(
-                listener,
+        tasks.spawn(runtime.track(
+            TaskKind::StratumListener,
+            listener.serve(
                 highdiff,
                 coordinator.clone(),
                 coordinator.refresh.subscribe(),
                 shutdown_rx.clone(),
                 registry.clone(),
-            );
-            async move {
-                if !caught_up.await {
-                    return Ok(());
-                }
-                listener.await
-            }
-        }));
+                admission.clone(),
+                stale_after,
+            ),
+        ));
+    }
+    if let (Some(listener), Some(config)) = (readiness_listener, &readiness_endpoint) {
+        tracing::info!(address=%listener.local_addr()?, "PRISM readiness endpoint listening");
+        tasks.spawn(endpoint::serve(
+            listener,
+            endpoint::Endpoint::new(config, admission.clone(), stale_after, registry.clone()),
+            shutdown_rx.clone(),
+        ));
     }
     tasks.spawn(runtime.track(TaskKind::Refresh, {
         let coordinator = coordinator.clone();
@@ -349,7 +383,17 @@ pub async fn run(config: Config) -> Result<()> {
     ));
     tasks.spawn(runtime.track(
         TaskKind::HealthPublisher,
-        publish_health(coordinator.clone(), api_state, stats, shutdown_rx.clone()),
+        publish_health(
+            coordinator.clone(),
+            api_state,
+            stats,
+            shutdown_rx.clone(),
+            AdmissionPublisher {
+                admission: Admission::new(admission_grace),
+                decisions: admission_decisions,
+                exposed: admission_exposed,
+            },
+        ),
     ));
     tasks.spawn({
         let ledger = coordinator.ledger.clone();
@@ -509,18 +553,138 @@ async fn prune_jobs<T, F: std::future::Future<Output = Result<T>>>(
     Ok(())
 }
 
+/// A Stratum address as the frontend serves it: listening from startup as
+/// in 3.0, or, in dual-writer mode (3.1), bound and listening only while the
+/// frontend admits miners.
+enum StratumAddress {
+    Listening(TcpListener),
+    Gated(ReservedAddress),
+}
+
+impl StratumAddress {
+    async fn bind(addr: impl ToSocketAddrs, backlog: u32, gated: bool) -> std::io::Result<Self> {
+        Ok(if gated {
+            Self::Gated(reserve_address(addr).await?)
+        } else {
+            Self::Listening(bind_listener(addr, backlog).await?)
+        })
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Listening(listener) => listener.local_addr(),
+            Self::Gated(address) => Ok(address.local_addr()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve(
+        self,
+        config: StratumConfig,
+        coordinator: Arc<Coordinator>,
+        refresh: watch::Receiver<u64>,
+        shutdown: watch::Receiver<bool>,
+        registry: Arc<metrics::Metrics>,
+        admission: watch::Receiver<AdmissionSignal>,
+        stale_after: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Listening(listener) => {
+                run_listener(listener, config, coordinator, refresh, shutdown, registry).await
+            }
+            Self::Gated(address) => {
+                run_gated_listener(
+                    address,
+                    config,
+                    coordinator,
+                    refresh,
+                    shutdown,
+                    registry,
+                    admission,
+                    stale_after,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// 3.1: folds each health publication into the admission decision that the
+/// dual-writer Stratum gate and the readiness endpoint read, and reports it
+/// in the health payload and the metrics.
+struct AdmissionPublisher {
+    admission: Admission,
+    decisions: watch::Sender<AdmissionSignal>,
+    /// Dual-writer mode or the readiness endpoint; otherwise nothing reads
+    /// admission and nothing is decided or reported.
+    exposed: bool,
+}
+
+impl AdmissionPublisher {
+    fn publish(
+        &mut self,
+        health: &mut serde_json::Value,
+        dual: Option<&DualWriterReport>,
+        runtime_stalled: bool,
+        registry: &metrics::Metrics,
+    ) {
+        if !self.exposed {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        // The readiness this publication reports, as /healthz will serve it
+        // short of staleness, which the readers age themselves.
+        let ready = health["ready"] == true && !runtime_stalled;
+        let change =
+            self.admission
+                .observe(now.into_std(), ready, dual.and_then(|dual| dual.withdrawal));
+        let state = self.admission.state();
+        self.decisions
+            .send_replace(AdmissionSignal::decided(state.admits(), now));
+        match change {
+            Some(AdmissionChange::Admitted) => {
+                tracing::info!("PRISM admits miners: readiness endpoint ready, dual-writer Stratum listeners accepting")
+            }
+            Some(AdmissionChange::Withdrawn(reason)) => {
+                registry.record_admission_withdrawal(reason.label());
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "PRISM withdrew: readiness endpoint not ready, dual-writer Stratum listeners refusing new connections"
+                );
+            }
+            None => {}
+        }
+        registry.publish_admission(state.label());
+        if let Some(dual) = dual {
+            registry.publish_dual_writer(
+                dual.identity.node.index(),
+                dual.identity.carry_owner,
+                dual.own_log_caught_up,
+                dual.writer_path.map(WriterPath::label),
+            );
+        }
+        health["admission"] = serde_json::json!({
+            "admitting": state.admits(),
+            "state": state.as_str(),
+            "reason": state.reason().map(|reason| reason.as_str()),
+            "grace_seconds": self.admission.grace().as_secs(),
+        });
+    }
+}
+
 async fn publish_health(
     coordinator: Arc<Coordinator>,
     state: ApiState,
     stats: Arc<StratumStats>,
     mut shutdown: watch::Receiver<bool>,
+    mut admission: AdmissionPublisher,
 ) -> Result<()> {
     let mut tick = publication_ticks(&state);
     let mut missing_since = None::<Instant>;
     loop {
         tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
         let health = with_health_publication_progress(&state, async {
-            let mut health = coordinator.health().await;
+            let (mut health, dual) = coordinator.health_report().await;
             let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
             if snapshot.authorized_missing_current_work == 0 {
                 missing_since = None;
@@ -539,8 +703,14 @@ async fn publish_health(
             }
             health["stratum"] = serde_json::to_value(&snapshot)?;
             metrics::add_known_health_fields(&mut health);
-            state.publish_health(health.clone());
             let registry = state.metrics();
+            admission.publish(
+                &mut health,
+                dual.as_ref(),
+                registry.runtime().snapshot().stalled(),
+                &registry,
+            );
+            state.publish_health(health.clone());
             registry.publish_stratum(
                 &snapshot,
                 health["ok"] == true,

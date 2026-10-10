@@ -352,6 +352,8 @@ pub struct Coordinator {
     /// 3.1 dual writer: the CTV broadcaster's view of the peer's node, the
     /// finder of the zero-fee fanouts it may take over.
     pub finder_liveness: crate::broadcaster::FinderLiveness,
+    /// 3.1: the dual-writer readiness inputs, `None` for a single writer.
+    dual_writer: Option<crate::readiness::dual_writer::DualWriterReadiness>,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -988,6 +990,10 @@ impl Coordinator {
             Some(dual) => crate::peer_sync::PeerIngestWait::new(dual)?,
             None => None,
         };
+        let dual_writer = config
+            .dual_writer
+            .as_ref()
+            .map(|dual| crate::readiness::dual_writer::DualWriterReadiness::new(dual.identity));
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
@@ -1030,6 +1036,7 @@ impl Coordinator {
             peer_sync: Default::default(),
             peer_ingest,
             finder_liveness: Default::default(),
+            dual_writer,
         }))
     }
 
@@ -3356,6 +3363,28 @@ impl Coordinator {
     }
 
     pub async fn health(&self) -> Value {
+        self.health_report().await.0
+    }
+
+    /// 3.1: read the peer sync's status from `handle` for dual-writer
+    /// readiness. Until one is attached a dual-writer frontend reads its own
+    /// log as not caught up, so it does not serve; a single writer ignores it.
+    pub fn attach_peer_sync(&self, handle: crate::peer_sync::PeerSyncHandle) {
+        if let Some(dual) = &self.dual_writer {
+            dual.attach_peer_sync(handle);
+        }
+    }
+
+    /// `health`, and in dual-writer mode (3.1) the report it was read with,
+    /// for admission and the metrics. A dual-writer frontend is ready only
+    /// while its own log is caught up and its writer is local; a single
+    /// writer's health is exactly 3.0's.
+    pub(crate) async fn health_report(
+        &self,
+    ) -> (
+        Value,
+        Option<crate::readiness::dual_writer::DualWriterReport>,
+    ) {
         let (poll_age, fee_floor) = {
             let readiness = self.readiness.read().await;
             (
@@ -3381,11 +3410,29 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"block_submission_hold":submission_hold_report(hold.as_ref()),"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let dual = match &self.dual_writer {
+            Some(dual) => Some(dual.report(&self.ledger.pool).await),
+            None => None,
+        };
+        let ready = ready
+            && dual
+                .as_ref()
+                .is_none_or(crate::readiness::dual_writer::DualWriterReport::serving);
+        let status = if ready {
+            "ok"
+        } else {
+            dual.as_ref()
+                .and_then(crate::readiness::dual_writer::DualWriterReport::status)
+                .unwrap_or("unavailable")
+        };
+        let Value::Object(mut fields) = json!({"ok":ready,"status":status,"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"block_submission_hold":submission_hold_report(hold.as_ref()),"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
         else {
             unreachable!("coordinator health fields are an object");
         };
-        HeartbeatHealth::new(ready, fields).into_value()
+        if let Some(dual) = &dual {
+            fields.insert("dual_writer".into(), dual.value.clone());
+        }
+        (HeartbeatHealth::new(ready, fields).into_value(), dual)
     }
 }
 
