@@ -171,9 +171,9 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let populated = contract::census(&body).unwrap();
         assert_eq!(populated.families.len(), 95);
         // 981 since the 3.1 dual writer's peer_sync ORDER_LOCK holder: one
-        // more holder's hold histogram, 16 series; 996 with the carry owner
-        // guard's state (12), alert (1) and peer check (2) series.
-        assert_eq!(populated.series.len(), 996);
+        // more holder's hold histogram, 16 series; 997 with the carry owner
+        // guard's state (13), alert (1) and peer check (2) series.
+        assert_eq!(populated.series.len(), 997);
         assert_eq!(
             sample(&body, "qbit_prism_tip_poll_age_seconds"),
             if known { elapsed.as_secs_f64() } else { -1. }
