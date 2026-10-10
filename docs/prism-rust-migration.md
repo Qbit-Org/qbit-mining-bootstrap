@@ -1808,9 +1808,9 @@ reads this node's newest share, each through it. Without it either is a walk
 of the primary key until it meets a row of the node it wants, and on a node
 that has written nothing lately the cut walks the whole ledger under
 `ORDER_LOCK`. It is an index only, additive like 024: no capability and no
-shutdown proof, and a binary that does not know it never reads it. Versions
-28 to 30 belong to the rest of the 3.1 dual writer; each version is checked
-on its own, so 031 needs none of them. The
+shutdown proof, and a binary that does not know it never reads it. 028 is
+the window cuts, and 029 and 030 belong to the rest of the 3.1 dual writer;
+each version is checked on its own, so 031 needs none of them. The
 [index inventory](prism-ledger-ops.md#share-ledger-indexes) lists it with its
 readers.
 

@@ -218,38 +218,35 @@ pub(crate) const PEER_HIGH_WATER_SQL: &str = "SELECT qbit_prism_peer_share_mark(
 /// `(origin_node, share_seq)` index (shaped as [`OWN_CUT_SQL`] is), from the
 /// mark down: the rows it passes are the peer's rows stamped after the
 /// anchor, the few within the clock skew, however many of this node's rows
-/// lie above the peer's newest. `$1` is the peer's index, `$2` the mark, `$3`
-/// the anchor.
-const PEER_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 AND share_seq<=$2 AND accepted AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY origin_node DESC, share_seq DESC LIMIT 1)";
-
-/// The peer's entry for a window anchored at `anchor_ms`: its newest synced
-/// row at or below its high-water mark that is stamped at or before the
-/// anchor ([`PEER_CUT_SQL`]). Every peer row at or below it is in this
-/// database and stamped at or before the anchor too (a node's stamps rise
-/// with its `share_seq`), so the anchor rule never removes a row the cut
-/// admits, and the peer's rows above it join the next windows.
+/// lie above the peer's newest. `$1` is the peer's index, `$2` the mark the
+/// cutoff's statement read, `$3` the anchor.
 ///
-/// `high_water` is the mark the cutoff's statement read under `ORDER_LOCK`,
-/// in another transaction. The mark is read again here and the lower one
-/// bounds the entry, so a mark rewound in between (a restore, or a
-/// repersonalise) never admits a peer row whose lower rows this database no
-/// longer holds; NULL either time admits none.
+/// The mark is read again in this statement, and both bound the walk: the
+/// cutoff's statement ran in another transaction, so a mark rewound since
+/// (a restore, or a repersonalise) never admits a peer row whose lower rows
+/// this database no longer holds. The second column is the mark the entry
+/// used, the lower of the two; a NULL mark either time admits no row and
+/// uses none.
+const PEER_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 AND share_seq<=$2 AND share_seq<=qbit_prism_peer_share_mark() AND accepted AND accepted_at<=to_timestamp($3::double precision/1000) AND job_issued_at<=to_timestamp($3::double precision/1000) ORDER BY origin_node DESC, share_seq DESC LIMIT 1),\
+     CASE WHEN qbit_prism_peer_share_mark() IS NOT NULL THEN LEAST($2, qbit_prism_peer_share_mark()) END";
+
+/// The peer's entry for a window anchored at `anchor_ms`, and the peer mark
+/// it used ([`PEER_CUT_SQL`]): its newest synced row at or below both the
+/// mark the cutoff's statement read, `high_water`, and the mark now, that
+/// is stamped at or before the anchor. Every peer row at or below it is in
+/// this database and stamped at or before the anchor too (a node's stamps
+/// rise with its `share_seq`), so the anchor rule never removes a row the
+/// cut admits, and the peer's rows above it join the next windows.
 pub(crate) async fn read_peer_cut(
     connection: &mut sqlx::PgConnection,
     peer: i16,
     high_water: Option<i64>,
     anchor_ms: i64,
-) -> Result<Option<u64>, WindowError> {
+) -> Result<(Option<u64>, Option<i64>), WindowError> {
     let Some(high_water) = high_water else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    let now: Option<i64> = sqlx::query_scalar(PEER_HIGH_WATER_SQL)
-        .fetch_one(&mut *connection)
-        .await?;
-    let Some(high_water) = now.map(|now| now.min(high_water)) else {
-        return Ok(None);
-    };
-    let entry: Option<i64> = sqlx::query_scalar(PEER_CUT_SQL)
+    let (entry, used): (Option<i64>, Option<i64>) = sqlx::query_as(PEER_CUT_SQL)
         // Planned with its values, as every bounded ledger read here is.
         .persistent(false)
         .bind(peer)
@@ -257,7 +254,7 @@ pub(crate) async fn read_peer_cut(
         .bind(anchor_ms)
         .fetch_one(&mut *connection)
         .await?;
-    entry.map_or(Ok(None), positive_entry)
+    Ok((entry.map_or(Ok(None), positive_entry)?, used))
 }
 
 /// Two more columns for [the holding probe](super::probe_window_holding) of
