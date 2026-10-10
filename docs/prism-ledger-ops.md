@@ -3785,9 +3785,12 @@ rollback to one writer.
 
 `qbit-prism-server node-identity set --index N` makes a database node A's
 (`0`) or node B's (`1`). The bootstrap and cutover steps run it once per
-database, before the node's first dual-writer start; a frontend never does. It
-needs only `PRISM_DATABASE_URL`, takes `SETTLEMENT_LOCK` and `ORDER_LOCK`, and
-in one transaction:
+database, before the node's first dual-writer start; a frontend never does.
+Stop every frontend on the database first: a frontend reads whether its
+database is personalised only at start (a single writer's rollup sweep, for
+one, takes the progress row first only on a database personalised when it
+started). It needs only `PRISM_DATABASE_URL`, takes `SETTLEMENT_LOCK` and
+`ORDER_LOCK`, and in one transaction:
 
 - sets every copied table's `origin_node` default to `N`, so every row the
   node writes carries its index without any statement naming it;
@@ -3883,9 +3886,10 @@ refresh and the submit loop wait. It is unset at start, and is set once this
 node holds every row it originated that the peer holds. The node pulls back
 any it lacks (its own shares, landings, prepared jobs and journal rows).
 Landings and prepared jobs commit out of order, so it reads every one of its
-own the peer holds since the node was personalised: the key of each landing,
-then whole only the landings missing here, and each prepared job whose expiry
-has not passed (it prunes expired ones itself). It then raises its own
+own the peer holds since the node was personalised: the key and a digest of
+the immutable facts of each landing, then whole only the landings missing
+here or held with other facts, and each prepared job whose expiry has not
+passed (it prunes expired ones itself). It then raises its own
 sequences and ledger clock above everything the peer has seen of it, and
 records the system identifier and WAL timeline it verified on in
 `qbit_prism_node_lineage`. If the peer cannot be reached or read at start, the
@@ -3896,7 +3900,7 @@ reads 1, and the node waits for the peer. Once recovery finds an own row
 missing, the node first forgets its last verification, so a recovery cut
 short (a peer that fails partway, a crash) leaves it waiting for the peer
 even after a restore that kept the timeline. If an own row that recovery
-reads from the peer differs from the one here, the own log has diverged: the
+compares differs from the one here, the own log has diverged: the
 conflict is recorded, and the latch stays unset, with or without the peer, until an
 operator decides. Losing the peer later never clears the latch. A change of
 identifier or timeline while the frontend runs, a restore or promotion under

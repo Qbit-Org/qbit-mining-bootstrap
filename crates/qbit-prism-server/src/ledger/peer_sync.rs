@@ -135,6 +135,22 @@ const BLOCK_FACTS: &[&str] = &[
     "payout_manifest_sha256",
     "as_issued_audit_sha256",
 ];
+/// A digest of landed block `b`'s [`BLOCK_FACTS`] and its audit digest,
+/// everything [`Ledger::apply_block`] compares for a block held already,
+/// computed alike on either node: own-log recovery compares it to tell a
+/// block held here with other facts from one held the same.
+fn block_facts_digest() -> String {
+    let pairs = BLOCK_FACTS
+        .iter()
+        .map(|fact| format!("'{fact}',b.{fact}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "md5(jsonb_build_array(jsonb_build_object({pairs}),(SELECT a.audit_bundle_sha256 \
+         FROM qbit_pool_audit_bundles a WHERE a.block_hash=b.block_hash))::text)"
+    )
+}
+
 /// The content-determined columns of an audit snapshot (D-15): windows with
 /// one share array share one row, whose anchor, cut, origin and creation
 /// time may differ.
@@ -573,19 +589,21 @@ pub mod peer {
         block_bundles(&rows)
     }
 
-    /// The `sync_seq` and hash of each landed block `origin` wrote with
-    /// `sync_seq` above `after`, at most `limit`, in `sync_seq` order: what
-    /// own-log recovery compares before it reads any block whole.
+    /// The `sync_seq`, hash and facts digest of each landed block `origin`
+    /// wrote with `sync_seq` above `after`, at most `limit`, in `sync_seq`
+    /// order: what own-log recovery compares before it reads any block
+    /// whole.
     pub async fn block_keys(
         connection: &mut PgConnection,
         origin: NodeIndex,
         after: i64,
         limit: i64,
-    ) -> Result<Vec<(i64, String)>> {
-        Ok(sqlx::query_as(
-            "SELECT sync_seq,block_hash FROM qbit_pool_blocks WHERE origin_node=$1 AND sync_seq>$2 \
-             ORDER BY sync_seq LIMIT $3",
-        )
+    ) -> Result<Vec<(i64, String, String)>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT b.sync_seq,b.block_hash,{} FROM qbit_pool_blocks b WHERE b.origin_node=$1 \
+             AND b.sync_seq>$2 ORDER BY b.sync_seq LIMIT $3",
+            block_facts_digest()
+        ))
         .bind(origin.index())
         .bind(after)
         .bind(limit)
@@ -902,8 +920,9 @@ impl Ledger {
     /// Apply one pull of share rows that `origin` wrote: the peer's own
     /// rows (`stream` is `Some(SHARES)`, which also advances its cursor and
     /// the safe peer mark to `batch.through`), or this node's own rows read
-    /// back from the peer (`None`). For those, `own_rows_through` is the
-    /// peer's cursor over this node's shares, if it has one.
+    /// back from the peer (`None`). For those, `own_rows_through` is what
+    /// bounds every own row the peer holds: the higher of its cursor over
+    /// this node's shares and its own lineage floor.
     ///
     /// A peer row is inserted only after this node's share sequence is
     /// above it and a partition holds it. An own row is inserted under
@@ -927,10 +946,11 @@ impl Ledger {
         // without a partition. Refused below as a conflict, never raised to.
         // This node's own rows, read back from the peer after a restore, can
         // lie far above its restored sequence (a backup node restored from
-        // an old backup), but never above the peer's cursor over this node's
-        // shares, which every own row the peer holds came through (a pull,
-        // or the copy `node-identity repersonalise` set it above): their
-        // ceiling counts from that cursor.
+        // an old backup), but each came to the peer through a pull, which
+        // its cursor over this node's shares covers, or was held when the
+        // peer was personalised, below its floor (`node-identity
+        // repersonalise` also sets that cursor above them): their ceiling
+        // counts from the higher of the two.
         let above = own_rows_through.filter(|_| own).unwrap_or(0);
         let ceiling = self.share_seq_ceiling(above).await?;
         let acceptable = acceptable_highest(&batch.rows, ceiling)?;
@@ -1482,13 +1502,23 @@ impl Ledger {
             == 1)
     }
 
-    /// The blocks among `hashes` this database lacks, in their order.
-    pub async fn missing_blocks(&self, hashes: &[String]) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT h FROM unnest($1::text[]) WITH ORDINALITY AS u(h,n) \
-             WHERE NOT EXISTS (SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=h) ORDER BY n",
-        )
-        .bind(hashes)
+    /// The blocks among `keys` (hash and facts digest, as
+    /// [`peer::block_keys`] reads them) this database lacks or holds with
+    /// another digest, in their order, each with whether it is held here.
+    pub async fn missing_blocks(&self, keys: &[(String, String)]) -> Result<Vec<(String, bool)>> {
+        let (hashes, digests): (Vec<&str>, Vec<&str>) = keys
+            .iter()
+            .map(|(hash, digest)| (hash.as_str(), digest.as_str()))
+            .unzip();
+        Ok(sqlx::query_as(&format!(
+            "SELECT u.h,EXISTS (SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=u.h) \
+             FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS u(h,d,n) \
+             WHERE NOT EXISTS (SELECT 1 FROM qbit_pool_blocks b WHERE b.block_hash=u.h AND {}=u.d) \
+             ORDER BY u.n",
+            block_facts_digest()
+        ))
+        .bind(&hashes)
+        .bind(&digests)
         .fetch_all(&mut *self.acquire().await?)
         .await?)
     }

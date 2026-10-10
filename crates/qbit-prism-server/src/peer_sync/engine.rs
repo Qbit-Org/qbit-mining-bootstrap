@@ -30,7 +30,7 @@ use crate::ledger::peer_sync::{
 use crate::ledger::{IdentityCheck, Ledger, LineageEvidence};
 use crate::metrics::Metrics;
 use crate::node_identity::NodeIndex;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, PgPool};
 use std::collections::BTreeMap;
@@ -530,7 +530,7 @@ impl PeerSync {
         if !self.latch.caught_up {
             report
                 .applied
-                .merge(self.recover_own_log(connection).await?);
+                .merge(self.recover_own_log(connection, &facts).await?);
         }
         report.own_log_caught_up = self.latch.caught_up;
         if self.latch.caught_up {
@@ -678,13 +678,22 @@ impl PeerSync {
     /// the peer has seen of this node, record the verification, and set the
     /// latch (D-8, D-14). A conflict among the own rows leaves the latch
     /// unset: the own log has diverged, and an operator must decide.
-    async fn recover_own_log(&mut self, connection: &mut sqlx::PgConnection) -> Result<Applied> {
+    async fn recover_own_log(
+        &mut self,
+        connection: &mut sqlx::PgConnection,
+        facts: &PeerFacts,
+    ) -> Result<Applied> {
         let node = self.node;
         let mut applied = Applied::default();
         let mut clock_ms = None;
-        // Every own row the peer holds is at or below its cursor over this
-        // node's shares, which bounds the keys taken back.
-        let own_rows_through = bounded(peer::cursors(connection)).await?.shares;
+        // Every own row the peer holds came through its pulls, which its
+        // cursor over this node's shares covers, or was held when it was
+        // personalised, below its floor: together they bound the keys taken
+        // back.
+        let own_rows_through = bounded(peer::cursors(connection))
+            .await?
+            .shares
+            .max(facts.share_seq_floor);
         loop {
             let (held, ..) = self.ledger.highest_held_of(node).await?;
             let batch = bounded(peer::shares_of(
@@ -708,10 +717,11 @@ impl PeerSync {
         }
         // Landed blocks and prepared jobs commit out of sync_seq order, so
         // the highest one held here proves no prefix: a backup can hold a
-        // block whose earlier-numbered sibling was still open. The key of
-        // every block of this node's the peer holds since it was
-        // personalised is compared; only the blocks missing here are read
-        // whole.
+        // block whose earlier-numbered sibling was still open. The key and
+        // facts digest of every block of this node's the peer holds since it
+        // was personalised are compared; only the blocks missing here, or
+        // held with other facts (a conflict: the own log has diverged), are
+        // read whole.
         let floor = self
             .ledger
             .node_lineage()
@@ -726,16 +736,25 @@ impl PeerSync {
                 BLOCK_KEYS_PER_READ,
             ))
             .await?;
-            let Some(last) = keys.last().map(|(sync_seq, _)| *sync_seq) else {
+            let Some(last) = keys.last().map(|(sync_seq, ..)| *sync_seq) else {
                 break;
             };
-            let hashes: Vec<String> = keys.into_iter().map(|(_, hash)| hash).collect();
-            let missing = self.ledger.missing_blocks(&hashes).await?;
-            if !missing.is_empty() {
+            let keys: Vec<(String, String)> = keys
+                .into_iter()
+                .map(|(_, hash, digest)| (hash, digest))
+                .collect();
+            let unlike = self.ledger.missing_blocks(&keys).await?;
+            if unlike.iter().any(|(_, held)| !held) {
                 self.own_rows_missing().await?;
             }
-            for some in missing.chunks(BLOCKS_PER_PASS as usize) {
+            let hashes: Vec<String> = unlike.into_iter().map(|(hash, _)| hash).collect();
+            for some in hashes.chunks(BLOCKS_PER_PASS as usize) {
                 let blocks = bounded(peer::blocks_with_hashes(connection, node, some)).await?;
+                ensure!(
+                    blocks.len() == some.len(),
+                    "the peer no longer holds {} of the own blocks it listed; recovery starts again",
+                    some.len() - blocks.len()
+                );
                 for block in &blocks {
                     applied.merge(self.ledger.apply_block(block, None).await?);
                 }

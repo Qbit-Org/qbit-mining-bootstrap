@@ -2014,3 +2014,46 @@ async fn recovery_refuses_an_own_row_beyond_the_peers_cursor() -> Result<()> {
     })
     .await
 }
+
+/// Own-log recovery compares each own landed block the peer holds and this
+/// database holds too by a digest of its immutable facts: one held here
+/// with other facts is read whole and recorded as a conflict, the own log
+/// has diverged, and the latch stays down.
+#[tokio::test]
+async fn recovery_finds_an_own_block_held_with_other_facts() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        append(&pair.a, &["d1", "d2", "d3"]).await?;
+        let block = land(&pair.a, "diverged", 500).await?;
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| {
+            Ok(count(&pair.b.pool, "SELECT count(*) FROM qbit_pool_blocks").await? == 1)
+        })
+        .await?;
+        // A's own row of the block now names another coinbase.
+        sqlx::query("UPDATE qbit_pool_blocks SET coinbase_txid=$2 WHERE block_hash=$1")
+            .bind(&block)
+            .bind(hex("another coinbase"))
+            .execute(&pair.a.pool)
+            .await?;
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let refused = on_a.pass().await;
+        ensure!(
+            refused.as_ref().is_err_and(|error| format!("{error:#}").contains("diverged")),
+            "{refused:?}"
+        );
+        ensure!(!on_a.subscribe().borrow().own_log_caught_up);
+        ensure!(
+            count(
+                &pair.a.pool,
+                &format!("SELECT count(*) FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_pool_blocks' AND row_key='{block}'"),
+            )
+            .await?
+                == 1
+        );
+        Ok(())
+    })
+    .await
+}

@@ -813,7 +813,7 @@ async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
                 // The peer's own server, when its URL is set: this database
                 // must not be on it. Either path to it will do.
                 let mut peer_server = None;
-                let mut unread = None;
+                let mut unread = Vec::new();
                 for name in [
                     "PRISM_PEER_DATABASE_URL",
                     "PRISM_PEER_DATABASE_URL_FALLBACK",
@@ -826,22 +826,20 @@ async fn node_identity(command: NodeIdentityCommand) -> Result<()> {
                             peer_server = Some(evidence);
                             break;
                         }
-                        Err(error) => unread = Some(error.context(format!("reading {name}"))),
+                        Err(error) => unread.push(format!("{name}: {error:#}")),
                     }
                 }
-                match unread {
-                    Some(error) if peer_server.is_none() && unverified_copy => {
-                        tracing::warn!(error = %format!("{error:#}"), "the peer's server could not be read; going on, --unverified-copy given");
+                if peer_server.is_none() && !unread.is_empty() {
+                    let unread = unread.join("; ");
+                    if !unverified_copy {
+                        bail!(
+                            "the peer's server, which this database must not be on, could not be \
+                             read ({unread}); run again once it answers. --unverified-copy goes \
+                             on without it, and without the own-log verification check: only \
+                             once you have made sure this database is the promoted copy"
+                        );
                     }
-                    Some(error) if peer_server.is_none() => {
-                        return Err(error.context(
-                            "the peer's server, which this database must not be on, could not \
-                             be read; run again once it answers. --unverified-copy goes on \
-                             without it, and without the own-log verification check: only once \
-                             you have made sure this database is the promoted copy",
-                        ))
-                    }
-                    _ => {}
+                    tracing::warn!(%unread, "the peer's server could not be read; going on, --unverified-copy given");
                 }
                 let guard = crate::ledger::RepersonaliseGuard {
                     unverified_copy,
