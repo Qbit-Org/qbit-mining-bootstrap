@@ -69,8 +69,9 @@ struct Counters {
 pub struct RelayStats {
     pub name: String,
     pub state: LinkState,
-    /// The one-way latency added to every chunk, in milliseconds.
-    pub latency_ms: u64,
+    /// The highest one-way latency the link carried during the run, in
+    /// milliseconds (a scenario lifts it before the report is taken).
+    pub latency_ms_max: u64,
     pub accepted: u64,
     pub reset: u64,
     pub upstream_failures: u64,
@@ -81,8 +82,9 @@ pub struct Relay {
     port: u16,
     target: Arc<AtomicU16>,
     state: watch::Sender<LinkState>,
-    /// One-way latency, in milliseconds, added to every chunk forwarded.
+    /// One-way latency, in milliseconds, added to each burst forwarded.
     latency_ms: Arc<AtomicU64>,
+    latency_ms_max: AtomicU64,
     counters: Arc<Counters>,
     task: JoinHandle<()>,
 }
@@ -111,6 +113,7 @@ impl Relay {
             target,
             state,
             latency_ms,
+            latency_ms_max: AtomicU64::new(0),
             counters,
             task,
         })
@@ -133,12 +136,16 @@ impl Relay {
         self.state.send_replace(state);
     }
 
-    /// Delay every chunk either side sends by `latency` before it is
-    /// forwarded, on connections old and new: a path between two sites.
-    /// Chunks are forwarded one at a time, so bulk transfer slows too.
+    /// Delay what either side sends by `latency` before it is forwarded, on
+    /// connections old and new: a path between two sites. A chunk the pump
+    /// had to wait for (a request, a reply's start) waits the latency; the
+    /// rest of a burst, already waiting to be read, follows without another
+    /// one, so a round trip costs twice the latency and bulk transfer is not
+    /// capped. Nothing being discarded waits.
     pub fn set_latency(&self, latency: std::time::Duration) {
-        self.latency_ms
-            .store(latency.as_millis() as u64, Ordering::SeqCst);
+        let ms = latency.as_millis() as u64;
+        self.latency_ms.store(ms, Ordering::SeqCst);
+        self.latency_ms_max.fetch_max(ms, Ordering::SeqCst);
     }
 
     /// Point new connections at another port (a restarted child's, say).
@@ -150,7 +157,7 @@ impl Relay {
         RelayStats {
             name: self.name.clone(),
             state: self.state(),
-            latency_ms: self.latency_ms.load(Ordering::Relaxed),
+            latency_ms_max: self.latency_ms_max.load(Ordering::Relaxed),
             accepted: self.counters.accepted.load(Ordering::Relaxed),
             reset: self.counters.reset.load(Ordering::Relaxed),
             upstream_failures: self.counters.upstream_failures.load(Ordering::Relaxed),
@@ -326,24 +333,34 @@ async fn forward(
     state: &mut watch::Receiver<LinkState>,
     latency: std::time::Duration,
 ) -> Forwarded {
-    // The path's latency, before the chunk moves; a state change still acts
-    // at once, and the loop below re-checks it.
-    if !latency.is_zero() {
-        tokio::select! {
-            () = tokio::time::sleep(latency) => {}
-            changed = state.changed() => {
-                if changed.is_err() {
-                    return Forwarded::Ended;
-                }
-            }
-        }
-    }
     let mut sent = 0;
+    let mut delayed = latency.is_zero();
     while sent < chunk.len() {
         match flowing(state).await {
             None => return Forwarded::Ended,
             Some(Flow::Drop) => return Forwarded::Dropped,
             Some(Flow::Forward) => {}
+        }
+        // The path's latency, once, before the chunk moves. The sleep runs
+        // to its deadline while the link stays open; any other state is
+        // acted on at once by the check above.
+        if !delayed {
+            delayed = true;
+            let deadline = tokio::time::Instant::now() + latency;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => break,
+                    changed = state.changed() => {
+                        if changed.is_err() {
+                            return Forwarded::Ended;
+                        }
+                        if *state.borrow() != LinkState::Open {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
         }
         tokio::select! {
             written = to.write(&chunk[sent..]) => match written {
@@ -377,6 +394,9 @@ async fn pump(
     discarded: Arc<AtomicBool>,
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
     let mut buffer = vec![0u8; 16 * 1024];
+    // A connection's first chunk always starts a burst, even one sent
+    // before this pump began to read.
+    let mut first = true;
     loop {
         let Some(flow) = flowing(&mut state).await else {
             return (from, to);
@@ -387,15 +407,23 @@ async fn pump(
             // Out of Discard: the connection ends, to be reset.
             return (from, to);
         }
-        let read = tokio::select! {
-            read = from.read(&mut buffer) => read,
-            // Re-check the state: a blackhole stops the read here.
-            changed = state.changed() => {
-                if changed.is_err() {
-                    return (from, to);
-                }
-                continue;
+        // A chunk already waiting to be read is the rest of a burst; one the
+        // pump has to wait for starts a burst, and pays the path's latency.
+        let (read, waited) = match from.try_read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let read = tokio::select! {
+                    read = from.read(&mut buffer) => read,
+                    // Re-check the state: a blackhole stops the read here.
+                    changed = state.changed() => {
+                        if changed.is_err() {
+                            return (from, to);
+                        }
+                        continue;
+                    }
+                };
+                (read, true)
             }
+            read => (read, false),
         };
         let count = match read {
             Ok(0) | Err(_) => {
@@ -410,7 +438,12 @@ async fn pump(
             }
             Ok(count) => count,
         };
-        let latency = std::time::Duration::from_millis(latency_ms.load(Ordering::SeqCst));
+        let latency = if waited || first {
+            std::time::Duration::from_millis(latency_ms.load(Ordering::SeqCst))
+        } else {
+            std::time::Duration::ZERO
+        };
+        first = false;
         match forward(&mut to, &buffer[..count], &mut state, latency).await {
             Forwarded::Written => {}
             Forwarded::Dropped => discarded.store(true, Ordering::SeqCst),
@@ -510,10 +543,27 @@ mod tests {
             "both ways wait: {:?}",
             started.elapsed()
         );
+        // A burst pays the latency once, not once a chunk: 4 MiB echoed in
+        // 16 KiB chunks would take minutes if every chunk waited.
+        let bulk = vec![9u8; 4 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let (mut read, mut write) = stream.split();
+        let (sent, echoed) = tokio::join!(write.write_all(&bulk), async {
+            let mut back = vec![0u8; bulk.len()];
+            read.read_exact(&mut back).await.map(|_| back)
+        });
+        sent?;
+        assert_eq!(echoed?, bulk);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "bulk transfer is not capped: {:?}",
+            started.elapsed()
+        );
         relay.set_latency(Duration::ZERO);
         let started = std::time::Instant::now();
         assert_eq!(round_trip(&mut stream, b"fast").await?, b"fast");
         assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(relay.stats().latency_ms_max, 150);
         Ok(())
     }
 
