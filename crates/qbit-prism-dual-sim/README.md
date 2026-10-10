@@ -178,8 +178,8 @@ What each one does:
   peer backend idle in transaction. Then A's database link discards (B's
   replies drain and no close reaches it, as when A's host dies; a plain kill -9
   sends a FIN), and A's frontend is killed while its puller is busy on B. A's
-  backends on B must hold no snapshot or transaction beyond 10 s, and B's share
-  answer latency must stay flat (p95 45 to 60 s
+  backends on B must hold no snapshot or transaction beyond 10 s, no session may
+  be routed to A after its mark-down, and B's share answer latency must stay flat (p95 45 to 60 s
   after the death at most twice the p95 5 to 20 s after A's mark-down, plus
   50 ms).
 - **S3:** B's host dies (frontend and PostgreSQL); A's miners see no gap above

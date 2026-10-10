@@ -96,6 +96,15 @@ pub struct ShareRecord {
     pub scheduled_block: bool,
 }
 
+/// How many of `records` are [`ShareRecord::accepted_on`] `node` after
+/// `after_ms`.
+pub fn count_accepted_on(records: &[ShareRecord], node: Node, after_ms: u64) -> usize {
+    records
+        .iter()
+        .filter(|r| r.accepted_on(node, after_ms))
+        .count()
+}
+
 impl ShareRecord {
     pub fn accepted(&self) -> bool {
         self.outcome == "accepted"
@@ -533,12 +542,7 @@ impl Load {
     pub fn accepted_on(&self, node: Node, after_ms: u64) -> usize {
         self.log
             .lock()
-            .map(|log| {
-                log.shares
-                    .iter()
-                    .filter(|r| r.accepted_on(node, after_ms))
-                    .count()
-            })
+            .map(|log| count_accepted_on(&log.shares, node, after_ms))
             .unwrap_or(0)
     }
 
