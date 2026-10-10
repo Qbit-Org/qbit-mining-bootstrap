@@ -38,6 +38,7 @@ fn found_candidate() -> Result<Candidate> {
         payout_revision: 7,
         shares: vec![share(1, "miner.rig:window")],
         prior_balances: vec![],
+        cut: None,
     };
     let manifest_key = ManifestSigningKey::from_seed_hex(&"11".repeat(32))?;
     let ledger_key = ManifestSigningKey::from_seed_hex(&"22".repeat(32))?;

@@ -74,7 +74,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(script.preamble.count(module.BEGIN), 1)
         # Every flag a later part branches on is set before the first export.
         for flag in ("has_native_share_hashes", "share_hashes_deferred", "has_audit_snapshots",
-                     "has_policy_transitions"):
+                     "has_policy_transitions", "has_audit_snapshot_cuts"):
             self.assertIn(f"AS {flag}", script.preamble)
         # A pending backfill's cursor is exported once, last, by the part that
         # commits the closing kinds: no other session reads the cursor table,

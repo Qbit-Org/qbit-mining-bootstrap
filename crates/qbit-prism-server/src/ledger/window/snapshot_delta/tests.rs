@@ -53,6 +53,7 @@ fn retained(capture: SnapshotCapture, network: u128) -> RetainedShares {
         anchor_ms: snapshot.anchor_ms,
         cutoff: snapshot.share_seq,
         shares: snapshot.shares,
+        cut: None,
     }
 }
 
@@ -84,6 +85,7 @@ async fn differential_report(
         network * 8,
         full.anchor_ms,
         i64::try_from(full.share_seq)?,
+        full.cut,
         &completion,
     )
     .await?;
@@ -351,7 +353,7 @@ async fn concurrent_detach_pending_cannot_authorize_retained_rows() -> Result<()
             }
         }).await??;
         let mut tx = ledger.begin().await?;
-        assert!(leaf_witness(&mut tx, 1, 8, prior.anchor_ms, Some(8)).await?.is_none());
+        assert!(leaf_witness(&mut tx, 1, 8, prior.anchor_ms, None, Some(8)).await?.is_none());
         tx.commit().await?;
         pin.rollback().await?;
         tokio::time::timeout(std::time::Duration::from_secs(5), detach).await???;
@@ -390,7 +392,7 @@ async fn healthy_pool_rotation_and_reconnect_preserve_history_evidence() -> Resu
                     .await?
                 );
                 assert_eq!(
-                    leaf_witness(&mut tx, 1, 8, prior.anchor_ms, Some(8)).await?,
+                    leaf_witness(&mut tx, 1, 8, prior.anchor_ms, None, Some(8)).await?,
                     prior.leaf
                 );
                 transactions.push(tx);
@@ -661,6 +663,7 @@ async fn delta_windows_pass_landing_rederivation_and_neighbours_fail() -> Result
                     share_count: i64::try_from(shares.len())?,
                     inline: None,
                     shares: std::sync::Arc::new(shares),
+                    cut: None,
                 })
             };
             let exact = write(window.shares.clone())?;

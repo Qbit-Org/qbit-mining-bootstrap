@@ -787,6 +787,7 @@ async fn balance_snapshot_writer_is_canonical_idempotent_and_conflict_checked() 
                 anchor_ms: ANCHOR,
                 prior_balances_digest: digest,
                 shares: None,
+                cut: None,
             };
             let window = ledger
                 .read_window(&reference, BalanceSource::AsIssued)
@@ -822,7 +823,8 @@ async fn balance_snapshot_writer_is_canonical_idempotent_and_conflict_checked() 
                     &WindowRef {
                         anchor_ms: ANCHOR,
                         prior_balances_digest: empty,
-                        shares: None
+                        shares: None,
+                        cut: None,
                     },
                     BalanceSource::AsIssued
                 )
@@ -894,6 +896,7 @@ async fn share_probe_and_paged_reader_serve_a_callers_transaction() -> Result<()
                 share_count,
                 snapshot_sha256: Sha256::digest(serde_json::to_vec(&expected).unwrap()).into(),
             }),
+            cut: None,
         };
         // read_window itself is unchanged by the refactor.
         let window = ledger.read_window(&range(expected.len() as u64), BalanceSource::Current).await?;
@@ -1023,6 +1026,7 @@ async fn permit_release_body(db: &Database) -> Result<()> {
             // Unreachable: the final page never returns while the gate holds.
             snapshot_sha256: [0; 32],
         }),
+        cut: None,
     };
     let reader = tokio::spawn(async move {
         ledger

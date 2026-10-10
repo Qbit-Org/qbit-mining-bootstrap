@@ -21,6 +21,13 @@ pub(crate) struct RefreshProbe {
     pub accepted_share_seq: u64,
     /// The writer timeline of the same snapshot (#619).
     pub timeline: WriterTimeline,
+    /// In dual-writer mode, the peer's share-stream high-water mark of the
+    /// same snapshot (`window/cut.rs`): when it has moved past the mark a
+    /// cached window was taken at, the peer's newer rows, which can all lie
+    /// below `accepted_share_seq`, make that window stale. `None` for a
+    /// single writer, which reads nothing more than 3.0 did, and before the
+    /// first pull.
+    pub peer_mark: Option<i64>,
 }
 
 const PAYOUT_REVISION_SQL: &str = "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'";
@@ -98,6 +105,14 @@ impl Ledger {
         let (payout_revision, timeline) = refresh_revision(&mut tx).await?;
         let (accepted_share_seq, prior_balances_digest) =
             refresh_balances(&mut tx, &completion).await?;
+        let peer_mark = match self.dual_writer_identity() {
+            Some(_) => {
+                sqlx::query_scalar(super::cut::PEER_HIGH_WATER_SQL)
+                    .fetch_one(&mut *tx)
+                    .await?
+            }
+            None => None,
+        };
         tx.commit().await?;
         Ok(RefreshProbe {
             payout_state: PayoutState {
@@ -106,6 +121,7 @@ impl Ledger {
             },
             accepted_share_seq,
             timeline,
+            peer_mark,
         })
     }
 }

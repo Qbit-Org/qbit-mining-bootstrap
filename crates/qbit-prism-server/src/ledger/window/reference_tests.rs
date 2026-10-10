@@ -25,6 +25,7 @@ fn reference_hex_is_strict_and_empty_is_distinct_from_a_range() {
         anchor_ms: 7,
         prior_balances_digest: [0xab; 32],
         shares: None,
+        cut: None,
     };
     let range = WindowRef {
         shares: Some(ShareRange {
@@ -164,6 +165,7 @@ fn snapshot_of(shares: Vec<AcceptedShare>) -> Snapshot {
                 balance_sats: 9,
             },
         ],
+        cut: None,
     }
 }
 

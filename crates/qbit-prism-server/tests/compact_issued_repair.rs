@@ -130,6 +130,7 @@ fn record(
                 share_count: 2,
                 snapshot_sha256: [0x34; 32],
             }),
+            cut: None,
         },
         share_seq: 5,
         payout_revision: 0,

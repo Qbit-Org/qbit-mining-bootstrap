@@ -105,6 +105,7 @@ impl Prepared {
             payout_revision: self.snapshot.payout_revision,
             shares: Vec::new(),
             prior_balances: (*self.reservation.balances).clone(),
+            cut: self.window.cut,
         })
     }
 }

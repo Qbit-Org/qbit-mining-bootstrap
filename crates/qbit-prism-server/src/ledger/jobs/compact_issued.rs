@@ -182,7 +182,12 @@ impl Ledger {
         }
         require_live(&mut tx, expires).await?;
 
-        let mut row = dependency_row(&mut tx, dependency.key).await?;
+        let mut row = dependency_row(
+            &mut tx,
+            dependency.key,
+            self.dual_writer_identity().is_some(),
+        )
+        .await?;
         let missing_record = row.is_none();
         require_live(&mut tx, expires).await?;
         if let Some(row) = &row {
@@ -212,7 +217,12 @@ impl Ledger {
                 .bind(range.map(|r| r.first_share_seq as i64)).bind(range.map(|r| r.last_share_seq as i64))
                 .bind(range.map(|r| r.share_count as i64)).bind(range.map(|r| hex::encode(r.snapshot_sha256)))
                 .bind(&record.template_sha256).execute(&mut *tx).await?;
-            row = dependency_row(&mut tx, dependency.key).await?;
+            row = dependency_row(
+                &mut tx,
+                dependency.key,
+                self.dual_writer_identity().is_some(),
+            )
+            .await?;
         }
         let row = row.context("prepared dependency disappeared")?;
         dependency.check_row(&row)?;
@@ -319,12 +329,7 @@ impl CompactDependency<'_> {
 // Return only bounded identity/column metadata and server-side consistency
 // results: never transfer the prepared payload, template or balance bytes on
 // the hot path. The blob keys' existence is not proof of unseen byte integrity.
-pub(super) async fn dependency_row(
-    tx: &mut Transaction<'_, Postgres>,
-    key: &str,
-) -> Result<Option<PgRow>> {
-    Ok(sqlx::query(
-        r#"SELECT parent_hash,payout_revision,expires_at,
+const DEPENDENCY_ROW_SQL: &str = r#"SELECT parent_hash,payout_revision,expires_at,
         window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,
         window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256,
         payload->'original_expires_at_ms' AS original_expires_at_ms,
@@ -341,12 +346,36 @@ pub(super) async fn dependency_row(
                         'last_share_seq',window_last_share_seq,'share_count',window_share_count,
                         'snapshot_sha256',window_snapshot_sha256) END),false)
             AS payload_matches_columns
-        FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#,
-    )
-    .bind(key)
-    .bind(i32::from(CompactPrepared::FORMAT_VERSION))
-    .fetch_optional(&mut **tx)
-    .await?)
+        FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#;
+
+/// [`DEPENDENCY_ROW_SQL`] for a dual-writer frontend, whose prepared windows
+/// carry a cut. The typed window columns duplicate the reference's anchor,
+/// balances digest and range, not the cut, so the payload's window is
+/// compared without its `cut` key. The cut is held to the payload's canonical
+/// encoding when the record is decoded (`prepared.rs`), and to the record's
+/// audit hashes when it is rebuilt. A single writer issues 3.0's statement.
+static DUAL_WRITER_DEPENDENCY_ROW_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        let window = "AND payload->'window'=jsonb_build_object(";
+        assert_eq!(DEPENDENCY_ROW_SQL.matches(window).count(), 1);
+        DEPENDENCY_ROW_SQL.replace(window, "AND (payload->'window')-'cut'=jsonb_build_object(")
+    });
+
+pub(super) async fn dependency_row(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &str,
+    dual_writer: bool,
+) -> Result<Option<PgRow>> {
+    let sql: &str = if dual_writer {
+        &DUAL_WRITER_DEPENDENCY_ROW_SQL
+    } else {
+        DEPENDENCY_ROW_SQL
+    };
+    Ok(sqlx::query(sql)
+        .bind(key)
+        .bind(i32::from(CompactPrepared::FORMAT_VERSION))
+        .fetch_optional(&mut **tx)
+        .await?)
 }
 
 pub(super) async fn lock_blob_metadata(
@@ -377,4 +406,20 @@ pub(super) async fn require_live(
         .await?;
     ensure!(live, "issued job deadline elapsed");
     Ok(())
+}
+
+#[cfg(test)]
+mod dependency_row_tests {
+    use super::*;
+
+    #[test]
+    fn a_dual_writer_compares_the_window_without_its_cut_and_a_single_writer_as_3_0() {
+        assert!(DEPENDENCY_ROW_SQL.contains("AND payload->'window'=jsonb_build_object("));
+        assert!(!DEPENDENCY_ROW_SQL.contains("'cut'"));
+        let dual: &str = &DUAL_WRITER_DEPENDENCY_ROW_SQL;
+        assert_eq!(
+            dual.replace("(payload->'window')-'cut'", "payload->'window'"),
+            DEPENDENCY_ROW_SQL
+        );
+    }
 }

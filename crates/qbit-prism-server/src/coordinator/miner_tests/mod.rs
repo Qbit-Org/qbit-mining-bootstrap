@@ -626,6 +626,7 @@ impl Fixture {
             payout_revision: revision,
             shares: vec![share.clone()],
             prior_balances: vec![],
+            cut: None,
         });
         let bundle = Arc::new(
             qbit_prism::build_audit_bundle_with_coinbase_options(
@@ -788,6 +789,7 @@ impl Fixture {
                     payout_revision: prepared.snapshot.payout_revision,
                     shares: vec![],
                     prior_balances: (*prepared.reservation.balances).clone(),
+                    cut: None,
                 }
             });
         snapshot.prior_balances = (*prepared.reservation.balances).clone();

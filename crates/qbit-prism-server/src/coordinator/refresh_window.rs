@@ -36,6 +36,9 @@ pub(super) struct RefreshWindow {
     leaf: Option<crate::ledger::LeafWitness>,
     /// The writer timeline the window's rows were read on (#619).
     pub timeline: crate::ledger::WriterTimeline,
+    /// The dual-writer peer mark the window's cut was taken at; `None` for a
+    /// single writer.
+    peer_mark: Option<i64>,
     anchored: Instant,
 }
 
@@ -45,6 +48,7 @@ impl RefreshWindow {
             network: self.network,
             anchor_ms: self.snapshot.anchor_ms,
             cutoff: self.snapshot.share_seq,
+            cut: self.snapshot.cut,
             shares: self.snapshot.shares,
             leaf: self.leaf,
         }
@@ -57,18 +61,22 @@ impl RefreshWindow {
     /// Whether a new template may reuse this window. A window read on
     /// another writer timeline never is: a promotion can lose its rows and
     /// hand their numbers to other shares, so an equal cutoff proves nothing
-    /// (#619).
+    /// (#619). Nor is a dual-writer window once the peer sync's mark has
+    /// moved: the peer's newer rows can all lie below this node's cutoff, so
+    /// an equal cutoff does not prove that nothing arrived (CONTRACT D-13).
     pub fn reusable(
         &self,
         network: u128,
         share_seq: u64,
         state: crate::ledger::PayoutState,
         timeline: crate::ledger::WriterTimeline,
+        peer_mark: Option<i64>,
         interval: Duration,
     ) -> bool {
         self.network == network
             && self.timeline == timeline
             && self.snapshot.share_seq == share_seq
+            && self.peer_mark == peer_mark
             && self.snapshot.payout_revision == state.payout_revision
             && self.reference.prior_balances_digest == state.prior_balances_digest
             && self.within_reanchor_interval(interval)
@@ -145,6 +153,7 @@ impl Coordinator {
                     leaf,
                     acquisition,
                     timeline,
+                    peer_mark,
                 } = Arc::try_unwrap(capture)
                     .ok()
                     .expect("both borrowed computations have finished");
@@ -156,6 +165,7 @@ impl Coordinator {
                     network,
                     leaf,
                     timeline,
+                    peer_mark,
                     anchored,
                 });
                 // Keep the original cache behavior even when body preparation failed.
@@ -163,5 +173,53 @@ impl Coordinator {
                 Ok(CompactOwner::new((window, body, admission)))
             })
             .await?
+    }
+}
+
+#[cfg(test)]
+mod peer_mark_tests {
+    use super::*;
+
+    fn window(peer_mark: Option<i64>) -> RefreshWindow {
+        let snapshot = Snapshot {
+            anchor_ms: 10,
+            share_seq: 40,
+            payout_revision: 3,
+            shares: Vec::new(),
+            prior_balances: Vec::new(),
+            cut: peer_mark.map(|_| qbit_prism::WindowCut::new(Some(40), Some(21)).unwrap()),
+        };
+        RefreshWindow {
+            reference: WindowRef::from_snapshot(&snapshot).unwrap(),
+            snapshot,
+            acquisition: crate::ledger::AcquisitionReport::full(
+                crate::metrics::WindowAcquisition::NoPrior,
+            ),
+            network: 7,
+            leaf: None,
+            timeline: crate::ledger::WriterTimeline::new(1),
+            peer_mark,
+            anchored: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_window_is_not_reused_once_the_peer_mark_moves() {
+        let interval = Duration::from_secs(60);
+        let state = |window: &RefreshWindow| crate::ledger::PayoutState {
+            payout_revision: window.snapshot.payout_revision,
+            prior_balances_digest: window.reference.prior_balances_digest,
+        };
+        let timeline = crate::ledger::WriterTimeline::new(1);
+        // A single writer's window carries no mark, and its reuse is 3.0's.
+        let single = window(None);
+        assert!(single.reusable(7, 40, state(&single), timeline, None, interval));
+        assert!(!single.reusable(7, 41, state(&single), timeline, None, interval));
+        // A dual-writer window is reused only at the mark it was taken at:
+        // the peer's newer rows can all lie under the unchanged cutoff.
+        let dual = window(Some(21));
+        assert!(dual.reusable(7, 40, state(&dual), timeline, Some(21), interval));
+        assert!(!dual.reusable(7, 40, state(&dual), timeline, Some(23), interval));
+        assert!(!dual.reusable(7, 40, state(&dual), timeline, None, interval));
     }
 }

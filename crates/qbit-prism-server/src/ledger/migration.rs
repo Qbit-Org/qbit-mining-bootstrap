@@ -43,7 +43,7 @@ pub use share_hashes::{
 /// plain `migrate` records it.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    31,
+    28, 31,
 ];
 
 /// The schema migrations a start requires: `REQUIRED_SCHEMA_VERSIONS`, but
@@ -2267,6 +2267,7 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         27,
         include_str!("../../migrations/027_dual_writer_identity.sql"),
     ),
+    (28, include_str!("../../migrations/028_window_cuts.sql")),
     (
         31,
         include_str!("../../migrations/031_share_ledger_origin_index.sql"),
@@ -3478,6 +3479,18 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(27)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    // 3.1 dual writer (D2): a dual-writer payout window's per-node cut on
+    // its audit share snapshot. Two nullable columns that an earlier binary
+    // never names, NULL (no cut, 3.0's meaning) on every row it writes, so
+    // the migration needs no capability or shutdown proof.
+    if !versions.contains(&28) {
+        sqlx::raw_sql(native_migration(28))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(28)")
             .execute(&mut **tx)
             .await?;
     }

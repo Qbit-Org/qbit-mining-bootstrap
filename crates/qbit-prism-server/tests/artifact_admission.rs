@@ -234,6 +234,7 @@ fn window_ref_for(shares: &[AcceptedShare], snapshot: &Snapshot) -> Result<Windo
         anchor_ms: snapshot.anchor_ms,
         prior_balances_digest: qbit_prism::prior_balances_digest(&snapshot.prior_balances),
         shares: range,
+        cut: None,
     })
 }
 
