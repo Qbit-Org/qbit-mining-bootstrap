@@ -128,7 +128,9 @@ only while it admits miners:
 - before its first admission, after a withdrawal, and while its decision is
   stale, the kernel refuses every connection with a reset: no TCP handshake
   completes, so no check, balancer or miner sees a frontend that cannot
-  serve as up;
+  serve as up. A connection whose handshake completes in the moment before
+  the listener closes is closed unserved: a session starts only on a
+  decision that admits at that instant;
 - withdrawing resets connections still queued unaccepted, so their miners
   reconnect elsewhere at once;
 - after a `not-ready` withdrawal, sessions already accepted carry on until
@@ -266,8 +268,9 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
   established session is still served, closes established sessions too on a
   withdrawal for a definite fault (also one that follows a `not-ready`
   withdrawal) after answering the request in hand, keeps them on a withdrawal
-  for a database that stopped answering, and closes when its decision goes
-  stale.
+  for a database that stopped answering, closes when its decision goes
+  stale, and closes a connection it accepts on a decision gone stale without
+  serving it.
 - Gated, `tests/dual_writer_readiness.rs`: the latch and the identity at the
   coordinator, a database turning read-only and back, the peer lost after
   the latch, a database personalised as the peer (`remote`), a ledger pool

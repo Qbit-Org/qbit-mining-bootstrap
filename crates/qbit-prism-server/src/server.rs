@@ -93,6 +93,24 @@ pub async fn run(config: Config) -> Result<()> {
         ),
         None => None,
     };
+    // Gated, an address that could never listen beside another still binds
+    // beside it (SO_REUSEADDR, not listening yet), and its listen would fail
+    // only once admitted, taking the frontend down. Refuse such pairs here,
+    // before the coordinator writes cluster state, as 3.0's eager listen does;
+    // the audit listener, bound after the coordinator as in 3.0, is checked
+    // where it binds.
+    let mut gated_addresses = Vec::new();
+    if gated {
+        gated_addresses.push(("primary Stratum", primary.local_addr()?));
+        if let Some(high) = &high_listener {
+            gated_addresses.push(("high difficulty Stratum", high.local_addr()?));
+        }
+    }
+    let readiness_address = match &readiness_listener {
+        Some(listener) => vec![("readiness endpoint", listener.local_addr()?)],
+        None => Vec::new(),
+    };
+    refuse_listen_conflicts(&gated_addresses, &readiness_address)?;
     let registry = Arc::new(metrics::Metrics::default());
     // #291: 0 from the start with the switch off. With it on, unknown until
     // the first health publication has read the cluster's hold (#664).
@@ -220,6 +238,9 @@ pub async fn run(config: Config) -> Result<()> {
     } else {
         None
     };
+    if let Some(listener) = &api_listener {
+        refuse_listen_conflicts(&gated_addresses, &[("audit API", listener.local_addr()?)])?;
+    }
     let mut tasks = JoinSet::new();
     // 3.1 dual writer: the peer sync, and the own-log latch (D-8) that the
     // tasks writing this node's own rows wait for: the refresh (prepared
@@ -566,6 +587,23 @@ async fn prune_jobs<T, F: std::future::Future<Output = Result<T>>>(
     Ok(())
 }
 
+/// Refuse any two addresses, at least one of them a gated Stratum address
+/// (`gated`), that could never both listen ([`crate::listen::listen_conflict`]).
+fn refuse_listen_conflicts(
+    gated: &[(&str, SocketAddr)],
+    others: &[(&str, SocketAddr)],
+) -> Result<()> {
+    for (index, (name, addr)) in gated.iter().enumerate() {
+        for (other, other_addr) in gated[index + 1..].iter().chain(others) {
+            anyhow::ensure!(
+                !crate::listen::listen_conflict(*addr, *other_addr),
+                "the {other} address {other_addr} overlaps the {name} address {addr}: in dual-writer mode both bind at startup, but only one could listen once the frontend admits miners; give each its own port"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A Stratum address as the frontend serves it: listening from startup as
 /// in 3.0, or, in dual-writer mode (3.1), bound and listening only while the
 /// frontend admits miners.
@@ -855,6 +893,41 @@ mod tests {
     use axum::{body::Body, http::Request};
     use serde_json::json;
     use tower::ServiceExt;
+
+    /// The gated Stratum addresses are checked against each other and against
+    /// every other listener, the audit API's included, and only pairs with a
+    /// gated address are refused: two eager listeners refuse each other at
+    /// their own bind.
+    #[test]
+    fn listen_conflicts_are_refused_only_against_a_gated_address() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let gated = [
+            ("primary Stratum", addr("0.0.0.0:3340")),
+            ("high difficulty Stratum", addr("0.0.0.0:4334")),
+        ];
+        refuse_listen_conflicts(&gated, &[("audit API", addr("127.0.0.1:3341"))]).unwrap();
+        let error = refuse_listen_conflicts(&gated, &[("audit API", addr("127.0.0.1:4334"))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the audit API address 127.0.0.1:4334 overlaps the high difficulty Stratum address 0.0.0.0:4334"),
+            "{error}"
+        );
+        let both = [
+            gated[0],
+            ("high difficulty Stratum", addr("127.0.0.1:3340")),
+        ];
+        assert!(refuse_listen_conflicts(&both, &[]).is_err());
+        // Without a gated address, nothing is compared.
+        refuse_listen_conflicts(
+            &[],
+            &[
+                ("readiness endpoint", addr("0.0.0.0:3340")),
+                ("audit API", addr("0.0.0.0:3340")),
+            ],
+        )
+        .unwrap();
+    }
 
     fn state() -> ApiState {
         state_with(ApiConfig::default())

@@ -8,7 +8,10 @@
 //! marks the frontend down: on the pair, 400 simultaneous connects through
 //! HAProxy overflowed a 128 queue 175 times. Whatever is asked for, the
 //! kernel caps the backlog at `net.core.somaxconn`.
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+};
 use tokio::net::{lookup_host, TcpListener, TcpSocket, ToSocketAddrs};
 
 /// The HTTP listeners' backlog (the audit and operator API, and the public
@@ -65,6 +68,22 @@ fn bind_on(addr: SocketAddr) -> io::Result<TcpSocket> {
     Ok(socket)
 }
 
+/// Whether two bound addresses could never both listen: one port, on one
+/// address, or on an address the other's unspecified one covers. An IPv4-mapped
+/// IPv6 address is that IPv4 address, and IPv6's unspecified address covers
+/// IPv4 too (no socket here is IPv6-only). With `SO_REUSEADDR` both bind while
+/// neither listens, as [`ReservedAddress`]es do; the second `listen` fails.
+pub fn listen_conflict(a: SocketAddr, b: SocketAddr) -> bool {
+    if a.port() != b.port() {
+        return false;
+    }
+    match (a.ip().to_canonical(), b.ip().to_canonical()) {
+        (IpAddr::V4(x), IpAddr::V4(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+        (IpAddr::V6(x), IpAddr::V6(y)) => x == y || x.is_unspecified() || y.is_unspecified(),
+        (IpAddr::V6(v6), IpAddr::V4(_)) | (IpAddr::V4(_), IpAddr::V6(v6)) => v6.is_unspecified(),
+    }
+}
+
 /// A Stratum address bound but not listening (3.1 dual-writer mode). The
 /// bind holds the port from startup, so a restart that loses the bind race to
 /// a listening predecessor still fails before the coordinator starts, while
@@ -77,7 +96,8 @@ fn bind_on(addr: SocketAddr) -> io::Result<TcpSocket> {
 /// again at once while closed sessions linger in `TIME_WAIT`. Linux lets two
 /// such sockets bind one address while neither listens, so a predecessor that
 /// is itself reserved does not fail this bind; whichever listens second
-/// fails then.
+/// fails then. The frontend refuses its own addresses that would clash so at
+/// startup ([`listen_conflict`]).
 #[derive(Debug)]
 pub struct ReservedAddress {
     addr: SocketAddr,
@@ -196,9 +216,56 @@ mod tests {
         }
     }
 
-    /// The dual-writer gate's socket cycle: refused while reserved, accepted
-    /// while listening, refused again, on the same port, and a connection
-    /// left unaccepted in the queue is reset when the listener closes.
+    /// Two reservations of one address both bind, and only the first
+    /// listens: what `listen_conflict` names, which the kernel agrees with
+    /// for the pairs it can bind here.
+    #[tokio::test]
+    async fn reservations_that_cannot_both_listen_are_named_as_conflicting() {
+        let mut first = reserve_address(("127.0.0.1", 0)).await.unwrap();
+        let port = first.local_addr().port();
+        let mut same = reserve_address(("127.0.0.1", port)).await.unwrap();
+        let mut wildcard = reserve_address(("0.0.0.0", port)).await.unwrap();
+        let mut other = reserve_address(("127.0.0.2", port)).await.unwrap();
+        assert!(listen_conflict(first.local_addr(), same.local_addr()));
+        assert!(listen_conflict(first.local_addr(), wildcard.local_addr()));
+        assert!(!listen_conflict(first.local_addr(), other.local_addr()));
+        let _listening = first.listen(16).unwrap();
+        assert_eq!(
+            same.listen(16).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert_eq!(
+            wildcard.listen(16).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let _other = other.listen(16).unwrap();
+        // Ports apart never conflict; IPv6's unspecified address covers IPv4,
+        // a mapped IPv4 address is that address, and IPv4's unspecified one
+        // leaves IPv6 alone.
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        assert!(!listen_conflict(addr("127.0.0.1:1"), addr("127.0.0.1:2")));
+        assert!(listen_conflict(addr("[::]:1"), addr("127.0.0.1:1")));
+        assert!(listen_conflict(
+            addr("[::ffff:127.0.0.1]:1"),
+            addr("127.0.0.1:1")
+        ));
+        assert!(listen_conflict(
+            addr("[::ffff:127.0.0.1]:1"),
+            addr("0.0.0.0:1")
+        ));
+        assert!(listen_conflict(
+            addr("[::ffff:0.0.0.0]:1"),
+            addr("[::ffff:127.0.0.1]:1")
+        ));
+        assert!(!listen_conflict(
+            addr("[::ffff:127.0.0.1]:1"),
+            addr("[::1]:1")
+        ));
+        assert!(!listen_conflict(addr("0.0.0.0:1"), addr("[::1]:1")));
+        assert!(listen_conflict(addr("[::]:1"), addr("[::1]:1")));
+        assert!(!listen_conflict(addr("[::1]:1"), addr("[::2]:1")));
+    }
+
     #[tokio::test]
     async fn a_listening_predecessor_fails_the_reservation_as_it_fails_a_bind() {
         let predecessor = bind_listener(("127.0.0.1", 0), 16).await.unwrap();
@@ -208,6 +275,9 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
 
+    /// The dual-writer gate's socket cycle: refused while reserved, accepted
+    /// while listening, refused again, on the same port, and a connection
+    /// left unaccepted in the queue is reset when the listener closes.
     #[tokio::test]
     async fn a_reserved_address_refuses_until_it_listens_and_again_after() {
         let mut reserved = reserve_address(("127.0.0.1", 0)).await.unwrap();

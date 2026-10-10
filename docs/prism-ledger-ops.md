@@ -220,7 +220,7 @@ accounting after it, and the row records where the block is between them:
 | State | Meaning |
 | --- | --- |
 | `pending` | Durable and never offered. The only state a claim may offer from, and the only one that may still be abandoned: a block proven superseded before it was ever offered. |
-| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
+| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
 | `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
 | `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout after the connection was established, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
 | `orphaned` | Terminal (migration 015, #415). Reachable from the three offer states only. One coherent read-only observation proved a *different* block active at the candidate's height with at least `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted as `tip_height − height + 1`), after the row's audit landed: the lost tip race of the 2026-09-16 mainnet orphan stall (#413). `last_error` names the competitor, the height, the confirmations and the tip. Like the other terminal states, the row releases its document, block bytes and window reference, so terminal history does not pin candidate payloads or balance snapshots. It preserves its offer metadata and reason; the landed audit and pool-block row retain the accounting evidence. Never claimed again, never offered again, and no longer counted by `qbit_prism_block_candidates_pending` / `qbit_prism_block_candidate_oldest_pending_seconds`; `qbit_prism_block_candidates_orphaned_total` counts completions observed by this process after commit and may undercount if cancellation or restart intervenes. The block's `qbit_pool_blocks` row is marked `inactive` and keeps its landed audit, so a later reorg that reactivates the block is confirmed and credited (deferred share included) by the ordinary reorg reconciler, from that preserved evidence, without this row ever reopening. `orphaned` describes the completed outbox processing decision, not the block's permanent chain status. |
@@ -1666,7 +1666,13 @@ then.
   is always at a superseded revision: its shares are no longer credited, and a
   block on it is offered only through the #478 capture bound.
 - **The bump can fail** (for example while the cluster is halted). The change
-  then stays in force and the bump is retried every 2 s.
+  then stays in force and the bump is retried every 2 s. While the gate is
+  closed, or a change of it awaits its bump, an offer never takes a block on
+  carry-paying work for current work, whatever its revision: it goes through
+  the #478 capture bound, or is abandoned with capture off. The gate is checked
+  again right before the send: if it moved after the reservation of a block on
+  carry-paying work (closed, unfenced, or closed and reopened), nothing is sent,
+  and the reservation returns to `pending`, due again at once.
 - **Canonical balances elsewhere.** Landing, confirmation and the #478 records
   always measure against the canonical balances. The debt gauge
   (`qbit_prism_carry_forward_debt_sats`) is never fed from carry-free work.
@@ -1796,10 +1802,18 @@ claims and leases are per database, and each attempt re-verifies the chain.
 A zero-fee fanout needs a CPFP child funded from a wallet. Only one node
 sponsors it: the node whose work its block was found on. That node is read from
 the extranonce1 in the block's coinbase, since each node hands out its own half
-of the extranonce1 space; it does not matter which node landed the rows. Keep
-`PRISM_STRATUM_EXTRANONCE2_SIZE` the same on both nodes: extranonce1 is read at
-this node's width, and the pair's fingerprint does not compare it. (Adoption
-reads a peer record's own width, so it lands either way.) The other node only
+of the extranonce1 space; it does not matter which node landed the rows.
+Extranonce1 is read at this node's `PRISM_STRATUM_EXTRANONCE2_SIZE`, and only
+where the coinbase tag sits right before it. A block issued with another width
+therefore names no finder here, and since every coinbase this node builds names
+it, such a block is never taken for this node's own, even when this node adopted
+it: it is sponsored here only by takeover. A dual writer refuses to start with a
+`PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). Keep
+the width and the tag the same on both nodes; the pair's fingerprint compares
+neither. Change either only while both nodes are up and
+landing their blocks, as for adoption below, and give one-shot commands the
+frontends' values. (Adoption reads a peer record's own width, so it lands
+either way.) The other node only
 watches the fanout until it is overdue for a takeover (below),
 so the two nodes do not fund conflicting children, which would leave a wallet
 coin locked.
@@ -1811,9 +1825,12 @@ fanout is overdue and its finder silent:
   matured here, and the newest work (prepared record) of the finder's that this
   node holds was published, at least 30 minutes ago.
 - **Silent:** the finder's own database, read through every peer URL, shows
-  its newest work, aged by its own clock, to be at least 30 minutes old. Or
-  that database has failed three checks in a row, over a minute at least; then
-  the stale copy here decides. A blip or two only waits. One check runs at a
+  its newest work, aged by its own clock, to be at least 30 minutes old. A
+  database that answers with no work of its node at all (a frontend just
+  started, or its expired work pruned) is not silent until the checks have
+  found none for 30 minutes. Or that database has failed three checks in a row,
+  over a minute at least; then the stale copy here decides. A blip or two only
+  waits. One check runs at a
   time, and its verdict serves every fanout for 30 seconds.
 
 A frontend that is alive publishes work every few minutes (the reanchor and the
@@ -1957,7 +1974,12 @@ fail after printing if a check refuses, or without `--confirm`.
    journals `acquire`, recording the peer epoch it read. With the copy, a peer
    rebuilt from this node's database gets its release back. The copy is the
    peer's own row, which the sync copies anyway, so it stands even if the
-   acquire is then refused.
+   acquire is then refused. Right before the acquire, under the lock, it
+   checks that the scanned tip is still on the active chain: after a
+   reorganisation, the new branch could hold a carry-paying block of the peer's
+   that the scan never saw, so nothing is acquired and the command asks to be
+   run again. Blocks found on top of the scanned tip are above the release
+   depth, so carry-free.
 4. **Finish the change.** Set `PRISM_CARRY_OWNER=true` on the new owner and
    `false` on the old one, and restart both frontends. Until then both report
    `setting_pending` and build carry-free work; nothing is paid twice.
