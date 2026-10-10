@@ -4063,7 +4063,22 @@ impl Ledger {
         // and the server rolls the transaction back at once. A pooled
         // connection dropped with half a statement sent would be pinged on
         // its way back to the pool instead, with the transaction still open.
-        let mut connection = self.acquire().await?.detach();
+        let Some(acquired) = until_stopped(
+            stop,
+            tokio::time::timeout(options.write_timeout, self.acquire()),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        let mut connection = acquired
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "no database connection within the write timeout ({} ms)",
+                    options.write_timeout.as_millis()
+                )
+            })??
+            .detach();
         // The transaction's setup is bounded like the write, and a stop ends
         // it as it ends the write.
         let setup = async {
@@ -4150,7 +4165,7 @@ impl Ledger {
         // transaction is among them. Other waiters, such as a second
         // importer, just wait.
         loop {
-            let (granted, blocking): (bool, bool) = sqlx::query_as("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(WITH RECURSIVE chain(pid,depth) AS (SELECT blocker.pid,1 FROM pg_locks holder CROSS JOIN LATERAL unnest(pg_blocking_pids(holder.pid)) AS blocker(pid) WHERE holder.granted AND holder.locktype='advisory' AND holder.classid::bigint=$2 AND holder.objid::bigint=$3 AND holder.objsubid=1 UNION SELECT blocker.pid,chain.depth+1 FROM chain CROSS JOIN LATERAL unnest(pg_blocking_pids(chain.pid)) AS blocker(pid) WHERE chain.depth<8) SELECT 1 FROM chain WHERE chain.pid=pg_backend_pid()) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
+            let (granted, blocking): (bool, bool) = sqlx::query_as("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(WITH RECURSIVE chain(pid) AS (SELECT blocker.pid FROM pg_locks holder CROSS JOIN LATERAL unnest(pg_blocking_pids(holder.pid)) AS blocker(pid) WHERE holder.granted AND holder.locktype='advisory' AND holder.classid::bigint=$2 AND holder.objid::bigint=$3 AND holder.objsubid=1 UNION SELECT blocker.pid FROM chain CROSS JOIN LATERAL unnest(pg_blocking_pids(chain.pid)) AS blocker(pid)) SELECT 1 FROM chain WHERE chain.pid=pg_backend_pid()) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
                 .bind(SETTLEMENT_LOCK)
                 .bind(SETTLEMENT_LOCK >> 32)
                 .bind(SETTLEMENT_LOCK & 0xffff_ffff)
@@ -4439,8 +4454,10 @@ impl std::fmt::Display for ImportStopped {
 
 impl std::error::Error for ImportStopped {}
 
-/// How often the importer retries SETTLEMENT_LOCK while it is busy.
-const IMPORT_LOCK_RETRY: Duration = Duration::from_millis(10);
+/// How often the importer retries SETTLEMENT_LOCK while it is busy, as the
+/// session lock loop does (`connect.rs`): each miss also walks the lock
+/// holder's blockers, which reads the lock manager's state.
+const IMPORT_LOCK_RETRY: Duration = Duration::from_millis(25);
 /// The longest a legacy audit's UPDATE goes unpolled; see [`repolled`].
 const IMPORT_REPOLL: Duration = Duration::from_millis(100);
 /// How long a committed row's connection may take to close before the
