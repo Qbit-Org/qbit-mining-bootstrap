@@ -404,7 +404,7 @@
       "labels": {
         "reason": "WithdrawalReason"
       },
-      "status": "Counted once per transition from admitting (or grace) to withdrawn, by the reason at that moment; every reason starts at zero when admission is exposed. `own-log-behind` and `writer-not-local` withdraw at once, `not-ready` after the grace. A withdrawn dual-writer frontend closes its Stratum listeners, and on a withdrawal for a definite fault (the own log behind, or a database that answered that it is not this node's writable one) its accepted sessions too, each after the request in hand, so the Hashbalancer's layer-4 observation and readiness check move its miners to the other node."
+      "status": "Counted once per transition from admitting (or grace) to withdrawn, by the reason at that moment; every reason starts at zero when admission is exposed. `own-log-behind` and `writer-not-local` withdraw without waiting for the grace (`writer-not-local` for a database that stopped answering once its last answer is four seconds old), `not-ready` after the grace. A withdrawn dual-writer frontend closes its Stratum listeners, and on a withdrawal for a definite fault (the own log behind, or a database that answered that it is not this node's writable one) its accepted sessions too, each after the request in hand, which can still land, so the Hashbalancer's layer-4 observation and readiness check move its miners to the other node."
     },
     "stratum_listener_accepting": {
       "labels": {

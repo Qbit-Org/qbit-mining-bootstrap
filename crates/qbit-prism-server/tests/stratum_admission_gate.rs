@@ -407,7 +407,30 @@ async fn a_closed_session_answers_the_request_in_hand_first() {
         .await
         .expect("the authorize reached the backend");
     gate.withdraw(Withdrawal::WriterNotLocal, true);
-    refusing(gate.addr).await;
+    // The listener reads as closed only once it has told the closing
+    // sessions to stop, so from here the session is stopping with its
+    // request in hand.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gate.accepting_gauge() != "qbit_prism_stratum_listener_accepting{listener=\"default\"} 0"
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the listener never read as closed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Long enough for a drain without a bound to have aborted the session.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The closing session drains off the listener's loop: while its request
+    // is still held, a new decision reopens the listener at once.
+    gate.admit(true);
+    let reopening = Instant::now();
+    let fresh = connected(gate.addr).await;
+    assert!(
+        reopening.elapsed() < Duration::from_secs(1),
+        "the listener waited for the drain: {:?}",
+        reopening.elapsed()
+    );
     backend.release.add_permits(1);
     let mut line = String::new();
     timeout(Duration::from_secs(5), session.read_line(&mut line))
@@ -417,6 +440,7 @@ async fn a_closed_session_answers_the_request_in_hand_first() {
     let answer: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(answer["id"], 2, "{answer}");
     closed(&mut session, "a definite fault, after its answer").await;
+    drop(fresh);
     gate.stop().await;
 }
 

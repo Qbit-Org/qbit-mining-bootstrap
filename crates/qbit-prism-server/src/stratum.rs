@@ -2185,8 +2185,8 @@ pub async fn run_listener<B: MiningBackend>(
 /// already accepted carry on until they end or the balancer closes them,
 /// unless the withdrawal rests on a definite fault (the own log behind, or a
 /// database that answered that it is not this node's writable one): then
-/// they stop, each after the request in hand, so none of them writes another
-/// share there; what is left after a short drain is aborted.
+/// they stop, each after the request in hand, which can still land, and read
+/// no other; what is left after a short drain is aborted.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_gated_listener<B: MiningBackend>(
     mut address: crate::listen::ReservedAddress,
@@ -2205,14 +2205,18 @@ pub async fn run_gated_listener<B: MiningBackend>(
     // The sessions' stop signal, raised on shutdown and on a withdrawal that
     // closes them. A session reads it between requests, so it finishes the
     // one in hand before it closes.
-    let (stop_sessions, sessions_stop) = watch::channel(false);
-    let sessions = Sessions {
+    let (mut stop_sessions, sessions_stop) = watch::channel(false);
+    let mut sessions = Sessions {
         config: config.clone(),
         backend: backend.clone(),
         refresh: refresh.clone(),
         shutdown: sessions_stop,
         metrics: metrics.clone(),
     };
+    // Sessions closed by a definite fault, draining off this loop.
+    let mut drains = JoinSet::new();
+    // The listener has just stopped listening: say so, once.
+    let mut withdrawn = false;
     // The health publisher holds the sender for the life of the process; if
     // it is gone nothing can admit again, so the listener stays closed.
     let mut decisions = true;
@@ -2226,18 +2230,34 @@ pub async fn run_gated_listener<B: MiningBackend>(
             // A definite fault closes the sessions already accepted too,
             // whether it withdrew an admitting frontend or found one that a
             // not-ready withdrawal had left them on.
+            // They drain in a task of their own, so this loop keeps serving
+            // decisions and shutdown meanwhile; sessions accepted later get a
+            // fresh set and a fresh stop signal.
             if let Some(reason) = decision.closes_sessions() {
                 if !connections.is_empty() {
                     tracing::warn!(listener = %config.listener_name, reason = reason.as_str(), sessions = connections.len(), "Stratum sessions closing: the frontend withdrew for a fault that forbids its shares, so each session stops after the request in hand");
                     stop_sessions.send_replace(true);
-                    drain_sessions_within(std::mem::take(&mut connections), SESSION_CLOSE_DRAIN)
-                        .await;
-                    stop_sessions.send_replace(false);
+                    let (fresh, receiver) = watch::channel(false);
+                    let closing = std::mem::replace(&mut stop_sessions, fresh);
+                    sessions.shutdown = receiver;
+                    let draining = std::mem::take(&mut connections);
+                    drains.spawn(async move {
+                        drain_sessions_within(draining, SESSION_CLOSE_DRAIN).await;
+                        drop(closing);
+                    });
                 }
+            }
+            // Only now, with any closing sessions already told to stop, does
+            // the listener read as closed.
+            if withdrawn {
+                withdrawn = false;
+                metrics.publish_stratum_listener_accepting(&config.listener_name, false);
+                tracing::warn!(listener = %config.listener_name, address = %address.local_addr(), "Stratum listener refusing connections: the frontend withdrew");
             }
             tokio::select! {
                 changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
                 _ = connections.join_next(), if !connections.is_empty() => {}
+                _ = drains.join_next(), if !drains.is_empty() => {}
                 changed = admission.changed(), if decisions => decisions = changed.is_ok(),
             }
             continue;
@@ -2259,6 +2279,7 @@ pub async fn run_gated_listener<B: MiningBackend>(
             tokio::select! {
                 changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break 'gate; } }
                 _ = connections.join_next(), if !connections.is_empty() => {}
+                _ = drains.join_next(), if !drains.is_empty() => {}
                 changed = admission.changed(), if decisions => {
                     decisions = changed.is_ok();
                     if !decisions || !admission.borrow_and_update().admits_at(tokio::time::Instant::now(), stale_after) {
@@ -2281,12 +2302,13 @@ pub async fn run_gated_listener<B: MiningBackend>(
                 address.local_addr()
             )
         })?;
-        metrics.publish_stratum_listener_accepting(&config.listener_name, false);
-        tracing::warn!(listener = %config.listener_name, address = %address.local_addr(), "Stratum listener refusing connections: the frontend withdrew");
+        withdrawn = true;
     }
     metrics.publish_stratum_listener_accepting(&config.listener_name, false);
+    // Shutdown drains every session, those already closing included.
     stop_sessions.send_replace(true);
     drain_sessions(connections).await;
+    while drains.join_next().await.is_some() {}
     Ok(())
 }
 

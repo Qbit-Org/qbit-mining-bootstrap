@@ -103,8 +103,11 @@ the decision:
 | `grace` | yes | readiness false, less than `PRISM_READINESS_GRACE_SECONDS` after the last publication that found it ready |
 | `withdrawn` | no | admitted once, then withdrawn; `reason` says what blocks it now |
 
-Withdrawal reasons: `own-log-behind` and `writer-not-local` at once, whatever
-the grace; `not-ready` once readiness has stayed false for the whole grace,
+Withdrawal reasons: `own-log-behind` and `writer-not-local` without waiting
+for the grace (`writer-not-local` at once for a database that answered that
+it is not this node's, and for one that stopped answering once its last
+answer is 4 s old); `not-ready` once readiness has stayed false for the whole
+grace,
 which runs from the last publication that found the frontend ready (default
 10 s, 0 to 120, the operator readiness contract's ten seconds in
 [the HA reference](prism-ha-reference-architecture.md#operator-tcp-load-balancer-readiness-contract)).
@@ -135,11 +138,12 @@ only while it admits miners:
   answered that it is not this node's writable primary (`remote`,
   `unidentified`, `read_only`), closes them too, also when it comes after a
   `not-ready` one: each session stops after the request in hand, and what is
-  left after 3 s is aborted, so no share is written to a database that is not
-  this node's, or before its own log is caught up;
-- a database that only stopped answering withdraws the node at once
-  (`writer-not-local`) but leaves its sessions to the balancer, since it may
-  be a stall that a checkpoint or an fsync ends.
+  left after 3 s is aborted. No session reads another request, so at most the
+  one each session was handling, such as a share being written, can still
+  land in that database;
+- a database that only stopped answering withdraws the node once its last
+  answer is 4 s old (`writer-not-local`) but leaves its sessions to the
+  balancer, since it may be a stall that a checkpoint or an fsync ends.
 
 A single writer's listeners are 3.0's: listening from startup, whatever
 readiness says. Linux lets a second socket bind an address that a reserved one

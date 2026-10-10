@@ -125,7 +125,8 @@ pub struct DualWriterReport {
     pub identity: NodeIdentity,
     pub own_log_caught_up: bool,
     pub writer_path: Option<WriterPath>,
-    /// The fault that withdraws the node at once, if any.
+    /// The fault that withdraws the node without waiting for the grace, if
+    /// any.
     pub withdrawal: Option<Withdrawal>,
     /// The `dual_writer` object of `/healthz`.
     pub value: Value,
