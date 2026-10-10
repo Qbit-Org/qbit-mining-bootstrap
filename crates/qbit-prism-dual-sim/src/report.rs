@@ -25,8 +25,9 @@ pub struct GapReport {
     pub last_accept_before_ms: Option<u64>,
     /// The first accepted answer after the fault.
     pub first_accept_after_ms: Option<u64>,
-    /// `first_accept_after - last_accept_before`: the longest stretch with
-    /// no share accepted anywhere, across the fault.
+    /// `first_accept_after - last_accept_before`: the stretch with no share
+    /// accepted anywhere that spans the fault. A later stall is not in it:
+    /// [`longest_gap`] measures a whole window.
     pub gap_ms: Option<u64>,
     /// `first_accept_after - fault`.
     pub fault_to_first_accept_ms: Option<u64>,
@@ -102,10 +103,121 @@ pub fn gap(records: &[ShareRecord], fault_at_ms: u64) -> GapReport {
     }
 }
 
+/// The longest stretch from `from_ms` to `to_ms` with no share accepted
+/// anywhere (load sessions only, block finders excluded): between the
+/// window's start, every accepted answer in it, and its end. The whole
+/// window when nothing was accepted in it. `to_ms` must be a moment the load
+/// was still running, or the stretch to it counts as a stall.
+pub fn longest_gap(records: &[ShareRecord], from_ms: u64, to_ms: u64) -> u64 {
+    let mut moments: Vec<u64> = records
+        .iter()
+        .filter(|record| record.accepted() && !record.scheduled_block)
+        .filter_map(|record| record.answered_ms)
+        .filter(|at| (from_ms..=to_ms).contains(at))
+        .collect();
+    moments.push(from_ms);
+    moments.push(to_ms.max(from_ms));
+    moments.sort_unstable();
+    moments
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap_or(0)
+}
+
+/// How the miners of a dead node moved to the survivor: every session with
+/// a share accepted at or before the fault, and when it first had a share
+/// accepted on the survivor's work after the fault, up to `until_ms` (the
+/// heal, or now if earlier). A session with none by then is stranded: a
+/// failover is every miner's, not the first one's.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct FailoverReport {
+    pub fault_at_ms: u64,
+    pub survivor: Option<Node>,
+    pub until_ms: u64,
+    pub sessions: usize,
+    /// The sessions with no share accepted on the survivor's work by
+    /// `until_ms`.
+    pub stranded: Vec<usize>,
+    /// From the fault to each moved session's first share accepted on the
+    /// survivor's work.
+    pub p50_ms: Option<u64>,
+    pub p95_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+}
+
+impl FailoverReport {
+    /// Every session moved, the slowest within `bound_ms`.
+    pub fn within(&self, bound_ms: u64) -> bool {
+        self.sessions > 0
+            && self.stranded.is_empty()
+            && self.max_ms.is_some_and(|ms| ms <= bound_ms)
+    }
+}
+
+pub fn failover(
+    records: &[ShareRecord],
+    fault_at_ms: u64,
+    survivor: Node,
+    until_ms: u64,
+) -> FailoverReport {
+    let mut by_session: BTreeMap<usize, (bool, Option<u64>)> = BTreeMap::new();
+    for record in records
+        .iter()
+        .filter(|record| record.accepted() && !record.scheduled_block)
+    {
+        let Some(at) = record.answered_ms else {
+            continue;
+        };
+        let entry = by_session.entry(record.session).or_insert((false, None));
+        if at <= fault_at_ms {
+            entry.0 = true;
+        } else if at <= until_ms
+            && record.issuer == Some(survivor)
+            && entry.1.is_none_or(|first| at < first)
+        {
+            entry.1 = Some(at);
+        }
+    }
+    let mut waits = Vec::new();
+    let mut stranded = Vec::new();
+    let mut sessions = 0;
+    for (session, (before, moved)) in &by_session {
+        if !before {
+            continue;
+        }
+        sessions += 1;
+        match moved {
+            Some(at) => waits.push(at - fault_at_ms),
+            None => stranded.push(*session),
+        }
+    }
+    waits.sort_unstable();
+    let percentile = |p: f64| -> Option<u64> {
+        if waits.is_empty() {
+            return None;
+        }
+        let rank = ((p * waits.len() as f64).ceil() as usize).clamp(1, waits.len());
+        Some(waits[rank - 1])
+    };
+    FailoverReport {
+        fault_at_ms,
+        survivor: Some(survivor),
+        until_ms,
+        sessions,
+        stranded,
+        p50_ms: percentile(0.50),
+        p95_ms: percentile(0.95),
+        max_ms: waits.last().copied(),
+    }
+}
+
 /// Every submit, by outcome and reason, and by the node that issued the
 /// job.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ShareSummary {
+    /// Shares submitted (an outage's offers with no session to take them are
+    /// `unplaced`, not here).
     pub offered: usize,
     pub accepted: usize,
     pub accepted_by_issuer: BTreeMap<String, usize>,
@@ -115,6 +227,9 @@ pub struct ShareSummary {
     pub lost: usize,
     /// Acknowledged shares missing and excused as a documented tail.
     pub excused_tail: usize,
+    /// Offers the load made while no session could take one (every session
+    /// down or busy, as during a failover): never submitted.
+    pub unplaced: u64,
 }
 
 pub fn summarize(records: &[ShareRecord]) -> ShareSummary {
@@ -224,8 +339,9 @@ impl ScenarioReport {
         let shares = &self.shares;
         let _ = writeln!(
             out,
-            "Offered {}, accepted {} (by issuing node: {:?}), rejected {:?}, no answer {:?}. Lost (acknowledged, missing, not excused): **{}**. Excused documented tail: {}.\n",
+            "Offered {} (and {} offers no session could take), accepted {} (by issuing node: {:?}), rejected {:?}, no answer {:?}. Lost (acknowledged, missing, not excused): **{}**. Excused documented tail: {}.\n",
             shares.offered,
+            shares.unplaced,
             shares.accepted,
             shares.accepted_by_issuer,
             shares.rejected,
@@ -319,6 +435,58 @@ mod tests {
             answered_ms: Some(answered),
             scheduled_block: false,
         }
+    }
+
+    fn on(session: usize, answered: u64, issuer: Node) -> ShareRecord {
+        ShareRecord {
+            issuer: Some(issuer),
+            ..record(session, answered, "accepted")
+        }
+    }
+
+    #[test]
+    fn the_longest_gap_finds_a_stall_after_the_first_accept_past_the_fault() {
+        // The fault at 1 000: a share at 1 040 (the gap across the fault is
+        // short), then nothing until 6 000, then steady again.
+        let mut records = vec![record(0, 900, "accepted"), record(1, 1_040, "accepted")];
+        records.extend((0..20u64).map(|i| record((i % 3) as usize, 6_000 + i * 100, "accepted")));
+        records.push(record(2, 3_000, "rejected"));
+        assert_eq!(gap(&records, 1_000).gap_ms, Some(140));
+        assert_eq!(longest_gap(&records, 0, 8_000), 4_960);
+        // Edges count: nothing accepted between the window's start and the
+        // first answer, or between the last answer and the window's end.
+        assert_eq!(longest_gap(&records, 0, 900), 900);
+        assert_eq!(longest_gap(&records, 7_900, 9_000), 1_100);
+        assert_eq!(longest_gap(&[], 100, 600), 500);
+    }
+
+    #[test]
+    fn a_failover_is_every_session_on_the_survivors_work() {
+        let records = vec![
+            on(0, 900, Node::A),
+            on(1, 950, Node::A),
+            on(2, 980, Node::A),
+            // Session 0 answered by A just after the fault was stamped: not
+            // a move to the survivor.
+            on(0, 1_010, Node::A),
+            on(0, 5_000, Node::B),
+            on(1, 6_000, Node::B),
+            // Session 2 reaches B only after the heal at 9 000.
+            on(2, 9_500, Node::B),
+            // Session 3 mined only after the fault: not one of A's miners.
+            on(3, 4_000, Node::B),
+        ];
+        let report = failover(&records, 1_000, Node::B, 9_000);
+        assert_eq!(report.sessions, 3);
+        assert_eq!(report.stranded, vec![2]);
+        assert_eq!(report.max_ms, Some(5_000));
+        assert!(!report.within(30_000));
+        let all = failover(&records, 1_000, Node::B, 10_000);
+        assert!(all.stranded.is_empty());
+        assert_eq!(all.max_ms, Some(8_500));
+        assert!(all.within(8_500));
+        assert!(!all.within(8_499));
+        assert!(!failover(&[], 1_000, Node::B, 9_000).within(30_000));
     }
 
     #[test]

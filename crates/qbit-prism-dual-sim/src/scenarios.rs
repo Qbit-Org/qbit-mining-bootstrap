@@ -346,6 +346,10 @@ struct Body {
     /// Checks this scenario expects to fail (the control); every other
     /// check must pass.
     expected_failures: Vec<&'static str>,
+    /// Why each expected failure must fail: for a check, words that one of
+    /// its listed problems must all contain. A check that fails for another
+    /// reason, or through one database only, does not count.
+    expected_causes: Vec<(&'static str, Vec<String>)>,
 }
 
 impl Body {
@@ -374,6 +378,20 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
             return Err(error.context(format!("{} could not start", scenario.id())));
         }
     };
+    // Until the run writes its verdict, its report says it did not finish
+    // (the start cleared the directory): a panic, a timeout or a stopped
+    // runner leaves this one, and the matrix summary shows the scenario
+    // failed instead of leaving it out.
+    failed_report(
+        scenario,
+        started,
+        parameters.clone(),
+        &anyhow::anyhow!(
+            "the scenario did not finish: it panicked, or was stopped, before writing its verdict"
+        ),
+        Some(&sim),
+    )
+    .write(&sim.report_dir)?;
     // The driver owns what the body measures, so a scenario that fails
     // part-way still reports every expectation, gap and block it recorded.
     let mut body = Body::default();
@@ -418,6 +436,7 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
     }) {
         Ok((records, invariants)) => {
             let mut shares = report::summarize(&records);
+            shares.unplaced = sim.load.as_ref().map_or(0, |load| load.unplaced_offers());
             if let Some(check) = invariants.get("inv4-acked-shares-present") {
                 if check.status == Status::Fail && body.expected_failures.is_empty() {
                     shares.lost = check.problem_count;
@@ -488,7 +507,10 @@ fn failed_report(
         gaps: Vec::new(),
         shares: sim
             .and_then(|sim| sim.load.as_ref())
-            .map(|load| report::summarize(&load.records()))
+            .map(|load| report::ShareSummary {
+                unplaced: load.unplaced_offers(),
+                ..report::summarize(&load.records())
+            })
             .unwrap_or_default(),
         blocks: Vec::new(),
         expectations: Vec::new(),
@@ -504,13 +526,25 @@ fn failed_report(
 fn judge_invariants(body: &mut Body, report: &InvariantReport) {
     for check in &report.checks {
         let expected_fail = body.expected_failures.contains(&check.id.as_str());
+        let unmet: Vec<&Vec<String>> = body
+            .expected_causes
+            .iter()
+            .filter(|(id, _)| *id == check.id)
+            .map(|(_, words)| words)
+            .filter(|words| {
+                !check
+                    .problems
+                    .iter()
+                    .any(|problem| words.iter().all(|word| problem.contains(word.as_str())))
+            })
+            .collect();
         let passed = match check.status {
             Status::Pass | Status::Skip => !expected_fail,
-            Status::Fail => expected_fail,
+            Status::Fail => expected_fail && unmet.is_empty(),
         };
         let detail = if expected_fail {
             format!(
-                "expected to fail: {:?} with {} problems; {}",
+                "expected to fail: {:?} with {} problems, causes not named: {unmet:?}; {}",
                 check.status, check.problem_count, check.summary
             )
         } else {
@@ -721,10 +755,78 @@ async fn checker_control(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.mark(&format!(
         "B's block left {b_deltas} accounts with a carry delta"
     ));
-    // The failures must be the right ones: each block missing on the other
-    // node. The driver adds the per-check verdicts after the checker runs.
+    // The failures must be the right ones, through each database: each
+    // block, its fanouts, shares and windows missing on the other node. The
+    // driver adds the per-check verdicts after the checker runs.
+    let causes = [
+        (
+            "inv3-landing-rows",
+            vec![format!("pool block {a} has no landing rows on node B")],
+        ),
+        (
+            "inv3-landing-rows",
+            vec![format!("pool block {b} has no landing rows on node A")],
+        ),
+        (
+            "inv3-fanouts-identical",
+            vec![format!(" of {a} is on node A only")],
+        ),
+        (
+            "inv3-fanouts-identical",
+            vec![format!(" of {b} is on node B only")],
+        ),
+        (
+            "inv4-acked-shares-present",
+            vec![
+                "(issued by Some(A),".to_owned(),
+                "is missing on [B]".to_owned(),
+            ],
+        ),
+        (
+            "inv4-acked-shares-present",
+            vec![
+                "(issued by Some(B),".to_owned(),
+                "is missing on [A]".to_owned(),
+            ],
+        ),
+        (
+            "inv4-windows-reproducible",
+            vec!["built on node A recomputes on node B".to_owned()],
+        ),
+        (
+            "inv4-windows-reproducible",
+            vec!["built on node B recomputes on node A".to_owned()],
+        ),
+    ];
+    body.expected_causes.extend(causes);
     body.options.excused_missing.clear();
     sim.mark(&format!("control blocks: A {a}, B {b}"));
+
+    // D-2's own control. Nothing is copied here, so the checker skips it;
+    // on A's database in both slots every local row is "on both nodes", and
+    // the check must say so.
+    let a_pool = sim.pool(Node::A).await?;
+    let both: std::collections::BTreeMap<Node, sqlx::PgPool> = Node::BOTH
+        .iter()
+        .map(|node| (*node, a_pool.clone()))
+        .collect();
+    let d2 = invariants::local_state_check(&both, chrono::Utc::now() - chrono::Duration::hours(1))
+        .await?;
+    a_pool.close().await;
+    let named = d2
+        .problems
+        .iter()
+        .any(|problem| problem.contains("is the same row in both outboxes"));
+    body.expect(
+        "the D-2 check fails on a copied outbox (A's database in both slots)",
+        matches!(d2.status, Status::Fail) && named,
+        format!(
+            "{:?} with {} problems: {:?}",
+            d2.status,
+            d2.problem_count,
+            d2.problems.iter().take(3).collect::<Vec<_>>()
+        ),
+    );
     Ok(())
 }
 
@@ -953,6 +1055,35 @@ async fn s01_steady_state(sim: &mut Sim, body: &mut Body) -> Result<()> {
     Ok(())
 }
 
+/// A failover moves every miner, not the first: each session that mined
+/// before the fault has a share accepted on the survivor's work within
+/// [`FAILOVER_GAP_BOUND_MS`] of it, read up to `until_ms` (before the heal,
+/// so a session stranded until failback counts as stranded).
+fn expect_every_miner_moved(
+    body: &mut Body,
+    records: &[ShareRecord],
+    fault_at: u64,
+    survivor: Node,
+    until_ms: u64,
+) {
+    let moved = report::failover(records, fault_at, survivor, until_ms);
+    body.expect(
+        &format!("every miner moved to {survivor:?} within the failover bound"),
+        moved.within(FAILOVER_GAP_BOUND_MS),
+        format!(
+            "{} of {} sessions mining before the fault had a share accepted on {survivor:?}'s work \
+             by {until_ms} ms (stranded: {:?}); from the fault, p50 {:?} ms, p95 {:?} ms, max \
+             {:?} ms (bound {FAILOVER_GAP_BOUND_MS} ms)",
+            moved.sessions - moved.stranded.len(),
+            moved.sessions,
+            moved.stranded,
+            moved.p50_ms,
+            moved.p95_ms,
+            moved.max_ms
+        ),
+    );
+}
+
 /// D-5 and D-10, for the peer blocks one sampler watched arrive on `on`: none
 /// was there before its window's shares or with part of its landing missing
 /// (bundle, snapshot, payout, carry or fanout rows), and at
@@ -1131,18 +1262,39 @@ async fn s02_a_dies(sim: &mut Sim, death: Death, body: &mut Body) -> Result<()> 
         "A's unsynced tail when it died: {} shares",
         tail.count
     ));
-    body.expect(
-        "miners moved to B",
-        accepted_from(&records, Node::B, fault_at) > 0,
-        format!(
-            "{} shares accepted on B's jobs after the fault",
-            accepted_from(&records, Node::B, fault_at)
-        ),
-    );
+    expect_every_miner_moved(body, &records, fault_at, Node::B, sim.clock.now_ms());
 
     if let Some(sampler) = readiness {
         let trace = sampler.finish().await?;
         expect_self_withdrawal(sim, body, fault_at, &trace);
+    }
+    if death != Death::PostgresKill {
+        // The premise: A was cut off from B's log while it was down. Its
+        // database, which the harness reaches directly and B's blocks only
+        // through A's puller, holds none of the blocks B found meanwhile.
+        let pool = sim.pool(Node::A).await?;
+        let mut on_a = Vec::new();
+        for hash in &b_blocks {
+            let held: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM qbit_pool_blocks WHERE block_hash = $1)",
+            )
+            .bind(hash)
+            .fetch_one(&pool)
+            .await?;
+            if held {
+                on_a.push(hash.clone());
+            }
+        }
+        pool.close().await;
+        body.expect(
+            "A held none of B's blocks while it was down",
+            !b_blocks.is_empty() && on_a.is_empty(),
+            format!(
+                "{} of the {} blocks B found while A was down were on A before the heal: {on_a:?}",
+                on_a.len(),
+                b_blocks.len()
+            ),
+        );
     }
     sim.heal(fault).await?;
     if !sim.frontend(Node::A).running() {
@@ -1180,11 +1332,20 @@ async fn s02_a_dies(sim: &mut Sim, death: Death, body: &mut Body) -> Result<()> 
         ),
     );
     body.gaps.push(gap);
+    let pool = sim.pool(Node::B).await?;
+    let tail_on_b: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM qbit_share_ledger WHERE accepted AND share_id = ANY($1)",
+    )
+    .bind(&tail.share_ids)
+    .fetch_one(&pool)
+    .await?;
+    pool.close().await;
     body.expect(
-        "A's tail is measured, and returns with A",
-        true,
+        "A's tail, measured when it went, returns with A",
+        usize::try_from(tail_on_b).is_ok_and(|on_b| on_b == tail.count),
         format!(
-            "{} shares acknowledged by A were not on B when A went (answered {:?}..{:?} ms); A's disk survived, so none may be missing at the end",
+            "{} shares acknowledged by A were not on B when A went (answered {:?}..{:?} ms); \
+             {tail_on_b} of them are on B now. A's disk survived, so every one must come back",
             tail.count, tail.first_answered_ms, tail.last_answered_ms
         ),
     );
@@ -1689,27 +1850,35 @@ const PULL_SAMPLE_EVERY: Duration = Duration::from_millis(10);
 /// idle-in-transaction timeout, so a snapshot held until then is measured.
 pub const LINGER_WATCH: Duration = Duration::from_secs(70);
 
-/// The p95 answer latency, in milliseconds, of the shares accepted on
-/// `node`'s jobs and answered within `from_ms..to_ms`, and how many there were.
+/// The p95 answer latency, in milliseconds, of the shares sent on `node`'s
+/// jobs within `from_ms..to_ms`, and how many there were. Every answer
+/// counts, a refusal as much as an acceptance, and a share never answered
+/// counts as slower than any answer: a p95 that lands on one is `None`, so
+/// shares B stops answering cannot leave a flat p95 of the ones it did.
 fn answer_p95(
     records: &[ShareRecord],
     node: Node,
     from_ms: u64,
     to_ms: u64,
 ) -> (Option<u64>, usize) {
-    let mut latencies: Vec<u64> = records
+    let mut latencies: Vec<Option<u64>> = records
         .iter()
-        .filter(|r| r.accepted() && !r.scheduled_block && r.issuer == Some(node))
-        .filter_map(|r| {
-            let answered = r.answered_ms?;
-            (from_ms..to_ms)
-                .contains(&answered)
-                .then(|| answered.saturating_sub(r.sent_ms))
+        .filter(|r| {
+            !r.scheduled_block && r.issuer == Some(node) && (from_ms..to_ms).contains(&r.sent_ms)
+        })
+        .map(|r| {
+            if r.outcome == "no-response" {
+                return None;
+            }
+            r.answered_ms
+                .map(|answered| answered.saturating_sub(r.sent_ms))
         })
         .collect();
-    latencies.sort_unstable();
+    latencies.sort_unstable_by_key(|latency| latency.unwrap_or(u64::MAX));
     let count = latencies.len();
-    let p95 = (count > 0).then(|| latencies[((count * 95).div_ceil(100)).clamp(1, count) - 1]);
+    let p95 = (count > 0)
+        .then(|| latencies[((count * 95).div_ceil(100)).clamp(1, count) - 1])
+        .flatten();
     (p95, count)
 }
 
@@ -1900,13 +2069,19 @@ async fn s03_b_dies(sim: &mut Sim, body: &mut Body) -> Result<()> {
     steady(sim, 8).await;
     let a2 = find_block(sim, body, Node::A, "A while B is down", Some(&[Node::A])).await?;
     steady(sim, 2).await;
+    let measured_until = sim.clock.now_ms();
     let records = sim.load()?.records();
     let gap = report::gap(&records, fault_at);
+    // The whole stretch with B down, A's block included, not just the
+    // moment of the death: a stall that starts later is a gap too.
+    let longest = report::longest_gap(&records, fault_at.saturating_sub(1_000), measured_until);
     body.expect(
         "A's miners see no gap",
-        gap.gap_ms.is_some_and(|ms| ms <= NO_IMPACT_GAP_MS),
+        longest <= NO_IMPACT_GAP_MS,
         format!(
-            "gap {:?} ms across B's death (bound {NO_IMPACT_GAP_MS} ms)",
+            "longest stretch without an accepted share from 1 s before B's death to \
+             {measured_until} ms: {longest} ms (bound {NO_IMPACT_GAP_MS} ms); across the death \
+             itself {:?} ms",
             gap.gap_ms
         ),
     );
@@ -2016,14 +2191,26 @@ async fn s04_link_cut(sim: &mut Sim, body: &mut Body) -> Result<()> {
         ),
     );
     steady(sim, 2).await;
+    // The load runs until the settle pauses it.
+    let load_until = sim.clock.now_ms();
     sim.settle(SETTLE_BOUND).await?;
     let records = sim.load()?.records();
-    for (at, what) in [(fault_at, "the cut"), (healed_at, "the heal")] {
+    // Each whole stretch, not just its first moment: the cut until the heal,
+    // and the heal through the catch-up until the load stops.
+    for (at, until, what) in [
+        (fault_at, healed_at, "through the cut"),
+        (healed_at, load_until, "through the heal and the catch-up"),
+    ] {
         let gap = report::gap(&records, at);
+        let longest = report::longest_gap(&records, at.saturating_sub(1_000), until);
         body.expect(
-            &format!("no mining impact at {what}"),
-            gap.gap_ms.is_some_and(|ms| ms <= NO_IMPACT_GAP_MS),
-            format!("gap {:?} ms (bound {NO_IMPACT_GAP_MS} ms)", gap.gap_ms),
+            &format!("no mining impact {what}"),
+            longest <= NO_IMPACT_GAP_MS,
+            format!(
+                "longest stretch without an accepted share from 1 s before {at} ms to {until} ms: \
+                 {longest} ms (bound {NO_IMPACT_GAP_MS} ms); across {at} ms itself {:?} ms",
+                gap.gap_ms
+            ),
         );
         body.gaps.push(gap);
     }
@@ -2141,14 +2328,15 @@ async fn s04_transient_apply(sim: &mut Sim, body: &mut Body) -> Result<()> {
     body.expect(
         "B's block, which A failed to apply while locked, lands on A once the lock clears",
         own == 0
-            && !attempts.is_empty()
+            && attempts.len() >= 2
             && !held_while_locked
             && landed.is_ok()
             && conflicts.is_empty(),
         format!(
-            "{} inserts of A's frontend waited on the lock during the {} s hold (at least one \
-             must, or the retry was never exercised; A's own candidates, which would insert \
-             there too: {own}, and there must be none): {attempts:?}; on A while locked: \
+            "{} inserts of A's frontend waited on the lock during the {} s hold (at least two \
+             must: the first fails at lock_timeout and only a second shows the retry; A's own \
+             candidates, which would insert there too: {own}, and there must be none): \
+             {attempts:?}; on A while locked: \
              {held_while_locked} (the lock must keep it out); confirmed on A after the release: \
              {}; sync conflicts recorded for it: {conflicts:?}",
             attempts.len(),
@@ -2292,6 +2480,34 @@ async fn s06_restore(sim: &mut Sim, x: Node, body: &mut Body) -> Result<()> {
     sim.mark(&format!(
         "node {x:?} restored from the old backup onto timeline {timeline}"
     ));
+    // The premise, read before x's frontend can recover anything: the
+    // restore took x back before the block it found after the backup, and
+    // before own rows the peer holds.
+    let (restored_shares, restored_blocks) = origin_rows(sim, x, x).await?;
+    let (own_on_y, own_blocks_on_y) = origin_rows(sim, y, x).await?;
+    let lacking = own_on_y
+        .iter()
+        .filter(|id| !restored_shares.contains(id))
+        .count();
+    let lacking_blocks = own_blocks_on_y
+        .iter()
+        .filter(|hash| !restored_blocks.contains(hash))
+        .count();
+    body.expect(
+        "the restore took the node back before its later own rows",
+        !restored_blocks.contains(&after) && lacking > 0,
+        format!(
+            "restored, node {x:?} lacks {lacking} of the {} own shares and {lacking_blocks} of the \
+             {} own blocks the peer holds; the block it found after the backup ({after}) is {}",
+            own_on_y.len(),
+            own_blocks_on_y.len(),
+            if restored_blocks.contains(&after) {
+                "still there"
+            } else {
+                "gone"
+            }
+        ),
+    );
     sim.frontend_mut(x).start()?;
     let held_from = Instant::now();
     let mut served = Vec::new();
@@ -2326,16 +2542,42 @@ async fn s06_restore(sim: &mut Sim, x: Node, body: &mut Body) -> Result<()> {
         .iter()
         .filter(|hash| !own_blocks_on_x.contains(hash))
         .collect();
+    // Own-log recovery brings back the unexpired prepared records and the
+    // journal rows too (D-17), not only shares and landings.
+    let (pool_x, pool_y) = (sim.pool(x).await?, sim.pool(y).await?);
+    let prepared_on_x = invariants::prepared_records(&pool_x, x, false).await?;
+    let prepared_on_y = invariants::prepared_records(&pool_y, x, true).await?;
+    let journal_on_x = invariants::journal_rows(&pool_x, x).await?;
+    let journal_on_y = invariants::journal_rows(&pool_y, x).await?;
+    pool_x.close().await;
+    pool_y.close().await;
+    let missing_prepared: Vec<&String> = prepared_on_y
+        .keys()
+        .filter(|job| !prepared_on_x.contains_key(*job))
+        .collect();
+    let missing_journal: Vec<&i64> = journal_on_y
+        .keys()
+        .filter(|epoch| !journal_on_x.contains_key(*epoch))
+        .collect();
     body.expect(
         "the restored node held every own row of the peer's before it was ready",
-        missing.is_empty() && missing_blocks.is_empty(),
+        missing.is_empty()
+            && missing_blocks.is_empty()
+            && missing_prepared.is_empty()
+            && missing_journal.is_empty(),
         format!(
-            "ready {:.1} s after the heal; {} own shares and {} own blocks on the peer, {} and {} of them missing on node {x:?}",
+            "ready {:.1} s after the heal; on the peer: {} own shares, {} own blocks, {} unexpired \
+             own prepared records and {} own journal rows, of which missing on node {x:?}: {}, \
+             {}, {:?} and {:?}",
             started.elapsed().as_secs_f64(),
             own_on_y.len(),
             own_blocks_on_y.len(),
+            prepared_on_y.len(),
+            journal_on_y.len(),
             missing.len(),
-            missing_blocks.len()
+            missing_blocks.len(),
+            missing_prepared,
+            missing_journal
         ),
     );
     sim.load()?.resume();
@@ -2585,24 +2827,43 @@ async fn s07_disk_replaced(sim: &mut Sim, x: Node, body: &mut Body) -> Result<()
             repersonalise.stderr.trim()
         ),
     );
+    expect_repersonalised(sim, body, x).await?;
     sim.frontend_mut(x).start()?;
     sim.frontend(x).wait_ready(RECOVERY_BOUND).await?;
     sim.mark(&format!("node {x:?} rebuilt from its peer and serving"));
 
     let records = sim.load()?.records();
     let tail = crate::measure::tail(&records, x, fault_at, &held);
+    // Only what x acknowledged within the steady-state sync lag of its death
+    // can be its unsynced tail. An older share should have reached y: it is
+    // not excused, so it fails invariant 4 as lost, and this fails too.
+    let stale = crate::measure::answered_before(
+        &records,
+        &tail,
+        fault_at.saturating_sub(SYNC_LAG_BOUND_MS),
+    );
     body.expect(
         "only the dead node's unsynced tail is lost (measured)",
-        true,
+        stale.is_empty(),
         format!(
-            "{} shares node {x:?} acknowledged were not on its peer when it died (answered {:?}..{:?} ms); they are excused, and any other missing acknowledged share fails invariant 4",
-            tail.count, tail.first_answered_ms, tail.last_answered_ms
+            "{} shares node {x:?} acknowledged were not on its peer when it died (answered \
+             {:?}..{:?} ms); {} of them were answered more than {SYNC_LAG_BOUND_MS} ms before it \
+             died, too old for an unsynced tail: {stale:?}. The rest are excused; any other \
+             missing acknowledged share fails invariant 4",
+            tail.count,
+            tail.first_answered_ms,
+            tail.last_answered_ms,
+            stale.len()
         ),
     );
-    body.options.excused_missing = crate::measure::excuse(
+    let mut excused = crate::measure::excuse(
         &tail,
         "S7: the replaced disk's unsynced tail when its node died",
     );
+    for (share, _) in &stale {
+        excused.remove(share);
+    }
+    body.options.excused_missing = excused;
     sim.balancer
         .wait_state(x.label(), true, Duration::from_secs(60))
         .await?;
@@ -2611,6 +2872,112 @@ async fn s07_disk_replaced(sim: &mut Sim, x: Node, body: &mut Body) -> Result<()
     steady(sim, 2).await;
     sim.settle(SETTLE_BOUND).await?;
     expect_dual_health(sim, body).await?;
+    Ok(())
+}
+
+/// D-16, read in the rebuilt database before its frontend starts: what
+/// re-personalise left, judged by D1's table inventory rather than by the
+/// command's exit status. Every table the inventory clears is empty, no row
+/// a copied table keeps for its own node (issued jobs, the peer's fanout
+/// claims) is left, the identity is `x`'s, the lineage carries no own-log
+/// verification, and every cursor follows `x`'s peer from at or below that
+/// peer's own highest key: a cursor kept from the copy would skip the
+/// peer's later rows below it.
+async fn expect_repersonalised(sim: &Sim, body: &mut Body, x: Node) -> Result<()> {
+    use qbit_prism_server::ledger::table_inventory::{
+        LocalPart, Reset, TableClass, TABLE_INVENTORY,
+    };
+    let y = x.peer();
+    let pool = sim.pool(x).await?;
+    let mut left = Vec::new();
+    for entry in TABLE_INVENTORY {
+        let present: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(entry.table)
+            .fetch_one(&pool)
+            .await?;
+        if !present {
+            continue;
+        }
+        let predicates: Vec<&str> = match entry.class {
+            TableClass::Local(Reset::Clear) => vec!["true"],
+            TableClass::Copied(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    LocalPart::Rows { predicate } => Some(*predicate),
+                    LocalPart::Reset { rows, .. } => Some(*rows),
+                    LocalPart::Kept(_) => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for predicate in predicates {
+            let rows: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {} WHERE {predicate}",
+                entry.table
+            ))
+            .fetch_one(&pool)
+            .await?;
+            if rows > 0 {
+                left.push(format!("{rows} rows of {} where {predicate}", entry.table));
+            }
+        }
+    }
+    let identity: Option<i16> =
+        sqlx::query_scalar("SELECT node_index FROM qbit_prism_node_identity")
+            .fetch_optional(&pool)
+            .await?;
+    let unverified: Option<bool> =
+        sqlx::query_scalar("SELECT verified_at IS NULL FROM qbit_prism_node_lineage")
+            .fetch_optional(&pool)
+            .await?;
+    let cursors: Vec<(String, i16, i64)> = sqlx::query_as(
+        "SELECT stream, peer_node, scanned_through FROM qbit_prism_peer_sync_cursors \
+         ORDER BY stream",
+    )
+    .fetch_all(&pool)
+    .await?;
+    pool.close().await;
+    let peer = sim.pool(y).await?;
+    let (shares, blocks, prepared): (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT max(share_seq) FROM qbit_share_ledger WHERE origin_node = $1), \
+                (SELECT max(sync_seq) FROM qbit_pool_blocks WHERE origin_node = $1), \
+                (SELECT max(sync_seq) FROM qbit_prism_jobs \
+                  WHERE origin_node = $1 AND job_id LIKE 'prepared:%')",
+    )
+    .bind(y.index() as i16)
+    .fetch_one(&peer)
+    .await?;
+    peer.close().await;
+    let wrong_cursors: Vec<String> = cursors
+        .iter()
+        .filter(|(stream, peer_node, through)| {
+            let highest = match stream.as_str() {
+                "shares" => shares,
+                "blocks" => blocks,
+                "prepared" => prepared,
+                _ => None,
+            };
+            *peer_node != y.index() as i16 || highest.is_some_and(|highest| *through > highest)
+        })
+        .map(|(stream, peer_node, through)| {
+            format!("{stream}: follows node {peer_node} from {through}")
+        })
+        .collect();
+    body.expect(
+        "re-personalise reset the copy as D1's table inventory says (D-16)",
+        left.is_empty()
+            && identity == Some(x.index() as i16)
+            && unverified == Some(true)
+            && wrong_cursors.is_empty(),
+        format!(
+            "left over: {left:?}; identity {identity:?} (must be {}); lineage unverified: \
+             {unverified:?}; cursors {cursors:?}, of which wrong: {wrong_cursors:?} (each must \
+             follow node {} from at or below its highest keys: shares {shares:?}, blocks \
+             {blocks:?}, prepared {prepared:?})",
+            x.index(),
+            y.index()
+        ),
+    );
     Ok(())
 }
 
@@ -2703,6 +3070,9 @@ async fn own_journal_rows(sim: &Sim, node: Node) -> Result<i64> {
     Ok(rows?)
 }
 
+/// The words of D-12's refusal (`Ledger::refuse_single_writer_on_dual_ledger`).
+pub const D12_REFUSAL: &str = "has run as a dual-writer node";
+
 /// CONTRACT.md D-12: once a database is a dual-writer node's (its journal
 /// holds rows), a single-writer start on it is refused unless the downgrade
 /// flag is set. The node must first seed its journal (D-4); then its
@@ -2735,8 +3105,10 @@ async fn expect_single_writer_refused(sim: &mut Sim, node: Node, body: &mut Body
     spec.readiness = None;
     let probe = crate::frontend::Frontend::new(spec, &sim.logs)?;
     let attempt = probe.tool(&["run"], Duration::from_secs(45)).await;
+    // D-12's own refusal, not just any failed start: a start that failed for
+    // another reason proves nothing about the guard.
     let refused = match &attempt {
-        Ok(run) => !run.success,
+        Ok(run) => !run.success && run.stderr.contains(D12_REFUSAL),
         // Still serving after 45 s: it did not refuse.
         Err(_) => false,
     };
@@ -2745,8 +3117,13 @@ async fn expect_single_writer_refused(sim: &mut Sim, node: Node, body: &mut Body
         refused,
         match attempt {
             Ok(run) => format!(
-                "exit {:?}: {}",
+                "exit {:?}, the refusal (\"{D12_REFUSAL}\") {}: {}",
                 run.code,
+                if run.stderr.contains(D12_REFUSAL) {
+                    "given"
+                } else {
+                    "not given"
+                },
                 run.stderr.trim().lines().last().unwrap_or("")
             ),
             Err(error) => format!("{error:#}"),
@@ -3243,12 +3620,7 @@ async fn s10_single_writer(sim: &mut Sim, body: &mut Body) -> Result<()> {
     steady(sim, 8).await;
     find_block(sim, body, Node::B, "B while A is down", None).await?;
     let records = sim.load()?.records();
-    let on_b = accepted_from(&records, Node::B, fault_at);
-    body.expect(
-        "miners moved to B",
-        on_b > 0,
-        format!("{on_b} shares accepted on B's jobs after the fault"),
-    );
+    expect_every_miner_moved(body, &records, fault_at, Node::B, sim.clock.now_ms());
 
     sim.heal(fault).await?;
     sim.balancer
@@ -3258,6 +3630,19 @@ async fn s10_single_writer(sim: &mut Sim, body: &mut Body) -> Result<()> {
     steady(sim, 6).await;
     find_block(sim, body, Node::A, "A after its restart", None).await?;
     steady(sim, 2).await;
+    // Failback is every session's too: the balancer must route every one
+    // back to A (paced), not just let the first through.
+    let failed_back = routing_settled(sim).await;
+    body.expect(
+        "every session failed back to A",
+        failed_back.is_ok(),
+        match &failed_back {
+            Ok(()) => "every session routed to A, both nodes up".to_owned(),
+            Err(error) => format!("{error:#}"),
+        },
+    );
+    // The load runs until the settle pauses it.
+    let load_until = sim.clock.now_ms();
     sim.settle(SETTLE_BOUND).await?;
 
     let records = sim.load()?.records();
@@ -3273,7 +3658,7 @@ async fn s10_single_writer(sim: &mut Sim, body: &mut Body) -> Result<()> {
         ),
     );
     body.gaps.push(gap);
-    let back_on_a = accepted_from(&records, Node::A, sim.clock.now_ms().saturating_sub(4_000));
+    let back_on_a = accepted_from(&records, Node::A, load_until.saturating_sub(4_000));
     body.expect(
         "miners failed back to A",
         back_on_a > 0,

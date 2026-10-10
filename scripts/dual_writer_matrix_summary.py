@@ -5,7 +5,12 @@ Each scenario writes `<report dir>/<scenario>/report.json`. This reads every
 one and writes a single Markdown table: each scenario's verdict, its
 duration, the miner-visible gap after each fault, the acknowledged shares
 lost, the documented tail it excused, and what failed (expectations and
-invariant checks), followed by every failed scenario's error, if any.
+invariant checks), followed by every failed scenario's error, if any. A run
+that stopped before its invariant checker ran shows its shares as "not
+checked", and a run that stopped before measuring any fault shows "not
+measured", never a loss-free or fault-free row. A scenario that panicked or
+was stopped leaves the report the harness writes when it starts: a failed
+row saying it did not finish.
 
 The table is the matrix report: the nightly job appends it to the job
 summary and keeps it in the artifact. It reports; the test step is what
@@ -55,8 +60,14 @@ def seconds(milliseconds: object) -> str:
 def gaps(report: dict) -> str:
     found = report.get("gaps") or []
     if not found:
-        return "no fault"
+        return "not measured" if report.get("error") else "no fault"
     return ", ".join(seconds(gap.get("fault_to_first_accept_ms")) for gap in found)
+
+
+def checked(report: dict) -> bool:
+    """Whether the invariant checker ran: a run that stopped before it has no
+    share verdict, so its zero counts mean nothing."""
+    return report.get("invariants") is not None or not report.get("error")
 
 
 def failures(report: dict) -> list[str]:
@@ -116,8 +127,8 @@ def render(reports: list[dict]) -> str:
                 "pass" if report.get("passed") else "**FAIL**",
                 seconds(report.get("duration_ms")),
                 gaps(report),
-                shares.get("lost", "?"),
-                shares.get("excused_tail", "?"),
+                shares.get("lost", "?") if checked(report) else "not checked",
+                shares.get("excused_tail", "?") if checked(report) else "not checked",
                 cell("; ".join(failed)) if failed else "",
             )
         )

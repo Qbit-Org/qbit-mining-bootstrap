@@ -48,10 +48,35 @@ class MatrixSummary(unittest.TestCase):
         self.assertIn("1 of 2 scenarios passed.", text)
         self.assertIn("| s01-steady-state | pass | 95.0 s | no fault | 0 | 2 |  |", text)
         self.assertIn(
-            "| s02-a-dies-kill9 | **FAIL** | 95.0 s | 3.4 s | 0 | 2 | miners moved to B; did not complete |",
+            "| s02-a-dies-kill9 | **FAIL** | 95.0 s | 3.4 s | not checked | not checked | "
+            "miners moved to B; did not complete |",
             text,
         )
         self.assertIn("- s02-a-dies-kill9: frontend A did not restart", text)
+
+    def test_a_run_that_stopped_early_is_not_shown_loss_free_or_fault_free(self) -> None:
+        # The harness's placeholder for a scenario that panicked or was
+        # stopped: failed, no gaps, no checker.
+        self.write(
+            report(
+                "s03-b-dies",
+                False,
+                gaps=[],
+                expectations=[],
+                invariants=None,
+                error="the scenario did not finish: it panicked, or was stopped, before writing its verdict",
+            )
+        )
+        # Stopped after its checker ran: its counts stand.
+        self.write(report("s04-link-cut", False, invariants={"checks": []}, error="settle timed out"))
+        text = summary.render(summary.load_reports(self.root))
+        self.assertIn("0 of 2 scenarios passed.", text)
+        self.assertIn(
+            "| s03-b-dies | **FAIL** | 95.0 s | not measured | not checked | not checked | did not complete |",
+            text,
+        )
+        self.assertIn("| s04-link-cut | **FAIL** | 95.0 s | 3.4 s | 0 | 2 |", text)
+        self.assertIn("- s03-b-dies: the scenario did not finish", text)
 
     def test_an_unreadable_report_is_a_failed_row_not_a_crash(self) -> None:
         path = self.root / "s04-link-cut" / "report.json"

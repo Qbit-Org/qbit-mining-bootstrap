@@ -362,6 +362,26 @@ impl Frontend {
 
     /// Wait until `/healthz` answers 200 with `ok: true`, failing at once if
     /// the process exits.
+    /// A frontend names each PRISM setting in its environment it does not
+    /// read ("set but unread by native PRISM", `config::check_environment`),
+    /// and outside production mode only warns. A setting the harness gives
+    /// it is a scenario's premise (S8's wait turned off, a fault's timing),
+    /// so one it ignores fails the scenario instead of running it without.
+    fn every_setting_read(&self) -> Result<()> {
+        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        if let Some(line) = log
+            .lines()
+            .find(|line| line.contains("set but unread by native PRISM"))
+        {
+            anyhow::bail!(
+                "frontend {:?} ignores a setting the harness gave it: {}",
+                self.node(),
+                line.trim()
+            );
+        }
+        Ok(())
+    }
+
     pub async fn wait_ready(&self, limit: Duration) -> Result<Duration> {
         let started = Instant::now();
         let mut last;
@@ -376,7 +396,10 @@ impl Frontend {
                 }
             }
             match self.health().await {
-                Ok((200, body)) if body["ok"] == true => return Ok(started.elapsed()),
+                Ok((200, body)) if body["ok"] == true => {
+                    self.every_setting_read()?;
+                    return Ok(started.elapsed());
+                }
                 Ok((status, body)) => {
                     last = format!(
                         "HTTP {status}, status {}, error {}",
