@@ -227,8 +227,8 @@ What each one does:
   ready within 120 s and take miners within 60 s of that (D-8, D-17); then B
   is healed and the pair catches up.
 - **S7:** the node's host dies, its disk is wiped and rebuilt as a promoted
-  physical copy of the peer, re-personalised (D-16); only its measured tail is
-  excused.
+  physical copy of the peer, re-personalised (D-16) once the copied frontend
+  rows are 60 s old, as D1's runbook says; only its measured tail is excused.
 - **S8:** A dies at the instant it finds a block: with the `submitblock` held
   (the block never reaches the chain; A may keep its candidate for
   reconciliation, and its gate must see the block offered no second time) or
