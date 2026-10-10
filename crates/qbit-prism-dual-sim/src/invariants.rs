@@ -1084,10 +1084,12 @@ async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
             check.problem(format!("node {node:?}: {kind}: {key}"));
         }
         // What a header's row says, for the cross-node comparison: every
-        // copied row must keep the origin's identity and content.
+        // copied row must keep the origin's identity and content, its
+        // provenance (`origin_node`, which owns the sequence) included.
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT lower(right(share_id, 64)), \
-                    concat_ws('|', share_id, share_seq, miner_id, encode(p2mr_program, 'hex'), \
+                    concat_ws('|', origin_node, share_id, share_seq, miner_id, \
+                              encode(p2mr_program, 'hex'), \
                               share_difficulty, network_difficulty, job_id, \
                               floor(extract(epoch FROM job_issued_at) * 1000)::bigint, \
                               floor(extract(epoch FROM accepted_at) * 1000)::bigint, ntime) \

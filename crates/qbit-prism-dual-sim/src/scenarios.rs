@@ -933,8 +933,8 @@ async fn s01_steady_state(sim: &mut Sim, body: &mut Body) -> Result<()> {
         "A's shares reach B within the sync interval",
         lag.resolved > 0 && lag.p95_ms.is_some_and(|ms| ms <= SYNC_LAG_BOUND_MS),
         format!(
-            "{} of {} samples seen on B; p50 {:?} ms, p95 {:?} ms, max {:?} ms (interval {} ms, bound {SYNC_LAG_BOUND_MS} ms, resolution {} ms, {} failed polls)",
-            lag.resolved, lag.samples, lag.p50_ms, lag.p95_ms, lag.max_ms,
+            "{} of {} samples seen on B ({} never, polled until 30 s old or about {} ms after the sampling stopped, and counted as over the bound); p50 {:?} ms, p95 {:?} ms, max resolved {:?} ms (interval {} ms, bound {SYNC_LAG_BOUND_MS} ms, resolution {} ms, {} failed polls)",
+            lag.resolved, lag.samples, lag.unresolved, crate::measure::LAG_DRAIN_MS, lag.p50_ms, lag.p95_ms, lag.max_ms,
             sim.config.sync_interval_ms, lag.resolution_ms, lag.failed_polls
         ),
     );

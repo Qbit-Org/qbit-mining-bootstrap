@@ -23,6 +23,11 @@ use tokio::task::JoinHandle;
 pub const LAG_POLL: Duration = Duration::from_millis(100);
 /// A sample still unseen on the peer after this is reported as unresolved.
 const LAG_GIVE_UP_MS: u64 = 30_000;
+/// Once sampling stops, the samples still pending are polled this much
+/// longer. Every sample has then had more than S1's 2 s bound to reach the
+/// peer, so one still unresolved truly exceeds it, and counting it as such
+/// is fair.
+pub const LAG_DRAIN_MS: u64 = 3_000;
 /// How many poll errors a report keeps.
 const KEPT_ERRORS: usize = 10;
 
@@ -179,8 +184,16 @@ pub struct LagSample {
 pub struct LagReport {
     pub samples: usize,
     pub resolved: usize,
+    /// Samples never seen on the peer. Each was polled until it was 30 s old
+    /// or until about [`LAG_DRAIN_MS`] after sampling stopped, so each had
+    /// more than S1's 2 s bound to arrive, and the percentiles rank them
+    /// above every resolved one.
+    pub unresolved: usize,
+    /// The percentiles over every sample, `None` when there is none or the
+    /// rank falls on an unresolved sample.
     pub p50_ms: Option<u64>,
     pub p95_ms: Option<u64>,
+    /// The largest resolved lag.
     pub max_ms: Option<u64>,
     /// The sampler's poll interval: no lag below it can be told apart.
     pub resolution_ms: u64,
@@ -197,26 +210,45 @@ impl LagSampler {
             let mut samples: Vec<LagSample> = Vec::new();
             let mut failed_polls = 0;
             let mut last: Option<String> = None;
-            while !stop.load(Ordering::SeqCst) {
-                let newest = sqlx::query_scalar::<_, String>(
-                    "SELECT share_id FROM qbit_share_ledger WHERE accepted \
-                     ORDER BY accepted_at DESC, share_seq DESC LIMIT 1",
-                )
-                .fetch_optional(&origin)
-                .await;
-                let now = clock.now_ms();
-                match newest {
-                    Ok(Some(newest)) if last.as_ref() != Some(&newest) => {
-                        samples.push(LagSample {
-                            share_id: newest.clone(),
-                            seen_on_origin_ms: now,
-                            seen_on_peer_ms: None,
-                        });
-                        last = Some(newest);
+            // Set once stopped: no new sample is taken, and the pending ones
+            // are polled until this time, or until none is left.
+            let mut drain_until: Option<u64> = None;
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    let now = clock.now_ms();
+                    let until = *drain_until.get_or_insert(now + LAG_DRAIN_MS);
+                    let pending = samples.iter().any(|s| {
+                        s.seen_on_peer_ms.is_none()
+                            && now.saturating_sub(s.seen_on_origin_ms) < LAG_GIVE_UP_MS
+                    });
+                    if now >= until || !pending {
+                        break;
                     }
-                    Ok(_) => {}
-                    Err(_) => failed_polls += 1,
                 }
+                let now = if drain_until.is_none() {
+                    let newest = sqlx::query_scalar::<_, String>(
+                        "SELECT share_id FROM qbit_share_ledger WHERE accepted \
+                         ORDER BY accepted_at DESC, share_seq DESC LIMIT 1",
+                    )
+                    .fetch_optional(&origin)
+                    .await;
+                    let now = clock.now_ms();
+                    match newest {
+                        Ok(Some(newest)) if last.as_ref() != Some(&newest) => {
+                            samples.push(LagSample {
+                                share_id: newest.clone(),
+                                seen_on_origin_ms: now,
+                                seen_on_peer_ms: None,
+                            });
+                            last = Some(newest);
+                        }
+                        Ok(_) => {}
+                        Err(_) => failed_polls += 1,
+                    }
+                    now
+                } else {
+                    clock.now_ms()
+                };
                 let pending: Vec<String> = samples
                     .iter()
                     .filter(|s| {
@@ -264,24 +296,27 @@ impl LagSampler {
 }
 
 pub fn lag_report(samples: &[LagSample]) -> LagReport {
-    let mut lags: Vec<u64> = samples
+    // Every sample, an unresolved one ranked above every resolved lag.
+    let mut lags: Vec<Option<u64>> = samples
         .iter()
-        .filter_map(|s| Some(s.seen_on_peer_ms? - s.seen_on_origin_ms))
+        .map(|s| Some(s.seen_on_peer_ms? - s.seen_on_origin_ms))
         .collect();
-    lags.sort_unstable();
+    lags.sort_unstable_by_key(|lag| lag.unwrap_or(u64::MAX));
     let percentile = |p: f64| -> Option<u64> {
         if lags.is_empty() {
             return None;
         }
         let rank = ((p * lags.len() as f64).ceil() as usize).clamp(1, lags.len());
-        Some(lags[rank - 1])
+        lags[rank - 1]
     };
+    let resolved = lags.iter().flatten().count();
     LagReport {
         samples: samples.len(),
-        resolved: lags.len(),
+        resolved,
+        unresolved: samples.len() - resolved,
         p50_ms: percentile(0.50),
         p95_ms: percentile(0.95),
-        max_ms: lags.last().copied(),
+        max_ms: lags.iter().flatten().max().copied(),
         resolution_ms: LAG_POLL.as_millis() as u64,
         failed_polls: 0,
     }
@@ -712,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn lag_percentiles_ignore_unresolved_samples() {
+    fn lag_percentiles_rank_unresolved_samples_above_every_resolved_one() {
         let samples = vec![
             LagSample {
                 share_id: "1".into(),
@@ -731,8 +766,27 @@ mod tests {
             },
         ];
         let report = lag_report(&samples);
-        assert_eq!((report.samples, report.resolved), (3, 2));
-        assert_eq!(report.p50_ms, Some(100));
+        assert_eq!(
+            (report.samples, report.resolved, report.unresolved),
+            (3, 2, 1)
+        );
+        assert_eq!(report.p50_ms, Some(300));
+        assert_eq!(report.p95_ms, None, "the p95 falls on the unresolved one");
         assert_eq!(report.max_ms, Some(300));
+        // One quick sample among many that never arrived cannot pass.
+        let mut slow: Vec<LagSample> = (0..19)
+            .map(|i| LagSample {
+                share_id: format!("slow{i}"),
+                seen_on_origin_ms: 0,
+                seen_on_peer_ms: None,
+            })
+            .collect();
+        slow.push(LagSample {
+            share_id: "quick".into(),
+            seen_on_origin_ms: 0,
+            seen_on_peer_ms: Some(50),
+        });
+        let report = lag_report(&slow);
+        assert_eq!((report.resolved, report.p95_ms), (1, None));
     }
 }
