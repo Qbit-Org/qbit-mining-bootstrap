@@ -785,7 +785,8 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
         sim.clock,
     );
     let order =
-        crate::measure::LandingOrderSampler::start(sim.pool(Node::B).await?, Node::A, sim.clock);
+        crate::measure::LandingOrderSampler::start(sim.pool(Node::B).await?, Node::A, sim.clock)
+            .await?;
     for note in ["A's first block", "A's second block"] {
         let hash = find_block(sim, &mut body, Node::A, note, None).await?;
         let took = confirm_on_both(sim, &hash).await?;
@@ -820,36 +821,40 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
     Ok(body)
 }
 
-/// D-5, for the peer blocks one sampler watched arrive on `on`: none was
-/// there before its window's shares, and at least one was counted as it
-/// arrived, so the order was shown, not merely not contradicted.
+/// D-5 and D-10, for the peer blocks one sampler watched arrive on `on`: none
+/// was there before its window's shares or without its window record, and at
+/// least one was seen whole on a poll that followed a good one, so the order
+/// was shown, not merely not contradicted.
 fn expect_landing_order(body: &mut Body, on: Node, report: crate::measure::LandingOrderReport) {
     use crate::measure::LandingVerdict;
-    let count = |verdict| {
-        report
-            .samples
-            .iter()
-            .filter(|sample| sample.verdict() == verdict)
-            .count()
-    };
-    let violated: Vec<&crate::measure::LandingOrder> = report
+    let bad: Vec<&crate::measure::LandingOrder> = report
         .samples
         .iter()
-        .filter(|sample| sample.verdict() == LandingVerdict::Violated)
+        .filter(|sample| {
+            matches!(
+                sample.verdict(),
+                LandingVerdict::Violated | LandingVerdict::Torn
+            )
+        })
         .collect();
-    let in_order = count(LandingVerdict::InOrder);
+    let in_order = report.count(LandingVerdict::InOrder);
     body.expect(
         &format!(
-            "node {:?}'s blocks never land on node {on:?} before their window's shares (D-5)",
+            "node {:?}'s blocks never land on node {on:?} before their window's shares (D-5) \
+             or without their audit (D-10)",
             on.peer()
         ),
-        violated.is_empty() && in_order > 0,
+        bad.is_empty() && in_order > 0,
         format!(
-            "{} blocks seen arriving: {in_order} with every window share already there, {} unresolved \
-             (window counted only after the block, or never); out of order: {violated:?}. \
+            "{} blocks seen arriving ({} already there at the start): {in_order} with every \
+             window share there, {} before their shares, {} without their window record, {} \
+             unresolved (inline, or first seen after a failed poll); out of order: {bad:?}. \
              {} of {} polls failed {:?}; resolution {} ms",
             report.samples.len(),
-            count(LandingVerdict::Unresolved),
+            report.baseline,
+            report.count(LandingVerdict::Violated),
+            report.count(LandingVerdict::Torn),
+            report.count(LandingVerdict::Unresolved),
             report.failed_polls,
             report.polls,
             report.errors,
@@ -1047,29 +1052,43 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
         ),
     );
     // D-8: the latch is for a node's start. A serving node that later loses
-    // its peer keeps serving, so the balancer never withdraws either node
-    // from the cut to the catch-up. A single failed check is counted, not
-    // failed: a landed block can fail one while the node rebuilds its work.
-    let caught_up_at = sim.clock.now_ms();
-    let events = sim.balancer.report().events;
-    let during: Vec<&crate::balancer::BalancerEvent> = events
+    // its peer keeps serving, so the balancer keeps both nodes up from the
+    // cut until the catch-up, and for long enough after it that a mark-down
+    // whose failing checks began before it would have landed. Checks that
+    // failed while a node stayed up (fewer than `fall` in a row, as a landed
+    // block's work rebuild can cause) are counted, not failed.
+    let checks = &sim.config.balancer;
+    let horizon = checks.check_interval * checks.fall + checks.check_timeout;
+    tokio::time::sleep(horizon).await;
+    let until = sim.clock.now_ms();
+    let report = sim.balancer.report();
+    let withdrawn: Vec<&str> = Node::BOTH
         .iter()
-        .filter(|event| (fault_at..=caught_up_at).contains(&event.at_ms))
+        .map(|node| node.label())
+        .filter(|name| !report.up_throughout(name, fault_at, until))
         .collect();
-    let withdrawn: Vec<&&crate::balancer::BalancerEvent> = during
+    let failed_while_up: std::collections::BTreeMap<&str, usize> = Node::BOTH
         .iter()
-        .filter(|event| event.event.contains(" marked down "))
+        .map(|node| {
+            let name = node.label();
+            let count = report
+                .failed_checks
+                .iter()
+                .filter(|f| {
+                    f.backend == name && f.while_up && (fault_at..=until).contains(&f.at_ms)
+                })
+                .count();
+            (name, count)
+        })
         .collect();
-    let failed_checks = during
-        .iter()
-        .filter(|event| event.event.contains(" check failing"))
-        .count();
     body.expect(
         "a link loss never withdraws a serving node (D-8)",
         withdrawn.is_empty(),
         format!(
-            "{} mark-downs from the cut to the catch-up: {withdrawn:?}; {failed_checks} single failed checks",
-            withdrawn.len()
+            "not up throughout {fault_at}..{until} ms (the cut until {} ms after the catch-up): {withdrawn:?}; \
+             checks failed while serving: {failed_while_up:?}; transitions: {:?}",
+            horizon.as_millis(),
+            report.transitions
         ),
     );
     steady(sim, 2).await;
@@ -1096,9 +1115,11 @@ async fn s05_both_write(sim: &mut Sim) -> Result<Body> {
     sim.load()?.resume();
     steady(sim, 6).await;
     let on_a =
-        crate::measure::LandingOrderSampler::start(sim.pool(Node::A).await?, Node::B, sim.clock);
+        crate::measure::LandingOrderSampler::start(sim.pool(Node::A).await?, Node::B, sim.clock)
+            .await?;
     let on_b =
-        crate::measure::LandingOrderSampler::start(sim.pool(Node::B).await?, Node::A, sim.clock);
+        crate::measure::LandingOrderSampler::start(sim.pool(Node::B).await?, Node::A, sim.clock)
+            .await?;
     for (node, note) in [
         (Node::A, "A, both writing"),
         (Node::B, "B, both writing"),
