@@ -36,6 +36,22 @@ use tokio::sync::watch;
 /// How long one statement against the peer may take before the path is
 /// treated as dead: a black-holed network answers nothing.
 const PEER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The peer session's settings. Every statement is read-only and ends on
+/// the server before the client's own bound gives up on it, so an abandoned
+/// one never runs on; no transaction is held open, and the server drops a
+/// session left idle in one at once. The keepalives and user timeout let the
+/// peer's server notice a client that vanished. The sync role sets the same
+/// (status/D1.md), so a frontend's options only ever tighten them.
+pub(super) const PEER_SESSION_OPTIONS: [(&str, &str); 8] = [
+    ("default_transaction_read_only", "on"),
+    ("statement_timeout", "8s"),
+    ("lock_timeout", "2s"),
+    ("idle_in_transaction_session_timeout", "5s"),
+    ("tcp_keepalives_idle", "5"),
+    ("tcp_keepalives_interval", "2"),
+    ("tcp_keepalives_count", "3"),
+    ("tcp_user_timeout", "10000"),
+];
 /// How long connecting to the peer may take.
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// While on the fallback path, how often the first path is tried again.
@@ -168,6 +184,9 @@ pub struct PeerSync {
     identity_checked: Option<Instant>,
     identity_refusal: Option<Refusal>,
     latch: Latch,
+    /// Own-log recovery met an own row this database holds with other
+    /// content: the latch stays down until an operator resolves it.
+    own_log_diverged: bool,
     safe_sync_mark: Option<i64>,
     streams: BTreeMap<&'static str, StreamState>,
     started: Instant,
@@ -203,6 +222,7 @@ impl PeerSync {
             identity_checked: None,
             identity_refusal: None,
             latch: Latch::default(),
+            own_log_diverged: false,
             safe_sync_mark: None,
             streams: BTreeMap::new(),
             started: Instant::now(),
@@ -279,6 +299,7 @@ impl PeerSync {
 
     /// Close the active path's pool and move to the next path.
     fn drop_active_path(&mut self) {
+        self.safe_sync_mark = None;
         if let Some(pool) = self.paths[self.active].pool.take() {
             tokio::spawn(async move { pool.close().await });
         }
@@ -306,13 +327,13 @@ impl PeerSync {
         }
         let path = &mut self.paths[self.active];
         if path.pool.is_none() {
+            // A new connection may reach a peer that was restored or failed
+            // over meanwhile: a mark read from the old one proves nothing.
+            self.safe_sync_mark = None;
             let options = PgConnectOptions::from_str(&path.url)
                 .map_err(|_| anyhow::anyhow!("invalid peer database URL"))?
                 .application_name("qbit-prism-peer-sync")
-                .options([
-                    ("default_transaction_read_only", "on"),
-                    ("statement_timeout", "30s"),
-                ])
+                .options(PEER_SESSION_OPTIONS)
                 .disable_statement_logging();
             path.pool = Some(
                 PgPoolOptions::new()
@@ -367,31 +388,52 @@ impl PeerSync {
         };
         report.reached_peer = true;
         report.path = Some(self.active);
-        let facts = bounded(peer::facts(&mut connection)).await?;
-        if let Some(refusal) = self.check_peer(&mut connection, &facts).await? {
-            tracing::error!(%refusal, "ALERT: the peer sync refuses this peer");
-            self.latch_without_peer().await?;
-            report.own_log_caught_up = self.latch.caught_up;
-            report.refused = Some(refusal.clone());
-            self.publish(true, Some(&refusal));
-            return Ok(report);
-        }
-        if !self.latch.caught_up {
-            report
-                .applied
-                .merge(self.recover_own_log(&mut connection).await?);
-        }
-        report.own_log_caught_up = self.latch.caught_up;
-        if self.latch.caught_up {
-            let (applied, more) = self.pull_peer(&mut connection, &facts).await?;
-            report.applied.merge(applied);
-            report.more = more;
+        let on_peer = self.pass_on_peer(&mut connection, &mut report).await;
+        if let Err(error) = on_peer {
+            // A peer that answers the connection but cannot be read is as
+            // good as unreachable for the latch (D-8): without it, the latch
+            // follows the local rollback evidence, unless the own log was
+            // found to have diverged from the peer's copy of it.
+            if !self.own_log_diverged {
+                self.latch_without_peer().await?;
+            }
+            self.publish(false, None);
+            return Err(error);
         }
         if let Some(metrics) = &self.metrics {
             metrics.record_peer_sync_applied(&report.applied);
         }
-        self.publish(true, None);
+        self.publish(true, report.refused.as_ref());
         Ok(report)
+    }
+
+    /// The part of a pass that reads the peer: its identity and fingerprint,
+    /// the own log until the latch is set, then the peer's streams.
+    async fn pass_on_peer(
+        &mut self,
+        connection: &mut sqlx::PgConnection,
+        report: &mut PassReport,
+    ) -> Result<()> {
+        let facts = bounded(peer::facts(connection)).await?;
+        if let Some(refusal) = self.check_peer(connection, &facts).await? {
+            tracing::error!(%refusal, "ALERT: the peer sync refuses this peer");
+            self.latch_without_peer().await?;
+            report.own_log_caught_up = self.latch.caught_up;
+            report.refused = Some(refusal);
+            return Ok(());
+        }
+        if !self.latch.caught_up {
+            report
+                .applied
+                .merge(self.recover_own_log(connection).await?);
+        }
+        report.own_log_caught_up = self.latch.caught_up;
+        if self.latch.caught_up {
+            let (applied, more) = self.pull_peer(connection, &facts).await?;
+            report.applied.merge(applied);
+            report.more = more;
+        }
+        Ok(())
     }
 
     /// D-9: refuse unless this database is personalised as this node, with
@@ -474,7 +516,7 @@ impl PeerSync {
     /// Without the peer, the latch is set unless this database shows
     /// evidence of a rollback since its own log was last verified (D-17).
     async fn latch_without_peer(&mut self) -> Result<()> {
-        if self.latch.caught_up {
+        if self.latch.caught_up || self.own_log_diverged {
             return Ok(());
         }
         let now = self.ledger.lineage_evidence().await?;
@@ -539,7 +581,7 @@ impl PeerSync {
                     .apply_share_batch(node, node, &batch, None)
                     .await?,
             );
-            ensure_progress(&applied)?;
+            ensure_progress(&mut self.own_log_diverged, &applied)?;
         }
         loop {
             let (_, held, ..) = self.ledger.highest_held_of(node).await?;
@@ -557,7 +599,7 @@ impl PeerSync {
             for block in &blocks {
                 applied.merge(self.ledger.apply_block(block, None).await?);
             }
-            ensure_progress(&applied)?;
+            ensure_progress(&mut self.own_log_diverged, &applied)?;
         }
         loop {
             let (_, _, held, _) = self.ledger.highest_held_of(node).await?;
@@ -573,11 +615,11 @@ impl PeerSync {
                 break;
             }
             applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
-            ensure_progress(&applied)?;
+            ensure_progress(&mut self.own_log_diverged, &applied)?;
         }
         let roles = bounded(peer::node_roles(connection, node)).await?;
         applied.merge(self.ledger.apply_node_roles(&roles, node).await?);
-        ensure_progress(&applied)?;
+        ensure_progress(&mut self.own_log_diverged, &applied)?;
         // Above everything the peer has seen of this node: its cursors over
         // this node's streams, and the highest own rows it holds.
         let cursors = bounded(peer::cursors(connection)).await?;
@@ -674,10 +716,24 @@ impl PeerSync {
             BLOCKS_PER_PASS,
         ))
         .await?;
-        for block in &blocks {
+        // D-5: a block waits until the share mark covers its window, so its
+        // audit is verifiable here when this node confirms it.
+        let share_mark = self
+            .ledger
+            .peer_sync_cursor(SHARES)
+            .await?
+            .map(|(mark, _)| mark);
+        let covered = blocks
+            .iter()
+            .take_while(|block| window_covered(block, share_mark))
+            .count();
+        for block in &blocks[..covered] {
             applied.merge(self.ledger.apply_block(block, Some((BLOCKS, peer))).await?);
         }
-        if (blocks.len() as i64) < BLOCKS_PER_PASS {
+        if covered < blocks.len() {
+            more = true;
+            self.stream_done(BLOCKS, (blocks.len() - covered) as u64);
+        } else if (blocks.len() as i64) < BLOCKS_PER_PASS {
             self.ledger
                 .settle_peer_sync_cursor(BLOCKS, peer, safe)
                 .await?;
@@ -793,6 +849,21 @@ impl PeerSync {
     }
 }
 
+/// Whether every share of `block`'s window is at or below the share mark:
+/// its snapshot's last `share_seq`, which no window share is above. A block
+/// with no snapshot (an empty window) needs none.
+fn window_covered(block: &BlockBundle, share_mark: Option<i64>) -> bool {
+    let last = block
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("last_share_seq"))
+        .and_then(serde_json::Value::as_i64);
+    match last {
+        None => true,
+        Some(last) => share_mark.is_some_and(|mark| mark >= last),
+    }
+}
+
 /// Where a stream's cursor starts: the lower of the highest peer row held
 /// here and the peer's floor, so a peer row neither has seen is never
 /// skipped.
@@ -805,8 +876,9 @@ fn start_position(held: Option<i64>, floor: Option<i64>) -> i64 {
 }
 
 /// An own-log conflict leaves the latch unset.
-fn ensure_progress(applied: &Applied) -> Result<()> {
+fn ensure_progress(diverged: &mut bool, applied: &Applied) -> Result<()> {
     if applied.total_conflicts() > 0 {
+        *diverged = true;
         bail!(
             "own-log recovery met rows this node holds with other content ({:?}); the own log has \
              diverged from the peer's copy of it and this node does not serve until an operator \

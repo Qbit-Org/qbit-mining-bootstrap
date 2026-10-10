@@ -79,7 +79,7 @@ impl PeerIngestWait {
                 let options = PgConnectOptions::from_str(url)
                     .ok()?
                     .application_name("qbit-prism-peer-ingest-wait")
-                    .options([("default_transaction_read_only", "on")])
+                    .options(super::engine::PEER_SESSION_OPTIONS)
                     .disable_statement_logging();
                 Some(
                     PgPoolOptions::new()

@@ -888,3 +888,161 @@ async fn the_sync_carries_every_column_the_inventory_does_not_keep_local() -> Re
     ledger.pool.close().await;
     db.close(result).await
 }
+
+/// The sync barrier is one statement: a puller that called it and then
+/// stalls, its connection open and idle, holds nothing a writer waits on,
+/// and leaves no advisory lock behind. While a writer that drew a sync_seq
+/// is still open the barrier is not taken, and the last mark stands.
+#[tokio::test]
+async fn a_stalled_puller_never_holds_the_sync_barrier() -> Result<()> {
+    use qbit_prism_server::ledger::peer_sync::SYNC_BARRIER_LOCK;
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let puller = PgPool::connect(&pair.a_url).await?;
+        let mut stalled = puller.acquire().await?;
+        let (taken, position): (bool, Option<i64>) =
+            sqlx::query_as("SELECT taken,sync_position FROM qbit_prism_sync_barrier()")
+                .fetch_one(&mut *stalled)
+                .await?;
+        ensure!(taken && position.is_none(), "{taken} {position:?}");
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *stalled)
+            .await?;
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE pid=$1 AND locktype='advisory'",
+        )
+        .bind(pid)
+        .fetch_one(&pair.a.pool)
+        .await?;
+        ensure!(held == 0, "the puller still holds {held} advisory lock(s)");
+        // The puller stalls with its session open; the writers go on at once.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            land(&pair.a, "beside a stalled puller", 400).await?;
+            prepare(&pair.a, "beside a stalled puller").await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("a writer waited on a stalled puller")??;
+        ensure!(started.elapsed() < Duration::from_secs(5));
+        // A writer still open with its sync_seq: the barrier is not taken.
+        let mut open = pair.a.pool.begin().await?;
+        sqlx::query("SELECT qbit_prism_next_sync_seq()")
+            .execute(&mut *open)
+            .await?;
+        let (taken, _): (bool, Option<i64>) =
+            sqlx::query_as("SELECT taken,sync_position FROM qbit_prism_sync_barrier()")
+                .fetch_one(&mut *stalled)
+                .await?;
+        ensure!(!taken, "the barrier was taken past an open sync_seq");
+        open.rollback().await?;
+        let (taken, position): (bool, Option<i64>) =
+            sqlx::query_as("SELECT taken,sync_position FROM qbit_prism_sync_barrier()")
+                .fetch_one(&mut *stalled)
+                .await?;
+        ensure!(taken && position.is_some(), "{taken} {position:?}");
+        ensure!(SYNC_BARRIER_LOCK == 0x505249534d000008);
+        drop(stalled);
+        puller.close().await;
+        Ok(())
+    })
+    .await
+}
+
+/// CONTRACT D-8: a peer that accepts the connection but whose reads fail is
+/// as good as unreachable. The pass fails, and the latch follows the local
+/// rollback evidence: set when the database is on the server its own log
+/// was last verified on, unset when it is not.
+#[tokio::test]
+async fn a_peer_that_answers_but_cannot_be_read_leaves_the_latch_to_the_evidence() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        ensure!(on_a.pass().await?.own_log_caught_up);
+        // A database that accepts the sync's connection and has no PRISM schema.
+        let empty = FixtureDatabase::open(&raw, "sync_unreadable_").await?;
+        let result = async {
+            let (mut unreadable, _) = sync(&pair.a, NodeIndex::A, &empty.url);
+            let status = unreadable.subscribe();
+            ensure!(
+                unreadable.pass().await.is_err(),
+                "reading an empty database succeeded"
+            );
+            ensure!(
+                status.borrow().own_log_caught_up,
+                "the latch stayed down although the evidence matches"
+            );
+            sqlx::query("UPDATE qbit_prism_node_lineage SET verified_timeline=verified_timeline+1")
+                .execute(&pair.a.pool)
+                .await?;
+            let (mut rolled_back, _) = sync(&pair.a, NodeIndex::A, &empty.url);
+            let status = rolled_back.subscribe();
+            ensure!(rolled_back.pass().await.is_err());
+            ensure!(
+                !status.borrow().own_log_caught_up,
+                "the latch was set against rollback evidence"
+            );
+            Ok(())
+        }
+        .await;
+        empty.close(result).await
+    })
+    .await
+}
+
+/// A block whose insert fails for a passing reason (here a lock wait on its
+/// audit snapshot, which a local transaction is inserting) is never skipped:
+/// the pass fails with the cursor where it was, nothing is recorded as a
+/// conflict, and the block lands once the wait clears.
+#[tokio::test]
+async fn a_block_that_fails_to_apply_for_a_passing_reason_is_retried() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        // Shares first: a block waits until the share mark covers its window.
+        append(&pair.a, &["c1", "c2"]).await?;
+        let block = land(&pair.a, "contended", 500).await?;
+        let snapshot = hex("snapshot contended");
+        // B is inserting the same snapshot row, and has not committed.
+        let mut blocker = pair.b.pool.begin().await?;
+        sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count) VALUES($1,1,3,1000,3)")
+            .bind(&snapshot)
+            .execute(&mut *blocker)
+            .await?;
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        let mut failed = false;
+        for _ in 0..200 {
+            match on_b.pass().await {
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        ensure!(failed, "the contended block never failed to apply");
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_pool_blocks").await? == 0);
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 0);
+        let cursor: Option<i64> = sqlx::query_scalar(
+            "SELECT scanned_through FROM qbit_prism_peer_sync_cursors WHERE stream='blocks'",
+        )
+        .fetch_optional(&pair.b.pool)
+        .await?;
+        let sync_seq = count(&pair.a.pool, &format!("SELECT sync_seq FROM qbit_pool_blocks WHERE block_hash='{block}'")).await?;
+        ensure!(cursor.is_none_or(|cursor| cursor < sync_seq), "the cursor passed the block: {cursor:?}");
+        blocker.rollback().await?;
+        pass_until(&mut on_b, async |_| {
+            Ok(count(&pair.b.pool, &format!("SELECT count(*) FROM qbit_pool_blocks WHERE block_hash='{block}'")).await? == 1)
+        })
+        .await?;
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_payout_carry_forward").await? == 1);
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 0);
+        Ok(())
+    })
+    .await
+}

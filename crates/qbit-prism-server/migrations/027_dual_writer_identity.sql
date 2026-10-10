@@ -4,10 +4,11 @@
 -- that does not know these columns and tables never names them, and every
 -- new column has a constant default or none, so adding it rewrites no table
 -- and validates nothing by a scan: each ALTER holds its table's lock only for
--- the catalog change, the share ledger's across its partitions, until the
--- migration commits. With PRISM_DUAL_WRITER off nothing reads or writes any of
--- it except the defaults below, which leave every existing statement's result
--- unchanged.
+-- the catalog change, until the migration commits. The share ledger and its
+-- header mappings are altered last, so a frontend still serving waits on them
+-- only from that last step to the commit. With PRISM_DUAL_WRITER off nothing
+-- reads or writes any of it except the defaults below, which leave every
+-- existing statement's result unchanged.
 --
 -- 1. origin_node on every table the peer sync copies: the node that wrote
 --    the row, 0 for A and 1 for B. Every row from before 3.1 is node 0.
@@ -16,9 +17,8 @@
 --    index, so no INSERT names the column, and the peer sync names it,
 --    copying the peer's value. No CHECK: on the share ledger one would scan
 --    every partition under the lock; personalisation and the sync only ever
---    write 0 or 1.
-ALTER TABLE qbit_share_ledger ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
-ALTER TABLE qbit_prism_share_hashes ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
+--    write 0 or 1. The share ledger and the header mappings are at the end of
+--    this file.
 ALTER TABLE qbit_pool_blocks ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
 ALTER TABLE qbit_prism_audit_snapshots ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
 ALTER TABLE qbit_pool_audit_bundles ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
@@ -42,13 +42,16 @@ ALTER TABLE qbit_prism_jobs ADD COLUMN IF NOT EXISTS origin_node smallint NOT NU
 --    not pass a number whose transaction may still commit. The default takes
 --    a shared transaction-scoped advisory lock (0x505249534d000008, the sync
 --    barrier) before it takes the number, and keeps it until the transaction
---    ends. A puller that takes the same lock exclusively, without waiting
---    (pg_try_advisory_lock, so no writer ever queues behind it), and reads
---    the sequence while holding it has seen, or can never see, every row at
---    or below what it read. The barrier is per database, so no transaction
---    elsewhere on the server holds a pull back. Rows from before 027 keep
---    NULL and are never pulled: both databases of a pair start from one
---    ledger and hold them already.
+--    ends. The puller calls qbit_prism_sync_barrier(), one statement that
+--    tries the same lock exclusively, transaction-scoped, never waiting for
+--    it, and reads the sequence while it holds it: every row at or below the
+--    position read has committed or never will. The lock goes with the
+--    statement's own transaction, which a cancelled statement or a vanished
+--    client ends too, so the puller can never leave it held, and a writer
+--    waits on it for that one statement at most. The barrier is per
+--    database, so no transaction elsewhere on the server holds a pull back.
+--    Rows from before 027 keep NULL and are never pulled: both databases of a
+--    pair start from one ledger and hold them already.
 CREATE SEQUENCE IF NOT EXISTS qbit_prism_sync_seq AS bigint;
 
 CREATE OR REPLACE FUNCTION qbit_prism_next_sync_seq()
@@ -56,6 +59,18 @@ RETURNS bigint LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
     PERFORM pg_advisory_xact_lock_shared(5787769093247467528);
     RETURN nextval('qbit_prism_sync_seq');
+END;
+$$;
+
+-- taken: whether no transaction that drew a sync_seq was open;
+-- sync_position: the sequence's last value then, NULL before the first draw.
+CREATE OR REPLACE FUNCTION qbit_prism_sync_barrier(OUT taken boolean, OUT sync_position bigint)
+LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    taken := pg_try_advisory_xact_lock(5787769093247467528);
+    IF taken THEN
+        SELECT CASE WHEN is_called THEN last_value END INTO sync_position FROM qbit_prism_sync_seq;
+    END IF;
 END;
 $$;
 
@@ -171,3 +186,8 @@ CREATE TABLE IF NOT EXISTS qbit_prism_peer_sync_conflicts (
     seen_count bigint NOT NULL DEFAULT 1 CHECK (seen_count > 0),
     PRIMARY KEY (source_table, row_key)
 );
+
+-- 8. Last, the share ledger and its header mappings (see 1): appends wait on
+--    these two from here to the commit only.
+ALTER TABLE qbit_prism_share_hashes ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;
+ALTER TABLE qbit_share_ledger ADD COLUMN IF NOT EXISTS origin_node smallint NOT NULL DEFAULT 0;

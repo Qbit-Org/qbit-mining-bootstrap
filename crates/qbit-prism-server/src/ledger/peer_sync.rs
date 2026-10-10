@@ -40,6 +40,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// rest of its transaction (migration 027), the puller exclusively.
 pub const SYNC_BARRIER_LOCK: i64 = 0x505249534d000008;
 
+/// The highest `share_seq` of `$1`'s rows, in the shape only the
+/// (origin_node, share_seq) index of migration 031 can serve.
+const HIGHEST_SHARE: &str =
+    "SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 \
+     ORDER BY origin_node DESC,share_seq DESC LIMIT 1";
+
 pub const SHARES: &str = "shares";
 pub const BLOCKS: &str = "blocks";
 pub const PREPARED: &str = "prepared";
@@ -332,35 +338,29 @@ pub mod peer {
 
     /// The peer's rows above `after`, in `share_seq` order, scanning at
     /// most `limit` rows of any origin and returning those `origin` wrote.
-    /// One repeatable-read snapshot, so the rows, their mappings and the
-    /// position reached agree.
+    /// One statement, so the rows, their mappings and the position reached
+    /// share its snapshot, and no snapshot outlives it.
     pub async fn shares_scanned(
         connection: &mut PgConnection,
         after: i64,
         limit: i64,
         origin: NodeIndex,
     ) -> Result<ShareBatch> {
-        let mut tx = repeatable_read(connection).await?;
-        let (through, scanned): (Option<i64>, i64) = sqlx::query_as(
-            "SELECT max(share_seq),count(*) FROM (SELECT share_seq FROM qbit_share_ledger \
-             WHERE share_seq>$1 ORDER BY share_seq LIMIT $2) scanned",
-        )
+        let row = sqlx::query(&format!(
+            "WITH scanned AS MATERIALIZED (SELECT share_seq FROM qbit_share_ledger \
+                WHERE share_seq>$1 ORDER BY share_seq LIMIT $2),\
+             bounds AS MATERIALIZED (SELECT max(share_seq) AS through,count(*) AS scanned FROM scanned),\
+             picked AS MATERIALIZED (SELECT s.* FROM qbit_share_ledger s WHERE s.origin_node BETWEEN $3 AND $3 \
+                AND s.share_seq>$1 AND s.share_seq<=(SELECT through FROM bounds) \
+                ORDER BY s.origin_node,s.share_seq) \
+             SELECT (SELECT through FROM bounds) AS through,(SELECT scanned FROM bounds) AS scanned,{PICKED_SHARES}"
+        ))
         .bind(after)
         .bind(limit)
-        .fetch_one(&mut *tx)
+        .bind(origin.index())
+        .fetch_one(&mut *connection)
         .await?;
-        let mut batch = ShareBatch {
-            through,
-            scanned,
-            rows: Value::Array(Vec::new()),
-            hashes: Value::Array(Vec::new()),
-            ..ShareBatch::default()
-        };
-        if let Some(through) = through {
-            fill_shares(&mut tx, &mut batch, after, Some(through), origin, None).await?;
-        }
-        tx.commit().await?;
-        Ok(batch)
+        share_batch(&row)
     }
 
     /// The rows `origin` wrote above `after`, at most `limit`, in
@@ -373,62 +373,55 @@ pub mod peer {
         limit: i64,
         origin: NodeIndex,
     ) -> Result<ShareBatch> {
-        let mut tx = repeatable_read(connection).await?;
-        let mut batch = ShareBatch {
-            rows: Value::Array(Vec::new()),
-            hashes: Value::Array(Vec::new()),
-            ..ShareBatch::default()
-        };
-        fill_shares(&mut tx, &mut batch, after, None, origin, Some(limit)).await?;
-        batch.through = batch.highest;
-        batch.scanned = i64::try_from(batch.row_count)?;
-        tx.commit().await?;
-        Ok(batch)
-    }
-
-    async fn fill_shares(
-        tx: &mut Transaction<'_, Postgres>,
-        batch: &mut ShareBatch,
-        after: i64,
-        through: Option<i64>,
-        origin: NodeIndex,
-        limit: Option<i64>,
-    ) -> Result<()> {
-        let row = sqlx::query(
-            "WITH picked AS MATERIALIZED (SELECT s.* FROM qbit_share_ledger s WHERE s.origin_node=$1 \
-                AND s.share_seq>$2 AND s.share_seq<=$3 ORDER BY s.share_seq LIMIT $4) \
-             SELECT COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.share_seq) FROM picked p),'[]'::jsonb) AS rows,\
-                COALESCE((SELECT jsonb_agg(to_jsonb(h) ORDER BY h.header_hash) FROM qbit_prism_share_hashes h \
-                    WHERE h.share_id IN (SELECT share_id FROM picked WHERE accepted)),'[]'::jsonb) AS hashes,\
-                (SELECT count(*) FROM picked) AS row_count,(SELECT max(share_seq) FROM picked) AS highest,\
-                (SELECT floor(extract(epoch FROM max(accepted_at))*1000)::bigint FROM picked) AS accepted_ms",
-        )
+        let row = sqlx::query(&format!(
+            "WITH picked AS MATERIALIZED (SELECT s.* FROM qbit_share_ledger s \
+                WHERE s.origin_node BETWEEN $1 AND $1 AND s.share_seq>$2 \
+                ORDER BY s.origin_node,s.share_seq LIMIT $3) \
+             SELECT (SELECT max(share_seq) FROM picked) AS through,\
+                (SELECT count(*) FROM picked) AS scanned,{PICKED_SHARES}"
+        ))
         .bind(origin.index())
         .bind(after)
-        .bind(through.unwrap_or(i64::MAX))
-        .bind(limit.unwrap_or(i64::MAX))
-        .fetch_one(&mut **tx)
+        .bind(limit)
+        .fetch_one(&mut *connection)
         .await?;
-        batch.rows = row.try_get("rows")?;
-        batch.hashes = row.try_get("hashes")?;
-        batch.row_count = usize::try_from(row.try_get::<i64, _>("row_count")?)?;
-        batch.highest = row.try_get("highest")?;
-        batch.highest_accepted_at_ms = row.try_get("accepted_ms")?;
-        Ok(())
+        share_batch(&row)
+    }
+
+    /// The columns both share reads return of their `picked` rows.
+    const PICKED_SHARES: &str = "COALESCE((SELECT jsonb_agg(to_jsonb(p) ORDER BY p.share_seq) FROM picked p),'[]'::jsonb) AS rows,\
+        COALESCE((SELECT jsonb_agg(to_jsonb(h) ORDER BY h.header_hash) FROM qbit_prism_share_hashes h \
+            WHERE h.share_id IN (SELECT share_id FROM picked WHERE accepted)),'[]'::jsonb) AS hashes,\
+        (SELECT count(*) FROM picked) AS row_count,(SELECT max(share_seq) FROM picked) AS highest,\
+        (SELECT floor(extract(epoch FROM max(accepted_at))*1000)::bigint FROM picked) AS accepted_ms";
+
+    fn share_batch(row: &PgRow) -> Result<ShareBatch> {
+        Ok(ShareBatch {
+            through: row.try_get("through")?,
+            scanned: row.try_get("scanned")?,
+            rows: row.try_get("rows")?,
+            hashes: row.try_get("hashes")?,
+            row_count: usize::try_from(row.try_get::<i64, _>("row_count")?)?,
+            highest: row.try_get("highest")?,
+            highest_accepted_at_ms: row.try_get("accepted_ms")?,
+        })
     }
 
     /// The highest `share_seq` and `sync_seq` the peer holds of rows
-    /// `origin` wrote, and of the journal's epochs.
+    /// `origin` wrote, and of the journal's epochs. The share read takes the
+    /// shape only the (origin_node, share_seq) index can serve: with an
+    /// equality on origin_node the planner may walk the primary key backward
+    /// through the other node's rows instead.
     pub async fn highest_of(
         connection: &mut PgConnection,
         origin: NodeIndex,
     ) -> Result<(Option<i64>, Option<i64>, Option<i64>)> {
-        Ok(sqlx::query_as(
-            "SELECT (SELECT max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1),\
+        Ok(sqlx::query_as(&format!(
+            "SELECT ({HIGHEST_SHARE}),\
              GREATEST((SELECT max(sync_seq) FROM qbit_pool_blocks WHERE origin_node=$1),\
                       (SELECT max(sync_seq) FROM qbit_prism_jobs WHERE origin_node=$1 AND job_id LIKE 'prepared:%')),\
-             (SELECT max(epoch) FROM qbit_prism_node_roles WHERE origin_node=$1)",
-        )
+             (SELECT max(epoch) FROM qbit_prism_node_roles WHERE origin_node=$1)"
+        ))
         .bind(origin.index())
         .fetch_one(&mut *connection)
         .await?)
@@ -443,7 +436,8 @@ pub mod peer {
         cap: i64,
     ) -> Result<i64> {
         Ok(sqlx::query_scalar(
-            "SELECT count(*) FROM (SELECT 1 FROM qbit_share_ledger WHERE origin_node=$1 AND share_seq>$2 LIMIT $3) beyond",
+            "SELECT count(*) FROM (SELECT 1 FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 \
+             AND share_seq>$2 ORDER BY origin_node,share_seq LIMIT $3) beyond",
         )
         .bind(origin.index())
         .bind(after)
@@ -452,34 +446,21 @@ pub mod peer {
         .await?)
     }
 
-    /// The peer's sync sequence position at the sync barrier, or `None` when
+    /// The peer's sync sequence position at the sync barrier, or `None` while
     /// a transaction that drew a `sync_seq` is still open (the barrier is
-    /// held shared): every `sync_seq` default holds the barrier shared until
-    /// its transaction ends, so while this session holds it exclusively no
-    /// row at or below the position read can still commit. Tried, never
-    /// waited for, so no writer ever queues behind the puller.
+    /// held shared). One call to `qbit_prism_sync_barrier()` (migration 027),
+    /// which tries the barrier exclusively for its own statement only and
+    /// reads the sequence under it: every row at or below the position read
+    /// has committed or never will. The lock ends with the statement, so a
+    /// puller that stalls or vanishes can never leave it held, and the
+    /// writers it shares the barrier with wait for that one statement at
+    /// most.
     pub async fn sync_barrier(connection: &mut PgConnection) -> Result<Option<Option<i64>>> {
-        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-            .bind(SYNC_BARRIER_LOCK)
-            .fetch_one(&mut *connection)
-            .await?;
-        if !taken {
-            return Ok(None);
-        }
-        let position = sqlx::query_scalar(
-            "SELECT CASE WHEN is_called THEN last_value END FROM qbit_prism_sync_seq",
-        )
-        .fetch_one(&mut *connection)
-        .await;
-        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-            .bind(SYNC_BARRIER_LOCK)
-            .fetch_one(&mut *connection)
-            .await?;
-        ensure!(
-            released,
-            "the sync barrier was not held when it was released"
-        );
-        Ok(Some(position?))
+        let (taken, position): (bool, Option<i64>) =
+            sqlx::query_as("SELECT taken,sync_position FROM qbit_prism_sync_barrier()")
+                .fetch_one(&mut *connection)
+                .await?;
+        Ok(taken.then_some(position))
     }
 
     /// Landed blocks `origin` wrote with `sync_seq` in `(after, through]`,
@@ -491,7 +472,6 @@ pub mod peer {
         through: Option<i64>,
         limit: i64,
     ) -> Result<Vec<BlockBundle>> {
-        let mut tx = repeatable_read(connection).await?;
         let rows = sqlx::query(
             "SELECT b.sync_seq,b.block_hash,to_jsonb(b) AS block,\
              (SELECT to_jsonb(a) FROM qbit_pool_audit_bundles a WHERE a.block_hash=b.block_hash) AS bundle,\
@@ -508,9 +488,8 @@ pub mod peer {
         .bind(after)
         .bind(through.unwrap_or(i64::MAX))
         .bind(limit)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *connection)
         .await?;
-        tx.commit().await?;
         rows.iter()
             .map(|row| {
                 Ok(BlockBundle {
@@ -537,7 +516,6 @@ pub mod peer {
         through: Option<i64>,
         limit: i64,
     ) -> Result<PreparedBatch> {
-        let mut tx = repeatable_read(connection).await?;
         let row = sqlx::query(
             "WITH picked AS MATERIALIZED (SELECT j.* FROM qbit_prism_jobs j WHERE j.origin_node=$1 \
                 AND j.job_id LIKE 'prepared:%' AND j.sync_seq>$2 AND j.sync_seq<=$3 \
@@ -553,9 +531,8 @@ pub mod peer {
         .bind(after)
         .bind(through.unwrap_or(i64::MAX))
         .bind(limit)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
-        tx.commit().await?;
         Ok(PreparedBatch {
             jobs: row.try_get("jobs")?,
             templates: row.try_get("templates")?,
@@ -573,16 +550,6 @@ pub mod peer {
         .bind(origin.index())
         .fetch_one(&mut *connection)
         .await?)
-    }
-
-    async fn repeatable_read(
-        connection: &mut PgConnection,
-    ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
-        let mut tx = sqlx::Connection::begin(connection).await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        Ok(tx)
     }
 }
 
@@ -639,12 +606,12 @@ impl Ledger {
         &self,
         origin: NodeIndex,
     ) -> Result<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
-        Ok(sqlx::query_as(
-            "SELECT (SELECT max(share_seq) FROM qbit_share_ledger WHERE origin_node=$1),\
+        Ok(sqlx::query_as(&format!(
+            "SELECT ({HIGHEST_SHARE}),\
              (SELECT max(sync_seq) FROM qbit_pool_blocks WHERE origin_node=$1),\
              (SELECT max(sync_seq) FROM qbit_prism_jobs WHERE origin_node=$1 AND job_id LIKE 'prepared:%'),\
-             (SELECT max(epoch) FROM qbit_prism_node_roles WHERE origin_node=$1)",
-        )
+             (SELECT max(epoch) FROM qbit_prism_node_roles WHERE origin_node=$1)"
+        ))
         .bind(origin.index())
         .fetch_one(&mut *self.acquire().await?)
         .await?)
@@ -799,6 +766,21 @@ impl Ledger {
         Ok(())
     }
 
+    /// The highest `share_seq` this node accepts from a pull: its attached
+    /// partitions and its own sequence, whichever reaches higher, plus
+    /// `PULL_HEADROOM_PARTITIONS` partitions.
+    async fn share_seq_ceiling(&self) -> Result<i64> {
+        let ceiling: i64 = sqlx::query_scalar(
+            "SELECT GREATEST((SELECT COALESCE(max(upper_seq),0) FROM qbit_prism_share_partitions WHERE state='attached'),\
+             (SELECT last_value FROM qbit_share_ledger_share_seq_seq))\
+             +$1*(SELECT partition_rows FROM qbit_prism_share_partitioning WHERE singleton)",
+        )
+        .bind(PULL_HEADROOM_PARTITIONS)
+        .fetch_one(&mut *self.acquire().await?)
+        .await?;
+        Ok(ceiling)
+    }
+
     /// Raise this node's share sequence above `highest`, a peer row about
     /// to be inserted, keeping its parity, under ORDER_LOCK so no append
     /// holds a lower value meanwhile. A no-op when it is already above.
@@ -839,8 +821,15 @@ impl Ledger {
     ) -> Result<Applied> {
         let mut applied = Applied::default();
         let own = origin == node;
+        // A key this far above what this node can hold is no key a node
+        // drew: raising the sequence to it would leave every local append
+        // without a partition. Refused below as a conflict, never raised to.
+        let ceiling = self.share_seq_ceiling().await?;
+        let acceptable = acceptable_highest(&batch.rows, ceiling)?;
         if batch.row_count > 0 {
-            if let Some(highest) = batch.highest.filter(|_| !own) {
+            // Above every row about to be inserted, the peer's and this node's
+            // own alike, before the lead is attached, so `ensure` covers them.
+            if let Some(highest) = acceptable {
                 self.raise_share_sequence_above(node, highest).await?;
             }
             crate::partitions::ensure_with_metrics(&self.pool, self.metrics.as_deref()).await?;
@@ -863,10 +852,13 @@ impl Ledger {
                  FROM mappings m JOIN qbit_prism_share_hashes h ON h.share_id=m.share_id WHERE h.header_hash<>m.header_hash \
                  UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is below every attached partition' FROM incoming i \
                  WHERE i.share_seq<(SELECT COALESCE(min(lower_seq),-1) FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NOT NULL) \
-                 AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NULL)",
+                 AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NULL) \
+                 UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is beyond any key a node draws here (above '||$3||')' \
+                 FROM incoming i WHERE i.share_seq>$3",
             )
             .bind(&batch.rows)
             .bind(&batch.hashes)
+            .bind(ceiling)
             .fetch_all(&mut *tx)
             .await?;
             let refused_ids: Vec<String> = refused.iter().map(|(id, _)| id.clone()).collect();
@@ -1045,17 +1037,28 @@ impl Ledger {
                         applied.add(table, count);
                     }
                 }
-                Err(error) => {
+                // Only a row this node holds under the same identity with
+                // other content skips the block, recorded and alerted. Any
+                // other failure (a lock or statement timeout, an I/O stall)
+                // rolls the whole transaction back with its cursor, so the
+                // next pass applies the block again: it is never lost.
+                Err(BlockRefused::Conflict(detail)) => {
                     savepoint.rollback().await?;
                     Self::record_conflict(
                         &mut tx,
                         "qbit_pool_blocks",
                         &block.block_hash,
                         origin,
-                        &format!("the block could not be applied: {error:#}"),
+                        &format!("the block could not be applied: {detail}"),
                     )
                     .await?;
                     applied.conflict("qbit_pool_blocks");
+                }
+                Err(BlockRefused::Failed(error)) => {
+                    return Err(error.context(format!(
+                        "applying peer block {}; it is retried on the next pass",
+                        block.block_hash
+                    )));
                 }
             }
         }
@@ -1068,6 +1071,16 @@ impl Ledger {
     }
 
     async fn insert_block(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        block: &BlockBundle,
+    ) -> Result<Vec<(&'static str, u64)>, BlockRefused> {
+        self.insert_block_rows(tx, block)
+            .await
+            .map_err(BlockRefused::classify)
+    }
+
+    async fn insert_block_rows(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         block: &BlockBundle,
@@ -1105,10 +1118,11 @@ impl Ledger {
                 .bind(snapshot)
                 .fetch_one(&mut **tx)
                 .await?;
-                ensure!(
-                    same,
-                    "its audit snapshot is held here with other content (D-15)"
-                );
+                if !same {
+                    return Err(anyhow::Error::new(HeldOtherwise(
+                        "its audit snapshot is held here with other content (D-15)",
+                    )));
+                }
             }
             rows.push(("qbit_prism_audit_snapshots", inserted));
         }
@@ -1354,6 +1368,68 @@ impl Ledger {
         self.record_conflict_alone(table, key, origin.index(), detail)
             .await
     }
+}
+
+/// Why a peer block was not applied.
+enum BlockRefused {
+    /// A row of it is held here under the same identity with other content:
+    /// it is skipped, recorded and alerted.
+    Conflict(String),
+    /// Anything else; the block is applied again on the next pass.
+    Failed(anyhow::Error),
+}
+
+/// A row held here under the same identity with other content.
+#[derive(Debug)]
+struct HeldOtherwise(&'static str);
+
+impl std::fmt::Display for HeldOtherwise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for HeldOtherwise {}
+
+impl BlockRefused {
+    /// A unique or exclusion violation, or a held row compared unequal, is a
+    /// conflict: the same key, other content. Every other error is not.
+    fn classify(error: anyhow::Error) -> Self {
+        if error.downcast_ref::<HeldOtherwise>().is_some() {
+            return Self::Conflict(format!("{error:#}"));
+        }
+        let conflict = error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|error| error.as_database_error())
+            .and_then(|error| error.code())
+            .is_some_and(|code| matches!(code.as_ref(), "23505" | "23P01"));
+        if conflict {
+            Self::Conflict(format!("{error:#}"))
+        } else {
+            Self::Failed(error)
+        }
+    }
+}
+
+/// How many partitions above what it can already hold a node accepts a
+/// pulled `share_seq`: at 2^24 rows a partition, days of the peer's appends
+/// even at peak, and few enough that attaching them stays within one
+/// `ensure`.
+const PULL_HEADROOM_PARTITIONS: i64 = 64;
+
+/// The highest `share_seq` among `rows` at or below `ceiling`.
+fn acceptable_highest(rows: &Value, ceiling: i64) -> Result<Option<i64>> {
+    let mut highest = None;
+    for row in rows.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let share_seq = row
+            .get("share_seq")
+            .and_then(Value::as_i64)
+            .context("a pulled share has no share_seq")?;
+        if share_seq <= ceiling {
+            highest = highest.max(Some(share_seq));
+        }
+    }
+    Ok(highest)
 }
 
 /// `a,b` with each name prefixed: `l.a,l.b`.

@@ -3658,7 +3658,7 @@ pub(crate) async fn undo_027(pool: &PgPool) -> Result<()> {
          DROP FUNCTION qbit_prism_peer_share_mark(), qbit_prism_preserve_node_roles(); \
          DROP INDEX qbit_pool_blocks_origin_sync_idx, qbit_prism_jobs_prepared_origin_sync_idx; \
          ALTER TABLE qbit_pool_blocks DROP COLUMN sync_seq; ALTER TABLE qbit_prism_jobs DROP COLUMN sync_seq; \
-         DROP FUNCTION qbit_prism_next_sync_seq(); DROP SEQUENCE qbit_prism_sync_seq;",
+         DROP FUNCTION qbit_prism_next_sync_seq(), qbit_prism_sync_barrier(); DROP SEQUENCE qbit_prism_sync_seq;",
     );
     for table in qbit_prism_server::peer_sync::COPIED_TABLES
         .iter()
