@@ -2018,7 +2018,7 @@ impl Fixture {
         }
         if let Some(mark) = mark {
             sqlx::query(
-                "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through,ingested_through) VALUES('shares',1,$1,$1)",
+                "INSERT INTO qbit_prism_peer_sync_cursors(stream,peer_node,scanned_through) VALUES('shares',1,$1)",
             )
             .bind(mark)
             .execute(&ledger.pool)
