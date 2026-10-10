@@ -968,7 +968,7 @@ id = "dual-writer-s02-a-dies"
 title = "S2: A dies (kill -9, PostgreSQL kill, freeze, network drop); miners move to B, which mines carry-free"
 owner = "#761"
 lanes = ["nightly", "pr"]
-criteria = "Miners reach B within the failover bound; B finds blocks whose priors are empty and whose deltas are non-negative; A's unsynced tail is measured; when A returns it ingests and confirms B's blocks and its next block pays down the carry they accrued (its priors equal the chain's sums); every acknowledged share ends on both nodes; invariants 1 to 4 hold. The freeze variant holds A frozen for at least 60 s while B keeps landing blocks and builds work on each before A thaws. The PR lane runs the kill -9 variant."
+criteria = "Miners reach B within the failover bound; B finds blocks whose priors are empty and whose deltas are non-negative; A's unsynced tail is measured; when A returns it ingests and confirms B's blocks and its next block pays down the carry they accrued (its priors equal the chain's sums); every acknowledged share ends on both nodes; invariants 1 to 4 hold. With A's PostgreSQL killed, A's frontend stops answering ready within 10 s (the balancer's first failed check on it) and is marked down within 12 s of that. The freeze variant holds A frozen for at least 60 s while B keeps landing blocks and builds work on each before A thaws. The PR lane runs the kill -9 variant."
 runs = false
 reason = "Needs the 3.1 stack: peer sync and own-log recovery, carry-free non-owner work and owner reconciliation, readiness (D1 to D4)."
 
