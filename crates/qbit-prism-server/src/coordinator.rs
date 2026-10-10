@@ -32,6 +32,7 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
+pub mod adoption;
 mod bundle_build;
 mod chain_observation;
 mod claim_release;
@@ -348,6 +349,9 @@ pub struct Coordinator {
     /// peer to hold what adopting it needs; `None` on a single writer or
     /// with `PRISM_PEER_INGEST_WAIT_MS=0`.
     peer_ingest: Option<crate::peer_sync::PeerIngestWait>,
+    /// 3.1 dual writer: the CTV broadcaster's view of the peer's node, the
+    /// finder of the zero-fee fanouts it may take over.
+    pub finder_liveness: crate::broadcaster::FinderLiveness,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -898,22 +902,13 @@ impl Coordinator {
             rpc.without_relay()
         };
         if let Some(address) = &config.fee_address {
-            let validation = rpc.call("validateaddress", json!([address])).await?;
-            let script = validation["scriptPubKey"]
-                .as_str()
-                .context("pool fee address has no script")?;
-            ensure!(
-                validation["isvalid"] == true
-                    && script.starts_with("5220")
-                    && hex::decode(script)?.len() == 34,
-                "pool fee address must be P2MR"
-            );
+            let program = pool_fee_address_program(&rpc, address).await?;
             config
                 .payout_policy
                 .pool_fee_policy
                 .as_mut()
                 .context("missing fee policy")?
-                .p2mr_program_hex = script[4..].into();
+                .p2mr_program_hex = program;
         }
         let genesis = rpc.call("getblockhash", json!([0])).await?;
         config.verify_genesis(genesis.as_str().context("qbit genesis hash missing")?)?;
@@ -964,6 +959,7 @@ impl Coordinator {
         }
         if let Some(dual) = &config.dual_writer {
             ledger.set_dual_writer_identity(dual.identity)?;
+            ledger.set_extranonce2_size(config.extranonce2_size)?;
         }
         // Keep a frontend's initial heartbeat non-quiescent if configuration
         // fails. Another live incarnation may share this instance ID, so this
@@ -1033,6 +1029,7 @@ impl Coordinator {
             submission_hold: Default::default(),
             peer_sync: Default::default(),
             peer_ingest,
+            finder_liveness: Default::default(),
         }))
     }
 
@@ -2823,12 +2820,15 @@ impl Coordinator {
         // overpay ceiling in the same transaction (#478). An unknown bound
         // is an error like any other here: nothing is reserved, nothing is
         // abandoned, and the claim is retried.
+        let mut reserved_current = false;
+        // The gate as the reservation finds it, at the latest.
+        let carry_generation = self.ledger.carry_gate_generation();
         match self
             .ledger
             .reserve_offer_within(claim, Some(self.config.capture_overpay_ceiling_bps))
             .await?
         {
-            OfferReservation::Reserved { bound: None } => {}
+            OfferReservation::Reserved { bound: None } => reserved_current = true,
             OfferReservation::Reserved { bound: Some(bound) } => {
                 self.metrics
                     .record_capture_decision(crate::metrics::CaptureDecision::Offered);
@@ -2904,6 +2904,27 @@ impl Coordinator {
         // Renewal failure cancels the attempt even between periodic ticks.
         // Recheck the strictly-live token at the external mutation boundary.
         self.renew_candidate(claim, lease).await?;
+        // 3.1 dual writer: the carry gate may have moved since the
+        // reservation took this carry-paying block for current work. Then
+        // nothing is sent: the reservation goes back to `pending`, due at
+        // once, and the next attempt's reservation takes the capture path
+        // (the bound, or abandonment with capture off). A leased candidate
+        // was reserved without a revision check, as before.
+        if reserved_current
+            && !candidate.leased
+            && self
+                .ledger
+                .carry_paying_unsendable(&candidate.window.prior_balances_digest, carry_generation)
+        {
+            let reason = format!(
+                "{}: the carry gate moved after this carry-paying block was reserved as current work; the reservation taken by {} was returned to pending for another attempt",
+                crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
+                self.config.instance_id
+            );
+            self.ledger.release_unmade_offer(claim, &reason).await?;
+            tracing::warn!(block = %candidate.block_hash, %reason, "the carry gate moved before the offer; the next attempt decides it again, through the capture path");
+            return Ok(());
+        }
         let (result, offered_at_ms) = self.submit_block(params).await?;
         // #522, #526: a call whose connection was never established, or
         // that the node answered from its warmup, provably did not run, so
@@ -3482,6 +3503,22 @@ fn job_deferral(error: &anyhow::Error) -> crate::metrics::JobDeferral {
         None if error.is::<JobFeeRefused>() => JobDeferral::FeeFloor,
         None => JobDeferral::Other,
     }
+}
+
+/// The 32-byte P2MR program, as hex, that a pool-fee address pays, checked
+/// through the node; shared by the frontend and the `carry-owner` scan.
+pub(crate) async fn pool_fee_address_program(rpc: &Rpc, address: &str) -> Result<String> {
+    let validation = rpc.call("validateaddress", json!([address])).await?;
+    let script = validation["scriptPubKey"]
+        .as_str()
+        .context("pool fee address has no script")?;
+    ensure!(
+        validation["isvalid"] == true
+            && script.starts_with("5220")
+            && hex::decode(script)?.len() == 34,
+        "pool fee address must be P2MR"
+    );
+    Ok(script[4..].into())
 }
 
 fn header_parent(block: &[u8]) -> Result<String> {

@@ -141,3 +141,15 @@ impl<'a> BlobTransaction<'a> {
 // of a hash semi-join scanning every live job. Preserve the outer expiry recheck
 // after a concurrent renewal's row-lock wait; selection grants no delete right.
 pub(super) const EXPIRED_JOBS: &str = "DELETE FROM qbit_prism_jobs WHERE job_id = ANY(ARRAY(SELECT job_id FROM qbit_prism_jobs WHERE expires_at < statement_timestamp() ORDER BY expires_at LIMIT 4096)) AND expires_at < clock_timestamp()";
+
+/// [`EXPIRED_JOBS`] in dual-writer mode (D-3): the peer's prepared records,
+/// copied by peer sync with the peer's own short expiry, stay until 24 hours
+/// after it, so this node can still adopt a block found on them after the
+/// peer died (S8; `coordinator/adoption.rs`). The templates and balance
+/// snapshots they reference stay with them, because the blob pruner keeps
+/// every referenced blob. `$1` is this node's `origin_node` and `$2` the
+/// peer's. Each node's rows are selected by their own range of the
+/// `(origin_node, expires_at)` order, so retained peer rows never starve
+/// this node's expired ones of the batch, and with an index on those columns
+/// neither side scans the other's rows.
+pub(super) const EXPIRED_JOBS_DUAL_WRITER: &str = "DELETE FROM qbit_prism_jobs WHERE job_id = ANY(ARRAY(SELECT job_id FROM (SELECT job_id FROM qbit_prism_jobs WHERE origin_node = $1 AND expires_at < statement_timestamp() ORDER BY expires_at LIMIT 4096) own UNION ALL SELECT job_id FROM (SELECT job_id FROM qbit_prism_jobs WHERE origin_node = $2 AND expires_at < statement_timestamp() - interval '24 hours' ORDER BY expires_at LIMIT 4096) peer)) AND expires_at < clock_timestamp() - CASE WHEN origin_node = $1 THEN interval '0' ELSE interval '24 hours' END";

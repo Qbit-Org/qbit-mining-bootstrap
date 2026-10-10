@@ -98,7 +98,104 @@ struct LostAttempt<'a> {
     error: &'a str,
 }
 
+/// Dual writer: how long a zero-fee fanout found on the peer's work waits for
+/// the finder's node before this node may sponsor it: since its block matured
+/// here, and since the newest work of the finder's this node holds (a synced
+/// prepared record). The broadcaster also reads the finder's own database
+/// live (`broadcaster::finder_silent`): a finder that is alive publishes work
+/// every few minutes, so its fanouts are not taken over while it can be read.
+pub const SPONSOR_TAKEOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Why this node may fund a zero-fee fanout's CPFP child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FanoutSponsor {
+    /// The fanout's block was found on this node's work, or this is a single
+    /// writer.
+    Finder,
+    /// Dual writer: found on the peer's work, and this node holds a CPFP
+    /// package for it, from a takeover it started and finishes.
+    Held,
+    /// Dual writer: found on the peer's work; its block matured here, and
+    /// the finder's newest work this node holds was published, at least
+    /// [`SPONSOR_TAKEOVER_AFTER`] ago. The broadcaster takes it over if the
+    /// finder's own database, when it can be read, agrees.
+    Overdue,
+}
+
+/// The newest work of node `$1` this database holds: a prepared record, by
+/// the time it records. One definition for the ledger's overdue fence and
+/// for the age the broadcaster reads live from the peer's database.
+macro_rules! newest_work_sql {
+    () => {
+        "SELECT created_at FROM qbit_prism_jobs WHERE origin_node=$1 AND sync_seq IS NOT NULL AND job_id LIKE 'prepared:%' ORDER BY sync_seq DESC LIMIT 1"
+    };
+}
+
+/// A fanout's finder (by its origin and its block's coinbase), whether this
+/// node holds a CPFP package for it, and whether it is overdue: its block
+/// matured here, and the newest work of node `$1` (the peer) this node holds
+/// was published, at least `$2` seconds ago. The fanout is `$3`.
+const FANOUT_SPONSOR_SQL: &str = concat!(
+    "SELECT artifact.origin_node,fanout_set.parent_coinbase_tx_hex,",
+    "EXISTS(SELECT 1 FROM qbit_prism_cpfp_packages package WHERE package.fanout_txid=artifact.fanout_txid) AS held,",
+    "COALESCE(block.matured_at<=clock_timestamp()-make_interval(secs=>$2),false) ",
+    "AND NOT EXISTS(SELECT 1 FROM (",
+    newest_work_sql!(),
+    ") newest WHERE newest.created_at>clock_timestamp()-make_interval(secs=>$2)) AS overdue ",
+    "FROM qbit_ctv_fanout_artifacts artifact JOIN qbit_ctv_fanout_sets fanout_set ON fanout_set.block_hash=artifact.block_hash ",
+    "LEFT JOIN qbit_pool_blocks block ON block.block_hash=artifact.block_hash WHERE artifact.fanout_txid=$3"
+);
+
+/// How long ago node `$1` published its newest work held in this database
+/// (`newest_work_sql!`), by this database's clock, in seconds; no row when it
+/// holds none. Run on the peer's own database, it ages the peer's work by the
+/// peer's own clock.
+pub const WORK_AGE_SQL: &str = concat!(
+    "SELECT EXTRACT(EPOCH FROM clock_timestamp()-created_at)::float8 FROM (",
+    newest_work_sql!(),
+    ") newest"
+);
+
 impl Ledger {
+    /// Whether, and why, this node may sponsor (CPFP) the zero-fee fanout
+    /// `fanout_txid` (`None`: the finder's node does). A single writer always
+    /// does. In dual-writer mode the node whose work the block was found on
+    /// does ([`Ledger::found_here`]), whichever node landed it, so the two
+    /// nodes do not fund conflicting children; the other node only once the
+    /// fanout is overdue, or to finish a package it holds.
+    pub async fn fanout_sponsor(&self, fanout_txid: &str) -> Result<Option<FanoutSponsor>> {
+        let Some(own) = self.own_node() else {
+            return Ok(Some(FanoutSponsor::Finder));
+        };
+        let (origin, coinbase, held, overdue): (i16, String, bool, bool) =
+            sqlx::query_as(FANOUT_SPONSOR_SQL)
+                .bind(1 - own)
+                .bind(SPONSOR_TAKEOVER_AFTER.as_secs_f64())
+                .bind(fanout_txid)
+                .fetch_one(&mut *self.acquire().await?)
+                .await?;
+        let coinbase = hex::decode(coinbase).ok();
+        Ok(if self.found_here(coinbase.as_deref(), origin == own) {
+            Some(FanoutSponsor::Finder)
+        } else if held {
+            Some(FanoutSponsor::Held)
+        } else if overdue {
+            Some(FanoutSponsor::Overdue)
+        } else {
+            None
+        })
+    }
+
+    /// How long ago node `origin` published its newest work this database
+    /// holds ([`WORK_AGE_SQL`]); `None` when it holds none.
+    pub async fn work_age(&self, origin: i16) -> Result<Option<std::time::Duration>> {
+        let seconds: Option<f64> = sqlx::query_scalar(WORK_AGE_SQL)
+            .bind(origin)
+            .fetch_optional(&mut *self.acquire().await?)
+            .await?;
+        Ok(seconds.map(|seconds| std::time::Duration::from_secs_f64(seconds.max(0.))))
+    }
+
     /// Renew only a token that still holds the fanout. A worker another
     /// instance took over must not revive itself before wallet or network
     /// mutations. Fenced on the token alone (#654): whether the lease is
@@ -286,6 +383,15 @@ impl Ledger {
         vout: u32,
         value: u64,
     ) -> Result<bool> {
+        // Dual writer: a fanout found on the peer's work is funded from this
+        // wallet only once it is overdue, by the block's maturity and the
+        // finder's newest work held here; this refuses anything earlier. The
+        // broadcaster also reads the finder's own database first.
+        ensure!(
+            self.fanout_sponsor(&claim.fanout_txid).await?.is_some(),
+            "fanout {} was found on the peer's work, whose node sponsors it until it is overdue for a takeover",
+            claim.fanout_txid
+        );
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         require_fanout(&mut tx, claim).await?;

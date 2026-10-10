@@ -176,6 +176,38 @@ pub fn witness_merkle_leaves_from_block(block: &[u8]) -> Result<Vec<String>> {
     Ok(leaves)
 }
 
+/// The coinbase transaction of an assembled block, as serialized there.
+pub fn coinbase_from_block(block: &[u8]) -> Result<&[u8]> {
+    ensure!(block.len() >= 80, "truncated block header");
+    let mut c = Cursor {
+        bytes: block,
+        offset: 80,
+    };
+    let count = c.count().context("block transaction count")?;
+    ensure!(count > 0, "block declares no transactions");
+    let rest = block
+        .get(c.offset..)
+        .context("truncated block transaction list")?;
+    let layout = walk_transaction(rest).context("block coinbase")?;
+    Ok(&rest[..layout.len])
+}
+
+/// The scriptSig of a coinbase transaction's one input.
+pub fn coinbase_script_sig(tx: &[u8]) -> Result<&[u8]> {
+    ensure!(tx.len() >= 10, "transaction is too short");
+    let mut c = Cursor {
+        bytes: tx,
+        offset: 4,
+    };
+    if tx[4] == 0 && tx[5] != 0 {
+        c.take(2)?;
+    }
+    ensure!(c.count()? == 1, "a coinbase has exactly one input");
+    c.take(36)?;
+    let length = c.count()?;
+    c.take(length)
+}
+
 pub fn split_coinbase_extranonce(tx: &[u8], placeholder: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     ensure!(
         tx.len() >= 10 && !placeholder.is_empty(),

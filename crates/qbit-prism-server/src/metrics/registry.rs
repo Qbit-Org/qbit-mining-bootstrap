@@ -1,5 +1,8 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
-use super::{Labels, LockKind, OrderLockHolder, Outcome, RefreshAcquisition, RefreshTrigger};
+use super::{
+    CarryOwnerState, Labels, LockKind, OrderLockHolder, Outcome, PeerCheckResult,
+    RefreshAcquisition, RefreshTrigger,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -105,6 +108,9 @@ families! {
     OfferStandbyWaits: Counter, "block_offer_standby_wait_total", "Found-block offers that waited for the failover standby's WAL flush first (#529, PRISM_OFFER_STANDBY_APPLICATION_NAME), by how the wait ended; every one was offered.";
     DivergentLandings: Counter, "divergent_landings_total", "Confirmations this instance committed whose landed rows started to count on canonical balances other than their as-issued prior balances.";
     DivergentOverpay: Counter, "divergent_landing_overpay_sats_total", "Carry-forward debt, in sats, created by the divergent confirmations this instance committed.";
+    CarryOwnerState: Gauge, "carry_owner_state", "Dual writer: one sample per carry owner guard state, 1 for the state this frontend builds work in and 0 for the others: paying, or why its work is carry-free; no samples in single-writer mode.";
+    CarryOwnerAlert: Gauge, "carry_owner_alert", "Dual writer: 1 while the carry owner guard needs an operator, a carry-free state other than not_owner or peer_unconfirmed, else 0; no sample in single-writer mode.";
+    CarryOwnerPeerChecks: Counter, "carry_owner_peer_checks_total", "Dual writer: live reads of the peer's node-role journal by this frontend's carry owner guard, by result; no samples in single-writer mode.";
     CarryForwardDebt: Gauge, "carry_forward_debt_sats", "Sum of negative carry-forward balances, in sats, read from the canonical balances at this instance's latest balance change or full refresh, or -1 before one.";
     NodePeers: Gauge, "node_peers", "Node peer connections from the latest node observation, or -1 when unknown.";
     NodeIbd: Gauge, "node_initial_block_download", "Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown.";
@@ -273,6 +279,26 @@ impl Registry {
                             Sample::Pending,
                         );
                     }
+                }
+            }
+            Family::CarryOwnerState => {
+                for state in CarryOwnerState::ALL {
+                    self.samples.insert(
+                        (family, Labels::One(("state", state.as_str()))),
+                        Sample::Pending,
+                    );
+                }
+            }
+            Family::CarryOwnerAlert => {
+                self.samples
+                    .insert((family, Labels::Empty), Sample::Pending);
+            }
+            Family::CarryOwnerPeerChecks => {
+                for result in PeerCheckResult::ALL {
+                    self.samples.insert(
+                        (family, Labels::One(("result", result.as_str()))),
+                        Sample::Pending,
+                    );
                 }
             }
             Family::OrderLockHold => {

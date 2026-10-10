@@ -38,7 +38,22 @@
       "status": "The sum over committed divergent confirmations of the carry-forward debt each created: per account, the increase in max(0, -balance) when the block's rows start to count. Unrecovered while the indebted miner earns no further gross; see the ledger operations guide for the accepted-cost bound. Process-local; starts at zero. No firing rule."
     },
     "carry_forward_debt_sats": {
-      "status": "Read from the canonical balances after every confirmation or deactivation this frontend commits and at every full refresh snapshot; zero when no account is negative. Process-local. No firing rule."
+      "status": "Read from the canonical balances after every confirmation or deactivation this frontend commits and at every full refresh snapshot that reads them; a dual-writer carry-free snapshot reads no balances and leaves it unchanged. Zero when no account is negative. Process-local. No firing rule."
+    },
+    "carry_owner_state": {
+      "labels": {
+        "state": "CarryOwnerState"
+      },
+      "status": "Set by the carry owner guard (`carry_owner.rs`) at every check, about every 2 s, in dual-writer mode only. `paying`: the setting `PRISM_CARRY_OWNER`, this node's latest `qbit_prism_node_roles` row and a live read of the peer since this process started agree that this node is the only carry owner, and, if the peer's latest row is a `release`, this node's claim is the `acquire` that `carry-owner transfer` wrote after it. Every other state builds carry-free work (empty prior balances): `not_owner` is the configured non-owner, `peer_unconfirmed` an owner waiting for its first live read of the peer, `setting_pending` a `carry-owner release` or `transfer` waiting for its `PRISM_CARRY_OWNER` change (it sets the alert after 30 minutes), and the rest set `qbit_prism_carry_owner_alert` (docs/prism-ledger-ops.md, \"Carry owner\"). Process-local; no samples until the guard's first decision."
+    },
+    "carry_owner_alert": {
+      "status": "Dual writer only. Fire on 1 held for a few minutes: the guard is in `config_mismatch`, `setting_pending` for 30 minutes or more, `node_unidentified`, `own_journal_behind_peer`, `own_journal_rolled_back`, `claim_not_vetted`, `peer_claims_ownership` or `peer_journal_behind`, or in `no_journal_row` or `peer_not_seeded` after its start-up (2 minutes after the own-log latch is first set, or 10 minutes if it never is; see `qbit_prism_carry_owner_state`). Carry payments wait while it is 1; nothing is paid twice. Process-local; no sample until the guard's first decision."
+    },
+    "carry_owner_peer_checks_total": {
+      "labels": {
+        "result": "PeerCheckResult"
+      },
+      "status": "Dual writer only, and only on a node whose setting and journal claim ownership: the others need no peer read. `failed` counts reads that could not reach or read the peer's journal; an owner confirmed since its start keeps paying through them, because the peer can acquire ownership only after reading this node's `release` row. Process-local; no samples until the first check."
     },
     "ctv_fanout_broadcaster_tip_refresh_yields_total": {
       "replaces": ["qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"]

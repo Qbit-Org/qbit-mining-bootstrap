@@ -102,6 +102,11 @@ pub fn expected(populated: bool) -> Census {
         series: BTreeSet::new(),
     };
     let unlabelled = [String::new()];
+    let carry_owner_states = labels(
+        "state",
+        "paying,not_owner,node_unidentified,no_journal_row,config_mismatch,setting_pending,own_journal_behind_peer,own_journal_rolled_back,claim_not_vetted,peer_claims_ownership,peer_journal_behind,peer_not_seeded,peer_unconfirmed",
+    );
+    let peer_checks = labels("result", "answered,failed");
     for name in [
         "ctv_fanout_broadcaster_tip_refresh_yields_total",
         "accepted_shares_total",
@@ -368,6 +373,25 @@ pub fn expected(populated: bool) -> Census {
         "hashrate_rollup_watermark_lag_seconds",
         "gauge",
         if populated { &unlabelled } else { &[] },
+        &[],
+    );
+    // PRISM 3.1: only a dual-writer frontend's carry owner guard samples these.
+    result.family(
+        "carry_owner_state",
+        "gauge",
+        if populated { &carry_owner_states } else { &[] },
+        &[],
+    );
+    result.family(
+        "carry_owner_alert",
+        "gauge",
+        if populated { &unlabelled } else { &[] },
+        &[],
+    );
+    result.family(
+        "carry_owner_peer_checks_total",
+        "counter",
+        if populated { &peer_checks } else { &[] },
         &[],
     );
     result

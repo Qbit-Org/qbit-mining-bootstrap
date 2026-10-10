@@ -227,6 +227,9 @@ impl Metrics {
         // likewise its window snapshots' origin-index check (D2).
         for family in [
             Family::FirstOffer,
+            Family::CarryOwnerState,
+            Family::CarryOwnerAlert,
+            Family::CarryOwnerPeerChecks,
             Family::LockWait,
             Family::OrderLockHold,
             Family::RefreshSeconds,

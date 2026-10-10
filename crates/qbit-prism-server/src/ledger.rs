@@ -29,6 +29,8 @@ pub use audit::{
 mod candidates;
 #[cfg(test)]
 pub(crate) use candidates::faults as candidate_faults;
+mod carry;
+pub use carry::{bump_payout_revision, carry_free_prior_digest, CarryGate};
 mod claim_observer;
 pub use candidates::revoke_candidate_claims;
 pub use candidates::{
@@ -51,7 +53,7 @@ pub use divergence::{
     rows_divergence, AccountOverpay, CarryRow, LandingDivergence, OfferReservation, OverpayBound,
 };
 mod fanout;
-pub use fanout::revoke_fanout_claims;
+pub use fanout::{revoke_fanout_claims, FanoutSponsor, SPONSOR_TAKEOVER_AFTER, WORK_AGE_SQL};
 mod fatal_state;
 pub use fatal_state::{integrity_report_bounded, require_operator_reason, FATAL_STATE_CLEAR_BOUND};
 mod instances;
@@ -146,6 +148,10 @@ pub struct Ledger {
     /// The CTV fanout claims this frontend has watched, timed the same way
     /// (#654).
     fanout_claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
+    /// Which prior balances work is built on (PRISM 3.1 dual writer). Open
+    /// for good in single-writer mode. Shared across clones, so the owner
+    /// guard's decision reaches every handle of the frontend.
+    carry: std::sync::Arc<CarryGate>,
     #[cfg(test)]
     pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
     #[cfg(test)]
