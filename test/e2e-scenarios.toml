@@ -922,3 +922,124 @@ lane_checks = [
   "public-api-lists-found-blocks",
 ]
 notes = "scripts/prism_shipped_image_lane.py; the report, client logs and Compose logs are the `prism-shipped-images` artifact."
+
+# ---------------------------------------------------------------------------
+# PRISM 3.1 dual writer (two independent writers, one carry owner): the
+# scenario matrix of the effort's contract, §5, run by crates/qbit-prism-dual-sim
+# on a simulated pair (two PostgreSQL 16 primaries, two frontends, one qbitd
+# per node and one for the network, a balancer stand-in routing by /healthz,
+# Stratum load through it, a fault injector) and held to the contract's §4
+# payout invariants by its checker. Each test writes report.md,
+# report.json and invariants.json; the fast lane (`pr`) is the
+# prism-dual-writer job of ci.yml, the full matrix the dual-writer-nightly
+# job. A scenario that needs the 3.1 stack's code runs once the stack's
+# branches provide it.
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "dual-writer-checker-control"
+title = "Dual-writer checker control: two unsynced single writers fail exactly the checks they must"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Two single-writer nodes on independent databases with nothing between them, both taking miners and each finding a block: the checker fails invariant 3's landing rows and fanouts, the share-presence check, window reproducibility and the owner's balance view, each naming the other node's block or shares, and passes every other check. A checker that passed this would prove nothing elsewhere."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks"]
+
+[[scenario]]
+id = "dual-writer-s10-single-writer"
+title = "S10: with dual mode off, the 3.0 pair keeps every share and pays exactly through a frontend kill"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "On the 3.0 pair (one writer, B a streaming standby, both frontends writing A's database), under load through the balancer stand-in: a block on each node, A's frontend killed with SIGKILL, the balancer marks A down within 10 s, miners move to B with a first accepted share within 30 s, B finds a block, A returns and miners fail back, A finds a block. Every acknowledged share is in the writer, every pool block on the chain is landed, audited by qbit-prism-audit-verify against the chain's coinbase and paid without raising any account's debt, the standby holds every landing, and no node reports a dual-writer mode."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill"]
+
+[[scenario]]
+id = "dual-writer-s01-steady-state"
+title = "S1: A preferred and B idle; A's shares and blocks reach B within the sync interval"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Every miner on A; A's shares appear on B within 2 s (p95), its blocks are landed and confirmed on both nodes, every window recomputes to its digest on both nodes, and both nodes report their dual-writer identity."
+runs = false
+reason = "Needs the 3.1 stack's peer sync, window cuts and dual-writer health (D1 to D4)."
+
+[[scenario]]
+id = "dual-writer-s02-a-dies"
+title = "S2: A dies (kill -9, PostgreSQL kill, freeze, network drop); miners move to B, which mines carry-free"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "Miners reach B within the failover bound; B finds blocks whose priors are empty and whose deltas are non-negative; A's unsynced tail is measured; when A returns it ingests and confirms B's blocks and its next block pays down the carry they accrued (its priors equal the chain's sums); every acknowledged share ends on both nodes; invariants 1 to 4 hold. The PR lane runs the kill -9 variant."
+runs = false
+reason = "Needs the 3.1 stack: peer sync and own-log recovery, carry-free non-owner work and owner reconciliation, readiness (D1 to D4)."
+
+[[scenario]]
+id = "dual-writer-s03-b-dies"
+title = "S3: B dies; A is unaffected and B catches up when it returns"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "A's miners see no gap above 2 s across B's death, A keeps mining, and B, back, holds A's blocks and shares; invariants hold."
+runs = false
+reason = "Needs the 3.1 stack's peer sync (D1)."
+
+[[scenario]]
+id = "dual-writer-s04-link-cut"
+title = "S4: the link between the databases cut with both nodes alive"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "No mining impact at the cut or the heal (no gap above 2 s); a block A finds during the cut is absent from B until the heal, then landed on both; the sync catches up within 60 s; nothing is paid twice."
+runs = false
+reason = "Needs the 3.1 stack's peer sync (D1)."
+
+[[scenario]]
+id = "dual-writer-s05-both-write"
+title = "S5: both nodes take miners and write at once"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "With a misrouting balancer both nodes accept shares and find interleaved blocks; every block lands on both nodes, B's are carry-free, no share or carry is credited or paid twice, and windows match on both nodes."
+runs = false
+reason = "Needs the 3.1 stack: peer sync, window cuts and the carry owner (D1 to D3)."
+
+[[scenario]]
+id = "dual-writer-s06-restore"
+title = "S6: a node restored from an older base backup pulls its own missing rows back before it is ready"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Restored to a backup older than its last block, the node reports not ready until it holds every row of its own that its peer holds; no row is lost or duplicated, its sequences continue above what it recovered, and invariants hold. Run for each node."
+runs = false
+reason = "Needs the 3.1 stack's own-log recovery and readiness (D1, D4)."
+
+[[scenario]]
+id = "dual-writer-s07-disk-replaced"
+title = "S7: a node's disk replaced and rebuilt from its peer"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "The node is rebuilt from its peer and re-personalised; only its own unsynced tail at the moment it died is lost, measured and reported; every other acknowledged share and every pool block's landing rows are on both nodes."
+runs = false
+reason = "Needs the 3.1 stack's rebuild procedure (D1, D5)."
+
+[[scenario]]
+id = "dual-writer-s08-block-at-death"
+title = "S8: a block found at the instant its node dies"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Whether the dying node's block reached its qbitd or not, it ends landed once on both nodes or adoptable, and nothing is paid twice."
+runs = false
+reason = "Needs the 3.1 stack's prepared-work copy and adoption path (D3)."
+
+[[scenario]]
+id = "dual-writer-s09-migration"
+title = "S9: a 3.0 single-writer ledger with history, carry and blocks cut over to dual mode"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "Balances, the integrity and divergence reports, every table's content digests and every audit are unchanged by the cutover on both nodes; every pre-cutover row is node 0; the first owner job's priors equal the pre-cutover balances; both nodes then mine in dual mode with every invariant holding."
+runs = false
+reason = "Needs the 3.1 stack and its cutover procedure (D1 to D5)."
+
+[[scenario]]
+id = "dual-writer-s11-carry-owner-transfer"
+title = "S11: the carry-owner transfer drill"
+owner = "#761"
+lanes = ["nightly"]
+criteria = "The guarded transfer is refused while an own block on the active chain lacks local landing rows, and succeeds once it is resolved; exactly one owner remains."
+runs = false
+reason = "Needs the 3.1 stack's carry-owner transfer command (D3)."

@@ -1400,6 +1400,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "qbit-prism-dual-sim"
+version = "3.0.0-rc.6"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "hex",
+ "libc",
+ "qbit-pool-builder",
+ "qbit-prism",
+ "qbit-prism-load",
+ "qbit-prism-server",
+ "qbit-prism-test-gate",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "qbit-prism-load"
 version = "3.0.0-rc.6"
 dependencies = [

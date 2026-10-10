@@ -1,0 +1,11 @@
+# The full dual-writer scenario matrix (crates/qbit-prism-dual-sim,
+# CONTRACT.md §5 of the 3.1 effort), run nightly and on dispatch by the
+# dual-writer-nightly job of .github/workflows/prism-load-nightly.yml:
+# qbit-prism-dual-sim::scenarios once with these ids, --ignored --exact
+# --test-threads=1, in required integration mode, each proven executed with
+# scripts/check_gate_manifest.py. A superset of the PR fast lane
+# (test/prism-dual-writer-gated-tests.txt). One
+# `<package>::<binary>::<test>` id per line, sorted; each is named in
+# test/e2e-scenarios.toml.
+qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks
+qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill
