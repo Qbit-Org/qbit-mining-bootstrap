@@ -752,3 +752,85 @@ fn randomized_cut_windows_fold_the_same_on_both_nodes_and_verify() {
             .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
     }
 }
+
+#[test]
+fn a_share_id_from_both_nodes_in_one_window_is_refused_not_credited_twice() {
+    // The share-hash registry keeps one header's credit on one node, and the
+    // peer sync records a second copy as a conflict instead of inserting it.
+    // Were a copy ever to reach a window anyway, the fold refuses the window
+    // outright, in the builder and in every verifier.
+    let fixture = fixture();
+    let mut shares = fixture.shares.clone();
+    let mut copy = shares
+        .iter()
+        .find(|share| share.share_seq == 38)
+        .unwrap()
+        .clone();
+    copy.share_seq = 39;
+    let index = shares
+        .iter()
+        .position(|share| share.share_seq == 39)
+        .unwrap();
+    shares[index] = copy.clone();
+    for parallelism in [Parallelism::serial(), Parallelism::new(3, 2)] {
+        let error = build(
+            false,
+            &shares,
+            &fixture.found_block,
+            Some(fixture.window_cut),
+            &fixture.prior_balances,
+            parallelism,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, PrismError::DuplicateShareId { share_id } if *share_id == copy.share_id),
+            "{error:?}"
+        );
+    }
+}
+
+/// The CTV-settlement build of the fixture, pinned as `DUAL_WRITER_GOLDEN`
+/// pins the coinbase-options build: the reward manifest (and its cut) also
+/// feeds every fan-out precommitment. Never re-record.
+const DUAL_WRITER_CTV_GOLDEN: DualWriterGolden = DualWriterGolden {
+    canonical_sha256: "d458b2b670ea1ea7c0ab31d3f3f537a7bf29d7be2aa2fce3df14e31b22481ec5",
+    reward_manifest_sha256: "55f8f89c61ef7ecf29c5e4b779f230006dd5c722b673ad7887f8eeadb4a3ab26",
+    audit_commitment_root: "aa671e5a9e32925d990fec850c2c43161a9a7d7913bfa33b997b30f761d35eb1",
+};
+
+#[test]
+fn the_ctv_settlement_build_of_the_fixture_is_pinned() {
+    let fixture = fixture();
+    let body = build(
+        true,
+        &fixture.shares,
+        &fixture.found_block,
+        Some(fixture.window_cut),
+        &fixture.prior_balances,
+        Parallelism::serial(),
+    )
+    .unwrap();
+    assert!(body.ctv_fanout_manifest_set.is_some());
+    let bytes = canonical_audit_bundle_bytes_from_parts(&body, &fixture.shares).unwrap();
+    let golden = DUAL_WRITER_CTV_GOLDEN;
+    assert_eq!(sha256_hex(&bytes), golden.canonical_sha256);
+    assert_eq!(
+        sha256_hex(&canonical_reward_manifest_bytes(&body.reward_manifest).unwrap()),
+        golden.reward_manifest_sha256
+    );
+    assert_eq!(
+        body.audit_commitment_root_hex.as_deref(),
+        Some(golden.audit_commitment_root)
+    );
+    // The same manifest as the coinbase-options build: only settlement differs.
+    let plain = build(
+        false,
+        &fixture.shares,
+        &fixture.found_block,
+        Some(fixture.window_cut),
+        &fixture.prior_balances,
+        Parallelism::serial(),
+    )
+    .unwrap();
+    assert_eq!(body.reward_manifest, plain.reward_manifest);
+}
