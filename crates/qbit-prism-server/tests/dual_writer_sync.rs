@@ -1631,3 +1631,64 @@ async fn the_origin_share_reads_never_walk_the_other_nodes_rows() -> Result<()> 
     .await;
     db.close(result).await
 }
+
+/// D-9: a database whose identity changes under the running frontend stops
+/// it, reporting it not ready and refusing every share until it has exited:
+/// an origin default that drifts, and an identity row rewritten as the other
+/// node's, each after the sync saw the database ready.
+#[tokio::test]
+async fn a_frontend_whose_identity_changes_while_it_runs_stops() -> Result<()> {
+    use qbit_prism_server::{ledger::OwnLogLost, peer_sync::FrontendStop};
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        // A drifted origin default on A.
+        let (mut on_a, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let status = on_a.subscribe();
+        ensure!(on_a.pass().await?.own_log_caught_up);
+        sqlx::raw_sql("ALTER TABLE qbit_pool_blocks ALTER COLUMN origin_node SET DEFAULT 1")
+            .execute(&pair.a.pool)
+            .await?;
+        on_a.recheck_identity();
+        let stopped = on_a.pass().await;
+        ensure!(
+            stopped.as_ref().is_err_and(|error| matches!(
+                error.downcast_ref::<FrontendStop>(),
+                Some(FrontendStop::IdentityChanged(_))
+            )),
+            "{stopped:?}"
+        );
+        ensure!(
+            !status.borrow().own_log_caught_up,
+            "a stopping node still reports ready"
+        );
+        let refused = append(&pair.a, &["drifted"]).await;
+        ensure!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<OwnLogLost>().is_some()),
+            "{refused:?}"
+        );
+        // B's identity row rewritten as the other node's.
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        let status = on_b.subscribe();
+        ensure!(on_b.pass().await?.own_log_caught_up);
+        sqlx::raw_sql("UPDATE qbit_prism_node_identity SET node_index=0")
+            .execute(&pair.b.pool)
+            .await?;
+        on_b.recheck_identity();
+        let stopped = on_b.pass().await;
+        ensure!(
+            stopped.as_ref().is_err_and(|error| matches!(
+                error.downcast_ref::<FrontendStop>(),
+                Some(FrontendStop::IdentityChanged(_))
+            )),
+            "{stopped:?}"
+        );
+        ensure!(!status.borrow().own_log_caught_up);
+        ensure!(pair.b.own_log_lost());
+        Ok(())
+    })
+    .await
+}

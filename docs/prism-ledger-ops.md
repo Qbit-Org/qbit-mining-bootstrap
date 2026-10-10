@@ -3810,7 +3810,11 @@ A dual-writer frontend checks its database at start. If a default, a key
 sequence's parity or the session range was changed after personalisation, it
 refuses to start, naming each, until `node-identity set` runs again. A
 database with no identity, or the other node's, is reported: the frontend runs,
-but the peer sync does not, and the frontend admits no miners.
+but the peer sync does not, and the frontend admits no miners. The peer sync
+checks the database again every 30 seconds. Once it has seen the database
+ready, a change of any of these while the frontend runs stops the frontend with
+an `ALERT`, refusing every share until it has exited. Its restart applies the
+checks above.
 
 ### The peer sync
 

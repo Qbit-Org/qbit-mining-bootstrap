@@ -25,7 +25,7 @@ pub struct AppendResult {
 }
 
 /// The share append refused before any statement: this node's database was
-/// restored under the running frontend (D-8), see
+/// restored or changed identity under the running frontend (D-8, D-9), see
 /// [`Ledger::set_own_log_lost`].
 #[derive(Debug)]
 pub struct OwnLogLost;
@@ -33,8 +33,9 @@ pub struct OwnLogLost;
 impl std::fmt::Display for OwnLogLost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "this node's database was restored under the running frontend (D-8): no share is \
-             appended until the frontend has stopped; its restart recovers the own log first",
+            "this node's database was restored or changed identity under the running frontend \
+             (D-8, D-9): no share is appended until the frontend has stopped; its restart checks \
+             the database again first",
         )
     }
 }

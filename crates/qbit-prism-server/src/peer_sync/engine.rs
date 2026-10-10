@@ -3,10 +3,10 @@
 //! batch. A pass whose peer reads fail is counted and logged, and the next
 //! one starts over on the other path; peer rows that fail to apply here fail
 //! only their stream, which tries them again next pass and alerts when that
-//! goes on. The loop ends at shutdown, or with [`OwnLogLostWhileRunning`]
-//! when the database was restored or promoted under the running frontend,
-//! which stops the frontend: its restart serves only once own-log recovery
-//! completes (D-8).
+//! goes on. The loop ends at shutdown, or with a [`FrontendStop`] when the
+//! database was restored, promoted or changed identity under the running
+//! frontend, which stops the frontend: its restart runs every startup check
+//! again (D-8, D-9).
 //!
 //! Each pass, in order:
 //! 1. this database must be personalised as this node (D-9, checked every
@@ -157,21 +157,39 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// The database was restored or promoted under the running frontend (D-8,
-/// D-17): [`PeerSync::run`] ends with it, which stops the frontend.
+/// The database changed under the running frontend in a way no task started
+/// before it can be trusted with: [`PeerSync::run`] ends with it, which stops
+/// the frontend, and its restart runs every startup check again.
 #[derive(Debug)]
-pub struct OwnLogLostWhileRunning;
+pub enum FrontendStop {
+    /// Restored or promoted: a new system identifier or WAL timeline since
+    /// the own log was verified (D-8, D-17). The restart serves only once
+    /// own-log recovery completes.
+    OwnLogLost,
+    /// Its node identity, an origin default or a key sequence's parity
+    /// changed since the frontend saw it ready (D-9). The restart refuses a
+    /// drifted database, and admits no miners on one that is not this
+    /// node's, until it is repaired.
+    IdentityChanged(String),
+}
 
-impl std::fmt::Display for OwnLogLostWhileRunning {
+impl std::fmt::Display for FrontendStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "this node's database was restored or promoted under the running frontend: it stops, \
-             and its restart serves only once own-log recovery completes (D-8)",
-        )
+        match self {
+            Self::OwnLogLost => f.write_str(
+                "this node's database was restored or promoted under the running frontend: it \
+                 stops, and its restart serves only once own-log recovery completes (D-8)",
+            ),
+            Self::IdentityChanged(why) => write!(
+                f,
+                "this node's database changed identity under the running frontend ({why}): it \
+                 stops, and serves again only on a database personalised as this node (D-9)"
+            ),
+        }
     }
 }
 
-impl std::error::Error for OwnLogLostWhileRunning {}
+impl std::error::Error for FrontendStop {}
 
 /// What one pass did.
 #[derive(Clone, Debug, Default)]
@@ -229,6 +247,8 @@ pub struct PeerSync {
     on_fallback_since: Option<Instant>,
     identity_checked: Option<Instant>,
     identity_refusal: Option<Refusal>,
+    /// This database was found personalised as this node, undrifted.
+    identity_ready: bool,
     latch: Latch,
     /// Own-log recovery met an own row this database holds with other
     /// content: the latch stays down until an operator resolves it.
@@ -268,6 +288,7 @@ impl PeerSync {
             on_fallback_since: None,
             identity_checked: None,
             identity_refusal: None,
+            identity_ready: false,
             latch: Latch::default(),
             own_log_diverged: false,
             own_rows_missing: false,
@@ -285,8 +306,8 @@ impl PeerSync {
 
     /// Pass until `shutdown` turns true. A failed pass is logged and counted,
     /// and the next one starts over on the other path after a pause that
-    /// grows with consecutive failures. The one error it returns is
-    /// [`OwnLogLostWhileRunning`], which stops the frontend.
+    /// grows with consecutive failures. The one error it returns is a
+    /// [`FrontendStop`], which stops the frontend.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut failures: u32 = 0;
         loop {
@@ -302,7 +323,7 @@ impl PeerSync {
                         self.interval
                     }
                 }
-                Err(error) if error.downcast_ref::<OwnLogLostWhileRunning>().is_some() => {
+                Err(error) if error.downcast_ref::<FrontendStop>().is_some() => {
                     for path in &mut self.paths {
                         if let Some(pool) = path.pool.take() {
                             pool.close().await;
@@ -406,6 +427,25 @@ impl PeerSync {
             .context("connecting to the peer's database")
     }
 
+    /// The database changed under the running frontend: refuse every share
+    /// from now until the process exits (the server cancels every other task
+    /// as the sync ends with the returned error), drop the latch and say so,
+    /// so that health and the gauges stop reporting this node ready.
+    fn stop_frontend(&mut self, stop: FrontendStop, refusal: Option<&Refusal>) -> anyhow::Error {
+        tracing::error!(reason = %stop, "ALERT: the frontend stops");
+        self.ledger.set_own_log_lost(true);
+        self.latch = Latch::default();
+        self.publish(false, refusal);
+        stop.into()
+    }
+
+    /// Check this database's identity at the next pass, whatever the time
+    /// since the last check. For tests.
+    #[doc(hidden)]
+    pub fn recheck_identity(&mut self) {
+        self.identity_checked = None;
+    }
+
     /// One pass. Public so that tests can drive the sync step by step.
     pub async fn pass(&mut self) -> Result<PassReport> {
         let mut report = PassReport::default();
@@ -417,17 +457,8 @@ impl PeerSync {
         if self.latch.caught_up {
             let now = self.ledger.lineage_evidence().await?;
             if Some(now) != self.latch.evidence {
-                tracing::error!(
-                    previous = ?self.latch.evidence,
-                    now = ?now,
-                    "ALERT: this database's system identifier or WAL timeline changed while the \
-                     frontend ran: a restore or promotion; the frontend stops, and serves again \
-                     only once its own log is checked against the peer"
-                );
-                self.ledger.set_own_log_lost(true);
-                self.latch = Latch::default();
-                self.publish(false, None);
-                return Err(OwnLogLostWhileRunning.into());
+                tracing::error!(previous = ?self.latch.evidence, now = ?now, "evidence of a restore or promotion");
+                return Err(self.stop_frontend(FrontendStop::OwnLogLost, None));
             }
         }
         if let Some(refusal) = self.check_local_identity().await? {
@@ -505,7 +536,8 @@ impl PeerSync {
 
     /// D-9: refuse unless this database is personalised as this node, with
     /// nothing drifted, and holds a valid 031 index (D-14). Checked every
-    /// `IDENTITY_RECHECK`.
+    /// `IDENTITY_RECHECK`. Once seen ready, a database that is no longer
+    /// this node's stops the frontend ([`FrontendStop::IdentityChanged`]).
     async fn check_local_identity(&mut self) -> Result<Option<Refusal>> {
         if self
             .identity_checked
@@ -513,7 +545,11 @@ impl PeerSync {
         {
             return Ok(self.identity_refusal.clone());
         }
-        let refusal = match self.ledger.check_node_identity(self.node).await? {
+        let check = self.ledger.check_node_identity(self.node).await?;
+        if matches!(check, IdentityCheck::Ready(_)) {
+            self.identity_ready = true;
+        }
+        let refusal = match check {
             IdentityCheck::Ready(_) => None,
             IdentityCheck::Unidentified => Some(Refusal::LocalIdentity(format!(
                 "no node identity; run `qbit-prism-server node-identity set --index {}`",
@@ -534,6 +570,12 @@ impl PeerSync {
             }
             refusal => refusal,
         };
+        // Seen ready once, then not: the identity changed under the running
+        // frontend, which every one of its writers was started on. It stops.
+        if let (Some(Refusal::LocalIdentity(why)), true) = (&refusal, self.identity_ready) {
+            let stop = FrontendStop::IdentityChanged(why.clone());
+            return Err(self.stop_frontend(stop, refusal.as_ref()));
+        }
         if let Some(refusal) = &refusal {
             tracing::error!(%refusal, "ALERT: the peer sync does not run");
         }

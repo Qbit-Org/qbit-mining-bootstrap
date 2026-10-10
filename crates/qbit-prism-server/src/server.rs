@@ -368,12 +368,14 @@ pub async fn run(config: Config) -> Result<()> {
         result=tasks.join_next()=>{Some(match result {Some(Ok(Err(error)))=>error,Some(Err(error))=>error.into(),_=>anyhow::anyhow!("critical PRISM task exited")})}
     };
     shutdown.send_replace(true);
-    // A database restored under the running frontend (D-8): no task may
-    // commit another own row, so nothing drains; every task is cancelled at
-    // once, and its open transaction rolls back. The restart recovers first.
+    // A database restored, promoted or re-identified under the running
+    // frontend (D-8, D-9): nothing drains. Every task is cancelled at once,
+    // and its open transaction rolls back, so none commits another own row
+    // unless its COMMIT was already sent. The restart runs every startup
+    // check again.
     if failure.as_ref().is_some_and(|failure| {
         failure
-            .downcast_ref::<crate::peer_sync::OwnLogLostWhileRunning>()
+            .downcast_ref::<crate::peer_sync::FrontendStop>()
             .is_some()
     }) {
         tasks.abort_all();
