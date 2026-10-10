@@ -155,6 +155,20 @@ pub fn signal(pid: i32, sig: libc::c_int) -> Result<()> {
     Ok(())
 }
 
+/// Whether the process is stopped (SIGSTOP), as `/proc/<pid>/stat` says.
+/// A freeze is delivered asynchronously, and a stopped process that was
+/// killed and restarted has another pid, so a check that a node stayed
+/// frozen reads this for the pid it froze.
+pub fn stopped(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim().chars().next())
+        })
+        .is_some_and(|state| state == 'T')
+}
+
 /// Whether a process with this pid exists (zombies included).
 pub fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
@@ -208,21 +222,16 @@ mod tests {
         process.freeze()?;
         // SIGSTOP is delivered asynchronously.
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", process.pid()))?;
-            let state = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.trim().chars().next());
-            if state == Some('T') {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the frozen child is still {state:?}"
-            );
+        while !stopped(process.pid()) {
+            assert!(Instant::now() < deadline, "the frozen child never stopped");
             std::thread::sleep(Duration::from_millis(10));
         }
         process.thaw()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stopped(process.pid()) {
+            assert!(Instant::now() < deadline, "the thawed child stayed stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         process.kill9()?;
         assert!(process.exited().is_some());
         assert!(std::fs::read_to_string(&log)?.contains("=== dual-sim: sleeper started at"));

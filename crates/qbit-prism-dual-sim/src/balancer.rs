@@ -153,18 +153,31 @@ pub struct BalancerReport {
 }
 
 impl BalancerReport {
-    /// Whether `backend` was up for the whole of `from_ms..=to_ms`: marked up
-    /// at or before `from_ms`, and not marked down again until `to_ms`.
+    /// Whether `backend` was up at `at_ms`: its last mark at or before then
+    /// was up. Every node starts down.
+    pub fn up_at(&self, backend: &str, at_ms: u64) -> bool {
+        self.transitions
+            .iter()
+            .rev()
+            .find(|t| t.backend == backend && t.at_ms <= at_ms)
+            .is_some_and(|t| t.up)
+    }
+
+    /// Whether `backend` was up for the whole of `from_ms..=to_ms`: up at
+    /// `from_ms`, and not marked down again until `to_ms`.
     pub fn up_throughout(&self, backend: &str, from_ms: u64, to_ms: u64) -> bool {
-        let mut up = false;
-        for transition in self.transitions.iter().filter(|t| t.backend == backend) {
-            if transition.at_ms <= from_ms {
-                up = transition.up;
-            } else if transition.at_ms <= to_ms && !transition.up {
-                return false;
-            }
-        }
-        up
+        self.up_at(backend, from_ms)
+            && !self
+                .transitions
+                .iter()
+                .any(|t| t.backend == backend && t.at_ms > from_ms && t.at_ms <= to_ms && !t.up)
+    }
+
+    /// How long after a fault's effect a mark-down can still land: `fall`
+    /// failing checks, each taking up to the longer of the interval and the
+    /// timeout, plus one interval for the streak to start.
+    pub fn mark_down_horizon(config: &BalancerConfig) -> Duration {
+        config.check_interval.max(config.check_timeout) * config.fall + config.check_interval
     }
 }
 
@@ -713,6 +726,16 @@ mod tests {
         );
         assert!(report.up_throughout("b", 50, 5_000));
         assert!(!report.up_throughout("c", 0, 1), "never marked up");
+        assert!(report.up_at("a", 499) && !report.up_at("a", 500) && report.up_at("a", 900));
+        let slow = BalancerConfig {
+            check_interval: Duration::from_secs(1),
+            check_timeout: Duration::from_secs(3),
+            ..BalancerConfig::default()
+        };
+        assert_eq!(
+            BalancerReport::mark_down_horizon(&slow),
+            Duration::from_secs(10)
+        );
     }
 
     #[tokio::test]
