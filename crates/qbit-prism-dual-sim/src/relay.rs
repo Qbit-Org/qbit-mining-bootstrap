@@ -33,9 +33,12 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -136,12 +139,11 @@ impl Relay {
         self.state.send_replace(state);
     }
 
-    /// Delay what either side sends by `latency` before it is forwarded, on
-    /// connections old and new: a path between two sites. A chunk the pump
-    /// had to wait for (a request, a reply's start) waits the latency; the
-    /// rest of a burst, already waiting to be read, follows without another
-    /// one, so a round trip costs twice the latency and bulk transfer is not
-    /// capped. Nothing being discarded waits.
+    /// Delay every byte either side sends by `latency` before it is
+    /// forwarded, on connections old and new: a path between two sites. The
+    /// pumps are delay lines, so a round trip costs twice the latency and a
+    /// stream keeps its rate (up to 1 MiB in flight each way). Nothing
+    /// being discarded waits.
     pub fn set_latency(&self, latency: std::time::Duration) {
         let ms = latency.as_millis() as u64;
         self.latency_ms.store(ms, Ordering::SeqCst);
@@ -293,99 +295,25 @@ async fn connection(
     }
 }
 
-/// What a link in motion does with bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Flow {
-    Forward,
-    Drop,
-}
+/// How much a pump may hold in its delay line before it stops reading: a
+/// receiver slower than its sender pushes back, as it would over TCP.
+const DELAY_LINE_BYTES: usize = 1 << 20;
 
-/// Wait until bytes move: forwarded when the link is open, dropped when it
-/// discards; `None` when it is reset (or the relay is gone). A blackhole
-/// waits.
-async fn flowing(state: &mut watch::Receiver<LinkState>) -> Option<Flow> {
-    match wait_state(state, |s| s != LinkState::Blackholed).await? {
-        LinkState::Open => Some(Flow::Forward),
-        LinkState::Discard => Some(Flow::Drop),
-        LinkState::Reset | LinkState::Blackholed => None,
-    }
-}
-
-/// What became of a chunk a pump forwarded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Forwarded {
-    /// All of it reached the receiver.
-    Written,
-    /// The link discards: the rest of it was dropped.
-    Dropped,
-    /// The link was reset, or the receiver is gone while the link is open.
-    Ended,
-}
-
-/// Write `chunk` to `to` a piece at a time, re-checking the link between
-/// pieces: a blackhole holds what is left until the link moves again, a
-/// discarding link drops it, a reset ends it. `write` is cancel-safe (a
-/// cancelled write wrote nothing), so a state change can interrupt a write
-/// stuck on a receiver that stopped reading.
-async fn forward(
-    to: &mut OwnedWriteHalf,
-    chunk: &[u8],
-    state: &mut watch::Receiver<LinkState>,
-    latency: std::time::Duration,
-) -> Forwarded {
-    let mut sent = 0;
-    let mut delayed = latency.is_zero();
-    while sent < chunk.len() {
-        match flowing(state).await {
-            None => return Forwarded::Ended,
-            Some(Flow::Drop) => return Forwarded::Dropped,
-            Some(Flow::Forward) => {}
-        }
-        // The path's latency, once, before the chunk moves. The sleep runs
-        // to its deadline while the link stays open; any other state is
-        // acted on at once by the check above.
-        if !delayed {
-            delayed = true;
-            let deadline = tokio::time::Instant::now() + latency;
-            loop {
-                tokio::select! {
-                    () = tokio::time::sleep_until(deadline) => break,
-                    changed = state.changed() => {
-                        if changed.is_err() {
-                            return Forwarded::Ended;
-                        }
-                        if *state.borrow() != LinkState::Open {
-                            break;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-        tokio::select! {
-            written = to.write(&chunk[sent..]) => match written {
-                Ok(count) if count > 0 => sent += count,
-                // The receiver is gone: a discarding link drains on.
-                _ if *state.borrow() == LinkState::Discard => return Forwarded::Dropped,
-                _ => return Forwarded::Ended,
-            },
-            changed = state.changed() => {
-                if changed.is_err() {
-                    return Forwarded::Ended;
-                }
-            }
-        }
-    }
-    Forwarded::Written
-}
-
-/// Copy `from` to `to` while the link is open. Blackholed, it stops reading,
-/// so the sender's window fills as it would against a dead path, and it
-/// holds what it has not yet written until the link moves again.
-/// Discarding, it reads and drops everything, including the rest of a chunk
-/// it was writing, and passes on no close: it holds until the link leaves
-/// Discard and then ends, for the connection to be reset. It ends on EOF, an
-/// error, or a reset, and hands both halves back.
+/// Copy `from` to `to` as a delay line. Each chunk is stamped when it is
+/// read and written once the link's latency has passed since then, so every
+/// byte is delayed by the same latency and a stream keeps its rate.
+///
+/// - **Open:** reads, and writes what is due.
+/// - **Blackholed:** neither reads nor writes. What it holds waits for the
+///   link, as unacknowledged segments wait for a path, and keeps its stamp.
+/// - **Discard:** reads and drops everything, what it held included, and
+///   passes on no close. It holds until the link leaves Discard, then ends,
+///   for the connection to be reset.
+/// - **Reset:** ends at once.
+///
+/// It ends on EOF (once what it holds is written), an error, or a reset, and
+/// hands both halves back. Writes are partial and cancel-safe, so a state
+/// change interrupts one stuck on a receiver that stopped reading.
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
@@ -394,62 +322,84 @@ async fn pump(
     discarded: Arc<AtomicBool>,
 ) -> (OwnedReadHalf, OwnedWriteHalf) {
     let mut buffer = vec![0u8; 16 * 1024];
-    // A connection's first chunk always starts a burst, even one sent
-    // before this pump began to read.
-    let mut first = true;
+    let mut line: VecDeque<(tokio::time::Instant, Vec<u8>)> = VecDeque::new();
+    // Bytes the line holds, and how much of its head is already written.
+    let (mut held, mut written) = (0usize, 0usize);
+    let mut eof = false;
     loop {
-        let Some(flow) = flowing(&mut state).await else {
-            return (from, to);
-        };
-        if flow == Flow::Drop {
-            discarded.store(true, Ordering::SeqCst);
-        } else if discarded.load(Ordering::SeqCst) {
-            // Out of Discard: the connection ends, to be reset.
-            return (from, to);
-        }
-        // A chunk already waiting to be read is the rest of a burst; one the
-        // pump has to wait for starts a burst, and pays the path's latency.
-        let (read, waited) = match from.try_read(&mut buffer) {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let read = tokio::select! {
-                    read = from.read(&mut buffer) => read,
-                    // Re-check the state: a blackhole stops the read here.
-                    changed = state.changed() => {
-                        if changed.is_err() {
-                            return (from, to);
-                        }
-                        continue;
-                    }
-                };
-                (read, true)
-            }
-            read => (read, false),
-        };
-        let count = match read {
-            Ok(0) | Err(_) => {
-                if discarded.load(Ordering::SeqCst) || *state.borrow() == LinkState::Discard {
+        let link = *state.borrow_and_update();
+        match link {
+            LinkState::Reset => return (from, to),
+            LinkState::Discard => {
+                discarded.store(true, Ordering::SeqCst);
+                line.clear();
+                (held, written) = (0, 0);
+                if eof {
                     // Pass on no close: hold until the link leaves Discard.
-                    discarded.store(true, Ordering::SeqCst);
                     wait_state(&mut state, |s| s != LinkState::Discard).await;
                     return (from, to);
                 }
-                let _ = to.shutdown().await;
-                return (from, to);
             }
-            Ok(count) => count,
+            // Out of Discard: the connection ends, to be reset.
+            _ if discarded.load(Ordering::SeqCst) => return (from, to),
+            LinkState::Open | LinkState::Blackholed => {}
+        }
+        if eof && line.is_empty() {
+            let _ = to.shutdown().await;
+            return (from, to);
+        }
+        let reading = !eof && link != LinkState::Blackholed && held < DELAY_LINE_BYTES;
+        let latency = std::time::Duration::from_millis(latency_ms.load(Ordering::SeqCst));
+        let head = match link {
+            LinkState::Open => line
+                .front()
+                .map(|(stamp, chunk)| (*stamp + latency, &chunk[written..])),
+            _ => None,
         };
-        let latency = if waited || first {
-            std::time::Duration::from_millis(latency_ms.load(Ordering::SeqCst))
-        } else {
-            std::time::Duration::ZERO
-        };
-        first = false;
-        match forward(&mut to, &buffer[..count], &mut state, latency).await {
-            Forwarded::Written => {}
-            Forwarded::Dropped => discarded.store(true, Ordering::SeqCst),
-            Forwarded::Ended => return (from, to),
+        let writing = head.is_some();
+        tokio::select! {
+            read = from.read(&mut buffer), if reading => match read {
+                Ok(0) | Err(_) => eof = true,
+                Ok(count) => {
+                    if link != LinkState::Discard {
+                        line.push_back((tokio::time::Instant::now(), buffer[..count].to_vec()));
+                        held += count;
+                    }
+                }
+            },
+            wrote = write_due(&mut to, head), if writing => match wrote {
+                Ok(count) if count > 0 => {
+                    written += count;
+                    if line.front().is_some_and(|(_, chunk)| written == chunk.len()) {
+                        if let Some((_, chunk)) = line.pop_front() {
+                            held -= chunk.len();
+                        }
+                        written = 0;
+                    }
+                }
+                // The receiver is gone while the link is open.
+                _ => return (from, to),
+            },
+            changed = state.changed() => {
+                if changed.is_err() {
+                    return (from, to);
+                }
+            }
         }
     }
+}
+
+/// Wait until the head of a delay line is due, then write a piece of it.
+/// Cancel-safe, as `write` is: cancelled, it wrote nothing.
+async fn write_due(
+    to: &mut OwnedWriteHalf,
+    head: Option<(tokio::time::Instant, &[u8])>,
+) -> std::io::Result<usize> {
+    let Some((due, chunk)) = head else {
+        return std::future::pending().await;
+    };
+    tokio::time::sleep_until(due).await;
+    to.write(chunk).await
 }
 
 #[cfg(test)]
@@ -528,6 +478,34 @@ mod tests {
         let mut five = [0u8; 5];
         timeout(Duration::from_secs(5), held.read_exact(&mut five)).await??;
         assert_eq!(&five, b"three");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_through_a_slow_link_keeps_its_rate() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay = Relay::open("test", listener.local_addr()?.port()).await?;
+        relay.set_latency(Duration::from_millis(150));
+        let mut client = TcpStream::connect(("127.0.0.1", relay.port())).await?;
+        let (mut server, _) = timeout(Duration::from_secs(5), listener.accept()).await??;
+        // 100 pieces of 8 KiB, 5 ms apart: half a second of streaming. A link
+        // that paid its latency per piece would take 15 s.
+        let sender = tokio::spawn(async move {
+            for _ in 0..100 {
+                server.write_all(&[3u8; 8 * 1024]).await?;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            anyhow::Ok(server)
+        });
+        let started = std::time::Instant::now();
+        let mut received = vec![0u8; 100 * 8 * 1024];
+        timeout(Duration::from_secs(10), client.read_exact(&mut received)).await??;
+        let took = started.elapsed();
+        let _server = sender.await??;
+        assert!(
+            took >= Duration::from_millis(150) && took < Duration::from_secs(3),
+            "one latency, then the stream's own pace: {took:?}"
+        );
         Ok(())
     }
 
