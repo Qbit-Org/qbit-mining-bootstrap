@@ -757,7 +757,9 @@ impl Sim {
 
     /// Wait until the two databases hold the same shares and blocks, and
     /// still do a second later: with the load paused (`settle`), the pair's
-    /// end state.
+    /// end state. "The same" is by content, a digest of every share's header
+    /// and id and every block's hash, not by count: a sync that dropped one
+    /// row on each side would leave the counts equal.
     pub async fn wait_converged(&self, limit: Duration) -> Result<()> {
         let started = Instant::now();
         let mut last = None;
@@ -765,9 +767,14 @@ impl Sim {
             let mut reading = Vec::new();
             for node in Node::BOTH {
                 let pool = self.pool(node).await?;
-                let counts: (i64, i64) = sqlx::query_as(
-                    "SELECT (SELECT count(*) FROM qbit_prism_share_hashes), \
-                            (SELECT count(*) FROM qbit_pool_blocks)",
+                let counts: (String, String) = sqlx::query_as(
+                    "SELECT (SELECT count(*)::text || ' ' || coalesce(md5(string_agg( \
+                                header_hash || '=' || share_id, ',' \
+                                ORDER BY header_hash COLLATE \"C\")), '') \
+                             FROM qbit_prism_share_hashes), \
+                            (SELECT count(*)::text || ' ' || coalesce(md5(string_agg( \
+                                block_hash, ',' ORDER BY block_hash COLLATE \"C\")), '') \
+                             FROM qbit_pool_blocks)",
                 )
                 .fetch_one(&pool)
                 .await?;
@@ -779,7 +786,7 @@ impl Sim {
             }
             ensure!(
                 started.elapsed() < limit,
-                "the databases did not converge within {limit:?}: (shares, blocks) A {:?}, B {:?}",
+                "the databases did not converge within {limit:?}: (shares, blocks) as count and digest, A {:?}, B {:?}",
                 reading[0],
                 reading[1]
             );
