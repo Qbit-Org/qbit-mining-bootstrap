@@ -123,9 +123,11 @@ impl Ledger {
     /// Dual writer: whether this node issued the work a block with this
     /// coinbase was found on ([`finder_node`]). A block adopted from the
     /// peer's work (S8) carries this node as its origin, but was found by
-    /// the peer. Without a recorded coinbase layout, or for a coinbase that
-    /// names no node (one issued with another extranonce2 width among them),
-    /// `origin_is_own` decides.
+    /// the peer. A coinbase that names no node is not this node's: every
+    /// coinbase it builds names it, so such a block was issued elsewhere
+    /// (with another extranonce2 width or tag, adopted here among them) and
+    /// is sponsored here only by takeover. Without a recorded coinbase
+    /// layout, or without the coinbase, `origin_is_own` decides.
     pub fn found_here(&self, coinbase_tx: Option<&[u8]>, origin_is_own: bool) -> bool {
         let (Some(own), Some((tag, size)), Some(coinbase)) = (
             self.own_node(),
@@ -134,7 +136,7 @@ impl Ledger {
         ) else {
             return origin_is_own;
         };
-        finder_node(coinbase, tag, *size).map_or(origin_is_own, |finder| finder == own)
+        finder_node(coinbase, tag, *size) == Some(own)
     }
 
     /// Whether work built now pays carried balances: always in single-writer
@@ -415,12 +417,15 @@ mod tests {
         assert!(ledger.set_coinbase_layout(b"/OTHER/", 8).is_err());
         // Adopted from B's work: this node's rows, B's block.
         assert!(!ledger.found_here(Some(&coinbase(u32::MAX)), true));
-        // B's block issued with another width names nobody: its origin
-        // decides, so a peer-landed one is never taken for this node's.
+        // B's block issued with another width names nobody, so it is never
+        // taken for this node's.
         assert!(!ledger.found_here(Some(&coinbase_with(7, 4)), false));
         assert!(ledger.found_here(Some(&coinbase(7)), false));
         assert!(!ledger.found_here(None, false));
-        assert!(ledger.found_here(Some(&[0]), true));
+        // A coinbase that names no node is not this node's, whatever the
+        // origin: B's block issued with another width and adopted here.
+        assert!(!ledger.found_here(Some(&coinbase_with(u32::MAX, 4)), true));
+        assert!(!ledger.found_here(Some(&[0]), true));
     }
 
     #[test]

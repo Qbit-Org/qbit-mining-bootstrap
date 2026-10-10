@@ -1507,6 +1507,15 @@ async fn refused(f: &Fixture) -> Result<()> {
     let result = narrow_control(f, &narrow, &hash, &found_on, &mut state).await;
     narrow.ledger.pool.close().await;
     result?;
+    // Only the issuing layout names the block's finder: the narrow frontend
+    // adopted it, with its own origin, but never takes it for its own find,
+    // so it would sponsor its fanouts only by takeover.
+    let coinbase = codec::coinbase_from_block(&block)?;
+    ensure!(
+        c.ledger.found_here(Some(coinbase), false)
+            && !narrow.ledger.found_here(Some(coinbase), true),
+        "a layout other than the issuing one named the adopted block's finder"
+    );
     session.release().await
 }
 

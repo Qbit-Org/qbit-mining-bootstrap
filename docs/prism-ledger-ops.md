@@ -1805,8 +1805,9 @@ the extranonce1 in the block's coinbase, since each node hands out its own half
 of the extranonce1 space; it does not matter which node landed the rows.
 Extranonce1 is read at this node's `PRISM_STRATUM_EXTRANONCE2_SIZE`, and only
 where the coinbase tag sits right before it. A block issued with another width
-therefore names no finder here; its origin decides, so a peer's block is never
-taken for this node's own. Keep the width, and a `PRISM_COINBASE_TAG` of several
+therefore names no finder here, and since every coinbase this node builds names
+it, such a block is never taken for this node's own, even when this node adopted
+it: it is sponsored here only by takeover. Keep the width, and a `PRISM_COINBASE_TAG` of several
 bytes (the default `/PRISM/` has 7), the same on both nodes; the pair's
 fingerprint compares neither. Change either only while both nodes are up and
 landing their blocks, as for adoption below, and give one-shot commands the
