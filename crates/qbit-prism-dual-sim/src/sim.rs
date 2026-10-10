@@ -769,24 +769,34 @@ impl Sim {
     /// load the two databases are never equal at one instant, so this waits
     /// for the first reading's rows to arrive, not for equal counts. It says
     /// nothing about a node's own rows (a restored node pulling its own rows
-    /// back is S6's and S7's check). Every read is retried, and capped by the
-    /// time left, until the bound; a timeout names the sync conflicts each
-    /// node recorded during the wait, since a row the peer refuses never
+    /// back is S6's and S7's check). Connecting and every read are capped by
+    /// the time left, and reads are retried until the bound; a timeout names
+    /// each node's sync conflicts, since a row the peer refuses never
     /// arrives.
     pub async fn wait_synced(&self, limit: Duration) -> Result<()> {
         let started = Instant::now();
         let deadline = tokio::time::Instant::now() + limit;
+        // A pool's close waits for every connection it lent, and a read
+        // cancelled mid-query leaves one pinging a stalled database: cap it
+        // too, and let a pool that will not close go.
+        async fn close_all(pools: BTreeMap<Node, PgPool>) {
+            for pool in pools.into_values() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), pool.close()).await;
+            }
+        }
         let mut pools = BTreeMap::new();
         for node in Node::BOTH {
-            match self.pool(node).await {
-                Ok(pool) => {
+            match tokio::time::timeout_at(deadline, self.pool(node)).await {
+                Ok(Ok(pool)) => {
                     pools.insert(node, pool);
                 }
-                Err(error) => {
-                    for pool in pools.into_values() {
-                        pool.close().await;
-                    }
+                Ok(Err(error)) => {
+                    close_all(pools).await;
                     return Err(error);
+                }
+                Err(_) => {
+                    close_all(pools).await;
+                    anyhow::bail!("connecting to node {node:?} outlived the {limit:?} bound");
                 }
             }
         }
@@ -845,33 +855,35 @@ impl Sim {
             if started.elapsed() >= limit {
                 let mut conflicts = Vec::new();
                 for (node, pool) in &pools {
-                    let count = match since.get(node) {
-                        Some(at) => tokio::time::timeout(
-                            Duration::from_secs(5),
-                            sqlx::query_scalar::<_, i64>(
-                                "SELECT count(*) FROM qbit_prism_peer_sync_conflicts \
-                                 WHERE last_seen_at >= $1",
-                            )
-                            .bind(*at)
-                            .fetch_one(pool),
+                    // Every conflict, and those seen during the wait: a row
+                    // refused before it stays missing just the same.
+                    let since = since.get(node).copied().unwrap_or_else(chrono::Utc::now);
+                    let count = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        sqlx::query_as::<_, (i64, i64)>(
+                            "SELECT count(*), count(*) FILTER (WHERE last_seen_at >= $1) \
+                             FROM qbit_prism_peer_sync_conflicts",
                         )
-                        .await
-                        .map_or_else(|_| "unread".to_owned(), |count| format!("{count:?}")),
-                        None => "unread".to_owned(),
-                    };
-                    conflicts.push(format!("node {node:?}: {count}"));
+                        .bind(since)
+                        .fetch_one(pool),
+                    )
+                    .await;
+                    conflicts.push(match count {
+                        Ok(Ok((all, recent))) => {
+                            format!("node {node:?}: {all} ({recent} seen during the wait)")
+                        }
+                        Ok(Err(error)) => format!("node {node:?}: unread ({error})"),
+                        Err(_) => format!("node {node:?}: unread (timed out)"),
+                    });
                 }
                 break Err(anyhow::anyhow!(
-                    "the sync did not catch up within {limit:?}: {last}; sync conflicts recorded \
-                     during the wait: {}",
+                    "the sync did not catch up within {limit:?}: {last}; sync conflicts {}",
                     conflicts.join(", ")
                 ));
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
-        for pool in pools.into_values() {
-            pool.close().await;
-        }
+        close_all(pools).await;
         result
     }
 

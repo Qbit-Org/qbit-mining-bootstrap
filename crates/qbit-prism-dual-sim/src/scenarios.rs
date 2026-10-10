@@ -1617,14 +1617,28 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
         Some(down) if down + 20_000 <= fault_at + 45_000 => {
             let (early, early_n) = answer_p95(&records, Node::B, down + 5_000, down + 20_000);
             let (late, late_n) = answer_p95(&records, Node::B, fault_at + 45_000, fault_at + 60_000);
+            // B took every miner: each session had shares accepted on B's
+            // jobs late in the minute, A's former miners included.
+            let sessions: usize = sim.config.load.accounts.iter().map(|a| a.sessions).sum();
+            let on_b: std::collections::BTreeSet<usize> = records
+                .iter()
+                .filter(|r| {
+                    r.accepted_on(Node::B, fault_at + 45_000)
+                        && r.answered_ms.is_some_and(|at| at < fault_at + 60_000)
+                })
+                .map(|r| r.session)
+                .collect();
             let passed = matches!((early, late), (Some(early), Some(late)) if late <= 2 * early + 50);
             (
-                passed,
+                passed && on_b.len() == sessions,
                 format!(
-                    "p95 answer latency of shares on B's jobs: {early:?} ms over {early_n} shares \
+                    "sessions with shares accepted on B 45 to 60 s after the death: {} of \
+                     {sessions}; p95 answer latency of shares on B's jobs: {early:?} ms over \
+                     {early_n} shares \
                      5 to 20 s after A was marked down ({} ms after the death), {late:?} ms over \
                      {late_n} shares 45 to 60 s after the death (bound: twice the first, plus \
                      50 ms), at {PULLER_DEATH_RATE} offered shares/s",
+                    on_b.len(),
                     down as i64 - fault_at as i64
                 ),
             )
@@ -1635,7 +1649,7 @@ async fn s02_puller_dies_mid_read(sim: &mut Sim, body: &mut Body) -> Result<()> 
         ),
     };
     body.expect(
-        "B's share appends stay flat while A's puller is dead",
+        "B takes every miner and its share appends stay flat while A's puller is dead",
         flat.0,
         flat.1,
     );
