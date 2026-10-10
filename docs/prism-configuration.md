@@ -291,7 +291,8 @@ listeners behave as in 3.0 and no readiness statement runs; the new metric
 families show only their HELP and TYPE lines, and
 `PRISM_READINESS_GRACE_SECONDS` is still validated at startup. In dual-writer
 mode `qbit-prism-server healthcheck` reports liveness, not readiness, and needs
-the operator listener. See
+the operator listener; the frontend's health path also keeps its own pool of
+at most two database connections beside `PRISM_DATABASE_MAX_CONNECTIONS`. See
 [dual-writer readiness](prism-dual-writer-readiness.md).
 
 ## Preventing stale guidance

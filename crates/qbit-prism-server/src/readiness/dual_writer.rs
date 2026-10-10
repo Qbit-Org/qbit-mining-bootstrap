@@ -7,8 +7,11 @@
 use super::admission::Withdrawal;
 use crate::{metrics::WriterPathLabel, node_identity::NodeIdentity, peer_sync::PeerSyncStatus};
 use serde_json::{json, Value};
-use sqlx::PgPool;
-use std::time::{Duration, Instant};
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use tokio::sync::watch;
 
 /// How long one probe of this node's database may take before it counts as
@@ -22,6 +25,9 @@ pub const WRITER_UNANSWERED_WITHDRAWAL: Duration = Duration::from_secs(4);
 /// A health read within this long of the last probe reuses it, so Stratum
 /// health probes cannot multiply database reads.
 const WRITER_PROBE_REUSE: Duration = Duration::from_secs(1);
+/// The health path's own connections: the writer probe and the health reads,
+/// one of each at a time.
+const HEALTH_POOL_CONNECTIONS: u32 = 2;
 
 /// Where this frontend's writes go, as its database last answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +136,10 @@ impl DualWriterReport {
 pub struct DualWriterReadiness {
     identity: NodeIdentity,
     writer: tokio::sync::Mutex<WriterProbe>,
+    /// The health path's own small pool: the writer probe and the health
+    /// reads never wait behind share traffic for a ledger connection, so a
+    /// busy but healthy database still answers them in time.
+    health_pool: OnceLock<PgPool>,
 }
 
 impl DualWriterReadiness {
@@ -137,17 +147,51 @@ impl DualWriterReadiness {
         Self {
             identity,
             writer: tokio::sync::Mutex::new(WriterProbe::default()),
+            health_pool: OnceLock::new(),
         }
     }
 
-    /// Probe the writer if the last probe is not recent, then report.
-    /// `peer_sync` is the sync's status channel; until it is attached the own
-    /// log reads as not caught up, so the node does not serve.
+    /// The health path's pool: built on first use from the ledger pool's
+    /// connect options (the same server, credentials and options, the search
+    /// path included) and connected lazily. A connection waits at most the
+    /// probe's budget to be acquired, and the database cancels a health
+    /// statement it cannot answer within that budget too, so none holds a
+    /// connection or waits on a lock past it.
+    pub fn health_pool(&self, ledger: &PgPool) -> &PgPool {
+        self.health_pool.get_or_init(|| {
+            let budget = WRITER_PROBE_TIMEOUT.as_millis().to_string();
+            PgPoolOptions::new()
+                .max_connections(HEALTH_POOL_CONNECTIONS)
+                .min_connections(0)
+                .acquire_timeout(WRITER_PROBE_TIMEOUT)
+                .after_connect(move |connection, _| {
+                    let budget = budget.clone();
+                    Box::pin(async move {
+                        sqlx::query(
+                            "SELECT set_config('statement_timeout',$1,false),\
+                             set_config('lock_timeout',$1,false)",
+                        )
+                        .bind(budget)
+                        .execute(&mut *connection)
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .connect_lazy_with((*ledger.connect_options()).clone())
+        })
+    }
+
+    /// Probe the writer, on the health pool, if the last probe is not
+    /// recent, then report. `ledger` is the ledger's pool, which the health
+    /// pool is built from. `peer_sync` is the sync's status channel; until it
+    /// is attached the own log reads as not caught up, so the node does not
+    /// serve.
     pub async fn report(
         &self,
-        pool: &PgPool,
+        ledger: &PgPool,
         peer_sync: Option<&watch::Receiver<PeerSyncStatus>>,
     ) -> DualWriterReport {
+        let pool = self.health_pool(ledger);
         let writer = {
             let mut probe = self.writer.lock().await;
             if probe.due(Instant::now()) {

@@ -64,10 +64,14 @@ of the frontend's own pool:
 The probe is one statement, `pg_is_in_recovery()`,
 `transaction_read_only` and the identity row, at most once a second however
 many health reads ask; it never reads the peer. The first health read
-probes, so `/healthz` never reports a `writer_path` of `null`. A database
-that stops answering, dead or hung, withdraws the frontend about 4 s after its
-last answer, plus at most one 2 s probe: each publication reads the database
-beside the probe and waits for neither longer than the probe's 2 s, and its
+probes, so `/healthz` never reports a `writer_path` of `null`. The probe and
+the health reads run on the frontend's own pool of at most two connections,
+beside the ledger's `PRISM_DATABASE_MAX_CONNECTIONS`, so share traffic that
+keeps every ledger connection busy never delays them: a busy but healthy
+database is not read as `unanswered`. A database that stops answering, dead
+or hung, withdraws the frontend about 4 s after its last answer, plus at most
+one 2 s probe: each publication reads the database beside the probe and waits
+for neither longer than the probe's 2 s, and its
 heartbeat to the cluster table is bounded the same way, or skipped when the
 probe went unanswered, so the publications keep coming while the database is
 gone.
@@ -245,8 +249,9 @@ non-owner serving miners" reads `qbit_prism_dual_writer_carry_owner == 0` with
   when its decision goes stale.
 - Gated, `tests/dual_writer_readiness.rs`: the latch and the identity at the
   coordinator, a database turning read-only and back, the peer lost after
-  the latch, a database personalised as the peer (`remote`), and a single
-  writer's unchanged health.
+  the latch, a database personalised as the peer (`remote`), a ledger pool
+  whose every connection is busy (the writer stays `local` and health
+  answers within 3 s), and a single writer's unchanged health.
 - Gated, `tests/readiness_frontend.rs`: the server binary in dual mode, not
   yet admitted, refuses Stratum and answers `503` and `401`; a single writer
   listens from startup and answers `200`; five payout revision bumps under

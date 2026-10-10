@@ -256,6 +256,75 @@ async fn a_database_personalised_as_the_peer_keeps_the_frontend_out() -> Result<
     database.close(outcome).await
 }
 
+/// Under heavy share load every ledger connection can be busy. The writer
+/// probe and the health reads run on the frontend's own small health pool,
+/// so a busy but healthy database still answers them in time and the node is
+/// not withdrawn as `unanswered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saturated_ledger_pool_leaves_the_writer_local() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_saturated_").await?;
+    let ledger =
+        match Ledger::connect_tool(&database.url, "d4-saturated-fixture".into(), 2, true, None)
+            .await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(database.abandon(error).await),
+        };
+    let outcome = async {
+        ledger.set_node_identity(NodeIndex::B, "d4-test").await?;
+        let node = FakeNode::open().await?;
+        let frontend = frontend(
+            &database,
+            &node,
+            "d4-saturated-b",
+            Some(dual_writer(NodeIndex::B)),
+        )
+        .await?;
+        let (sync, status) = PeerSyncPublisher::new();
+        frontend.peer_sync.set(status).expect("attached once");
+        sync.update(|status| status.own_log_caught_up = true);
+        health_until(&frontend, "a local writer", |health| {
+            health["dual_writer"]["writer_path"] == "local"
+        })
+        .await?;
+        // Every ledger connection busy, as under saturated share appends.
+        let pool = &frontend.ledger.pool;
+        let mut held = Vec::new();
+        for _ in 0..pool.options().get_max_connections() {
+            held.push(
+                tokio::time::timeout(Duration::from_secs(20), pool.acquire())
+                    .await
+                    .context("holding a ledger connection")??,
+            );
+        }
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(200), pool.acquire())
+                .await
+                .is_err(),
+            "the ledger pool still had a connection to give"
+        );
+        // Past the probe's one-second reuse, so this health read probes.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let health = tokio::time::timeout(Duration::from_secs(3), frontend.health())
+            .await
+            .context("a health read waited on the saturated ledger pool")?;
+        ensure!(health["dual_writer"]["writer_path"] == "local", "{health}");
+        ensure!(
+            health["status"] != "writer-not-local" && health["status"] != "own-log-behind",
+            "{health}"
+        );
+        drop(held);
+        frontend.ledger.pool.close().await;
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_writer_health_carries_no_dual_writer_state() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
