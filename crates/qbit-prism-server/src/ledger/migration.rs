@@ -3918,10 +3918,15 @@ impl Ledger {
         loop {
             if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
                 // A stop that lands once the last row is in still ends as a
-                // finished import; this read loads no body.
-                let remaining: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1)")
-                    .bind(&cursor).fetch_one(&mut *self.acquire().await?).await?;
-                if !remaining {
+                // finished import. This read loads no body and is bounded;
+                // if it cannot answer in time, the stop wins.
+                let remaining = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, async {
+                    let remaining: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1)")
+                        .bind(&cursor).fetch_one(&mut *self.acquire().await?).await?;
+                    anyhow::Ok(remaining)
+                })
+                .await;
+                if matches!(remaining, Ok(Ok(false))) {
                     break;
                 }
                 return Err(ImportStopped { imported }.into());
@@ -3932,6 +3937,10 @@ impl Ledger {
             let row = sqlx::query("SELECT block_hash,body_uri,audit_bundle,audit_bundle_sha256,coinbase_tx_hex FROM qbit_pool_audit_bundles WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL AND block_hash>$1 ORDER BY block_hash LIMIT 1")
                 .bind(&cursor).fetch_optional(&mut *self.acquire().await?).await?;
             let Some(row) = row else { break };
+            // A stop that landed during the read starts no work on the body.
+            if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+                return Err(ImportStopped { imported }.into());
+            }
             let hash: String = row.try_get("block_hash")?;
             cursor = hash.clone();
             let uri: Option<String> = row.try_get("body_uri")?;
@@ -4055,26 +4064,44 @@ impl Ledger {
         // connection dropped with half a statement sent would be pinged on
         // its way back to the pool instead, with the transaction still open.
         let mut connection = self.acquire().await?.detach();
-        // While a statement runs, the server checks every
-        // IMPORT_CONNECTION_CHECK that the client is still there, so an
-        // abandoned row is rolled back within that long even mid-UPDATE.
-        // Best effort, for this connection's life only: a server that cannot
-        // check (before PostgreSQL 14, or off Linux) refuses the setting, and
-        // the row then waits for the write timeout instead.
-        let _ = sqlx::query("SELECT set_config('client_connection_check_interval',$1,false)")
-            .bind(IMPORT_CONNECTION_CHECK.as_millis().to_string())
-            .execute(&mut connection)
-            .await;
-        let mut tx = connection.begin().await?;
-        // The write runs before SETTLEMENT_LOCK, so these bound only how
-        // long the row stays locked and the import waits: the server ends a
-        // session that sends the statement for longer than the write timeout
-        // (it is idle in transaction until the whole statement has arrived),
-        // and cancels the UPDATE if it runs or waits for the row that long.
-        set_transaction_timeouts(&mut tx, options.write_timeout, options.write_timeout).await?;
-        // Refuse a halted cluster or a live legacy writer before sending
-        // anything, as when the guard ran first; it runs again under the lock.
-        writable(&mut tx).await?;
+        // The transaction's setup is bounded like the write, and a stop ends
+        // it as it ends the write.
+        let setup = async {
+            // While a statement runs, the server checks every
+            // IMPORT_CONNECTION_CHECK that the client is still there, so an
+            // abandoned row is rolled back within that long even mid-UPDATE.
+            // Best effort, for this connection's life only: a server that
+            // cannot check (before PostgreSQL 14, or off Linux) refuses the
+            // setting, and the row then waits for the write timeout instead.
+            let _ = sqlx::query("SELECT set_config('client_connection_check_interval',$1,false)")
+                .bind(IMPORT_CONNECTION_CHECK.as_millis().to_string())
+                .execute(&mut connection)
+                .await;
+            let mut tx = connection.begin().await?;
+            // The write runs before SETTLEMENT_LOCK, so these bound only how
+            // long the row stays locked and the import waits: the server ends
+            // a session that sends the statement for longer than the write
+            // timeout (it is idle in transaction until the whole statement
+            // has arrived), and cancels the UPDATE if it runs or waits for
+            // the row that long.
+            set_transaction_timeouts(&mut tx, options.write_timeout, options.write_timeout).await?;
+            // Refuse a halted cluster or a live legacy writer before sending
+            // anything, as when the guard ran first; it runs again under the
+            // lock.
+            writable(&mut tx).await?;
+            anyhow::Ok(tx)
+        };
+        let Some(setup) =
+            until_stopped(stop, tokio::time::timeout(options.write_timeout, setup)).await
+        else {
+            return Ok(None);
+        };
+        let mut tx = setup.map_err(|_| {
+            anyhow::anyhow!(
+                "opening the row's transaction took more than the write timeout ({} ms)",
+                options.write_timeout.as_millis()
+            )
+        })??;
         let write_started = std::time::Instant::now();
         // Store the exact canonical bytes and the non-share metadata only;
         // readers decode the bytes. A two-copy inline JSONB body would cross
@@ -4102,9 +4129,10 @@ impl Ledger {
             // The row changed after it was read; nothing to commit. A
             // rollback or close that does not finish leaves the dropped
             // connection to the server, which rolls back on its own.
-            let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, tx.rollback()).await;
+            if let Ok(Ok(())) = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, tx.rollback()).await {
+                let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
+            }
             row.total = started.elapsed();
-            let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
             return Ok(Some(row));
         }
         // Under SETTLEMENT_LOCK, a statement or a client gap that outlasts
@@ -4116,11 +4144,13 @@ impl Ledger {
         // holder waiting for that row (a landing that fills a legacy row's
         // found_block_bits). Settlement work queued for the lock goes first,
         // and a SETTLEMENT_LOCK holder this transaction blocks is let through
-        // at once: the poll that misses the lock also asks whether the
-        // session holding it waits for this transaction, and if so the row is
-        // rolled back. Other waiters, such as a second importer, just wait.
+        // at once: the poll that misses the lock also walks the holder's
+        // blockers (pg_blocking_pids, which counts its parallel workers too,
+        // then their blockers in turn) and rolls the row back if this
+        // transaction is among them. Other waiters, such as a second
+        // importer, just wait.
         loop {
-            let (granted, blocking): (bool, bool) = sqlx::query_as("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(SELECT 1 FROM pg_locks waiter JOIN pg_locks held ON held.pid=waiter.pid WHERE NOT waiter.granted AND pg_backend_pid()=ANY(pg_blocking_pids(waiter.pid)) AND held.granted AND held.locktype='advisory' AND held.classid::bigint=$2 AND held.objid::bigint=$3 AND held.objsubid=1) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
+            let (granted, blocking): (bool, bool) = sqlx::query_as("SELECT granted,CASE WHEN granted THEN false ELSE EXISTS(WITH RECURSIVE chain(pid,depth) AS (SELECT blocker.pid,1 FROM pg_locks holder CROSS JOIN LATERAL unnest(pg_blocking_pids(holder.pid)) AS blocker(pid) WHERE holder.granted AND holder.locktype='advisory' AND holder.classid::bigint=$2 AND holder.objid::bigint=$3 AND holder.objsubid=1 UNION SELECT blocker.pid,chain.depth+1 FROM chain CROSS JOIN LATERAL unnest(pg_blocking_pids(chain.pid)) AS blocker(pid) WHERE chain.depth<8) SELECT 1 FROM chain WHERE chain.pid=pg_backend_pid()) END FROM (SELECT pg_try_advisory_xact_lock($1) AS granted OFFSET 0) poll")
                 .bind(SETTLEMENT_LOCK)
                 .bind(SETTLEMENT_LOCK >> 32)
                 .bind(SETTLEMENT_LOCK & 0xffff_ffff)
@@ -4148,8 +4178,9 @@ impl Ledger {
             // Release the row at once and end the session cleanly, or leave
             // it to the server if that does not finish; the refusal is what
             // the operator sees either way.
-            let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, tx.rollback()).await;
-            let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
+            if let Ok(Ok(())) = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, tx.rollback()).await {
+                let _ = tokio::time::timeout(IMPORT_CLOSE_TIMEOUT, connection.close()).await;
+            }
             bail!(refusal);
         }
         let granted = std::time::Instant::now();

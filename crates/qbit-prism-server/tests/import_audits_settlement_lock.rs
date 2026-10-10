@@ -980,6 +980,133 @@ async fn stop_mid_write(fixture: &Fixture) -> Result<()> {
     Ok(())
 }
 
+/// The same when the holder waits for the row only through another session
+/// that waits for the importer: the importer walks the holder's blockers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settlement_lock_holder_queued_behind_another_waiter_still_goes_first() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = holder_waits_through_another(&fixture).await;
+    fixture.close(result).await
+}
+
+async fn holder_waits_through_another(fixture: &Fixture) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bundle = legacy_bundle(100, 10)?;
+    let (block_hash, digest) =
+        seed_legacy_row(&fixture.ledger.pool, directory.path(), &bundle, 0x57).await?;
+    let mut holder = PgConnection::connect(&fixture.database.url).await?;
+    let mut held = holder.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SETTLEMENT_LOCK)
+        .execute(&mut *held)
+        .await?;
+    let mut patient = options(None);
+    patient.lock_timeout = Duration::from_secs(30);
+    let importer = fixture.importer().clone();
+    let root = directory.path().to_path_buf();
+    let import = tokio::spawn(async move {
+        importer
+            .import_legacy_audits_with(Some(root.as_path()), &ledger_public_key(), &patient, |_| {})
+            .await
+    });
+    let waiting = |prefix: &'static str| {
+        let pool = fixture.ledger.pool.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let found: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
+                     AND query LIKE $1)",
+                )
+                .bind(prefix)
+                .fetch_one(&pool)
+                .await?;
+                if found {
+                    return anyhow::Ok(());
+                }
+                ensure!(Instant::now() < deadline, "no session ran {prefix}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    waiting("SELECT granted,CASE WHEN granted%").await?;
+    // A plain session queues on the row first, holding its tuple lock...
+    let mut middle = PgConnection::connect(&fixture.database.url).await?;
+    let hash = block_hash.clone();
+    let between = tokio::spawn(async move {
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1 /* middle */")
+            .bind(&hash)
+            .bind("1d00ffff")
+            .execute(&mut middle)
+            .await?;
+        middle.close().await?;
+        anyhow::Ok(())
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
+             AND wait_event_type='Lock' AND query LIKE '%/* middle */%')",
+        )
+        .fetch_one(&fixture.ledger.pool)
+        .await?;
+        if queued {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the middle session never queued on the row"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // ...so the holder waits for that session, not for the importer.
+    let asked = Instant::now();
+    sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1")
+        .bind(&block_hash)
+        .bind("207fffff")
+        .execute(&mut *held)
+        .await?;
+    let waited = asked.elapsed();
+    held.commit().await?;
+    holder.close().await?;
+    tokio::time::timeout(SLACK, between)
+        .await
+        .context("the middle session never finished")???;
+    let failed = tokio::time::timeout(SLACK, import)
+        .await
+        .context("the import did not end")??;
+    let error = format!("{:#}", failed.err().context("the import kept the row")?);
+    println!("holder waited {waited:?} behind another waiter: {error}");
+    ensure!(
+        waited < Duration::from_secs(2),
+        "the SETTLEMENT_LOCK holder waited {waited:?}"
+    );
+    ensure!(
+        error.contains(
+            "the session holding SETTLEMENT_LOCK is waiting for a lock this row's write holds"
+        ),
+        "{error}"
+    );
+    ensure!(
+        fixture.stored_digest(&block_hash).await?.is_none(),
+        "the row was stored"
+    );
+    let imported = fixture
+        .importer()
+        .import_legacy_audits_with(
+            Some(directory.path()),
+            &ledger_public_key(),
+            &options(None),
+            |_| {},
+        )
+        .await?;
+    ensure!(imported == 1, "the re-run imported {imported} rows");
+    ensure!(fixture.stored_digest(&block_hash).await?.as_deref() == Some(digest.as_str()));
+    Ok(())
+}
+
 /// A stop while the server is still running the row's UPDATE (here slowed
 /// by a test trigger) rolls it back within about a second: the importer's
 /// transaction asks the server to check that the client is still there.
