@@ -235,6 +235,10 @@ pub struct Sim {
     timeline: Mutex<Vec<TimelineEvent>>,
     /// Base backups taken during the run, by name.
     pub backups: BTreeMap<String, PathBuf>,
+    /// When the pair began writing as two primaries: just before the dual
+    /// bootstrap, or the cutover's. Rows written before it are history both
+    /// databases share (the 3.0 pair wrote one database).
+    pub dual_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Sim {
@@ -390,6 +394,7 @@ impl Sim {
         let links = Links { relays };
 
         let ready_limit = Duration::from_secs(180);
+        let dual_since = (config.topology == Topology::DualWriter).then(chrono::Utc::now);
         if config.topology == Topology::DualWriter {
             // The bootstrap a fresh pair runs (CONTRACT.md D-9): migrate
             // each database, personalise it as its node, then let the peer
@@ -465,6 +470,7 @@ impl Sim {
             gates,
             timeline: Mutex::new(Vec::new()),
             backups: BTreeMap::new(),
+            dual_since,
         };
         sim.mark(&format!(
             "started: {:?} pair, {} sessions through the balancer",
@@ -820,6 +826,7 @@ impl Sim {
         });
         self.config.topology = Topology::DualWriter;
         self.config.readiness = Readiness::Readyz;
+        self.dual_since = Some(chrono::Utc::now());
         for node in [Node::B, Node::A] {
             bootstrap_node(&self.frontends[&node], &self.pg[&node]).await?;
         }

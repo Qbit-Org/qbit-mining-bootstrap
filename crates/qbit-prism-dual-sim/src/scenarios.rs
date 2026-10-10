@@ -796,14 +796,14 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
         steady(sim, 4).await;
     }
     let (lag, _) = sampler.stop().await?;
-    expect_landing_order(&mut body, order.stop().await?);
+    expect_landing_order(&mut body, Node::B, order.stop().await?);
     body.expect(
         "A's shares reach B within the sync interval",
         lag.resolved > 0 && lag.p95_ms.is_some_and(|ms| ms <= SYNC_LAG_BOUND_MS),
         format!(
-            "{} of {} samples seen on B; p50 {:?} ms, p95 {:?} ms, max {:?} ms (interval {} ms, bound {SYNC_LAG_BOUND_MS} ms, resolution {} ms)",
+            "{} of {} samples seen on B; p50 {:?} ms, p95 {:?} ms, max {:?} ms (interval {} ms, bound {SYNC_LAG_BOUND_MS} ms, resolution {} ms, {} failed polls)",
             lag.resolved, lag.samples, lag.p50_ms, lag.p95_ms, lag.max_ms,
-            sim.config.sync_interval_ms, lag.resolution_ms
+            sim.config.sync_interval_ms, lag.resolution_ms, lag.failed_polls
         ),
     );
     sim.settle(SETTLE_BOUND).await?;
@@ -820,16 +820,40 @@ async fn s01_steady_state(sim: &mut Sim) -> Result<Body> {
     Ok(body)
 }
 
-/// D-5: every peer block a sampler saw arrive had its whole window there.
-fn expect_landing_order(body: &mut Body, samples: Vec<crate::measure::LandingOrder>) {
-    let incomplete: Vec<&crate::measure::LandingOrder> =
-        samples.iter().filter(|sample| !sample.complete()).collect();
+/// D-5, for the peer blocks one sampler watched arrive on `on`: none was
+/// there before its window's shares, and at least one was counted as it
+/// arrived, so the order was shown, not merely not contradicted.
+fn expect_landing_order(body: &mut Body, on: Node, report: crate::measure::LandingOrderReport) {
+    use crate::measure::LandingVerdict;
+    let count = |verdict| {
+        report
+            .samples
+            .iter()
+            .filter(|sample| sample.verdict() == verdict)
+            .count()
+    };
+    let violated: Vec<&crate::measure::LandingOrder> = report
+        .samples
+        .iter()
+        .filter(|sample| sample.verdict() == LandingVerdict::Violated)
+        .collect();
+    let in_order = count(LandingVerdict::InOrder);
     body.expect(
-        "a peer block never lands before its window's shares (D-5)",
-        !samples.is_empty() && incomplete.is_empty(),
+        &format!(
+            "node {:?}'s blocks never land on node {on:?} before their window's shares (D-5)",
+            on.peer()
+        ),
+        violated.is_empty() && in_order > 0,
         format!(
-            "{} peer blocks seen arriving; incomplete windows: {incomplete:?}",
-            samples.len()
+            "{} blocks seen arriving: {in_order} with every window share already there, {} unresolved \
+             (window counted only after the block, or never); out of order: {violated:?}. \
+             {} of {} polls failed {:?}; resolution {} ms",
+            report.samples.len(),
+            count(LandingVerdict::Unresolved),
+            report.failed_polls,
+            report.polls,
+            report.errors,
+            report.resolution_ms
         ),
     );
 }
@@ -980,8 +1004,9 @@ async fn s03_b_dies(sim: &mut Sim) -> Result<Body> {
 }
 
 /// S4. The link between the databases is blackholed while both nodes are
-/// up and every miner is on A: mining does not notice, A finds a block B
-/// cannot see, and on heal the sync resumes and B catches up.
+/// up and every miner is on A: mining does not notice, neither node is
+/// withdrawn (D-8), A finds a block B cannot see, and on heal the sync
+/// resumes and B catches up.
 async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
     let mut body = Body::default();
     sim.load()?.resume();
@@ -1021,6 +1046,32 @@ async fn s04_link_cut(sim: &mut Sim) -> Result<Body> {
             started.elapsed().as_secs_f64()
         ),
     );
+    // D-8: the latch is for a node's start. A serving node that later loses
+    // its peer keeps serving, so the balancer never withdraws either node
+    // from the cut to the catch-up. A single failed check is counted, not
+    // failed: a landed block can fail one while the node rebuilds its work.
+    let caught_up_at = sim.clock.now_ms();
+    let events = sim.balancer.report().events;
+    let during: Vec<&crate::balancer::BalancerEvent> = events
+        .iter()
+        .filter(|event| (fault_at..=caught_up_at).contains(&event.at_ms))
+        .collect();
+    let withdrawn: Vec<&&crate::balancer::BalancerEvent> = during
+        .iter()
+        .filter(|event| event.event.contains(" marked down "))
+        .collect();
+    let failed_checks = during
+        .iter()
+        .filter(|event| event.event.contains(" check failing"))
+        .count();
+    body.expect(
+        "a link loss never withdraws a serving node (D-8)",
+        withdrawn.is_empty(),
+        format!(
+            "{} mark-downs from the cut to the catch-up: {withdrawn:?}; {failed_checks} single failed checks",
+            withdrawn.len()
+        ),
+    );
     steady(sim, 2).await;
     sim.settle(SETTLE_BOUND).await?;
     let records = sim.load()?.records();
@@ -1058,9 +1109,8 @@ async fn s05_both_write(sim: &mut Sim) -> Result<Body> {
         confirm_on_both(sim, &hash).await?;
         steady(sim, 3).await;
     }
-    let mut samples = on_a.stop().await?;
-    samples.extend(on_b.stop().await?);
-    expect_landing_order(&mut body, samples);
+    expect_landing_order(&mut body, Node::A, on_a.stop().await?);
+    expect_landing_order(&mut body, Node::B, on_b.stop().await?);
     sim.settle(SETTLE_BOUND).await?;
     let records = sim.load()?.records();
     for node in Node::BOTH {

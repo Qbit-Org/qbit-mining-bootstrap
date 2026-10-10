@@ -109,10 +109,20 @@ block whose coinbase carries `/PRISM/`), never from a database's
 | `inv4-windows-reproducible` | every recorded window recomputes to its digest from every database |
 | `ledger-integrity` | `qbit_carry_forward_integrity_report()` is clean everywhere |
 | `candidates-settled` | no block candidate is left unfinished |
+| `d2-local-state-not-copied` | dual-writer pairs, for rows written since the pair began writing as two primaries: no node holds a candidate claimed or reserved by its peer's frontend, or an offer decision for a block it never had as a candidate (only the offering frontend records one, so such a divergence row was copied); each database identifies as its own node (D-2, D-9). After S7's rebuild this is D-16's reset |
 
 The negative control (`checker-control`) runs two unsynced single writers
 that both mine and checks that the checker fails exactly the checks that must
 fail and passes the rest.
+
+S1 and S5 also sample the sync order (D-5) while they run. A sampler polls a
+node every 100 ms for peer blocks that have arrived and, in the same
+statement, counts each one's window shares there. A block counted short
+fails, and each direction needs at least one block counted complete as it
+arrived. A block whose window record arrived after it is counted then: short
+still fails (shares only accumulate), complete is reported as unresolved.
+Failed polls are counted and listed. The sampler cannot see an out-of-order
+landing shorter than its poll interval.
 
 ## Scenarios (CONTRACT.md §5)
 
@@ -124,12 +134,54 @@ fail and passes the rest.
 | S3 | `s03_b_dies_*` | nightly | the 3.1 stack |
 | S4 | `s04_link_cut_*` | PR, nightly | the 3.1 stack |
 | S5 | `s05_both_nodes_writing_*` | PR, nightly | the 3.1 stack |
+| S6 | `s06_a_restored_*`, `s06_b_restored_*` | nightly | own-log recovery and the D-8 latch |
+| S7 | `s07_b_disk_replaced_*`, `s07_a_disk_replaced_*` | nightly | `node-identity repersonalise` (D-16) |
+| S8 | `s08_a_block_lost_*`, `s08_a_block_accepted_*`, `s08_without_the_peer_ingest_wait_*` | nightly | adoption (D-10, D-11) and the D-19 wait |
+| S9 | `s09_a_3_0_ledger_cut_over_*` | nightly | the 3.1 stack |
 | S10 | `s10_single_writer_*` | PR, nightly | today's code |
+| S11 | `s11_carry_owner_transfer_*` | nightly | `carry-owner release` and `transfer` |
+
+What each one does:
+
+- **S1:** every miner on A; A's shares reach B within 2 s (p95), its blocks
+  land and confirm on B, each peer block's window is complete on B the moment
+  it arrives (D-5), and both nodes report their identity.
+- **S2:** A dies (kill -9 of the frontend, PostgreSQL kill -9, SIGSTOP, or its
+  whole network blackholed); miners reach B within 30 s, B finds two
+  carry-free blocks, A's unsynced tail is measured, A returns, confirms B's
+  blocks from its own chain view, and its next block pays the carry they
+  accrued (its priors equal the chain's sums).
+- **S3:** B's host dies (frontend and PostgreSQL); A's miners see no gap above
+  2 s, and B catches up on return.
+- **S4:** the databases' link blackholed with both nodes up: no gap at the cut
+  or the heal, the balancer withdraws neither node (D-8: a later link loss
+  never withdraws a serving node), A's block is absent from B until the heal,
+  then the sync catches up.
+- **S5:** round-robin routing, both nodes write; four interleaved blocks land
+  on both nodes, each window complete on arrival, B's blocks carry-free.
+- **S6:** a plain PostgreSQL restart with the peer unreachable serves (D-17); a
+  restore onto a new timeline with the peer unreachable stays unready for
+  20 s (D-8, D-17); after the heal the node holds every own row the peer
+  holds at its first ready reading.
+- **S7:** the node's host dies, its disk is wiped and rebuilt as a promoted
+  physical copy of the peer, re-personalised (D-16); only its measured tail is
+  excused.
+- **S8:** A dies at the instant it finds a block: with the `submitblock` held
+  (the block never reaches the chain) or answered by the node and withheld
+  (B adopts it; once A returns each node holds one landing of it), with D-19's
+  wait on and off.
+- **S9:** the 3.0 pair mines a history, is cut over live (drain, promote B,
+  migrate, identity, B then A in dual mode); both ledgers equal the 3.0
+  writer's, every pre-cutover row is node 0, a single-writer start is refused
+  (D-12), the owner's first block pays from the 3.0 balances.
+- **S11:** A releases ownership while B lacks one of A's blocks; B's transfer is
+  refused by the chain scan, succeeds once B has landed the block, and B then
+  pays carry while A builds carry-free work.
 
 A scenario joins its lanes' lists (`test/prism-dual-writer-gated-tests.txt`,
-`test/prism-dual-writer-nightly-gated-tests.txt`) once the 3.1 stack's
-branches make it runnable. S6 to S9 and S11 follow the stack's procedures
-(CONTRACT.md D-8, D-10 to D-17, D-19).
+`test/prism-dual-writer-nightly-gated-tests.txt`) and runs in
+`test/e2e-scenarios.toml` once the 3.1 stack's branches make it runnable;
+until then each lane names it in its summary as not run yet.
 
 ## Bounds and retries
 
