@@ -1855,6 +1855,17 @@ block from its own candidate, whole-block sync keeps one copy on each node
 found, records no divergence for it, and sponsors its zero-fee fanouts only by
 takeover.
 
+**Before the own-log latch.** An adopted block's rows are this node's own, so adoption
+starts only once the own-log latch is set, as the submit loop does. A node
+restored from a backup therefore adopts nothing until its own-log recovery has
+pulled back the landings it lost and raised its sequences, and if it waits for
+a peer that is down, until the peer returns. If the peer cannot be read at
+start, a plain restart still sets the latch, so a survivor that restarts goes
+on adopting. Until the latch is set, adoption reports nothing either. The last
+ALERT below comes only from a running loop: a block that leaves the 1,440-block
+lookback (about 24 hours) while none runs, with the frontend down or waiting
+for its latch, is not reported.
+
 **The solving share.** An adopted block credits no share for the miner who
 solved it. That share was the finder's deferred row, which never reached this
 node (D-11): it is part of the dead node's unsynced tail, one share per adopted

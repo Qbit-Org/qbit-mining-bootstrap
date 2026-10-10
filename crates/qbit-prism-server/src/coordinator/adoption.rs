@@ -28,6 +28,11 @@
 //!    its coinbase ([`Ledger::found_here`]): only that node sponsors its
 //!    fanouts and counts it as found, and no divergence is recorded here.
 //!
+//! Those rows are this node's own, so the loop starts only once the own-log
+//! latch is set (D-8), as the submit loop does: a node restored from a backup
+//! lands nothing before its own-log recovery has pulled back the landings it
+//! lost and raised its sequences.
+//!
 //! While the peer's database is reachable and the peer sync is still pulling
 //! landed blocks or prepared records it lags behind on (a heal or a
 //! catch-up), a pass adopts and reports nothing: the rows it would miss are
@@ -491,9 +496,21 @@ pub const ADOPTION_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 
 impl Coordinator {
     /// Dual writer: run [`Coordinator::adoption_pass`] every
-    /// [`ADOPTION_INTERVAL`] until shutdown. A failed pass is logged and
-    /// retried; nothing it read is trusted across a failure.
+    /// [`ADOPTION_INTERVAL`] until shutdown, from the moment the own-log
+    /// latch is set (module comment). A failed pass is logged and retried;
+    /// nothing it read is trusted across a failure.
     pub async fn adoption_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        // The wait the server puts before its other own-row writers.
+        if let Some(mut status) = self.peer_sync.get().cloned() {
+            let caught_up = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => false,
+                caught_up = status.wait_for(|status| status.own_log_caught_up) => caught_up.is_ok(),
+            };
+            if !caught_up {
+                return;
+            }
+        }
         let mut state = AdoptionState::default();
         loop {
             if let Err(error) = self.adoption_pass(&mut state).await {
