@@ -3366,6 +3366,14 @@ impl Coordinator {
         self.health_report().await.0
     }
 
+    /// Close the dual-writer health pool, if any: at shutdown, beside the
+    /// ledger's pool.
+    pub async fn close_health_pool(&self) {
+        if let Some(dual) = &self.dual_writer {
+            dual.close().await;
+        }
+    }
+
     /// How many dual-writer health refreshes (the writer probe and the health
     /// reads) this frontend has run; `None` for a single writer.
     pub fn dual_writer_health_refreshes(&self) -> Option<u64> {

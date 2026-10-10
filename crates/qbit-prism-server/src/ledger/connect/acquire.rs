@@ -62,6 +62,15 @@ impl Ledger {
     pub(crate) async fn acquire(&self) -> sqlx::Result<PoolConnection<Postgres>> {
         time_pool_acquire(self.metrics.as_deref(), self.pool.acquire()).await
     }
+
+    /// [`Self::acquire`] from another pool of this ledger's database, timed
+    /// the same way: a dual-writer frontend's own health pool (3.1).
+    pub(crate) async fn acquire_from(
+        &self,
+        pool: &sqlx::PgPool,
+    ) -> sqlx::Result<PoolConnection<Postgres>> {
+        time_pool_acquire(self.metrics.as_deref(), pool.acquire()).await
+    }
 }
 
 #[cfg(test)]

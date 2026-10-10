@@ -48,7 +48,10 @@ acquisitions, these paths use the shared checkout timer:
   transaction after an append is refused with SQLSTATE 23514;
 - candidate heartbeat's live-token read after renewal contention and its
   terminal-state read after work cancellation;
-- `apply_online_migration`'s startup checkout, before the connection is detached.
+- `apply_online_migration`'s startup checkout, before the connection is detached;
+- 3.1 dual-writer mode: the health refresh's checkouts from the frontend's own
+  health pool (the writer probe and the health reads, through
+  `Ledger::acquire_from`), whose acquire timeout is 2 s, not 15 s.
 
 Each pending online migration records one checkout when metrics are attached.
 Timing ends before detach: the runner's session settings, advisory-lock waits, concurrent

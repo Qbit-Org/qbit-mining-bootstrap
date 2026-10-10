@@ -462,6 +462,7 @@ pub async fn run(config: Config) -> Result<()> {
     // reservations. On failure, retain reservations and close without a
     // stopped marker so a replacement cannot reclaim live IDs.
     if let Err(error) = coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await {
+        coordinator.close_health_pool().await;
         coordinator.ledger.pool.close().await;
         if let Some(failure) = failure {
             return Err(anyhow::anyhow!(
@@ -475,6 +476,7 @@ pub async fn run(config: Config) -> Result<()> {
         .release_session_owner_reservations()
         .await
         .err();
+    coordinator.close_health_pool().await;
     coordinator.ledger.pool.close().await;
     if let Some(error) = cleanup_error {
         return Err(anyhow::anyhow!(

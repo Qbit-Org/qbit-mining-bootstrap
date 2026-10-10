@@ -135,7 +135,7 @@ impl Ledger {
         &self,
         pool: &PgPool,
     ) -> Result<(Option<i64>, Option<SubmissionHold>)> {
-        health_reads_with(&mut *pool.acquire().await?).await
+        health_reads_with(&mut *self.acquire_from(pool).await?).await
     }
 
     /// Hold block submission cluster-wide, or keep a hold already set as it

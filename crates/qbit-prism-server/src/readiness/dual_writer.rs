@@ -190,6 +190,9 @@ impl DualWriterReadiness {
                 .max_connections(HEALTH_POOL_CONNECTIONS)
                 .min_connections(0)
                 .acquire_timeout(WRITER_PROBE_TIMEOUT)
+                // No ping on checkout: it would spend a round trip of the
+                // probe's budget, and the probe itself is the liveness check.
+                .test_before_acquire(false)
                 .after_connect(move |connection, _| {
                     let budget = budget.clone();
                     Box::pin(async move {
@@ -223,7 +226,7 @@ impl DualWriterReadiness {
             let mut refresh = self.refresh.lock().await;
             if refresh.writer.due(Instant::now()) {
                 let (path, reads) = tokio::join!(
-                    probe_writer(pool, self.identity),
+                    probe_writer(ledger, pool, self.identity),
                     tokio::time::timeout(WRITER_PROBE_TIMEOUT, ledger.health_reads_on(pool)),
                 );
                 refresh.writer.record(Instant::now(), path);
@@ -244,6 +247,14 @@ impl DualWriterReadiness {
     /// How many health refreshes this frontend has run.
     pub fn refreshes(&self) -> u64 {
         self.refreshes.load(Ordering::Relaxed)
+    }
+
+    /// Close the health pool, if it was ever built: at shutdown, beside the
+    /// ledger's pool.
+    pub async fn close(&self) {
+        if let Some(pool) = self.health_pool.get() {
+            pool.close().await;
+        }
     }
 
     fn assemble(
@@ -275,14 +286,23 @@ impl DualWriterReadiness {
     }
 }
 
-/// Ask this frontend's own database whether it is this node's and can take
-/// its writes. Any error or a timeout is no answer.
-pub(crate) async fn probe_writer(pool: &PgPool, identity: NodeIdentity) -> WriterPath {
-    let probe = sqlx::query_as::<_, (bool, bool, Option<i16>)>(
-        "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on', \
-         (SELECT node_index FROM qbit_prism_node_identity WHERE singleton)",
-    )
-    .fetch_one(pool);
+/// Ask this frontend's own database, on `pool` (the health pool), whether it
+/// is this node's and can take its writes. The checkout is timed with the
+/// ledger's pool-acquire metric. Any error or a timeout is no answer.
+pub(crate) async fn probe_writer(
+    ledger: &Ledger,
+    pool: &PgPool,
+    identity: NodeIdentity,
+) -> WriterPath {
+    let probe = async {
+        let mut connection = ledger.acquire_from(pool).await?;
+        sqlx::query_as::<_, (bool, bool, Option<i16>)>(
+            "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on', \
+             (SELECT node_index FROM qbit_prism_node_identity WHERE singleton)",
+        )
+        .fetch_one(&mut *connection)
+        .await
+    };
     match tokio::time::timeout(WRITER_PROBE_TIMEOUT, probe).await {
         Ok(Ok((in_recovery, read_only, recorded))) => {
             classify(in_recovery, read_only, recorded, identity)
