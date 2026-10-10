@@ -21,7 +21,8 @@ const ACCEPTED_CUTOFF_SQL: &str =
 /// cut entry and the peer's share-stream high-water mark (`window/cut.rs`).
 /// Every peer row at or below the mark is visible to the cutoff's read, so
 /// the cutoff is at least every row the window's cut can admit. `$1` is this
-/// node's index.
+/// node's index, `$2` the anchor, `$3` the retained window's entry for this
+/// node or NULL.
 static DUAL_CUTOFF_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "SELECT ({ACCEPTED_CUTOFF_SQL}),({}),({})",
@@ -1228,6 +1229,15 @@ impl Ledger {
         let dual_writer_node = self
             .dual_writer_identity()
             .map(|identity| identity.node.index());
+        // The retained window's entry for this node bounds the own-cut probe
+        // below (`cut::OWN_CUT_SQL`); NULL without one.
+        let retained_own = match (dual_writer_node, prior.as_ref().and_then(|prior| prior.cut)) {
+            (Some(node), Some(cut)) => cut
+                .get(u8::try_from(node)?)?
+                .map(i64::try_from)
+                .transpose()?,
+            _ => None,
+        };
         let mut tx = self.begin().await?;
         if dual_writer_node.is_some() {
             // The cut reads probe the (origin_node, share_seq) index, the own
@@ -1263,6 +1273,8 @@ impl Ledger {
                 let (cutoff, own, mark): (i64, Option<i64>, Option<i64>) =
                     sqlx::query_as(&DUAL_CUTOFF_SQL)
                         .bind(node)
+                        .bind(anchor_ms)
+                        .bind(retained_own)
                         .fetch_one(&mut *tx)
                         .await?;
                 (cutoff, own, mark)
@@ -1624,8 +1636,9 @@ pub enum WindowHolding {
     /// a prefix of the range.
     PrefixPruned,
     /// The last row is absent, or is another share that does not match the
-    /// window's own predicate: this primary does not hold the history the
-    /// window was read from.
+    /// window's own predicate, or, in a dual-writer window, a node's entry
+    /// or the peer's rows under it are missing: this primary does not hold
+    /// the history the window was read from.
     NotHeld,
 }
 
@@ -1648,6 +1661,18 @@ pub enum WindowHolding {
 /// A reissued row can only match the predicate if the promoted host's clock
 /// runs behind the old primary's by more than the time from the anchor to
 /// its reissue. The landing's count and digest stay the proof either way.
+///
+/// **A dual-writer window** (one with a cut) holds rows from two logs, and
+/// its database has no physical standby (CONTRACT D-19): the rows it can
+/// lose are the newest of each log, to a restore. Own-log recovery brings
+/// back the own rows the peer had pulled, in `share_seq` order, and the
+/// peer sync pulls the peer's again from the restored mark. So the window is
+/// held when, besides its last row, this node's entry in the window's range
+/// is its row under the predicate (the own rows below it came back with it),
+/// and the peer sync's safe mark is at or above the peer's entry
+/// ([`cut::entries_held_sql`]). A rewound mark is [`WindowHolding::NotHeld`]
+/// whatever retention did; a missing entry row is only when the first row
+/// is present, since retention may have removed an entry under it.
 pub async fn probe_window_holding(
     connection: &mut sqlx::PgConnection,
     window: &WindowRef,
@@ -1656,22 +1681,43 @@ pub async fn probe_window_holding(
         return Ok(WindowHolding::Held);
     };
     let (first, last) = range.bounds()?;
-    let (first_present, last_held): (bool, bool) = sqlx::query_as(&format!(
+    let endpoints = format!(
         "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$1),\
          EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_seq=$2 AND {})",
         cut::window_eligibility_sql(3, window.cut.map(|_| 4))
-    ))
-    .bind(first)
-    .bind(last)
-    .bind(window.anchor_ms)
-    .bind_cut(window.cut.as_ref())?
-    .fetch_one(&mut *connection)
-    .await?;
-    Ok(match (last_held, first_present) {
-        (false, _) => WindowHolding::NotHeld,
-        (true, false) => WindowHolding::PrefixPruned,
-        (true, true) => WindowHolding::Held,
-    })
+    );
+    let (first_present, last_held, entries_present, peer_rows_present) = match &window.cut {
+        None => {
+            let (first_present, last_held): (bool, bool) = sqlx::query_as(&endpoints)
+                .bind(first)
+                .bind(last)
+                .bind(window.anchor_ms)
+                .fetch_one(&mut *connection)
+                .await?;
+            (first_present, last_held, true, true)
+        }
+        Some(cut) => {
+            sqlx::query_as(&format!("{endpoints},{}", cut::entries_held_sql(1, 3, 4)))
+                .bind(first)
+                .bind(last)
+                .bind(window.anchor_ms)
+                .bind_cut(Some(cut))?
+                .fetch_one(&mut *connection)
+                .await?
+        }
+    };
+    Ok(
+        match (
+            last_held && peer_rows_present,
+            first_present,
+            entries_present,
+        ) {
+            (false, _, _) => WindowHolding::NotHeld,
+            (true, false, _) => WindowHolding::PrefixPruned,
+            (true, true, false) => WindowHolding::NotHeld,
+            (true, true, true) => WindowHolding::Held,
+        },
+    )
 }
 
 /// A block candidate refused before its enqueue: the primary that would hold

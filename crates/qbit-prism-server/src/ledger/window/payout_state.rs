@@ -34,20 +34,37 @@ const PAYOUT_REVISION_SQL: &str = "SELECT payout_revision FROM qbit_prism_cluste
 
 /// [`PAYOUT_REVISION_SQL`] with the writer timeline in the same statement,
 /// behind the same guards, so the refresh probe gains no round trip (#619).
-fn refresh_revision_sql() -> String {
-    format!("SELECT payout_revision, {WRITER_TIMELINE_SQL} FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'")
+/// A dual-writer frontend reads the peer sync's mark there too
+/// (`window/cut.rs`); a single writer's statement is 3.0's.
+fn refresh_revision_sql(dual_writer: bool) -> String {
+    let peer_mark = if dual_writer {
+        ", qbit_prism_peer_share_mark()"
+    } else {
+        ""
+    };
+    format!("SELECT payout_revision, {WRITER_TIMELINE_SQL}{peer_mark} FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'")
 }
 
-/// The refresh probe's revision and writer timeline, from one statement.
+/// The refresh probe's revision, writer timeline and, for a dual writer,
+/// the peer's mark, from one statement.
 async fn refresh_revision(
     tx: &mut Transaction<'_, Postgres>,
-) -> Result<(i64, WriterTimeline), WindowError> {
-    let (payout_revision, timeline): (i64, String) = sqlx::query_as(&refresh_revision_sql())
-        .fetch_one(&mut **tx)
-        .await?;
+    dual_writer: bool,
+) -> Result<(i64, WriterTimeline, Option<i64>), WindowError> {
+    let sql = refresh_revision_sql(dual_writer);
+    let (payout_revision, timeline, peer_mark) = if dual_writer {
+        sqlx::query_as::<_, (i64, String, Option<i64>)>(&sql)
+            .fetch_one(&mut **tx)
+            .await?
+    } else {
+        let (payout_revision, timeline): (i64, String) =
+            sqlx::query_as(&sql).fetch_one(&mut **tx).await?;
+        (payout_revision, timeline, None)
+    };
     Ok((
         payout_revision,
         WriterTimeline::parse(&timeline).map_err(WindowError::Decode)?,
+        peer_mark,
     ))
 }
 
@@ -102,17 +119,10 @@ impl Ledger {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *tx)
             .await?;
-        let (payout_revision, timeline) = refresh_revision(&mut tx).await?;
+        let (payout_revision, timeline, peer_mark) =
+            refresh_revision(&mut tx, self.dual_writer_identity().is_some()).await?;
         let (accepted_share_seq, prior_balances_digest) =
             refresh_balances(&mut tx, &completion).await?;
-        let peer_mark = match self.dual_writer_identity() {
-            Some(_) => {
-                sqlx::query_scalar(super::cut::PEER_HIGH_WATER_SQL)
-                    .fetch_one(&mut *tx)
-                    .await?
-            }
-            None => None,
-        };
         tx.commit().await?;
         Ok(RefreshProbe {
             payout_state: PayoutState {
@@ -184,3 +194,21 @@ async fn refresh_balances(
 #[cfg(test)]
 #[path = "payout_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod refresh_revision_sql_tests {
+    use super::*;
+
+    #[test]
+    fn a_single_writer_reads_3_0s_statement_and_a_dual_writer_adds_the_mark() {
+        let single = refresh_revision_sql(false);
+        assert_eq!(
+            single,
+            format!("SELECT payout_revision, {WRITER_TIMELINE_SQL} FROM qbit_prism_cluster WHERE singleton AND fatal_error IS NULL AND NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'")
+        );
+        assert_eq!(
+            refresh_revision_sql(true).replace(", qbit_prism_peer_share_mark()", ""),
+            single
+        );
+    }
+}

@@ -10,9 +10,10 @@
 //! before it, and every proof of a window reads the same rows on either node.
 //!
 //! **How the entries are chosen** ([`OWN_CUT_SQL`], [`read_peer_cut`]): each
-//! is a row of its node, the highest one the window saw.
-//! - This node's entry is its newest own row, read under `ORDER_LOCK`: every
-//!   own row is appended under that lock, so every later one is above it.
+//! is a row of its node that the window's predicate admits, the newest one.
+//! - This node's entry is its newest own row eligible at the anchor, read
+//!   under `ORDER_LOCK` once the anchor is taken: every own row is appended
+//!   under that lock, so every later one is above it.
 //! - The peer's entry is its newest synced row at or below the peer sync's
 //!   high-water mark for the share stream, below which every peer row is
 //!   already committed here (the sync writes the mark in the transaction that
@@ -143,12 +144,19 @@ pub(crate) fn cut_from_columns(
     }
 }
 
-/// This node's own entry: its newest own row, read where `ORDER_LOCK` is
-/// held. Every own row is appended under that lock (the share append and the
-/// settlement's deferred-share credit; own-log recovery runs before the node
-/// serves and only adds rows above the restored ones), so every own row
-/// appended later is above it. NULL when this node has written no row. `$1`
-/// is this node's index.
+/// This node's own entry: its newest own row eligible at the anchor, read
+/// where `ORDER_LOCK` is held, after the anchor is taken. Every own row is
+/// appended under that lock (the share append and the settlement's
+/// deferred-share credit; own-log recovery runs before the node serves and
+/// only adds rows above the restored ones), so every own row appended later
+/// is above it. A native append is accepted and stamped with the ledger
+/// clock, so the newest own row is the entry; only legacy rows, rejected or
+/// stamped ahead, can lie above it, and they are outside the window either
+/// way. Holding to eligibility keeps both entries rows the window's predicate
+/// admits: the higher one is the window's newest row, as the accepted cutoff
+/// is without a cut. NULL when this node has no eligible row. `$1` is this
+/// node's index, `$2` the anchor, and `$3` the retained window's entry for
+/// this node, or NULL.
 ///
 /// **One index probe per partition, whatever the planner believes.** A node's
 /// own rows can all lie under a long run of the peer's, as on a node that was
@@ -160,21 +168,35 @@ pub(crate) fn cut_from_columns(
 /// equality, leaves it out of the planner's equivalence classes, so the order
 /// `(origin_node, share_seq)` is served only by the `(origin_node,
 /// share_seq)` index (migration 031): one backward probe per partition, to
-/// this node's newest row. `accepted` is not filtered: native writers insert
-/// only accepted rows, and a rejected legacy row on top would only be a
-/// bound no eligible row can exceed.
-pub(crate) const OWN_CUT_SQL: &str = "SELECT (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 ORDER BY origin_node DESC, share_seq DESC LIMIT 1)";
+/// this node's newest row, which a native append makes the entry.
+///
+/// **Bounded below by the retained window's entry.** One probe per
+/// partition would still grow with the partitions retained, all inside
+/// `ORDER_LOCK`, where 3.0's cutoff reads only the newest. The entry never
+/// moves back while the rows stay, so the first probe reads only the
+/// partitions at or above the retained window's entry, usually the newest
+/// alone. `COALESCE` evaluates the unbounded probe only when that one finds
+/// nothing: on the first snapshot (no retained entry, NULL), and after
+/// retention or a restore removed the retained entry's row.
+pub(crate) const OWN_CUT_SQL: &str = "SELECT COALESCE(\
+     (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 AND share_seq>=$3 AND accepted AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY origin_node DESC, share_seq DESC LIMIT 1),\
+     (SELECT share_seq FROM qbit_share_ledger WHERE origin_node BETWEEN $1 AND $1 AND accepted AND accepted_at<=to_timestamp($2::double precision/1000) AND job_issued_at<=to_timestamp($2::double precision/1000) ORDER BY origin_node DESC, share_seq DESC LIMIT 1))";
 
 /// Whether the share ledger has a valid `(origin_node, share_seq)` index
 /// (migration 031), on its parent and so on every partition: the index
 /// [`OWN_CUT_SQL`] and [`read_peer_cut`] read. Without it they would scan the
 /// ledger, the first inside `ORDER_LOCK`, so a dual-writer snapshot checks it
-/// first and refuses.
+/// first and refuses. A btree, both columns in one direction with default
+/// null ordering, so a scan of it in either direction serves their
+/// `ORDER BY`. One catalog lookup per snapshot, about 0.04 ms, re-read each
+/// time so an index dropped or left invalid later is still caught.
 pub(crate) const ORIGIN_INDEX_SQL: &str = "SELECT EXISTS(SELECT 1 FROM pg_index i \
+     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am m ON m.oid=c.relam \
      JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
      JOIN pg_attribute b ON b.attrelid=i.indrelid AND b.attnum=i.indkey[1] \
      WHERE i.indrelid='qbit_share_ledger'::regclass AND i.indnkeyatts>=2 AND i.indisvalid \
-       AND i.indpred IS NULL AND a.attname='origin_node' AND b.attname='share_seq')";
+       AND i.indpred IS NULL AND m.amname='btree' AND i.indoption[0]=i.indoption[1] \
+       AND i.indoption[0] IN (0,3) AND a.attname='origin_node' AND b.attname='share_seq')";
 
 /// A dual-writer snapshot's refusal on a ledger without that index
 /// ([`ORIGIN_INDEX_SQL`]). Every refresh repeats it until the index is
@@ -224,6 +246,37 @@ pub(crate) async fn read_peer_cut(
         .fetch_one(&mut *connection)
         .await?;
     entry.map_or(Ok(None), positive_entry)
+}
+
+/// Two more columns for [the holding probe](super::probe_window_holding) of
+/// a window with a cut:
+/// - whether each node's entry is this database's row of that node under the
+///   window's predicate: own rows are appended, and recovered, in
+///   `share_seq` order, so holding this node's entry holds every own row
+///   below it;
+/// - whether the peer sync's safe mark (D-14) is at or above the peer's
+///   entry, so every peer row of the window is here. The cursor row names the
+///   node whose stream the mark covers, so a window read on either node is
+///   judged from this database's side; before the first pull there is no
+///   cursor and no peer row either.
+///
+/// An entry absent from the cut, or below the window's first row, has no row
+/// in the window and holds trivially. `$first` is the window's first
+/// `share_seq`, `$anchor` its anchor, and `$cut` and `$cut + 1` its entries.
+pub(crate) fn entries_held_sql(first: usize, anchor: usize, cut: usize) -> String {
+    let entries = format!(
+        "(VALUES (0::smallint,${cut}::bigint),(1::smallint,${}::bigint)) e(node,share_seq)",
+        cut + 1
+    );
+    let outside = format!("e.share_seq IS NULL OR e.share_seq<${first}");
+    format!(
+        "(SELECT COALESCE(bool_and({outside} OR EXISTS(SELECT 1 FROM qbit_share_ledger \
+           WHERE share_seq=e.share_seq AND origin_node=e.node AND {})),false) FROM {entries}),\
+         (SELECT COALESCE(bool_and({outside} OR e.node IS DISTINCT FROM \
+           (SELECT peer_node FROM qbit_prism_peer_sync_cursors WHERE stream='shares') \
+           OR COALESCE(qbit_prism_peer_share_mark()>=e.share_seq,false)),false) FROM {entries})",
+        window_eligibility_sql(anchor, Some(cut))
+    )
 }
 
 /// A cut entry from a `share_seq` or a cut column the database returned:

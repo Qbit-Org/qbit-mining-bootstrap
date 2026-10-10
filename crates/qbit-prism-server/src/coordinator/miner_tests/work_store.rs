@@ -106,7 +106,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
                     payout_state,
                     accepted_share_seq: snapshot.share_seq,
                     timeline: crate::ledger::WriterTimeline::new(1),
-                    peer_mark: None,
+                    peer_mark: *self.peer_mark.lock().unwrap(),
                 })
             };
             let gate = self.compact.state_gate.lock().unwrap().take();
@@ -479,7 +479,7 @@ impl work_ledger::WorkLedger for MemoryLedger {
                     crate::metrics::WindowAcquisition::NoPrior,
                 ),
                 timeline: crate::ledger::WriterTimeline::new(1),
-                peer_mark: None,
+                peer_mark: *self.peer_mark.lock().unwrap(),
             }))
         })
     }

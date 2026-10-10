@@ -130,8 +130,8 @@ impl RetainedShares {
     /// With a cut, the cutoff checks are made per node instead: the fresh cut
     /// must cover the retained one (a window whose mode changed, cut to none
     /// or none to cut, counts as regressed; a frontend's mode is fixed for
-    /// its life, so that is a defect, not a path), and the slots between the
-    /// two, summed over the nodes, bound the delta as `MAX_DELTA_SLOTS` does.
+    /// its life, so that is a defect, not a path), and the slots the delta
+    /// would read ([`cut_delta_slots`]) bound it as `MAX_DELTA_SLOTS` does.
     fn refusal(
         &self,
         anchor: i64,
@@ -154,11 +154,8 @@ impl RetainedShares {
                 if !cut.covers(retained) {
                     return Some(WindowAcquisition::CutoffRegressed);
                 }
-                let slots = |node| {
-                    let entry = |cut: &WindowCut| cut.get(node).ok().flatten().unwrap_or(0);
-                    entry(cut) - entry(retained)
-                };
-                if slots(0).saturating_add(slots(1)) > MAX_DELTA_SLOTS {
+                let first = self.shares.first().map(|share| share.share_seq);
+                if cut_delta_slots(retained, cut, first) > MAX_DELTA_SLOTS {
                     return Some(WindowAcquisition::DeltaTooLarge);
                 }
             }
@@ -188,6 +185,28 @@ impl RetainedShares {
             return Some(WindowAcquisition::NoEvidence);
         }
         None
+    }
+}
+
+/// The `share_seq` slots a dual-writer delta reads ([`advance_in_cut`]): for
+/// each node, those above its retained entry, and at or above the retained
+/// first row, up to its fresh entry. Each slot holds one row of either node,
+/// so the union of the two ranges bounds the rows read, as the cutoff's
+/// difference does without a cut; interleaved sequences count once.
+fn cut_delta_slots(retained: &WindowCut, cut: &WindowCut, first: Option<u64>) -> u64 {
+    let floor = first.map_or(0, |first| first.saturating_sub(1));
+    let range = |node| {
+        let high = cut.get(node).ok().flatten()?;
+        let low = retained.get(node).ok().flatten().unwrap_or(0).max(floor);
+        (high > low).then_some((low, high))
+    };
+    match (range(0), range(1)) {
+        (None, None) => 0,
+        (Some((low, high)), None) | (None, Some((low, high))) => high - low,
+        (Some((low_0, high_0)), Some((low_1, high_1))) => {
+            let overlap = high_0.min(high_1).saturating_sub(low_0.max(low_1));
+            (high_0 - low_0) + (high_1 - low_1) - overlap
+        }
     }
 }
 
@@ -387,7 +406,7 @@ pub(super) async fn advance(
     // Replay the full reader's newest-first saturating fold over the delta,
     // then the retained rows. Saturating subtraction matches it, including
     // zero weights, a partial crossing row, and sums that overflow.
-    let mut merge = completion
+    let merge = completion
         .own((prior, delta))
         .map_anyhow(move |(prior, delta)| {
             let prior = prior.into_inner();
@@ -423,58 +442,11 @@ pub(super) async fn advance(
         .await?;
     // A heavier target than the retained rows reach continues the same walk
     // below the retained first row, newest first, bounded in pages.
-    let margin_page = format!(
-        "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT {DELTA_PAGE_ROWS}",
-        super::super::audit::anchored_eligibility_sql(2)
-    );
-    let mut margin_pages = 0;
-    let mut cursor = first;
-    while merge.remaining > 0 {
-        if margin_pages == MAX_MARGIN_PAGES {
-            retire(merge).await?;
-            return Ok(reject(report, WindowAcquisition::MarginTooLarge));
-        }
-        let rows = sqlx::query(&margin_page)
-            .persistent(false)
-            .bind(cursor)
-            .bind(anchor)
-            .fetch_all(&mut **tx)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        margin_pages += 1;
-        report.pages += 1;
-        merge = merge
-            .map_anyhow(move |mut merge| {
-                for row in &rows {
-                    let share = share_from_row(row)?;
-                    merge.remaining = merge.remaining.saturating_sub(share.share_difficulty);
-                    merge.margin.push(share);
-                    if merge.remaining == 0 {
-                        break;
-                    }
-                }
-                Ok(merge)
-            })
-            .await?;
-        cursor = i64::try_from(
-            merge
-                .margin
-                .last()
-                .context("decoded margin page is empty")?
-                .share_seq,
-        )?;
-    }
-    report.margin_rows = merge.margin.len();
-    report.retired_rows = merge.start;
-    if merge.remaining > 0 {
-        // Out of history before the target: the count proof below could not
-        // tell this partial window from one missing older rows, so the full
-        // scan decides.
-        retire(merge).await?;
-        return Ok(reject(report, WindowAcquisition::Partial));
-    }
+    let retired = merge.start;
+    let merge = match walk_margin(tx, merge, first, anchor, None, retired, &mut report).await? {
+        Ok(merge) => merge,
+        Err(outcome) => return Ok(reject(report, outcome)),
+    };
     // Assemble oldest first: margin (reversed), the kept retained suffix, the
     // kept delta suffix. Without a margin the retained vector is trimmed in
     // place and appended to, so obsolete rows never inflate its capacity and
@@ -513,16 +485,8 @@ pub(super) async fn advance(
             // re-derives the same boundary (`ledger/audit.rs`,
             // `oldest_boundary`), so a window failing either check here
             // would be refused there; it is refused here first.
-            let ascending = shares
-                .windows(2)
-                .all(|pair| pair[0].share_seq < pair[1].share_seq);
-            let without_first = shares.iter().skip(1).fold(weight, |left, share| {
-                left.saturating_sub(share.share_difficulty)
-            });
-            let crossing = shares.first().is_some_and(|first| {
-                without_first > 0 && without_first.saturating_sub(first.share_difficulty) == 0
-            });
-            Ok((shares, ascending && crossing))
+            let holds = window_invariant(&shares, weight);
+            Ok((shares, holds))
         })
         .await?;
     if !merged.1 {
@@ -537,23 +501,146 @@ pub(super) async fn advance(
     }
     let merged = merged.map_anyhow(|(shares, _)| Ok(shares)).await?;
     report.window_rows = merged.len();
-    // The merged range's witness is re-read first without the count, so a
-    // margin that crossed into another leaf, or an incarnation or timeline
-    // that changed while the pages were read, is named as such; then the
-    // same statement with the count checks complete eligible membership.
-    // Within the same writer timeline, immutability makes the retained rows
-    // a subset of the anchored set and the delta and margin rows were just
-    // read from it; equal cardinality proves equality, even with sequence
-    // gaps, retroactive INSERTs and newly eligible timestamps. This is
-    // intentionally an O(window) metadata scan, not a claim of O(delta)
-    // database work.
-    let first = i64::try_from(
-        merged
-            .first()
-            .context("full retained suffix disappeared")?
-            .share_seq,
-    )?;
-    if leaf_witness(tx, first, cutoff, anchor, None, None)
+    prove_merged(tx, merged, cutoff, anchor, None, witness, report).await
+}
+
+fn reject(mut report: AcquisitionReport, outcome: WindowAcquisition) -> Advance {
+    report.outcome = outcome;
+    Advance::Rejected(report)
+}
+
+/// The newest-first walk's state while the margin below the retained first
+/// row is read: what [`walk_margin`] extends, for [`advance`]'s merge and
+/// [`advance_in_cut`]'s alike.
+trait MarginWalk: Send + 'static {
+    /// The target weight the walk has still to meet.
+    fn remaining(&self) -> u128;
+    /// The rows read below the retained first row, newest first.
+    fn margin(&self) -> &[AcceptedShare];
+    /// Take the next older row: its weight comes off the target, saturating
+    /// as the full reader's fold does.
+    fn take(&mut self, share: AcceptedShare);
+}
+
+impl MarginWalk for Merge {
+    fn remaining(&self) -> u128 {
+        self.remaining
+    }
+    fn margin(&self) -> &[AcceptedShare] {
+        &self.margin
+    }
+    fn take(&mut self, share: AcceptedShare) {
+        self.remaining = self.remaining.saturating_sub(share.share_difficulty);
+        self.margin.push(share);
+    }
+}
+
+impl MarginWalk for CutMerge {
+    fn remaining(&self) -> u128 {
+        self.remaining
+    }
+    fn margin(&self) -> &[AcceptedShare] {
+        &self.margin
+    }
+    fn take(&mut self, share: AcceptedShare) {
+        self.remaining = self.remaining.saturating_sub(share.share_difficulty);
+        self.margin.push(share);
+    }
+}
+
+/// Continue the walk below the retained first row, `first`, newest first,
+/// in bounded pages under the fresh window's predicate (and its cut, for a
+/// dual-writer window), until the target is met or history runs out. The
+/// margin's rows, pages and the merge's `retired` rows go in the report.
+/// `Err` is the refusal: more than [`MAX_MARGIN_PAGES`], or out of history
+/// before the target ([`WindowAcquisition::Partial`]), where the count proof
+/// could not tell the partial window from one missing older rows, so the
+/// full scan decides.
+async fn walk_margin<M: MarginWalk>(
+    tx: &mut Transaction<'_, Postgres>,
+    mut merge: BlockingDrop<M>,
+    first: i64,
+    anchor: i64,
+    cut: Option<&WindowCut>,
+    retired: usize,
+    report: &mut AcquisitionReport,
+) -> Result<Result<BlockingDrop<M>, WindowAcquisition>> {
+    let margin_page = format!(
+        "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT {DELTA_PAGE_ROWS}",
+        super::cut::window_eligibility_sql(2, cut.map(|_| 3))
+    );
+    let mut margin_pages = 0;
+    let mut cursor = first;
+    while merge.remaining() > 0 {
+        if margin_pages == MAX_MARGIN_PAGES {
+            retire(merge).await?;
+            return Ok(Err(WindowAcquisition::MarginTooLarge));
+        }
+        let rows = sqlx::query(&margin_page)
+            .persistent(false)
+            .bind(cursor)
+            .bind(anchor)
+            .bind_cut(cut)?
+            .fetch_all(&mut **tx)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        margin_pages += 1;
+        report.pages += 1;
+        merge = merge
+            .map_anyhow(move |mut merge| {
+                for row in &rows {
+                    merge.take(share_from_row(row)?);
+                    if merge.remaining() == 0 {
+                        break;
+                    }
+                }
+                Ok(merge)
+            })
+            .await?;
+        cursor = i64::try_from(
+            merge
+                .margin()
+                .last()
+                .context("decoded margin page is empty")?
+                .share_seq,
+        )?;
+    }
+    report.margin_rows = merge.margin().len();
+    report.retired_rows = retired;
+    if merge.remaining() > 0 {
+        retire(merge).await?;
+        return Ok(Err(WindowAcquisition::Partial));
+    }
+    Ok(Ok(merge))
+}
+
+/// The proof both advances end with, over the merged window's range up to
+/// `last` (the cutoff without a cut, the window's last row with one), under
+/// the fresh anchor and cut.
+///
+/// The merged range's witness is re-read first without the count, so a
+/// margin that crossed into another leaf, or an incarnation or timeline
+/// that changed while the pages were read, is named as such; then the
+/// same statement with the count checks complete eligible membership.
+/// Within the same writer timeline, immutability makes the retained rows
+/// a subset of the anchored set and the delta and margin rows were just
+/// read from it; equal cardinality proves equality, even with sequence
+/// gaps, retroactive INSERTs and newly eligible timestamps. This is
+/// intentionally an O(window) metadata scan, not a claim of O(delta)
+/// database work.
+async fn prove_merged(
+    tx: &mut Transaction<'_, Postgres>,
+    merged: BlockingDrop<Vec<AcceptedShare>>,
+    last: i64,
+    anchor: i64,
+    cut: Option<&WindowCut>,
+    witness: LeafWitness,
+    report: AcquisitionReport,
+) -> Result<Advance> {
+    let first = i64::try_from(merged.first().context("merged window is empty")?.share_seq)?;
+    if leaf_witness(tx, first, last, anchor, cut, None)
         .await?
         .as_ref()
         != Some(&witness)
@@ -562,7 +649,7 @@ pub(super) async fn advance(
         return Ok(reject(report, WindowAcquisition::WitnessChanged));
     }
     let count = i64::try_from(merged.len())?;
-    if leaf_witness(tx, first, cutoff, anchor, None, Some(count))
+    if leaf_witness(tx, first, last, anchor, cut, Some(count))
         .await?
         .as_ref()
         != Some(&witness)
@@ -575,11 +662,6 @@ pub(super) async fn advance(
         leaf: witness,
         report,
     })
-}
-
-fn reject(mut report: AcquisitionReport, outcome: WindowAcquisition) -> Advance {
-    report.outcome = outcome;
-    Advance::Rejected(report)
 }
 
 /// [`advance`] for a dual-writer window, whose fresh `cut` covers the
@@ -673,7 +755,7 @@ async fn advance_in_cut(
         }
     }
     report.delta_rows = delta.len();
-    let mut merge = completion
+    let merge = completion
         .own((prior, delta))
         .map_anyhow(move |(prior, delta)| {
             merge_cut_delta(prior.into_inner().shares, delta.into_inner(), weight)
@@ -682,57 +764,12 @@ async fn advance_in_cut(
     // A heavier target than the merged rows reach continues the walk below the
     // retained first row, newest first and bounded in pages, under the fresh
     // predicate: old rows and late peer rows alike.
-    let margin_page = format!(
-        "{SELECT_SHARE} WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT {DELTA_PAGE_ROWS}",
-        super::cut::window_eligibility_sql(2, Some(3))
-    );
-    let mut margin_pages = 0;
-    let mut cursor = first;
-    while merge.remaining > 0 {
-        if margin_pages == MAX_MARGIN_PAGES {
-            retire(merge).await?;
-            return Ok(reject(report, WindowAcquisition::MarginTooLarge));
-        }
-        let rows = sqlx::query(&margin_page)
-            .persistent(false)
-            .bind(cursor)
-            .bind(anchor)
-            .bind_cut(Some(&cut))?
-            .fetch_all(&mut **tx)
-            .await?;
-        if rows.is_empty() {
-            break;
-        }
-        margin_pages += 1;
-        report.pages += 1;
-        merge = merge
-            .map_anyhow(move |mut merge| {
-                for row in &rows {
-                    let share = share_from_row(row)?;
-                    merge.remaining = merge.remaining.saturating_sub(share.share_difficulty);
-                    merge.margin.push(share);
-                    if merge.remaining == 0 {
-                        break;
-                    }
-                }
-                Ok(merge)
-            })
-            .await?;
-        cursor = i64::try_from(
-            merge
-                .margin
-                .last()
-                .context("decoded margin page is empty")?
-                .share_seq,
-        )?;
-    }
-    report.margin_rows = merge.margin.len();
-    report.retired_rows = merge.retired;
-    if merge.remaining > 0 {
-        // Out of history before the target: the full scan decides.
-        retire(merge).await?;
-        return Ok(reject(report, WindowAcquisition::Partial));
-    }
+    let retired = merge.retired;
+    let merge =
+        match walk_margin(tx, merge, first, anchor, Some(&cut), retired, &mut report).await? {
+            Ok(merge) => merge,
+            Err(outcome) => return Ok(reject(report, outcome)),
+        };
     let merged = merge
         .map_anyhow(move |merge| {
             let shares = merge.assemble();
@@ -752,30 +789,8 @@ async fn advance_in_cut(
     }
     let merged = merged.map_anyhow(|(shares, _)| Ok(shares)).await?;
     report.window_rows = merged.len();
-    let first = i64::try_from(merged.first().context("merged window is empty")?.share_seq)?;
     let last = i64::try_from(merged.last().context("merged window is empty")?.share_seq)?;
-    if leaf_witness(tx, first, last, anchor, Some(&cut), None)
-        .await?
-        .as_ref()
-        != Some(&witness)
-    {
-        retire(merged).await?;
-        return Ok(reject(report, WindowAcquisition::WitnessChanged));
-    }
-    let count = i64::try_from(merged.len())?;
-    if leaf_witness(tx, first, last, anchor, Some(&cut), Some(count))
-        .await?
-        .as_ref()
-        != Some(&witness)
-    {
-        retire(merged).await?;
-        return Ok(reject(report, WindowAcquisition::CountMismatch));
-    }
-    Ok(Advance::Advanced {
-        shares: merged,
-        leaf: witness,
-        report,
-    })
+    prove_merged(tx, merged, last, anchor, Some(&cut), witness, report).await
 }
 
 /// The cut path's state between blocking hand-offs: the merged rows the

@@ -459,17 +459,24 @@ async fn the_cut_reads_probe_the_origin_index_and_never_walk_the_other_nodes_run
                 sqlx::query(&format!("SET LOCAL plan_cache_mode = {mode}"))
                     .execute(&mut *tx)
                     .await?;
-                for (label, sql, peer) in [
-                    ("own cut", OWN_CUT_SQL, false),
-                    ("peer cut", PEER_CUT_SQL, true),
+                let anchor = PAST_MS + 86_400_000_000;
+                for (label, sql, [second, third]) in [
+                    // The anchor, and no retained entry: a first snapshot.
+                    ("own cut", OWN_CUT_SQL, [Some(anchor), None]),
+                    // The anchor and a retained entry: the bounded probe.
+                    ("bounded own cut", OWN_CUT_SQL, [Some(anchor), Some(1)]),
+                    // The mark, then the anchor.
+                    ("peer cut", PEER_CUT_SQL, [Some(i64::MAX), Some(anchor)]),
                 ] {
                     let statement =
                         format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {sql}");
-                    let mut explain = sqlx::query_scalar::<_, String>(&statement).bind(1i16);
-                    if peer {
-                        explain = explain.bind(i64::MAX).bind(PAST_MS + 86_400_000_000);
-                    }
-                    let plan = explain.fetch_all(&mut *tx).await?.join("\n");
+                    let plan = sqlx::query_scalar::<_, String>(&statement)
+                        .bind(1i16)
+                        .bind(second)
+                        .bind(third)
+                        .fetch_all(&mut *tx)
+                        .await?
+                        .join("\n");
                     ensure!(
                         !plan.contains("pkey") && !plan.contains("Rows Removed by Filter"),
                         "{label} under {mode} walks rows:\n{plan}"
@@ -499,12 +506,163 @@ async fn the_cut_reads_probe_the_origin_index_and_never_walk_the_other_nodes_run
                 }
                 tx.rollback().await?;
             }
-            // And they still answer: node 1's newest row is 797, under node 0's run.
-            let own: Option<i64> = sqlx::query_scalar(OWN_CUT_SQL)
-                .bind(1i16)
-                .fetch_one(&ledger.pool)
+            // And they still answer: node 1's newest row is 797, under node
+            // 0's run, with no retained entry, one below it, and one above
+            // every row (as after a restore), which the unbounded probe
+            // answers.
+            for retained in [None, Some(1i64), Some(10_000)] {
+                let own: Option<i64> = sqlx::query_scalar(OWN_CUT_SQL)
+                    .bind(1i16)
+                    .bind(PAST_MS + 86_400_000_000)
+                    .bind(retained)
+                    .fetch_one(&ledger.pool)
+                    .await?;
+                assert_eq!(own, Some(797), "retained entry {retained:?}");
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The own cut runs inside `ORDER_LOCK`, so its first probe reads only the
+/// partitions at or above the retained window's entry, usually the newest
+/// alone, as 3.0's cutoff does; the unbounded probe, one descent per
+/// partition, runs only without a retained entry or when the bounded probe
+/// finds nothing. Custom and generic plans alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_own_cut_probes_only_the_partitions_at_or_above_the_retained_entry() -> Result<()> {
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            // Empty test database only: four leaves, this node's rows in each
+            // and the peer's in the newest.
+            sqlx::raw_sql(
+                "ALTER TABLE qbit_share_ledger DETACH PARTITION qbit_share_ledger_p0;
+                 SELECT qbit_prism_share_partition_create('qbit_share_ledger_p50',1,100);
+                 SELECT qbit_prism_share_partition_create('qbit_share_ledger_p51',100,200);
+                 SELECT qbit_prism_share_partition_create('qbit_share_ledger_p52',200,300);
+                 SELECT qbit_prism_share_partition_create('qbit_share_ledger_p53',300,1000);",
+            )
+            .execute(&ledger.pool)
+            .await?;
+            origin_index(ledger).await?;
+            let mut rows: Vec<Row> = [2, 50, 120, 180, 250, 320, 400]
+                .into_iter()
+                .map(|seq| row(0, seq, 1))
+                .collect();
+            rows.extend([301, 303, 405].into_iter().map(|seq| row(1, seq, 1)));
+            insert(ledger, &rows).await?;
+            sqlx::query("ANALYZE qbit_share_ledger")
+                .execute(&ledger.pool)
                 .await?;
-            assert_eq!(own, Some(797));
+            let anchor = PAST_MS + 86_400_000_000;
+            // The leaves each case reads, by the share_seq ranges above:
+            // from an entry in the newest leaf, none wholly below it, and
+            // the unbounded probe never; with no entry, or one above every
+            // row (as after a restore), the unbounded probe reads them all.
+            let below = [
+                "qbit_share_ledger_p50",
+                "qbit_share_ledger_p51",
+                "qbit_share_ledger_p52",
+            ];
+            for (retained, unbounded) in [(Some(320i64), false), (None, true), (Some(900), true)] {
+                for mode in ["force_custom_plan", "force_generic_plan"] {
+                    let mut tx = ledger.begin().await?;
+                    sqlx::query(&format!("SET LOCAL plan_cache_mode = {mode}"))
+                        .execute(&mut *tx)
+                        .await?;
+                    let plan = sqlx::query_scalar::<_, String>(&format!(
+                        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {OWN_CUT_SQL}"
+                    ))
+                    .bind(0i16)
+                    .bind(anchor)
+                    .bind(retained)
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .join("\n");
+                    // The leaves a scan actually read, in either probe.
+                    let read: Vec<&str> = plan
+                        .lines()
+                        .filter(|line| line.contains(" Scan") && !line.contains("never executed"))
+                        .filter_map(|line| line.split(" on ").nth(1))
+                        .filter_map(|rest| rest.split_whitespace().next())
+                        .collect();
+                    let read_below = below.iter().filter(|leaf| read.contains(leaf)).count();
+                    ensure!(
+                        read.contains(&"qbit_share_ledger_p53")
+                            && read_below == if unbounded { below.len() } else { 0 },
+                        "{mode} with retained entry {retained:?} read {read:?}:\n{plan}"
+                    );
+                    let own: Option<i64> = sqlx::query_scalar(OWN_CUT_SQL)
+                        .bind(0i16)
+                        .bind(anchor)
+                        .bind(retained)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    ensure!(own == Some(400), "{mode}, {retained:?}: {own:?}");
+                    tx.rollback().await?;
+                }
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The #619 holding probe of a dual-writer window, which has no physical
+/// standby: the rows a restore loses are each log's newest. The window is
+/// held while each node's entry is that node's row and the peer sync's mark
+/// covers the peer's entry, whichever node holds the window's last row. A
+/// mark the restore rewound, or an own entry it lost, is not held until the
+/// sync and own-log recovery bring the rows back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_holding_probe_checks_each_nodes_entry_and_the_peer_mark() -> Result<()> {
+    run(gate::site!(), |ledger| {
+        Box::pin(async move {
+            let probe = |reference: WindowRef| async move {
+                let mut connection = ledger.pool.acquire().await?;
+                anyhow::Ok(probe_window_holding(&mut connection, &reference).await?)
+            };
+            let lose = |seq: i64| async move {
+                sqlx::raw_sql(&format!(
+                    "ALTER TABLE qbit_share_ledger DISABLE TRIGGER qbit_prism_immutable_share_history; \
+                     DELETE FROM qbit_share_ledger WHERE share_seq={seq}; \
+                     ALTER TABLE qbit_share_ledger ENABLE TRIGGER qbit_prism_immutable_share_history"
+                ))
+                .execute(&ledger.pool)
+                .await?;
+                anyhow::Ok(())
+            };
+            // This node's run tops the window; the peer's entry lies below.
+            let mut rows: Vec<Row> = (1..=20).map(|i| row(0, 2 * i, 1)).collect();
+            rows.extend([21, 25, 29, 33].into_iter().map(|seq| row(1, seq, 1)));
+            insert(ledger, &rows).await?;
+            mark(ledger, 1, 33).await?;
+            let own_top = capture(ledger, 2).await?;
+            assert_eq!(own_top.cut, Some(WindowCut::new(Some(40), Some(33))?));
+            let reference = WindowRef::from_snapshot(&own_top.snapshot)?;
+            assert_eq!(probe(reference).await?, WindowHolding::Held);
+            // A restore rewinds the mark below the peer's entry: the last row
+            // is still held, but the peer's rows above the mark may be gone.
+            mark(ledger, 1, 25).await?;
+            assert_eq!(probe(reference).await?, WindowHolding::NotHeld);
+            mark(ledger, 1, 33).await?;
+            assert_eq!(probe(reference).await?, WindowHolding::Held);
+            // Now the peer's rows top the window, and this node's entry is
+            // lower: losing it is not held, though the last row is.
+            insert(ledger, &[row(1, 41, 1), row(1, 45, 1)]).await?;
+            mark(ledger, 1, 45).await?;
+            let peer_top = capture(ledger, 2).await?;
+            assert_eq!(peer_top.cut, Some(WindowCut::new(Some(40), Some(45))?));
+            let reference = WindowRef::from_snapshot(&peer_top.snapshot)?;
+            assert_eq!(probe(reference).await?, WindowHolding::Held);
+            lose(40).await?;
+            assert_eq!(probe(reference).await?, WindowHolding::NotHeld);
+            // Retention under the first row stays what it was.
+            insert(ledger, &[row(0, 40, 1)]).await?;
+            let first = reference.shares.context("a window range")?.first_share_seq;
+            lose(first as i64).await?;
+            assert_eq!(probe(reference).await?, WindowHolding::PrefixPruned);
             Ok(())
         })
     })
@@ -555,6 +713,14 @@ async fn a_dual_writer_snapshot_refuses_without_the_origin_index() -> Result<()>
             "{error:#}"
         );
         assert_eq!(gauge(), ["qbit_prism_dual_writer_origin_index_missing 1"]);
+        // An index on the columns that cannot serve their order still refuses.
+        sqlx::query("CREATE INDEX qbit_share_ledger_origin_seq_brin ON qbit_share_ledger USING brin (origin_node, share_seq)")
+            .execute(&ledger.pool)
+            .await?;
+        let Err(error) = capture(ledger, 1).await else {
+            bail!("a dual-writer snapshot was taken on a BRIN index");
+        };
+        assert!(error.is::<OriginIndexMissing>(), "{error:#}");
         // Nothing was taken: no lock is left held and the clock did not move.
         // This test's own database: other tests share the cluster.
         let held: i64 = sqlx::query_scalar(
@@ -898,6 +1064,8 @@ async fn measure_dual_writer_refresh() -> Result<()> {
             for _ in 0..10 {
                 let _: Option<i64> = sqlx::query_scalar(OWN_CUT_SQL)
                     .bind(1i16)
+                    .bind(PAST_MS + 86_400_000_000)
+                    .bind(None::<i64>)
                     .fetch_one(&ledger.pool)
                     .await?;
             }
@@ -905,7 +1073,12 @@ async fn measure_dual_writer_refresh() -> Result<()> {
             let mut tx = ledger.begin().await?;
             sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan").execute(&mut *tx).await?;
             let plan = format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {OWN_CUT_SQL}");
-            let lines: Vec<String> = sqlx::query_scalar(&plan).bind(1i16).fetch_all(&mut *tx).await?;
+            let lines: Vec<String> = sqlx::query_scalar(&plan)
+                .bind(1i16)
+                .bind(PAST_MS + 86_400_000_000)
+                .bind(None::<i64>)
+                .fetch_all(&mut *tx)
+                .await?;
             println!("measure: own cut plan ({label}):\n{}", lines.join("\n"));
             if index {
                 assert!(

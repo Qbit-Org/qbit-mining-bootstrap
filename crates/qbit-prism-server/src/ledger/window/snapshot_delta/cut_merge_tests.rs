@@ -300,14 +300,36 @@ fn the_cut_refusals_are_made_per_node() {
         retained.refusal(99, 0, Some(&cut(Some(8), Some(5)))),
         Some(WindowAcquisition::AnchorRegressed)
     );
-    // The delta bound sums both nodes' new slots.
-    let half = MAX_DELTA_SLOTS / 2;
+    // The delta bound counts the slots the delta reads once, however the
+    // nodes' sequences interleave: node 0's (8, 5 + M] lies inside node 1's
+    // (5, 5 + M], so together they span M slots, not 2M - 3.
+    let most = MAX_DELTA_SLOTS;
     assert_eq!(
-        retained.refusal(101, 0, Some(&cut(Some(8 + half), Some(5 + half)))),
+        retained.refusal(101, 0, Some(&cut(Some(5 + most), Some(5 + most)))),
         None
     );
     assert_eq!(
-        retained.refusal(101, 0, Some(&cut(Some(8 + half + 1), Some(5 + half)))),
+        retained.refusal(101, 0, Some(&cut(Some(5 + most), Some(6 + most)))),
+        Some(WindowAcquisition::DeltaTooLarge)
+    );
+    // Disjoint ranges add up: (8, 6 + M] and (5, 7] span M slots.
+    assert_eq!(
+        retained.refusal(101, 0, Some(&cut(Some(6 + most), Some(7)))),
+        None
+    );
+    assert_eq!(
+        retained.refusal(101, 0, Some(&cut(Some(7 + most), Some(7)))),
+        Some(WindowAcquisition::DeltaTooLarge)
+    );
+    // A node without a retained entry is read from the retained first row,
+    // 996, not from the start of the ledger: (995, 995 + M] is M slots.
+    let late = retained_with(Some(cut(Some(1000), None)), &[996, 998, 1000]);
+    assert_eq!(
+        late.refusal(101, 0, Some(&cut(Some(1000), Some(995 + most)))),
+        None
+    );
+    assert_eq!(
+        late.refusal(101, 0, Some(&cut(Some(1000), Some(996 + most)))),
         Some(WindowAcquisition::DeltaTooLarge)
     );
     // The retained tail must be the cut's top row, as it must be the
