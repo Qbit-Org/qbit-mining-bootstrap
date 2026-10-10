@@ -406,6 +406,62 @@ async fn a_burst_of_health_reads_shares_one_refresh() -> Result<()> {
     database.close(outcome).await
 }
 
+/// The health pool pings no connection on checkout, so after a PostgreSQL
+/// restart its idle connections are dead until used. A statement that fails
+/// on one is retried once on a fresh connection, and the writer still reads
+/// local instead of unanswered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_idle_health_connection_is_retried_on_a_fresh_one() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let database = FixtureDatabase::open(&raw, "prism_d4_dead_idle_").await?;
+    let ledger =
+        match Ledger::connect_tool(&database.url, "d4-dead-idle-fixture".into(), 2, true, None)
+            .await
+        {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(database.abandon(error).await),
+        };
+    let outcome = async {
+        ledger.set_node_identity(NodeIndex::B, "d4-test").await?;
+        let node = FakeNode::open().await?;
+        let frontend = frontend(
+            &database,
+            &node,
+            "d4-dead-idle-b",
+            Some(dual_writer(NodeIndex::B)),
+        )
+        .await?;
+        let (sync, status) = PeerSyncPublisher::new();
+        frontend.peer_sync.set(status).expect("attached once");
+        sync.update(|status| status.own_log_caught_up = true);
+        health_until(&frontend, "a local writer", |health| {
+            health["dual_writer"]["writer_path"] == "local"
+        })
+        .await?;
+        // Every idle connection to the fixture database dies, the health
+        // pool's among them, as when PostgreSQL restarts.
+        let terminated: i64 = sqlx::query_scalar(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE datname = $1 AND state = 'idle' AND pid <> pg_backend_pid()",
+        )
+        .bind(database.name())
+        .fetch_one(&database.admin)
+        .await?;
+        ensure!(terminated > 0, "no idle connection to terminate");
+        // Past the reuse window, so this health read refreshes.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let health = frontend.health().await;
+        ensure!(health["dual_writer"]["writer_path"] == "local", "{health}");
+        frontend.ledger.pool.close().await;
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    database.close(outcome).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_writer_health_carries_no_dual_writer_state() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {

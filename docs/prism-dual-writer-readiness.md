@@ -70,7 +70,10 @@ probes, so `/healthz` never reports a `writer_path` of `null`. The probe and
 the health reads run on the frontend's own pool of at most two connections,
 beside the ledger's `PRISM_DATABASE_MAX_CONNECTIONS`, so share traffic that
 keeps every ledger connection busy never delays them: a busy but healthy
-database is not read as `unanswered`. A database that stops answering, dead
+database is not read as `unanswered`. That pool pings no connection on
+checkout, so a statement that fails is retried once on a fresh connection
+within the 2 s: an idle connection that died with a restarted PostgreSQL does
+not read as `unanswered` either. A database that stops answering, dead
 or hung, withdraws the frontend about 4 s after its last answer, plus at most
 one 2 s probe: each publication reads the database beside the probe and waits
 for neither longer than the probe's 2 s, and its

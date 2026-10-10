@@ -6,13 +6,12 @@
 //! peer's reachability and the sync lag are reported, never decided on.
 use super::admission::Withdrawal;
 use crate::{
-    ledger::{Ledger, SubmissionHold},
-    metrics::WriterPathLabel,
-    node_identity::NodeIdentity,
+    ledger::SubmissionHold, metrics::WriterPathLabel, node_identity::NodeIdentity,
     peer_sync::PeerSyncStatus,
 };
+use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -227,20 +226,24 @@ impl DualWriterReadiness {
     /// then report, with the health reads the refresh ran. A refresh is the
     /// writer probe and the health reads, side by side on the health pool
     /// within the probe's budget; reads that fail or run out of time are
-    /// `None`. `peer_sync` is the sync's status channel; until it is attached
+    /// `None`. `ledger` is the ledger's pool, which the health pool is built
+    /// from. `peer_sync` is the sync's status channel; until it is attached
     /// the own log reads as not caught up, so the node does not serve.
     pub async fn report(
         &self,
-        ledger: &Ledger,
+        ledger: &PgPool,
         peer_sync: Option<&watch::Receiver<PeerSyncStatus>>,
     ) -> (DualWriterReport, Option<HealthReads>) {
-        let pool = self.health_pool(&ledger.pool);
+        let pool = self.health_pool(ledger);
         let refresh = {
             let mut refresh = self.refresh.lock().await;
             if refresh.writer.due(Instant::now()) {
                 let (path, reads) = tokio::join!(
-                    probe_writer(ledger, pool, self.identity),
-                    tokio::time::timeout(WRITER_PROBE_TIMEOUT, ledger.health_reads_on(pool)),
+                    probe_writer(pool, self.identity),
+                    tokio::time::timeout(
+                        WRITER_PROBE_TIMEOUT,
+                        on_health_connection(pool, health_reads_statement),
+                    ),
                 );
                 refresh.writer.record(Instant::now(), path);
                 refresh.reads = reads.ok().and_then(Result::ok);
@@ -299,23 +302,54 @@ impl DualWriterReadiness {
     }
 }
 
-/// Ask this frontend's own database, on `pool` (the health pool), whether it
-/// is this node's and can take its writes. The checkout is timed with the
-/// ledger's pool-acquire metric. Any error or a timeout is no answer.
-pub(crate) async fn probe_writer(
-    ledger: &Ledger,
+/// Run `statement` on a connection of the health pool and, if it fails, once
+/// more on a fresh connection. The pool does not ping a connection on
+/// checkout, so an idle connection that died with a restarted PostgreSQL
+/// fails its first statement; that must not read as a database that does not
+/// answer. The caller's budget bounds both attempts.
+async fn on_health_connection<T, E: From<sqlx::Error>>(
     pool: &PgPool,
-    identity: NodeIdentity,
-) -> WriterPath {
-    let probe = async {
-        let mut connection = ledger.acquire_from(pool).await?;
-        sqlx::query_as::<_, (bool, bool, Option<i16>)>(
+    statement: for<'c> fn(&'c mut PgConnection) -> BoxFuture<'c, Result<T, E>>,
+) -> Result<T, E> {
+    let mut connection = pool.acquire().await?;
+    if let Ok(value) = statement(&mut connection).await {
+        return Ok(value);
+    }
+    // Neither the failed connection nor another idle one that has died goes
+    // back to the pool: a connection that does not answer a ping is dropped,
+    // and the pool opens a fresh one.
+    drop(connection.detach());
+    let mut connection = pool.acquire().await?;
+    if connection.ping().await.is_err() {
+        drop(connection.detach());
+        connection = pool.acquire().await?;
+    }
+    statement(&mut connection).await
+}
+
+fn probe_statement(
+    connection: &mut PgConnection,
+) -> BoxFuture<'_, sqlx::Result<(bool, bool, Option<i16>)>> {
+    Box::pin(
+        sqlx::query_as(
             "SELECT pg_is_in_recovery(), current_setting('transaction_read_only') = 'on', \
              (SELECT node_index FROM qbit_prism_node_identity WHERE singleton)",
         )
-        .fetch_one(&mut *connection)
-        .await
-    };
+        .fetch_one(&mut *connection),
+    )
+}
+
+fn health_reads_statement(
+    connection: &mut PgConnection,
+) -> BoxFuture<'_, anyhow::Result<HealthReads>> {
+    Box::pin(crate::ledger::health_reads_with(connection))
+}
+
+/// Ask this frontend's own database, on `pool` (the health pool), whether it
+/// is this node's and can take its writes. Any error, after the one retry,
+/// or a timeout is no answer.
+pub(crate) async fn probe_writer(pool: &PgPool, identity: NodeIdentity) -> WriterPath {
+    let probe = on_health_connection(pool, probe_statement);
     match tokio::time::timeout(WRITER_PROBE_TIMEOUT, probe).await {
         Ok(Ok((in_recovery, read_only, recorded))) => {
             classify(in_recovery, read_only, recorded, identity)

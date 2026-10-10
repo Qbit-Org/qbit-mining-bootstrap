@@ -3413,7 +3413,7 @@ impl Coordinator {
         // single writer reads as in 3.0.
         let (reads, dual) = match &self.dual_writer {
             Some(dual) => {
-                let (report, reads) = dual.report(&self.ledger, self.peer_sync.get()).await;
+                let (report, reads) = dual.report(&self.ledger.pool, self.peer_sync.get()).await;
                 (
                     reads.context("the health reads failed or ran out of time"),
                     Some(report),

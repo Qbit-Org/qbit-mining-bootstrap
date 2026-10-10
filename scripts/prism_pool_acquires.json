@@ -95,6 +95,11 @@
       "owner": "3.1 carry owner",
       "reason": "A checkout from the carry owner's own one-connection pool on the peer's database (PRISM_PEER_DATABASE_URL or its fallback, through PeerJournal), never the run pool; each read bounded by the peer timeout and outside the run pool's acquisition metrics."
     },
+    "health-pool": {
+      "class": "public",
+      "owner": "dual-writer readiness",
+      "reason": "The dual-writer frontend's own two-connection health pool (3.1): the writer probe and the health reads, a 2 s acquire timeout and one retry on a fresh connection. Built from the run pool's connect options, it never checks out from the run pool, and stays out of database_pool_acquire_seconds so that histogram remains the run pool's saturation signal."
+    },
     "shielded-begin": {
       "class": "borrowed",
       "owner": "ledger",
@@ -271,7 +276,6 @@
     "ledger/connect.rs::begin#2::pool .acquire() [timer: metrics]": [1,"timer"],
     "ledger/connect.rs::shielded_begin#1::begin(connection , None)": [1,"transaction"],
     "ledger/connect/acquire.rs::acquire#1::self . pool .acquire() [timer: self . metrics . as_deref ( )]": [1,"timer"],
-    "ledger/connect/acquire.rs::acquire_from#1::pool .acquire() [timer: self . metrics . as_deref ( )]": [1,"timer"],
     "ledger/difficulty.rs::worker_difficulty#1::self .acquire()": [1,"ledger"],
     "ledger/difficulty.rs::record_worker_difficulty#1::self .begin()": [1,"ledger"],
     "ledger/difficulty.rs::lower_worker_difficulty#1::self .begin()": [1,"ledger"],
@@ -298,7 +302,6 @@
     "ledger/fatal_state.rs::clear_fatal_state_in#1::self .begin()": [1,"ledger"],
     "ledger/submission_hold.rs::submission_hold#1::self .acquire()": [1,"ledger"],
     "ledger/submission_hold.rs::health_reads#1::self .acquire()": [1,"ledger"],
-    "ledger/submission_hold.rs::health_reads_on#1::self .acquire_from(pool)": [1,"ledger"],
     "ledger/submission_hold.rs::set_submission_hold#1::self .begin()": [1,"ledger"],
     "ledger/submission_hold.rs::clear_submission_hold#1::self .begin()": [1,"ledger"],
     "ledger/instances.rs::heartbeat#1::self .acquire()": [1,"ledger"],
@@ -398,10 +401,12 @@
     "stratum.rs::prepare_job#1::config . rebuild_job_limit .acquire()": [1,"non-database"],
     "stratum.rs::prepare_job#1::match config . rebuild_job_limit .try_acquire()": [1,"non-database"],
     "stratum.rs::request#1::begin(metrics , is_submit , received_at)": [1,"non-database"],
-    "readiness/dual_writer.rs::probe_writer#1::ledger .acquire_from(pool)": [1,"ledger"],
-    "readiness/dual_writer.rs::report#1::ledger .health_reads_on(pool)": [1,"ledger"],
-    "readiness/dual_writer.rs::report#1::probe_writer(ledger , pool , self . identity)": [1,"ledger"],
     "readiness/endpoint.rs::serve_with#1::endpoint .answer(request . method ( ) , request . uri ( ) . path ( ) , request . headers ( ))": [1,"non-database"],
+    "readiness/dual_writer.rs::on_health_connection#1::pool .acquire()": [3,"health-pool"],
+    "readiness/dual_writer.rs::probe_writer#1::on_health_connection(pool , probe_statement)": [1,"health-pool"],
+    "readiness/dual_writer.rs::report#1::on_health_connection(pool , health_reads_statement)": [1,"health-pool"],
+    "readiness/dual_writer.rs::report#1::probe_writer(pool , self . identity)": [1,"health-pool"],
+    "coordinator.rs::health_report#1::dual .report(& self . ledger . pool , self . peer_sync . get ( ))": [1,"health-pool"],
     "readiness/endpoint.rs::serve_with#1::sources .acquire(peer . ip ( ) , limits . per_source)": [1,"non-database"],
     "stratum.rs::start#1::config . connection_limit .try_acquire()": [1,"non-database"],
     "stratum.rs::timed_out#1::database(message)": [1,"non-database"],

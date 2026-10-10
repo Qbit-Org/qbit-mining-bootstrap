@@ -128,16 +128,6 @@ impl Ledger {
         health_reads_with(&mut *self.acquire().await?).await
     }
 
-    /// [`Self::health_reads`] on `pool`: a dual-writer frontend's own small
-    /// health pool (3.1), so its health never waits behind share traffic for
-    /// a ledger connection.
-    pub async fn health_reads_on(
-        &self,
-        pool: &PgPool,
-    ) -> Result<(Option<i64>, Option<SubmissionHold>)> {
-        health_reads_with(&mut *self.acquire_from(pool).await?).await
-    }
-
     /// Hold block submission cluster-wide, or keep a hold already set as it
     /// is. Returns the hold in force and whether this call set it; only a
     /// new hold is journaled. Allowed on a halted cluster: a hold only ever
@@ -253,7 +243,9 @@ async fn read_submission_hold_report(connection: &mut sqlx::PgConnection) -> Res
     Ok(state)
 }
 
-async fn health_reads_with(
+/// [`Ledger::health_reads`]'s statement on `connection`: a dual-writer
+/// frontend runs it on its own health pool (3.1).
+pub(crate) async fn health_reads_with(
     connection: &mut sqlx::PgConnection,
 ) -> Result<(Option<i64>, Option<SubmissionHold>)> {
     let row = sqlx::query(&format!(
