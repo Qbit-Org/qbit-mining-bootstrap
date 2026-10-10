@@ -11,7 +11,7 @@ pub(crate) use snapshot_delta::{
 };
 pub(super) mod cut;
 use cut::BindCut;
-pub use cut::WindowCut;
+pub use cut::{OriginIndexMissing, WindowCut};
 
 const ACCEPTED_CUTOFF_SQL: &str =
     "SELECT COALESCE(max(share_seq),0) FROM qbit_share_ledger WHERE accepted";
@@ -1236,10 +1236,12 @@ impl Ledger {
             let indexed: bool = sqlx::query_scalar(cut::ORIGIN_INDEX_SQL)
                 .fetch_one(&mut *tx)
                 .await?;
-            ensure!(
-                indexed,
-                "a dual-writer window cut needs a valid (origin_node, share_seq) index on qbit_share_ledger (migration 031); refusing to take one without it"
-            );
+            if let Some(metrics) = self.metrics.as_deref() {
+                metrics.record_origin_index(indexed);
+            }
+            if !indexed {
+                return Err(cut::OriginIndexMissing.into());
+            }
         }
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         let order = self

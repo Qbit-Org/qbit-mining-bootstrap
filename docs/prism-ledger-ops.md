@@ -4140,10 +4140,14 @@ as in 3.0, under the fresh cut. A cut that moved back is counted as
 `cutoff_regressed` in `qbit_prism_refresh_window_acquisitions_total`.
 
 **The index.** This node's entry is read under `ORDER_LOCK`. Both entries come
-from the `(origin_node, share_seq)` index (migration 031), in a statement shape
-only that index can serve, so a node whose rows all lie under a long run of the
-peer's never walks that run. Without a valid index, a dual-writer snapshot
-refuses before it takes any lock, naming migration 031.
+from the `(origin_node, share_seq)` index (migration 031,
+`qbit_share_ledger_origin_seq_idx`), in a statement shape only that index can
+serve, so a node whose rows all lie under a long run of the peer's never walks
+that run. Without a valid btree index on those columns, a dual-writer snapshot
+refuses before it takes any lock, naming migration 031, and the frontend
+publishes no new work. The refresh loop logs that refusal as an `ALERT` once a
+minute, not on every attempt, and `qbit_prism_dual_writer_origin_index_missing`
+reads 1 until a snapshot finds the index again.
 
 **Not cut-aware.** The operator route `/audit/share-window` and the
 dashboards' current-window figures compute a window by anchor over every row.

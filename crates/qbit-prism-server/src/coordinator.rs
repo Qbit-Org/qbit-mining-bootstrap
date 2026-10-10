@@ -1922,6 +1922,7 @@ impl Coordinator {
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_hint_prune = Instant::now();
+        let mut origin_index_alert = refresh_window::AlertEveryMinute::default();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
             // One definite accounting-only refusal may retry immediately with
@@ -1935,11 +1936,24 @@ impl Coordinator {
                 match self.refresh_once().await {
                     Ok(()) => {
                         *self.last_error.write().await = None;
+                        origin_index_alert.clear();
                         break;
                     }
                     Err(error) => {
                         let retry = error.is::<crate::ledger::ChainObservationRetry>();
-                        tracing::warn!(%error,"template refresh deferred");
+                        if error.is::<crate::ledger::OriginIndexMissing>() {
+                            // Every tick and wake repeats it until the index
+                            // is valid: alert once a minute, while the
+                            // dual_writer_origin_index_missing gauge holds 1.
+                            if origin_index_alert.due(Instant::now()) {
+                                tracing::error!(
+                                    %error,
+                                    "ALERT: template refresh deferred: this dual-writer frontend publishes no new work until migration 031's index is valid"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(%error,"template refresh deferred");
+                        }
                         *self.last_error.write().await = Some(error.to_string());
                         if !retry {
                             break;

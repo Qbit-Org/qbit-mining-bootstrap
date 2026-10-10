@@ -223,7 +223,8 @@ impl Metrics {
         // The rollup lag joins them: a disabled rollup publishes no pass, and an
         // absent sample is not the same claim as a lag of -1.
         // 3.1 dual writer (D1): only a dual-writer frontend's peer sync
-        // publishes these, so a single writer declares them without samples.
+        // publishes these, so a single writer declares them without samples;
+        // likewise its window snapshots' origin-index check (D2).
         for family in [
             Family::FirstOffer,
             Family::LockWait,
@@ -242,6 +243,7 @@ impl Metrics {
             Family::PeerSyncConflicts,
             Family::PeerSyncFailures,
             Family::PeerSyncOfferWaits,
+            Family::DualWriterOriginIndexMissing,
         ] {
             registry.declare(family);
         }

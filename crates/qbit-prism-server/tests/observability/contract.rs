@@ -344,7 +344,8 @@ pub fn expected(populated: bool) -> Census {
         SECONDS,
     );
     // 3.1 dual writer (D1): only a dual-writer frontend's peer sync publishes
-    // these, so a single writer declares them without samples.
+    // these, so a single writer declares them without samples; likewise its
+    // window snapshots' origin-index check (D2).
     for (name, kind) in [
         ("peer_sync_peer_reachable", "gauge"),
         ("peer_sync_own_log_caught_up", "gauge"),
@@ -357,6 +358,7 @@ pub fn expected(populated: bool) -> Census {
         ("peer_sync_conflicts_total", "counter"),
         ("peer_sync_failures_total", "counter"),
         ("peer_sync_offer_waits_total", "counter"),
+        ("dual_writer_origin_index_missing", "gauge"),
     ] {
         result.family(name, kind, &[], &[]);
     }

@@ -10,7 +10,7 @@ use super::super::super::audit::{
 };
 use super::super::snapshot_delta::{advance, Advance, RetainedShares, SnapshotCapture};
 use super::*;
-use super::{ORIGIN_INDEX_SQL, OWN_CUT_SQL, PEER_CUT_SQL};
+use super::{OriginIndexMissing, ORIGIN_INDEX_SQL, OWN_CUT_SQL, PEER_CUT_SQL};
 use crate::metrics::WindowAcquisition;
 use crate::node_identity::{NodeIdentity, NodeIndex};
 use futures_util::future::LocalBoxFuture;
@@ -23,7 +23,16 @@ async fn open(
 ) -> Result<(crate::ledger_test_database::FixtureDatabase, Ledger)> {
     let fixture =
         crate::ledger_test_database::FixtureDatabase::open(raw, "dual_writer_windows_").await?;
-    let ledger = match Ledger::connect(&fixture.url, format!("dual-writer-{node}"), 4, true).await {
+    let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+    let ledger = match Ledger::connect_with_metrics(
+        &fixture.url,
+        format!("dual-writer-{node}"),
+        4,
+        true,
+        Some(metrics),
+    )
+    .await
+    {
         Ok(ledger) => ledger,
         Err(error) => return Err(fixture.abandon(error).await),
     };
@@ -523,18 +532,42 @@ async fn a_dual_writer_snapshot_refuses_without_the_origin_index() -> Result<()>
                 .execute(&ledger.pool)
                 .await?;
         }
+        let gauge = || -> Vec<String> {
+            let rendered = ledger
+                .metrics
+                .as_deref()
+                .map(|metrics| metrics.render())
+                .unwrap_or_default();
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("qbit_prism_dual_writer_origin_index_missing"))
+                .map(str::to_owned)
+                .collect()
+        };
         let Err(error) = capture(ledger, 1).await else {
             bail!("a dual-writer snapshot was taken without the origin index");
         };
+        // Typed, so the refresh loop alerts on it once a minute; the gauge
+        // says why no work is published meanwhile.
+        assert!(error.is::<OriginIndexMissing>(), "{error:#}");
         assert!(
             format!("{error:#}").contains("needs a valid (origin_node, share_seq) index"),
             "{error:#}"
         );
+        assert_eq!(gauge(), ["qbit_prism_dual_writer_origin_index_missing 1"]);
         // Nothing was taken: no lock is left held and the clock did not move.
-        let held: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory'")
-            .fetch_one(&ledger.pool)
-            .await?;
+        // This test's own database: other tests share the cluster.
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory' \
+             AND database=(SELECT oid FROM pg_database WHERE datname=current_database())",
+        )
+        .fetch_one(&ledger.pool)
+        .await?;
         assert_eq!(held, 0);
+        // Once the index is valid again, snapshots are taken and the gauge clears.
+        origin_index(ledger).await?;
+        capture(ledger, 1).await?;
+        assert_eq!(gauge(), ["qbit_prism_dual_writer_origin_index_missing 0"]);
         Ok(())
     })).await
 }

@@ -132,6 +132,7 @@ families! {
     PeerSyncConflicts: Counter, "peer_sync_conflicts_total", "3.1 dual writer: rows the peer sync found under an identity this node holds with other content, or could not insert, by copied table; each is kept out, recorded in qbit_prism_peer_sync_conflicts and alerted.";
     PeerSyncFailures: Counter, "peer_sync_failures_total", "3.1 dual writer: peer sync passes that failed, by the path they used; the next pass tries the other path.";
     PeerSyncOfferWaits: Counter, "peer_sync_offer_waits_total", "3.1 dual writer (D-19): found-block offers that first waited, up to PRISM_PEER_INGEST_WAIT_MS, for the peer to hold this node's shares through the block's window and its prepared record, by how the wait ended (unreachable: neither path to the peer answered, or this node could not read the record); every one was offered.";
+    DualWriterOriginIndexMissing: Gauge, "dual_writer_origin_index_missing", "3.1 dual writer: 1 while this frontend refuses to take window snapshots because qbit_share_ledger has no valid (origin_node, share_seq) index (migration 031), so it publishes no new work; 0 once a snapshot found one. No sample on a single writer.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
