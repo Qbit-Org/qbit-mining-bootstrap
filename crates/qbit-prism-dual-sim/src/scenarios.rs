@@ -3167,10 +3167,11 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
     let before = ledger_digest(&sim.pool(Node::A).await?).await?;
     let cutover = sim.cutover_to_dual().await?;
     // The prepared state the drain left (prepared records whole, their blobs,
-    // the journal) survives the promotion and the bootstrap on both
-    // databases, read before either frontend could write or prune any.
-    // Compared whole: a cutover that lost or damaged it the same way on both
-    // would pass every later cross-node check.
+    // the journal) is exactly what both databases hold after the promotion
+    // and the bootstrap, read before either frontend could write or prune
+    // any: nothing lost, changed or added (neither step writes these
+    // tables). Compared whole: a cutover that altered it the same way on
+    // both would pass every later cross-node check.
     let (prepared_before, prepared_after) = sim
         .cutover_prepared
         .clone()
@@ -3178,9 +3179,11 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
     for node in Node::BOTH {
         let mut lost = Vec::new();
         let mut changed = Vec::new();
+        let mut added = Vec::new();
         let mut kept = 0;
+        let after = prepared_after.get(&node);
         for (table, rows) in &prepared_before {
-            let there = prepared_after.get(&node).and_then(|state| state.get(table));
+            let there = after.and_then(|state| state.get(table));
             for (key, row) in rows {
                 match there.and_then(|rows| rows.get(key)) {
                     None => lost.push(format!("{table} {key}")),
@@ -3192,18 +3195,29 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
                 }
             }
         }
+        for (table, rows) in after.into_iter().flatten() {
+            let before = prepared_before.get(table);
+            for key in rows.keys() {
+                if before.is_none_or(|rows| !rows.contains_key(key)) {
+                    added.push(format!("{table} {key}"));
+                }
+            }
+        }
         let count = |table: &str| {
             prepared_before
                 .get(table)
                 .map_or(0, std::collections::BTreeMap::len)
         };
         body.expect(
-            &format!("the cutover kept the prepared state whole on node {node:?}"),
-            lost.is_empty() && changed.is_empty() && count("qbit_prism_jobs") > 0,
+            &format!("the cutover kept the prepared state exactly on node {node:?}"),
+            lost.is_empty()
+                && changed.is_empty()
+                && added.is_empty()
+                && count("qbit_prism_jobs") > 0,
             format!(
                 "{kept} rows from before the promotion kept whole ({} prepared records, {} \
                  templates, {} balance snapshots, {} journal rows); lost: {lost:?}; changed: \
-                 {changed:?}",
+                 {changed:?}; added: {added:?}",
                 count("qbit_prism_jobs"),
                 count("qbit_prism_templates"),
                 count("qbit_prism_balance_snapshots"),
