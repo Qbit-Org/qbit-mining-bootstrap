@@ -3120,7 +3120,7 @@ async fn expect_single_writer_refused(sim: &mut Sim, node: Node, body: &mut Body
         Err(_) => false,
     };
     body.expect(
-        "a single-writer start on a dual-mode database is refused (D-12)",
+        &format!("a single-writer start on node {node:?}'s dual-mode database is refused (D-12)"),
         refused,
         match attempt {
             Ok(run) => format!(
@@ -3266,7 +3266,10 @@ async fn s09_migration(sim: &mut Sim, body: &mut Body) -> Result<()> {
         );
         pool.close().await;
     }
-    expect_single_writer_refused(sim, Node::B, body).await?;
+    // On either database (D-12), the carry owner's included.
+    for node in [Node::B, Node::A] {
+        expect_single_writer_refused(sim, node, body).await?;
+    }
     sim.load()?.resume();
     steady(sim, 5).await;
     let first = find_block(
@@ -3581,6 +3584,7 @@ async fn s11_carry_owner_transfer(sim: &mut Sim, body: &mut Body) -> Result<()> 
         format!("exit {:?}: {}", transferred.code, transferred.stdout.trim()),
     );
     let (transfer_height, _, _) = sim.chain.c.tip().await?;
+    expect_one_owner(sim, body, Node::B).await?;
 
     for (node, owner) in [(Node::A, false), (Node::B, true)] {
         let frontend = sim.frontend_mut(node);
@@ -3608,6 +3612,54 @@ async fn s11_carry_owner_transfer(sim: &mut Sim, body: &mut Body) -> Result<()> 
     steady(sim, 2).await;
     sim.settle(SETTLE_BOUND).await?;
     body.options.ownership = vec![(0, Some(Node::A)), (transfer_height + 1, Some(Node::B))];
+    Ok(())
+}
+
+/// How long both journals may take to show a transfer: one pull each way.
+pub const JOURNAL_SETTLE_BOUND: Duration = Duration::from_secs(15);
+
+/// D-4, from the journal itself rather than the roles the harness then
+/// gives the frontends: on both databases, each node's latest claim leaves
+/// `owner` the only carry owner. A transfer that left the old owner's claim
+/// standing beside the new one fails here, before the restart could mask it.
+async fn expect_one_owner(sim: &Sim, body: &mut Body, owner: Node) -> Result<()> {
+    let started = Instant::now();
+    let one_owner = |latest: &Vec<(i16, bool, String)>| {
+        latest.len() == 2
+            && latest
+                .iter()
+                .filter(|(_, carry_owner, _)| *carry_owner)
+                .map(|(origin, _, _)| *origin)
+                .eq([owner.index() as i16])
+    };
+    let views = loop {
+        let mut views = Vec::new();
+        for node in Node::BOTH {
+            let pool = sim.pool(node).await?;
+            let latest: Result<Vec<(i16, bool, String)>, _> = sqlx::query_as(
+                "SELECT DISTINCT ON (origin_node) origin_node, carry_owner, action \
+                 FROM qbit_prism_node_roles ORDER BY origin_node, epoch DESC",
+            )
+            .fetch_all(&pool)
+            .await;
+            pool.close().await;
+            views.push((node, latest?));
+        }
+        if views.iter().all(|(_, latest)| one_owner(latest))
+            || started.elapsed() >= JOURNAL_SETTLE_BOUND
+        {
+            break views;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    body.expect(
+        &format!("the journal names node {owner:?} alone as the carry owner, on both nodes (D-4)"),
+        views.iter().all(|(_, latest)| one_owner(latest)),
+        format!(
+            "each node's latest claim, (origin, carry owner, action), as each database holds \
+             them: {views:?}"
+        ),
+    );
     Ok(())
 }
 
