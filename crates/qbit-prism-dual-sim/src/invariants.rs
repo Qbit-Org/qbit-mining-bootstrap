@@ -1910,6 +1910,12 @@ async fn copied_state_target(
     lost: &mut Vec<String>,
 ) -> Result<CopiedStateTarget> {
     let peer = origin.peer();
+    // The peer first: whatever it holds, the origin wrote before, so the
+    // origin's later read holds it too unless it was lost there. Read the
+    // other way round, a row written and pulled between the reads would
+    // look lost.
+    let copies = prepared_records(copy, origin, true).await?;
+    let copied_journal = journal_rows(copy, origin).await?;
     let highest: Option<i64> = sqlx::query_scalar(
         "SELECT max(sync_seq) FROM qbit_prism_jobs \
          WHERE origin_node = $1 AND job_id LIKE 'prepared:%'",
@@ -1924,7 +1930,7 @@ async fn copied_state_target(
         .into_iter()
         .filter(|(_, (seq, _))| highest.is_some_and(|highest| *seq <= highest))
         .collect();
-    for job in prepared_records(copy, origin, true).await?.keys() {
+    for job in copies.keys() {
         if !originals.contains_key(job) {
             lost.push(format!(
                 "node {peer:?} holds node {origin:?}'s unexpired prepared record {job}, which \
@@ -1932,7 +1938,7 @@ async fn copied_state_target(
             ));
         }
     }
-    for epoch in journal_rows(copy, origin).await?.keys() {
+    for epoch in copied_journal.keys() {
         if !journal.contains_key(epoch) {
             lost.push(format!(
                 "node {peer:?} holds node {origin:?}'s journal row of epoch {epoch}, which node \
