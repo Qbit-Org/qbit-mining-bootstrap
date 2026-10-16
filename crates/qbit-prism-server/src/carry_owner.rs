@@ -125,6 +125,9 @@ pub struct GuardInputs {
     /// The peer's latest row in this node's synced copy of its journal.
     pub peer_synced: Option<RoleRow>,
     pub peer_read: PeerRead,
+    /// Why this node's coinbase layout is not the peer's, if it is not
+    /// (`Ledger::layout_mismatch`).
+    pub layout_mismatch: Option<String>,
 }
 
 /// Why work is carry-free. Every reason but `NotOwner` is an alert.
@@ -165,10 +168,14 @@ pub enum CarryFreeReason {
     PeerNotSeeded,
     /// The peer has not been read since this process started.
     PeerUnconfirmed,
+    /// The peer issues work with another coinbase tag or extranonce2 width
+    /// (`Ledger::layout_mismatch`): a coinbase can then name a finder at
+    /// either node's offset.
+    LayoutMismatch,
 }
 
 impl CarryFreeReason {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::NotOwner,
         Self::NodeUnidentified,
         Self::NoJournalRow,
@@ -181,6 +188,7 @@ impl CarryFreeReason {
         Self::PeerJournalBehind,
         Self::PeerNotSeeded,
         Self::PeerUnconfirmed,
+        Self::LayoutMismatch,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -197,6 +205,7 @@ impl CarryFreeReason {
             Self::PeerJournalBehind => "peer_journal_behind",
             Self::PeerNotSeeded => "peer_not_seeded",
             Self::PeerUnconfirmed => "peer_unconfirmed",
+            Self::LayoutMismatch => "layout_mismatch",
         }
     }
 
@@ -244,6 +253,7 @@ impl CarryDecision {
                 CarryFreeReason::PeerJournalBehind => CarryOwnerState::PeerJournalBehind,
                 CarryFreeReason::PeerNotSeeded => CarryOwnerState::PeerNotSeeded,
                 CarryFreeReason::PeerUnconfirmed => CarryOwnerState::PeerUnconfirmed,
+                CarryFreeReason::LayoutMismatch => CarryOwnerState::LayoutMismatch,
             },
         }
     }
@@ -287,6 +297,10 @@ impl Guard {
         };
         if inputs.database_node != Some(inputs.node_index) {
             return not_claiming(self, NodeUnidentified);
+        }
+        // Either node, owner or not: the pair's layouts must match.
+        if inputs.layout_mismatch.is_some() {
+            return not_claiming(self, LayoutMismatch);
         }
         // An append-only journal's latest epoch never falls (module comment).
         let rolled_back = match (&inputs.own, self.highest_own_epoch) {
@@ -786,6 +800,9 @@ pub async fn check(
         Some(read) => read,
         None => read_peer(peer, settings.node_index, metrics).await,
     };
+    // Logged with its ALERT only when the decision changes (`log_decision`);
+    // `carry-owner status` and the fanout and adoption refusals say why.
+    let layout_mismatch = ledger.layout_mismatch().await?;
     Ok(guard.decide(&GuardInputs {
         node_index: settings.node_index,
         database_node,
@@ -793,6 +810,7 @@ pub async fn check(
         own: local.own,
         peer_synced: local.peer,
         peer_read,
+        layout_mismatch,
     }))
 }
 
@@ -982,6 +1000,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_layout_mismatch_is_carry_free_and_alerts_on_either_node() {
+        let mismatch = Some("tags differ".to_owned());
+        let decision = Guard::default().decide(&GuardInputs {
+            layout_mismatch: mismatch.clone(),
+            ..owner_inputs(answered(Some(row(1, 11, false, "seed"))))
+        });
+        assert_eq!(
+            decision,
+            CarryDecision::CarryFree(CarryFreeReason::LayoutMismatch)
+        );
+        assert!(decision.alerts());
+        let not_owner = GuardInputs {
+            env_owner: false,
+            own: Some(row(0, 10, false, "seed")),
+            layout_mismatch: mismatch,
+            ..owner_inputs(PeerRead::Failed)
+        };
+        assert_eq!(
+            Guard::default().decide(&not_owner),
+            CarryDecision::CarryFree(CarryFreeReason::LayoutMismatch)
+        );
+    }
+
     fn owner_inputs(peer_read: PeerRead) -> GuardInputs {
         GuardInputs {
             node_index: 0,
@@ -990,6 +1032,7 @@ mod tests {
             own: Some(row(0, 10, true, "seed")),
             peer_synced: Some(row(1, 11, false, "seed")),
             peer_read,
+            layout_mismatch: None,
         }
     }
 

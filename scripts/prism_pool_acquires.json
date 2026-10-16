@@ -122,6 +122,7 @@
     "ledger/audit.rs::audit_canonical_bytes_admitted#1::materialize_audit_row_with_metrics(& mut reader , & mut logical , permit , None , true)": [1,"audit-public"],
     "ledger/audit.rs::materialize_audit_row_with_metrics#1::reader .connection(metrics)": [1,"audit-forward"],
     "ledger/audit.rs::read_range#1::reader .connection(metrics)": [1,"audit-forward"],
+    "ledger/carry.rs::layout_mismatch#1::self .acquire()": [1,"ledger"],
     "ledger/carry.rs::settlement_transaction#1::self .begin()": [1,"ledger"],
     "ledger/divergence.rs::reserve_offer_within#1::self .begin()": [2,"ledger"],
     "ledger/divergence.rs::record_capture_disabled#1::self .begin()": [1,"ledger"],

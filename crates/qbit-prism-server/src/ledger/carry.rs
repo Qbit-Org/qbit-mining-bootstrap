@@ -71,9 +71,10 @@ pub struct CarryGate {
 /// issued the work the block was found on, whichever node landed its rows.
 /// The scriptSig ends with the coinbase tag, extranonce1 (four bytes,
 /// big-endian, as Stratum sends it) and extranonce2 (`extranonce2_size`
-/// bytes, this node's width). The pair need not share that width, so
-/// extranonce1 is read only where `tag` sits right before it: work issued
-/// with another width names no node here, whatever its bytes say. `None`
+/// bytes, this node's width). The pair must share the width and the tag
+/// ([`Ledger::layout_mismatch`] refuses otherwise); extranonce1 is still
+/// read only where `tag` sits right before it, so work issued with another
+/// width, before a change, names no node here, whatever its bytes say. `None`
 /// when the coinbase does not parse, the tag is not there, or extranonce1
 /// is 0, which no session is given. An empty tag verifies nothing, so a
 /// dual writer refuses to start with one (`config.rs`).
@@ -89,6 +90,34 @@ pub fn finder_node(coinbase_tx: &[u8], tag: &[u8], extranonce2_size: usize) -> O
         .into_iter()
         .find(|node| node.extranonce1_range().contains(&extranonce1))
         .map(|node| node.index())
+}
+
+/// The coinbase suffix of node `$1`'s newest prepared record this database
+/// holds: the layout that node issues work with now.
+const PEER_SUFFIX_SQL: &str = "SELECT payload->>'coinbase_suffix_hex' FROM qbit_prism_jobs WHERE origin_node=$1 AND sync_seq IS NOT NULL AND job_id LIKE 'prepared:%' ORDER BY sync_seq DESC LIMIT 1";
+
+/// The coinbase tag and extranonce2 width a prepared record's coinbase
+/// suffix was issued with: the tag, then extranonce1 (four bytes) and
+/// extranonce2 zeroed. The tag is printable ASCII, so the trailing zeros are
+/// exactly the placeholder. `None` when it is not such a suffix.
+pub fn layout_from_suffix(suffix_hex: &str) -> Option<(Vec<u8>, usize)> {
+    let suffix = hex::decode(suffix_hex).ok()?;
+    let placeholder = suffix.iter().rev().take_while(|byte| **byte == 0).count();
+    let width = placeholder.checked_sub(4).filter(|width| *width > 0)?;
+    Some((suffix[..suffix.len() - placeholder].to_vec(), width))
+}
+
+/// Why two coinbase layouts differ, or `None` when they match.
+fn layout_difference(own: &(Vec<u8>, usize), peer: &(Vec<u8>, usize)) -> Option<String> {
+    (own != peer).then(|| {
+        format!(
+            "this node issues work with coinbase tag {:?} and a {}-byte extranonce2, the peer with tag {:?} and a {}-byte extranonce2; set the same PRISM_COINBASE_TAG and PRISM_STRATUM_EXTRANONCE2_SIZE on both nodes",
+            String::from_utf8_lossy(&own.0),
+            own.1,
+            String::from_utf8_lossy(&peer.0),
+            peer.1
+        )
+    })
 }
 
 impl Ledger {
@@ -146,6 +175,39 @@ impl Ledger {
             return origin_is_own;
         };
         finder_node(coinbase, tag, *size).map_or(origin_is_own && offered, |finder| finder == own)
+    }
+
+    /// Dual writer: why this node's coinbase layout is not the peer's, read
+    /// from the peer's newest prepared record held here, or `None` when they
+    /// match or nothing here shows the peer's layout yet. The pair must
+    /// issue work with one tag and one extranonce2 width: under two, a
+    /// coinbase can name a finder at either node's offset, so while they
+    /// differ work is carry-free, no fanout is sponsored as its finder or
+    /// taken over, and no block is adopted.
+    pub async fn layout_mismatch(&self) -> Result<Option<String>> {
+        let Some(own) = self.own_node() else {
+            return Ok(None);
+        };
+        if self.carry.coinbase_layout.get().is_none() {
+            return Ok(None);
+        }
+        let suffix: Option<Option<String>> = sqlx::query_scalar(PEER_SUFFIX_SQL)
+            .bind(1 - own)
+            .fetch_optional(&mut *self.acquire().await?)
+            .await?;
+        Ok(self.layout_mismatch_with(suffix.flatten().as_deref()))
+    }
+
+    /// [`Ledger::layout_mismatch`], given the peer's newest coinbase suffix.
+    pub(super) fn layout_mismatch_with(&self, peer_suffix_hex: Option<&str>) -> Option<String> {
+        let own = self.carry.coinbase_layout.get()?;
+        let suffix = peer_suffix_hex?;
+        match layout_from_suffix(suffix) {
+            Some(peer) => layout_difference(own, &peer),
+            None => Some(format!(
+                "the peer's newest prepared record has coinbase suffix {suffix}, which shows no tag and extranonce placeholder"
+            )),
+        }
     }
 
     /// Whether work built now pays carried balances: always in single-writer
@@ -407,6 +469,33 @@ mod tests {
         assert_eq!(finder_node(&coinbase(u32::MAX), b"/OTHER/", 8), None);
         assert_eq!(finder_node(&coinbase(u32::MAX), b"", 8), Some(1));
         assert_eq!(finder_node(&coinbase_with(u32::MAX, 4), b"", 8), Some(0));
+    }
+
+    #[tokio::test]
+    async fn the_peers_layout_is_read_from_its_coinbase_suffix_and_must_match() {
+        let suffix =
+            |tag: &[u8], width: usize| hex::encode([tag, &vec![0; 4 + width][..]].concat());
+        assert_eq!(layout_from_suffix(&suffix(TAG, 8)), Some((TAG.to_vec(), 8)));
+        assert_eq!(layout_from_suffix(&suffix(TAG, 0)), None);
+        assert_eq!(layout_from_suffix("zz"), None);
+        let ledger = ledger();
+        // Single writer, or no layout recorded: nothing to compare.
+        assert_eq!(ledger.layout_mismatch_with(Some(&suffix(TAG, 4))), None);
+        ledger
+            .set_dual_writer_identity(NodeIdentity {
+                node: NodeIndex::A,
+                carry_owner: true,
+            })
+            .unwrap();
+        ledger.set_coinbase_layout(TAG, 8).unwrap();
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+        assert_eq!(ledger.layout_mismatch_with(Some(&suffix(TAG, 8))), None);
+        let wider = ledger.layout_mismatch_with(Some(&suffix(TAG, 4))).unwrap();
+        assert!(wider.contains("4-byte extranonce2"), "{wider}");
+        assert!(ledger
+            .layout_mismatch_with(Some(&suffix(b"/OTHER/", 8)))
+            .is_some());
+        assert!(ledger.layout_mismatch_with(Some("00")).is_some());
     }
 
     #[tokio::test]
