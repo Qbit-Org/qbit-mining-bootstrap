@@ -5,6 +5,11 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod admission;
+pub mod dual_writer;
+pub mod endpoint;
+pub mod liveness;
+
 /// The same check without a registry, for callers that own no metrics.
 pub async fn chain_info(rpc: &Rpc, chain: &str, min_peers: u64) -> Result<Value> {
     chain_info_with_metrics(rpc, chain, min_peers, None).await

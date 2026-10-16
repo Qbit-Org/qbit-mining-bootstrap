@@ -46,19 +46,30 @@ impl MetricsSnapshot {
             (None, Some(metrics)) => metrics.render(),
             _ => self.body,
         };
-        let mut body = if freshness.stale() || runtime.as_ref().is_some_and(|view| view.stalled()) {
-            // Rewrite only the health sample, never another family's metadata or value.
+        let stale = freshness.stale();
+        let mut body = if stale || runtime.as_ref().is_some_and(|view| view.stalled()) {
+            // Rewrite only these samples, never another family's metadata or
+            // value: the health sample; and, once the snapshot is stale, the
+            // admission and gated-listener samples (3.1), because a decision
+            // that old admits nothing, so the readiness endpoint answers 503
+            // and the listeners have closed. A stalled runtime with a fresh
+            // snapshot leaves them: the publisher's grace still decides.
             registered_body
                 .lines()
                 .map(|line| {
-                    if line.split_whitespace().next() == Some("qbit_prism_health_state") {
-                        "qbit_prism_health_state 0"
+                    let name = line.split_whitespace().next().unwrap_or_default();
+                    if name == "qbit_prism_health_state"
+                        || (stale
+                            && (name == "qbit_prism_admission_admitting"
+                                || name.starts_with("qbit_prism_stratum_listener_accepting{")))
+                    {
+                        std::borrow::Cow::Owned(format!("{name} 0"))
                     } else {
-                        line
+                        std::borrow::Cow::Borrowed(line)
                     }
                 })
                 .fold(String::new(), |mut body, line| {
-                    body.push_str(line);
+                    body.push_str(&line);
                     body.push('\n');
                     body
                 })

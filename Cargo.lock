@@ -1439,6 +1439,8 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "num-bigint",
  "num-traits",
