@@ -1805,9 +1805,12 @@ the extranonce1 in the block's coinbase, since each node hands out its own half
 of the extranonce1 space; it does not matter which node landed the rows.
 Extranonce1 is read at this node's `PRISM_STRATUM_EXTRANONCE2_SIZE`, and only
 where the coinbase tag sits right before it. A block issued with another width
-therefore names no finder here, and since every coinbase this node builds names
-it, such a block is never taken for this node's own, even when this node adopted
-it: it is sponsored here only by takeover. A dual writer refuses to start with a
+or tag therefore names no finder here. Such a block counts as this node's own
+only if this node offered it, meaning it carries this node's origin and this
+node holds its outbox row (the outbox is local and never copied). That covers
+this node's own block found before the width or tag changed. A block this node
+adopted has no outbox row, so a cross-width adoption is sponsored here only by
+takeover. A dual writer refuses to start with a
 `PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). Keep
 the width and the tag the same on both nodes; the pair's fingerprint compares
 neither. Change either only while both nodes are up and

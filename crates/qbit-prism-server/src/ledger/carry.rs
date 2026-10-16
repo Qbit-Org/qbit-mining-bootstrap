@@ -124,12 +124,20 @@ impl Ledger {
     /// Dual writer: whether this node issued the work a block with this
     /// coinbase was found on ([`finder_node`]). A block adopted from the
     /// peer's work (S8) carries this node as its origin, but was found by
-    /// the peer. A coinbase that names no node is not this node's: every
-    /// coinbase it builds names it, so such a block was issued elsewhere
-    /// (with another extranonce2 width or tag, adopted here among them) and
-    /// is sponsored here only by takeover. Without a recorded coinbase
-    /// layout, or without the coinbase, `origin_is_own` decides.
-    pub fn found_here(&self, coinbase_tx: Option<&[u8]>, origin_is_own: bool) -> bool {
+    /// the peer. A coinbase names no node when it was issued with another
+    /// extranonce2 width or tag: by the peer, or by this node before its
+    /// layout changed. Only the latter was offered here, so such a block is
+    /// this node's when it carries this node's origin and this node holds
+    /// its outbox row (`offered`; the outbox is local and never copied). An
+    /// adopted block has no outbox row: a cross-layout adoption is sponsored
+    /// here only by takeover. Without a recorded coinbase layout, or without
+    /// the coinbase, `origin_is_own` decides.
+    pub fn found_here(
+        &self,
+        coinbase_tx: Option<&[u8]>,
+        origin_is_own: bool,
+        offered: bool,
+    ) -> bool {
         let (Some(own), Some((tag, size)), Some(coinbase)) = (
             self.own_node(),
             self.carry.coinbase_layout.get(),
@@ -137,7 +145,7 @@ impl Ledger {
         ) else {
             return origin_is_own;
         };
-        finder_node(coinbase, tag, *size) == Some(own)
+        finder_node(coinbase, tag, *size).map_or(origin_is_own && offered, |finder| finder == own)
     }
 
     /// Whether work built now pays carried balances: always in single-writer
@@ -402,31 +410,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn found_here_follows_the_finder_and_falls_back_to_the_origin() {
+    async fn found_here_follows_the_finder_and_falls_back_to_this_nodes_offer() {
         let ledger = ledger();
         // Single writer: the origin decides, whatever the coinbase says.
-        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true, false));
         ledger
             .set_dual_writer_identity(NodeIdentity {
                 node: NodeIndex::A,
                 carry_owner: true,
             })
             .unwrap();
-        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true, false));
         ledger.set_coinbase_layout(TAG, 8).unwrap();
         assert!(ledger.set_coinbase_layout(TAG, 4).is_err());
         assert!(ledger.set_coinbase_layout(b"/OTHER/", 8).is_err());
         // Adopted from B's work: this node's rows, B's block.
-        assert!(!ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        assert!(!ledger.found_here(Some(&coinbase(u32::MAX)), true, true));
         // B's block issued with another width names nobody, so it is never
         // taken for this node's.
-        assert!(!ledger.found_here(Some(&coinbase_with(7, 4)), false));
-        assert!(ledger.found_here(Some(&coinbase(7)), false));
-        assert!(!ledger.found_here(None, false));
-        // A coinbase that names no node is not this node's, whatever the
-        // origin: B's block issued with another width and adopted here.
-        assert!(!ledger.found_here(Some(&coinbase_with(u32::MAX, 4)), true));
-        assert!(!ledger.found_here(Some(&[0]), true));
+        assert!(!ledger.found_here(Some(&coinbase_with(7, 4)), false, false));
+        assert!(ledger.found_here(Some(&coinbase(7)), false, false));
+        assert!(!ledger.found_here(None, false, true));
+        assert!(ledger.found_here(None, true, false));
+        // A coinbase that names no node: this node's only when it offered
+        // the block, issued here before the layout changed. B's block
+        // issued with another width and adopted here has no outbox row.
+        assert!(ledger.found_here(Some(&coinbase_with(7, 4)), true, true));
+        assert!(ledger.found_here(Some(&[0]), true, true));
+        assert!(!ledger.found_here(Some(&coinbase_with(u32::MAX, 4)), true, false));
+        assert!(!ledger.found_here(Some(&[0]), true, false));
+        assert!(!ledger.found_here(Some(&[0]), false, true));
     }
 
     #[test]

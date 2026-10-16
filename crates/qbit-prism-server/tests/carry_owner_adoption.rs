@@ -930,6 +930,29 @@ async fn adopted_as_landed(f: &Fixture, settlement: Settlement) -> Result<()> {
             "the finder does not sponsor its own fanout {txid}"
         );
     }
+    // Still this node's after its PRISM_STRATUM_EXTRANONCE2_SIZE changed:
+    // the coinbase names no node at the new width, and this node offered
+    // the block (its outbox row).
+    if fanouts > 0 {
+        let resized = Coordinator::new(
+            qbit_prism_server::config::Config {
+                extranonce2_size: c.config.extranonce2_size / 2,
+                instance_id: "finder-resized".into(),
+                ..(*c.config).clone()
+            },
+            Arc::new(Metrics::default()),
+        )
+        .await?;
+        let txid = original["qbit_ctv_fanout_artifacts"][0]["fanout_txid"]
+            .as_str()
+            .context("a fanout artifact has no txid")?;
+        let sponsor = resized.ledger.fanout_sponsor(txid).await;
+        resized.ledger.pool.close().await;
+        ensure!(
+            sponsor? == Some(FanoutSponsor::Finder),
+            "the finder does not sponsor its own fanout {txid} after a width change"
+        );
+    }
     // The block's coinbase commits to the audit the finder landed.
     let root = hex::encode(coinbase_witness_reserved_value(
         codec::coinbase_from_block(&block)?,
@@ -1532,12 +1555,19 @@ async fn refused(f: &Fixture) -> Result<()> {
     narrow.ledger.pool.close().await;
     result?;
     // Only the issuing layout names the block's finder: the narrow frontend
-    // adopted it, with its own origin, but never takes it for its own find,
-    // so it would sponsor its fanouts only by takeover.
+    // adopted it, with its own origin but no outbox row, so it never takes
+    // it for its own find and would sponsor its fanouts only by takeover.
     let coinbase = codec::coinbase_from_block(&block)?;
+    let offered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1)",
+    )
+    .bind(&hash)
+    .fetch_one(pool)
+    .await?;
     ensure!(
-        c.ledger.found_here(Some(coinbase), false)
-            && !narrow.ledger.found_here(Some(coinbase), true),
+        !offered
+            && c.ledger.found_here(Some(coinbase), false, false)
+            && !narrow.ledger.found_here(Some(coinbase), true, offered),
         "a layout other than the issuing one named the adopted block's finder"
     );
     session.release().await
