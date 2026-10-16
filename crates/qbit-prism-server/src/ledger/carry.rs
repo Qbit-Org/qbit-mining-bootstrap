@@ -383,6 +383,28 @@ impl Ledger {
                 && !carry_free_block(true, prior_balances_digest)
                 && self.carry_gate_generation() != generation)
     }
+
+    /// Dual writer: whether this node's journal, read now, no longer claims
+    /// ownership for a carry-paying block on work built on
+    /// `prior_balances_digest`. The gate learns of a `carry-owner release`,
+    /// which another process commits, only at the guard's next check; the
+    /// offer reads the journal itself right before it sends, so a block
+    /// reserved before the release is not offered after it, where the new
+    /// owner's transfer scan may already have passed. False for carry-free
+    /// work and in single-writer mode.
+    pub async fn carry_claim_withdrawn(&self, prior_balances_digest: &[u8; 32]) -> Result<bool> {
+        let Some(own) = self.own_node() else {
+            return Ok(false);
+        };
+        if carry_free_block(true, prior_balances_digest) {
+            return Ok(false);
+        }
+        let claims: Option<bool> = sqlx::query_scalar(OWN_CLAIM_SQL)
+            .bind(own)
+            .fetch_optional(&mut *self.acquire().await?)
+            .await?;
+        Ok(claims != Some(true))
+    }
 }
 
 /// Bump the payout revision in a transaction that holds `SETTLEMENT_LOCK`
