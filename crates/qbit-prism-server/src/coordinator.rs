@@ -2912,7 +2912,9 @@ impl Coordinator {
         // was reserved without a revision check, as before.
         // The gate is this process's; a `carry-owner release` another
         // process committed reaches it only at the guard's next check, so
-        // the journal is read here too.
+        // the journal is read here too. A read that fails is taken as
+        // withdrawn: the reservation goes back to `pending` below, whereas
+        // an error here would leave it reserved, a call that never ran.
         if reserved_current
             && !candidate.leased
             && (self
@@ -2921,7 +2923,11 @@ impl Coordinator {
                 || self
                     .ledger
                     .carry_claim_withdrawn(&candidate.window.prior_balances_digest)
-                    .await?)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(block = %candidate.block_hash, error = %format!("{error:#}"), "could not read this node's journal before the offer; not sending this carry-paying block now");
+                        true
+                    }))
         {
             let reason = format!(
                 "{}: the carry gate moved, or this node's journal stopped claiming ownership, after this carry-paying block was reserved as current work; the reservation taken by {} was returned to pending for another attempt",
