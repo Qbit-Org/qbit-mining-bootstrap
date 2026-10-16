@@ -716,7 +716,47 @@ async fn landing_rows(
                     COALESCE(jsonb_array_length(a.audit_bundle #> '{ctv_fanout_manifest_set,manifests}'), 0) AS expected_fanouts, \
                     f.block_hash IS NOT NULL AS has_fanout_set, \
                     (SELECT count(*) FROM qbit_ctv_fanout_artifacts fa WHERE fa.block_hash = h.block_hash) AS fanout_artifacts, \
-                    b.coinbase_txid \
+                    b.coinbase_txid, \
+                    (SELECT count(*) FROM ( \
+                       (SELECT p.miner_id, p.payout_order_key, p.p2mr_program, \
+                               p.onchain_amount_sats::numeric, p.carry_forward_balance_sats::numeric, p.action \
+                          FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash \
+                        EXCEPT ALL \
+                        SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'onchain_amount_sats')::numeric, (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc) \
+                       UNION ALL \
+                       (SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'onchain_amount_sats')::numeric, (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                        EXCEPT ALL \
+                        SELECT p.miner_id, p.payout_order_key, p.p2mr_program, \
+                               p.onchain_amount_sats::numeric, p.carry_forward_balance_sats::numeric, p.action \
+                          FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash)) x) AS payout_mismatches, \
+                    (SELECT count(*) FROM ( \
+                       (SELECT c.miner_id, c.payout_order_key, c.p2mr_program, c.gross_amount_sats::numeric, \
+                               c.prior_balance_sats::numeric, c.candidate_balance_sats::numeric, c.onchain_amount_sats::numeric, \
+                               c.settlement_fee_sats::numeric, c.carry_forward_balance_sats::numeric, c.action \
+                          FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash \
+                        EXCEPT ALL \
+                        SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'gross_amount_sats')::numeric, (acc->>'prior_balance_sats')::numeric, \
+                               (acc->>'candidate_balance_sats')::numeric, (acc->>'onchain_amount_sats')::numeric, \
+                               COALESCE((acc->>'settlement_fee_sats')::numeric, 0), (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                         WHERE COALESCE(acc->>'account_type', 'miner') = 'miner') \
+                       UNION ALL \
+                       (SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'gross_amount_sats')::numeric, (acc->>'prior_balance_sats')::numeric, \
+                               (acc->>'candidate_balance_sats')::numeric, (acc->>'onchain_amount_sats')::numeric, \
+                               COALESCE((acc->>'settlement_fee_sats')::numeric, 0), (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                         WHERE COALESCE(acc->>'account_type', 'miner') = 'miner' \
+                        EXCEPT ALL \
+                        SELECT c.miner_id, c.payout_order_key, c.p2mr_program, c.gross_amount_sats::numeric, \
+                               c.prior_balance_sats::numeric, c.candidate_balance_sats::numeric, c.onchain_amount_sats::numeric, \
+                               c.settlement_fee_sats::numeric, c.carry_forward_balance_sats::numeric, c.action \
+                          FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash)) y) AS carry_mismatches \
              FROM unnest($1::text[]) AS h(block_hash) \
              LEFT JOIN qbit_pool_blocks b ON b.block_hash = h.block_hash \
              LEFT JOIN qbit_pool_audit_bundles a ON a.block_hash = h.block_hash \
@@ -761,6 +801,20 @@ async fn landing_rows(
             let miners: i64 = row.try_get("manifest_miners")?;
             if carry != miners {
                 faults.push(format!("{carry} carry rows for {miners} miner accounts"));
+            }
+            // Not just as many rows as the signed manifest's accounts: the
+            // same rows, field for field, as the landing writes them from it.
+            for (column, what) in [
+                ("payout_mismatches", "payout entries"),
+                ("carry_mismatches", "carry rows"),
+            ] {
+                let mismatches: i64 = row.try_get(column)?;
+                if mismatches != 0 {
+                    faults.push(format!(
+                        "{mismatches} {what} and manifest accounts differ (recipient, order key, \
+                         program, amounts or action)"
+                    ));
+                }
             }
             let expected: i32 = row.try_get("expected_fanouts")?;
             let artifacts: i64 = row.try_get("fanout_artifacts")?;
