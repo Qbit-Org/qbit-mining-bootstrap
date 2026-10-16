@@ -276,36 +276,44 @@ impl Ledger {
             .map(BlockingDrop::into_inner))
     }
 
-    /// Dual writer (S8): every compact prepared record built on
-    /// `parent_hash`, expired or not, with both blobs, newest first: the
-    /// work a block on that parent may have been found on. A record that
-    /// does not decode, or whose blobs are gone, cannot be adopted from and
-    /// is skipped with a warning.
-    pub async fn compact_prepared_on_parent(
-        &self,
-        parent_hash: &str,
-    ) -> Result<Vec<(String, StoredCompactPrepared)>> {
-        let rows = sqlx::query("SELECT j.job_id,j.parent_hash,j.payout_revision,j.payload,j.expires_at,j.window_anchor_ms,j.window_prior_balances_sha256,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,j.window_snapshot_sha256,j.template_sha256,t.template_bytes,b.balances FROM qbit_prism_jobs j LEFT JOIN qbit_prism_templates t ON t.template_sha256=j.template_sha256 LEFT JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.parent_hash=$1 AND j.template_sha256 IS NOT NULL ORDER BY j.created_at DESC,j.job_id")
+    /// Dual writer (S8): the keys of every compact prepared record built on
+    /// `parent_hash`, expired or not, newest first: the work a block on that
+    /// parent may have been found on. Only the keys: a parent current for
+    /// hours holds many records, each with its template and balances, so
+    /// adoption loads them one at a time ([`Ledger::compact_prepared_held`]).
+    pub async fn compact_prepared_on_parent(&self, parent_hash: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT job_id FROM qbit_prism_jobs WHERE parent_hash=$1 AND template_sha256 IS NOT NULL ORDER BY created_at DESC,job_id")
             .bind(parent_hash)
             .fetch_all(&mut *self.acquire().await?)
+            .await?)
+    }
+
+    /// Dual writer (S8): the compact prepared record `key`, expired or not,
+    /// with both blobs ([`Ledger::compact_prepared_on_parent`]). `None` when
+    /// it is gone, or does not decode or has lost its blobs (with a warning):
+    /// it cannot be adopted from.
+    pub async fn compact_prepared_held(&self, key: &str) -> Result<Option<StoredCompactPrepared>> {
+        let row = sqlx::query("SELECT j.parent_hash,j.payout_revision,j.payload,j.expires_at,j.window_anchor_ms,j.window_prior_balances_sha256,j.window_first_share_seq,j.window_last_share_seq,j.window_share_count,j.window_snapshot_sha256,j.template_sha256,t.template_bytes,b.balances FROM qbit_prism_jobs j LEFT JOIN qbit_prism_templates t ON t.template_sha256=j.template_sha256 LEFT JOIN qbit_prism_balance_snapshots b ON b.prior_balances_digest=j.window_prior_balances_sha256 WHERE j.job_id=$1 AND j.template_sha256 IS NOT NULL")
+            .bind(key)
+            .fetch_optional(&mut *self.acquire().await?)
             .await?;
-        tokio::task::spawn_blocking(move || {
-            let mut records = Vec::new();
-            for row in rows {
-                let key: String = row.try_get("job_id")?;
-                match decode_row(row) {
-                    Ok(Some(stored)) => records.push((key, stored)),
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(
-                        prepared = %key,
-                        error = %format!("{error:#}"),
-                        "a prepared record on this parent cannot be decoded; it cannot be adopted from"
-                    ),
-                }
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || match decode_row(row) {
+            Ok(stored) => stored,
+            Err(error) => {
+                tracing::warn!(
+                    prepared = %key,
+                    error = %format!("{error:#}"),
+                    "a prepared record on this parent cannot be decoded; it cannot be adopted from"
+                );
+                None
             }
-            Ok(records)
         })
-        .await?
+        .await
+        .map_err(Into::into)
     }
 
     /// Runtime admission follows the SQL row, decoder, returned metadata and

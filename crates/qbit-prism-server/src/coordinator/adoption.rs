@@ -351,14 +351,18 @@ impl Coordinator {
         let root = hex::encode(crate::ledger::coinbase_witness_reserved_value(coinbase)?);
         let script_sig = codec::coinbase_script_sig(coinbase)?.to_vec();
         let leaves = codec::witness_merkle_leaves_from_block(&block_bytes)?;
-        let records = self.ledger.compact_prepared_on_parent(&parent).await?;
-        if records.is_empty() {
+        let keys = self.ledger.compact_prepared_on_parent(&parent).await?;
+        if keys.is_empty() {
             return Ok(no_record(format!(
                 "no prepared record on parent {parent} is held here"
             )));
         }
         let mut reasons = Vec::new();
-        for (key, stored) in records {
+        for key in keys {
+            let Some(stored) = self.ledger.compact_prepared_held(&key).await? else {
+                reasons.push(format!("{key}: cannot be read or decoded"));
+                continue;
+            };
             match self
                 .adoption_candidate(block_hash, &block_bytes, &script_sig, &leaves, &stored)
                 .await

@@ -314,6 +314,7 @@
     "ledger/jobs/compact_issued_batch.rs::save_compact_batch#1::connection . connection . as_mut ( ) . unwrap ( ) .begin()": [1,"transaction"],
     "ledger/jobs/prepared.rs::save_compact_prepared#1::self .begin()": [1,"ledger"],
     "ledger/jobs/prepared.rs::compact_prepared_with_admission#1::self .acquire()": [1,"ledger"],
+    "ledger/jobs/prepared.rs::compact_prepared_held#1::self .acquire()": [1,"ledger"],
     "ledger/jobs/prepared.rs::compact_prepared_on_parent#1::self .acquire()": [1,"ledger"],
     "ledger/migration.rs::inspect_source_schema#1::read_capabilities(& mut * * tx)": [1,"transaction"],
     "ledger/migration.rs::read_capabilities#1::executor .acquire()": [1,"startup-generic"],
