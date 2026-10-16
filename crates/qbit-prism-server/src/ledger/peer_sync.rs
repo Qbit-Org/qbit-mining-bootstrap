@@ -53,12 +53,17 @@ pub const HIGHEST_SHARE: &str =
 /// btree on both databases.
 pub const ORIGIN_INDEX: &str = "qbit_share_ledger_origin_seq_idx";
 
-/// Whether [`ORIGIN_INDEX`] is a valid btree: false while 031 has not built
-/// it, or its online build has not attached every partition's leaf.
+/// Whether [`ORIGIN_INDEX`] is a valid btree on the share ledger's
+/// `(origin_node, share_seq)`, with no predicate or expression: false while
+/// 031 has not built it, while its online build has not attached every
+/// partition's leaf, or when an index of that name is something else.
 const ORIGIN_INDEX_VALID: &str =
     "SELECT EXISTS(SELECT 1 FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid \
      JOIN pg_am am ON am.oid=i.relam \
-     WHERE x.indexrelid=to_regclass('qbit_share_ledger_origin_seq_idx') AND x.indisvalid AND am.amname='btree')";
+     WHERE x.indexrelid=to_regclass('qbit_share_ledger_origin_seq_idx') AND x.indisvalid AND am.amname='btree' \
+     AND x.indrelid=to_regclass('qbit_share_ledger') AND x.indpred IS NULL AND x.indexprs IS NULL \
+     AND (SELECT array_agg(a.attname::text ORDER BY k.ord) FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS k(attnum,ord) \
+          JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum)=ARRAY['origin_node','share_seq'])";
 
 pub const SHARES: &str = "shares";
 pub const BLOCKS: &str = "blocks";
@@ -997,10 +1002,11 @@ impl Ledger {
         let mut refused_through = None;
         if batch.row_count > 0 {
             // Header mappings this node holds for another share, a share this
-            // node credits at another share_seq (the ledger is unique on
-            // share_id per partition only), and rows below every attached
-            // partition: refused whole, one conflict per share whatever
-            // number of these it breaks.
+            // node credits, or holds or retains as rejected, at another
+            // share_seq (the ledger is unique on share_id per partition only,
+            // and a rejected share has no mapping), and rows below every
+            // attached partition: refused whole, one conflict per share
+            // whatever number of these it breaks.
             let refused: Vec<(String, String)> = sqlx::query_as(
                 "WITH incoming AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_share_ledger,$1)),\
                  mappings AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_prism_share_hashes,$2)) \
@@ -1012,6 +1018,9 @@ impl Ledger {
                  UNION ALL SELECT i.share_id,'share_id '||i.share_id||' is credited here at another share_seq than '||i.share_seq \
                  FROM incoming i WHERE EXISTS (SELECT 1 FROM qbit_prism_share_hashes h WHERE h.share_id=i.share_id) \
                  AND NOT EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_seq=i.share_seq AND l.share_id=i.share_id) \
+                 UNION ALL SELECT i.share_id,'share_id '||i.share_id||' is held here as a rejected share at another share_seq' \
+                 FROM incoming i WHERE EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_id=i.share_id AND l.share_seq<>i.share_seq AND NOT l.accepted) \
+                 OR EXISTS (SELECT 1 FROM qbit_prism_rejected_share_ids r WHERE r.share_id=i.share_id AND r.share_seq<>i.share_seq) \
                  UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is below every attached partition' FROM incoming i \
                  WHERE i.share_seq<(SELECT COALESCE(min(lower_seq),-1) FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NOT NULL) \
                  AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NULL) \
@@ -1114,10 +1123,14 @@ impl Ledger {
                 .map(Vec::as_slice)
                 .unwrap_or_default()
                 .iter()
+                // A refused rejected share is in no window, so it never holds
+                // the found-block wait back.
                 .filter(|row| {
-                    row.get("share_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| refused.contains(id))
+                    row.get("accepted").and_then(Value::as_bool) != Some(false)
+                        && row
+                            .get("share_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| refused.contains(id))
                 })
                 .filter_map(|row| row.get("share_seq").and_then(Value::as_i64))
                 .chain(differing.iter().map(|(share_seq, _)| *share_seq))
@@ -1584,24 +1597,43 @@ impl Ledger {
 
     /// Record that this node's own log was proved complete on the server
     /// `evidence` names (D-8, D-17).
+    ///
+    /// `evidence` is what the server showed when recovery began; the update
+    /// applies only while it still shows it, in the same statement. Each step
+    /// of a recovery takes its own pooled connection, so a failover partway
+    /// could leave the recovered rows on the old primary while this lands on
+    /// the promoted one: then it refuses, and recovery runs again there.
     pub async fn record_own_log_verified(
         &self,
         evidence: super::node_identity::LineageEvidence,
     ) -> Result<()> {
-        let updated = sqlx::query(
+        let mut connection = self.acquire().await?;
+        let updated = sqlx::query(&format!(
             "UPDATE qbit_prism_node_lineage SET verified_system_identifier=$1,verified_timeline=$2,\
-             verified_at=clock_timestamp() WHERE singleton",
-        )
+             verified_at=clock_timestamp() WHERE singleton AND ({})=($1::bigint,$2::int)",
+            super::node_identity::LINEAGE_EVIDENCE_SQL.trim_start_matches("SELECT ")
+        ))
         .bind(evidence.system_identifier)
         .bind(evidence.timeline)
-        .execute(&mut *self.acquire().await?)
+        .execute(&mut *connection)
         .await?
         .rows_affected();
+        if updated == 1 {
+            return Ok(());
+        }
+        let lineage: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM qbit_prism_node_lineage WHERE singleton)",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
         ensure!(
-            updated == 1,
+            lineage,
             "this database has no qbit_prism_node_lineage row; run node-identity set first"
         );
-        Ok(())
+        bail!(
+            "this database's system identifier or WAL timeline changed during own-log recovery \
+             (a failover or restore); the verification is not recorded, and recovery runs again"
+        )
     }
 
     /// A conflict found outside an apply transaction.
