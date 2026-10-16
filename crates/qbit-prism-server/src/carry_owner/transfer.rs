@@ -443,6 +443,10 @@ pub struct TransferFacts {
     pub peer_claim: Option<RoleRow>,
     /// Whether the peer's live journal answered for its claims too.
     pub peer_claim_read: bool,
+    /// The peer's live journal and this database's copy hold different
+    /// claims at one epoch: the peer's journal was rewritten (a restore), and
+    /// neither claim's recorded height can bound the scan.
+    pub peer_claim_conflict: bool,
     pub tip_height: u64,
     /// How far past the peer's release the tip must be: the orphan
     /// confirmation depth.
@@ -493,7 +497,9 @@ pub fn transfer_checks(facts: &TransferFacts) -> Vec<Check> {
             false,
             "the peer's journal could not be read over PRISM_PEER_DATABASE_URL (transfer never reads the fallback), so it may still act as owner",
         )),
-        PeerRead::Answered { peer, own_at_peer } => {
+        PeerRead::Answered {
+            peer, own_at_peer, ..
+        } => {
             checks.push(check(
                 "peer_answered",
                 true,
@@ -625,11 +631,19 @@ pub fn transfer_checks(facts: &TransferFacts) -> Vec<Check> {
     checks
 }
 
-/// The scan must start at or below the tip the peer's latest claim of
-/// ownership recorded (an `acquire`'s): below it, nothing the peer found was
-/// carry-paying. A claim that recorded none (a `seed`) bounds nothing, so the
-/// scan must read the whole chain. A peer that never claimed found only
-/// carry-free blocks, which can only underpay here if they are missing.
+/// How far below the tip an `acquire` recorded a transfer's scan must start
+/// (`scan_start`): the coinbase maturity, the depth PRISM treats as final (a
+/// mature pool block disconnected is a fatal state).
+pub const SCAN_REORG_MARGIN: u64 = qbit_prism::QBIT_COINBASE_MATURITY_BLOCKS;
+
+/// The scan must start [`SCAN_REORG_MARGIN`] or more below the tip the
+/// peer's latest claim of ownership recorded (an `acquire`'s): below that,
+/// nothing the peer found was carry-paying. The margin covers a
+/// reorganization after the claim to a fork below its tip, on which the
+/// peer, already owner, found blocks at heights under it. A claim that
+/// recorded none (a `seed`) bounds nothing, so the scan must read the whole
+/// chain. A peer that never claimed found only carry-free blocks, which can
+/// only underpay here if they are missing.
 fn scan_start(facts: &TransferFacts) -> Check {
     let start = facts.scan.from_height;
     if !facts.peer_claim_read {
@@ -637,6 +651,13 @@ fn scan_start(facts: &TransferFacts) -> Check {
             "scan_start",
             false,
             "the peer's claims of ownership could not be read, so nothing bounds the scan",
+        );
+    }
+    if facts.peer_claim_conflict {
+        return check(
+            "scan_start",
+            false,
+            "the peer's live journal and this database's copy hold different claims of ownership at one epoch (the peer's journal was rewritten), so neither bounds the scan; find out why before any transfer",
         );
     }
     let Some(claim) = &facts.peer_claim else {
@@ -661,14 +682,17 @@ fn scan_start(facts: &TransferFacts) -> Check {
         };
     };
     match claim.tip_height() {
-        Some(bound) => check(
-            "scan_start",
-            start <= bound,
-            format!(
-                "the scan starts at height {start}; the peer's last claim of ownership (epoch {}, {}) recorded height {bound}, and the scan must start at or below it",
-                claim.epoch, claim.action
-            ),
-        ),
+        Some(tip) => {
+            let bound = tip.saturating_sub(SCAN_REORG_MARGIN);
+            check(
+                "scan_start",
+                start <= bound,
+                format!(
+                    "the scan starts at height {start}; the peer's last claim of ownership (epoch {}, {}) recorded height {tip}, and the scan must start at or below {bound}, {SCAN_REORG_MARGIN} blocks under it, in case the chain reorganized below it after the claim",
+                    claim.epoch, claim.action
+                ),
+            )
+        }
         None => check(
             "scan_start",
             start == 0,
@@ -691,6 +715,10 @@ pub struct Report {
     pub local: LatestRoles,
     pub peer: Option<LatestRoles>,
     pub decision: CarryDecision,
+    /// Why this node's coinbase layout is not the peer's, if it is not
+    /// (`Ledger::layout_mismatch`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_mismatch: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -711,6 +739,7 @@ impl Report {
             local: LatestRoles::default(),
             peer: None,
             decision: CarryDecision::CarryFree(CarryFreeReason::PeerUnconfirmed),
+            layout_mismatch: None,
             checks: Vec::new(),
             scan: None,
             written: None,
@@ -730,6 +759,9 @@ async fn observe(
     report: &mut Report,
 ) -> Result<PeerRead> {
     let peer_read = peer.read(settings.node_index).await;
+    // As the guard does: the peer's primary shows its layout when this
+    // database holds none of its records.
+    super::refresh_peer_layout(ledger, peer, settings.node_index).await?;
     observe_with(ledger, settings, peer_read, report).await
 }
 
@@ -745,12 +777,15 @@ async fn observe_with(
     report.local = read_latest_roles(&mut connection, settings.node_index).await?;
     drop(connection);
     report.peer = match &peer_read {
-        PeerRead::Answered { peer, own_at_peer } => Some(LatestRoles {
+        PeerRead::Answered {
+            peer, own_at_peer, ..
+        } => Some(LatestRoles {
             own: own_at_peer.clone(),
             peer: peer.clone(),
         }),
         PeerRead::Failed => None,
     };
+    report.layout_mismatch = ledger.layout_mismatch().await?;
     report.decision = Guard::default().decide(&GuardInputs {
         node_index: settings.node_index,
         database_node: report.database_node,
@@ -758,6 +793,7 @@ async fn observe_with(
         own: report.local.own.clone(),
         peer_synced: report.local.peer.clone(),
         peer_read: peer_read.clone(),
+        layout_mismatch: report.layout_mismatch.clone(),
     });
     Ok(peer_read)
 }
@@ -877,9 +913,11 @@ pub async fn transfer<C: ChainSource>(
     // The peer's latest rows and its latest claim, from one snapshot.
     let view = peer.view(settings.node_index).await;
     let peer_read = match &view {
+        // `peer` reads PRISM_PEER_DATABASE_URL only.
         Some(view) => PeerRead::Answered {
             peer: view.latest.peer.clone(),
             own_at_peer: view.latest.own.clone(),
+            primary: true,
         },
         None => PeerRead::Failed,
     };
@@ -891,6 +929,10 @@ pub async fn transfer<C: ChainSource>(
     };
     let peer_claim_read = view.is_some();
     let live_claim = view.and_then(|view| view.peer_claim);
+    let peer_claim_conflict = matches!(
+        (&live_claim, &synced_claim),
+        (Some(live), Some(synced)) if live.epoch == synced.epoch && live != synced
+    );
     let peer_claim = [live_claim, synced_claim]
         .into_iter()
         .flatten()
@@ -904,6 +946,7 @@ pub async fn transfer<C: ChainSource>(
         peer_synced: report.local.peer.clone(),
         peer_claim,
         peer_claim_read,
+        peer_claim_conflict,
         tip_height: scan.tip_height,
         release_depth,
         scan: scan.clone(),
@@ -1032,7 +1075,7 @@ mod tests {
 
     fn scan(blocks: &[(u64, Landing)]) -> ChainScan {
         ChainScan {
-            from_height: 1,
+            from_height: 0,
             tip_height: 200,
             tip_hash: "tip".into(),
             scanned_blocks: 200,
@@ -1055,11 +1098,13 @@ mod tests {
             peer_read: PeerRead::Answered {
                 peer,
                 own_at_peer: Some(role(1, 10, false, "seed", None)),
+                primary: true,
             },
             peer_synced: None,
             // The claim before the peer's release, recorded at height 100.
             peer_claim: Some(role(0, 5, true, "acquire", Some(100))),
             peer_claim_read: true,
+            peer_claim_conflict: false,
             tip_height: 200,
             release_depth: 6,
             scan: scan(&[(150, Landing::Confirmed), (190, Landing::Confirmed)]),
@@ -1162,6 +1207,7 @@ mod tests {
         behind.peer_read = PeerRead::Answered {
             peer: Some(role(0, 12, false, "release", Some(150))),
             own_at_peer: Some(role(1, 11, false, "seed", None)),
+            primary: true,
         };
         assert_eq!(failed(&transfer_checks(&behind)), ["own_journal_current"]);
         let mut unidentified = facts(Some(role(0, 12, false, "release", Some(150))));
@@ -1171,15 +1217,40 @@ mod tests {
 
     #[test]
     fn the_scan_starts_no_higher_than_the_tip_of_the_peers_last_claim() {
-        let starting_at = |from_height, claim: Option<RoleRow>, release_tip| {
+        let starting_at = |from_height, claim: Option<RoleRow>, release_tip: Option<u64>| {
             let mut facts = facts(Some(role(0, 12, false, "release", release_tip)));
+            // The tip as far above the release as in `facts`.
+            if let Some(release) = release_tip.filter(|release| *release > 190) {
+                facts.tip_height = release + 10;
+                facts.scan.tip_height = release + 10;
+            }
             facts.scan.from_height = from_height;
             facts.peer_claim = claim;
             failed(&transfer_checks(&facts))
         };
-        let acquired = role(0, 8, true, "acquire", Some(120));
-        assert!(starting_at(120, Some(acquired.clone()), Some(190)).is_empty());
-        assert_eq!(starting_at(121, Some(acquired), Some(190)), ["scan_start"]);
+        // The acquire's tip, less the reorganization margin, or lower.
+        let tip = SCAN_REORG_MARGIN + 120;
+        let acquired = role(0, 8, true, "acquire", Some(tip));
+        let release = Some(tip + 70);
+        assert!(starting_at(120, Some(acquired.clone()), release).is_empty());
+        assert_eq!(
+            starting_at(121, Some(acquired.clone()), release),
+            ["scan_start"]
+        );
+        assert_eq!(
+            starting_at(tip, Some(acquired.clone()), release),
+            ["scan_start"]
+        );
+        // An acquire within the margin of genesis: only the whole chain.
+        let early = role(0, 8, true, "acquire", Some(SCAN_REORG_MARGIN / 2));
+        assert!(starting_at(0, Some(early.clone()), release).is_empty());
+        assert_eq!(starting_at(1, Some(early), release), ["scan_start"]);
+        // Two claims at one epoch, live and synced: refused, whatever the
+        // start.
+        let mut conflict = facts(Some(role(0, 12, false, "release", Some(190))));
+        conflict.scan.from_height = 0;
+        conflict.peer_claim_conflict = true;
+        assert_eq!(failed(&transfer_checks(&conflict)), ["scan_start"]);
         // A seed records no height: the peer may have paid from any height
         // before its release, so only the whole chain will do.
         let seeded = role(0, 8, true, "seed", None);

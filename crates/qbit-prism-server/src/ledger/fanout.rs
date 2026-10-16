@@ -101,7 +101,8 @@ struct LostAttempt<'a> {
 /// Dual writer: how long a zero-fee fanout found on the peer's work waits for
 /// the finder's node before this node may sponsor it: since its block matured
 /// here, and since the newest work of the finder's this node holds (a synced
-/// prepared record). The broadcaster also reads the finder's own database
+/// prepared record), or, with none held, for an outage of the finder's own
+/// database observed that long. The broadcaster also reads the finder's own database
 /// live (`broadcaster::finder_silent`): a finder that is alive publishes work
 /// every few minutes, so its fanouts are not taken over while it can be read.
 pub const SPONSOR_TAKEOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
@@ -120,6 +121,13 @@ pub enum FanoutSponsor {
     /// [`SPONSOR_TAKEOVER_AFTER`] ago. The broadcaster takes it over if the
     /// finder's own database, when it can be read, agrees.
     Overdue,
+    /// Dual writer: as [`FanoutSponsor::Overdue`], but this node holds no
+    /// work of the finder's at all (none synced yet, or its copies expired),
+    /// so nothing here dates the finder's silence. The broadcaster takes it
+    /// over only on evidence it gathers itself for
+    /// [`SPONSOR_TAKEOVER_AFTER`]: the finder's own database out of reach,
+    /// or answering with no fresh work, for that long.
+    Unwitnessed,
 }
 
 /// The newest work of node `$1` this database holds: a prepared record, by
@@ -131,17 +139,24 @@ macro_rules! newest_work_sql {
     };
 }
 
-/// A fanout's finder (by its origin and its block's coinbase), whether this
-/// node holds a CPFP package for it, and whether it is overdue: its block
-/// matured here, and the newest work of node `$1` (the peer) this node holds
-/// was published, at least `$2` seconds ago. The fanout is `$3`.
+/// A fanout's finder (by its origin, its block's coinbase and whether this
+/// node offered it), whether this node holds a CPFP package for it, whether
+/// it is overdue: its block matured here, and the newest work of node `$1`
+/// (the peer) this node holds was published, if any, at least `$2` seconds
+/// ago; whether this node holds any work of node `$1`, and the coinbase
+/// suffix of its newest ([`Ledger::layout_mismatch`]). The fanout is `$3`.
 const FANOUT_SPONSOR_SQL: &str = concat!(
     "SELECT artifact.origin_node,fanout_set.parent_coinbase_tx_hex,",
+    "EXISTS(SELECT 1 FROM qbit_block_candidate_outbox offer WHERE offer.block_hash=artifact.block_hash) AS offered_here,",
     "EXISTS(SELECT 1 FROM qbit_prism_cpfp_packages package WHERE package.fanout_txid=artifact.fanout_txid) AS held,",
     "COALESCE(block.matured_at<=clock_timestamp()-make_interval(secs=>$2),false) ",
     "AND NOT EXISTS(SELECT 1 FROM (",
     newest_work_sql!(),
-    ") newest WHERE newest.created_at>clock_timestamp()-make_interval(secs=>$2)) AS overdue ",
+    ") newest WHERE newest.created_at>clock_timestamp()-make_interval(secs=>$2)) AS overdue,",
+    "EXISTS(SELECT 1 FROM (",
+    newest_work_sql!(),
+    ") newest) AS work_held,",
+    "(SELECT payload->>'coinbase_suffix_hex' FROM qbit_prism_jobs WHERE origin_node=$1 AND sync_seq IS NOT NULL AND job_id LIKE 'prepared:%' ORDER BY sync_seq DESC LIMIT 1) AS peer_suffix ",
     "FROM qbit_ctv_fanout_artifacts artifact JOIN qbit_ctv_fanout_sets fanout_set ON fanout_set.block_hash=artifact.block_hash ",
     "LEFT JOIN qbit_pool_blocks block ON block.block_hash=artifact.block_hash WHERE artifact.fanout_txid=$3"
 );
@@ -167,23 +182,44 @@ impl Ledger {
         let Some(own) = self.own_node() else {
             return Ok(Some(FanoutSponsor::Finder));
         };
-        let (origin, coinbase, held, overdue): (i16, String, bool, bool) =
-            sqlx::query_as(FANOUT_SPONSOR_SQL)
-                .bind(1 - own)
-                .bind(SPONSOR_TAKEOVER_AFTER.as_secs_f64())
-                .bind(fanout_txid)
-                .fetch_one(&mut *self.acquire().await?)
-                .await?;
+        let (origin, coinbase, offered_here, held, overdue, work_held, peer_suffix): (
+            i16,
+            String,
+            bool,
+            bool,
+            bool,
+            bool,
+            Option<String>,
+        ) = sqlx::query_as(FANOUT_SPONSOR_SQL)
+            .bind(1 - own)
+            .bind(SPONSOR_TAKEOVER_AFTER.as_secs_f64())
+            .bind(fanout_txid)
+            .fetch_one(&mut *self.acquire().await?)
+            .await?;
+        // Under two coinbase layouts a coinbase can name a finder at either
+        // node's offset: only a package this node holds is finished.
+        if let Some(mismatch) = self.layout_mismatch_with(peer_suffix.as_deref()) {
+            tracing::error!(
+                fanout_txid,
+                mismatch = %mismatch,
+                "ALERT: the pair's coinbase layouts differ; no zero-fee fanout is sponsored as its finder or taken over until they match"
+            );
+            return Ok(held.then_some(FanoutSponsor::Held));
+        }
         let coinbase = hex::decode(coinbase).ok();
-        Ok(if self.found_here(coinbase.as_deref(), origin == own) {
-            Some(FanoutSponsor::Finder)
-        } else if held {
-            Some(FanoutSponsor::Held)
-        } else if overdue {
-            Some(FanoutSponsor::Overdue)
-        } else {
-            None
-        })
+        Ok(
+            if self.found_here(coinbase.as_deref(), origin == own, offered_here) {
+                Some(FanoutSponsor::Finder)
+            } else if held {
+                Some(FanoutSponsor::Held)
+            } else if overdue && work_held {
+                Some(FanoutSponsor::Overdue)
+            } else if overdue {
+                Some(FanoutSponsor::Unwitnessed)
+            } else {
+                None
+            },
+        )
     }
 
     /// How long ago node `origin` published its newest work this database

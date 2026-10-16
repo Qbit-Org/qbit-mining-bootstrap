@@ -337,6 +337,13 @@ impl Coordinator {
             block_hash: block_hash.to_owned(),
             reason,
         };
+        // Under two coinbase layouts the block's finder cannot be told
+        // (`Ledger::layout_mismatch`): adopt nothing until they match.
+        if let Some(mismatch) = self.ledger.layout_mismatch().await? {
+            return Ok(no_record(format!(
+                "adoption is refused while the pair's coinbase layouts differ: {mismatch}"
+            )));
+        }
         let raw = self.rpc.call("getblock", json!([block_hash, 0])).await?;
         let block_bytes = hex::decode(raw.as_str().context("getblock returned no block")?)?;
         let mut header_hash =
@@ -351,14 +358,18 @@ impl Coordinator {
         let root = hex::encode(crate::ledger::coinbase_witness_reserved_value(coinbase)?);
         let script_sig = codec::coinbase_script_sig(coinbase)?.to_vec();
         let leaves = codec::witness_merkle_leaves_from_block(&block_bytes)?;
-        let records = self.ledger.compact_prepared_on_parent(&parent).await?;
-        if records.is_empty() {
+        let keys = self.ledger.compact_prepared_on_parent(&parent).await?;
+        if keys.is_empty() {
             return Ok(no_record(format!(
                 "no prepared record on parent {parent} is held here"
             )));
         }
         let mut reasons = Vec::new();
-        for (key, stored) in records {
+        for key in keys {
+            let Some(stored) = self.ledger.compact_prepared_held(&key).await? else {
+                reasons.push(format!("{key}: cannot be read or decoded"));
+                continue;
+            };
             match self
                 .adoption_candidate(block_hash, &block_bytes, &script_sig, &leaves, &stored)
                 .await

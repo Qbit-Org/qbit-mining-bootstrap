@@ -64,6 +64,10 @@ pub struct CarryGate {
     /// extranonce1 in a coinbase ([`finder_node`]); set with the dual-writer
     /// identity.
     coinbase_layout: std::sync::OnceLock<(Vec<u8>, usize)>,
+    /// The peer's newest coinbase suffix read live from its primary
+    /// database, when this database holds none of its prepared records
+    /// (`carry_owner::check`); `None` while that read found no work.
+    peer_suffix_live: std::sync::Mutex<Option<String>>,
 }
 
 /// The node whose half of the extranonce1 space a coinbase's extranonce1 is
@@ -71,9 +75,10 @@ pub struct CarryGate {
 /// issued the work the block was found on, whichever node landed its rows.
 /// The scriptSig ends with the coinbase tag, extranonce1 (four bytes,
 /// big-endian, as Stratum sends it) and extranonce2 (`extranonce2_size`
-/// bytes, this node's width). The pair need not share that width, so
-/// extranonce1 is read only where `tag` sits right before it: work issued
-/// with another width names no node here, whatever its bytes say. `None`
+/// bytes, this node's width). The pair must share the width and the tag
+/// ([`Ledger::layout_mismatch`] refuses otherwise); extranonce1 is still
+/// read only where `tag` sits right before it, so work issued with another
+/// width, before a change, names no node here, whatever its bytes say. `None`
 /// when the coinbase does not parse, the tag is not there, or extranonce1
 /// is 0, which no session is given. An empty tag verifies nothing, so a
 /// dual writer refuses to start with one (`config.rs`).
@@ -89,6 +94,34 @@ pub fn finder_node(coinbase_tx: &[u8], tag: &[u8], extranonce2_size: usize) -> O
         .into_iter()
         .find(|node| node.extranonce1_range().contains(&extranonce1))
         .map(|node| node.index())
+}
+
+/// The coinbase suffix of node `$1`'s newest prepared record this database
+/// holds: the layout that node issues work with now.
+pub const PEER_SUFFIX_SQL: &str = "SELECT payload->>'coinbase_suffix_hex' FROM qbit_prism_jobs WHERE origin_node=$1 AND sync_seq IS NOT NULL AND job_id LIKE 'prepared:%' ORDER BY sync_seq DESC LIMIT 1";
+
+/// The coinbase tag and extranonce2 width a prepared record's coinbase
+/// suffix was issued with: the tag, then extranonce1 (four bytes) and
+/// extranonce2 zeroed. The tag is printable ASCII, so the trailing zeros are
+/// exactly the placeholder. `None` when it is not such a suffix.
+pub fn layout_from_suffix(suffix_hex: &str) -> Option<(Vec<u8>, usize)> {
+    let suffix = hex::decode(suffix_hex).ok()?;
+    let placeholder = suffix.iter().rev().take_while(|byte| **byte == 0).count();
+    let width = placeholder.checked_sub(4).filter(|width| *width > 0)?;
+    Some((suffix[..suffix.len() - placeholder].to_vec(), width))
+}
+
+/// Why two coinbase layouts differ, or `None` when they match.
+fn layout_difference(own: &(Vec<u8>, usize), peer: &(Vec<u8>, usize)) -> Option<String> {
+    (own != peer).then(|| {
+        format!(
+            "this node issues work with coinbase tag {:?} and a {}-byte extranonce2, the peer with tag {:?} and a {}-byte extranonce2; set the same PRISM_COINBASE_TAG and PRISM_STRATUM_EXTRANONCE2_SIZE on both nodes",
+            String::from_utf8_lossy(&own.0),
+            own.1,
+            String::from_utf8_lossy(&peer.0),
+            peer.1
+        )
+    })
 }
 
 impl Ledger {
@@ -124,12 +157,20 @@ impl Ledger {
     /// Dual writer: whether this node issued the work a block with this
     /// coinbase was found on ([`finder_node`]). A block adopted from the
     /// peer's work (S8) carries this node as its origin, but was found by
-    /// the peer. A coinbase that names no node is not this node's: every
-    /// coinbase it builds names it, so such a block was issued elsewhere
-    /// (with another extranonce2 width or tag, adopted here among them) and
-    /// is sponsored here only by takeover. Without a recorded coinbase
-    /// layout, or without the coinbase, `origin_is_own` decides.
-    pub fn found_here(&self, coinbase_tx: Option<&[u8]>, origin_is_own: bool) -> bool {
+    /// the peer. A coinbase names no node when it was issued with another
+    /// extranonce2 width or tag: by the peer, or by this node before its
+    /// layout changed. Only the latter was offered here, so such a block is
+    /// this node's when it carries this node's origin and this node holds
+    /// its outbox row (`offered`; the outbox is local and never copied). An
+    /// adopted block has no outbox row: a cross-layout adoption is sponsored
+    /// here only by takeover. Without a recorded coinbase layout, or without
+    /// the coinbase, `origin_is_own` decides.
+    pub fn found_here(
+        &self,
+        coinbase_tx: Option<&[u8]>,
+        origin_is_own: bool,
+        offered: bool,
+    ) -> bool {
         let (Some(own), Some((tag, size)), Some(coinbase)) = (
             self.own_node(),
             self.carry.coinbase_layout.get(),
@@ -137,7 +178,82 @@ impl Ledger {
         ) else {
             return origin_is_own;
         };
-        finder_node(coinbase, tag, *size) == Some(own)
+        finder_node(coinbase, tag, *size).map_or(origin_is_own && offered, |finder| finder == own)
+    }
+
+    /// Dual writer: why this node's coinbase layout is not the peer's, read
+    /// from the peer's newest prepared record held here, or `None` when they
+    /// match or nothing here shows the peer's layout yet. The pair must
+    /// issue work with one tag and one extranonce2 width: under two, a
+    /// coinbase can name a finder at either node's offset, so while they
+    /// differ work is carry-free, no fanout is sponsored as its finder or
+    /// taken over, and no block is adopted.
+    ///
+    /// With none of the peer's records held here (its jobs stream refused
+    /// or lagging), the suffix the carry owner guard last read live from the
+    /// peer's primary database decides ([`Ledger::set_peer_suffix_live`];
+    /// held records clear it). Only when that read found no work, or never
+    /// answered, is the layout unknown and taken to match, so a peer whose
+    /// records here expired and whose database is gone does not hold the
+    /// survivor carry-free; a mismatch the primary showed before it went
+    /// out of reach, with nothing held since, does until the frontend
+    /// restarts.
+    pub async fn layout_mismatch(&self) -> Result<Option<String>> {
+        let held = self.peer_suffix_held().await?;
+        Ok(self.layout_mismatch_with(held.as_deref()))
+    }
+
+    /// The coinbase suffix of the peer's newest prepared record held here
+    /// (`None` in single-writer mode, without a recorded layout, or when
+    /// none is held).
+    pub async fn peer_suffix_held(&self) -> Result<Option<String>> {
+        let Some(own) = self.own_node() else {
+            return Ok(None);
+        };
+        if self.carry.coinbase_layout.get().is_none() {
+            return Ok(None);
+        }
+        let suffix: Option<Option<String>> = sqlx::query_scalar(PEER_SUFFIX_SQL)
+            .bind(1 - own)
+            .fetch_optional(&mut *self.acquire().await?)
+            .await?;
+        Ok(suffix.flatten())
+    }
+
+    /// Record the peer's newest coinbase suffix as its primary database
+    /// shows it (`None`: it shows no work), for [`Ledger::layout_mismatch`]
+    /// while this database holds none of the peer's records.
+    pub fn set_peer_suffix_live(&self, suffix: Option<String>) {
+        *self
+            .carry
+            .peer_suffix_live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = suffix;
+    }
+
+    /// [`Ledger::layout_mismatch`], given the peer's newest coinbase suffix
+    /// held here; without one, the live suffix decides.
+    pub fn layout_mismatch_with(&self, peer_suffix_hex: Option<&str>) -> Option<String> {
+        let own = self.carry.coinbase_layout.get()?;
+        let live;
+        let suffix = match peer_suffix_hex {
+            Some(suffix) => suffix,
+            None => {
+                live = self
+                    .carry
+                    .peer_suffix_live
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()?;
+                live.as_str()
+            }
+        };
+        match layout_from_suffix(suffix) {
+            Some(peer) => layout_difference(own, &peer),
+            None => Some(format!(
+                "the peer's newest prepared record has coinbase suffix {suffix}, which shows no tag and extranonce placeholder"
+            )),
+        }
     }
 
     /// Whether work built now pays carried balances: always in single-writer
@@ -266,6 +382,28 @@ impl Ledger {
             || (self.dual_writer()
                 && !carry_free_block(true, prior_balances_digest)
                 && self.carry_gate_generation() != generation)
+    }
+
+    /// Dual writer: whether this node's journal, read now, no longer claims
+    /// ownership for a carry-paying block on work built on
+    /// `prior_balances_digest`. The gate learns of a `carry-owner release`,
+    /// which another process commits, only at the guard's next check; the
+    /// offer reads the journal itself right before it sends, so a block
+    /// reserved before the release is not offered after it, where the new
+    /// owner's transfer scan may already have passed. False for carry-free
+    /// work and in single-writer mode.
+    pub async fn carry_claim_withdrawn(&self, prior_balances_digest: &[u8; 32]) -> Result<bool> {
+        let Some(own) = self.own_node() else {
+            return Ok(false);
+        };
+        if carry_free_block(true, prior_balances_digest) {
+            return Ok(false);
+        }
+        let claims: Option<bool> = sqlx::query_scalar(OWN_CLAIM_SQL)
+            .bind(own)
+            .fetch_optional(&mut *self.acquire().await?)
+            .await?;
+        Ok(claims != Some(true))
     }
 }
 
@@ -402,31 +540,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn found_here_follows_the_finder_and_falls_back_to_the_origin() {
+    async fn the_peers_layout_is_read_from_its_coinbase_suffix_and_must_match() {
+        let suffix =
+            |tag: &[u8], width: usize| hex::encode([tag, &vec![0; 4 + width][..]].concat());
+        assert_eq!(layout_from_suffix(&suffix(TAG, 8)), Some((TAG.to_vec(), 8)));
+        assert_eq!(layout_from_suffix(&suffix(TAG, 0)), None);
+        assert_eq!(layout_from_suffix("zz"), None);
         let ledger = ledger();
-        // Single writer: the origin decides, whatever the coinbase says.
-        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        // Single writer, or no layout recorded: nothing to compare.
+        assert_eq!(ledger.layout_mismatch_with(Some(&suffix(TAG, 4))), None);
         ledger
             .set_dual_writer_identity(NodeIdentity {
                 node: NodeIndex::A,
                 carry_owner: true,
             })
             .unwrap();
-        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        ledger.set_coinbase_layout(TAG, 8).unwrap();
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+        assert_eq!(ledger.layout_mismatch_with(Some(&suffix(TAG, 8))), None);
+        let wider = ledger.layout_mismatch_with(Some(&suffix(TAG, 4))).unwrap();
+        assert!(wider.contains("4-byte extranonce2"), "{wider}");
+        assert!(ledger
+            .layout_mismatch_with(Some(&suffix(b"/OTHER/", 8)))
+            .is_some());
+        assert!(ledger.layout_mismatch_with(Some("00")).is_some());
+        // None held here: the suffix the peer's primary showed decides; none
+        // (no work, or never read) is unknown, taken to match.
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+        ledger.set_peer_suffix_live(Some(suffix(TAG, 4)));
+        assert!(ledger.layout_mismatch_with(None).is_some());
+        // A held record still decides over it.
+        assert_eq!(ledger.layout_mismatch_with(Some(&suffix(TAG, 8))), None);
+        ledger.set_peer_suffix_live(Some(suffix(TAG, 8)));
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+        ledger.set_peer_suffix_live(None);
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+    }
+
+    #[tokio::test]
+    async fn found_here_follows_the_finder_and_falls_back_to_this_nodes_offer() {
+        let ledger = ledger();
+        // Single writer: the origin decides, whatever the coinbase says.
+        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true, false));
+        ledger
+            .set_dual_writer_identity(NodeIdentity {
+                node: NodeIndex::A,
+                carry_owner: true,
+            })
+            .unwrap();
+        assert!(ledger.found_here(Some(&coinbase(u32::MAX)), true, false));
         ledger.set_coinbase_layout(TAG, 8).unwrap();
         assert!(ledger.set_coinbase_layout(TAG, 4).is_err());
         assert!(ledger.set_coinbase_layout(b"/OTHER/", 8).is_err());
         // Adopted from B's work: this node's rows, B's block.
-        assert!(!ledger.found_here(Some(&coinbase(u32::MAX)), true));
+        assert!(!ledger.found_here(Some(&coinbase(u32::MAX)), true, true));
         // B's block issued with another width names nobody, so it is never
         // taken for this node's.
-        assert!(!ledger.found_here(Some(&coinbase_with(7, 4)), false));
-        assert!(ledger.found_here(Some(&coinbase(7)), false));
-        assert!(!ledger.found_here(None, false));
-        // A coinbase that names no node is not this node's, whatever the
-        // origin: B's block issued with another width and adopted here.
-        assert!(!ledger.found_here(Some(&coinbase_with(u32::MAX, 4)), true));
-        assert!(!ledger.found_here(Some(&[0]), true));
+        assert!(!ledger.found_here(Some(&coinbase_with(7, 4)), false, false));
+        assert!(ledger.found_here(Some(&coinbase(7)), false, false));
+        assert!(!ledger.found_here(None, false, true));
+        assert!(ledger.found_here(None, true, false));
+        // A coinbase that names no node: this node's only when it offered
+        // the block, issued here before the layout changed. B's block
+        // issued with another width and adopted here has no outbox row.
+        assert!(ledger.found_here(Some(&coinbase_with(7, 4)), true, true));
+        assert!(ledger.found_here(Some(&[0]), true, true));
+        assert!(!ledger.found_here(Some(&coinbase_with(u32::MAX, 4)), true, false));
+        assert!(!ledger.found_here(Some(&[0]), true, false));
+        assert!(!ledger.found_here(Some(&[0]), false, true));
     }
 
     #[test]

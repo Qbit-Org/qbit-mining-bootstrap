@@ -758,6 +758,33 @@ async fn gate_changes_are_fenced(url: String) -> Result<()> {
         "a repeated close bumped the revision"
     );
     ensure_balances(&pool, &[&LOCAL], "after the gate moved twice").await?;
+    // The offer reads the journal itself before it sends: a release another
+    // process commits withdraws carry-paying work at once, whatever the gate
+    // in this process still says. Carry-free work is never withdrawn.
+    ensure!(
+        !canonical.is_empty()
+            && !ledger.carry_claim_withdrawn(&canonical_digest).await?
+            && !ledger
+                .carry_claim_withdrawn(&carry_free_prior_digest())
+                .await?,
+        "a journal claiming ownership withdrew work"
+    );
+    qbit_prism_server::carry_owner::append_role(
+        &mut *pool.acquire().await?,
+        NodeIndex::B.index(),
+        false,
+        "release",
+        "carry-owner-test",
+        &serde_json::json!({"reason": "test", "tip_height": 0}),
+    )
+    .await?;
+    ensure!(
+        ledger.carry_claim_withdrawn(&canonical_digest).await?
+            && !ledger
+                .carry_claim_withdrawn(&carry_free_prior_digest())
+                .await?,
+        "a committed release did not withdraw carry-paying work before the offer"
+    );
     ledger.pool.close().await;
     Ok(())
 }
