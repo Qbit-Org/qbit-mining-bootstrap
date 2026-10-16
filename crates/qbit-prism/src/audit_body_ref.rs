@@ -254,6 +254,7 @@ fn resolve_audit_body_ref(
             body_ref.schema
         )));
     }
+    refuse_window_cut(&body_ref.bundle_without_shares, "audit-body-ref.v1")?;
     let expected_sha256 = body_ref.audit_bundle_sha256.to_lowercase();
     if expected_sha256.len() != 64 || !expected_sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(AuditBodyRefError::Invalid(
@@ -300,6 +301,7 @@ fn resolve_audit_bundle_v2(
             bundle_v2.schema
         )));
     }
+    refuse_window_cut(&bundle_v2.bundle_without_shares, "audit-bundle.v2")?;
     let proof = bundle_v2.share_window_proof;
     if proof.schema != AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA {
         return Err(AuditBodyRefError::Invalid(format!(
@@ -351,6 +353,8 @@ fn resolve_audit_bundle_v2(
         shares,
     )?;
     let bundle: AuditBundle = serde_json::from_value(bundle_value)?;
+    // Always `None`: a cut is refused above, as these envelopes predate
+    // dual-writer windows.
     let expected_reward_manifest = build_prism_reward_manifest_with_cut(
         &bundle.shares,
         &bundle.found_block,
@@ -641,6 +645,24 @@ fn append_contiguous(
         }
     }
     target.append(&mut incoming);
+    Ok(())
+}
+
+/// The storage envelopes (`audit-body-ref.v1`, `audit-bundle.v2`) are 2.x
+/// artifacts: the cutover import, the read-model API's legacy bodies and the
+/// verify and canonicalize CLIs read them, and no 3.x writer produces them. Their completeness checks require a contiguous `share_seq` run, which
+/// a dual-writer window with a cut need not be (a late peer row outside the
+/// cut leaves a gap). So a window with a cut is refused by name here, never
+/// half-checked: such a bundle only ever travels as a flat logical bundle.
+fn refuse_window_cut(bundle_without_shares: &Value, label: &str) -> Result<(), AuditBodyRefError> {
+    let cut = bundle_without_shares
+        .get("reward_manifest")
+        .and_then(|manifest| manifest.get("cut"));
+    if cut.is_some_and(|cut| !cut.is_null()) {
+        return Err(AuditBodyRefError::Invalid(format!(
+            "{label} predates dual-writer window cuts: a bundle whose reward manifest has a cut is only valid as a flat audit bundle"
+        )));
+    }
     Ok(())
 }
 
