@@ -662,8 +662,10 @@ pub async fn sponsors_fanout(coordinator: &Coordinator, fanout_txid: &str) -> Re
 ///   youngest newest work it shows of its own node, aged by its own clock, is
 ///   [`SPONSOR_TAKEOVER_AFTER`] old. A frontend that is alive publishes work
 ///   every few minutes (the reanchor and the template's maximum age).
-/// - **It answers with no work of its node at all** (a frontend just
-///   started, or its expired work pruned): unknown, and silent only once the
+/// - **It answers with no work of its node at all**, through any URL that
+///   answers, and no URL shows work younger than the takeover delay (a
+///   frontend just started, or its expired work pruned; another URL's stale
+///   copy does not override it): unknown, and silent only once the
 ///   checks have found none for [`SPONSOR_TAKEOVER_AFTER`].
 /// - **It has failed [`OUTAGE_CHECKS`] checks in a row, over
 ///   `out_of_reach_after` at least:** silent. That is [`OUT_OF_REACH_AFTER`]

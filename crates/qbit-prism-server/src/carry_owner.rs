@@ -566,9 +566,8 @@ impl PeerJournal {
 
     /// How long ago node `origin` published its newest work the peer's
     /// database holds, by the peer's own clock (`ledger::WORK_AGE_SQL`),
-    /// read through every URL: the youngest answer, so a lagging path cannot
-    /// make the work look older than it is. `Some(None)` when none holds any
-    /// work, `None` if no URL answered.
+    /// read through every URL and combined by [`youngest_work_age`].
+    /// `None` if no URL answered.
     pub async fn work_age(&self, origin: i16) -> Option<Option<Duration>> {
         let answers = self
             .every_answer(|mut connection| async move {
@@ -578,13 +577,11 @@ impl PeerJournal {
                     .await
             })
             .await;
-        let ages = answers
-            .into_iter()
-            .map(|seconds| seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.))));
-        ages.reduce(|youngest, age| match (youngest, age) {
-            (Some(known), Some(age)) => Some(known.min(age)),
-            (known, age) => known.or(age),
-        })
+        youngest_work_age(
+            answers
+                .into_iter()
+                .map(|seconds| seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.)))),
+        )
     }
 
     /// `origin`'s latest row in the peer's journal, every column; `None` if
@@ -905,8 +902,65 @@ fn log_decision(decision: CarryDecision, alert: bool, settings: &CarryOwnerSetti
     }
 }
 
+/// The peer's URLs' answers to [`PeerJournal::work_age`], combined. Work
+/// younger than the takeover delay on any path wins: the finder is alive,
+/// and a lagging or empty path cannot hide it. Otherwise a path that
+/// answers with no work at all makes the age unknown (`Some(None)`): it may
+/// be the current one, holding none since a restart, and another path's
+/// stale copy must not age the finder into silence. Only when every path
+/// shows stale work does the youngest of them decide. `None` when no path
+/// answered.
+fn youngest_work_age(answers: impl Iterator<Item = Option<Duration>>) -> Option<Option<Duration>> {
+    let mut answered = false;
+    let mut empty = false;
+    let mut youngest: Option<Duration> = None;
+    for age in answers {
+        answered = true;
+        match age {
+            Some(age) => youngest = Some(youngest.map_or(age, |known| known.min(age))),
+            None => empty = true,
+        }
+    }
+    if !answered {
+        return None;
+    }
+    Some(match youngest {
+        Some(age) if age < crate::ledger::SPONSOR_TAKEOVER_AFTER || !empty => Some(age),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fresh_work_wins_and_a_path_with_no_work_makes_stale_work_unknown() {
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        assert_eq!(youngest_work_age(std::iter::empty()), None);
+        assert_eq!(
+            youngest_work_age([minutes(40), minutes(2)].into_iter()),
+            Some(minutes(2))
+        );
+        assert_eq!(
+            youngest_work_age([None, minutes(40)].into_iter()),
+            Some(None)
+        );
+        assert_eq!(
+            youngest_work_age([minutes(40), None].into_iter()),
+            Some(None)
+        );
+        assert_eq!(youngest_work_age([None].into_iter()), Some(None));
+        // Fresh work on any path wins: an empty path does not hide a live
+        // finder.
+        assert_eq!(
+            youngest_work_age([None, minutes(2)].into_iter()),
+            Some(minutes(2))
+        );
+        assert_eq!(
+            youngest_work_age([minutes(2), None, minutes(40)].into_iter()),
+            Some(minutes(2))
+        );
+    }
+
     use super::*;
 
     fn row(origin_node: i16, epoch: i64, carry_owner: bool, action: &str) -> RoleRow {
