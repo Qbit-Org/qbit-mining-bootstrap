@@ -26,8 +26,9 @@
 //! 3. `inv3-landing-rows`: every census block has its landing rows in every
 //!    checked database (block, audit bundle and snapshot, one payout entry
 //!    per manifest account, one carry row per miner account, its CTV fanout
-//!    set and artifacts), the same in every database in every column the
-//!    peer sync carries (provenance included; a snapshot by its content).
+//!    set and artifacts) at the chain's height and coinbase txid, its child
+//!    rows at the block's height, the same in every database in every
+//!    column the peer sync carries (provenance included; a snapshot by its content).
 //!    `inv3-audits-verify`: each node's frontend serves the block's bundle,
 //!    `qbit-prism-audit-verify` accepts it against the coinbase from the
 //!    chain with the pinned ledger key, its manifest key is the pinned one,
@@ -716,7 +717,11 @@ async fn landing_rows(
                     COALESCE(jsonb_array_length(a.audit_bundle #> '{ctv_fanout_manifest_set,manifests}'), 0) AS expected_fanouts, \
                     f.block_hash IS NOT NULL AS has_fanout_set, \
                     (SELECT count(*) FROM qbit_ctv_fanout_artifacts fa WHERE fa.block_hash = h.block_hash) AS fanout_artifacts, \
-                    b.coinbase_txid, \
+                    b.coinbase_txid, b.block_height, \
+                    (SELECT count(*) FROM qbit_pool_payout_entries p \
+                      WHERE p.block_hash = h.block_hash AND p.block_height IS DISTINCT FROM b.block_height) AS payout_height_mismatches, \
+                    (SELECT count(*) FROM qbit_payout_carry_forward c \
+                      WHERE c.block_hash = h.block_hash AND c.block_height IS DISTINCT FROM b.block_height) AS carry_height_mismatches, \
                     (SELECT count(*) FROM ( \
                        (SELECT p.miner_id, p.payout_order_key, p.p2mr_program, \
                                p.onchain_amount_sats::numeric, p.carry_forward_balance_sats::numeric, p.action \
@@ -825,14 +830,33 @@ async fn landing_rows(
                     "{artifacts} fanout artifacts for {expected} manifests"
                 ));
             }
-            // The landed coinbase must be the chain's: the census read it
-            // from C, never from a database.
+            // The landed coinbase and height must be the chain's: the census
+            // read them from C, never from a database. The child rows carry
+            // the block's height too.
             let coinbase_txid: Option<String> = row.try_get("coinbase_txid")?;
+            let height: Option<i64> = row.try_get("block_height")?;
             if let Some(block) = census.iter().find(|block| block.hash == hash) {
                 if coinbase_txid.as_deref() != Some(block.coinbase_txid.as_str()) {
                     faults.push(format!(
                         "coinbase txid {coinbase_txid:?}, the chain's is {}",
                         block.coinbase_txid
+                    ));
+                }
+                if height.and_then(|h| u64::try_from(h).ok()) != Some(block.height) {
+                    faults.push(format!(
+                        "block height {height:?}, the chain's is {}",
+                        block.height
+                    ));
+                }
+            }
+            for (column, what) in [
+                ("payout_height_mismatches", "payout entries"),
+                ("carry_height_mismatches", "carry rows"),
+            ] {
+                let mismatches: i64 = row.try_get(column)?;
+                if mismatches != 0 {
+                    faults.push(format!(
+                        "{mismatches} {what} at another height than the block"
                     ));
                 }
             }
@@ -1580,21 +1604,15 @@ pub async fn windows_unchanged(pools: &BTreeMap<Node, PgPool>) -> Result<Check> 
     Ok(check.finish(format!("{windows} recorded windows re-read")))
 }
 
+/// Every recorded window recomputes to its digest on the database that
+/// built it (an in-place edit of a share keeps the count `windows_unchanged`
+/// reads), and in a pair on the other database too.
 async fn windows_reproducible(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
-    if pools.len() < 2 {
-        return Ok(Check::skip(
-            "inv4-windows-reproducible",
-            "one database: every window is read where it was built",
-        ));
-    }
     let mut check = CheckBuilder::new("inv4-windows-reproducible");
     let mut compared = 0;
     for (node, pool) in pools {
         for window in recorded_windows(pool).await? {
             for (other, other_pool) in pools {
-                if other == node {
-                    continue;
-                }
                 compared += 1;
                 let digest = window_digest(other_pool, &window).await?;
                 if digest.as_deref() != Some(window.snapshot.as_str()) {
@@ -1607,7 +1625,9 @@ async fn windows_reproducible(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
             }
         }
     }
-    Ok(check.finish(format!("{compared} cross-node window recomputations")))
+    Ok(check.finish(format!(
+        "{compared} window recomputations on the building and the other databases"
+    )))
 }
 
 /// The snapshot digest of a recorded window, recomputed from a ledger
