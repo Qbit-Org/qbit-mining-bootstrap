@@ -619,11 +619,10 @@ fn continue_outage(
 }
 
 impl Outage {
-    /// Whether it has lasted long enough, over enough checks, for the peer's
+    /// Whether it has lasted `after`, over enough checks, for the peer's
     /// node to count as silent.
-    fn long_enough(&self, now: std::time::Instant) -> bool {
-        self.failed_checks >= OUTAGE_CHECKS
-            && now.saturating_duration_since(self.since) >= OUT_OF_REACH_AFTER
+    fn long_enough(&self, now: std::time::Instant, after: std::time::Duration) -> bool {
+        self.failed_checks >= OUTAGE_CHECKS && now.saturating_duration_since(self.since) >= after
     }
 }
 
@@ -635,8 +634,15 @@ impl Outage {
 pub async fn sponsors_fanout(coordinator: &Coordinator, fanout_txid: &str) -> Result<bool> {
     match coordinator.ledger.fanout_sponsor(fanout_txid).await? {
         Some(FanoutSponsor::Finder | FanoutSponsor::Held) => Ok(true),
-        Some(FanoutSponsor::Overdue) => {
-            let silent = finder_silent(coordinator).await?;
+        Some(sponsor @ (FanoutSponsor::Overdue | FanoutSponsor::Unwitnessed)) => {
+            // Without the finder's work held here, an outage must itself
+            // last the takeover delay.
+            let out_of_reach_after = if sponsor == FanoutSponsor::Overdue {
+                OUT_OF_REACH_AFTER
+            } else {
+                SPONSOR_TAKEOVER_AFTER
+            };
+            let silent = finder_silent(coordinator, out_of_reach_after).await?;
             if silent {
                 tracing::warn!(
                     fanout_txid,
@@ -660,13 +666,18 @@ pub async fn sponsors_fanout(coordinator: &Coordinator, fanout_txid: &str) -> Re
 ///   started, or its expired work pruned): unknown, and silent only once the
 ///   checks have found none for [`SPONSOR_TAKEOVER_AFTER`].
 /// - **It has failed [`OUTAGE_CHECKS`] checks in a row, over
-///   [`OUT_OF_REACH_AFTER`] at least:** silent.
-///   The overdue fence has already found the finder's work this node holds as
-///   old as the takeover delay. A finder that is alive but cut off from this
-///   node that long looks silent, and both nodes may then fund a child
-///   (docs/prism-ledger-ops.md).
+///   `out_of_reach_after` at least:** silent. That is [`OUT_OF_REACH_AFTER`]
+///   for an [`FanoutSponsor::Overdue`] fanout, whose fence has already found
+///   the finder's work this node holds as old as the takeover delay, and
+///   [`SPONSOR_TAKEOVER_AFTER`] for an [`FanoutSponsor::Unwitnessed`] one,
+///   with no such work here to date the silence. A finder that is alive but
+///   cut off from this node that long looks silent, and both nodes may then
+///   fund a child (docs/prism-ledger-ops.md).
 /// - **A shorter outage:** not silent yet.
-async fn finder_silent(coordinator: &Coordinator) -> Result<bool> {
+async fn finder_silent(
+    coordinator: &Coordinator,
+    out_of_reach_after: std::time::Duration,
+) -> Result<bool> {
     let settings = match CarryOwnerSettings::from_config(&coordinator.config) {
         Ok(settings) => settings,
         Err(error) => {
@@ -681,7 +692,11 @@ async fn finder_silent(coordinator: &Coordinator) -> Result<bool> {
     let mut state = liveness.state.lock().await;
     if let Some((at, silent)) = state.verdict {
         if at.elapsed() < VERDICT_TTL {
-            return Ok(silent);
+            // An outage's verdict depends on how long the caller needs it.
+            return Ok(match state.outage {
+                Some(outage) => outage.long_enough(at, out_of_reach_after),
+                None => silent,
+            });
         }
     }
     let peer = crate::carry_owner::peer_index(settings.node_index);
@@ -701,7 +716,7 @@ async fn finder_silent(coordinator: &Coordinator) -> Result<bool> {
         None => {
             let outage = continue_outage(state.outage, state.verdict.map(|(at, _)| at), now);
             state.outage = Some(outage);
-            outage.long_enough(now)
+            outage.long_enough(now, out_of_reach_after)
         }
     };
     state.verdict = Some((now, silent));
@@ -1369,7 +1384,7 @@ mod tests {
                 failed_checks: 1
             }
         );
-        assert!(!first.long_enough(now));
+        assert!(!first.long_enough(now, OUT_OF_REACH_AFTER));
         // Failed checks a minute apart continue it; two blips are not enough.
         let earlier = Outage {
             since: ago(60),
@@ -1377,16 +1392,27 @@ mod tests {
         };
         let second = continue_outage(Some(earlier), Some(ago(60)), now);
         assert_eq!(second.failed_checks, 2);
-        assert!(!second.long_enough(now));
+        assert!(!second.long_enough(now, OUT_OF_REACH_AFTER));
         // A third, over a minute after the first: the peer's node is silent.
         let third = continue_outage(Some(second), Some(ago(30)), now + Duration::from_secs(30));
-        assert!(third.failed_checks == 3 && third.long_enough(now + Duration::from_secs(30)));
+        assert!(
+            third.failed_checks == 3
+                && third.long_enough(now + Duration::from_secs(30), OUT_OF_REACH_AFTER)
+        );
+        // Without the finder's work held here, a minute is not enough: the
+        // outage itself must last the takeover delay.
+        assert!(!third.long_enough(now + Duration::from_secs(30), SPONSOR_TAKEOVER_AFTER));
+        let long = Outage {
+            since: ago(SPONSOR_TAKEOVER_AFTER.as_secs()),
+            failed_checks: 3,
+        };
+        assert!(long.long_enough(now, SPONSOR_TAKEOVER_AFTER));
         // Three quick failures within a minute are not enough either.
         let quick = Outage {
             since: ago(20),
             failed_checks: 3,
         };
-        assert!(!quick.long_enough(now));
+        assert!(!quick.long_enough(now, OUT_OF_REACH_AFTER));
         // A failure long after the last check begins a new outage: the old
         // one may have ended unobserved.
         assert_eq!(

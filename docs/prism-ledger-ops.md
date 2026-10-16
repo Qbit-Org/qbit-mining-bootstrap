@@ -1832,9 +1832,11 @@ fanout is overdue and its finder silent:
   database that answers with no work of its node at all (a frontend just
   started, or its expired work pruned) is not silent until the checks have
   found none for 30 minutes. Or that database has failed three checks in a row,
-  over a minute at least; then the stale copy here decides. A blip or two only
-  waits. One check runs at a
-  time, and its verdict serves every fanout for 30 seconds.
+  over a minute at least; then the stale copy here decides. When this node holds
+  no work of the finder's at all (none synced yet, or its copies expired),
+  nothing here dates the silence, so the outage itself must last 30 minutes. A
+  blip or two only waits. One check runs at a time, and its verdict serves
+  every fanout for 30 seconds.
 
 A frontend that is alive publishes work every few minutes (the reanchor and the
 template's maximum age), so a living finder whose database answers keeps its
