@@ -855,8 +855,16 @@ pub async fn check(
     };
     // Logged with its ALERT only when the decision changes (`log_decision`);
     // `carry-owner status` and the fanout and adoption refusals say why.
+    // A failed read of it fails closed, as a mismatch: an error here would
+    // keep the gate as it is without deciding on what the peer read showed.
     let layout_mismatch = if identified {
-        refresh_peer_layout(ledger, peer, settings.node_index).await?
+        refresh_peer_layout(ledger, peer, settings.node_index)
+            .await
+            .unwrap_or_else(|error| {
+                Some(format!(
+                    "the peer's coinbase layout could not be read: {error:#}"
+                ))
+            })
     } else {
         None
     };
