@@ -2030,10 +2030,35 @@ it:
   cursors unchanged; it does not undo previously committed expiry. Successful
   nonzero counts are logged per phase, and failures warn on each pruning tick.
 - Per-item import failure and restart. `import-audits` processes one legacy
-  audit at a time, each verified off the runtime threads and stored in its
-  own transaction. A failing item stops the command with an error; earlier
-  items stay imported, there is no partially imported item, and rerunning the
-  command resumes with the rows that still lack canonical bytes.
+  audit at a time, each verified, and its statement's parameters encoded,
+  off the runtime threads, and stored in its own transaction. A failing item
+  stops the command with an error that names it; earlier items stay
+  imported, there is no partially imported item, and rerunning the command
+  resumes with the rows that still lack canonical bytes.
+- `import-audits` and `SETTLEMENT_LOCK` (#765). Each row's UPDATE is sent
+  and run first, holding only that row's lock; only then does the command
+  poll for `SETTLEMENT_LOCK` (`pg_try_advisory_xact_lock`, never queued),
+  check the write guard under it and commit; the guard also runs before the
+  write, so a halted cluster is refused before anything is sent. Settlement
+  waits for that check and the commit, never for a legacy body to be sent or
+  stored. The one exception is a lock holder that needs the very row being
+  imported (a re-landing of that block filling its `found_block_bits`): it
+  waits for that row's UPDATE to finish, and then goes first, because a poll
+  that misses the lock and finds the lock's holder waiting for the importer
+  rolls the row back. A stopped or killed importer's row is rolled back
+  within a second even mid-UPDATE, because its connection sets
+  `client_connection_check_interval` (PostgreSQL 14 or later on Linux;
+  elsewhere the server finds out at the write timeout). Transaction-local timeouts bound each phase:
+  `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS` (60 s) the write, and
+  `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS` (5 s) the wait for the lock and,
+  once it is held, any statement or client pause, after which PostgreSQL
+  ends the session and the lock with it. A row that exceeds one is rolled
+  back. SIGTERM (`docker stop`) or SIGINT stops the command before the next
+  row, or rolls back a row that has not been granted the lock, and it exits
+  1; a second signal exits at once. Each imported row prints one
+  `import-audits: block_hash=...` line on
+  stderr with every parameter's encoded size and the prepare, write, lock
+  wait, lock hold and total times.
 
 ### A ledger future cancelled inside `BEGIN` (#482)
 
