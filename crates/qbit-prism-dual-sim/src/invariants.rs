@@ -789,6 +789,22 @@ async fn landing_rows(
                 ));
             }
         }
+        // A row confirmed for a block the chain's census does not hold is a
+        // phantom landing, which no check above would visit. Rows of other
+        // states (a lost block's prepared row, a reorged one) may stay.
+        let phantoms: Vec<String> = sqlx::query_scalar(
+            "SELECT block_hash FROM qbit_pool_blocks \
+             WHERE chain_state = 'confirmed' AND NOT (block_hash = ANY($1)) ORDER BY block_hash",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        for hash in phantoms {
+            check.problem(format!(
+                "node {node:?} holds pool block {hash} as confirmed, but it is no pool block of \
+                 the active chain since the scenario began"
+            ));
+        }
         if pools.len() > 1 {
             landings.insert(*node, carried_landings(pool, &hashes).await?);
         }
