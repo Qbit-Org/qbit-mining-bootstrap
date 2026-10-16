@@ -1830,8 +1830,10 @@ fanout is overdue and its finder silent:
 - **Silent:** the finder's own database, read through every peer URL, shows
   its newest work, aged by its own clock, to be at least 30 minutes old. A
   database that answers with no work of its node at all (a frontend just
-  started, or its expired work pruned) is not silent until the checks have
-  found none for 30 minutes. Or that database has failed three checks in a row,
+  started, or its expired work pruned), through any peer URL that answers, is
+  not silent until the checks have found none for 30 minutes; another URL's
+  older copy does not override that answer, while work under 30 minutes old on
+  any URL always shows the finder alive. Or that database has failed three checks in a row,
   over a minute at least; then the stale copy here decides. When this node holds
   no work of the finder's at all (none synced yet, or its copies expired),
   nothing here dates the silence, so the outage itself must last 30 minutes. A
