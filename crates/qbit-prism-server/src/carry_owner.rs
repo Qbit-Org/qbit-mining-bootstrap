@@ -615,6 +615,24 @@ impl PeerJournal {
         )
     }
 
+    /// The coinbase suffix of node `origin`'s newest prepared record, read
+    /// over `PRISM_PEER_DATABASE_URL` only (`ledger::PEER_SUFFIX_SQL`): a
+    /// lagging fallback could show a layout the peer has left. `Some(None)`
+    /// when it holds no work of `origin`'s, `None` if it could not be read.
+    pub async fn primary_suffix(&self, origin: i16) -> Option<Option<String>> {
+        let primary = self.pools.first()?;
+        self.answer(primary, &|mut connection: sqlx::pool::PoolConnection<
+            sqlx::Postgres,
+        >| async move {
+            sqlx::query_scalar::<_, Option<String>>(crate::ledger::PEER_SUFFIX_SQL)
+                .bind(origin)
+                .fetch_optional(&mut *connection)
+                .await
+                .map(Option::flatten)
+        })
+        .await
+    }
+
     /// `origin`'s latest row in the peer's journal, every column; `None` if
     /// the peer could not be read.
     pub async fn latest_row_json(&self, origin: i16) -> Option<Option<serde_json::Value>> {
@@ -833,7 +851,11 @@ pub async fn check(
     };
     // Logged with its ALERT only when the decision changes (`log_decision`);
     // `carry-owner status` and the fanout and adoption refusals say why.
-    let layout_mismatch = ledger.layout_mismatch().await?;
+    let layout_mismatch = if identified {
+        refresh_peer_layout(ledger, peer, settings.node_index).await?
+    } else {
+        None
+    };
     Ok(guard.decide(&GuardInputs {
         node_index: settings.node_index,
         database_node,
@@ -843,6 +865,26 @@ pub async fn check(
         peer_read,
         layout_mismatch,
     }))
+}
+
+/// Why this node's coinbase layout is not the peer's, if it is not
+/// (`Ledger::layout_mismatch`). With none of the peer's records held here,
+/// the peer's primary database shows its layout, and the ledger keeps what
+/// it showed for the fanout and adoption checks; an unreachable primary
+/// keeps the last it showed. Records held here decide, and clear what the
+/// primary showed, so it cannot outlive them once they expire.
+pub async fn refresh_peer_layout(
+    ledger: &Ledger,
+    peer: &PeerJournal,
+    node_index: i16,
+) -> Result<Option<String>> {
+    let held = ledger.peer_suffix_held().await?;
+    if held.is_some() {
+        ledger.set_peer_suffix_live(None);
+    } else if let Some(live) = peer.primary_suffix(peer_index(node_index)).await {
+        ledger.set_peer_suffix_live(live);
+    }
+    Ok(ledger.layout_mismatch_with(held.as_deref()))
 }
 
 /// One live read of the peer's journal, counted.

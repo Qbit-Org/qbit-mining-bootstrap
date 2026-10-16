@@ -30,7 +30,7 @@ mod candidates;
 #[cfg(test)]
 pub(crate) use candidates::faults as candidate_faults;
 mod carry;
-pub use carry::{bump_payout_revision, carry_free_prior_digest, CarryGate};
+pub use carry::{bump_payout_revision, carry_free_prior_digest, CarryGate, PEER_SUFFIX_SQL};
 mod claim_observer;
 pub use candidates::revoke_candidate_claims;
 pub use candidates::{

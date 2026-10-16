@@ -64,6 +64,10 @@ pub struct CarryGate {
     /// extranonce1 in a coinbase ([`finder_node`]); set with the dual-writer
     /// identity.
     coinbase_layout: std::sync::OnceLock<(Vec<u8>, usize)>,
+    /// The peer's newest coinbase suffix read live from its primary
+    /// database, when this database holds none of its prepared records
+    /// (`carry_owner::check`); `None` while that read found no work.
+    peer_suffix_live: std::sync::Mutex<Option<String>>,
 }
 
 /// The node whose half of the extranonce1 space a coinbase's extranonce1 is
@@ -94,7 +98,7 @@ pub fn finder_node(coinbase_tx: &[u8], tag: &[u8], extranonce2_size: usize) -> O
 
 /// The coinbase suffix of node `$1`'s newest prepared record this database
 /// holds: the layout that node issues work with now.
-const PEER_SUFFIX_SQL: &str = "SELECT payload->>'coinbase_suffix_hex' FROM qbit_prism_jobs WHERE origin_node=$1 AND sync_seq IS NOT NULL AND job_id LIKE 'prepared:%' ORDER BY sync_seq DESC LIMIT 1";
+pub const PEER_SUFFIX_SQL: &str = "SELECT payload->>'coinbase_suffix_hex' FROM qbit_prism_jobs WHERE origin_node=$1 AND sync_seq IS NOT NULL AND job_id LIKE 'prepared:%' ORDER BY sync_seq DESC LIMIT 1";
 
 /// The coinbase tag and extranonce2 width a prepared record's coinbase
 /// suffix was issued with: the tag, then extranonce1 (four bytes) and
@@ -184,7 +188,25 @@ impl Ledger {
     /// coinbase can name a finder at either node's offset, so while they
     /// differ work is carry-free, no fanout is sponsored as its finder or
     /// taken over, and no block is adopted.
+    ///
+    /// With none of the peer's records held here (its jobs stream refused
+    /// or lagging), the suffix the carry owner guard last read live from the
+    /// peer's primary database decides ([`Ledger::set_peer_suffix_live`];
+    /// held records clear it). Only when that read found no work, or never
+    /// answered, is the layout unknown and taken to match, so a peer whose
+    /// records here expired and whose database is gone does not hold the
+    /// survivor carry-free; a mismatch the primary showed before it went
+    /// out of reach, with nothing held since, does until the frontend
+    /// restarts.
     pub async fn layout_mismatch(&self) -> Result<Option<String>> {
+        let held = self.peer_suffix_held().await?;
+        Ok(self.layout_mismatch_with(held.as_deref()))
+    }
+
+    /// The coinbase suffix of the peer's newest prepared record held here
+    /// (`None` in single-writer mode, without a recorded layout, or when
+    /// none is held).
+    pub async fn peer_suffix_held(&self) -> Result<Option<String>> {
         let Some(own) = self.own_node() else {
             return Ok(None);
         };
@@ -195,13 +217,37 @@ impl Ledger {
             .bind(1 - own)
             .fetch_optional(&mut *self.acquire().await?)
             .await?;
-        Ok(self.layout_mismatch_with(suffix.flatten().as_deref()))
+        Ok(suffix.flatten())
     }
 
-    /// [`Ledger::layout_mismatch`], given the peer's newest coinbase suffix.
-    pub(super) fn layout_mismatch_with(&self, peer_suffix_hex: Option<&str>) -> Option<String> {
+    /// Record the peer's newest coinbase suffix as its primary database
+    /// shows it (`None`: it shows no work), for [`Ledger::layout_mismatch`]
+    /// while this database holds none of the peer's records.
+    pub fn set_peer_suffix_live(&self, suffix: Option<String>) {
+        *self
+            .carry
+            .peer_suffix_live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = suffix;
+    }
+
+    /// [`Ledger::layout_mismatch`], given the peer's newest coinbase suffix
+    /// held here; without one, the live suffix decides.
+    pub fn layout_mismatch_with(&self, peer_suffix_hex: Option<&str>) -> Option<String> {
         let own = self.carry.coinbase_layout.get()?;
-        let suffix = peer_suffix_hex?;
+        let live;
+        let suffix = match peer_suffix_hex {
+            Some(suffix) => suffix,
+            None => {
+                live = self
+                    .carry
+                    .peer_suffix_live
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()?;
+                live.as_str()
+            }
+        };
         match layout_from_suffix(suffix) {
             Some(peer) => layout_difference(own, &peer),
             None => Some(format!(
@@ -496,6 +542,17 @@ mod tests {
             .layout_mismatch_with(Some(&suffix(b"/OTHER/", 8)))
             .is_some());
         assert!(ledger.layout_mismatch_with(Some("00")).is_some());
+        // None held here: the suffix the peer's primary showed decides; none
+        // (no work, or never read) is unknown, taken to match.
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+        ledger.set_peer_suffix_live(Some(suffix(TAG, 4)));
+        assert!(ledger.layout_mismatch_with(None).is_some());
+        // A held record still decides over it.
+        assert_eq!(ledger.layout_mismatch_with(Some(&suffix(TAG, 8))), None);
+        ledger.set_peer_suffix_live(Some(suffix(TAG, 8)));
+        assert_eq!(ledger.layout_mismatch_with(None), None);
+        ledger.set_peer_suffix_live(None);
+        assert_eq!(ledger.layout_mismatch_with(None), None);
     }
 
     #[tokio::test]

@@ -737,6 +737,9 @@ async fn observe(
     report: &mut Report,
 ) -> Result<PeerRead> {
     let peer_read = peer.read(settings.node_index).await;
+    // As the guard does: the peer's primary shows its layout when this
+    // database holds none of its records.
+    super::refresh_peer_layout(ledger, peer, settings.node_index).await?;
     observe_with(ledger, settings, peer_read, report).await
 }
 

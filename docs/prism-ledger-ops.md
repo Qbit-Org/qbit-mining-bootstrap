@@ -1819,7 +1819,14 @@ takeover. A dual writer refuses to start with a
 `PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). The
 width and the tag must be the same on both nodes. The pair's fingerprint
 compares neither, so each node reads the other's from the newest prepared
-record it has synced. While they differ, a coinbase could name a finder at
+record it has synced, or, holding none (the jobs stream refused or lagging),
+from the peer's primary database (`PRISM_PEER_DATABASE_URL`, never the
+fallback) at each carry owner guard check, keeping the last it showed while
+that database is out of reach. Only when neither shows the peer's work is its
+layout unknown and taken to match, so a peer whose records here expired and
+whose database is gone does not hold the survivor carry-free. (A mismatch the
+primary showed before it went out of reach, with none of the peer's records
+synced since, holds until this frontend restarts.) While they differ, a coinbase could name a finder at
 either node's offset, so both nodes refuse: work is carry-free
 (`layout_mismatch`, an alert), no zero-fee fanout is sponsored as its finder or
 taken over (a CPFP package already held is finished), and no block is adopted.
