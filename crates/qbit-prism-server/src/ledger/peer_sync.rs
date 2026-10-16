@@ -53,12 +53,17 @@ pub const HIGHEST_SHARE: &str =
 /// btree on both databases.
 pub const ORIGIN_INDEX: &str = "qbit_share_ledger_origin_seq_idx";
 
-/// Whether [`ORIGIN_INDEX`] is a valid btree: false while 031 has not built
-/// it, or its online build has not attached every partition's leaf.
+/// Whether [`ORIGIN_INDEX`] is a valid btree on the share ledger's
+/// `(origin_node, share_seq)`, with no predicate or expression: false while
+/// 031 has not built it, while its online build has not attached every
+/// partition's leaf, or when an index of that name is something else.
 const ORIGIN_INDEX_VALID: &str =
     "SELECT EXISTS(SELECT 1 FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid \
      JOIN pg_am am ON am.oid=i.relam \
-     WHERE x.indexrelid=to_regclass('qbit_share_ledger_origin_seq_idx') AND x.indisvalid AND am.amname='btree')";
+     WHERE x.indexrelid=to_regclass('qbit_share_ledger_origin_seq_idx') AND x.indisvalid AND am.amname='btree' \
+     AND x.indrelid=to_regclass('qbit_share_ledger') AND x.indpred IS NULL AND x.indexprs IS NULL \
+     AND (SELECT array_agg(a.attname::text ORDER BY k.ord) FROM unnest(x.indkey::int2[]) WITH ORDINALITY AS k(attnum,ord) \
+          JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum)=ARRAY['origin_node','share_seq'])";
 
 pub const SHARES: &str = "shares";
 pub const BLOCKS: &str = "blocks";

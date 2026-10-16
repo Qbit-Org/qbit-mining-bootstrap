@@ -943,9 +943,13 @@ async fn the_sync_refuses_wrong_identities_and_fingerprints() -> Result<()> {
         ensure!(metrics
             .render()
             .contains("qbit_prism_peer_sync_refused{reason=\"schema\"} 1"));
-        sqlx::raw_sql("DROP INDEX qbit_share_ledger_origin_seq_idx")
-            .execute(&pair.b.pool)
-            .await?;
+        // An index of that name on other columns is not the origin index.
+        sqlx::raw_sql(
+            "DROP INDEX qbit_share_ledger_origin_seq_idx; \
+             CREATE INDEX qbit_share_ledger_origin_seq_idx ON qbit_share_ledger (share_seq)",
+        )
+        .execute(&pair.b.pool)
+        .await?;
         let (mut no_index, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
         let report = no_index.pass().await?;
         ensure!(
