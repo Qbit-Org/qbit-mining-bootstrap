@@ -1251,19 +1251,48 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         !sponsors_fanout(c, &txid).await?,
         "the broadcaster would sponsor a fanout found on the peer's work"
     );
-    // Node A's work, as the sync copied it: published a moment ago.
+    // Its block matured over half an hour ago, and this node holds no work
+    // of A's at all: nothing here dates A's silence. A's database out of
+    // reach for a minute does not hand the fanout over; only an outage as
+    // long as the takeover delay does.
+    sqlx::query("UPDATE qbit_pool_blocks SET matured_at=matured_at-interval '31 minutes' WHERE block_hash=$1")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    ensure!(
+        c.ledger.fanout_sponsor(&txid).await? == Some(FanoutSponsor::Unwitnessed),
+        "a matured fanout with none of its finder's work held here is not unwitnessed"
+    );
+    let unreachable = || {
+        PeerJournal::new(
+            &["postgresql://prism@127.0.0.1:1/unreachable".to_owned()],
+            Duration::from_millis(500),
+        )
+    };
+    c.finder_liveness.use_journal(unreachable()?).await;
+    c.finder_liveness
+        .assume_unreachable_since(std::time::Instant::now() - Duration::from_secs(61))
+        .await;
+    ensure!(
+        !sponsors_fanout(c, &txid).await?,
+        "a minute's outage handed over a fanout whose finder's work this node never held"
+    );
+    c.finder_liveness.use_journal(unreachable()?).await;
+    c.finder_liveness
+        .assume_unreachable_since(std::time::Instant::now() - Duration::from_secs(31 * 60))
+        .await;
+    ensure!(
+        sponsors_fanout(c, &txid).await?,
+        "an outage as long as the takeover delay did not hand the fanout over"
+    );
+    // Node A's work, as the sync copied it: published a moment ago, so the
+    // fanout is not overdue, and the ledger refuses.
     sqlx::query(
         "INSERT INTO qbit_prism_jobs SELECT (jsonb_populate_record(NULL::qbit_prism_jobs,to_jsonb(j)||jsonb_build_object('job_id','prepared:peer-work','origin_node',0,'created_at',clock_timestamp()))).* \
          FROM qbit_prism_jobs j WHERE j.job_id LIKE 'prepared:%' ORDER BY j.created_at LIMIT 1",
     )
     .execute(pool)
     .await?;
-    // Its block matured over half an hour ago, but A's newest work held
-    // here is a moment old: not overdue, and the ledger refuses.
-    sqlx::query("UPDATE qbit_pool_blocks SET matured_at=matured_at-interval '31 minutes' WHERE block_hash=$1")
-        .bind(&hash)
-        .execute(pool)
-        .await?;
     ensure!(
         c.ledger.fanout_sponsor(&txid).await?.is_none(),
         "a fanout whose finder published work a moment ago is overdue"
