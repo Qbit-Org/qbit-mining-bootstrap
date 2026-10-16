@@ -188,8 +188,9 @@ pub async fn run(config: Config) -> Result<()> {
     let mut tasks = JoinSet::new();
     // 3.1 dual writer: the peer sync, and the own-log latch (D-8) that the
     // tasks writing this node's own rows wait for: the Stratum listeners
-    // (share appends), the refresh (prepared work, reconciliation) and the
-    // submit loop (landings). A node restored from an old backup pulls its
+    // (share appends), the refresh (prepared work, reconciliation), the
+    // submit loop (landings) and, inside its own loop, adoption (adopted
+    // landings, below). A node restored from an old backup pulls its
     // own rows back from the peer first, so none of them reuses a key the
     // peer already holds. A single writer waits for nothing.
     let own_log = match &config.dual_writer {
@@ -274,6 +275,26 @@ pub async fn run(config: Config) -> Result<()> {
                 Ok(())
             }
         }));
+    }
+    // PRISM 3.1 dual writer: the carry owner guard, and adoption of pool
+    // blocks whose finder died before their rows arrived (S8).
+    if config.dual_writer.is_some() {
+        let settings = crate::carry_owner::CarryOwnerSettings::from_config(config)?;
+        tasks.spawn(crate::carry_owner::run(
+            coordinator.ledger.clone(),
+            settings,
+            own_log.clone(),
+            Some(registry.clone()),
+            shutdown_rx.clone(),
+        ));
+        tasks.spawn({
+            let coordinator = coordinator.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                coordinator.adoption_loop(rx).await;
+                Ok(())
+            }
+        });
     }
     match config.block_submission().ctv_broadcaster {
         config::CtvBroadcaster::On => {

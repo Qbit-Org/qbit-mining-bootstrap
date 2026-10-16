@@ -172,7 +172,13 @@ impl Ledger {
     pub async fn prune_expired_jobs(&self) -> Result<u64> {
         // A candidate ID may have been selected before renewal committed. The
         // outer predicate is rechecked after DELETE waits for its row lock.
-        Ok(sqlx::query(cleanup::EXPIRED_JOBS)
+        let query = match self.own_node() {
+            None => sqlx::query(cleanup::EXPIRED_JOBS),
+            Some(own) => sqlx::query(cleanup::EXPIRED_JOBS_DUAL_WRITER)
+                .bind(own)
+                .bind(1 - own),
+        };
+        Ok(query
             .execute(&mut *self.acquire().await?)
             .await?
             .rows_affected())

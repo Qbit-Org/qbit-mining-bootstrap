@@ -68,13 +68,13 @@ async fn refresh_revision(
     ))
 }
 
-fn refresh_balances_sql() -> String {
+fn refresh_balances_sql(prior_balance_sql: &str) -> String {
     // Keep the guard in its own first SELECT: merely referencing share history
     // acquires relation locks before PostgreSQL can evaluate a fatal-state guard.
     // The left join emits one marked empty row when there are no balances, so
     // cutoff remains available without inventing a balance or changing its decoder.
     format!(
-        "SELECT balances.*, cutoff.accepted_share_seq FROM (SELECT ({ACCEPTED_CUTOFF_SQL}) AS accepted_share_seq) cutoff LEFT JOIN (SELECT true AS has_balance, current_balances.* FROM ({PRIOR_BALANCE_SQL}) current_balances) balances ON true"
+        "SELECT balances.*, cutoff.accepted_share_seq FROM (SELECT ({ACCEPTED_CUTOFF_SQL}) AS accepted_share_seq) cutoff LEFT JOIN (SELECT true AS has_balance, current_balances.* FROM ({prior_balance_sql}) current_balances) balances ON true"
     )
 }
 
@@ -96,8 +96,9 @@ impl Ledger {
         let payout_revision = sqlx::query_scalar(PAYOUT_REVISION_SQL)
             .fetch_one(&mut *tx)
             .await?;
+        let prior_sql = self.job_prior_balance_sql_in(&mut tx).await?;
         let prior_balances_digest =
-            current_balances_digest(&mut tx, &ReadAdmission::default()).await?;
+            current_balances_digest(&mut tx, prior_sql, &ReadAdmission::default()).await?;
         tx.commit().await?;
         Ok(PayoutState {
             payout_revision,
@@ -121,8 +122,9 @@ impl Ledger {
             .await?;
         let (payout_revision, timeline, peer_mark) =
             refresh_revision(&mut tx, self.dual_writer_identity().is_some()).await?;
+        let prior_sql = self.job_prior_balance_sql_in(&mut tx).await?;
         let (accepted_share_seq, prior_balances_digest) =
-            refresh_balances(&mut tx, &completion).await?;
+            refresh_balances(&mut tx, prior_sql, &completion).await?;
         tx.commit().await?;
         Ok(RefreshProbe {
             payout_state: PayoutState {
@@ -138,9 +140,10 @@ impl Ledger {
 
 async fn current_balances_digest(
     tx: &mut Transaction<'_, Postgres>,
+    prior_balance_sql: &'static str,
     completion: &ReadAdmission,
 ) -> Result<[u8; 32], WindowError> {
-    let rows = prior_balance_rows(tx).await?;
+    let rows = prior_balance_rows(tx, prior_balance_sql).await?;
     Ok(completion
         .own(rows)
         .map(digest_balance_rows)
@@ -156,9 +159,10 @@ fn digest_balance_rows(rows: Vec<PgRow>) -> Result<[u8; 32], WindowError> {
 
 async fn refresh_balances(
     tx: &mut Transaction<'_, Postgres>,
+    prior_balance_sql: &str,
     completion: &ReadAdmission,
 ) -> Result<(u64, [u8; 32]), WindowError> {
-    let rows = sqlx::query(&refresh_balances_sql())
+    let rows = sqlx::query(&refresh_balances_sql(prior_balance_sql))
         .fetch_all(&mut **tx)
         .await?;
     #[cfg(test)]
