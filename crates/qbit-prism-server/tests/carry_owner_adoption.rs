@@ -1365,6 +1365,51 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         !sponsors_fanout(c, &txid).await?,
         "a finder whose database shows no work at all was taken over at once"
     );
+    // A's layout, read live over its primary only (for when this node holds
+    // none of A's records): none while it shows no work, its newest
+    // record's suffix once it does, and nothing from an unreachable primary,
+    // even with a fallback that answers.
+    let primary = live_view()?;
+    ensure!(
+        primary.primary_suffix(0).await == Some(None),
+        "a primary with no work of A's showed a layout"
+    );
+    let narrow = hex::encode([c.config.coinbase_tag.as_bytes(), &[0; 8][..]].concat());
+    sqlx::query(
+        "INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,origin_node) \
+         VALUES('prepared:layout-work','adoption-peer',repeat('ab',32),0,jsonb_build_object('coinbase_suffix_hex',$1::text),clock_timestamp()+interval '1 hour',0)",
+    )
+    .bind(&narrow)
+    .execute(&peer.pool)
+    .await?;
+    ensure!(
+        primary.primary_suffix(0).await == Some(Some(narrow.clone())),
+        "the primary did not show A's newest suffix"
+    );
+    let unreachable = "postgresql://prism@127.0.0.1:1/unreachable".to_owned();
+    ensure!(
+        PeerJournal::new(
+            &[unreachable, peer_url.to_owned()],
+            Duration::from_millis(500)
+        )?
+        .primary_suffix(0)
+        .await
+        .is_none(),
+        "a fallback answered for an unreachable primary"
+    );
+    sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id='prepared:layout-work'")
+        .execute(&peer.pool)
+        .await?;
+    // Records of A's held here decide, and clear a layout the primary
+    // showed earlier, so it cannot outlive them once they expire.
+    c.ledger.set_peer_suffix_live(Some(narrow));
+    ensure!(
+        qbit_prism_server::carry_owner::refresh_peer_layout(&c.ledger, &primary, 1)
+            .await?
+            .is_none()
+            && c.ledger.layout_mismatch_with(None).is_none(),
+        "a layout the primary showed outlived the records held here"
+    );
     c.finder_liveness
         .assume_no_work_since(std::time::Instant::now() - Duration::from_secs(31 * 60))
         .await;
