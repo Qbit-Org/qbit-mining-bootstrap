@@ -1006,13 +1006,7 @@ async fn adopted_as_landed(f: &Fixture, settlement: Settlement) -> Result<()> {
         canonical_balances(pool).await?.is_empty(),
         "forgetting the only block left balances behind"
     );
-    let held: Vec<String> = c
-        .ledger
-        .compact_prepared_on_parent(&parent_hash())
-        .await?
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
+    let held = c.ledger.compact_prepared_on_parent(&parent_hash()).await?;
     ensure!(
         held == [second.storage_key.clone(), first.storage_key.clone()],
         "the prepared records on the parent, newest first, are {held:?}"
