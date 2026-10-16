@@ -1714,6 +1714,8 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
         archive::drop_partition(&ledger, P0, root.path()).await?;
         let disk = read_archive(&ledger, P0).await?;
         let manifest_path = PathBuf::from(catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?);
+        // Every row node A's: the archive is 3.0's v1, byte for byte.
+        ensure!(manifest_schema(&manifest_path)? == archive::ARCHIVE_SCHEMA_V1);
 
         // Restored, not attached: the same rows, the same digest, the shape
         // qbit_prism_share_partition_create builds.
@@ -1840,6 +1842,97 @@ async fn restore_rebuilds_the_partition_and_attach_returns_it_to_the_parent() ->
         ensure!(
             next == p0_upper + 5,
             "the restore moved the share sequence to {next}"
+        );
+        Ok(ledger)
+    }
+    .await;
+    match result {
+        Ok(ledger) => db.close(vec![ledger]).await,
+        Err(error) => {
+            db.close(Vec::new()).await?;
+            Err(error)
+        }
+    }
+}
+
+fn manifest_schema(path: &std::path::Path) -> Result<String> {
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    manifest["schema"]
+        .as_str()
+        .map(str::to_owned)
+        .context("the manifest names no schema")
+}
+
+/// A partition holding a dual writer's peer rows (migration 027's
+/// `origin_node`) archives as v2, which carries each row's origin, and
+/// restores every row under the node that originated it, not the restoring
+/// database's own: standalone, and imported with its header mappings into a
+/// database personalised as the other node.
+#[tokio::test]
+async fn a_v2_archive_restores_each_rows_origin() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let ledger = db.ledger("restore-origin").await?;
+        let root = tempfile::tempdir()?;
+        insert_shares(&ledger.pool, 1, 200, 7, "server-a", 7200.0).await?;
+        sqlx::query(
+            "INSERT INTO qbit_share_ledger(share_seq,share_id,miner_id,payout_order_key,p2mr_program,\
+             share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,\
+             accepted,writer_id,writer_epoch,origin_node) \
+             SELECT i,'peer:'||i::text,'m','k',decode(repeat('ab',32),'hex'),7,1000,100,'job-b',\
+             statement_timestamp()-interval '2 hours',1700000000,statement_timestamp()-interval '2 hours',\
+             true,'node-b',0,1 FROM generate_series(201::bigint,250::bigint) AS g(i)",
+        )
+        .execute(&ledger.pool)
+        .await?;
+        move_horizon_past_p0(&ledger.pool).await?;
+        archive::archive(&ledger, P0, root.path(), false, "operator-a").await?;
+        archive::verify(&ledger, P0, root.path()).await?;
+        archive::seal(&ledger, P0).await?;
+        archive::detach(&ledger, P0, &retention(0)).await?;
+        archive::drop_partition(&ledger, P0, root.path()).await?;
+        let manifest_path = PathBuf::from(catalog(&ledger.pool, P0).await?.try_get::<String, _>("archive_uri")?);
+        ensure!(manifest_schema(&manifest_path)? == archive::ARCHIVE_SCHEMA_V2);
+        let restored = archive::restore(&ledger, &manifest_path, root.path(), false).await?;
+        ensure!(restored["row_count"] == 250, "{restored}");
+        let origins: Vec<(i16, i64)> = sqlx::query_as(&format!(
+            "SELECT origin_node,count(*) FROM {P0} GROUP BY origin_node ORDER BY origin_node"
+        ))
+        .fetch_all(&ledger.pool)
+        .await?;
+        ensure!(origins == [(0, 200), (1, 50)], "restored origins: {origins:?}");
+
+        // Imported, attached, into a database personalised as node B: every
+        // row and every rebuilt header mapping keeps its own origin, not the
+        // destination's default.
+        sqlx::raw_sql(&format!(
+            "DROP TABLE {P0}; DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'; \
+             DELETE FROM qbit_prism_share_hashes; DELETE FROM qbit_prism_rejected_share_ids; \
+             UPDATE qbit_hashrate_rollup_progress SET last_share_seq=0; \
+             ALTER TABLE qbit_share_ledger ALTER COLUMN origin_node SET DEFAULT 1; \
+             ALTER TABLE qbit_prism_share_hashes ALTER COLUMN origin_node SET DEFAULT 1"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        let imported = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+        ensure!(imported["attached"] == true, "{imported}");
+        let origins: Vec<(i16, i64)> = sqlx::query_as(
+            "SELECT origin_node,count(*) FROM qbit_share_ledger WHERE share_seq<=250 GROUP BY origin_node ORDER BY origin_node",
+        )
+        .fetch_all(&ledger.pool)
+        .await?;
+        ensure!(origins == [(0, 200), (1, 50)], "imported origins: {origins:?}");
+        let (mismatched, peer_mappings): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE h.origin_node<>l.origin_node),count(*) FILTER (WHERE h.origin_node=1) \
+             FROM qbit_prism_share_hashes h JOIN qbit_share_ledger l USING (share_id)",
+        )
+        .fetch_one(&ledger.pool)
+        .await?;
+        ensure!(
+            mismatched == 0 && peer_mappings == 50,
+            "{mismatched} mappings differ from their share's origin; {peer_mappings} are node B's"
         );
         Ok(ledger)
     }
