@@ -935,3 +935,68 @@ fn the_ctv_settlement_build_of_the_fixture_is_pinned() {
     .unwrap();
     assert_eq!(body.reward_manifest, plain.reward_manifest);
 }
+
+/// The 2.x storage envelopes (`audit-body-ref.v1`, `audit-bundle.v2`) predate
+/// dual-writer windows, and no 3.x writer produces them. Their completeness
+/// checks need a contiguous `share_seq` run, which a cut window need not be
+/// (this fixture has a gap), so a bundle with a cut is refused by name in
+/// either envelope, while the same bundle as a flat logical bundle parses.
+#[test]
+fn the_legacy_envelopes_refuse_a_window_cut_by_name() {
+    let fixture = fixture();
+    let body = build(
+        false,
+        &fixture.shares,
+        &fixture.found_block,
+        Some(fixture.window_cut),
+        &fixture.prior_balances,
+        Parallelism::serial(),
+    )
+    .unwrap();
+    let bytes = canonical_audit_bundle_bytes_from_parts(&body, &fixture.shares).unwrap();
+    let digest = sha256_hex(&bytes);
+    let flat: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let parsed = qbit_prism::parse_audit_bundle_value(flat.clone(), None).unwrap();
+    assert_eq!(parsed.reward_manifest.cut, Some(fixture.window_cut));
+
+    let mut without_shares = flat;
+    without_shares.as_object_mut().unwrap().remove("shares");
+    let first = fixture.shares.first().unwrap().share_seq;
+    let last = fixture.shares.last().unwrap().share_seq;
+    let parts = serde_json::json!([{
+        "kind": "inline",
+        "first_share_seq": first,
+        "last_share_seq": last,
+        "share_count": fixture.shares.len(),
+        "shares": fixture.shares,
+    }]);
+    let body_ref = serde_json::json!({
+        "schema": "qbit.prism.audit-body-ref.v1",
+        "audit_bundle_sha256": digest,
+        "share_count": fixture.shares.len(),
+        "bundle_without_shares": without_shares,
+        "share_parts": parts,
+    });
+    let v2 = serde_json::json!({
+        "schema": "qbit.prism.audit-bundle.v2",
+        "audit_bundle_sha256": digest,
+        "share_count": fixture.shares.len(),
+        "bundle_without_shares": without_shares,
+        "share_window_proof": {
+            "schema": "qbit.prism.window-completeness-proof.v1",
+            "first_share_seq": first,
+            "last_share_seq": last,
+            "share_count": fixture.shares.len(),
+            "share_parts": parts,
+        },
+    });
+    for (label, envelope) in [("audit-body-ref.v1", body_ref), ("audit-bundle.v2", v2)] {
+        let error = qbit_prism::parse_audit_bundle_value(envelope, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("{label} predates dual-writer window cuts")),
+            "{label}: {error}"
+        );
+    }
+}
