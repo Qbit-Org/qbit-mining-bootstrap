@@ -1433,6 +1433,23 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         sponsors_fanout(c, &txid).await?,
         "a finder whose own database shows no work for half an hour was not taken over"
     );
+    // The same stale work, but only over a fallback while the primary is
+    // out of reach: a fallback may lag, so it is an outage, not silence.
+    ensure!(
+        matches!(live_view()?.work_age(0).await, Some(Some(age)) if age >= qbit_prism_server::ledger::SPONSOR_TAKEOVER_AFTER),
+        "the fallback's database does not show A's stale work"
+    );
+    let behind_fallback = PeerJournal::new(
+        &[
+            "postgresql://prism@127.0.0.1:1/unreachable".to_owned(),
+            peer_url.to_owned(),
+        ],
+        Duration::from_millis(500),
+    )?;
+    ensure!(
+        behind_fallback.work_age(0).await.is_none(),
+        "a fallback's stale work, with the primary out of reach, read as the finder's silence"
+    );
     // A's database does not answer at all. A first failed check may be a
     // blip: not silent yet. Once the checks have failed for a minute, the
     // stale copy here decides.
