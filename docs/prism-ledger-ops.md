@@ -1671,8 +1671,10 @@ then.
   carry-paying work for current work, whatever its revision: it goes through
   the #478 capture bound, or is abandoned with capture off. The gate is checked
   again right before the send: if it moved after the reservation of a block on
-  carry-paying work (closed, unfenced, or closed and reopened), nothing is sent,
-  and the reservation returns to `pending`, due again at once.
+  carry-paying work (closed, unfenced, or closed and reopened), or this node's
+  journal no longer claims ownership (a `carry-owner release` the gate has not
+  seen yet), nothing is sent, and the reservation returns to `pending`, due
+  again at once.
 - **Canonical balances elsewhere.** Landing, confirmation and the #478 records
   always measure against the canonical balances. The debt gauge
   (`qbit_prism_carry_forward_debt_sats`) is never fed from carry-free work.

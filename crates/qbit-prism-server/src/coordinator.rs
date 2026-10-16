@@ -2910,14 +2910,21 @@ impl Coordinator {
         // once, and the next attempt's reservation takes the capture path
         // (the bound, or abandonment with capture off). A leased candidate
         // was reserved without a revision check, as before.
+        // The gate is this process's; a `carry-owner release` another
+        // process committed reaches it only at the guard's next check, so
+        // the journal is read here too.
         if reserved_current
             && !candidate.leased
-            && self
+            && (self
                 .ledger
                 .carry_paying_unsendable(&candidate.window.prior_balances_digest, carry_generation)
+                || self
+                    .ledger
+                    .carry_claim_withdrawn(&candidate.window.prior_balances_digest)
+                    .await?)
         {
             let reason = format!(
-                "{}: the carry gate moved after this carry-paying block was reserved as current work; the reservation taken by {} was returned to pending for another attempt",
+                "{}: the carry gate moved, or this node's journal stopped claiming ownership, after this carry-paying block was reserved as current work; the reservation taken by {} was returned to pending for another attempt",
                 crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
                 self.config.instance_id
             );
