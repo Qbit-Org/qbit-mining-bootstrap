@@ -414,6 +414,102 @@ pub fn apply_proportional_fanout_fee(
     }
 }
 
+/// The reason a fanout's fee cannot be charged without leaving a recipient
+/// below the payout floor.
+pub(crate) const FANOUT_FEE_BELOW_FLOOR: &str =
+    "fanout fee would push a recipient below the payout floor";
+
+/// Charge a fanout's fee to every one of its recipients without taking any of
+/// them below `min_output_sats`, refusing only when no split can do that.
+///
+/// The audit builder charges each CTV fanout's fee to that fanout's own
+/// recipients. Split proportionally, a recipient a few sats above the floor
+/// can be left below it by its share, and the builder then refused the whole
+/// bundle, so no template was built until the window moved. This split keeps
+/// every recipient in the fanout:
+///
+/// - When [`apply_proportional_fanout_fee`] leaves every net amount at or
+///   above the floor, its decision is returned unchanged.
+/// - Otherwise each recipient whose share exceeds its slack, `gross -
+///   min_output_sats`, pays exactly its slack, and the rest of the fee is split
+///   over the remaining recipients by the same integer allocation: largest
+///   remainder, canonical account-key ties. This repeats until no share
+///   exceeds its recipient's slack, so the whole fee is charged and every net
+///   amount is at least the floor. Nobody is carried forward.
+/// - It refuses with the error the builder has always returned when the
+///   fanout's total slack is smaller than the fee, or a recipient is already
+///   below the floor before any fee.
+pub fn apply_floor_capped_fanout_fee(
+    recipients: &[SettlementRecipient],
+    fee_sats: u64,
+    min_output_sats: u64,
+) -> Result<FanoutFeeDecision, PrismError> {
+    let proportional = apply_proportional_fanout_fee(recipients, fee_sats, min_output_sats)?;
+    if proportional.carry_forward_recipients.is_empty() {
+        return Ok(proportional);
+    }
+
+    let mut uncapped = recipients.to_vec();
+    normalize_recipient_p2mr_programs(&mut uncapped)?;
+    uncapped.sort_by(canonical_recipient_cmp);
+    let total_slack_sats = uncapped.iter().try_fold(0_u64, |sum, recipient| {
+        recipient
+            .amount_sats
+            .checked_sub(min_output_sats)
+            .and_then(|slack_sats| sum.checked_add(slack_sats))
+    });
+    if total_slack_sats.is_none_or(|slack_sats| slack_sats < fee_sats) {
+        return Err(settlement_error(FANOUT_FEE_BELOW_FLOOR));
+    }
+
+    let mut payable = Vec::new();
+    let mut capped_fee_sats = 0_u64;
+    loop {
+        // Each capped recipient pays less than the share it was allocated, so
+        // the capped total stays below the fee and some recipient stays
+        // uncapped; their slack covers the rest, as the total slack covers the fee.
+        let remaining_fee_sats = fee_sats
+            .checked_sub(capped_fee_sats)
+            .ok_or_else(|| settlement_error("capped fanout fee exceeded the fee"))?;
+        let allocated =
+            allocate_proportional_fee(&uncapped, remaining_fee_sats, sum_amounts(&uncapped)?)?;
+        let over_slack = allocated
+            .iter()
+            .filter(|recipient| recipient.net_amount_sats < min_output_sats)
+            .map(fee_recipient_key)
+            .collect::<BTreeSet<_>>();
+        if over_slack.is_empty() {
+            payable.extend(allocated);
+            payable.sort_by(fanout_fee_recipient_cmp);
+            return Ok(FanoutFeeDecision {
+                total_gross_sats: proportional.total_gross_sats,
+                requested_fee_sats: fee_sats,
+                applied_fee_sats: fee_sats,
+                payable_recipients: payable,
+                carry_forward_recipients: Vec::new(),
+            });
+        }
+        for recipient in &uncapped {
+            if !over_slack.contains(&account_key(recipient)) {
+                continue;
+            }
+            let slack_sats = recipient.amount_sats - min_output_sats;
+            capped_fee_sats = capped_fee_sats
+                .checked_add(slack_sats)
+                .ok_or_else(|| settlement_error("capped fanout fee overflowed"))?;
+            payable.push(FanoutFeeRecipient {
+                recipient_id: recipient.recipient_id.clone(),
+                order_key: recipient.order_key.clone(),
+                p2mr_program_hex: recipient.p2mr_program_hex.clone(),
+                gross_amount_sats: recipient.amount_sats,
+                fee_sats: slack_sats,
+                net_amount_sats: min_output_sats,
+            });
+        }
+        uncapped.retain(|recipient| !over_slack.contains(&account_key(recipient)));
+    }
+}
+
 /// Estimate the fixed fanout transaction fee from a runtime market fee rate and
 /// operator premium. The result is rounded up so settlement never
 /// under-reserves by fractional sats.
@@ -448,6 +544,8 @@ pub fn estimate_ctv_fanout_fee_sats(
 
 /// Convenience wrapper for the launch policy: estimate the premium fanout fee,
 /// then allocate it proportionally across the recipients that remain payable.
+/// The audit builder and verifier charge fees with
+/// [`apply_floor_capped_fanout_fee`] instead, which keeps every recipient.
 pub fn apply_estimated_proportional_fanout_fee(
     recipients: &[SettlementRecipient],
     min_output_sats: u64,
@@ -723,6 +821,15 @@ fn sum_amounts(recipients: &[SettlementRecipient]) -> Result<u64, PrismError> {
         sum.checked_add(recipient.amount_sats)
             .ok_or_else(|| settlement_error("settlement amount overflowed"))
     })
+}
+
+/// [`account_key`] of a recipient whose fee has been allocated.
+fn fee_recipient_key(recipient: &FanoutFeeRecipient) -> SettlementAccountKey {
+    SettlementAccountKey {
+        order_key: recipient.order_key.clone(),
+        recipient_id: recipient.recipient_id.clone(),
+        p2mr_program_hex: recipient.p2mr_program_hex.clone(),
+    }
 }
 
 fn account_key(recipient: &SettlementRecipient) -> SettlementAccountKey {
@@ -1457,6 +1564,322 @@ mod tests {
                 ("small-a", 10_000, 0, 10_000),
                 ("small-b", 10_000, 0, 10_000)
             ]
+        );
+    }
+
+    fn fee_rows(recipients: &[FanoutFeeRecipient]) -> Vec<(&str, u64, u64, u64)> {
+        recipients
+            .iter()
+            .map(|recipient| {
+                (
+                    recipient.recipient_id.as_str(),
+                    recipient.gross_amount_sats,
+                    recipient.fee_sats,
+                    recipient.net_amount_sats,
+                )
+            })
+            .collect()
+    }
+
+    /// A full 1,000-recipient fanout at the launch fee with half its
+    /// recipients a few sats above the floor at varied margins: every net
+    /// stays at the floor or above, nobody pays more than its slack, and the
+    /// fee is charged exactly.
+    #[test]
+    fn floor_capped_fanout_fee_holds_at_a_full_chunk_of_near_floor_recipients() {
+        let floor = 14_720_u64;
+        let launch_policy = FanoutFeeRatePolicy::new(1_000, DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS);
+        let fee_sats = estimate_ctv_fanout_fee_sats(1_000, &launch_policy).unwrap();
+        let recipients = (0..1_000_u64)
+            .map(|index| {
+                let amount = if index % 2 == 0 {
+                    floor + index % 9
+                } else {
+                    floor + 40_000 + index * 37
+                };
+                recipient(&format!("miner-{index}"), &format!("{index:04}"), amount)
+            })
+            .collect::<Vec<_>>();
+        let proportional = apply_proportional_fanout_fee(&recipients, fee_sats, floor).unwrap();
+        assert!(
+            !proportional.carry_forward_recipients.is_empty(),
+            "the proportional split must carry someone for this to test the cap"
+        );
+        let capped = apply_floor_capped_fanout_fee(&recipients, fee_sats, floor).unwrap();
+        assert!(capped.carry_forward_recipients.is_empty());
+        assert_eq!(capped.payable_recipients.len(), recipients.len());
+        assert_eq!(capped.applied_fee_sats, fee_sats);
+        assert_eq!(
+            capped
+                .payable_recipients
+                .iter()
+                .map(|recipient| recipient.fee_sats)
+                .sum::<u64>(),
+            fee_sats
+        );
+        for recipient in &capped.payable_recipients {
+            assert!(recipient.net_amount_sats >= floor, "{recipient:?}");
+            assert_eq!(
+                recipient.net_amount_sats + recipient.fee_sats,
+                recipient.gross_amount_sats
+            );
+            assert!(recipient.fee_sats <= recipient.gross_amount_sats - floor);
+        }
+    }
+
+    fn is_fee_floor_refusal(error: &PrismError) -> bool {
+        matches!(
+            error,
+            PrismError::SettlementModeSelection { reason }
+                if reason == "fanout fee would push a recipient below the payout floor"
+        )
+    }
+
+    #[test]
+    fn floor_capped_fanout_fee_returns_the_proportional_split_whenever_it_succeeds() {
+        let launch_policy = FanoutFeeRatePolicy::new(1_000, DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS);
+        let thousand = (0..1_000)
+            .map(|index| recipient(&format!("miner-{index}"), &format!("{index:04}"), 25_000))
+            .collect::<Vec<_>>();
+        let cases = [
+            (
+                vec![
+                    recipient("a", "01", 100),
+                    recipient("b", "02", 100),
+                    recipient("c", "03", 100),
+                ],
+                10,
+                1,
+            ),
+            // A net amount exactly at the floor is payable, so nothing is capped.
+            (
+                vec![
+                    recipient("large", "01", 100_000),
+                    recipient("small", "02", 10_000),
+                ],
+                1_100,
+                9_900,
+            ),
+            (
+                thousand,
+                estimate_ctv_fanout_fee_sats(1_000, &launch_policy).unwrap(),
+                14_720,
+            ),
+        ];
+
+        for (recipients, fee_sats, floor) in cases {
+            let proportional = apply_proportional_fanout_fee(&recipients, fee_sats, floor).unwrap();
+            assert!(proportional.carry_forward_recipients.is_empty());
+            assert_eq!(
+                apply_floor_capped_fanout_fee(&recipients, fee_sats, floor).unwrap(),
+                proportional
+            );
+        }
+    }
+
+    #[test]
+    fn floor_capped_fanout_fee_caps_near_floor_shares_at_their_slack_and_respreads_the_rest() {
+        let recipients = vec![
+            recipient("small-a", "01", 10_000),
+            recipient("small-b", "02", 10_000),
+            recipient("large", "03", 100_000),
+        ];
+        // The proportional split carries both small recipients, so the
+        // builder used to refuse this chunk.
+        let proportional = apply_proportional_fanout_fee(&recipients, 1_000, 9_950).unwrap();
+        assert_eq!(proportional.carry_forward_recipients.len(), 2);
+
+        let decision = apply_floor_capped_fanout_fee(&recipients, 1_000, 9_950).unwrap();
+
+        assert_eq!(decision.total_gross_sats, 120_000);
+        assert_eq!(decision.requested_fee_sats, 1_000);
+        assert_eq!(decision.applied_fee_sats, 1_000);
+        assert!(decision.carry_forward_recipients.is_empty());
+        assert_eq!(
+            fee_rows(&decision.payable_recipients),
+            vec![
+                ("small-a", 10_000, 50, 9_950),
+                ("small-b", 10_000, 50, 9_950),
+                ("large", 100_000, 900, 99_100)
+            ]
+        );
+    }
+
+    #[test]
+    fn floor_capped_fanout_fee_repeats_until_no_share_exceeds_its_slack() {
+        // a's first share, 60, is over its 10-sat slack. The 290 left, split
+        // over b and c, gives b 73, over its 65-sat slack, so c pays the rest.
+        let recipients = vec![
+            recipient("a", "01", 10_010),
+            recipient("b", "02", 10_065),
+            recipient("c", "03", 30_000),
+        ];
+
+        let decision = apply_floor_capped_fanout_fee(&recipients, 300, 10_000).unwrap();
+
+        assert_eq!(decision.applied_fee_sats, 300);
+        assert!(decision.carry_forward_recipients.is_empty());
+        assert_eq!(
+            fee_rows(&decision.payable_recipients),
+            vec![
+                ("a", 10_010, 10, 10_000),
+                ("b", 10_065, 65, 10_000),
+                ("c", 30_000, 225, 29_775)
+            ]
+        );
+    }
+
+    #[test]
+    fn floor_capped_fanout_fee_refuses_only_when_the_chunk_cannot_pay_its_fee() {
+        // A total slack exactly equal to the fee leaves everyone at the floor.
+        let exact = vec![recipient("a", "01", 10_040), recipient("b", "02", 10_060)];
+        let decision = apply_floor_capped_fanout_fee(&exact, 100, 10_000).unwrap();
+        assert_eq!(
+            fee_rows(&decision.payable_recipients),
+            vec![("a", 10_040, 40, 10_000), ("b", 10_060, 60, 10_000)]
+        );
+
+        for (recipients, fee_sats, floor) in [
+            // One sat less slack than the fee.
+            (
+                vec![recipient("a", "01", 10_040), recipient("b", "02", 10_059)],
+                100,
+                10_000,
+            ),
+            // A lone recipient whose fee is larger than its slack.
+            (vec![recipient("tiny", "01", 10_000)], 1_000, 9_500),
+            // A recipient already below the floor before any fee.
+            (
+                vec![
+                    recipient("below", "01", 9_999),
+                    recipient("large", "02", 100_000),
+                ],
+                10,
+                10_000,
+            ),
+        ] {
+            let error = apply_floor_capped_fanout_fee(&recipients, fee_sats, floor).unwrap_err();
+            assert!(is_fee_floor_refusal(&error), "{error}");
+        }
+    }
+
+    /// SplitMix64: a seeded, dependency-free stream for the property loop.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    #[test]
+    fn floor_capped_fanout_fee_matches_the_proportional_split_or_keeps_every_net_at_the_floor() {
+        const PAYOUT_FLOOR: u64 = 14_720;
+        let mut rng = SplitMix(0x5eed_fee5_f100_2026);
+        let (mut identical, mut capped, mut refused) = (0, 0, 0);
+        for case in 0..4_000 {
+            let count = 1 + rng.below(40) as usize;
+            let recipients = (0..count)
+                .map(|index| {
+                    let amount_sats = match rng.below(40) {
+                        0 => PAYOUT_FLOOR - 1 - rng.below(100),
+                        1..=17 => PAYOUT_FLOOR + rng.below(64),
+                        18..=31 => PAYOUT_FLOOR + rng.below(1_000_000),
+                        _ => PAYOUT_FLOOR + rng.below(100_000_000),
+                    };
+                    let order_key = format!("{:04x}{index:04x}", rng.below(0x1_0000));
+                    recipient(&format!("r{case}-{index}"), &order_key, amount_sats)
+                })
+                .collect::<Vec<_>>();
+            let slack_sats = recipients
+                .iter()
+                .map(|recipient| recipient.amount_sats.saturating_sub(PAYOUT_FLOOR))
+                .sum::<u64>();
+            let fee_sats = if rng.below(2) == 0 {
+                let policy = FanoutFeeRatePolicy::new(
+                    1 + rng.below(20_000),
+                    DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS,
+                );
+                estimate_ctv_fanout_fee_sats(count, &policy).unwrap()
+            } else {
+                rng.below(slack_sats + slack_sats / 8 + 2)
+            };
+
+            let proportional =
+                apply_proportional_fanout_fee(&recipients, fee_sats, PAYOUT_FLOOR).unwrap();
+            let result = apply_floor_capped_fanout_fee(&recipients, fee_sats, PAYOUT_FLOOR);
+            let mut reversed = recipients.clone();
+            reversed.reverse();
+            match (
+                &result,
+                &apply_floor_capped_fanout_fee(&reversed, fee_sats, PAYOUT_FLOOR),
+            ) {
+                (Ok(left), Ok(right)) => assert_eq!(left, right),
+                (Err(left), Err(right)) => assert_eq!(left.to_string(), right.to_string()),
+                _ => panic!("case {case}: input order changed the outcome"),
+            }
+
+            if proportional.carry_forward_recipients.is_empty() {
+                assert_eq!(result.unwrap(), proportional, "case {case}");
+                identical += 1;
+                continue;
+            }
+            let all_at_or_above_floor = recipients
+                .iter()
+                .all(|recipient| recipient.amount_sats >= PAYOUT_FLOOR);
+            if !all_at_or_above_floor || slack_sats < fee_sats {
+                assert!(is_fee_floor_refusal(&result.unwrap_err()), "case {case}");
+                refused += 1;
+                continue;
+            }
+
+            let decision = result.unwrap();
+            assert!(decision.carry_forward_recipients.is_empty(), "case {case}");
+            assert_eq!(decision.requested_fee_sats, fee_sats);
+            assert_eq!(decision.applied_fee_sats, fee_sats);
+            assert_eq!(decision.total_gross_sats, proportional.total_gross_sats);
+            assert_eq!(
+                decision
+                    .payable_recipients
+                    .iter()
+                    .map(|recipient| recipient.fee_sats)
+                    .sum::<u64>(),
+                fee_sats,
+                "case {case}"
+            );
+            for paid in &decision.payable_recipients {
+                assert_eq!(paid.fee_sats + paid.net_amount_sats, paid.gross_amount_sats);
+                assert!(paid.net_amount_sats >= PAYOUT_FLOOR, "case {case}");
+            }
+            assert!(decision
+                .payable_recipients
+                .windows(2)
+                .all(|pair| fanout_fee_recipient_cmp(&pair[0], &pair[1]) == Ordering::Less));
+            let mut expected = recipients
+                .iter()
+                .map(|recipient| (recipient.recipient_id.clone(), recipient.amount_sats))
+                .collect::<Vec<_>>();
+            let mut charged = decision
+                .payable_recipients
+                .iter()
+                .map(|recipient| (recipient.recipient_id.clone(), recipient.gross_amount_sats))
+                .collect::<Vec<_>>();
+            expected.sort();
+            charged.sort();
+            assert_eq!(charged, expected, "case {case}");
+            capped += 1;
+        }
+        assert!(
+            identical > 500 && capped > 500 && refused > 500,
+            "identical={identical} capped={capped} refused={refused}"
         );
     }
 

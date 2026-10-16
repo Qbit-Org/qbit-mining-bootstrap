@@ -189,7 +189,12 @@ impl StoredPrepared {
         let Some(inputs) = self.inputs.as_ref() else {
             return Ok(None);
         };
-        if inputs != &BundleInputs::capture(config, self.fee)?
+        let current = BundleInputs {
+            audit_builder_version: inputs.audit_builder_version,
+            ..BundleInputs::capture(config, self.fee)?
+        };
+        if !qbit_prism::audit_builder_version_supported(inputs.audit_builder_version)
+            || inputs != &current
             || self
                 .bundle
                 .as_ref()
@@ -2466,11 +2471,12 @@ impl Coordinator {
     /// the reference is never rebuilt here: a rebuild under another builder or
     /// other keys would produce bytes the coinbase does not commit to.
     fn stored_inputs_mismatch(&self, candidate: &Candidate) -> Result<Option<String>> {
-        if candidate.audit_builder_version != qbit_prism::AUDIT_BUILDER_VERSION {
+        if !qbit_prism::audit_builder_version_supported(candidate.audit_builder_version) {
             return Ok(Some(format!(
-                "candidate was built by audit builder version {} and this binary is version {}; not rebuilding, drain it with a matching frontend",
+                "candidate was built by audit builder version {} and this binary builds versions {} and {}; not rebuilding, drain it with a matching frontend",
                 candidate.audit_builder_version,
-                qbit_prism::AUDIT_BUILDER_VERSION
+                qbit_prism::AUDIT_BUILDER_VERSION,
+                qbit_prism::AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP
             )));
         }
         let local = local_signer_keys(&self.config)?;

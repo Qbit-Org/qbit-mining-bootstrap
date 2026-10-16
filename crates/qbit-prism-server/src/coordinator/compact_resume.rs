@@ -95,9 +95,9 @@ impl ResumeFlights {
                             else {
                                 return Ok(None);
                             };
-                            if stored.record.audit_builder_version
-                                != qbit_prism::AUDIT_BUILDER_VERSION
-                                || stored.record.signer_keys != local_signer_keys(&config)?
+                            if !qbit_prism::audit_builder_version_supported(
+                                stored.record.audit_builder_version,
+                            ) || stored.record.signer_keys != local_signer_keys(&config)?
                             {
                                 return Ok(None);
                             }

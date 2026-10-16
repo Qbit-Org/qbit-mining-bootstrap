@@ -28,6 +28,11 @@ pub struct PreparedBundle {
     pub found_block: FoundBlock,
     pub ctv_fanout_manifest_set: Option<PreparedCtv>,
     pub coinbase_script_sig_suffix_hex: Option<String>,
+    /// The builder version of the body this job's coinbase commits to
+    /// ([`qbit_prism::AuditBundleBody::audit_builder_version`]): a bootstrap
+    /// job's body is built per worker, after its prepared record was stamped,
+    /// so its candidate takes the version from here (#764).
+    pub audit_builder_version: u16,
 }
 
 /// Presence of the original CTV fanout set, without retaining its outputs.
@@ -44,6 +49,10 @@ impl From<&qbit_prism::AuditBundleBody> for PreparedBundle {
                 .as_ref()
                 .map(|_| PreparedCtv {}),
             coinbase_script_sig_suffix_hex: body.coinbase_script_sig_suffix_hex.clone(),
+            // A body that cannot be classified is fenced like a capped one.
+            audit_builder_version: body
+                .audit_builder_version()
+                .unwrap_or(qbit_prism::AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP),
         }
     }
 }
@@ -58,6 +67,9 @@ impl From<&AuditBundle> for PreparedBundle {
                 .as_ref()
                 .map(|_| PreparedCtv {}),
             coinbase_script_sig_suffix_hex: bundle.coinbase_script_sig_suffix_hex.clone(),
+            audit_builder_version: bundle
+                .audit_builder_version()
+                .unwrap_or(qbit_prism::AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP),
         }
     }
 }
