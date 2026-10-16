@@ -205,7 +205,11 @@ impl Ledger {
         // Fence authority writers (each takes the row FOR UPDATE first; see
         // `lock_cluster_authority`) and blob GC before ALL authority checks,
         // without blocking the share append's non-key clock UPDATE. No
-        // advisory lock may be acquired after this shared row fence.
+        // advisory lock may be acquired after this shared row fence. The one
+        // exception is migration 027's sync barrier, which the `sync_seq`
+        // default takes shared: its only exclusive holder is the peer's
+        // single statement `qbit_prism_sync_barrier()`, which tries and never
+        // waits, so a wait on it ends with that statement and joins no cycle.
         let fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE",
         )

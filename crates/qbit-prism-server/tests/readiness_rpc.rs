@@ -431,6 +431,7 @@ fn coordinator_config(database_url: String, node: &Node) -> Result<Config> {
         version_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
         audit_bind: "127.0.0.1".into(),
         audit_port: 0,
+        dual_writer: None,
     })
 }
 
