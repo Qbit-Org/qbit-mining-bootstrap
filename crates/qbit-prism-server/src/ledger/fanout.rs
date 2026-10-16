@@ -137,6 +137,7 @@ macro_rules! newest_work_sql {
 /// was published, at least `$2` seconds ago. The fanout is `$3`.
 const FANOUT_SPONSOR_SQL: &str = concat!(
     "SELECT artifact.origin_node,fanout_set.parent_coinbase_tx_hex,",
+    "EXISTS(SELECT 1 FROM qbit_block_candidate_outbox offer WHERE offer.block_hash=artifact.block_hash) AS offered_here,",
     "EXISTS(SELECT 1 FROM qbit_prism_cpfp_packages package WHERE package.fanout_txid=artifact.fanout_txid) AS held,",
     "COALESCE(block.matured_at<=clock_timestamp()-make_interval(secs=>$2),false) ",
     "AND NOT EXISTS(SELECT 1 FROM (",
@@ -167,7 +168,7 @@ impl Ledger {
         let Some(own) = self.own_node() else {
             return Ok(Some(FanoutSponsor::Finder));
         };
-        let (origin, coinbase, held, overdue): (i16, String, bool, bool) =
+        let (origin, coinbase, offered_here, held, overdue): (i16, String, bool, bool, bool) =
             sqlx::query_as(FANOUT_SPONSOR_SQL)
                 .bind(1 - own)
                 .bind(SPONSOR_TAKEOVER_AFTER.as_secs_f64())
@@ -175,15 +176,17 @@ impl Ledger {
                 .fetch_one(&mut *self.acquire().await?)
                 .await?;
         let coinbase = hex::decode(coinbase).ok();
-        Ok(if self.found_here(coinbase.as_deref(), origin == own) {
-            Some(FanoutSponsor::Finder)
-        } else if held {
-            Some(FanoutSponsor::Held)
-        } else if overdue {
-            Some(FanoutSponsor::Overdue)
-        } else {
-            None
-        })
+        Ok(
+            if self.found_here(coinbase.as_deref(), origin == own, offered_here) {
+                Some(FanoutSponsor::Finder)
+            } else if held {
+                Some(FanoutSponsor::Held)
+            } else if overdue {
+                Some(FanoutSponsor::Overdue)
+            } else {
+                None
+            },
+        )
     }
 
     /// How long ago node `origin` published its newest work this database

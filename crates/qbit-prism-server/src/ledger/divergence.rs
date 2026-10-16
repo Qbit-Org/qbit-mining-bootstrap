@@ -402,7 +402,8 @@ async fn record_offer_decision(
 
 /// Program, miner, as-issued prior (text), gross, on-chain, block height,
 /// whether the block already has a divergence record, the block's origin
-/// node, and its landed coinbase (dual mode only).
+/// node, whether this node offered it (an outbox row), and its landed
+/// coinbase (dual mode only).
 type CarryRecordRow = (
     String,
     String,
@@ -412,6 +413,7 @@ type CarryRecordRow = (
     i64,
     bool,
     i16,
+    bool,
     Option<String>,
 );
 
@@ -450,7 +452,7 @@ pub(super) async fn record_confirmation(
     // A single writer runs 3.0's statement; dual mode reads the origin too.
     let rows: Vec<CarryRecordRow> = if dual.is_some() {
         sqlx::query_as(
-            "SELECT encode(ledger.p2mr_program,'hex'),ledger.miner_id,ledger.prior_balance_sats::text,ledger.gross_amount_sats,ledger.onchain_amount_sats,block.block_height,EXISTS(SELECT 1 FROM qbit_prism_payout_divergences divergence WHERE divergence.block_hash=$1),block.origin_node,(SELECT audit.coinbase_tx_hex FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=$1) FROM qbit_payout_carry_forward ledger JOIN qbit_pool_blocks block ON block.block_hash=ledger.block_hash WHERE ledger.block_hash=$1 AND ledger.maturity_state<>'reversed' AND block.chain_state IN ('prepared','inactive')",
+            "SELECT encode(ledger.p2mr_program,'hex'),ledger.miner_id,ledger.prior_balance_sats::text,ledger.gross_amount_sats,ledger.onchain_amount_sats,block.block_height,EXISTS(SELECT 1 FROM qbit_prism_payout_divergences divergence WHERE divergence.block_hash=$1),block.origin_node,EXISTS(SELECT 1 FROM qbit_block_candidate_outbox offer WHERE offer.block_hash=$1),(SELECT audit.coinbase_tx_hex FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=$1) FROM qbit_payout_carry_forward ledger JOIN qbit_pool_blocks block ON block.block_hash=ledger.block_hash WHERE ledger.block_hash=$1 AND ledger.maturity_state<>'reversed' AND block.chain_state IN ('prepared','inactive')",
         )
         .bind(block_hash)
         .fetch_all(&mut **tx)
@@ -464,11 +466,11 @@ pub(super) async fn record_confirmation(
         .await?
         .into_iter()
         .map(|(program, miner, issued, gross, onchain, height, exists)| {
-            (program, miner, issued, gross, onchain, height, exists, 0, None)
+            (program, miner, issued, gross, onchain, height, exists, 0, false, None)
         })
         .collect()
     };
-    let Some((_, _, _, _, _, height, exists, origin, coinbase)) = rows.first() else {
+    let Some((_, _, _, _, _, height, exists, origin, offered, coinbase)) = rows.first() else {
         return Ok(None);
     };
     let (height, exists) = (*height, *exists);
@@ -477,7 +479,10 @@ pub(super) async fn record_confirmation(
             .as_deref()
             .and_then(|coinbase| hex::decode(coinbase).ok());
         let origin_is_own = dual.ledger.own_node() == Some(*origin);
-        if !dual.ledger.found_here(coinbase.as_deref(), origin_is_own) {
+        if !dual
+            .ledger
+            .found_here(coinbase.as_deref(), origin_is_own, *offered)
+        {
             return Ok(None);
         }
     }
@@ -486,15 +491,17 @@ pub(super) async fn record_confirmation(
     let (divergence, digest) = tokio::task::spawn_blocking(move || {
         let rows = rows
             .into_iter()
-            .map(|(program, miner_id, issued, gross, onchain, _, _, _, _)| {
-                Ok(CarryRow {
-                    p2mr_program_hex: program,
-                    miner_id,
-                    issued_prior_sats: issued.parse()?,
-                    gross_sats: i128::from(gross),
-                    onchain_sats: i128::from(onchain),
-                })
-            })
+            .map(
+                |(program, miner_id, issued, gross, onchain, _, _, _, _, _)| {
+                    Ok(CarryRow {
+                        p2mr_program_hex: program,
+                        miner_id,
+                        issued_prior_sats: issued.parse()?,
+                        gross_sats: i128::from(gross),
+                        onchain_sats: i128::from(onchain),
+                    })
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
         let carry_free = dual_writer && carry_free_rows(&rows);
         let mut divergence = rows_divergence(rows, &current);
