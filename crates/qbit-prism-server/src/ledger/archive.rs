@@ -51,18 +51,27 @@ async fn lifecycle_guard(ledger: &Ledger) -> Result<PgConnection> {
     Ok(connection)
 }
 
-/// The only archive format this binary writes, and the only one it reads.
-/// EP-COMPAT: the format is persisted outside the database and outlives the
-/// binary that wrote it, so the version travels in the manifest and an
-/// unknown value is refused by name instead of being parsed optimistically.
+/// The archive formats this binary writes and reads. EP-COMPAT: the format is
+/// persisted outside the database and outlives the binary that wrote it, so
+/// the version travels in the manifest and an unknown value is refused by
+/// name instead of being parsed optimistically.
+///
+/// v1 is 3.0's. v2 is v1 plus each row's `origin_node` (3.1 dual writer,
+/// migration 027), written only where it is not 0, so a v1 line is a v2 line
+/// of a node A row. An archive is v2 exactly when one of its rows has another
+/// origin: every archive of a database that never ran a dual writer stays
+/// v1, byte for byte, and a 3.0 binary still reads it, while one that
+/// carries the peer's rows is refused by name by a binary that would restore
+/// them as its own.
 pub const ARCHIVE_SCHEMA_V1: &str = "qbit.prism.share-archive.v1";
+pub const ARCHIVE_SCHEMA_V2: &str = "qbit.prism.share-archive.v2";
 
 /// Rows per page of every ordered walk here. The same page the window reader
 /// and the durable-range proof use: about 2.5 MB of decoded rows, and one
 /// statement well inside the 15 s `statement_timeout` the operator pool sets.
 const PAGE_ROWS: i64 = 4096;
 
-/// Rows per multi-row `INSERT` during a restore. Seventeen columns per row, so
+/// Rows per multi-row `INSERT` during a restore. Eighteen columns per row, so
 /// this stays far below PostgreSQL's 65,535 bind parameters per statement.
 /// Binding each value keeps the restore free of any text quoting of its own:
 /// the bytes that come back out of the restored table have to re-stream to the
@@ -95,6 +104,14 @@ pub struct ArchiveRow {
     pub credit_policy: Option<String>,
     pub writer_id: String,
     pub writer_epoch: i64,
+    /// The node that originated the row (migration 027): absent, and 0, on
+    /// every row of a v1 archive.
+    #[serde(default, skip_serializing_if = "origin_is_node_a")]
+    pub origin_node: i16,
+}
+
+fn origin_is_node_a(origin: &i16) -> bool {
+    *origin == 0
 }
 
 /// The projection every stream of this module reads, in the archive's key
@@ -109,7 +126,7 @@ const SELECT_ARCHIVE_ROW: &str = "SELECT share_seq,share_id,miner_id,payout_orde
      template_height,job_id,\
      floor(extract(epoch FROM job_issued_at)*1000000)::bigint AS job_issued_at_us,\
      floor(extract(epoch FROM accepted_at)*1000000)::bigint AS accepted_at_us,\
-     ntime,accepted,reject_reason,credit_policy,writer_id,writer_epoch FROM ";
+     ntime,accepted,reject_reason,credit_policy,writer_id,writer_epoch,origin_node FROM ";
 
 /// Microseconds back to `timestamptz` without passing through `double
 /// precision`: an interval holds microseconds as a 64-bit integer, so the
@@ -136,6 +153,7 @@ impl ArchiveRow {
             credit_policy: row.try_get("credit_policy")?,
             writer_id: row.try_get("writer_id")?,
             writer_epoch: row.try_get("writer_epoch")?,
+            origin_node: row.try_get("origin_node")?,
         })
     }
 
@@ -153,10 +171,10 @@ impl ArchiveRow {
     pub fn parse_line(line: &[u8]) -> Result<Self> {
         let trimmed = line.strip_suffix(b"\n").unwrap_or(line);
         let row: Self = serde_json::from_slice(trimmed)
-            .context("share archive row is not a v1 ndjson row object")?;
+            .context("share archive row is not a v1 or v2 ndjson row object")?;
         ensure!(
             row.line()? == [trimmed, b"\n"].concat(),
-            "share archive row {} is not in the canonical v1 key order",
+            "share archive row {} is not in the canonical key order",
             row.share_seq
         );
         Ok(row)
@@ -291,6 +309,19 @@ struct RowsSummary {
     last_accepted_at_us: Option<i64>,
     rows_sha256: String,
     rows_bytes: i64,
+    /// Whether a row has an origin other than node A's, which makes the
+    /// archive v2.
+    other_origins: bool,
+}
+
+impl RowsSummary {
+    fn schema(&self) -> &'static str {
+        if self.other_origins {
+            ARCHIVE_SCHEMA_V2
+        } else {
+            ARCHIVE_SCHEMA_V1
+        }
+    }
 }
 
 /// One pass over a partition's rows in `share_seq` order. The same type serves
@@ -305,6 +336,7 @@ struct RowStream {
     last_share_seq: Option<i64>,
     first_accepted_at_us: Option<i64>,
     last_accepted_at_us: Option<i64>,
+    other_origins: bool,
     lower_seq: Option<i64>,
     upper_seq: i64,
     partition_name: String,
@@ -326,6 +358,7 @@ impl RowStream {
             last_share_seq: None,
             first_accepted_at_us: None,
             last_accepted_at_us: None,
+            other_origins: false,
             lower_seq,
             upper_seq,
             partition_name: partition_name.to_owned(),
@@ -368,6 +401,7 @@ impl RowStream {
         }
         self.last_share_seq = Some(row.share_seq);
         self.last_accepted_at_us = Some(row.accepted_at_us);
+        self.other_origins |= row.origin_node != 0;
         Ok(())
     }
 
@@ -382,6 +416,7 @@ impl RowStream {
             last_accepted_at_us: self.last_accepted_at_us,
             rows_sha256: hex::encode(self.hasher.finalize()),
             rows_bytes: i64::try_from(self.bytes)?,
+            other_origins: self.other_origins,
         };
         let file = match self.sink {
             None => None,
@@ -523,11 +558,11 @@ fn parse_manifest(bytes: &[u8], named: &str) -> Result<(ArchiveManifest, String)
         .and_then(Value::as_str)
         .unwrap_or("none");
     ensure!(
-        schema == ARCHIVE_SCHEMA_V1,
-        "{named} declares archive schema {schema}; this binary reads {ARCHIVE_SCHEMA_V1} only. Restore it with the release that wrote it"
+        schema == ARCHIVE_SCHEMA_V1 || schema == ARCHIVE_SCHEMA_V2,
+        "{named} declares archive schema {schema}; this binary reads {ARCHIVE_SCHEMA_V1} and {ARCHIVE_SCHEMA_V2} only. Restore it with the release that wrote it"
     );
     let manifest: ArchiveManifest = serde_json::from_slice(bytes)
-        .with_context(|| format!("{named} is not a v1 share archive manifest"))?;
+        .with_context(|| format!("{named} is not a v1 or v2 share archive manifest"))?;
     let (canonical, digest) = manifest.canonical()?;
     ensure!(
         canonical == bytes,
@@ -615,6 +650,12 @@ fn read_rows_file(
     }
     let (summary, _) = stream.finish()?;
     let named = path.display();
+    ensure!(
+        summary.schema() == manifest.schema,
+        "{named}: its rows make it {} but the manifest declares {}; a v1 archive holds no row of another origin than node A's, and a v2 one holds at least one",
+        summary.schema(),
+        manifest.schema
+    );
     ensure!(
         summary.rows_sha256 == manifest.rows_sha256,
         "{named}: rows_sha256 is {} but the manifest records {}; the archived rows were altered",
@@ -1648,7 +1689,7 @@ pub async fn archive(
         file.context("the archive writer closed without a file digest")?;
 
     let manifest = ArchiveManifest {
-        schema: ARCHIVE_SCHEMA_V1.to_owned(),
+        schema: summary.schema().to_owned(),
         partition_name: partition_name.to_owned(),
         lower_seq: record.lower_seq,
         upper_seq: record.upper_seq,
@@ -2833,10 +2874,10 @@ async fn insert_batch(
     }
     let mut tuples = Vec::with_capacity(batch.len());
     for index in 0..batch.len() {
-        let base = index * 17;
+        let base = index * 18;
         let at = |offset: usize| base + offset + 1;
         tuples.push(format!(
-            "(${},${},${},${},decode(${},'hex'),${}::text::numeric,${}::text::numeric,${},${},{},${},{},${},${},${},${},${})",
+            "(${},${},${},${},decode(${},'hex'),${}::text::numeric,${}::text::numeric,${},${},{},${},{},${},${},${},${},${},${})",
             at(0),
             at(1),
             at(2),
@@ -2854,10 +2895,11 @@ async fn insert_batch(
             at(14),
             at(15),
             at(16),
+            at(17),
         ));
     }
     let sql = format!(
-        "INSERT INTO {partition_name}(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,reject_reason,credit_policy,writer_id,writer_epoch) VALUES {}",
+        "INSERT INTO {partition_name}(share_seq,share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,reject_reason,credit_policy,writer_id,writer_epoch,origin_node) VALUES {}",
         tuples.join(",")
     );
     let mut query = sqlx::query(&sql);
@@ -2879,7 +2921,8 @@ async fn insert_batch(
             .bind(&row.reject_reason)
             .bind(&row.credit_policy)
             .bind(&row.writer_id)
-            .bind(row.writer_epoch);
+            .bind(row.writer_epoch)
+            .bind(row.origin_node);
     }
     Ok(i64::try_from(
         query.execute(&mut **tx).await?.rows_affected(),
@@ -2909,6 +2952,7 @@ mod tests {
             credit_policy: None,
             writer_id: "server-a".into(),
             writer_epoch: 0,
+            origin_node: 0,
         }
     }
 
@@ -2956,6 +3000,31 @@ mod tests {
         );
     }
 
+    /// v2: a row of another origin than node A's carries it last; node A's
+    /// rows stay v1 lines, and spelling their 0 out is not canonical.
+    #[test]
+    fn archive_row_carries_another_origin_last_and_node_a_as_a_v1_line() {
+        let peer = ArchiveRow {
+            origin_node: 1,
+            ..row()
+        };
+        let line = peer.line().unwrap();
+        let text = String::from_utf8(line.clone()).unwrap();
+        assert!(
+            text.ends_with(",\"writer_epoch\":0,\"origin_node\":1}\n"),
+            "{text}"
+        );
+        assert_eq!(ArchiveRow::parse_line(&line).unwrap(), peer);
+        let v1 = row().line().unwrap();
+        let spelled = String::from_utf8(v1)
+            .unwrap()
+            .replace("}\n", ",\"origin_node\":0}\n");
+        let error = ArchiveRow::parse_line(spelled.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical key order"), "{error}");
+    }
+
     #[test]
     fn archive_row_keeps_every_nullable_column_and_refuses_a_reordered_line() {
         let mut rejected = row();
@@ -2978,7 +3047,7 @@ mod tests {
         let error = ArchiveRow::parse_line(serde_json::to_string(&scrambled).unwrap().as_bytes())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("canonical v1 key order"), "{error}");
+        assert!(error.contains("canonical key order"), "{error}");
     }
 
     /// The manifest is the record the catalog and the next manifest name by
@@ -3010,12 +3079,15 @@ mod tests {
     fn manifest_reader_refuses_an_unknown_version_and_a_reformatted_record() {
         let (bytes, _) = manifest().canonical().unwrap();
         let mut future: Value = serde_json::from_slice(&bytes).unwrap();
-        future["schema"] = serde_json::json!("qbit.prism.share-archive.v2");
+        future["schema"] = serde_json::json!("qbit.prism.share-archive.v3");
         let error = parse_manifest(&serde_json::to_vec(&future).unwrap(), "manifest.json")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("share-archive.v2"), "{error}");
-        assert!(error.contains(ARCHIVE_SCHEMA_V1), "{error}");
+        assert!(error.contains("share-archive.v3"), "{error}");
+        assert!(
+            error.contains(ARCHIVE_SCHEMA_V1) && error.contains(ARCHIVE_SCHEMA_V2),
+            "{error}"
+        );
 
         let pretty = serde_json::to_vec_pretty(&manifest()).unwrap();
         let error = parse_manifest(&pretty, "manifest.json")
@@ -3029,7 +3101,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("not a v1 share archive manifest"), "{error}");
+        assert!(
+            error.contains("not a v1 or v2 share archive manifest"),
+            "{error}"
+        );
     }
 
     /// The chain proves the archived history is contiguous: a first partition
