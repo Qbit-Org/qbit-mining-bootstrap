@@ -65,6 +65,15 @@ image without root, so it needs `fuse2fs`, `mkfs.ext4`, `fusermount3` and
 under libfaketime, found next to the `faketime` wrapper (the `faketime` and
 `libfaketime` packages). Its private clusters use `PRISM_TEST_PG_BIN_DIR`.
 
+The 3.1 dual-writer scenarios (`qbit-prism-dual-sim::scenarios`) are all
+`#[ignore]`d and need `PRISM_TEST_PG_BIN_DIR` and `QBITD_BIN`, read through
+`required_inputs`. `ci.yml`'s `prism-dual-writer` job runs the fast lane in
+[test/prism-dual-writer-gated-tests.txt](../test/prism-dual-writer-gated-tests.txt),
+and `prism-load-nightly.yml`'s `dual-writer-nightly` job the full matrix in
+[test/prism-dual-writer-nightly-gated-tests.txt](../test/prism-dual-writer-nightly-gated-tests.txt),
+each with `--ignored --exact` and the same execution proof. Neither list is in
+`test/prism-gated-tests.txt`.
+
 The table is a pure function, `qbit_prism_test_gate::decide`, over injected
 values, with unit tests for every row in the crate itself.
 

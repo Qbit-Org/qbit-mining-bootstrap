@@ -1,0 +1,41 @@
+[package]
+name = "qbit-prism-dual-sim"
+version.workspace = true
+rust-version.workspace = true
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Two-node PRISM system simulation: fault injector, scenario matrix and payout-invariant checker for the 3.1 dual writer"
+
+[lib]
+name = "qbit_prism_dual_sim"
+path = "src/lib.rs"
+
+[dependencies]
+# The test signing seeds' public keys, which the checker pins.
+qbit-pool-builder = { path = "../qbit-pool-builder" }
+qbit-prism = { path = "../qbit-prism" }
+# The load generator: `external` mode's reconnecting Stratum sessions and
+# their share log, driven in process through the balancer stand-in.
+qbit-prism-load = { path = "../qbit-prism-load" }
+qbit-prism-server = { path = "../qbit-prism-server" }
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
+sha2 = "0.10"
+# A reset rather than a FIN on a cut link (`SO_LINGER` zero), which tokio
+# deprecates on its own streams.
+socket2 = "0.6"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+qbit-prism-test-gate = { path = "../qbit-prism-test-gate" }

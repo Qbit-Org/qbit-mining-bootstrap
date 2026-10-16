@@ -78,6 +78,9 @@ name: PRISM load harness (nightly)
 # the presets come from `ref` (3.x.x unless dispatched otherwise).
 #
 # #549 (S3 of #487):
+#   - A maintainer applying the `run-dual-writer-e2e` label to a PR runs the
+#     3.1 dual-writer scenario matrix (the `dual-writer-nightly` job) on the
+#     PR's merge result, and nothing else; see that job.
 #   - A maintainer applying the `run-load` label to a PR runs the nightly
 #     preset set against the PR's merge result, on `pull_request` (never
 #     `pull_request_target`), in a concurrency group of its own so it can
@@ -195,6 +198,14 @@ on:
           Also run the bridging lane, the short plan on the fake and the real
           node on one runner (#552; the nightly schedule and the run-load
           label always do).
+        type: boolean
+        required: false
+        default: false
+      dual_writer:
+        description: >-
+          Also run the 3.1 dual-writer scenario matrix listed in
+          test/prism-dual-writer-nightly-gated-tests.txt (the nightly
+          schedule always does).
         type: boolean
         required: false
         default: false
@@ -757,6 +768,106 @@ jobs:
             ${{ env.PRISM_TEST_LOG }}
           if-no-files-found: error
 
+  # The 3.1 dual-writer scenario matrix (crates/qbit-prism-dual-sim, the
+  # effort's contract §5): each id in
+  # test/prism-dual-writer-nightly-gated-tests.txt, a superset of ci.yml's
+  # fast lane, run explicitly with --ignored --exact, one at a time, in
+  # required integration mode, and proven executed with the gate manifest
+  # check. Every scenario runs a whole simulated pair (two PostgreSQL 16
+  # clusters, three regtest qbitds, two frontends, the balancer stand-in and
+  # Stratum load), injects its fault and checks the payout invariants; a
+  # failing scenario does not stop the others. The matrix summary goes to the
+  # job summary, and every report and log to the prism-dual-writer-nightly
+  # artifact. About 3 minutes a scenario on this runner, so all 24 take about
+  # 75; the limit leaves room for scenarios that fail slowly, waiting out
+  # their bounds.
+  #
+  # Before anything of the 3.1 stack merges, the matrix must have run on it,
+  # and a schedule or a dispatch runs only from the default branch. So
+  # applying the `run-dual-writer-e2e` label to a pull request also runs it,
+  # on the PR's merge result (refs/pull/N/merge), as #549's `run-load` label
+  # does for the presets: that label event starts nothing else here, and a
+  # later push needs the label applied again.
+  dual-writer-nightly:
+    name: Dual-writer scenario matrix
+    needs: guard
+    if: >-
+      ${{ !cancelled() && (github.event.label.name == 'run-dual-writer-e2e'
+      || (needs.guard.result == 'success' && needs.guard.outputs.skip != 'true'
+          && (github.event.schedule == '17 2 * * *' || inputs.dual_writer))) }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 150
+    # #551: the commit and the attempt a trend row names for this job.
+    outputs:
+      commit: ${{ steps.head.outputs.commit }}
+      # Job-level, so it is set even when a step before `head` failed.
+      attempt: ${{ github.run_attempt }}
+    env:
+      PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      PRISM_TEST_REQUIRE_INTEGRATION: "1"
+    steps:
+      # A labelled PR runs its merge result, what would land; everything
+      # else runs `ref`, 3.x.x by default.
+      - name: Check out the ref under test
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.ref || inputs.ref || '3.x.x' }}
+      - name: Record the commit under test
+        id: head
+        run: printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+      - name: Name the gate manifest and the test log
+        run: |
+          printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-dual-writer-nightly-gate-manifest.txt\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'PRISM_TEST_LOG=%s/prism-dual-writer-nightly-tests.log\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install PostgreSQL 16 server binaries
+        uses: ./.github/actions/apt-install
+        with:
+          packages: postgresql-16
+      - name: Restore the pinned qbit release from the cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Run the matrix
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' test/prism-dual-writer-nightly-gated-tests.txt \
+            | grep -v '^$' | sed 's/^qbit-prism-dual-sim::scenarios:://')
+          cargo test --locked -p qbit-prism-dual-sim --test scenarios -- \
+            --ignored --exact --test-threads=1 --nocapture "${tests[@]}" 2>&1 | tee "${PRISM_TEST_LOG}"
+      - name: Prove every listed scenario executed
+        run: |
+          python3 scripts/check_gate_manifest.py \
+            --manifest "${PRISM_TEST_GATE_MANIFEST}" \
+            --expected test/prism-dual-writer-nightly-gated-tests.txt \
+            --log "${PRISM_TEST_LOG}"
+      - name: Summarise the matrix
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/dual_writer_matrix_summary.py target/dual-sim-reports \
+            --manifest test/e2e-scenarios.toml --lane nightly \
+            --out target/dual-sim-reports/matrix.md
+          cat target/dual-sim-reports/matrix.md >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload the reports, logs and gate manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-dual-writer-nightly
+          overwrite: true
+          retention-days: 30
+          path: |
+            ${{ env.PRISM_TEST_GATE_MANIFEST }}
+            ${{ env.PRISM_TEST_LOG }}
+            target/dual-sim-reports
+          if-no-files-found: error
+
   # The weekly #[ignore] live_regtest scenarios (#487 L4): each id in
   # test/prism-weekly-gated-tests.txt, run as live-nightly runs its list, with
   # PostgreSQL's client tools for the scenarios' pg_dump and psql. Today that
@@ -912,7 +1023,7 @@ jobs:
   report:
     name: Record the tested commit and report a failure
     # `evidence` (#551) is here so its failure is reported like any job's.
-    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images, evidence]
+    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images, dual-writer-nightly, evidence]
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
@@ -1005,7 +1116,7 @@ jobs:
   # fetch, never forcing) and keeps the `prism-load-regression` issue.
   evidence:
     name: Record the trend rows and apply the regression rule
-    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images]
+    needs: [guard, plan, build, run, bridging, live-nightly, live-weekly, stratum-fuzz, shipped-images, dual-writer-nightly]
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     # Promotion downloads and uploads the soak's bundle; the append and the
