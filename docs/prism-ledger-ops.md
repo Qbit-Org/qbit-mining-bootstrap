@@ -1755,6 +1755,7 @@ current one); `qbit_prism_carry_owner_alert` is 1 when it needs an operator.
 | `peer_claims_ownership` | carry-free | yes | Both nodes claim ownership, so both build carry-free work. Run `carry-owner release` on both, then `carry-owner transfer` on the one that should own. |
 | `peer_journal_behind` | carry-free | yes | The peer's live journal claims ownership behind, or against, a newer row of the peer's this node holds: the peer's database was rolled back, or a lagging path answered. Do not release this node. Restart the peer's frontend, so its own-log check recovers its rows; this node pays again once the peer's journal is back. |
 | `peer_not_seeded` | carry-free | after start-up | The peer answers but has no journal row, so it may be running without the dual-writer rules. Start its frontend in dual-writer mode. |
+| `layout_mismatch` | carry-free | yes | The peer's newest prepared record held here was issued with another `PRISM_COINBASE_TAG` or `PRISM_STRATUM_EXTRANONCE2_SIZE` than this node's (`carry-owner status` prints both). No zero-fee fanout is sponsored as its finder or taken over, and no block is adopted, until they match. Set the same values on both nodes and restart their frontends; the state clears once the peer's new work is synced here. |
 
 **Every state except `paying` is safe.** Carry-free work never reduces a
 balance, so carry payments only wait. `carry-owner status` prints what the guard
@@ -1811,12 +1812,16 @@ node holds its outbox row (the outbox is local and never copied). That covers
 this node's own block found before the width or tag changed. A block this node
 adopted has no outbox row, so a cross-width adoption is sponsored here only by
 takeover. A dual writer refuses to start with a
-`PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). Keep
-the width and the tag the same on both nodes; the pair's fingerprint compares
-neither. Change either only while both nodes are up and
-landing their blocks, as for adoption below, and give one-shot commands the
-frontends' values. (Adoption reads a peer record's own width, so it lands
-either way.) The other node only
+`PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). The
+width and the tag must be the same on both nodes. The pair's fingerprint
+compares neither, so each node reads the other's from the newest prepared
+record it has synced. While they differ, a coinbase could name a finder at
+either node's offset, so both nodes refuse: work is carry-free
+(`layout_mismatch`, an alert), no zero-fee fanout is sponsored as its finder or
+taken over (a CPFP package already held is finished), and no block is adopted.
+Change either on both nodes together, while both are up and landing their
+blocks, and give one-shot commands the frontends' values. The node that did not
+find the block only
 watches the fanout until it is overdue for a takeover (below),
 so the two nodes do not fund conflicting children, which would leave a wallet
 coin locked.

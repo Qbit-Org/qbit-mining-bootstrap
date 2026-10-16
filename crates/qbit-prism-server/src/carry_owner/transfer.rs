@@ -691,6 +691,10 @@ pub struct Report {
     pub local: LatestRoles,
     pub peer: Option<LatestRoles>,
     pub decision: CarryDecision,
+    /// Why this node's coinbase layout is not the peer's, if it is not
+    /// (`Ledger::layout_mismatch`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout_mismatch: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -711,6 +715,7 @@ impl Report {
             local: LatestRoles::default(),
             peer: None,
             decision: CarryDecision::CarryFree(CarryFreeReason::PeerUnconfirmed),
+            layout_mismatch: None,
             checks: Vec::new(),
             scan: None,
             written: None,
@@ -751,6 +756,7 @@ async fn observe_with(
         }),
         PeerRead::Failed => None,
     };
+    report.layout_mismatch = ledger.layout_mismatch().await?;
     report.decision = Guard::default().decide(&GuardInputs {
         node_index: settings.node_index,
         database_node: report.database_node,
@@ -758,6 +764,7 @@ async fn observe_with(
         own: report.local.own.clone(),
         peer_synced: report.local.peer.clone(),
         peer_read: peer_read.clone(),
+        layout_mismatch: report.layout_mismatch.clone(),
     });
     Ok(peer_read)
 }

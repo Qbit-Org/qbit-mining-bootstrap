@@ -1306,6 +1306,40 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         c.ledger.fanout_sponsor(&txid).await? == Some(FanoutSponsor::Overdue),
         "a fanout whose block matured, and whose finder last published work, half an hour ago is not overdue"
     );
+    // Node A issues work with another extranonce2 width (its newest record
+    // here says so): a coinbase could name a finder at either offset, so
+    // nothing is sponsored or adopted until the layouts match again.
+    let suffix_of = |width: usize| {
+        hex::encode([c.config.coinbase_tag.as_bytes(), &vec![0; 4 + width][..]].concat())
+    };
+    let set_peer_suffix = |hex: String| {
+        sqlx::query("UPDATE qbit_prism_jobs SET payload=jsonb_set(payload,'{coinbase_suffix_hex}',to_jsonb($1::text)) WHERE job_id='prepared:peer-work'")
+            .bind(hex)
+            .execute(pool)
+    };
+    set_peer_suffix(suffix_of(c.config.extranonce2_size / 2)).await?;
+    let mismatch = c
+        .ledger
+        .layout_mismatch()
+        .await?
+        .context("a peer issuing work with another extranonce2 width is no mismatch")?;
+    ensure!(
+        c.ledger.fanout_sponsor(&txid).await?.is_none() && !sponsors_fanout(c, &txid).await?,
+        "a fanout was sponsored under two coinbase layouts: {mismatch}"
+    );
+    ensure!(
+        matches!(
+            c.adopt_block(&hash).await?,
+            Adoption::NoRecord { reason, .. } if reason.contains("coinbase layouts differ")
+        ),
+        "a block was adoptable under two coinbase layouts"
+    );
+    set_peer_suffix(suffix_of(c.config.extranonce2_size)).await?;
+    ensure!(
+        c.ledger.layout_mismatch().await?.is_none()
+            && c.ledger.fanout_sponsor(&txid).await? == Some(FanoutSponsor::Overdue),
+        "matching layouts did not restore the takeover fence"
+    );
     // A's own database answers, and shows work A published a moment ago,
     // though this node's copy is stale: A is alive, and keeps its fanout.
     sqlx::query(

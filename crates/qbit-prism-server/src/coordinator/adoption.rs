@@ -337,6 +337,13 @@ impl Coordinator {
             block_hash: block_hash.to_owned(),
             reason,
         };
+        // Under two coinbase layouts the block's finder cannot be told
+        // (`Ledger::layout_mismatch`): adopt nothing until they match.
+        if let Some(mismatch) = self.ledger.layout_mismatch().await? {
+            return Ok(no_record(format!(
+                "adoption is refused while the pair's coinbase layouts differ: {mismatch}"
+            )));
+        }
         let raw = self.rpc.call("getblock", json!([block_hash, 0])).await?;
         let block_bytes = hex::decode(raw.as_str().context("getblock returned no block")?)?;
         let mut header_hash =
