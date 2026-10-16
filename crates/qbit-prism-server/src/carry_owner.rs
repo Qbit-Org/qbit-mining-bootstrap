@@ -601,17 +601,19 @@ impl PeerJournal {
     /// `None` if no URL answered.
     pub async fn work_age(&self, origin: i16) -> Option<Option<Duration>> {
         let answers = self
-            .every_answer(|mut connection| async move {
+            .every_answer_at(|mut connection| async move {
                 sqlx::query_scalar::<_, f64>(crate::ledger::WORK_AGE_SQL)
                     .bind(origin)
                     .fetch_optional(&mut *connection)
                     .await
             })
             .await;
+        let primary_answered = answers.iter().any(|(at, _)| *at == 0);
         youngest_work_age(
-            answers
-                .into_iter()
-                .map(|seconds| seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.)))),
+            answers.into_iter().map(|(_, seconds)| {
+                seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.)))
+            }),
+            primary_answered,
         )
     }
 
@@ -670,8 +672,9 @@ impl PeerJournal {
         None
     }
 
-    /// Every answer to `read` through the peer's URLs, read at once.
-    async fn every_answer<T, Read, Answer>(&self, read: Read) -> Vec<T>
+    /// Every answer to `read` through the peer's URLs, read at once, each
+    /// with the index of its URL (0: `PRISM_PEER_DATABASE_URL`).
+    async fn every_answer_at<T, Read, Answer>(&self, read: Read) -> Vec<(usize, T)>
     where
         Read: Fn(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Answer,
         Answer: Future<Output = sqlx::Result<T>>,
@@ -679,7 +682,8 @@ impl PeerJournal {
         futures_util::future::join_all(self.pools.iter().map(|pool| self.answer(pool, &read)))
             .await
             .into_iter()
-            .flatten()
+            .enumerate()
+            .filter_map(|(at, answer)| answer.map(|answer| (at, answer)))
             .collect()
     }
 
@@ -995,13 +999,19 @@ fn log_decision(decision: CarryDecision, alert: bool, settings: &CarryOwnerSetti
 
 /// The peer's URLs' answers to [`PeerJournal::work_age`], combined. Work
 /// younger than the takeover delay on any path wins: the finder is alive,
-/// and a lagging or empty path cannot hide it. Otherwise a path that
-/// answers with no work at all makes the age unknown (`Some(None)`): it may
-/// be the current one, holding none since a restart, and another path's
-/// stale copy must not age the finder into silence. Only when every path
-/// shows stale work does the youngest of them decide. `None` when no path
-/// answered.
-fn youngest_work_age(answers: impl Iterator<Item = Option<Duration>>) -> Option<Option<Duration>> {
+/// and a lagging or empty path cannot hide it. Without `primary_answered`
+/// nothing else counts: a fallback may lag behind the primary, so its stale
+/// or empty answer is no evidence of silence, and the primary is out of
+/// reach (`None`, an outage the broadcaster times itself). Otherwise a path
+/// that answers with no work at all makes the age unknown (`Some(None)`):
+/// it may be the current one, holding none since a restart, and another
+/// path's stale copy must not age the finder into silence. Only when every
+/// path shows stale work does the youngest of them decide. `None` when no
+/// path answered.
+fn youngest_work_age(
+    answers: impl Iterator<Item = Option<Duration>>,
+    primary_answered: bool,
+) -> Option<Option<Duration>> {
     let mut answered = false;
     let mut empty = false;
     let mut youngest: Option<Duration> = None;
@@ -1015,39 +1025,58 @@ fn youngest_work_age(answers: impl Iterator<Item = Option<Duration>>) -> Option<
     if !answered {
         return None;
     }
-    Some(match youngest {
-        Some(age) if age < crate::ledger::SPONSOR_TAKEOVER_AFTER || !empty => Some(age),
-        _ => None,
-    })
+    match youngest {
+        Some(age) if age < crate::ledger::SPONSOR_TAKEOVER_AFTER => Some(Some(age)),
+        _ if !primary_answered => None,
+        Some(age) if !empty => Some(Some(age)),
+        _ => Some(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_fresh_work_counts_from_a_fallback_without_the_primary() {
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        // The primary out of reach: a fallback's fresh work still shows the
+        // finder alive, but its stale or empty answer is an outage.
+        assert_eq!(
+            youngest_work_age([minutes(2)].into_iter(), false),
+            Some(minutes(2))
+        );
+        assert_eq!(youngest_work_age([minutes(40)].into_iter(), false), None);
+        assert_eq!(youngest_work_age([None].into_iter(), false), None);
+        assert_eq!(
+            youngest_work_age([minutes(40)].into_iter(), true),
+            Some(minutes(40))
+        );
+    }
+
+    #[test]
     fn fresh_work_wins_and_a_path_with_no_work_makes_stale_work_unknown() {
         let minutes = |m: u64| Some(Duration::from_secs(m * 60));
-        assert_eq!(youngest_work_age(std::iter::empty()), None);
+        assert_eq!(youngest_work_age(std::iter::empty(), true), None);
         assert_eq!(
-            youngest_work_age([minutes(40), minutes(2)].into_iter()),
+            youngest_work_age([minutes(40), minutes(2)].into_iter(), true),
             Some(minutes(2))
         );
         assert_eq!(
-            youngest_work_age([None, minutes(40)].into_iter()),
+            youngest_work_age([None, minutes(40)].into_iter(), true),
             Some(None)
         );
         assert_eq!(
-            youngest_work_age([minutes(40), None].into_iter()),
+            youngest_work_age([minutes(40), None].into_iter(), true),
             Some(None)
         );
-        assert_eq!(youngest_work_age([None].into_iter()), Some(None));
+        assert_eq!(youngest_work_age([None].into_iter(), true), Some(None));
         // Fresh work on any path wins: an empty path does not hide a live
         // finder.
         assert_eq!(
-            youngest_work_age([None, minutes(2)].into_iter()),
+            youngest_work_age([None, minutes(2)].into_iter(), true),
             Some(minutes(2))
         );
         assert_eq!(
-            youngest_work_age([minutes(2), None, minutes(40)].into_iter()),
+            youngest_work_age([minutes(2), None, minutes(40)].into_iter(), true),
             Some(minutes(2))
         );
     }

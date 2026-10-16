@@ -667,6 +667,9 @@ pub async fn sponsors_fanout(coordinator: &Coordinator, fanout_txid: &str) -> Re
 ///   frontend just started, or its expired work pruned; another URL's stale
 ///   copy does not override it): unknown, and silent only once the
 ///   checks have found none for [`SPONSOR_TAKEOVER_AFTER`].
+/// - **Only a fallback answers**, with work no younger than the takeover
+///   delay or none: a fallback may lag behind the primary, so this counts
+///   as a failed check, as below (`PeerJournal::work_age`).
 /// - **It has failed [`OUTAGE_CHECKS`] checks in a row, over
 ///   `out_of_reach_after` at least:** silent. That is [`OUT_OF_REACH_AFTER`]
 ///   for an [`FanoutSponsor::Overdue`] fanout, whose fence has already found

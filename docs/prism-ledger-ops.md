@@ -1849,7 +1849,9 @@ fanout is overdue and its finder silent:
   started, or its expired work pruned), through any peer URL that answers, is
   not silent until the checks have found none for 30 minutes; another URL's
   older copy does not override that answer, while work under 30 minutes old on
-  any URL always shows the finder alive. Or that database has failed three checks in a row,
+  any URL always shows the finder alive. With `PRISM_PEER_DATABASE_URL` out of
+  reach, a fallback's stale or empty answer is no evidence either (a fallback
+  may lag): it counts as an outage, as below. Or that database has failed three checks in a row,
   over a minute at least; then the stale copy here decides. When this node holds
   no work of the finder's at all (none synced yet, or its copies expired),
   nothing here dates the silence, so the outage itself must last 30 minutes. A
