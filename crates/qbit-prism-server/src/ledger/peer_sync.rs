@@ -1002,10 +1002,11 @@ impl Ledger {
         let mut refused_through = None;
         if batch.row_count > 0 {
             // Header mappings this node holds for another share, a share this
-            // node credits at another share_seq (the ledger is unique on
-            // share_id per partition only), and rows below every attached
-            // partition: refused whole, one conflict per share whatever
-            // number of these it breaks.
+            // node credits, or holds or retains as rejected, at another
+            // share_seq (the ledger is unique on share_id per partition only,
+            // and a rejected share has no mapping), and rows below every
+            // attached partition: refused whole, one conflict per share
+            // whatever number of these it breaks.
             let refused: Vec<(String, String)> = sqlx::query_as(
                 "WITH incoming AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_share_ledger,$1)),\
                  mappings AS (SELECT * FROM jsonb_populate_recordset(NULL::qbit_prism_share_hashes,$2)) \
@@ -1017,6 +1018,9 @@ impl Ledger {
                  UNION ALL SELECT i.share_id,'share_id '||i.share_id||' is credited here at another share_seq than '||i.share_seq \
                  FROM incoming i WHERE EXISTS (SELECT 1 FROM qbit_prism_share_hashes h WHERE h.share_id=i.share_id) \
                  AND NOT EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_seq=i.share_seq AND l.share_id=i.share_id) \
+                 UNION ALL SELECT i.share_id,'share_id '||i.share_id||' is held here as a rejected share at another share_seq' \
+                 FROM incoming i WHERE EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_id=i.share_id AND l.share_seq<>i.share_seq AND NOT l.accepted) \
+                 OR EXISTS (SELECT 1 FROM qbit_prism_rejected_share_ids r WHERE r.share_id=i.share_id AND r.share_seq<>i.share_seq) \
                  UNION ALL SELECT i.share_id,'share_seq '||i.share_seq||' is below every attached partition' FROM incoming i \
                  WHERE i.share_seq<(SELECT COALESCE(min(lower_seq),-1) FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NOT NULL) \
                  AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_partitions WHERE state='attached' AND lower_seq IS NULL) \
@@ -1119,10 +1123,14 @@ impl Ledger {
                 .map(Vec::as_slice)
                 .unwrap_or_default()
                 .iter()
+                // A refused rejected share is in no window, so it never holds
+                // the found-block wait back.
                 .filter(|row| {
-                    row.get("share_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| refused.contains(id))
+                    row.get("accepted").and_then(Value::as_bool) != Some(false)
+                        && row
+                            .get("share_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| refused.contains(id))
                 })
                 .filter_map(|row| row.get("share_seq").and_then(Value::as_i64))
                 .chain(differing.iter().map(|(share_seq, _)| *share_seq))

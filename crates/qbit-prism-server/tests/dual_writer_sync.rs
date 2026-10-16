@@ -655,6 +655,12 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         let header = hex("contested");
         let doubled = share("doubled").share_id;
         let theirs = append(&pair.a, &["contested", "after", "doubled"]).await?;
+        // And one share both nodes rejected, each at its own share_seq.
+        let rejected_twice = format!("worker:{}", hex("rejected twice"));
+        for pool in [&pair.a.pool, &pair.b.pool] {
+            sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,reject_reason,writer_id,writer_epoch) VALUES($1,'miner','miner',decode(repeat('11',32),'hex'),1,100,100,'job',to_timestamp(0.001),1,clock_timestamp(),false,'stale-job','writer',0)")
+                .bind(&rejected_twice).execute(pool).await?;
+        }
         let mut tx = pair.b.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(ORDER_LOCK).execute(&mut *tx).await?;
         for (share_id, header) in [(format!("other:{header}"), header.clone()), (doubled.clone(), hex("other doubled header"))] {
@@ -713,12 +719,13 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
             ("qbit_prism_jobs".to_owned(), contested_job.clone()),
             ("qbit_share_ledger".to_owned(), share("contested").share_id),
             ("qbit_share_ledger".to_owned(), doubled.clone()),
+            ("qbit_share_ledger".to_owned(), rejected_twice.clone()),
         ];
         expected.sort();
         ensure!(conflicts == expected, "{conflicts:?}");
         let scrape = metrics.render();
         ensure!(scrape.contains("qbit_prism_peer_sync_conflicts_total{table=\"qbit_pool_blocks\"} 1"), "{scrape}");
-        ensure!(scrape.contains("qbit_prism_peer_sync_conflicts_total{table=\"qbit_share_ledger\"} 2"), "{scrape}");
+        ensure!(scrape.contains("qbit_prism_peer_sync_conflicts_total{table=\"qbit_share_ledger\"} 3"), "{scrape}");
         // The doubled share broke two rules: one sighting, both reasons.
         let (seen, detail): (i64, String) = sqlx::query_as(
             "SELECT seen_count,detail FROM qbit_prism_peer_sync_conflicts WHERE row_key=$1",
@@ -807,7 +814,7 @@ async fn conflicts_are_recorded_and_never_written_over() -> Result<()> {
         }
         // Seen again, each conflict is counted, not duplicated.
         on_b.pass().await?;
-        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 4);
+        ensure!(count(&pair.b.pool, "SELECT count(*) FROM qbit_prism_peer_sync_conflicts").await? == 5);
         Ok(())
     })
     .await
