@@ -168,7 +168,7 @@ async fn migration_009_preserves_preexisting_jobs_and_runs_once_for_two_frontend
         versions,
         vec![
             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27, 31
+            26, 27, 28, 31
         ]
     );
     let cycled: bool = sqlx::query_scalar(

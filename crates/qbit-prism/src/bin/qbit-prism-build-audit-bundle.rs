@@ -4,9 +4,10 @@ use qbit_prism::window::{
     DIFFICULTY_OVERFLOW_MESSAGE,
 };
 use qbit_prism::{
-    build_audit_bundle_with_coinbase_options, build_audit_bundle_with_ctv_settlement_options,
-    profile_audit_build, AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy,
-    FoundBlock, PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig,
+    build_audit_bundle_body_with_coinbase_options_parallel,
+    build_audit_bundle_body_with_ctv_settlement_options_parallel, profile_audit_build,
+    AcceptedShare, AuditBundle, CarryForwardBalance, FanoutFeeRatePolicy, FoundBlock, Parallelism,
+    PayoutPolicy, PayoutPolicyManifest, SettlementModeConfig, WindowCut,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,8 +17,9 @@ use std::{env, error::Error, fs, process};
 
 const PHASE_METRICS_PREFIX: &str = "qbit-prism-build-phase-metrics ";
 /// Version of the --serve JSONL protocol announced in the startup handshake.
-/// The coordinator refuses to speak to a daemon announcing a different
-/// version and falls back to one-shot builds instead. Version 2 adds the
+/// A client checks it exactly: the retired Python coordinator refused a
+/// daemon announcing another version and built one-shot instead (the native
+/// server builds in process and never starts the daemon). Version 2 adds the
 /// prepare_window request (payout-window fold, canonical digest, and
 /// incremental advance daemon-side) and unifies its window state with the
 /// build cache. Its non-success prepare_window envelopes carry structure,
@@ -26,8 +28,12 @@ const PHASE_METRICS_PREFIX: &str = "qbit-prism-build-phase-metrics ";
 /// vocabulary) beside the human-readable `error`, and `out_of_range` --
 /// distinct from a malformed request -- declares an integer outside the
 /// daemon's declared widths (`field`, `width`, `error`) so the coordinator
-/// folds that window in-process and keeps the daemon.
-const SERVE_PROTOCOL_VERSION: u64 = 2;
+/// folds that window in-process and keeps the daemon. Version 3 adds a build
+/// request's `window_cut` (PRISM 3.1's dual-writer cut, committed in the
+/// reward manifest). A version 2 daemon ignores the field and signs a
+/// manifest without the cut, which the build summary cannot reveal, so a
+/// client that sends a cut needs a daemon announcing 3.
+const SERVE_PROTOCOL_VERSION: u64 = 3;
 /// Parsed share windows retained by the --serve daemon. Windows rotate with
 /// payout/artifact generations, so two entries cover the current generation
 /// plus the previous one still finishing in-flight builds.
@@ -42,6 +48,10 @@ struct BuildAuditBundleInput {
     #[serde(default)]
     compact_shares: Vec<CompactAcceptedShare>,
     found_block: FoundBlock,
+    /// A dual-writer window's cut, recorded in the reward manifest. Absent
+    /// for a single-writer window, which then builds exactly as before.
+    #[serde(default)]
+    window_cut: Option<WindowCut>,
     #[serde(default)]
     prior_balances: Vec<CarryForwardBalance>,
     #[serde(default)]
@@ -92,6 +102,9 @@ struct ServeRequest {
     compact_shares: Vec<CompactAcceptedShare>,
     #[serde(default)]
     found_block: Option<FoundBlock>,
+    /// As [`BuildAuditBundleInput::window_cut`].
+    #[serde(default)]
+    window_cut: Option<WindowCut>,
     #[serde(default)]
     prior_balances: Vec<CarryForwardBalance>,
     #[serde(default)]
@@ -227,10 +240,14 @@ fn expand_compact_shares(
         .collect::<Result<Vec<_>, Box<dyn Error>>>()
 }
 
+/// One build, through the serial body builders the owning
+/// `build_audit_bundle_with_*_options` forms wrap, so a `window_cut` reaches
+/// the reward manifest; without one the bundle is the one those forms build.
 #[allow(clippy::too_many_arguments)]
 fn run_profiled_build(
     shares: Vec<AcceptedShare>,
     found_block: FoundBlock,
+    window_cut: Option<WindowCut>,
     prior_balances: Vec<CarryForwardBalance>,
     payout_policy: PayoutPolicy,
     ctv_settlement: Option<CtvSettlementInput>,
@@ -243,10 +260,11 @@ fn run_profiled_build(
     BTreeMap<&'static str, f64>,
 ) {
     profile_audit_build(|| {
-        if let Some(ctv_settlement) = ctv_settlement {
-            build_audit_bundle_with_ctv_settlement_options(
-                shares,
+        let body = if let Some(ctv_settlement) = ctv_settlement {
+            build_audit_bundle_body_with_ctv_settlement_options_parallel(
+                &shares,
                 found_block,
+                window_cut,
                 prior_balances,
                 payout_policy,
                 ctv_settlement.direct_floor_sats,
@@ -256,19 +274,23 @@ fn run_profiled_build(
                 witness_merkle_leaves_hex,
                 signing_key,
                 ledger_signing_key,
+                Parallelism::serial(),
             )
         } else {
-            build_audit_bundle_with_coinbase_options(
-                shares,
+            build_audit_bundle_body_with_coinbase_options_parallel(
+                &shares,
                 found_block,
+                window_cut,
                 prior_balances,
                 payout_policy,
                 coinbase_script_sig_suffix_hex,
                 witness_merkle_leaves_hex,
                 signing_key,
                 ledger_signing_key,
+                Parallelism::serial(),
             )
-        }
+        };
+        Ok(body?.into_bundle(shares))
     })
 }
 
@@ -342,6 +364,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let (bundle_result, phases_seconds) = run_profiled_build(
         input.shares,
         input.found_block,
+        input.window_cut,
         input.prior_balances,
         payout_policy,
         input.ctv_settlement,
@@ -565,6 +588,7 @@ fn serve_requests(
         let (bundle_result, phases_seconds) = run_profiled_build(
             shares,
             found_block,
+            request.window_cut,
             request.prior_balances,
             payout_policy,
             request.ctv_settlement,

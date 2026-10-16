@@ -319,12 +319,19 @@ impl CompactDependency<'_> {
 // Return only bounded identity/column metadata and server-side consistency
 // results: never transfer the prepared payload, template or balance bytes on
 // the hot path. The blob keys' existence is not proof of unseen byte integrity.
-pub(super) async fn dependency_row(
-    tx: &mut Transaction<'_, Postgres>,
-    key: &str,
-) -> Result<Option<PgRow>> {
-    Ok(sqlx::query(
-        r#"SELECT parent_hash,payout_revision,expires_at,
+//
+// The typed window columns duplicate the reference's anchor, balances digest
+// and range, never a dual-writer window's cut, so the payload's window is
+// compared without its `cut` key, in every mode: a single writer started
+// under D-12's downgrade issues jobs from the prepared rows a dual-writer
+// frontend wrote. The window must be an object, and a cut in it an object
+// too, so a malformed one is a mismatch, as 3.0 reported it, never a
+// statement error. On a 3.0 payload, which has no `cut`, the expression is
+// the whole window; it is the statement's one difference from 3.0's text.
+// The cut is held to the payload's canonical encoding when the record is
+// decoded (`prepared.rs`), and to the record's audit hashes when it is
+// rebuilt.
+const DEPENDENCY_ROW_SQL: &str = r#"SELECT parent_hash,payout_revision,expires_at,
         window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,
         window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256,
         payload->'original_expires_at_ms' AS original_expires_at_ms,
@@ -333,7 +340,10 @@ pub(super) async fn dependency_row(
             AND payload->'parent_hash'=to_jsonb(parent_hash)
             AND payload->'payout_revision'=to_jsonb(payout_revision)
             AND payload->'template_sha256'=to_jsonb(template_sha256)
-            AND payload->'window'=jsonb_build_object(
+            AND CASE WHEN jsonb_typeof(payload->'window')='object'
+                    AND (payload->'window'->'cut' IS NULL
+                         OR jsonb_typeof(payload->'window'->'cut')='object')
+                THEN (payload->'window')-'cut' END=jsonb_build_object(
                 'anchor_ms',window_anchor_ms,
                 'prior_balances_digest',window_prior_balances_sha256,
                 'shares',CASE WHEN window_first_share_seq IS NULL THEN 'null'::jsonb
@@ -341,12 +351,17 @@ pub(super) async fn dependency_row(
                         'last_share_seq',window_last_share_seq,'share_count',window_share_count,
                         'snapshot_sha256',window_snapshot_sha256) END),false)
             AS payload_matches_columns
-        FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#,
-    )
-    .bind(key)
-    .bind(i32::from(CompactPrepared::FORMAT_VERSION))
-    .fetch_optional(&mut **tx)
-    .await?)
+        FROM qbit_prism_jobs WHERE job_id=$1 FOR KEY SHARE"#;
+
+pub(super) async fn dependency_row(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &str,
+) -> Result<Option<PgRow>> {
+    Ok(sqlx::query(DEPENDENCY_ROW_SQL)
+        .bind(key)
+        .bind(i32::from(CompactPrepared::FORMAT_VERSION))
+        .fetch_optional(&mut **tx)
+        .await?)
 }
 
 pub(super) async fn lock_blob_metadata(
@@ -377,4 +392,138 @@ pub(super) async fn require_live(
         .await?;
     ensure!(live, "issued job deadline elapsed");
     Ok(())
+}
+
+#[cfg(test)]
+mod dependency_row_tests {
+    use super::*;
+    use anyhow::Context;
+    use qbit_prism_test_gate as gate;
+    use sha2::Digest;
+
+    /// The window comparison without its `cut` is the statement's one
+    /// difference from 3.0's text.
+    const WHOLE_WINDOW: &str = "AND payload->'window'=jsonb_build_object(";
+    const WINDOW_WITHOUT_CUT: &str = "AND CASE WHEN jsonb_typeof(payload->'window')='object'
+                    AND (payload->'window'->'cut' IS NULL
+                         OR jsonb_typeof(payload->'window'->'cut')='object')
+                THEN (payload->'window')-'cut' END=jsonb_build_object(";
+
+    #[test]
+    fn the_window_is_compared_without_its_cut_and_otherwise_as_in_3_0() {
+        assert_eq!(DEPENDENCY_ROW_SQL.matches(WINDOW_WITHOUT_CUT).count(), 1);
+        let three_zero = DEPENDENCY_ROW_SQL.replace(WINDOW_WITHOUT_CUT, WHOLE_WINDOW);
+        // 3.0's text, byte for byte.
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(three_zero.as_bytes())),
+            "34b0e2bd21a97e5477c0822739083e55980fb41e38e0e72c1ed3ebcffeb704f8"
+        );
+    }
+
+    /// D-12's downgrade: a single writer issues jobs from a prepared row a
+    /// dual-writer frontend wrote. Its payload window carries a cut the typed
+    /// columns do not, and still matches them; 3.0's comparison of the whole
+    /// window refuses it, and a changed column still fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dual_writer_prepared_row_matches_its_columns_on_a_single_writer() -> Result<()> {
+        let Some(raw) = gate::database_url(gate::site!())? else {
+            return Ok(());
+        };
+        let fixture =
+            crate::ledger_test_database::FixtureDatabase::open(&raw, "dependency_row_").await?;
+        let ledger = match Ledger::connect(&fixture.url, "dependency-row".into(), 2, true).await {
+            Ok(ledger) => ledger,
+            Err(error) => return Err(fixture.abandon(error).await),
+        };
+        let result = async {
+            ensure!(ledger.dual_writer_identity().is_none());
+            let digest = |byte: &str| byte.repeat(32);
+            let payload = serde_json::json!({
+                "format_version": CompactPrepared::FORMAT_VERSION,
+                "parent_hash": "parent",
+                "payout_revision": 3,
+                "template_sha256": digest("bb"),
+                "original_expires_at_ms": 1_800_000_000_000i64,
+                "window": {
+                    "anchor_ms": 5,
+                    "prior_balances_digest": digest("aa"),
+                    "shares": {
+                        "first_share_seq": 2,
+                        "last_share_seq": 9,
+                        "share_count": 4,
+                        "snapshot_sha256": digest("cc"),
+                    },
+                    "cut": serde_json::to_value(qbit_prism::WindowCut::new(Some(9), Some(7))?)?,
+                },
+            });
+            sqlx::query(
+                "INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256) \
+                 VALUES('dual-era','dual-writer-a','parent',3,$1,clock_timestamp()+interval '1 hour',5,$2,2,9,4,$3,$4)",
+            )
+            .bind(&payload)
+            .bind(digest("aa"))
+            .bind(digest("cc"))
+            .bind(digest("bb"))
+            .execute(&ledger.pool)
+            .await?;
+            let matches = |sql: String| {
+                let ledger = &ledger;
+                async move {
+                    let mut tx = ledger.begin().await?;
+                    let row = sqlx::query(&sql)
+                        .bind("dual-era")
+                        .bind(i32::from(CompactPrepared::FORMAT_VERSION))
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .context("the prepared row is gone")?;
+                    let matches: bool = row.try_get("payload_matches_columns")?;
+                    tx.rollback().await?;
+                    anyhow::Ok(matches)
+                }
+            };
+            ensure!(
+                matches(DEPENDENCY_ROW_SQL.to_owned()).await?,
+                "the cut-bearing payload does not match its columns"
+            );
+            ensure!(
+                !matches(DEPENDENCY_ROW_SQL.replace(WINDOW_WITHOUT_CUT, WHOLE_WINDOW)).await?,
+                "3.0's whole-window comparison accepted a payload with a cut"
+            );
+            // dependency_row itself, as the save paths call it.
+            let mut tx = ledger.begin().await?;
+            let row = dependency_row(&mut tx, "dual-era")
+                .await?
+                .context("the prepared row is gone")?;
+            ensure!(row.try_get::<bool, _>("payload_matches_columns")?);
+            tx.rollback().await?;
+            // The cut is the only key the comparison drops, a malformed cut
+            // or window is a mismatch, not an error, and a column still counts.
+            for (label, update) in [
+                ("another key", "payload=jsonb_set(payload,'{window,extra}','1')"),
+                ("a null cut", "payload=jsonb_set(payload,'{window,cut}','null')"),
+                ("a scalar cut", "payload=jsonb_set(payload,'{window,cut}','\"x\"')"),
+                ("a scalar window", "payload=jsonb_set(payload,'{window}','5')"),
+                ("a changed column", "window_anchor_ms=6"),
+            ] {
+                let mut tx = ledger.begin().await?;
+                sqlx::query(&format!("UPDATE qbit_prism_jobs SET {update} WHERE job_id='dual-era'"))
+                    .execute(&mut *tx)
+                    .await?;
+                let row = sqlx::query(DEPENDENCY_ROW_SQL)
+                    .bind("dual-era")
+                    .bind(i32::from(CompactPrepared::FORMAT_VERSION))
+                    .fetch_one(&mut *tx)
+                    .await?;
+                ensure!(
+                    !row.try_get::<bool, _>("payload_matches_columns")?,
+                    "{label} still matched"
+                );
+                tx.rollback().await?;
+            }
+            Ok(())
+        }
+        .await;
+        ledger.pool.close().await;
+        fixture.close(result).await
+    }
 }
