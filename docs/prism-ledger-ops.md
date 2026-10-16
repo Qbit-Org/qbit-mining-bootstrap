@@ -1688,9 +1688,12 @@ balances only while all of these agree:
 - **The journal.** This node's latest row in `qbit_prism_node_roles`, the
   append-only ownership journal that peer sync copies, holds ownership.
 - **The peer.** A live read of the peer's journal through
-  `PRISM_PEER_DATABASE_URL` (then its fallback), since this process started,
-  showed the peer has a journal row and does not claim ownership. A claim in the
-  synced copy of the peer's rows counts too.
+  `PRISM_PEER_DATABASE_URL`, since this process started, showed the peer has a
+  journal row and does not claim ownership. The fallback is read when the
+  primary fails, but it may lag behind the primary, so its answer only stops
+  payments (a claim it shows counts) and never confirms the peer or lets this
+  node seed its journal. A claim in the synced copy of the peer's rows counts
+  too.
 
 **Unreachable peer.** Once confirmed, the owner keeps paying while the peer
 cannot be read. The peer can only acquire ownership after it has read this
@@ -1698,7 +1701,8 @@ node's `release` row (see "Moving the carry owner"), so a dead or cut-off peer
 can never become a second owner.
 
 **After a restart.** A frontend that has not read the peer since it started
-builds carry-free work until it does. A restore from an old backup could have
+builds carry-free work until it reads it over `PRISM_PEER_DATABASE_URL`; the
+fallback alone never confirms. A restore from an old backup could have
 resurrected an ownership claim the pair has since moved.
 
 **After the peer's release.** Once the peer's latest row is a `release`, only a

@@ -493,7 +493,9 @@ pub fn transfer_checks(facts: &TransferFacts) -> Vec<Check> {
             false,
             "the peer's journal could not be read over PRISM_PEER_DATABASE_URL (transfer never reads the fallback), so it may still act as owner",
         )),
-        PeerRead::Answered { peer, own_at_peer } => {
+        PeerRead::Answered {
+            peer, own_at_peer, ..
+        } => {
             checks.push(check(
                 "peer_answered",
                 true,
@@ -750,7 +752,9 @@ async fn observe_with(
     report.local = read_latest_roles(&mut connection, settings.node_index).await?;
     drop(connection);
     report.peer = match &peer_read {
-        PeerRead::Answered { peer, own_at_peer } => Some(LatestRoles {
+        PeerRead::Answered {
+            peer, own_at_peer, ..
+        } => Some(LatestRoles {
             own: own_at_peer.clone(),
             peer: peer.clone(),
         }),
@@ -884,9 +888,11 @@ pub async fn transfer<C: ChainSource>(
     // The peer's latest rows and its latest claim, from one snapshot.
     let view = peer.view(settings.node_index).await;
     let peer_read = match &view {
+        // `peer` reads PRISM_PEER_DATABASE_URL only.
         Some(view) => PeerRead::Answered {
             peer: view.latest.peer.clone(),
             own_at_peer: view.latest.own.clone(),
+            primary: true,
         },
         None => PeerRead::Failed,
     };
@@ -1062,6 +1068,7 @@ mod tests {
             peer_read: PeerRead::Answered {
                 peer,
                 own_at_peer: Some(role(1, 10, false, "seed", None)),
+                primary: true,
             },
             peer_synced: None,
             // The claim before the peer's release, recorded at height 100.
@@ -1169,6 +1176,7 @@ mod tests {
         behind.peer_read = PeerRead::Answered {
             peer: Some(role(0, 12, false, "release", Some(150))),
             own_at_peer: Some(role(1, 11, false, "seed", None)),
+            primary: true,
         };
         assert_eq!(failed(&transfer_checks(&behind)), ["own_journal_current"]);
         let mut unidentified = facts(Some(role(0, 12, false, "release", Some(150))));
