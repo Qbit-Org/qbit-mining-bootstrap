@@ -91,11 +91,15 @@ impl RoleRow {
 /// What the live read of the peer's journal returned.
 #[derive(Clone, Debug)]
 pub enum PeerRead {
-    /// The peer answered: its latest own row, and its copy of this node's
-    /// latest row.
+    /// The peer answered: its latest own row, its copy of this node's
+    /// latest row, and whether `PRISM_PEER_DATABASE_URL` answered rather than
+    /// the fallback. A fallback may lag behind the peer's primary (a replica,
+    /// or a path to an old copy): its answer can stop payments, but only the
+    /// primary's confirms the peer or lets this node seed.
     Answered {
         peer: Option<RoleRow>,
         own_at_peer: Option<RoleRow>,
+        primary: bool,
     },
     /// The peer could not be read, for any reason.
     Failed,
@@ -166,7 +170,8 @@ pub enum CarryFreeReason {
     /// The peer answered but has never written a journal row, so it may be
     /// running without the dual-writer rules.
     PeerNotSeeded,
-    /// The peer has not been read since this process started.
+    /// The peer has not been read over `PRISM_PEER_DATABASE_URL` since this
+    /// process started (a fallback answer does not confirm it).
     PeerUnconfirmed,
     /// The peer issues work with another coinbase tag or extranonce2 width
     /// (`Ledger::layout_mismatch`): a coinbase can then name a finder at
@@ -210,7 +215,8 @@ impl CarryFreeReason {
     }
 
     /// Whether this state needs an operator: everything except a non-owner
-    /// working as configured, an owner waiting for its first peer read, and
+    /// working as configured, an owner waiting for its first read of the
+    /// peer's primary, and
     /// a transfer waiting for its setting change (which the loop escalates
     /// once it has lasted [`SETTING_PENDING_ALERT_AFTER`]). The loop also
     /// holds back the alert of the states a fresh start passes through
@@ -329,7 +335,11 @@ impl Guard {
             return not_claiming(self, NotOwner);
         }
         let (peer_live, read) = match &inputs.peer_read {
-            PeerRead::Answered { peer, own_at_peer } => {
+            PeerRead::Answered {
+                peer,
+                own_at_peer,
+                primary,
+            } => {
                 if own_at_peer
                     .as_ref()
                     .is_some_and(|theirs| theirs.epoch > own.epoch)
@@ -337,9 +347,9 @@ impl Guard {
                     self.peer_confirmed = false;
                     return CarryDecision::CarryFree(OwnJournalBehindPeer);
                 }
-                (peer.as_ref(), true)
+                (peer.as_ref(), Some(*primary))
             }
-            PeerRead::Failed => (None, false),
+            PeerRead::Failed => (None, None),
         };
         // The newest of the peer's rows this node can see, live or synced.
         let peer = [peer_live, inputs.peer_synced.as_ref()]
@@ -362,12 +372,17 @@ impl Guard {
         if peer.is_some_and(|row| row.action == "release" && !own.acquired_after(row)) {
             return not_claiming(self, ClaimNotVetted);
         }
-        if read {
+        if let Some(primary) = read {
             if peer.is_none() {
                 self.peer_confirmed = false;
                 return CarryDecision::CarryFree(PeerNotSeeded);
             }
-            self.peer_confirmed = true;
+            // A lagging fallback may still show a journal the peer has moved
+            // past (an acquire after this node's lost release): only the
+            // primary's answer confirms.
+            if primary {
+                self.peer_confirmed = true;
+            }
         }
         if self.peer_confirmed {
             CarryDecision::Paying
@@ -543,17 +558,19 @@ impl PeerJournal {
         Ok(Self { pools, timeout })
     }
 
-    /// Read the peer's latest rows, trying each URL in order.
+    /// Read the peer's latest rows, trying each URL in order; the first is
+    /// `PRISM_PEER_DATABASE_URL` ([`PeerRead::Answered`]'s `primary`).
     pub async fn read(&self, node_index: i16) -> PeerRead {
         match self
-            .first_answer(|mut connection| async move {
+            .first_answer_at(|mut connection| async move {
                 read_latest_roles(&mut connection, node_index).await
             })
             .await
         {
-            Some(latest) => PeerRead::Answered {
+            Some((at, latest)) => PeerRead::Answered {
                 peer: latest.peer,
                 own_at_peer: latest.own,
+                primary: at == 0,
             },
             None => PeerRead::Failed,
         }
@@ -617,9 +634,19 @@ impl PeerJournal {
         Read: Fn(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Answer,
         Answer: Future<Output = sqlx::Result<T>>,
     {
-        for pool in &self.pools {
+        self.first_answer_at(read).await.map(|(_, answer)| answer)
+    }
+
+    /// [`PeerJournal::first_answer`], with the index of the URL that
+    /// answered (0: `PRISM_PEER_DATABASE_URL`).
+    async fn first_answer_at<T, Read, Answer>(&self, read: Read) -> Option<(usize, T)>
+    where
+        Read: Fn(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Answer,
+        Answer: Future<Output = sqlx::Result<T>>,
+    {
+        for (at, pool) in self.pools.iter().enumerate() {
             if let Some(answer) = self.answer(pool, &read).await {
-                return Some(answer);
+                return Some((at, answer));
             }
         }
         None
@@ -772,8 +799,12 @@ pub async fn check(
         // takes the settlement lock, so only a node with no row pays for it;
         // `seed_role` re-reads under the lock.
         let read = read_peer(peer, settings.node_index, metrics).await;
+        // Only the primary's answer: a lagging fallback may not hold this
+        // node's rows yet.
         if let PeerRead::Answered {
-            own_at_peer: None, ..
+            own_at_peer: None,
+            primary: true,
+            ..
         } = read
         {
             if let Some(epoch) =
@@ -1024,6 +1055,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_the_primary_peer_view_confirms_an_owner() {
+        let fallback = |peer| PeerRead::Answered {
+            peer,
+            own_at_peer: Some(row(0, 10, true, "seed")),
+            primary: false,
+        };
+        // A restarted owner whose primary is out of reach: a lagging
+        // fallback showing the peer as non-owner does not open the gate.
+        let mut guard = Guard::default();
+        assert_eq!(
+            guard.decide(&owner_inputs(fallback(Some(row(1, 11, false, "seed"))))),
+            CarryDecision::CarryFree(CarryFreeReason::PeerUnconfirmed)
+        );
+        // It still stops payments: a claim it shows is a claim.
+        assert_eq!(
+            guard.decide(&owner_inputs(fallback(Some(row(1, 13, true, "acquire"))))),
+            CarryDecision::CarryFree(CarryFreeReason::PeerClaimsOwnership)
+        );
+        // The primary confirms; a later fallback answer keeps the
+        // confirmation, as an unreachable peer does.
+        assert_eq!(
+            guard.decide(&owner_inputs(answered(Some(row(1, 11, false, "seed"))))),
+            CarryDecision::Paying
+        );
+        assert_eq!(
+            guard.decide(&owner_inputs(fallback(Some(row(1, 11, false, "seed"))))),
+            CarryDecision::Paying
+        );
+    }
+
     fn owner_inputs(peer_read: PeerRead) -> GuardInputs {
         GuardInputs {
             node_index: 0,
@@ -1040,6 +1102,7 @@ mod tests {
         PeerRead::Answered {
             peer,
             own_at_peer: Some(row(0, 10, true, "seed")),
+            primary: true,
         }
     }
 
@@ -1254,6 +1317,7 @@ mod tests {
         let inputs = owner_inputs(PeerRead::Answered {
             peer: Some(row(1, 13, true, "acquire")),
             own_at_peer: Some(row(0, 12, false, "release")),
+            primary: true,
         });
         assert_eq!(
             guard.decide(&inputs),
@@ -1301,6 +1365,7 @@ mod tests {
         rolled_back.peer_read = PeerRead::Answered {
             peer: Some(row(1, 11, false, "seed")),
             own_at_peer: Some(row(0, 12, false, "release")),
+            primary: true,
         };
         assert_eq!(
             restarted.decide(&rolled_back),
