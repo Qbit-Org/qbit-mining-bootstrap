@@ -443,6 +443,10 @@ pub struct TransferFacts {
     pub peer_claim: Option<RoleRow>,
     /// Whether the peer's live journal answered for its claims too.
     pub peer_claim_read: bool,
+    /// The peer's live journal and this database's copy hold different
+    /// claims at one epoch: the peer's journal was rewritten (a restore), and
+    /// neither claim's recorded height can bound the scan.
+    pub peer_claim_conflict: bool,
     pub tip_height: u64,
     /// How far past the peer's release the tip must be: the orphan
     /// confirmation depth.
@@ -647,6 +651,13 @@ fn scan_start(facts: &TransferFacts) -> Check {
             "scan_start",
             false,
             "the peer's claims of ownership could not be read, so nothing bounds the scan",
+        );
+    }
+    if facts.peer_claim_conflict {
+        return check(
+            "scan_start",
+            false,
+            "the peer's live journal and this database's copy hold different claims of ownership at one epoch (the peer's journal was rewritten), so neither bounds the scan; find out why before any transfer",
         );
     }
     let Some(claim) = &facts.peer_claim else {
@@ -918,6 +929,10 @@ pub async fn transfer<C: ChainSource>(
     };
     let peer_claim_read = view.is_some();
     let live_claim = view.and_then(|view| view.peer_claim);
+    let peer_claim_conflict = matches!(
+        (&live_claim, &synced_claim),
+        (Some(live), Some(synced)) if live.epoch == synced.epoch && live != synced
+    );
     let peer_claim = [live_claim, synced_claim]
         .into_iter()
         .flatten()
@@ -931,6 +946,7 @@ pub async fn transfer<C: ChainSource>(
         peer_synced: report.local.peer.clone(),
         peer_claim,
         peer_claim_read,
+        peer_claim_conflict,
         tip_height: scan.tip_height,
         release_depth,
         scan: scan.clone(),
@@ -1088,6 +1104,7 @@ mod tests {
             // The claim before the peer's release, recorded at height 100.
             peer_claim: Some(role(0, 5, true, "acquire", Some(100))),
             peer_claim_read: true,
+            peer_claim_conflict: false,
             tip_height: 200,
             release_depth: 6,
             scan: scan(&[(150, Landing::Confirmed), (190, Landing::Confirmed)]),
@@ -1228,6 +1245,12 @@ mod tests {
         let early = role(0, 8, true, "acquire", Some(SCAN_REORG_MARGIN / 2));
         assert!(starting_at(0, Some(early.clone()), release).is_empty());
         assert_eq!(starting_at(1, Some(early), release), ["scan_start"]);
+        // Two claims at one epoch, live and synced: refused, whatever the
+        // start.
+        let mut conflict = facts(Some(role(0, 12, false, "release", Some(190))));
+        conflict.scan.from_height = 0;
+        conflict.peer_claim_conflict = true;
+        assert_eq!(failed(&transfer_checks(&conflict)), ["scan_start"]);
         // A seed records no height: the peer may have paid from any height
         // before its release, so only the whole chain will do.
         let seeded = role(0, 8, true, "seed", None);
