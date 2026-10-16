@@ -1981,9 +1981,11 @@ fail after printing if a check refuses, or without `--confirm`.
      newer row of it this node holds). A peer with no row is refused.
    - `own_journal_current`: the peer holds no newer row of this node's.
    - `release_depth`: the tip is buried as in step 2.
-   - `scan_start`: `--from-height` is no higher than the tip the peer's last
-     claim of ownership recorded (its `acquire`). Below that height the peer
-     found no carry-paying block. A peer that owned since its seed has no
+   - `scan_start`: `--from-height` is at least 1,000 blocks (the coinbase
+     maturity) below the tip the peer's last claim of ownership recorded (its
+     `acquire`). Below that height the peer found no carry-paying block; the
+     margin covers a reorganization after the claim to a fork below its tip,
+     on which the peer, already owner, found blocks under it. A peer that owned since its seed has no
      recorded height, so only `--from-height 0` passes. The check fails if the
      peer's claims cannot be read live, or if the peer has released but no
      claim of its can be read. The peer's latest rows and its latest claim are

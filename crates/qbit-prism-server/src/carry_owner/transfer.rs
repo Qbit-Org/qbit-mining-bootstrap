@@ -627,11 +627,19 @@ pub fn transfer_checks(facts: &TransferFacts) -> Vec<Check> {
     checks
 }
 
-/// The scan must start at or below the tip the peer's latest claim of
-/// ownership recorded (an `acquire`'s): below it, nothing the peer found was
-/// carry-paying. A claim that recorded none (a `seed`) bounds nothing, so the
-/// scan must read the whole chain. A peer that never claimed found only
-/// carry-free blocks, which can only underpay here if they are missing.
+/// How far below the tip an `acquire` recorded a transfer's scan must start
+/// (`scan_start`): the coinbase maturity, the depth PRISM treats as final (a
+/// mature pool block disconnected is a fatal state).
+pub const SCAN_REORG_MARGIN: u64 = qbit_prism::QBIT_COINBASE_MATURITY_BLOCKS;
+
+/// The scan must start [`SCAN_REORG_MARGIN`] or more below the tip the
+/// peer's latest claim of ownership recorded (an `acquire`'s): below that,
+/// nothing the peer found was carry-paying. The margin covers a
+/// reorganization after the claim to a fork below its tip, on which the
+/// peer, already owner, found blocks at heights under it. A claim that
+/// recorded none (a `seed`) bounds nothing, so the scan must read the whole
+/// chain. A peer that never claimed found only carry-free blocks, which can
+/// only underpay here if they are missing.
 fn scan_start(facts: &TransferFacts) -> Check {
     let start = facts.scan.from_height;
     if !facts.peer_claim_read {
@@ -663,14 +671,17 @@ fn scan_start(facts: &TransferFacts) -> Check {
         };
     };
     match claim.tip_height() {
-        Some(bound) => check(
-            "scan_start",
-            start <= bound,
-            format!(
-                "the scan starts at height {start}; the peer's last claim of ownership (epoch {}, {}) recorded height {bound}, and the scan must start at or below it",
-                claim.epoch, claim.action
-            ),
-        ),
+        Some(tip) => {
+            let bound = tip.saturating_sub(SCAN_REORG_MARGIN);
+            check(
+                "scan_start",
+                start <= bound,
+                format!(
+                    "the scan starts at height {start}; the peer's last claim of ownership (epoch {}, {}) recorded height {tip}, and the scan must start at or below {bound}, {SCAN_REORG_MARGIN} blocks under it, in case the chain reorganized below it after the claim",
+                    claim.epoch, claim.action
+                ),
+            )
+        }
         None => check(
             "scan_start",
             start == 0,
@@ -1048,7 +1059,7 @@ mod tests {
 
     fn scan(blocks: &[(u64, Landing)]) -> ChainScan {
         ChainScan {
-            from_height: 1,
+            from_height: 0,
             tip_height: 200,
             tip_hash: "tip".into(),
             scanned_blocks: 200,
@@ -1189,15 +1200,34 @@ mod tests {
 
     #[test]
     fn the_scan_starts_no_higher_than_the_tip_of_the_peers_last_claim() {
-        let starting_at = |from_height, claim: Option<RoleRow>, release_tip| {
+        let starting_at = |from_height, claim: Option<RoleRow>, release_tip: Option<u64>| {
             let mut facts = facts(Some(role(0, 12, false, "release", release_tip)));
+            // The tip as far above the release as in `facts`.
+            if let Some(release) = release_tip.filter(|release| *release > 190) {
+                facts.tip_height = release + 10;
+                facts.scan.tip_height = release + 10;
+            }
             facts.scan.from_height = from_height;
             facts.peer_claim = claim;
             failed(&transfer_checks(&facts))
         };
-        let acquired = role(0, 8, true, "acquire", Some(120));
-        assert!(starting_at(120, Some(acquired.clone()), Some(190)).is_empty());
-        assert_eq!(starting_at(121, Some(acquired), Some(190)), ["scan_start"]);
+        // The acquire's tip, less the reorganization margin, or lower.
+        let tip = SCAN_REORG_MARGIN + 120;
+        let acquired = role(0, 8, true, "acquire", Some(tip));
+        let release = Some(tip + 70);
+        assert!(starting_at(120, Some(acquired.clone()), release).is_empty());
+        assert_eq!(
+            starting_at(121, Some(acquired.clone()), release),
+            ["scan_start"]
+        );
+        assert_eq!(
+            starting_at(tip, Some(acquired.clone()), release),
+            ["scan_start"]
+        );
+        // An acquire within the margin of genesis: only the whole chain.
+        let early = role(0, 8, true, "acquire", Some(SCAN_REORG_MARGIN / 2));
+        assert!(starting_at(0, Some(early.clone()), release).is_empty());
+        assert_eq!(starting_at(1, Some(early), release), ["scan_start"]);
         // A seed records no height: the peer may have paid from any height
         // before its release, so only the whole chain will do.
         let seeded = role(0, 8, true, "seed", None);
