@@ -91,11 +91,15 @@ impl RoleRow {
 /// What the live read of the peer's journal returned.
 #[derive(Clone, Debug)]
 pub enum PeerRead {
-    /// The peer answered: its latest own row, and its copy of this node's
-    /// latest row.
+    /// The peer answered: its latest own row, its copy of this node's
+    /// latest row, and whether `PRISM_PEER_DATABASE_URL` answered rather than
+    /// the fallback. A fallback may lag behind the peer's primary (a replica,
+    /// or a path to an old copy): its answer can stop payments, but only the
+    /// primary's confirms the peer or lets this node seed.
     Answered {
         peer: Option<RoleRow>,
         own_at_peer: Option<RoleRow>,
+        primary: bool,
     },
     /// The peer could not be read, for any reason.
     Failed,
@@ -125,6 +129,9 @@ pub struct GuardInputs {
     /// The peer's latest row in this node's synced copy of its journal.
     pub peer_synced: Option<RoleRow>,
     pub peer_read: PeerRead,
+    /// Why this node's coinbase layout is not the peer's, if it is not
+    /// (`Ledger::layout_mismatch`).
+    pub layout_mismatch: Option<String>,
 }
 
 /// Why work is carry-free. Every reason but `NotOwner` is an alert.
@@ -163,12 +170,17 @@ pub enum CarryFreeReason {
     /// The peer answered but has never written a journal row, so it may be
     /// running without the dual-writer rules.
     PeerNotSeeded,
-    /// The peer has not been read since this process started.
+    /// The peer has not been read over `PRISM_PEER_DATABASE_URL` since this
+    /// process started (a fallback answer does not confirm it).
     PeerUnconfirmed,
+    /// The peer issues work with another coinbase tag or extranonce2 width
+    /// (`Ledger::layout_mismatch`): a coinbase can then name a finder at
+    /// either node's offset.
+    LayoutMismatch,
 }
 
 impl CarryFreeReason {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::NotOwner,
         Self::NodeUnidentified,
         Self::NoJournalRow,
@@ -181,6 +193,7 @@ impl CarryFreeReason {
         Self::PeerJournalBehind,
         Self::PeerNotSeeded,
         Self::PeerUnconfirmed,
+        Self::LayoutMismatch,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -197,11 +210,13 @@ impl CarryFreeReason {
             Self::PeerJournalBehind => "peer_journal_behind",
             Self::PeerNotSeeded => "peer_not_seeded",
             Self::PeerUnconfirmed => "peer_unconfirmed",
+            Self::LayoutMismatch => "layout_mismatch",
         }
     }
 
     /// Whether this state needs an operator: everything except a non-owner
-    /// working as configured, an owner waiting for its first peer read, and
+    /// working as configured, an owner waiting for its first read of the
+    /// peer's primary, and
     /// a transfer waiting for its setting change (which the loop escalates
     /// once it has lasted [`SETTING_PENDING_ALERT_AFTER`]). The loop also
     /// holds back the alert of the states a fresh start passes through
@@ -244,6 +259,7 @@ impl CarryDecision {
                 CarryFreeReason::PeerJournalBehind => CarryOwnerState::PeerJournalBehind,
                 CarryFreeReason::PeerNotSeeded => CarryOwnerState::PeerNotSeeded,
                 CarryFreeReason::PeerUnconfirmed => CarryOwnerState::PeerUnconfirmed,
+                CarryFreeReason::LayoutMismatch => CarryOwnerState::LayoutMismatch,
             },
         }
     }
@@ -288,6 +304,10 @@ impl Guard {
         if inputs.database_node != Some(inputs.node_index) {
             return not_claiming(self, NodeUnidentified);
         }
+        // Either node, owner or not: the pair's layouts must match.
+        if inputs.layout_mismatch.is_some() {
+            return not_claiming(self, LayoutMismatch);
+        }
         // An append-only journal's latest epoch never falls (module comment).
         let rolled_back = match (&inputs.own, self.highest_own_epoch) {
             (None, Some(_)) => true,
@@ -315,7 +335,11 @@ impl Guard {
             return not_claiming(self, NotOwner);
         }
         let (peer_live, read) = match &inputs.peer_read {
-            PeerRead::Answered { peer, own_at_peer } => {
+            PeerRead::Answered {
+                peer,
+                own_at_peer,
+                primary,
+            } => {
                 if own_at_peer
                     .as_ref()
                     .is_some_and(|theirs| theirs.epoch > own.epoch)
@@ -323,9 +347,9 @@ impl Guard {
                     self.peer_confirmed = false;
                     return CarryDecision::CarryFree(OwnJournalBehindPeer);
                 }
-                (peer.as_ref(), true)
+                (peer.as_ref(), Some(*primary))
             }
-            PeerRead::Failed => (None, false),
+            PeerRead::Failed => (None, None),
         };
         // The newest of the peer's rows this node can see, live or synced.
         let peer = [peer_live, inputs.peer_synced.as_ref()]
@@ -348,12 +372,17 @@ impl Guard {
         if peer.is_some_and(|row| row.action == "release" && !own.acquired_after(row)) {
             return not_claiming(self, ClaimNotVetted);
         }
-        if read {
+        if let Some(primary) = read {
             if peer.is_none() {
                 self.peer_confirmed = false;
                 return CarryDecision::CarryFree(PeerNotSeeded);
             }
-            self.peer_confirmed = true;
+            // A lagging fallback may still show a journal the peer has moved
+            // past (an acquire after this node's lost release): only the
+            // primary's answer confirms.
+            if primary {
+                self.peer_confirmed = true;
+            }
         }
         if self.peer_confirmed {
             CarryDecision::Paying
@@ -529,17 +558,19 @@ impl PeerJournal {
         Ok(Self { pools, timeout })
     }
 
-    /// Read the peer's latest rows, trying each URL in order.
+    /// Read the peer's latest rows, trying each URL in order; the first is
+    /// `PRISM_PEER_DATABASE_URL` ([`PeerRead::Answered`]'s `primary`).
     pub async fn read(&self, node_index: i16) -> PeerRead {
         match self
-            .first_answer(|mut connection| async move {
+            .first_answer_at(|mut connection| async move {
                 read_latest_roles(&mut connection, node_index).await
             })
             .await
         {
-            Some(latest) => PeerRead::Answered {
+            Some((at, latest)) => PeerRead::Answered {
                 peer: latest.peer,
                 own_at_peer: latest.own,
+                primary: at == 0,
             },
             None => PeerRead::Failed,
         }
@@ -566,25 +597,42 @@ impl PeerJournal {
 
     /// How long ago node `origin` published its newest work the peer's
     /// database holds, by the peer's own clock (`ledger::WORK_AGE_SQL`),
-    /// read through every URL: the youngest answer, so a lagging path cannot
-    /// make the work look older than it is. `Some(None)` when none holds any
-    /// work, `None` if no URL answered.
+    /// read through every URL and combined by [`youngest_work_age`].
+    /// `None` if no URL answered.
     pub async fn work_age(&self, origin: i16) -> Option<Option<Duration>> {
         let answers = self
-            .every_answer(|mut connection| async move {
+            .every_answer_at(|mut connection| async move {
                 sqlx::query_scalar::<_, f64>(crate::ledger::WORK_AGE_SQL)
                     .bind(origin)
                     .fetch_optional(&mut *connection)
                     .await
             })
             .await;
-        let ages = answers
-            .into_iter()
-            .map(|seconds| seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.))));
-        ages.reduce(|youngest, age| match (youngest, age) {
-            (Some(known), Some(age)) => Some(known.min(age)),
-            (known, age) => known.or(age),
+        let primary_answered = answers.iter().any(|(at, _)| *at == 0);
+        youngest_work_age(
+            answers.into_iter().map(|(_, seconds)| {
+                seconds.map(|seconds| Duration::from_secs_f64(seconds.max(0.)))
+            }),
+            primary_answered,
+        )
+    }
+
+    /// The coinbase suffix of node `origin`'s newest prepared record, read
+    /// over `PRISM_PEER_DATABASE_URL` only (`ledger::PEER_SUFFIX_SQL`): a
+    /// lagging fallback could show a layout the peer has left. `Some(None)`
+    /// when it holds no work of `origin`'s, `None` if it could not be read.
+    pub async fn primary_suffix(&self, origin: i16) -> Option<Option<String>> {
+        let primary = self.pools.first()?;
+        self.answer(primary, &|mut connection: sqlx::pool::PoolConnection<
+            sqlx::Postgres,
+        >| async move {
+            sqlx::query_scalar::<_, Option<String>>(crate::ledger::PEER_SUFFIX_SQL)
+                .bind(origin)
+                .fetch_optional(&mut *connection)
+                .await
+                .map(Option::flatten)
         })
+        .await
     }
 
     /// `origin`'s latest row in the peer's journal, every column; `None` if
@@ -606,16 +654,27 @@ impl PeerJournal {
         Read: Fn(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Answer,
         Answer: Future<Output = sqlx::Result<T>>,
     {
-        for pool in &self.pools {
+        self.first_answer_at(read).await.map(|(_, answer)| answer)
+    }
+
+    /// [`PeerJournal::first_answer`], with the index of the URL that
+    /// answered (0: `PRISM_PEER_DATABASE_URL`).
+    async fn first_answer_at<T, Read, Answer>(&self, read: Read) -> Option<(usize, T)>
+    where
+        Read: Fn(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Answer,
+        Answer: Future<Output = sqlx::Result<T>>,
+    {
+        for (at, pool) in self.pools.iter().enumerate() {
             if let Some(answer) = self.answer(pool, &read).await {
-                return Some(answer);
+                return Some((at, answer));
             }
         }
         None
     }
 
-    /// Every answer to `read` through the peer's URLs, read at once.
-    async fn every_answer<T, Read, Answer>(&self, read: Read) -> Vec<T>
+    /// Every answer to `read` through the peer's URLs, read at once, each
+    /// with the index of its URL (0: `PRISM_PEER_DATABASE_URL`).
+    async fn every_answer_at<T, Read, Answer>(&self, read: Read) -> Vec<(usize, T)>
     where
         Read: Fn(sqlx::pool::PoolConnection<sqlx::Postgres>) -> Answer,
         Answer: Future<Output = sqlx::Result<T>>,
@@ -623,7 +682,8 @@ impl PeerJournal {
         futures_util::future::join_all(self.pools.iter().map(|pool| self.answer(pool, &read)))
             .await
             .into_iter()
-            .flatten()
+            .enumerate()
+            .filter_map(|(at, answer)| answer.map(|answer| (at, answer)))
             .collect()
     }
 
@@ -761,8 +821,12 @@ pub async fn check(
         // takes the settlement lock, so only a node with no row pays for it;
         // `seed_role` re-reads under the lock.
         let read = read_peer(peer, settings.node_index, metrics).await;
+        // Only the primary's answer: a lagging fallback may not hold this
+        // node's rows yet.
         if let PeerRead::Answered {
-            own_at_peer: None, ..
+            own_at_peer: None,
+            primary: true,
+            ..
         } = read
         {
             if let Some(epoch) =
@@ -789,6 +853,21 @@ pub async fn check(
         Some(read) => read,
         None => read_peer(peer, settings.node_index, metrics).await,
     };
+    // Logged with its ALERT only when the decision changes (`log_decision`);
+    // `carry-owner status` and the fanout and adoption refusals say why.
+    // A failed read of it fails closed, as a mismatch: an error here would
+    // keep the gate as it is without deciding on what the peer read showed.
+    let layout_mismatch = if identified {
+        refresh_peer_layout(ledger, peer, settings.node_index)
+            .await
+            .unwrap_or_else(|error| {
+                Some(format!(
+                    "the peer's coinbase layout could not be read: {error:#}"
+                ))
+            })
+    } else {
+        None
+    };
     Ok(guard.decide(&GuardInputs {
         node_index: settings.node_index,
         database_node,
@@ -796,7 +875,28 @@ pub async fn check(
         own: local.own,
         peer_synced: local.peer,
         peer_read,
+        layout_mismatch,
     }))
+}
+
+/// Why this node's coinbase layout is not the peer's, if it is not
+/// (`Ledger::layout_mismatch`). With none of the peer's records held here,
+/// the peer's primary database shows its layout, and the ledger keeps what
+/// it showed for the fanout and adoption checks; an unreachable primary
+/// keeps the last it showed. Records held here decide, and clear what the
+/// primary showed, so it cannot outlive them once they expire.
+pub async fn refresh_peer_layout(
+    ledger: &Ledger,
+    peer: &PeerJournal,
+    node_index: i16,
+) -> Result<Option<String>> {
+    let held = ledger.peer_suffix_held().await?;
+    if held.is_some() {
+        ledger.set_peer_suffix_live(None);
+    } else if let Some(live) = peer.primary_suffix(peer_index(node_index)).await {
+        ledger.set_peer_suffix_live(live);
+    }
+    Ok(ledger.layout_mismatch_with(held.as_deref()))
 }
 
 /// One live read of the peer's journal, counted.
@@ -905,8 +1005,90 @@ fn log_decision(decision: CarryDecision, alert: bool, settings: &CarryOwnerSetti
     }
 }
 
+/// The peer's URLs' answers to [`PeerJournal::work_age`], combined. Work
+/// younger than the takeover delay on any path wins: the finder is alive,
+/// and a lagging or empty path cannot hide it. Without `primary_answered`
+/// nothing else counts: a fallback may lag behind the primary, so its stale
+/// or empty answer is no evidence of silence, and the primary is out of
+/// reach (`None`, an outage the broadcaster times itself). Otherwise a path
+/// that answers with no work at all makes the age unknown (`Some(None)`):
+/// it may be the current one, holding none since a restart, and another
+/// path's stale copy must not age the finder into silence. Only when every
+/// path shows stale work does the youngest of them decide. `None` when no
+/// path answered.
+fn youngest_work_age(
+    answers: impl Iterator<Item = Option<Duration>>,
+    primary_answered: bool,
+) -> Option<Option<Duration>> {
+    let mut answered = false;
+    let mut empty = false;
+    let mut youngest: Option<Duration> = None;
+    for age in answers {
+        answered = true;
+        match age {
+            Some(age) => youngest = Some(youngest.map_or(age, |known| known.min(age))),
+            None => empty = true,
+        }
+    }
+    if !answered {
+        return None;
+    }
+    match youngest {
+        Some(age) if age < crate::ledger::SPONSOR_TAKEOVER_AFTER => Some(Some(age)),
+        _ if !primary_answered => None,
+        Some(age) if !empty => Some(Some(age)),
+        _ => Some(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_fresh_work_counts_from_a_fallback_without_the_primary() {
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        // The primary out of reach: a fallback's fresh work still shows the
+        // finder alive, but its stale or empty answer is an outage.
+        assert_eq!(
+            youngest_work_age([minutes(2)].into_iter(), false),
+            Some(minutes(2))
+        );
+        assert_eq!(youngest_work_age([minutes(40)].into_iter(), false), None);
+        assert_eq!(youngest_work_age([None].into_iter(), false), None);
+        assert_eq!(
+            youngest_work_age([minutes(40)].into_iter(), true),
+            Some(minutes(40))
+        );
+    }
+
+    #[test]
+    fn fresh_work_wins_and_a_path_with_no_work_makes_stale_work_unknown() {
+        let minutes = |m: u64| Some(Duration::from_secs(m * 60));
+        assert_eq!(youngest_work_age(std::iter::empty(), true), None);
+        assert_eq!(
+            youngest_work_age([minutes(40), minutes(2)].into_iter(), true),
+            Some(minutes(2))
+        );
+        assert_eq!(
+            youngest_work_age([None, minutes(40)].into_iter(), true),
+            Some(None)
+        );
+        assert_eq!(
+            youngest_work_age([minutes(40), None].into_iter(), true),
+            Some(None)
+        );
+        assert_eq!(youngest_work_age([None].into_iter(), true), Some(None));
+        // Fresh work on any path wins: an empty path does not hide a live
+        // finder.
+        assert_eq!(
+            youngest_work_age([None, minutes(2)].into_iter(), true),
+            Some(minutes(2))
+        );
+        assert_eq!(
+            youngest_work_age([minutes(2), None, minutes(40)].into_iter(), true),
+            Some(minutes(2))
+        );
+    }
+
     use super::*;
 
     fn row(origin_node: i16, epoch: i64, carry_owner: bool, action: &str) -> RoleRow {
@@ -928,6 +1110,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_layout_mismatch_is_carry_free_and_alerts_on_either_node() {
+        let mismatch = Some("tags differ".to_owned());
+        let decision = Guard::default().decide(&GuardInputs {
+            layout_mismatch: mismatch.clone(),
+            ..owner_inputs(answered(Some(row(1, 11, false, "seed"))))
+        });
+        assert_eq!(
+            decision,
+            CarryDecision::CarryFree(CarryFreeReason::LayoutMismatch)
+        );
+        assert!(decision.alerts());
+        let not_owner = GuardInputs {
+            env_owner: false,
+            own: Some(row(0, 10, false, "seed")),
+            layout_mismatch: mismatch,
+            ..owner_inputs(PeerRead::Failed)
+        };
+        assert_eq!(
+            Guard::default().decide(&not_owner),
+            CarryDecision::CarryFree(CarryFreeReason::LayoutMismatch)
+        );
+    }
+
+    #[test]
+    fn only_the_primary_peer_view_confirms_an_owner() {
+        let fallback = |peer| PeerRead::Answered {
+            peer,
+            own_at_peer: Some(row(0, 10, true, "seed")),
+            primary: false,
+        };
+        // A restarted owner whose primary is out of reach: a lagging
+        // fallback showing the peer as non-owner does not open the gate.
+        let mut guard = Guard::default();
+        assert_eq!(
+            guard.decide(&owner_inputs(fallback(Some(row(1, 11, false, "seed"))))),
+            CarryDecision::CarryFree(CarryFreeReason::PeerUnconfirmed)
+        );
+        // It still stops payments: a claim it shows is a claim.
+        assert_eq!(
+            guard.decide(&owner_inputs(fallback(Some(row(1, 13, true, "acquire"))))),
+            CarryDecision::CarryFree(CarryFreeReason::PeerClaimsOwnership)
+        );
+        // The primary confirms; a later fallback answer keeps the
+        // confirmation, as an unreachable peer does.
+        assert_eq!(
+            guard.decide(&owner_inputs(answered(Some(row(1, 11, false, "seed"))))),
+            CarryDecision::Paying
+        );
+        assert_eq!(
+            guard.decide(&owner_inputs(fallback(Some(row(1, 11, false, "seed"))))),
+            CarryDecision::Paying
+        );
+    }
+
     fn owner_inputs(peer_read: PeerRead) -> GuardInputs {
         GuardInputs {
             node_index: 0,
@@ -936,6 +1173,7 @@ mod tests {
             own: Some(row(0, 10, true, "seed")),
             peer_synced: Some(row(1, 11, false, "seed")),
             peer_read,
+            layout_mismatch: None,
         }
     }
 
@@ -943,6 +1181,7 @@ mod tests {
         PeerRead::Answered {
             peer,
             own_at_peer: Some(row(0, 10, true, "seed")),
+            primary: true,
         }
     }
 
@@ -1157,6 +1396,7 @@ mod tests {
         let inputs = owner_inputs(PeerRead::Answered {
             peer: Some(row(1, 13, true, "acquire")),
             own_at_peer: Some(row(0, 12, false, "release")),
+            primary: true,
         });
         assert_eq!(
             guard.decide(&inputs),
@@ -1204,6 +1444,7 @@ mod tests {
         rolled_back.peer_read = PeerRead::Answered {
             peer: Some(row(1, 11, false, "seed")),
             own_at_peer: Some(row(0, 12, false, "release")),
+            primary: true,
         };
         assert_eq!(
             restarted.decide(&rolled_back),

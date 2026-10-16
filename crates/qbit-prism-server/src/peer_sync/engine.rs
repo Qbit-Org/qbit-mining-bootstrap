@@ -686,6 +686,9 @@ impl PeerSync {
         let node = self.node;
         let mut applied = Applied::default();
         let mut clock_ms = None;
+        // The server this recovery runs on: the verification is recorded
+        // only while the database still shows it.
+        let evidence = self.ledger.lineage_evidence().await?;
         // Every own row the peer holds came through its pulls, which its
         // cursor over this node's shares covers, or was held when it was
         // personalised, below its floor: together they bound the keys taken
@@ -804,7 +807,6 @@ impl PeerSync {
         self.ledger
             .raise_own_sequences(node, share_floor, sync_floor, clock_ms)
             .await?;
-        let evidence = self.ledger.lineage_evidence().await?;
         self.ledger.record_own_log_verified(evidence).await?;
         self.own_rows_missing = false;
         tracing::info!(

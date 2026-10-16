@@ -41,7 +41,8 @@ pub(super) const PARITY_KEYS: &[(&str, &str)] = &[
 const SESSION_SEQUENCE: &str = "qbit_prism_session_sequence";
 /// The system identifier and WAL timeline of the server a connection runs
 /// on ([`LineageEvidence`]).
-const LINEAGE_EVIDENCE_SQL: &str = "SELECT (SELECT system_identifier FROM pg_control_system()),\
+pub(super) const LINEAGE_EVIDENCE_SQL: &str =
+    "SELECT (SELECT system_identifier FROM pg_control_system()),\
      ('x'||substr(pg_walfile_name(pg_current_wal_lsn()),1,8))::bit(32)::int";
 /// How recent a heartbeat shows a frontend running on this database: an
 /// instance row neither drained nor stopped whose heartbeat is younger, by

@@ -930,6 +930,29 @@ async fn adopted_as_landed(f: &Fixture, settlement: Settlement) -> Result<()> {
             "the finder does not sponsor its own fanout {txid}"
         );
     }
+    // Still this node's after its PRISM_STRATUM_EXTRANONCE2_SIZE changed:
+    // the coinbase names no node at the new width, and this node offered
+    // the block (its outbox row).
+    if fanouts > 0 {
+        let resized = Coordinator::new(
+            qbit_prism_server::config::Config {
+                extranonce2_size: c.config.extranonce2_size / 2,
+                instance_id: "finder-resized".into(),
+                ..(*c.config).clone()
+            },
+            Arc::new(Metrics::default()),
+        )
+        .await?;
+        let txid = original["qbit_ctv_fanout_artifacts"][0]["fanout_txid"]
+            .as_str()
+            .context("a fanout artifact has no txid")?;
+        let sponsor = resized.ledger.fanout_sponsor(txid).await;
+        resized.ledger.pool.close().await;
+        ensure!(
+            sponsor? == Some(FanoutSponsor::Finder),
+            "the finder does not sponsor its own fanout {txid} after a width change"
+        );
+    }
     // The block's coinbase commits to the audit the finder landed.
     let root = hex::encode(coinbase_witness_reserved_value(
         codec::coinbase_from_block(&block)?,
@@ -983,13 +1006,7 @@ async fn adopted_as_landed(f: &Fixture, settlement: Settlement) -> Result<()> {
         canonical_balances(pool).await?.is_empty(),
         "forgetting the only block left balances behind"
     );
-    let held: Vec<String> = c
-        .ledger
-        .compact_prepared_on_parent(&parent_hash())
-        .await?
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
+    let held = c.ledger.compact_prepared_on_parent(&parent_hash()).await?;
     ensure!(
         held == [second.storage_key.clone(), first.storage_key.clone()],
         "the prepared records on the parent, newest first, are {held:?}"
@@ -1234,19 +1251,48 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         !sponsors_fanout(c, &txid).await?,
         "the broadcaster would sponsor a fanout found on the peer's work"
     );
-    // Node A's work, as the sync copied it: published a moment ago.
+    // Its block matured over half an hour ago, and this node holds no work
+    // of A's at all: nothing here dates A's silence. A's database out of
+    // reach for a minute does not hand the fanout over; only an outage as
+    // long as the takeover delay does.
+    sqlx::query("UPDATE qbit_pool_blocks SET matured_at=matured_at-interval '31 minutes' WHERE block_hash=$1")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    ensure!(
+        c.ledger.fanout_sponsor(&txid).await? == Some(FanoutSponsor::Unwitnessed),
+        "a matured fanout with none of its finder's work held here is not unwitnessed"
+    );
+    let unreachable = || {
+        PeerJournal::new(
+            &["postgresql://prism@127.0.0.1:1/unreachable".to_owned()],
+            Duration::from_millis(500),
+        )
+    };
+    c.finder_liveness.use_journal(unreachable()?).await;
+    c.finder_liveness
+        .assume_unreachable_since(std::time::Instant::now() - Duration::from_secs(61))
+        .await;
+    ensure!(
+        !sponsors_fanout(c, &txid).await?,
+        "a minute's outage handed over a fanout whose finder's work this node never held"
+    );
+    c.finder_liveness.use_journal(unreachable()?).await;
+    c.finder_liveness
+        .assume_unreachable_since(std::time::Instant::now() - Duration::from_secs(31 * 60))
+        .await;
+    ensure!(
+        sponsors_fanout(c, &txid).await?,
+        "an outage as long as the takeover delay did not hand the fanout over"
+    );
+    // Node A's work, as the sync copied it: published a moment ago, so the
+    // fanout is not overdue, and the ledger refuses.
     sqlx::query(
         "INSERT INTO qbit_prism_jobs SELECT (jsonb_populate_record(NULL::qbit_prism_jobs,to_jsonb(j)||jsonb_build_object('job_id','prepared:peer-work','origin_node',0,'created_at',clock_timestamp()))).* \
          FROM qbit_prism_jobs j WHERE j.job_id LIKE 'prepared:%' ORDER BY j.created_at LIMIT 1",
     )
     .execute(pool)
     .await?;
-    // Its block matured over half an hour ago, but A's newest work held
-    // here is a moment old: not overdue, and the ledger refuses.
-    sqlx::query("UPDATE qbit_pool_blocks SET matured_at=matured_at-interval '31 minutes' WHERE block_hash=$1")
-        .bind(&hash)
-        .execute(pool)
-        .await?;
     ensure!(
         c.ledger.fanout_sponsor(&txid).await?.is_none(),
         "a fanout whose finder published work a moment ago is overdue"
@@ -1259,6 +1305,40 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
     ensure!(
         c.ledger.fanout_sponsor(&txid).await? == Some(FanoutSponsor::Overdue),
         "a fanout whose block matured, and whose finder last published work, half an hour ago is not overdue"
+    );
+    // Node A issues work with another extranonce2 width (its newest record
+    // here says so): a coinbase could name a finder at either offset, so
+    // nothing is sponsored or adopted until the layouts match again.
+    let suffix_of = |width: usize| {
+        hex::encode([c.config.coinbase_tag.as_bytes(), &vec![0; 4 + width][..]].concat())
+    };
+    let set_peer_suffix = |hex: String| {
+        sqlx::query("UPDATE qbit_prism_jobs SET payload=jsonb_set(payload,'{coinbase_suffix_hex}',to_jsonb($1::text)) WHERE job_id='prepared:peer-work'")
+            .bind(hex)
+            .execute(pool)
+    };
+    set_peer_suffix(suffix_of(c.config.extranonce2_size / 2)).await?;
+    let mismatch = c
+        .ledger
+        .layout_mismatch()
+        .await?
+        .context("a peer issuing work with another extranonce2 width is no mismatch")?;
+    ensure!(
+        c.ledger.fanout_sponsor(&txid).await?.is_none() && !sponsors_fanout(c, &txid).await?,
+        "a fanout was sponsored under two coinbase layouts: {mismatch}"
+    );
+    ensure!(
+        matches!(
+            c.adopt_block(&hash).await?,
+            Adoption::NoRecord { reason, .. } if reason.contains("coinbase layouts differ")
+        ),
+        "a block was adoptable under two coinbase layouts"
+    );
+    set_peer_suffix(suffix_of(c.config.extranonce2_size)).await?;
+    ensure!(
+        c.ledger.layout_mismatch().await?.is_none()
+            && c.ledger.fanout_sponsor(&txid).await? == Some(FanoutSponsor::Overdue),
+        "matching layouts did not restore the takeover fence"
     );
     // A's own database answers, and shows work A published a moment ago,
     // though this node's copy is stale: A is alive, and keeps its fanout.
@@ -1285,6 +1365,51 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
         !sponsors_fanout(c, &txid).await?,
         "a finder whose database shows no work at all was taken over at once"
     );
+    // A's layout, read live over its primary only (for when this node holds
+    // none of A's records): none while it shows no work, its newest
+    // record's suffix once it does, and nothing from an unreachable primary,
+    // even with a fallback that answers.
+    let primary = live_view()?;
+    ensure!(
+        primary.primary_suffix(0).await == Some(None),
+        "a primary with no work of A's showed a layout"
+    );
+    let narrow = hex::encode([c.config.coinbase_tag.as_bytes(), &[0; 8][..]].concat());
+    sqlx::query(
+        "INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,origin_node) \
+         VALUES('prepared:layout-work','adoption-peer',repeat('ab',32),0,jsonb_build_object('coinbase_suffix_hex',$1::text),clock_timestamp()+interval '1 hour',0)",
+    )
+    .bind(&narrow)
+    .execute(&peer.pool)
+    .await?;
+    ensure!(
+        primary.primary_suffix(0).await == Some(Some(narrow.clone())),
+        "the primary did not show A's newest suffix"
+    );
+    let unreachable = "postgresql://prism@127.0.0.1:1/unreachable".to_owned();
+    ensure!(
+        PeerJournal::new(
+            &[unreachable, peer_url.to_owned()],
+            Duration::from_millis(500)
+        )?
+        .primary_suffix(0)
+        .await
+        .is_none(),
+        "a fallback answered for an unreachable primary"
+    );
+    sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id='prepared:layout-work'")
+        .execute(&peer.pool)
+        .await?;
+    // Records of A's held here decide, and clear a layout the primary
+    // showed earlier, so it cannot outlive them once they expire.
+    c.ledger.set_peer_suffix_live(Some(narrow));
+    ensure!(
+        qbit_prism_server::carry_owner::refresh_peer_layout(&c.ledger, &primary, 1)
+            .await?
+            .is_none()
+            && c.ledger.layout_mismatch_with(None).is_none(),
+        "a layout the primary showed outlived the records held here"
+    );
     c.finder_liveness
         .assume_no_work_since(std::time::Instant::now() - Duration::from_secs(31 * 60))
         .await;
@@ -1307,6 +1432,23 @@ async fn takeover_funding(f: &Fixture, peer: &Ledger, peer_url: &str) -> Result<
     ensure!(
         sponsors_fanout(c, &txid).await?,
         "a finder whose own database shows no work for half an hour was not taken over"
+    );
+    // The same stale work, but only over a fallback while the primary is
+    // out of reach: a fallback may lag, so it is an outage, not silence.
+    ensure!(
+        matches!(live_view()?.work_age(0).await, Some(Some(age)) if age >= qbit_prism_server::ledger::SPONSOR_TAKEOVER_AFTER),
+        "the fallback's database does not show A's stale work"
+    );
+    let behind_fallback = PeerJournal::new(
+        &[
+            "postgresql://prism@127.0.0.1:1/unreachable".to_owned(),
+            peer_url.to_owned(),
+        ],
+        Duration::from_millis(500),
+    )?;
+    ensure!(
+        behind_fallback.work_age(0).await.is_none(),
+        "a fallback's stale work, with the primary out of reach, read as the finder's silence"
     );
     // A's database does not answer at all. A first failed check may be a
     // blip: not silent yet. Once the checks have failed for a minute, the
@@ -1532,12 +1674,19 @@ async fn refused(f: &Fixture) -> Result<()> {
     narrow.ledger.pool.close().await;
     result?;
     // Only the issuing layout names the block's finder: the narrow frontend
-    // adopted it, with its own origin, but never takes it for its own find,
-    // so it would sponsor its fanouts only by takeover.
+    // adopted it, with its own origin but no outbox row, so it never takes
+    // it for its own find and would sponsor its fanouts only by takeover.
     let coinbase = codec::coinbase_from_block(&block)?;
+    let offered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM qbit_block_candidate_outbox WHERE block_hash=$1)",
+    )
+    .bind(&hash)
+    .fetch_one(pool)
+    .await?;
     ensure!(
-        c.ledger.found_here(Some(coinbase), false)
-            && !narrow.ledger.found_here(Some(coinbase), true),
+        !offered
+            && c.ledger.found_here(Some(coinbase), false, false)
+            && !narrow.ledger.found_here(Some(coinbase), true, offered),
         "a layout other than the issuing one named the adopted block's finder"
     );
     session.release().await

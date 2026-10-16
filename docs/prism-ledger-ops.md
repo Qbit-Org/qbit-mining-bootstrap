@@ -1671,8 +1671,10 @@ then.
   carry-paying work for current work, whatever its revision: it goes through
   the #478 capture bound, or is abandoned with capture off. The gate is checked
   again right before the send: if it moved after the reservation of a block on
-  carry-paying work (closed, unfenced, or closed and reopened), nothing is sent,
-  and the reservation returns to `pending`, due again at once.
+  carry-paying work (closed, unfenced, or closed and reopened), or this node's
+  journal no longer claims ownership (a `carry-owner release` the gate has not
+  seen yet), nothing is sent, and the reservation returns to `pending`, due
+  again at once.
 - **Canonical balances elsewhere.** Landing, confirmation and the #478 records
   always measure against the canonical balances. The debt gauge
   (`qbit_prism_carry_forward_debt_sats`) is never fed from carry-free work.
@@ -1688,9 +1690,12 @@ balances only while all of these agree:
 - **The journal.** This node's latest row in `qbit_prism_node_roles`, the
   append-only ownership journal that peer sync copies, holds ownership.
 - **The peer.** A live read of the peer's journal through
-  `PRISM_PEER_DATABASE_URL` (then its fallback), since this process started,
-  showed the peer has a journal row and does not claim ownership. A claim in the
-  synced copy of the peer's rows counts too.
+  `PRISM_PEER_DATABASE_URL`, since this process started, showed the peer has a
+  journal row and does not claim ownership. The fallback is read when the
+  primary fails, but it may lag behind the primary, so its answer only stops
+  payments (a claim it shows counts) and never confirms the peer or lets this
+  node seed its journal. A claim in the synced copy of the peer's rows counts
+  too.
 
 **Unreachable peer.** Once confirmed, the owner keeps paying while the peer
 cannot be read. The peer can only acquire ownership after it has read this
@@ -1698,7 +1703,8 @@ node's `release` row (see "Moving the carry owner"), so a dead or cut-off peer
 can never become a second owner.
 
 **After a restart.** A frontend that has not read the peer since it started
-builds carry-free work until it does. A restore from an old backup could have
+builds carry-free work until it reads it over `PRISM_PEER_DATABASE_URL`; the
+fallback alone never confirms. A restore from an old backup could have
 resurrected an ownership claim the pair has since moved.
 
 **After the peer's release.** Once the peer's latest row is a `release`, only a
@@ -1755,6 +1761,7 @@ current one); `qbit_prism_carry_owner_alert` is 1 when it needs an operator.
 | `peer_claims_ownership` | carry-free | yes | Both nodes claim ownership, so both build carry-free work. Run `carry-owner release` on both, then `carry-owner transfer` on the one that should own. |
 | `peer_journal_behind` | carry-free | yes | The peer's live journal claims ownership behind, or against, a newer row of the peer's this node holds: the peer's database was rolled back, or a lagging path answered. Do not release this node. Restart the peer's frontend, so its own-log check recovers its rows; this node pays again once the peer's journal is back. |
 | `peer_not_seeded` | carry-free | after start-up | The peer answers but has no journal row, so it may be running without the dual-writer rules. Start its frontend in dual-writer mode. |
+| `layout_mismatch` | carry-free | yes | The peer's newest prepared record held here was issued with another `PRISM_COINBASE_TAG` or `PRISM_STRATUM_EXTRANONCE2_SIZE` than this node's (`carry-owner status` prints both). No zero-fee fanout is sponsored as its finder or taken over, and no block is adopted, until they match. Set the same values on both nodes and restart their frontends; the state clears once the peer's new work is synced here. |
 
 **Every state except `paying` is safe.** Carry-free work never reduces a
 balance, so carry payments only wait. `carry-owner status` prints what the guard
@@ -1805,15 +1812,29 @@ the extranonce1 in the block's coinbase, since each node hands out its own half
 of the extranonce1 space; it does not matter which node landed the rows.
 Extranonce1 is read at this node's `PRISM_STRATUM_EXTRANONCE2_SIZE`, and only
 where the coinbase tag sits right before it. A block issued with another width
-therefore names no finder here, and since every coinbase this node builds names
-it, such a block is never taken for this node's own, even when this node adopted
-it: it is sponsored here only by takeover. A dual writer refuses to start with a
-`PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). Keep
-the width and the tag the same on both nodes; the pair's fingerprint compares
-neither. Change either only while both nodes are up and
-landing their blocks, as for adoption below, and give one-shot commands the
-frontends' values. (Adoption reads a peer record's own width, so it lands
-either way.) The other node only
+or tag therefore names no finder here. Such a block counts as this node's own
+only if this node offered it, meaning it carries this node's origin and this
+node holds its outbox row (the outbox is local and never copied). That covers
+this node's own block found before the width or tag changed. A block this node
+adopted has no outbox row, so a cross-width adoption is sponsored here only by
+takeover. A dual writer refuses to start with a
+`PRISM_COINBASE_TAG` shorter than 4 bytes (the default `/PRISM/` has 7). The
+width and the tag must be the same on both nodes. The pair's fingerprint
+compares neither, so each node reads the other's from the newest prepared
+record it has synced, or, holding none (the jobs stream refused or lagging),
+from the peer's primary database (`PRISM_PEER_DATABASE_URL`, never the
+fallback) at each carry owner guard check, keeping the last it showed while
+that database is out of reach. Only when neither shows the peer's work is its
+layout unknown and taken to match, so a peer whose records here expired and
+whose database is gone does not hold the survivor carry-free. (A mismatch the
+primary showed before it went out of reach, with none of the peer's records
+synced since, holds until this frontend restarts.) While they differ, a coinbase could name a finder at
+either node's offset, so both nodes refuse: work is carry-free
+(`layout_mismatch`, an alert), no zero-fee fanout is sponsored as its finder or
+taken over (a CPFP package already held is finished), and no block is adopted.
+Change either on both nodes together, while both are up and landing their
+blocks, and give one-shot commands the frontends' values. The node that did not
+find the block only
 watches the fanout until it is overdue for a takeover (below),
 so the two nodes do not fund conflicting children, which would leave a wallet
 coin locked.
@@ -1827,11 +1848,17 @@ fanout is overdue and its finder silent:
 - **Silent:** the finder's own database, read through every peer URL, shows
   its newest work, aged by its own clock, to be at least 30 minutes old. A
   database that answers with no work of its node at all (a frontend just
-  started, or its expired work pruned) is not silent until the checks have
-  found none for 30 minutes. Or that database has failed three checks in a row,
-  over a minute at least; then the stale copy here decides. A blip or two only
-  waits. One check runs at a
-  time, and its verdict serves every fanout for 30 seconds.
+  started, or its expired work pruned), through any peer URL that answers, is
+  not silent until the checks have found none for 30 minutes; another URL's
+  older copy does not override that answer, while work under 30 minutes old on
+  any URL always shows the finder alive. With `PRISM_PEER_DATABASE_URL` out of
+  reach, a fallback's stale or empty answer is no evidence either (a fallback
+  may lag): it counts as an outage, as below. Or that database has failed three checks in a row,
+  over a minute at least; then the stale copy here decides. When this node holds
+  no work of the finder's at all (none synced yet, or its copies expired),
+  nothing here dates the silence, so the outage itself must last 30 minutes. A
+  blip or two only waits. One check runs at a time, and its verdict serves
+  every fanout for 30 seconds.
 
 A frontend that is alive publishes work every few minutes (the reanchor and the
 template's maximum age), so a living finder whose database answers keeps its
@@ -1956,9 +1983,11 @@ fail after printing if a check refuses, or without `--confirm`.
      newer row of it this node holds). A peer with no row is refused.
    - `own_journal_current`: the peer holds no newer row of this node's.
    - `release_depth`: the tip is buried as in step 2.
-   - `scan_start`: `--from-height` is no higher than the tip the peer's last
-     claim of ownership recorded (its `acquire`). Below that height the peer
-     found no carry-paying block. A peer that owned since its seed has no
+   - `scan_start`: `--from-height` is at least 1,000 blocks (the coinbase
+     maturity) below the tip the peer's last claim of ownership recorded (its
+     `acquire`). Below that height the peer found no carry-paying block; the
+     margin covers a reorganization after the claim to a fork below its tip,
+     on which the peer, already owner, found blocks under it. A peer that owned since its seed has no
      recorded height, so only `--from-height 0` passes. The check fails if the
      peer's claims cannot be read live, or if the peer has released but no
      claim of its can be read. The peer's latest rows and its latest claim are

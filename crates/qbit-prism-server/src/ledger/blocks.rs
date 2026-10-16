@@ -650,7 +650,7 @@ impl Ledger {
         // A single writer runs 3.0's statement; dual mode reads the origin too.
         let own_node = self.own_node();
         let rows = sqlx::query(if own_node.is_some() {
-            "SELECT block.block_hash,block.block_height,block.chain_state,block.maturity_state,block.audit_publication_sequence,block.origin_node,(SELECT audit.coinbase_tx_hex FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=block.block_hash) AS coinbase_tx_hex FROM qbit_pool_blocks block WHERE block.chain_state IN ('prepared','confirmed','inactive') AND block.block_hash=ANY($1::text[]) ORDER BY block.block_height,block.block_hash FOR UPDATE OF block"
+            "SELECT block.block_hash,block.block_height,block.chain_state,block.maturity_state,block.audit_publication_sequence,block.origin_node,EXISTS(SELECT 1 FROM qbit_block_candidate_outbox offer WHERE offer.block_hash=block.block_hash) AS offered_here,(SELECT audit.coinbase_tx_hex FROM qbit_pool_audit_bundles audit WHERE audit.block_hash=block.block_hash) AS coinbase_tx_hex FROM qbit_pool_blocks block WHERE block.chain_state IN ('prepared','confirmed','inactive') AND block.block_hash=ANY($1::text[]) ORDER BY block.block_height,block.block_hash FOR UPDATE OF block"
         } else {
             "SELECT block_hash,block_height,chain_state,maturity_state,audit_publication_sequence FROM qbit_pool_blocks WHERE chain_state IN ('prepared','confirmed','inactive') AND block_hash=ANY($1::text[]) ORDER BY block_height,block_hash FOR UPDATE"
         }).bind(&hashes).fetch_all(&mut **tx).await?;
@@ -681,10 +681,11 @@ impl Ledger {
                         let origin_is_own = row
                             .try_get::<i16, _>("origin_node")
                             .is_ok_and(|origin| Some(origin) == own_node);
+                        let offered = row.try_get::<bool, _>("offered_here")?;
                         let coinbase = row
                             .try_get::<Option<String>, _>("coinbase_tx_hex")?
                             .and_then(|coinbase| hex::decode(coinbase).ok());
-                        if !self.found_here(coinbase.as_deref(), origin_is_own) {
+                        if !self.found_here(coinbase.as_deref(), origin_is_own, offered) {
                             effects.peer_first_confirmations += 1;
                         }
                     }
