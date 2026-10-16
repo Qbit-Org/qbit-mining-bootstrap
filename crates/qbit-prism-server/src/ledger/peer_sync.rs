@@ -1597,24 +1597,43 @@ impl Ledger {
 
     /// Record that this node's own log was proved complete on the server
     /// `evidence` names (D-8, D-17).
+    ///
+    /// `evidence` is what the server showed when recovery began; the update
+    /// applies only while it still shows it, in the same statement. Each step
+    /// of a recovery takes its own pooled connection, so a failover partway
+    /// could leave the recovered rows on the old primary while this lands on
+    /// the promoted one: then it refuses, and recovery runs again there.
     pub async fn record_own_log_verified(
         &self,
         evidence: super::node_identity::LineageEvidence,
     ) -> Result<()> {
-        let updated = sqlx::query(
+        let mut connection = self.acquire().await?;
+        let updated = sqlx::query(&format!(
             "UPDATE qbit_prism_node_lineage SET verified_system_identifier=$1,verified_timeline=$2,\
-             verified_at=clock_timestamp() WHERE singleton",
-        )
+             verified_at=clock_timestamp() WHERE singleton AND ({})=($1::bigint,$2::int)",
+            super::node_identity::LINEAGE_EVIDENCE_SQL.trim_start_matches("SELECT ")
+        ))
         .bind(evidence.system_identifier)
         .bind(evidence.timeline)
-        .execute(&mut *self.acquire().await?)
+        .execute(&mut *connection)
         .await?
         .rows_affected();
+        if updated == 1 {
+            return Ok(());
+        }
+        let lineage: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM qbit_prism_node_lineage WHERE singleton)",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
         ensure!(
-            updated == 1,
+            lineage,
             "this database has no qbit_prism_node_lineage row; run node-identity set first"
         );
-        Ok(())
+        bail!(
+            "this database's system identifier or WAL timeline changed during own-log recovery \
+             (a failover or restore); the verification is not recorded, and recovery runs again"
+        )
     }
 
     /// A conflict found outside an apply transaction.

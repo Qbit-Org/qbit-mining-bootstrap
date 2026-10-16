@@ -558,6 +558,18 @@ async fn the_own_log_latch_without_and_with_the_peer() -> Result<()> {
         let lineage = pair.a.node_lineage().await?.context("lineage")?;
         let (evidence, _) = lineage.verified.context("the verification was not recorded")?;
         ensure!(evidence == pair.a.lineage_evidence().await?);
+        // A verification is recorded only while the server still shows the
+        // evidence recovery began on: after a failover partway, it is not.
+        let moved = qbit_prism_server::ledger::LineageEvidence {
+            timeline: evidence.timeline + 1,
+            ..evidence
+        };
+        let refused = pair.a.record_own_log_verified(moved).await;
+        ensure!(
+            refused.as_ref().is_err_and(|error| error.to_string().contains("changed during own-log recovery")),
+            "{refused:?}"
+        );
+        ensure!(pair.a.node_lineage().await?.and_then(|lineage| lineage.verified).map(|(e, _)| e) == Some(evidence));
         // 3. A restart without the peer, on the same server: caught up at once.
         let (mut restarted, metrics) = sync(&pair.a, NodeIndex::A, &dead);
         let report = restarted.pass().await?;
