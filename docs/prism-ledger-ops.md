@@ -3082,7 +3082,18 @@ for `timestamptz`), the P2MR program is hex.
  "credit_policy":null,"writer_id":"…","writer_epoch":0}
 ```
 
-The manifest carries `schema` (`qbit.prism.share-archive.v1`), the recorded
+A 3.1 dual writer's rows also carry the node that originated them
+(`origin_node`, migration 027). It is written last, as `"origin_node":1`, only
+on a row that is not node A's, and such an archive declares
+`qbit.prism.share-archive.v2`. An archive whose rows are all node A's, which
+is every archive of a database that never ran a dual writer, stays v1 byte for
+byte, and a 3.0 binary still reads it. A restore writes each row, and an
+attached import each header mapping, under its archived origin, never the
+restoring database's own. Archive and restore a dual-writer database's
+partitions only with a 3.1 binary: an earlier one would drop the origins.
+
+The manifest carries `schema` (`qbit.prism.share-archive.v1`, or `v2` as
+above), the recorded
 bounds, what the rows hold (`row_count`, first and last `share_seq`, first and
 last `accepted_at_us`; zero rows is a valid archive), the digests and sizes of
 both the uncompressed stream and the file (`rows_sha256`, `rows_gz_sha256`,

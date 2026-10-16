@@ -1866,7 +1866,8 @@ fn manifest_schema(path: &std::path::Path) -> Result<String> {
 /// A partition holding a dual writer's peer rows (migration 027's
 /// `origin_node`) archives as v2, which carries each row's origin, and
 /// restores every row under the node that originated it, not the restoring
-/// database's own.
+/// database's own: standalone, and imported with its header mappings into a
+/// database personalised as the other node.
 #[tokio::test]
 async fn a_v2_archive_restores_each_rows_origin() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -1902,6 +1903,37 @@ async fn a_v2_archive_restores_each_rows_origin() -> Result<()> {
         .fetch_all(&ledger.pool)
         .await?;
         ensure!(origins == [(0, 200), (1, 50)], "restored origins: {origins:?}");
+
+        // Imported, attached, into a database personalised as node B: every
+        // row and every rebuilt header mapping keeps its own origin, not the
+        // destination's default.
+        sqlx::raw_sql(&format!(
+            "DROP TABLE {P0}; DELETE FROM qbit_prism_share_partitions WHERE partition_name='{P0}'; \
+             DELETE FROM qbit_prism_share_hashes; DELETE FROM qbit_prism_rejected_share_ids; \
+             UPDATE qbit_hashrate_rollup_progress SET last_share_seq=0; \
+             ALTER TABLE qbit_share_ledger ALTER COLUMN origin_node SET DEFAULT 1; \
+             ALTER TABLE qbit_prism_share_hashes ALTER COLUMN origin_node SET DEFAULT 1"
+        ))
+        .execute(&ledger.pool)
+        .await?;
+        let imported = archive::restore(&ledger, &manifest_path, root.path(), true).await?;
+        ensure!(imported["attached"] == true, "{imported}");
+        let origins: Vec<(i16, i64)> = sqlx::query_as(
+            "SELECT origin_node,count(*) FROM qbit_share_ledger WHERE share_seq<=250 GROUP BY origin_node ORDER BY origin_node",
+        )
+        .fetch_all(&ledger.pool)
+        .await?;
+        ensure!(origins == [(0, 200), (1, 50)], "imported origins: {origins:?}");
+        let (mismatched, peer_mappings): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE h.origin_node<>l.origin_node),count(*) FILTER (WHERE h.origin_node=1) \
+             FROM qbit_prism_share_hashes h JOIN qbit_share_ledger l USING (share_id)",
+        )
+        .fetch_one(&ledger.pool)
+        .await?;
+        ensure!(
+            mismatched == 0 && peer_mappings == 50,
+            "{mismatched} mappings differ from their share's origin; {peer_mappings} are node B's"
+        );
         Ok(ledger)
     }
     .await;

@@ -388,6 +388,13 @@ impl RowStream {
             self.lower_seq.map(|l| l.to_string()).unwrap_or_else(|| "MINVALUE".into()),
             self.upper_seq
         );
+        ensure!(
+            matches!(row.origin_node, 0 | 1),
+            "partition {} holds share_seq {} of origin_node {}; a dual-writer pair has nodes 0 and 1 only",
+            self.partition_name,
+            row.share_seq,
+            row.origin_node
+        );
         let line = row.line()?;
         self.hasher.update(&line);
         self.bytes += line.len() as u64;
@@ -2733,8 +2740,10 @@ async fn restore_import_hashes(
     retain_rejected_share_ids(tx, partition_name).await?;
     let mut after: Option<i64> = None;
     loop {
-        let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
-            "SELECT share_seq,share_id FROM {partition_name} \
+        // Each mapping takes its share's origin (migration 027), never the
+        // restoring database's default.
+        let rows: Vec<(i64, String, i16)> = sqlx::query_as(&format!(
+            "SELECT share_seq,share_id,origin_node FROM {partition_name} \
              WHERE accepted AND ($1::bigint IS NULL OR share_seq>$1) \
              ORDER BY share_seq LIMIT {RESTORE_BATCH_ROWS}"
         ))
@@ -2745,16 +2754,17 @@ async fn restore_import_hashes(
             return Ok(());
         }
         let mut mappings = std::collections::BTreeMap::new();
-        for (seq, share_id) in rows {
+        for (seq, share_id, origin) in rows {
             after = Some(seq);
             mappings
                 .entry(super::window::share_header_hash(&share_id))
-                .or_insert(share_id);
+                .or_insert((share_id, origin));
         }
-        let (hashes, share_ids): (Vec<_>, Vec<_>) = mappings.into_iter().unzip();
+        let (hashes, (share_ids, origins)): (Vec<_>, (Vec<_>, Vec<_>)) =
+            mappings.into_iter().unzip();
         let recorded = sqlx::query(&format!(
-            "INSERT INTO qbit_prism_share_hashes AS credited(header_hash,share_id) \
-             SELECT * FROM unnest($1::text[],$2::text[]) \
+            "INSERT INTO qbit_prism_share_hashes AS credited(header_hash,share_id,origin_node) \
+             SELECT * FROM unnest($1::text[],$2::text[],$3::smallint[]) \
              ON CONFLICT(header_hash) DO UPDATE SET share_id=credited.share_id \
              WHERE credited.share_id=EXCLUDED.share_id OR EXISTS (\
                  SELECT 1 FROM {partition_name} restored \
@@ -2762,6 +2772,7 @@ async fn restore_import_hashes(
         ))
         .bind(&hashes)
         .bind(&share_ids)
+        .bind(&origins)
         .execute(&mut **tx)
         .await?;
         ensure!(
