@@ -1006,7 +1006,8 @@ async fn builder_and_key_incompatibility_miss_before_window_or_build_admission()
     for kind in 0..4 {
         let mut stored = observation(&captured);
         match kind {
-            0 => stored.record.audit_builder_version += 1,
+            // A version this binary does not build (1 and 2 are its own).
+            0 => stored.record.audit_builder_version = 99,
             1 => stored.record.signer_keys.manifest_key_hex = hash(0x55),
             2 => stored.record.signer_keys.ledger_key_hex = hash(0x66),
             _ => stored

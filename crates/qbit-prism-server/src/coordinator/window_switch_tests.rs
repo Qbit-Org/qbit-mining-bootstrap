@@ -703,6 +703,35 @@ async fn builder_version_or_signer_mismatch_retries_without_a_rebuild() -> Resul
     result
 }
 
+/// A candidate stamped with the fee-cap builder version (#764) is this
+/// binary's to rebuild: it is neither refused nor drained, and it lands.
+/// Older binaries fence it, since their builder refuses capped fees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_candidate_at_the_fee_cap_builder_version_is_rebuilt_and_lands() -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut found = fixture.found(0)?;
+        found.candidate.audit_builder_version = qbit_prism::AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP;
+        let claim = fixture.enqueue_and_claim(&found).await?;
+        tokio::time::timeout(Duration::from_secs(30), fixture.process(&claim))
+            .await
+            .context("the fee-cap candidate did not finish")???;
+        let hash = &found.candidate.block_hash;
+        let (state, _, error) = fixture.row(hash).await?;
+        ensure!(
+            fixture.landed(hash).await?,
+            "the fee-cap candidate did not land: row {state}, {error:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
 // ---------------------------------------------------------------------------
 // The landed audit
 // ---------------------------------------------------------------------------

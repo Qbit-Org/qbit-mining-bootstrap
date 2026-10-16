@@ -505,9 +505,9 @@ async fn compact_reference_corruption_is_an_error_and_blobs_survive_collection()
             let prepared_key = &original.context.prepared.storage_key;
             let before = f.payload(prepared_key).await?;
             let mut incompatible = before.clone();
-            incompatible["audit_builder_version"] = json!(
-                before["audit_builder_version"].as_u64().context("builder version missing")? + 1
-            );
+            // A version this binary does not build (1 and 2 are its own).
+            ensure!(before["audit_builder_version"].is_u64(), "builder version missing");
+            incompatible["audit_builder_version"] = json!(99);
             f.replace_payload(prepared_key, &incompatible).await?;
             ensure!(f.b.resume_job(&worker, &original.wire.job_id).await?.is_none(), "incompatible builder silently rebuilt original work");
             f.replace_payload(prepared_key, &before).await?;

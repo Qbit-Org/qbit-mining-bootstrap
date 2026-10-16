@@ -192,7 +192,7 @@ impl Coordinator {
         let stored = CompactOwner::new(stored);
         // Compatibility is deliberate and checked before window/build I/O.
         // Use the same exact key equality as build_bundle, not case folding.
-        if stored.record.audit_builder_version != qbit_prism::AUDIT_BUILDER_VERSION
+        if !qbit_prism::audit_builder_version_supported(stored.record.audit_builder_version)
             || stored.record.signer_keys != local_signer_keys(&self.config)?
         {
             return Ok(None);

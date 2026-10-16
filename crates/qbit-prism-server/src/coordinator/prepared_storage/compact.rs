@@ -447,6 +447,13 @@ impl Coordinator {
                     )?,
                 };
                 let template = PreparedTemplate::encode(&source.template)?;
+                // A bundle whose fanout fee needed the floor cap is stamped with
+                // the version an older builder refuses (#764); the rest keep the
+                // captured one, with unchanged bytes.
+                let audit_builder_version = match body.as_ref() {
+                    Some(body) => body.audit_builder_version()?,
+                    None => source.inputs.audit_builder_version,
+                };
                 let record = CompactPrepared {
                     format_version: CompactPrepared::FORMAT_VERSION,
                     window,
@@ -464,7 +471,7 @@ impl Coordinator {
                     payout_policy: source.inputs.payout_policy,
                     ctv: source.inputs.ctv,
                     fee: source.fee,
-                    audit_builder_version: source.inputs.audit_builder_version,
+                    audit_builder_version,
                     signer_keys: source.inputs.signer_keys,
                     audit_hashes: hashes,
                 };

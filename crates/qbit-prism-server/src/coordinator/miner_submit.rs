@@ -349,7 +349,8 @@ pub(super) async fn submission_candidate(
             found_block: context.bundle.found_block.clone(),
             payout_policy: inputs.payout_policy.clone(),
             ctv: inputs.ctv.clone(),
-            audit_builder_version: inputs.audit_builder_version,
+            // The body the coinbase commits to, bootstrap work included.
+            audit_builder_version: context.bundle.audit_builder_version,
             signer_keys: inputs.signer_keys.clone(),
             leased: false,
             coinbase_suffix_hex: suffix,

@@ -120,7 +120,53 @@ pub const AUDIT_BUNDLE_SCHEMA_V1_1: &str = "qbit.prism.audit-bundle.v1.1";
 /// review then sees both. A release that bumps it ships a migration step whose
 /// refusal predicate counts `state='pending'` outbox rows at the old value, and
 /// the operator drains them with the old frontends first.
+///
+/// Version 2 is taken by [`AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP`], a stamp on
+/// fee-capped work beside this one, so the next canonical change goes to 3
+/// and must keep accepting (or drain) both 1 and 2.
 pub const AUDIT_BUILDER_VERSION: u16 = 1;
+
+/// The builder version stamped on work whose CTV fanout fee could only be
+/// paid with the payout-floor cap ([`apply_floor_capped_fanout_fee`]). The
+/// bytes of every bundle an older builder could build are unchanged, so those
+/// stay at [`AUDIT_BUILDER_VERSION`]; an older builder refuses a capped one, so
+/// this version keeps it from being rebuilt there (its fence wants its own
+/// version only). See [`audit_builder_version_for_parts`].
+pub const AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP: u16 = 2;
+
+/// Whether this builder rebuilds work stamped with `version`.
+pub fn audit_builder_version_supported(version: u16) -> bool {
+    version == AUDIT_BUILDER_VERSION || version == AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP
+}
+
+/// The builder version to stamp on work built with these settlement parts:
+/// [`AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP`] when any CTV fanout's fee could
+/// not be split proportionally without pushing a recipient below
+/// `min_output_sats` (the bundles an older builder refused), else
+/// [`AUDIT_BUILDER_VERSION`].
+pub fn audit_builder_version_for_parts(
+    settlement_mode_decision: Option<&SettlementModeDecision>,
+    ctv_fanout_fee_policy: Option<&FanoutFeeRatePolicy>,
+    min_output_sats: u64,
+) -> Result<u16, PrismError> {
+    let (Some(decision), Some(fee_policy)) = (settlement_mode_decision, ctv_fanout_fee_policy)
+    else {
+        return Ok(AUDIT_BUILDER_VERSION);
+    };
+    for chunk in &decision.fanout_chunks {
+        let fanout_fee_sats = estimate_ctv_fanout_fee_sats(chunk.recipients.len(), fee_policy)?;
+        // An older builder refused both a carried recipient and an error here.
+        let capped =
+            apply_proportional_fanout_fee(&chunk.recipients, fanout_fee_sats, min_output_sats)
+                .map_or(true, |decision| {
+                    !decision.carry_forward_recipients.is_empty()
+                });
+        if capped {
+            return Ok(AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP);
+        }
+    }
+    Ok(AUDIT_BUILDER_VERSION)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrismError {
@@ -444,6 +490,15 @@ impl Serialize for AuditBundle {
 }
 
 impl AuditBundle {
+    /// [`audit_builder_version_for_parts`] for this bundle.
+    pub fn audit_builder_version(&self) -> Result<u16, PrismError> {
+        audit_builder_version_for_parts(
+            self.settlement_mode_decision.as_ref(),
+            self.ctv_fanout_fee_policy.as_ref(),
+            self.payout_policy_manifest.min_output_sats,
+        )
+    }
+
     /// Split the bundle into its body and its payout window. Both halves are
     /// moved out; no share is copied.
     pub fn into_parts(self) -> (AuditBundleBody, Vec<AcceptedShare>) {
@@ -536,6 +591,15 @@ pub struct AuditBundleBody {
 }
 
 impl AuditBundleBody {
+    /// [`audit_builder_version_for_parts`] for this body.
+    pub fn audit_builder_version(&self) -> Result<u16, PrismError> {
+        audit_builder_version_for_parts(
+            self.settlement_mode_decision.as_ref(),
+            self.ctv_fanout_fee_policy.as_ref(),
+            self.payout_policy_manifest.min_output_sats,
+        )
+    }
+
     /// Assemble a bundle that owns `shares`. The window is moved in, not
     /// copied. Pass the window the body was built from; this does not check
     /// it, and [`verify_audit_bundle`] rejects a mismatched pair.

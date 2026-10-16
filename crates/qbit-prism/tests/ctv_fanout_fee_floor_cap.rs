@@ -14,11 +14,12 @@
 
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
-    apply_proportional_fanout_fee, build_audit_bundle_with_ctv_settlement_options,
-    estimate_ctv_fanout_fee_sats, verify_audit_bundle, AcceptedShare, CoinbaseOutputPolicy,
-    FanoutFeeRatePolicy, FoundBlock, PayoutPolicy, PoolFeePolicy, SettlementMode,
-    SettlementModeConfig, SettlementRecipient, DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS,
-    DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
+    apply_proportional_fanout_fee, audit_builder_version_supported,
+    build_audit_bundle_with_ctv_settlement_options, estimate_ctv_fanout_fee_sats,
+    verify_audit_bundle, AcceptedShare, CoinbaseOutputPolicy, FanoutFeeRatePolicy, FoundBlock,
+    PayoutPolicy, PoolFeePolicy, SettlementMode, SettlementModeConfig, SettlementRecipient,
+    AUDIT_BUILDER_VERSION, AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP,
+    DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS, DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
 };
 
 const FLOOR_SATS: u64 = 14_720;
@@ -27,7 +28,6 @@ const COINBASE_SATS: u64 = 19_200_000_000;
 const MINER_REWARD_SATS: u64 = 19_200_000_000 - 384_000_000;
 const NEAR_FLOOR_SATS: u64 = 14_721;
 const MID_SATS: u64 = 1_830_000;
-const WHALE_SATS: u64 = MINER_REWARD_SATS - MID_SATS - NEAR_FLOOR_SATS;
 
 fn program(byte: u8) -> String {
     hex::encode([byte; 32])
@@ -91,36 +91,7 @@ fn a_fanout_recipient_one_sat_above_the_floor_is_capped_at_its_slack_and_the_bun
         "miner-near"
     );
 
-    let signing_key = ManifestSigningKey::from_seed_hex(&"42".repeat(32)).unwrap();
-    let ledger_key = ManifestSigningKey::from_seed_hex(&"43".repeat(32)).unwrap();
-    let bundle = build_audit_bundle_with_ctv_settlement_options(
-        vec![
-            share(1, "miner-whale", 1, WHALE_SATS),
-            share(2, "miner-mid", 2, MID_SATS),
-            share(3, "miner-near", 3, NEAR_FLOOR_SATS),
-        ],
-        FoundBlock {
-            block_height: 100,
-            coinbase_value_sats: COINBASE_SATS,
-            network_difficulty: u128::from(MINER_REWARD_SATS / 8),
-            anchor_job_issued_at_ms: 1_000,
-        },
-        Vec::new(),
-        production_policy(),
-        DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
-        SettlementModeConfig {
-            max_coinbase_settlement_outputs: 16,
-            max_direct_coinbase_outputs: 12,
-            max_fanout_recipients_per_transaction: 1_000,
-            reserved_coinbase_outputs: 0,
-        },
-        Some(fee_policy),
-        Some("aaaaaaaa".to_string()),
-        Vec::new(),
-        &signing_key,
-        &ledger_key,
-    )
-    .unwrap();
+    let (bundle, ledger_key) = build(NEAR_FLOOR_SATS);
 
     let report = verify_audit_bundle(&bundle, &ledger_key.public_key_hex()).unwrap();
     assert_eq!(report.coinbase_value_sats, COINBASE_SATS);
@@ -176,4 +147,72 @@ fn a_fanout_recipient_one_sat_above_the_floor_is_capped_at_its_slack_and_the_bun
     let first_output = &bundle.signed_coinbase_manifest.manifest.outputs[0];
     assert_eq!(first_output.recipient_id, "pool-fee");
     assert_eq!(first_output.amount_sats, 384_000_000);
+}
+
+/// The production-settings build with the near-floor miner at `near_sats`.
+fn build(near_sats: u64) -> (qbit_prism::AuditBundle, ManifestSigningKey) {
+    let fee_policy = FanoutFeeRatePolicy::new(1_000, DEFAULT_CTV_FANOUT_FEE_PREMIUM_BPS);
+    let signing_key = ManifestSigningKey::from_seed_hex(&"42".repeat(32)).unwrap();
+    let ledger_key = ManifestSigningKey::from_seed_hex(&"43".repeat(32)).unwrap();
+    let bundle = build_audit_bundle_with_ctv_settlement_options(
+        vec![
+            share(
+                1,
+                "miner-whale",
+                1,
+                MINER_REWARD_SATS - MID_SATS - near_sats,
+            ),
+            share(2, "miner-mid", 2, MID_SATS),
+            share(3, "miner-near", 3, near_sats),
+        ],
+        FoundBlock {
+            block_height: 100,
+            coinbase_value_sats: COINBASE_SATS,
+            network_difficulty: u128::from(MINER_REWARD_SATS / 8),
+            anchor_job_issued_at_ms: 1_000,
+        },
+        Vec::new(),
+        production_policy(),
+        DEFAULT_DIRECT_COINBASE_PAYOUT_FLOOR_SATS,
+        SettlementModeConfig {
+            max_coinbase_settlement_outputs: 16,
+            max_direct_coinbase_outputs: 12,
+            max_fanout_recipients_per_transaction: 1_000,
+            reserved_coinbase_outputs: 0,
+        },
+        Some(fee_policy),
+        Some("aaaaaaaa".to_string()),
+        Vec::new(),
+        &signing_key,
+        &ledger_key,
+    )
+    .unwrap();
+    (bundle, ledger_key)
+}
+
+/// Only a build that needed the floor cap is stamped with the fee-cap builder
+/// version, which an older binary's fence refuses (its builder refuses the
+/// cap). Every other build keeps version 1 and its unchanged bytes, which
+/// both older and newer binaries rebuild.
+#[test]
+fn only_a_capped_build_carries_the_fee_cap_builder_version() {
+    let (capped, _) = build(NEAR_FLOOR_SATS);
+    assert_eq!(
+        capped.audit_builder_version().unwrap(),
+        AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP
+    );
+    let (uncapped, _) = build(NEAR_FLOOR_SATS + 10_000);
+    assert_eq!(
+        uncapped.audit_builder_version().unwrap(),
+        AUDIT_BUILDER_VERSION
+    );
+    // This binary rebuilds both; an older one rebuilds only its own version.
+    let older = |version: u16| version == AUDIT_BUILDER_VERSION;
+    assert!(audit_builder_version_supported(AUDIT_BUILDER_VERSION));
+    assert!(audit_builder_version_supported(
+        AUDIT_BUILDER_VERSION_FANOUT_FEE_CAP
+    ));
+    assert!(!audit_builder_version_supported(99));
+    assert!(older(uncapped.audit_builder_version().unwrap()));
+    assert!(!older(capped.audit_builder_version().unwrap()));
 }

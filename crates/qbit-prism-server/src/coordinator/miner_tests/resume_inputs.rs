@@ -29,7 +29,8 @@ fn issued_inputs_preserve_stored_identity_and_config_errors() {
         stored.issued_inputs(&config).unwrap().unwrap(),
         stored.inputs.as_ref().unwrap(),
     ));
-    stored.inputs.as_mut().unwrap().audit_builder_version += 1;
+    // A version this binary does not build (1 and 2 are its own).
+    stored.inputs.as_mut().unwrap().audit_builder_version = 99;
     assert!(stored.issued_inputs(&config).unwrap().is_none());
     config.manifest_seed = "invalid".into();
     assert!(stored.issued_inputs(&config).is_err());
@@ -166,7 +167,8 @@ async fn stored_builder_version_mismatch_is_a_resume_miss() {
         // Model an issued row from a different binary without changing its
         // original bundle or hashes. The bundle itself cannot prove this.
         edit_prepared(&f, &issued, |payload| {
-            payload["audit_builder_version"] = json!(qbit_prism::AUDIT_BUILDER_VERSION + 1);
+            // A version this binary does not build (1 and 2 are its own).
+            payload["audit_builder_version"] = json!(99);
         });
         assert_miss(&f, &issued).await;
     }
