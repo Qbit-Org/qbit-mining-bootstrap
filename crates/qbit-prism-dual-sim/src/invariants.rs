@@ -1125,20 +1125,63 @@ async fn fanouts_identical(
         .bind(&hashes)
         .fetch_all(pool)
         .await?;
-        // Each artifact must be the bundle's own manifest transaction.
+        // Each artifact must be one of the bundle's own signed manifests in
+        // every immutable field the landing copies from it (ledger/blocks.rs,
+        // persist_fanouts), its digests recomputing, not just its transaction.
         let mismatched: Vec<String> = sqlx::query_scalar(
             "SELECT fa.fanout_txid FROM qbit_ctv_fanout_artifacts fa \
              JOIN qbit_pool_audit_bundles a ON a.block_hash = fa.block_hash \
+             LEFT JOIN qbit_ctv_fanout_sets f ON f.block_hash = fa.block_hash \
              WHERE fa.block_hash = ANY($1) AND NOT EXISTS ( \
                SELECT 1 FROM jsonb_array_elements(a.audit_bundle #> '{ctv_fanout_manifest_set,manifests}') m \
-               WHERE m->>'fanout_tx_hex' = fa.fanout_tx_hex)",
+               WHERE fa.manifest = m AND fa.manifest_json::jsonb = m \
+                 AND fa.manifest_sha256 = encode(sha256(convert_to(fa.manifest_json, 'UTF8')), 'hex') \
+                 AND fa.manifest_set_sha256 IS NOT DISTINCT FROM f.manifest_set_sha256 \
+                 AND fa.fanout_txid = m->>'fanout_txid' \
+                 AND fa.precommitment_sha256 = m->>'precommitment_sha256_hex' \
+                 AND fa.ctv_hash = m #>> '{precommitment,ctv_hash_hex}' \
+                 AND fa.commitment_witness_leaf_hex = m->>'commitment_witness_leaf_hex' \
+                 AND fa.chunk_index = (m #>> '{precommitment,chunk_index}')::int \
+                 AND fa.chunk_count = (m #>> '{precommitment,chunk_count}')::int \
+                 AND fa.parent_coinbase_txid = m->>'parent_coinbase_txid' \
+                 AND fa.parent_coinbase_vout = (m->>'parent_coinbase_vout')::int \
+                 AND fa.fanout_tx_template_hex = m #>> '{precommitment,fanout_tx_template_hex}' \
+                 AND fa.fanout_tx_hex = m->>'fanout_tx_hex' \
+                 AND fa.anchor_vout IS NOT DISTINCT FROM (m #>> '{precommitment,anchor_vout}')::int \
+                 AND fa.covenant_output_value_sats = (m->>'covenant_output_value_sats')::bigint \
+                 AND fa.fanout_output_sum_sats = (m #>> '{precommitment,fanout_output_sum_sats}')::bigint)",
         )
         .bind(&hashes)
         .fetch_all(pool)
         .await?;
         for txid in mismatched {
             check.problem(format!(
-                "fanout {txid} on node {node:?} is not one of its bundle's manifests"
+                "fanout {txid} on node {node:?} is not one of its bundle's signed manifests in \
+                 every field"
+            ));
+        }
+        // And the set row is the bundle's signed manifest set.
+        let sets: Vec<String> = sqlx::query_scalar(
+            "SELECT f.block_hash FROM qbit_ctv_fanout_sets f \
+             JOIN qbit_pool_audit_bundles a ON a.block_hash = f.block_hash \
+             WHERE f.block_hash = ANY($1) AND NOT ( \
+               f.manifest_set = a.audit_bundle->'ctv_fanout_manifest_set' \
+               AND f.manifest_set_json::jsonb = f.manifest_set \
+               AND f.manifest_set_sha256 = encode(sha256(convert_to(f.manifest_set_json, 'UTF8')), 'hex') \
+               AND f.settlement_mode = f.manifest_set->>'settlement_mode' \
+               AND f.parent_coinbase_txid = f.manifest_set->>'parent_coinbase_txid' \
+               AND f.parent_coinbase_tx_hex = f.manifest_set #>> '{manifests,0,parent_coinbase_tx_hex}' \
+               AND f.fanout_count = (f.manifest_set->>'fanout_count')::int \
+               AND f.fanout_output_sum_sats = (f.manifest_set->>'fanout_output_sum_sats')::bigint \
+               AND f.covenant_output_value_sats = (f.manifest_set->>'covenant_output_value_sats')::bigint)",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        for block in sets {
+            check.problem(format!(
+                "the fanout set of {block} on node {node:?} is not its bundle's signed manifest \
+                 set in every field"
             ));
         }
         by_node.insert(*node, rows);
