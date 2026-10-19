@@ -197,7 +197,11 @@ impl Ledger {
         // append's `ledger_clock_ms` UPDATE, which holds ORDER_LOCK while it
         // waits and would otherwise queue every share behind this cohort.
         // Check authority only after acquiring it; this path must never
-        // acquire either advisory lock while holding it.
+        // acquire either advisory lock while holding it. Migration 027's sync
+        // barrier, which the `sync_seq` default takes shared, is not one of
+        // them: its only exclusive holder is the peer's single statement
+        // `qbit_prism_sync_barrier()`, which tries and never waits, so a wait
+        // on it ends with that statement and joins no cycle.
         let fingerprint: Option<String> = sqlx::query_scalar(
             "SELECT config_fingerprint FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE",
         )

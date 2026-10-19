@@ -168,7 +168,7 @@ pub struct MigrateOptions {
     /// [`ShareHashBackfill::Finish`] or, with `--defer-share-hashes`,
     /// [`ShareHashBackfill::Defer`].
     pub share_hashes: ShareHashBackfill,
-    /// How 013's and 024's indexes are built: concurrently, or for
+    /// How 013's, 024's and 031's indexes are built: concurrently, or for
     /// `migrate --offline-indexes` plainly in one transaction, which
     /// refuses a live instance.
     pub index_build: IndexBuildMode,
@@ -204,6 +204,8 @@ impl Ledger {
             session_owner: std::sync::Arc::new(SessionOwner::new_for_tests()),
             metrics: None,
             config_fingerprint: std::sync::Arc::default(),
+            dual_writer_identity: std::sync::Arc::default(),
+            own_log_lost: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
             compact_decode_hook: Default::default(),
@@ -316,8 +318,8 @@ impl Ledger {
     /// is `options.share_hashes`'s ([`ShareHashBackfill::Finish`] or, with
     /// `--defer-share-hashes`, [`ShareHashBackfill::Defer`]), so it is the
     /// one connect that finishes a backfill that permits serving, and with
-    /// `--offline-indexes` it builds 013's and 024's indexes plainly, once
-    /// no instance is live.
+    /// `--offline-indexes` it builds 013's, 024's and 031's indexes plainly,
+    /// once no instance is live.
     pub async fn connect_migrate(url: &str, options: impl Into<MigrateOptions>) -> Result<Self> {
         Self::connect_as_operator(url, true, options.into()).await
     }
@@ -408,7 +410,7 @@ impl Ledger {
             // database with 2 unrecorded once that has permitted serving;
             // the operator's plain `migrate` maps the rest after the others.
             for pending in &online {
-                // 013 and 024 build concurrently unless `migrate
+                // 013, 024 and 031 build concurrently unless `migrate
                 // --offline-indexes` asked for plain builds (`connect_migrate`).
                 migration::apply_online_migration(
                     &pool,
@@ -437,6 +439,8 @@ impl Ledger {
             }),
             metrics,
             config_fingerprint: std::sync::Arc::default(),
+            dual_writer_identity: std::sync::Arc::default(),
+            own_log_lost: std::sync::Arc::default(),
             claim_observer: std::sync::Arc::default(),
             fanout_claim_observer: std::sync::Arc::default(),
             #[cfg(test)]
@@ -510,6 +514,45 @@ impl Ledger {
         // for job persistence) against this value.
         let _ = self.config_fingerprint.set(fingerprint.to_owned());
         Ok(())
+    }
+
+    /// Record this frontend's dual-writer identity, from `PRISM_NODE_INDEX`
+    /// and `PRISM_CARRY_OWNER`, before any task uses this ledger. Every clone
+    /// sees it. A second call with another identity is refused.
+    pub fn set_dual_writer_identity(
+        &self,
+        identity: crate::node_identity::NodeIdentity,
+    ) -> Result<()> {
+        let recorded = self.dual_writer_identity.get_or_init(|| identity);
+        ensure!(
+            *recorded == identity,
+            "this ledger already serves dual-writer node {}",
+            recorded.node
+        );
+        Ok(())
+    }
+
+    /// The dual-writer identity this frontend runs as; `None` for a single
+    /// writer, whose behaviour is 3.0's.
+    pub fn dual_writer_identity(&self) -> Option<crate::node_identity::NodeIdentity> {
+        self.dual_writer_identity.get().copied()
+    }
+
+    /// Record whether this node's own log is lost (D-8): the peer sync sets
+    /// it when the database showed rollback evidence while the frontend ran,
+    /// a restore under it, and then stops the frontend. Its sequences may sit
+    /// below rows of its own the peer holds, so until the process exits no
+    /// share is appended, a credited deferred share included. Only a running
+    /// peer sync sets it, so a ledger without one, a single writer's
+    /// included, never refuses.
+    pub fn set_own_log_lost(&self, lost: bool) {
+        self.own_log_lost
+            .store(lost, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this node's own log is lost; see [`Ledger::set_own_log_lost`].
+    pub fn own_log_lost(&self) -> bool {
+        self.own_log_lost.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The cluster fingerprint this frontend pinned or verified in

@@ -24,6 +24,24 @@ pub struct AppendResult {
     pub captured: bool,
 }
 
+/// The share append refused before any statement: this node's database was
+/// restored or changed identity under the running frontend (D-8, D-9), see
+/// [`Ledger::set_own_log_lost`].
+#[derive(Debug)]
+pub struct OwnLogLost;
+
+impl std::fmt::Display for OwnLogLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this node's database was restored or changed identity under the running frontend \
+             (D-8, D-9): no share is appended until the frontend has stopped; its restart checks \
+             the database again first",
+        )
+    }
+}
+
+impl std::error::Error for OwnLogLost {}
+
 /// The pre-commit hook of [`Ledger::append_at_revision_gated`] refused COMMIT.
 /// COMMIT was never sent and the transaction was rolled back.
 #[derive(Debug)]
@@ -646,6 +664,9 @@ impl Ledger {
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
         moved: MovedRevision,
     ) -> Result<AppendResult> {
+        if self.own_log_lost() {
+            return Err(OwnLogLost.into());
+        }
         // The ACK path is the incident path. A block-solving share's candidate
         // is serialized, digested and checked here, before the transaction
         // opens and off the runtime, so `ORDER_LOCK` is held only for the
@@ -904,6 +925,9 @@ impl Ledger {
         tx: &mut Transaction<'_, Postgres>,
         share: AcceptedShare,
     ) -> Result<AppendResult> {
+        if self.own_log_lost() {
+            return Err(OwnLogLost.into());
+        }
         let share = validated_share(share)?;
         let probe = Self::read_append_probe(tx, &share).await?;
         self.append_probed(tx, share, probe).await

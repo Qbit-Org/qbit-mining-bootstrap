@@ -78,6 +78,62 @@ pub async fn run(config: Config) -> Result<()> {
         move || stats.accepted_submissions()
     });
     let coordinator = Coordinator::new(config, registry.clone()).await?;
+    // 3.1 dual writer. A frontend never personalises its database
+    // (`node-identity set` does, CONTRACT D-9): it checks it. A database
+    // personalised as this node whose defaults or key sequences have been
+    // changed since would write rows under the wrong identity, so it is
+    // refused. One not personalised, or personalised as the other node, is
+    // reported: the frontend runs, but the peer sync refuses to start and the
+    // frontend never becomes ready. A single writer refuses a database that
+    // has run as a dual-writer node, unless the rollback says so (D-12).
+    // A dual writer, or a single writer on a personalised database, sweeps
+    // the rollups as a dual writer does.
+    let dual_writer_sweep = match &coordinator.config.dual_writer {
+        Some(dual) => {
+            let node = dual.identity.node;
+            match coordinator.ledger.check_node_identity(node).await? {
+                crate::ledger::IdentityCheck::Ready(record) => tracing::info!(
+                    node = %record.node,
+                    carry_owner = dual.identity.carry_owner,
+                    recorded_at = %record.recorded_at,
+                    "dual-writer node identity"
+                ),
+                crate::ledger::IdentityCheck::Drifted(record, drift) => anyhow::bail!(
+                    "this database is dual-writer node {}, but {} changed since it was \
+                     personalised; run `qbit-prism-server node-identity set --index {}` again \
+                     before starting",
+                    record.node,
+                    drift.join(", "),
+                    node.index()
+                ),
+                crate::ledger::IdentityCheck::Unidentified => tracing::error!(
+                    node = %node,
+                    "ALERT: this database has no dual-writer node identity: run \
+                     `qbit-prism-server node-identity set --index {}` on it; until then the peer \
+                     sync does not run and this frontend admits no miners",
+                    node.index()
+                ),
+                crate::ledger::IdentityCheck::OtherNode(record) => tracing::error!(
+                    node = %node,
+                    database_node = %record.node,
+                    "ALERT: PRISM_DATABASE_URL names dual-writer node {}'s database, not this \
+                     node's; the peer sync does not run and this frontend admits no miners. If \
+                     it is a physical copy of that database rebuilt for this node, stop this \
+                     frontend and run `qbit-prism-server node-identity repersonalise --index {}`",
+                    record.node,
+                    node.index()
+                ),
+            }
+            true
+        }
+        None => {
+            coordinator
+                .ledger
+                .refuse_single_writer_on_dual_ledger(config::dual_writer_downgrade()?)
+                .await?;
+            coordinator.ledger.recorded_node_identity().await?.is_some()
+        }
+    };
     coordinator.landing_trim.set_enabled(landing_trim);
     tracing::info!(
         enabled = landing_trim,
@@ -130,35 +186,69 @@ pub async fn run(config: Config) -> Result<()> {
         None
     };
     let mut tasks = JoinSet::new();
-    tasks.spawn(runtime.track(
-        TaskKind::StratumListener,
-        run_listener(
+    // 3.1 dual writer: the peer sync, and the own-log latch (D-8) that the
+    // tasks writing this node's own rows wait for: the Stratum listeners
+    // (share appends), the refresh (prepared work, reconciliation) and the
+    // submit loop (landings). A node restored from an old backup pulls its
+    // own rows back from the peer first, so none of them reuses a key the
+    // peer already holds. A single writer waits for nothing.
+    let own_log = match &config.dual_writer {
+        Some(dual) => {
+            let (sync, status) = crate::peer_sync::PeerSync::new(
+                (*coordinator.ledger).clone(),
+                dual,
+                Some(registry.clone()),
+            );
+            let _ = coordinator.peer_sync.set(status.clone());
+            tasks.spawn(sync.run(shutdown_rx.clone()));
+            Some(status)
+        }
+        None => None,
+    };
+    tasks.spawn(runtime.track(TaskKind::StratumListener, {
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
+        let listener = run_listener(
             primary,
             stratum_config,
             coordinator.clone(),
             coordinator.refresh.subscribe(),
             shutdown_rx.clone(),
             registry.clone(),
-        ),
-    ));
+        );
+        async move {
+            if !caught_up.await {
+                return Ok(());
+            }
+            listener.await
+        }
+    }));
     if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
-        tasks.spawn(runtime.track(
-            TaskKind::StratumListener,
-            run_listener(
+        tasks.spawn(runtime.track(TaskKind::StratumListener, {
+            let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
+            let listener = run_listener(
                 listener,
                 highdiff,
                 coordinator.clone(),
                 coordinator.refresh.subscribe(),
                 shutdown_rx.clone(),
                 registry.clone(),
-            ),
-        ));
+            );
+            async move {
+                if !caught_up.await {
+                    return Ok(());
+                }
+                listener.await
+            }
+        }));
     }
     tasks.spawn(runtime.track(TaskKind::Refresh, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
         async move {
-            coordinator.refresh_loop(rx).await;
+            if caught_up.await {
+                coordinator.refresh_loop(rx).await;
+            }
             Ok(())
         }
     }));
@@ -167,8 +257,11 @@ pub async fn run(config: Config) -> Result<()> {
     tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
         async move {
-            coordinator.submit_loop(rx).await;
+            if caught_up.await {
+                coordinator.submit_loop(rx).await;
+            }
             Ok(())
         }
     }));
@@ -193,6 +286,15 @@ pub async fn run(config: Config) -> Result<()> {
         config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
+        // On a personalised database a peer sync may insert late shares, its
+        // own frontend's or another one's (a rollback in progress, or a
+        // frontend started without PRISM_DUAL_WRITER beside a dual writer),
+        // so the sweep takes the progress row first, as a dual writer's does.
+        let settings = if dual_writer_sweep {
+            settings.for_dual_writer()
+        } else {
+            settings
+        };
         tasks.spawn(runtime.track(
             TaskKind::Rollup,
             crate::rollups::run_with_metrics(
@@ -274,6 +376,18 @@ pub async fn run(config: Config) -> Result<()> {
         result=tasks.join_next()=>{Some(match result {Some(Ok(Err(error)))=>error,Some(Err(error))=>error.into(),_=>anyhow::anyhow!("critical PRISM task exited")})}
     };
     shutdown.send_replace(true);
+    // A database restored, promoted or re-identified under the running
+    // frontend (D-8, D-9): nothing drains. Every task is cancelled at once,
+    // and its open transaction rolls back, so none commits another own row
+    // unless its COMMIT was already sent. The restart runs every startup
+    // check again.
+    if failure.as_ref().is_some_and(|failure| {
+        failure
+            .downcast_ref::<crate::peer_sync::FrontendStop>()
+            .is_some()
+    }) {
+        tasks.abort_all();
+    }
     // Connections drain before pooled DB handles close; queued block intents
     // remain durable and can be claimed immediately after their lease expires.
     if tokio::time::timeout(Duration::from_secs(30), async {
@@ -317,6 +431,22 @@ pub async fn run(config: Config) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// 3.1 dual writer (D-8): true once the own log is caught up, false if the
+/// shutdown comes first. A single writer (`None`) never waits.
+async fn wait_for_own_log(
+    status: Option<watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    let Some(mut status) = status else {
+        return true;
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => false,
+        caught_up = status.wait_for(|status| status.own_log_caught_up) => caught_up.is_ok(),
+    }
 }
 
 // One operation ends at publication; subsequent database maintenance is not

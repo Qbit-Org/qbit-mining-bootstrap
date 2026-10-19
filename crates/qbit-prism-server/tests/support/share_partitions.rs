@@ -24,18 +24,23 @@ use tokio::time::{sleep, timeout};
 /// The default partition width, `qbit_prism_share_partitioning.partition_rows`.
 pub(super) const WIDTH: i64 = 16_777_216;
 
-const PARENT_INDEXES: [&str; 5] = [
+/// The parent's indexes: the release names 017 keeps, and 031's
+/// (origin_node, share_seq) index, which every migrate here applies after
+/// 017.
+const PARENT_INDEXES: [&str; 6] = [
     "qbit_share_ledger_accepted_block_suffix_idx",
     "qbit_share_ledger_accepted_miner_history_idx",
     "qbit_share_ledger_accepted_recent_idx",
     "qbit_share_ledger_accepted_seq_walk_idx",
+    "qbit_share_ledger_origin_seq_idx",
     "qbit_share_ledger_pkey",
 ];
-const LEAF_SUFFIXES: [&str; 6] = [
+const LEAF_SUFFIXES: [&str; 7] = [
     "_accepted_block_suffix_idx",
     "_accepted_miner_history_idx",
     "_accepted_recent_idx",
     "_accepted_seq_walk_idx",
+    "_origin_seq_idx",
     "_pkey",
     "_share_id_key",
 ];
@@ -126,8 +131,9 @@ async fn insert_share<'e>(
 }
 
 /// Everything the conversion leaves, on either path: a partitioned parent
-/// with the release index names, the release table as `_p0` with the leaf
-/// set (its own share_id uniqueness included), every attached partition in
+/// with the release index names (and 031's, built after it), the release
+/// table as `_p0` with the leaf set (its own share_id uniqueness and 031's
+/// leaf included), every attached partition in
 /// the catalog and the catalog's attached rows attached, the immutability
 /// trigger on the parent and every leaf, the release function returning
 /// the parent's row type, and 17 recorded after every other version.
@@ -202,6 +208,9 @@ pub(super) async fn undo_017(pool: &PgPool) -> Result<()> {
         relkind(pool, "qbit_share_ledger").await?.as_deref() == Some("p"),
         "undo_017 needs a converted ledger"
     );
+    // 031's index lives on these partitions: it goes first, and the next
+    // migrate builds it again after 017.
+    super::origin_index::undo_031(pool).await?;
     let versions = schema_versions(pool).await?;
     ensure!(versions.contains(&17));
     sqlx::raw_sql(

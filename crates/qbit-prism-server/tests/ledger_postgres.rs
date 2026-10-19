@@ -53,6 +53,9 @@ mod index_trim;
 #[path = "support/share_partitions.rs"]
 mod share_partitions;
 
+#[path = "support/origin_index.rs"]
+mod origin_index;
+
 #[path = "support/share_hash_backfill.rs"]
 mod share_hash_backfill;
 

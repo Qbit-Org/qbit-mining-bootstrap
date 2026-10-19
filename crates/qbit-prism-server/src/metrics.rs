@@ -222,6 +222,8 @@ impl Metrics {
         // Owner-dependent hooks are declared without inventing observations.
         // The rollup lag joins them: a disabled rollup publishes no pass, and an
         // absent sample is not the same claim as a lag of -1.
+        // 3.1 dual writer (D1): only a dual-writer frontend's peer sync
+        // publishes these, so a single writer declares them without samples.
         for family in [
             Family::FirstOffer,
             Family::LockWait,
@@ -229,6 +231,17 @@ impl Metrics {
             Family::RefreshSeconds,
             Family::RollupLag,
             Family::LandingTrimSeconds,
+            Family::PeerSyncReachable,
+            Family::PeerSyncOwnLogCaughtUp,
+            Family::PeerSyncRollbackEvidence,
+            Family::PeerSyncRefused,
+            Family::PeerSyncPath,
+            Family::PeerSyncLagRows,
+            Family::PeerSyncLagSeconds,
+            Family::PeerSyncRows,
+            Family::PeerSyncConflicts,
+            Family::PeerSyncFailures,
+            Family::PeerSyncOfferWaits,
         ] {
             registry.declare(family);
         }

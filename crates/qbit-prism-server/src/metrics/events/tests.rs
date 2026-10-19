@@ -185,3 +185,31 @@ async fn concurrent_observations_keep_every_outcome() {
     }
     assert_eq!(counts(&metrics), (16., 16.));
 }
+
+/// D5's paging rules alert on an increase: a dual-writer frontend's peer
+/// sync counters exist at 0 for every label from the start, and a single
+/// writer has none.
+#[test]
+fn a_dual_writer_peer_sync_starts_every_counter_at_zero() {
+    let single = Metrics::default();
+    assert!(!single
+        .render()
+        .contains("qbit_prism_peer_sync_conflicts_total{"));
+    let metrics = Metrics::default();
+    metrics.start_peer_sync();
+    let body = metrics.render();
+    for table in crate::peer_sync::COPIED_TABLES {
+        for family in ["rows", "conflicts"] {
+            let line = format!("qbit_prism_peer_sync_{family}_total{{table=\"{table}\"}} 0\n");
+            assert!(body.contains(&line), "missing {line}");
+        }
+    }
+    for path in ["primary", "fallback"] {
+        let line = format!("qbit_prism_peer_sync_failures_total{{path=\"{path}\"}} 0\n");
+        assert!(body.contains(&line), "missing {line}");
+    }
+    for outcome in ["confirmed", "timed_out", "unreachable"] {
+        let line = format!("qbit_prism_peer_sync_offer_waits_total{{outcome=\"{outcome}\"}} 0\n");
+        assert!(body.contains(&line), "missing {line}");
+    }
+}
