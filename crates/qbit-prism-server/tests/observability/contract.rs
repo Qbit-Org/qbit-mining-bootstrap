@@ -394,6 +394,20 @@ pub fn expected(populated: bool) -> Census {
         if populated { &peer_checks } else { &[] },
         &[],
     );
+    // 3.1 admission and dual-writer readiness: declared, and sampled only
+    // once dual-writer mode or the readiness endpoint exposes admission.
+    for (name, kind) in [
+        ("admission_admitting", "gauge"),
+        ("admission_state", "gauge"),
+        ("admission_withdrawals_total", "counter"),
+        ("stratum_listener_accepting", "gauge"),
+        ("dual_writer_writer_path", "gauge"),
+        ("dual_writer_node_index", "gauge"),
+        ("dual_writer_carry_owner", "gauge"),
+        ("readiness_requests_total", "counter"),
+    ] {
+        result.family(name, kind, &[], &[]);
+    }
     result
 }
 
