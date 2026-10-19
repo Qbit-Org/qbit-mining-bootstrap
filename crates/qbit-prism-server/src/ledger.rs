@@ -66,6 +66,7 @@ pub use instances::{HeartbeatHealth, HeartbeatStatus};
 pub use standby_durability::{
     OfferStandbyReport, OfferStandbyWait, StandbyDurability, StandbyWait,
 };
+pub(crate) use submission_hold::health_reads_with;
 pub use submission_hold::{SubmissionHeld, SubmissionHold, SubmissionHoldCleared};
 mod jobs;
 pub use jobs::{

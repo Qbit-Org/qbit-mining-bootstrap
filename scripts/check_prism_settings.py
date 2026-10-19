@@ -61,6 +61,7 @@ def check(root):
         "PRISM_MANIFEST_SIGNING_SEED_HEX",
         "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX",
         "PRISM_OPERATOR_BEARER_TOKEN",
+        "PRISM_READINESS_TOKEN",
     ))
     missing = referenced - known
     if missing:

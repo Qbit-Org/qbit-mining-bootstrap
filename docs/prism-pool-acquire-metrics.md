@@ -229,6 +229,7 @@ The following exclusions are intentional and remain visible in the inventory:
 | Public HTTP reads and readiness probes | Public API: isolated read pools; the public role's metric export policy requires a separate decision. |
 | Private audit HTTP endpoints and shared API read-model helpers | Operator API: private routes can retain the run-role pool, while public dispatch substitutes its isolated read pool. These HTTP queries remain excluded even when served by the run process. |
 | Pool-only audit, partition and rollup wrappers, including `lead_rows` | Compatibility APIs: no attached metrics owner. The server uses metrics-aware maintenance; its headroom collector reads within an already timed transaction. |
+| The dual-writer health pool (3.1): the writer probe and the health reads | Dual-writer readiness: the frontend's own two-connection pool, with a 2 s acquire timeout and one retry on a fresh connection; never a checkout from the run pool, and kept out of the histogram so it stays the run pool's saturation signal. |
 
 Pool creation and idle connection replenishment are not acquisition attempts
 observed by this helper. Ledgers created without telemetry record nothing.
