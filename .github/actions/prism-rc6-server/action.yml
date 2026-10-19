@@ -1,0 +1,69 @@
+name: Build the pinned 3.0.0-rc.6 server
+description: >-
+  Build qbit-prism-server from the 3.0.0-rc.6 release's commit, once per pin
+  (cached under its commit), check that it reports that version, and export
+  its path as PRISM_TEST_RC6_SERVER_BIN. The pre-migrate scenarios of
+  crates/qbit-prism-dual-sim (R1) run rc.6's frontends and rc.6's own
+  migrate beside this branch's migrate. The commit is the v3.0.0-rc.6 tag
+  (81c592c3), the release the pair serves until the 3.1 repin.
+
+inputs:
+  commit:
+    description: The rc.6 commit to build.
+    default: 81c592c38c3c02ceab5b2b1f925125f59f49324d
+  version:
+    description: What the built server must print for --version.
+    default: qbit-prism-server 3.0.0-rc.6
+
+runs:
+  using: composite
+  steps:
+    - name: Restore the rc.6 server from the cache
+      id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cache/prism-rc6-server
+        key: prism-rc6-server-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.commit }}
+
+    # A worktree of the pinned commit, built into its own target directory,
+    # so nothing of this branch's build is reused or overwritten.
+    - name: Build the rc.6 server
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        COMMIT: ${{ inputs.commit }}
+      run: |
+        set -euo pipefail
+        src="${RUNNER_TEMP}/prism-rc6-src"
+        target="${RUNNER_TEMP}/prism-rc6-target"
+        git fetch --no-tags --depth=1 origin "${COMMIT}"
+        git worktree add --detach "${src}" "${COMMIT}"
+        (cd "${src}" && CARGO_TARGET_DIR="${target}" \
+          cargo build --locked -p qbit-prism-server --bin qbit-prism-server)
+        mkdir -p "${HOME}/.cache/prism-rc6-server"
+        install -m 0755 "${target}/debug/qbit-prism-server" \
+          "${HOME}/.cache/prism-rc6-server/qbit-prism-server"
+        git worktree remove --force "${src}"
+        rm -rf "${target}"
+
+    - name: Check the rc.6 server and export its path
+      shell: bash
+      env:
+        EXPECTED: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        server="${HOME}/.cache/prism-rc6-server/qbit-prism-server"
+        version="$("${server}" --version)"
+        printf '%s\n' "${version}"
+        if [ "${version}" != "${EXPECTED}" ]; then
+          printf 'the pinned rc.6 server reports %s, not %s\n' "${version}" "${EXPECTED}" >&2
+          exit 1
+        fi
+        printf 'PRISM_TEST_RC6_SERVER_BIN=%s\n' "${server}" >> "${GITHUB_ENV}"
+
+    - name: Save the rc.6 server to the cache
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/prism-rc6-server
+        key: prism-rc6-server-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.commit }}

@@ -955,6 +955,18 @@ runs = true
 tests = ["qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill"]
 
 [[scenario]]
+id = "dual-writer-r01-rc6-premigrate"
+title = "R1: the 3.0 pair keeps serving on 3.0.0-rc.6 while 3.1's migrate takes its database to 27, 28 and 31"
+owner = "#761"
+lanes = ["nightly", "pr"]
+criteria = "On the 3.0 pair with both frontends on 3.0.0-rc.6 (its database migrated by rc.6's own migrate, every start with PRISM_POSTGRES_INIT_SCHEMA=0), under load: A lands a block at schema 26; 3.1's migrate then runs once as a one-off command with A's frontend environment while a reader holds a snapshot, so 031's CREATE INDEX CONCURRENTLY waits part-way. 027 and 028 commit with every share sent meanwhile answered, none refused for anything but superseded work and none waiting 5 s; appends continue during the build; A lands a block; A's frontend restarts and serves with 31 unrecorded and the index invalid, warning of 27 and 28. Once the reader ends, migrate reports 31 ready, the index is valid on the writer and, by replication, on the standby; B's frontend restarts and serves at 31, warning of 27, 28 and 31; A lands a block, and rc.6's landings and jobs after 027 take its defaults (node 0, a sync_seq). No frontend statement is cancelled, and the checker's invariants hold. Separately, on a populated ledger with appends under the 5 s lock timeout: p0 and its TOAST table keep their relfilenode, relfrozenxid and relminmxid, their vacuum and analyze counters are unchanged, the cluster logs no VACUUM, ANALYZE, CLUSTER or REINDEX, every index build on p0 is CREATE INDEX CONCURRENTLY, and every append succeeds."
+runs = true
+tests = [
+    "qbit-prism-dual-sim::scenarios::r01_rc6_pair_serves_lands_and_restarts_while_3_1_migrates_its_database_to_31",
+    "qbit-prism-dual-sim::scenarios::r01_the_premigrate_never_rewrites_freezes_vacuums_or_analyzes_the_ledgers_data_partition",
+]
+
+[[scenario]]
 id = "dual-writer-s01-steady-state"
 title = "S1: A preferred and B idle; A's shares and blocks reach B within the sync interval"
 owner = "#761"

@@ -20,6 +20,7 @@ pub mod invariants;
 pub mod load;
 pub mod measure;
 pub mod postgres;
+pub mod premigrate;
 pub mod process;
 pub mod relay;
 pub mod report;

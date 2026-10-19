@@ -69,11 +69,19 @@ pub enum Input {
     PgBinDir,
     /// `QBITD_BIN`: a `qbitd` executable for regtest.
     QbitdBin,
+    /// `PRISM_TEST_RC6_SERVER_BIN`: a `qbit-prism-server` built from the
+    /// 3.0.0-rc.6 release, for the tests that run it beside this one.
+    Rc6ServerBin,
 }
 
 impl Input {
     /// Every input, in the order the manifest and messages list them.
-    pub const ALL: [Input; 3] = [Input::DatabaseUrl, Input::PgBinDir, Input::QbitdBin];
+    pub const ALL: [Input; 4] = [
+        Input::DatabaseUrl,
+        Input::PgBinDir,
+        Input::QbitdBin,
+        Input::Rc6ServerBin,
+    ];
 
     /// The environment variable that carries the input.
     pub const fn name(self) -> &'static str {
@@ -81,6 +89,7 @@ impl Input {
             Input::DatabaseUrl => "PRISM_TEST_DATABASE_URL",
             Input::PgBinDir => "PRISM_TEST_PG_BIN_DIR",
             Input::QbitdBin => "QBITD_BIN",
+            Input::Rc6ServerBin => "PRISM_TEST_RC6_SERVER_BIN",
         }
     }
 
