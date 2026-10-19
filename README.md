@@ -493,7 +493,7 @@ qbit has its own JSON-RPC defaults. The qbit-specific `8355` value is the mainne
 
 - Public qbit networks use P2MR-only wallet output types. Use default wallet-generated payout addresses, and keep payout transactions inside qbit's allowed output policy.
 - Direct PRISM Stratum accepts `<qbit-payout-address>[.<worker>]` usernames. On qbit test chains, an invalid username payout falls back to `tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3` unless `PRISM_USERNAME_FALLBACK_ADDRESS` is set.
-- Direct PRISM Stratum tags its coinbase scriptSig with `PRISM_COINBASE_TAG` before the Stratum extranonce. The default is `/PRISM/`; set `PRISM_COINBASE_TAG=` to disable it or set another short printable ASCII tag.
+- Direct PRISM Stratum tags its coinbase scriptSig with `PRISM_COINBASE_TAG` before the Stratum extranonce. The default is `/PRISM/`; set `PRISM_COINBASE_TAG=` to disable it or set another short printable ASCII tag. A 3.1 dual writer (`PRISM_DUAL_WRITER`) refuses to start without a tag of at least 4 bytes: which node found a block is read right after it.
 - Direct PRISM Stratum accrues sub-floor miner balances instead of emitting dust outputs. The default floor is `14,720` bits; set `PRISM_PAYOUT_MIN_OUTPUT_BITS` for a fixed floor such as `10000`, or tune the `PRISM_PAYOUT_*` formula inputs. `PRISM_PAYOUT_MIN_OUTPUT_SATS` is still accepted as a legacy alias.
 - PRISM's launch settlement policy uses `10,485,760` bits as the default
   qbit-specific direct coinbase payout threshold. This is not the raw dust
