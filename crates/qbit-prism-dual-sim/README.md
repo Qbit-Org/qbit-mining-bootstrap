@@ -247,6 +247,47 @@ What each one does:
   refused by the chain scan, succeeds once B has landed the block, and B then
   pays carry while A builds carry-free work.
 
+### The pre-migrate (R1)
+
+The 3.0 → 3.1 cutover can run 3.1's `migrate` against A's database before
+the window, while the 3.0 pair keeps serving on 3.0.0-rc.6. R1 holds that to
+what the cutover relies on. Its frontends run rc.6 (`FrontendRelease::Rc6`,
+the server the `prism-rc6-server` action builds from the pinned commit,
+passed as `PRISM_TEST_RC6_SERVER_BIN`): rc.6's `migrate` makes the database,
+and every start runs with `PRISM_POSTGRES_INIT_SCHEMA=0`, as production's
+lanes do.
+
+- **R1** (`r01_rc6_pair_serves_…`): under load, A lands a block at 26. 3.1's
+  `migrate` then runs once with A's frontend environment while a reader holds
+  a snapshot, so 031's CREATE INDEX CONCURRENTLY is caught part-way. Checked:
+  027 and 028 commit with no share refused (stale work aside) and none
+  waiting 5 s; appends continue; A lands a block during the build; A's
+  frontend restarts with 31 unrecorded and the index invalid, and warns of
+  27 and 28. Once the reader ends: 31 ready and the index valid on the writer
+  and on the standby; B restarts at 31; a last landing; rc.6's rows take 027's
+  defaults; no frontend statement cancelled; the checker's invariants.
+- **p0** (`r01_the_premigrate_never_rewrites_…`, `src/premigrate.rs`): no
+  frontend, one cluster that logs every statement with autovacuum off. rc.6
+  migrates it, 300,000 synthetic rows fill p0, and an appender appends as a
+  frontend does under a 5 s lock timeout while 3.1's `migrate` runs. Checked:
+  p0 (and its TOAST table) keeps its relfilenode, relfrozenxid and
+  relminmxid; its vacuum and analyze counters are unchanged; no VACUUM,
+  ANALYZE, CLUSTER or REINDEX in the log; p0's only index build is CREATE
+  INDEX CONCURRENTLY; every append succeeds. It reports the lock holds and
+  the 031 build's steps from the log.
+- **Measurement** (`r01_measure_the_premigrate_…`, by hand, no lane): the same
+  at scale, `PRISM_PREMIGRATE_ROWS` (default 15,000,000, under p0's 2^24
+  bound) with `PRISM_PREMIGRATE_MWM` and `PRISM_PREMIGRATE_WORKERS` as
+  `maintenance_work_mem` and `max_parallel_maintenance_workers`; its
+  `outcome.json` is in `target/dual-sim-reports/r01-premigrate-scale/`.
+
+PostgreSQL's own behaviour is outside the runner's control and outside these
+checks: autovacuum and CREATE INDEX CONCURRENTLY both take SHARE UPDATE
+EXCLUSIVE on p0, so a build waits for a vacuum already running there (an
+anti-wraparound one is not cancelled for it) and no autovacuum of p0 starts
+while the build runs; and each CIC phase holds a snapshot, which holds back
+the cleanup of dead rows database-wide for the build.
+
 A scenario joins its lanes' lists (`test/prism-dual-writer-gated-tests.txt`,
 `test/prism-dual-writer-nightly-gated-tests.txt`) and runs in
 `test/e2e-scenarios.toml` once the 3.1 stack's branches make it runnable;

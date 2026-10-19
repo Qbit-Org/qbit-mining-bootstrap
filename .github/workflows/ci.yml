@@ -349,7 +349,9 @@ jobs:
   # contract §5): each scenario runs a whole simulated pair (two PostgreSQL 16
   # clusters, three regtest qbitds, two frontends, a balancer stand-in and
   # Stratum load), injects its fault and holds both databases, the chain and
-  # every acknowledged share to the payout invariants. The ids are
+  # every acknowledged share to the payout invariants; R1 holds 3.0.0-rc.6's
+  # frontends to serving while this branch's migrate applies 027, 028 and 031
+  # online, and p0 to being left unrewritten. The ids are
   # test/prism-dual-writer-gated-tests.txt, run once with --ignored --exact,
   # one at a time, and proven executed like the native shards' list. The
   # reports (report.md, invariants.json), the share log and every process's
@@ -388,6 +390,11 @@ jobs:
           set -euo pipefail
           PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
             bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      # R1, the pre-migrate (crates/qbit-prism-dual-sim): 3.0.0-rc.6's
+      # frontends and rc.6's own migrate run beside this branch's migrate.
+      # Built once per pin and cached; it exports PRISM_TEST_RC6_SERVER_BIN.
+      - name: Build the pinned rc.6 server
+        uses: ./.github/actions/prism-rc6-server
       - name: Run the listed scenarios
         run: |
           set -euo pipefail

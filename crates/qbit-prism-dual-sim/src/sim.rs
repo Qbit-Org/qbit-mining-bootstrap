@@ -86,6 +86,23 @@ pub struct Inputs {
     pub report_root: PathBuf,
     /// Keep the scenario's data directories after a pass.
     pub keep: bool,
+    /// A `qbit-prism-server` built from 3.0.0-rc.6, for the scenarios whose
+    /// frontends run that release ([`FrontendRelease::Rc6`]).
+    pub rc6_server: Option<PathBuf>,
+}
+
+/// Which release the frontends run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendRelease {
+    /// This workspace's server, [`Inputs::server`].
+    This,
+    /// 3.0.0-rc.6, [`Inputs::rc6_server`], as the 3.0 pair serves while 3.1's
+    /// `migrate` runs against its database before the cutover. Its database
+    /// is migrated by rc.6's own `migrate` before the first start, and every
+    /// start runs with `PRISM_POSTGRES_INIT_SCHEMA=0`, as production's lanes
+    /// do, so no rc.6 frontend ever migrates.
+    Rc6,
 }
 
 /// What one scenario runs.
@@ -105,6 +122,8 @@ pub struct SimConfig {
     pub sync_batch_rows: u64,
     /// Extra frontend settings, per node, applied last.
     pub overrides: BTreeMap<Node, Vec<(String, String)>>,
+    /// The release the frontends run.
+    pub frontend_release: FrontendRelease,
 }
 
 impl SimConfig {
@@ -142,6 +161,7 @@ impl SimConfig {
             sync_interval_ms: 250,
             sync_batch_rows: 5_000,
             overrides: BTreeMap::new(),
+            frontend_release: FrontendRelease::This,
         })
     }
 }
@@ -382,6 +402,13 @@ impl Sim {
                 );
             }
         }
+        let server_bin = match config.frontend_release {
+            FrontendRelease::This => inputs.server.clone(),
+            FrontendRelease::Rc6 => inputs
+                .rc6_server
+                .clone()
+                .context("the scenario's frontends run rc.6, and no rc.6 server was given")?,
+        };
         let mut frontends = BTreeMap::new();
         for node in Node::BOTH {
             let stratum_port = crate::postgres::free_port()?;
@@ -407,9 +434,13 @@ impl Sim {
                 sync_interval_ms: config.sync_interval_ms,
                 sync_batch_rows: config.sync_batch_rows,
             });
+            let mut overrides = config.overrides.get(&node).cloned().unwrap_or_default();
+            if config.frontend_release == FrontendRelease::Rc6 {
+                overrides.push(("PRISM_POSTGRES_INIT_SCHEMA".into(), "0".into()));
+            }
             let spec = FrontendSpec {
                 node,
-                server_bin: inputs.server.clone(),
+                server_bin: server_bin.clone(),
                 database_url,
                 qbitd_rpc_port: gates
                     .get(&node)
@@ -421,7 +452,7 @@ impl Sim {
                 dual,
                 stratum_max_connections: 512,
                 readiness: readiness.clone(),
-                overrides: config.overrides.get(&node).cloned().unwrap_or_default(),
+                overrides,
             };
             let public_stratum =
                 Relay::open(&format!("public-stratum-{}", node.label()), stratum_port).await?;
@@ -451,7 +482,20 @@ impl Sim {
             }
         } else {
             // A migrates its database first; in the 3.0 pair B then finds
-            // the schema in place.
+            // the schema in place. rc.6's frontends never migrate: its own
+            // `migrate` does, once, as the 3.0 pair's database was.
+            if config.frontend_release == FrontendRelease::Rc6 {
+                let run = frontends[&Node::A]
+                    .tool(&["migrate"], Duration::from_secs(300))
+                    .await?;
+                ensure!(
+                    run.success,
+                    "rc.6's migrate on node A failed ({:?}): {} {}",
+                    run.code,
+                    run.stdout.trim(),
+                    run.stderr.trim()
+                );
+            }
             frontends.get_mut(&Node::A).context("frontend a")?.start()?;
             frontends[&Node::A].wait_ready(ready_limit).await?;
             frontends.get_mut(&Node::B).context("frontend b")?.start()?;
@@ -1167,7 +1211,8 @@ pub fn qbitd_of(node: Node) -> chain::NodeName {
     }
 }
 
-async fn create_owner(node: &PgNode) -> Result<()> {
+/// The owner role the frontends log in as, its database, and the peer role.
+pub async fn create_owner(node: &PgNode) -> Result<()> {
     let pool = node.admin_pool("postgres").await?;
     sqlx::query(&format!("CREATE ROLE {OWNER_ROLE} LOGIN"))
         .execute(&pool)
