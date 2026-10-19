@@ -835,6 +835,11 @@ jobs:
           set -euo pipefail
           PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
             bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      # R1, the pre-migrate (crates/qbit-prism-dual-sim): 3.0.0-rc.7's
+      # frontends and rc.7's own migrate run beside this branch's migrate.
+      # Built once per pin and cached; it exports PRISM_TEST_RC7_SERVER_BIN.
+      - name: Build the pinned rc.7 server
+        uses: ./.github/actions/prism-rc7-server
       - name: Run the matrix
         run: |
           set -euo pipefail
