@@ -30,6 +30,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// A spawned task that is aborted when dropped, so a step that fails
+/// part-way never leaves it running: a child it waits on with
+/// `kill_on_drop` is killed with it.
+pub struct AbortOnDrop<T>(pub tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    pub fn spawn<F>(future: F) -> Self
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        Self(tokio::spawn(future))
+    }
+
+    /// Wait for the task's result.
+    pub async fn join(mut self) -> Result<T> {
+        Ok((&mut self.0).await?)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What one run builds and measures.
 #[derive(Clone, Debug, Serialize)]
 pub struct Plan {
@@ -49,6 +75,10 @@ pub struct Plan {
     /// The appender's pace: one append every this many milliseconds.
     pub append_every_ms: u64,
 }
+
+/// The savepoint the migrator applies its scratch copy of the schema under
+/// (`ledger/migration.rs`), and rolls back.
+const SCRATCH_SAVEPOINT: &str = "qbit_prism_release_schema";
 
 /// One append as a frontend makes it: the header's mapping read first,
 /// then the ledger row and the mapping, under the frontends' 5 s lock
@@ -218,62 +248,63 @@ fn maintenance_commands(sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// The commands of `sql` that build an index on `table` itself: `CREATE
-/// [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name> ON [ONLY] <table>`,
-/// schema-qualified or not. A migration file the migrator applies to its
-/// scratch schema mentions p0 in its comments and its other statements;
-/// only a command of this shape builds an index on it.
-fn index_builds_on(sql: &str, table: &str) -> Vec<String> {
+/// The commands of `sql` that build an index on `table`, each with whether
+/// it is CONCURRENTLY: `CREATE [UNIQUE] INDEX [CONCURRENTLY] [[IF NOT
+/// EXISTS] <name>] ON [ONLY] <target>`, schema-qualified or not, where the
+/// target is `table`, or `parent` without ONLY (a build of a partitioned
+/// table recurses into every partition, under a SHARE lock on each).
+fn index_builds_on(sql: &str, table: &str, parent: &str) -> Vec<(bool, String)> {
+    let named = |target: &str, name: &str| {
+        target == name
+            || target
+                .rsplit_once('.')
+                .is_some_and(|(_, last)| last == name)
+    };
     commands(sql)
         .into_iter()
-        .filter(|command| {
+        .filter_map(|command| {
             let words: Vec<String> = command
                 .split_whitespace()
                 .map(|word| word.trim_matches('"').to_ascii_lowercase())
                 .collect();
             let mut words = words.iter().map(String::as_str).peekable();
+            let concurrent;
             {
                 let mut take = |expected: &str| words.next_if_eq(&expected).is_some();
                 if !take("create") {
-                    return false;
+                    return None;
                 }
                 take("unique");
                 if !take("index") {
-                    return false;
+                    return None;
                 }
-                take("concurrently");
+                concurrent = take("concurrently");
                 if take("if") && !(take("not") && take("exists")) {
-                    return false;
+                    return None;
                 }
             }
-            // The index's name, then ON [ONLY] <table>.
-            words.next();
-            if words.next() != Some("on") {
-                return false;
+            // The index's name is optional: then ON [ONLY] <target>.
+            if words.next_if_eq(&"on").is_none() {
+                words.next();
+                words.next_if_eq(&"on")?;
             }
-            words.next_if_eq(&"only");
-            words.next().is_some_and(|target| {
-                target == table
-                    || target
-                        .rsplit_once('.')
-                        .is_some_and(|(_, name)| name == table)
-            })
+            let only = words.next_if_eq(&"only").is_some();
+            let target = words.next()?;
+            (named(target, table) || (!only && named(target, parent)))
+                .then(|| (concurrent, command.clone()))
         })
         .collect()
 }
 
 /// Milliseconds between two `%m` timestamps of one log ("YYYY-MM-DD
-/// HH:MM:SS.mmm TZ"), same day and zone.
+/// HH:MM:SS.mmm TZ", one zone).
 fn between(from: &str, to: &str) -> Option<f64> {
-    fn ms(stamp: &str) -> Option<f64> {
-        let time = stamp.split_whitespace().nth(1)?;
-        let mut parts = time.split(':');
-        let h: f64 = parts.next()?.parse().ok()?;
-        let m: f64 = parts.next()?.parse().ok()?;
-        let s: f64 = parts.next()?.parse().ok()?;
-        Some(((h * 60.0 + m) * 60.0 + s) * 1000.0)
+    fn at(stamp: &str) -> Option<chrono::NaiveDateTime> {
+        let mut parts = stamp.split_whitespace();
+        let text = format!("{} {}", parts.next()?, parts.next()?);
+        chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f").ok()
     }
-    Some(ms(to)? - ms(from)?)
+    Some((at(to)? - at(from)?).num_microseconds()? as f64 / 1000.0)
 }
 
 async fn storage(pool: &PgPool) -> Result<Vec<Storage>> {
@@ -307,9 +338,15 @@ async fn maintenance(pool: &PgPool) -> Result<Vec<Maintenance>> {
     sqlx::query("SELECT pg_stat_clear_snapshot()")
         .execute(pool)
         .await?;
+    // pg_stat_all_tables, not _user_tables: p0's TOAST table is in pg_toast.
     let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT relname::text, vacuum_count, autovacuum_count, analyze_count, autoanalyze_count \
-         FROM pg_stat_user_tables WHERE relname LIKE 'qbit\\_share\\_ledger\\_p%' ORDER BY 1",
+         FROM pg_stat_all_tables \
+         WHERE relid IN (SELECT inhrelid FROM pg_inherits \
+                         WHERE inhparent = 'qbit_share_ledger'::regclass) \
+            OR relid = (SELECT reltoastrelid FROM pg_class \
+                        WHERE oid = 'qbit_share_ledger_p0'::regclass) \
+         ORDER BY 1",
     )
     .fetch_all(pool)
     .await?;
@@ -500,6 +537,19 @@ pub async fn run(
         .connect(&url)
         .await
         .context("connecting as the owner")?;
+    // Every row in p0, as on a converted 3.0 ledger: the seed and the
+    // appends stay below p0's upper bound.
+    let p0_upper: i64 = sqlx::query_scalar(
+        "SELECT upper_seq FROM qbit_prism_share_partitions \
+         WHERE partition_name = 'qbit_share_ledger_p0'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    ensure!(
+        (plan.rows as i64) + 100_000 < p0_upper,
+        "{} rows would not all fit in p0, whose upper bound is {p0_upper}",
+        plan.rows
+    );
     let seeded = Instant::now();
     seed(&pool, &plan).await?;
     let seed_ms = seeded.elapsed().as_millis() as u64;
@@ -516,7 +566,7 @@ pub async fn run(
 
     let clock = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
-    let appending = tokio::spawn(appender(
+    let appending = AbortOnDrop::spawn(appender(
         url.clone(),
         Duration::from_millis(plan.append_every_ms),
         stop.clone(),
@@ -529,7 +579,7 @@ pub async fn run(
     let migrate_ms = migrating.elapsed().as_millis() as u64;
     tokio::time::sleep(Duration::from_secs(2)).await;
     stop.store(true, Ordering::SeqCst);
-    let appends = appending.await.context("the appender")?;
+    let appends = appending.join().await.context("the appender")?;
     let migrate_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     std::fs::write(
         work.join("migrate-3.1.log"),
@@ -560,6 +610,10 @@ pub async fn run(
     let mut p0_index_builds = Vec::new();
     let mut statements: Vec<Logged> = Vec::new();
     let mut temp_file_bytes = 0u64;
+    // The migrator applies every file to a scratch schema first, under a
+    // savepoint it rolls back, before it applies them to the database:
+    // what a backend runs between the two touches no live table.
+    let mut scratch: std::collections::BTreeSet<String> = Default::default();
     for (at, pid, entry) in &entries {
         if let Some(size) = entry
             .split_once("temporary file: ")
@@ -571,16 +625,26 @@ pub async fn run(
         let Some((duration_ms, sql)) = statement(entry) else {
             continue;
         };
+        // VACUUM and its kind cannot run in a transaction block at all,
+        // so a scratch apply's are counted too.
         maintenance_statements.extend(maintenance_commands(&sql));
-        for build in index_builds_on(&sql, "qbit_share_ledger_p0") {
-            let concurrent = build
-                .to_ascii_uppercase()
-                .contains("CREATE INDEX CONCURRENTLY")
-                || build
-                    .to_ascii_uppercase()
-                    .contains("CREATE UNIQUE INDEX CONCURRENTLY");
-            p0_index_builds.push((concurrent, build));
+        let trimmed = sql.trim();
+        if trimmed.starts_with(&format!("SAVEPOINT {SCRATCH_SAVEPOINT}")) {
+            scratch.insert(pid.clone());
+            continue;
         }
+        if trimmed.starts_with(&format!("ROLLBACK TO SAVEPOINT {SCRATCH_SAVEPOINT}")) {
+            scratch.remove(pid);
+            continue;
+        }
+        if scratch.contains(pid) {
+            continue;
+        }
+        p0_index_builds.extend(index_builds_on(
+            &sql,
+            "qbit_share_ledger_p0",
+            "qbit_share_ledger",
+        ));
         statements.push(Logged {
             at: at.clone(),
             pid: pid.clone(),
@@ -588,10 +652,7 @@ pub async fn run(
             sql,
         });
     }
-    // The migrator applies every file to a scratch schema first, under a
-    // savepoint it rolls back, and then to the database: the last
-    // statement with a file's text is the one that changed the database.
-    let find = |needle: &str| statements.iter().rev().find(|s| s.sql.contains(needle));
+    let find = |needle: &str| statements.iter().find(|s| s.sql.contains(needle));
     let migration_027 = find("-- 3.1 dual writer, node identity (D1)");
     let migration_028 = find("-- 3.1 dual writer, window cuts (D2)");
     // The commit of the transaction that applied them: the migrate
@@ -612,7 +673,9 @@ pub async fn run(
         .and_then(|(m027, commit)| Some(between(&m027.at, &commit.at)? + m027.duration_ms));
     let p0_build_ms = statements
         .iter()
-        .filter(|s| !index_builds_on(&s.sql, "qbit_share_ledger_p0").is_empty())
+        .filter(|s| {
+            !index_builds_on(&s.sql, "qbit_share_ledger_p0", "qbit_share_ledger").is_empty()
+        })
         .map(|s| s.duration_ms)
         .reduce(f64::max);
     let parent_index_ms = statements
@@ -681,33 +744,35 @@ mod tests {
     }
 
     #[test]
-    fn index_builds_are_those_on_the_table_itself() {
-        let table = "qbit_share_ledger_p0";
+    fn index_builds_are_those_on_the_table_and_its_parent_without_only() {
+        let builds = |sql: &str| index_builds_on(sql, "qbit_share_ledger_p0", "qbit_share_ledger");
         assert_eq!(
-            index_builds_on(
+            builds(
                 "CREATE INDEX CONCURRENTLY qbit_share_ledger_p0_origin_seq_idx ON \
-                 public.qbit_share_ledger_p0 USING btree (origin_node, share_seq)",
-                table
-            )
-            .len(),
-            1
+                 public.qbit_share_ledger_p0 USING btree (origin_node, share_seq)"
+            ),
+            vec![(
+                true,
+                "CREATE INDEX CONCURRENTLY qbit_share_ledger_p0_origin_seq_idx ON \
+                 public.qbit_share_ledger_p0 USING btree (origin_node, share_seq)"
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )]
         );
-        assert_eq!(
-            index_builds_on(
-                "create unique index if not exists i on qbit_share_ledger_p0 (a)",
-                table
-            )
-            .len(),
-            1
-        );
+        assert!(!builds("create unique index if not exists i on qbit_share_ledger_p0 (a)")[0].0);
+        // Unnamed, and a recursive build of the parent: both build on p0.
+        assert_eq!(builds("CREATE INDEX ON qbit_share_ledger_p0 (a)").len(), 1);
+        assert_eq!(builds("CREATE INDEX i ON qbit_share_ledger (a)").len(), 1);
+        // ON ONLY the parent builds nothing on a partition.
+        assert!(builds("CREATE INDEX i ON ONLY qbit_share_ledger (a)").is_empty());
         // A file naming p0 elsewhere builds nothing on it.
-        assert!(index_builds_on(
+        assert!(builds(
             "-- CREATE INDEX on qbit_share_ledger_p0 later\n\
-             CREATE INDEX i ON qbit_share_ledger (a); ALTER TABLE qbit_share_ledger_p0 ADD x int",
-            table
+             CREATE INDEX i ON qbit_prism_jobs (a); ALTER TABLE qbit_share_ledger_p0 ADD x int"
         )
         .is_empty());
-        assert!(index_builds_on("CREATE INDEX i ON qbit_share_ledger_p01 (a)", table).is_empty());
+        assert!(builds("CREATE INDEX i ON qbit_share_ledger_p01 (a)").is_empty());
     }
 
     #[test]
@@ -725,6 +790,10 @@ mod tests {
         assert_eq!(
             between("2026-10-19 18:40:01.123 UTC", "2026-10-19 18:40:02.500 UTC"),
             Some(1377.0)
+        );
+        assert_eq!(
+            between("2026-10-19 23:59:59.900 UTC", "2026-10-20 00:00:00.100 UTC"),
+            Some(200.0)
         );
     }
 }

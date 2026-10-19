@@ -71,19 +71,37 @@ fn log_lines(sim: &Sim, node: Node, needle: &str) -> Vec<String> {
         .collect()
 }
 
-/// Restart `node`'s rc.7 frontend gracefully and wait until it is ready and
-/// the balancer has it up again; how long the start took.
-async fn restart(sim: &mut Sim, node: Node) -> Result<Duration> {
-    sim.frontend_mut(node).stop(Duration::from_secs(20))?;
+/// What a restart of a frontend took.
+struct Restart {
+    /// Whether it exited on SIGTERM within the grace, rather than by SIGKILL.
+    graceful: bool,
+    /// From the start to ready.
+    ready_in: Duration,
+    /// When the balancer had it up again, on the run's clock.
+    up_at_ms: u64,
+}
+
+/// Restart `node`'s rc.7 frontend with a graceful stop, as `docker stop`
+/// does, once the balancer has marked it down, and wait until it is ready
+/// and the balancer has it up again.
+async fn restart(sim: &mut Sim, node: Node) -> Result<Restart> {
+    let graceful = sim.frontend_mut(node).stop(Duration::from_secs(20))?;
+    sim.balancer
+        .wait_state(node.label(), false, MARK_DOWN_BOUND)
+        .await?;
     sim.frontend_mut(node).start()?;
-    let took = sim
+    let ready_in = sim
         .frontend(node)
         .wait_ready(Duration::from_secs(180))
         .await?;
     sim.balancer
         .wait_state(node.label(), true, Duration::from_secs(30))
         .await?;
-    Ok(took)
+    Ok(Restart {
+        graceful,
+        ready_in,
+        up_at_ms: sim.clock.now_ms(),
+    })
 }
 
 /// The 3.0 pair on rc.7 (A's database the writer, B's its standby, both
@@ -130,8 +148,10 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     command.kill_on_drop(true);
     let migrate_from_ms = sim.clock.now_ms();
     sim.mark("3.1 migrate started against A's database");
-    let migrate =
-        tokio::spawn(async move { tokio::time::timeout(MIGRATE_BOUND, command.output()).await });
+    // Aborted, and the migrate killed, if a step below fails first.
+    let migrate = crate::premigrate::AbortOnDrop::spawn(async move {
+        tokio::time::timeout(MIGRATE_BOUND, command.output()).await
+    });
 
     let committed = wait_for("027 and 028 committed", MIGRATE_BOUND, || {
         let pool = pool.clone();
@@ -221,30 +241,35 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     );
 
     let mid_build = find_block(sim, body, Node::A, "A while 031 builds", None).await?;
-    let took = restart(sim, Node::A).await?;
+    let restarted = restart(sim, Node::A).await?;
     sim.mark(&format!(
         "A's rc.7 frontend restarted mid-build, ready in {:.1} s",
-        took.as_secs_f64()
+        restarted.ready_in.as_secs_f64()
     ));
     let still = versions(&pool).await?;
     let warned = log_lines(sim, Node::A, UNKNOWN_MIGRATIONS);
     body.expect(
-        "rc.7 restarts and serves mid-build, warning of 27 and 28",
-        !still.contains(&31) && warned.iter().any(|line| line.contains("27, 28")),
-        format!("recorded {still:?}; A's warnings {warned:?}"),
+        "rc.7 stops gracefully, restarts and serves mid-build, warning of 27 and 28",
+        restarted.graceful
+            && !still.contains(&31)
+            && warned.iter().any(|line| line.contains("27, 28")),
+        format!(
+            "stopped gracefully {}; recorded {still:?}; A's warnings {warned:?}",
+            restarted.graceful
+        ),
     );
     steady(sim, 4).await;
-    let restarted_ms = sim.clock.now_ms().saturating_sub(4_000);
-    let after_restart = accepted_from(&sim.load()?.records(), Node::A, restarted_ms);
+    let after_restart = accepted_from(&sim.load()?.records(), Node::A, restarted.up_at_ms);
     body.expect(
         "A takes shares again after its mid-build restart",
         after_restart > 0,
-        format!("{after_restart} shares accepted on A's jobs in the 4 s after it was up"),
+        format!("{after_restart} shares accepted on A's jobs since the balancer had it up again"),
     );
 
     reader.commit().await?;
     sim.mark("the reader's snapshot ended");
     let output = migrate
+        .join()
         .await
         .context("the migrate task")?
         .context("3.1's migrate ran over its bound")?
@@ -272,16 +297,19 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
         format!("recorded {after:?}; parent valid {parent:?}, p0's leaf valid {leaf:?}"),
     );
 
-    let took = restart(sim, Node::B).await?;
+    let restarted = restart(sim, Node::B).await?;
     sim.mark(&format!(
         "B's rc.7 frontend restarted at 31, ready in {:.1} s",
-        took.as_secs_f64()
+        restarted.ready_in.as_secs_f64()
     ));
     let warned = log_lines(sim, Node::B, UNKNOWN_MIGRATIONS);
     body.expect(
-        "rc.7 restarts and serves at 31, warning of 27, 28 and 31",
-        warned.iter().any(|line| line.contains("27, 28, 31")),
-        format!("B's warnings {warned:?}"),
+        "rc.7 stops gracefully, restarts and serves at 31, warning of 27, 28 and 31",
+        restarted.graceful && warned.iter().any(|line| line.contains("27, 28, 31")),
+        format!(
+            "stopped gracefully {}; B's warnings {warned:?}",
+            restarted.graceful
+        ),
     );
     let last = find_block(sim, body, Node::A, "A at 31", None).await?;
 
