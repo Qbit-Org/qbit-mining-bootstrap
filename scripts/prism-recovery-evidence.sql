@@ -59,7 +59,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 31];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31];
     applied integer[];
     missing integer[];
     metadata text;
@@ -308,7 +308,12 @@ SELECT (to_regclass('qbit_prism_cpfp_packages') IS NOT NULL
        (to_regclass('qbit_prism_fatal_state_events') IS NOT NULL
         OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_fatal_state_events,
        (to_regclass('qbit_prism_policy_transitions') IS NOT NULL
-        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_policy_transitions
+        OR to_regclass('qbit_prism_schema_migrations') IS NOT NULL) AS has_policy_transitions,
+       -- 028's window cut columns: on every native ledger startup accepts,
+       -- never on a frozen 2.x source's audit snapshots.
+       EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+               WHERE attrelid = to_regclass('qbit_prism_audit_snapshots')
+                 AND attname = 'cut_seq_0' AND NOT attisdropped) AS has_audit_snapshot_cuts
 \gset
 
 -- Migration 027's origin_node is a row's provenance in a 3.1 dual-writer
@@ -577,11 +582,23 @@ SELECT jsonb_build_object('kind', 'audit_bodies', 'row', jsonb_build_object(
 FROM qbit_pool_audit_bundles WHERE share_snapshot_sha256 IS NOT NULL
 ORDER BY block_hash COLLATE "C";
 
+\if :has_audit_snapshot_cuts
+-- A dual-writer window's cut (028) is exported only where a row has one, so
+-- a single-writer export is unchanged.
+SELECT jsonb_build_object('kind', 'audit_snapshots', 'row', jsonb_build_object(
+    'snapshot_sha256', snapshot_sha256,
+    'first_share_seq', first_share_seq, 'last_share_seq', last_share_seq,
+    'anchor_ms', anchor_ms, 'share_count', share_count, 'inline_shares', inline_shares)
+    || CASE WHEN cut_seq_0 IS NULL THEN '{}'::jsonb
+       ELSE jsonb_build_object('cut_seq_0', cut_seq_0, 'cut_seq_1', cut_seq_1) END)
+FROM qbit_prism_audit_snapshots ORDER BY snapshot_sha256 COLLATE "C";
+\else
 SELECT jsonb_build_object('kind', 'audit_snapshots', 'row', jsonb_build_object(
     'snapshot_sha256', snapshot_sha256,
     'first_share_seq', first_share_seq, 'last_share_seq', last_share_seq,
     'anchor_ms', anchor_ms, 'share_count', share_count, 'inline_shares', inline_shares))
 FROM qbit_prism_audit_snapshots ORDER BY snapshot_sha256 COLLATE "C";
+\endif
 \set FETCH_COUNT :prism_fetch_rows
 \endif
 \if :has_cpfp_packages

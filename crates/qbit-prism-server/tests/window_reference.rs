@@ -202,6 +202,7 @@ fn reference(shares: &[AcceptedShare], balances: &[CarryForwardBalance]) -> Wind
             share_count: shares.len() as u64,
             snapshot_sha256: hash.0.finalize().into(),
         }),
+        cut: None,
     }
 }
 

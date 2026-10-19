@@ -13,7 +13,9 @@ SELECT NOT EXISTS (
         ('qbit_pool_blocks','inactive_since'),
         ('qbit_pool_audit_bundles','share_snapshot_sha256'),
         ('qbit_pool_audit_bundles','canonical_audit_bytes'),
-        ('qbit_pool_blocks','solver_share_id')
+        ('qbit_pool_blocks','solver_share_id'),
+        ('qbit_prism_audit_snapshots','cut_seq_0'),
+        ('qbit_prism_audit_snapshots','cut_seq_1')
     ) AS required(relation,column_name)
     WHERE NOT EXISTS (
         SELECT 1 FROM pg_attribute

@@ -16,6 +16,7 @@ fn issued_inputs_preserve_stored_identity_and_config_errors() {
             payout_revision: 0,
             shares: vec![],
             prior_balances: vec![],
+            cut: None,
         }),
         bundle: None,
         inputs: Some(inputs),

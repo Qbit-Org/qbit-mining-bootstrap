@@ -226,6 +226,7 @@ fn build_parallel(
         build_audit_bundle_body_with_ctv_settlement_options_parallel(
             shares,
             found_block.clone(),
+            None,
             balances.to_vec(),
             PayoutPolicy::day_one_default(),
             2_000,
@@ -241,6 +242,7 @@ fn build_parallel(
         build_audit_bundle_body_with_coinbase_options_parallel(
             shares,
             found_block.clone(),
+            None,
             balances.to_vec(),
             PayoutPolicy::day_one_default(),
             Some("bbbbbbbb".into()),

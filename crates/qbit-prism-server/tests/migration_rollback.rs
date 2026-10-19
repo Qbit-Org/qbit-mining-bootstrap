@@ -2722,6 +2722,8 @@ async fn assert_native_audit_payload_fingerprints(
         ("audit_snapshots", "anchor_ms=anchor_ms+1"),
         ("audit_snapshots", "share_count=share_count+1"),
         ("audit_snapshots", "inline_shares='[]'::jsonb"),
+        // 028's dual-writer cut, recorded where a row has one.
+        ("audit_snapshots", "cut_seq_0=last_share_seq,cut_seq_1=0"),
     ] {
         let (table, key, identity) = if kind == "audit_bodies" {
             (
@@ -2760,7 +2762,7 @@ async fn assert_native_audit_payload_fingerprints(
         sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle=$2,share_snapshot_sha256=$3 WHERE block_hash=$1")
             .bind(&artifact.block_hash).bind(&body).bind(&snapshots[0])
             .execute(&source.pool).await?;
-        sqlx::query("UPDATE qbit_prism_audit_snapshots SET first_share_seq=$2,last_share_seq=$3,anchor_ms=$4,share_count=$5,inline_shares=NULL WHERE snapshot_sha256=$1")
+        sqlx::query("UPDATE qbit_prism_audit_snapshots SET first_share_seq=$2,last_share_seq=$3,anchor_ms=$4,share_count=$5,inline_shares=NULL,cut_seq_0=NULL,cut_seq_1=NULL WHERE snapshot_sha256=$1")
             .bind(&snapshots[0])
             .bind(bundle.shares.first().unwrap().share_seq as i64)
             .bind(bundle.shares.last().unwrap().share_seq as i64)

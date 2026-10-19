@@ -870,6 +870,15 @@ fn landing_from_parts(
         body.found_block.anchor_job_issued_at_ms == window.anchor_ms,
         "audit parts anchor differs from the candidate's window reference"
     );
+    // A dual-writer window's cut is committed in the reward manifest, which
+    // the verifier above rebuilt under it; it must be the reference's. The
+    // bootstrap window's synthetic share carries none.
+    let committed_cut = window.shares.and(window.cut);
+    ensure!(
+        body.reward_manifest.cut == committed_cut,
+        "audit parts' window cut {:?} differs from the candidate's window reference {committed_cut:?}",
+        body.reward_manifest.cut
+    );
     Ok(Landing {
         report,
         body: raw,
@@ -886,6 +895,7 @@ fn landing_from_parts(
             network_difficulty: body.found_block.network_difficulty,
             share_count: i64::try_from(shares.len())?,
             inline,
+            cut: window.cut,
             shares: Arc::clone(shares),
         },
     })
