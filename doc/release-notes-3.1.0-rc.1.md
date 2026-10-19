@@ -303,15 +303,54 @@ migrations it does not know.
 
 ### Rolling back
 
-- **From the dual writer to one writer:** stay on this candidate. Start the
-  single writer with `PRISM_DUAL_WRITER` off and
-  `PRISM_DUAL_WRITER_DOWNGRADE=1`; without it the start refuses a database
-  whose carry-owner journal holds rows, because a second payer of carried
-  balances would pay them twice. Only the deliberate rollback sets it. The
-  database stays personalised, so declare the peer's tail lost
-  (`qbit_prism_node_lineage.peer_tail_lost_at`) or `share-archive plan`
-  waits for a peer that no longer syncs
-  ([the peer sync](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.1.0-rc.1/docs/prism-ledger-ops.md#the-peer-sync)).
+- **From the dual writer to one writer:** stay on this candidate, keep one
+  node's database and retire the other node's for good. No E2E scenario runs this
+  rollback; follow it step by step. `PRISM_DUAL_WRITER_DOWNGRADE=1` only lets
+  a single writer start on a database that has run as a dual writer. It
+  fences nothing: a dual-writer frontend still running on either database
+  would pay carried balances beside it, twice.
+  1. **Move carry ownership to the kept node** unless
+     `qbit-prism-server carry-owner status` there shows it holds it already;
+     when neither node holds it, transfer it too. `release` it on the retired
+     node first if that node holds it
+     ([moving the carry owner](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.1.0-rc.1/docs/prism-ledger-ops.md#moving-the-carry-owner)). The
+     transfer's chain scan proves every pool block on the active chain is
+     landed and confirmed on the kept node. A single writer pays carry as 3.0
+     does and adopts nothing, so a carry-paying block the retired node found
+     and the kept node never landed would be paid again.
+  2. **Drain the retired node.** Move every miner off it, and wait until
+     `qbit-prism-server candidates list` on its database shows no unfinished
+     candidate: its outbox is local and never copied. On a zero-fee chain,
+     also wait until every fanout the retired node is sponsoring has
+     confirmed: a single writer sponsors every zero-fee fanout itself, and a
+     second child of one fanout leaves a wallet coin locked
+     ([peer fanouts](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.1.0-rc.1/docs/prism-ledger-ops.md#peer-fanouts)).
+     Then stop **every** frontend on the retired node's database and disable
+     them, leaving its PostgreSQL up. Never start a frontend on that database
+     again: it stays personalised, and would run as a second writer.
+  3. **Pull its tail.** On every frontend of the kept node, watch the peer
+     sync for a few passes after the stop: `qbit_prism_peer_sync_peer_reachable`
+     is 1, no `qbit_prism_peer_sync_refused` reason is 1,
+     `qbit_prism_peer_sync_failures_total` does not rise, and
+     `qbit_prism_peer_sync_lag_rows` is 0 on all four streams (`shares`,
+     `blocks`, `prepared` and `roles`). A refused or failing pass keeps
+     publishing its last lag, so a 0 alone proves nothing. Any row in
+     `qbit_prism_peer_sync_conflicts` was never pulled: resolve it first
+     ([the peer sync](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.1.0-rc.1/docs/prism-ledger-ops.md#the-peer-sync)).
+  4. **Restart the kept node as one writer.** Stop **every** frontend on its
+     database, then start them with `PRISM_DUAL_WRITER` off and
+     `PRISM_DUAL_WRITER_DOWNGRADE=1`; without it the start refuses a database
+     whose carry-owner journal holds rows. Only this deliberate rollback sets
+     it.
+  5. **Declare the retired peer's tail lost**
+     (`qbit_prism_node_lineage.peer_tail_lost_at`): the database stays
+     personalised, so otherwise `share-archive plan` waits for a peer that no
+     longer syncs. Declare it only for a peer that never comes back with its
+     own database, which could send unpulled shares into a partition that has
+     left. A return to the dual writer rebuilds the retired node from the
+     kept one ([rebuilding a node](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.1.0-rc.1/docs/prism-ledger-ops.md#rebuilding-a-node-from-its-peer)), and
+     then you clear `peer_tail_lost_at` on the kept node
+     (`SET peer_tail_lost_at = NULL`) once the rebuilt peer syncs.
 - **To 3.0.0-rc.6, from a database that was never personalised**
   (`node-identity show` prints no identity): first
   remove the new settings from every environment an rc.6 binary will read,
