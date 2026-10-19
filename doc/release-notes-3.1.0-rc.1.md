@@ -135,7 +135,30 @@ five pull requests:
   PostgreSQL clusters, regtest `qbitd`s, the real frontends, a balancer
   stand-in and relays a fault can cut or slow) and holds it to the 3.1
   payout invariants. CI's required `prism-dual-writer` job runs its fast
-  lane; `dual-writer-nightly` runs all 24 scenarios.
+  lane; `dual-writer-nightly` runs its whole matrix, 24 tests.
+
+After the five, #773, 3.1 pre-migrate: rc.6 serves while 3.1's migrate
+applies 027, 028 and 031, and p0 is never rewritten (`4b1aefee`), adds two
+gated tests of the [upgrade from rc.6](#upgrading), in the fast lane and the
+matrix, which they bring to 26 tests; it changes no runtime code.
+- **R1:** the 3.0 pair serves on 3.0.0-rc.6 (`81c592c3`, its database made by
+  rc.6's own `migrate`) under load while this candidate's `migrate` runs once
+  as a one-off command with A's frontend environment, and a reader's snapshot
+  holds 031's `CREATE INDEX CONCURRENTLY` part-way. 027 and 028 commit with
+  every share sent meanwhile answered and none waiting 5 s, appends continue
+  during the build, and blocks land before, during and after it. Both rc.6
+  frontends restart and serve, A while 31 is unrecorded and the index
+  invalid, B once 31 is recorded and the index valid on the writer; the
+  standby then has the valid index by replication. No frontend statement is
+  cancelled, and the checker's invariants hold.
+- **p0:** on a populated ledger that rc.6's `migrate` made (300,000 rows in
+  CI, no frontend), with a test appender under the
+  frontends' 5 s lock timeout, the migrate leaves the share ledger's data
+  partition `p0` and its TOAST table unrewritten, unfrozen and unvacuumed:
+  their `relfilenode`, `relfrozenxid` and `relminmxid` and their vacuum and
+  analyze counters are unchanged, the cluster logs no `VACUUM`, `ANALYZE`,
+  `CLUSTER` or `REINDEX`, every index build on `p0` is
+  `CREATE INDEX CONCURRENTLY`, and every append succeeds.
 
 **With `PRISM_DUAL_WRITER` off and `PRISM_READINESS_PORT` unset, behaviour is
 3.0's.** No new task starts, the statements a single writer runs have 3.0's
@@ -240,9 +263,13 @@ migrations it does not know.
      frontend's database settings. 027 and 028 commit in one short
      transaction, and 031 then builds online beside the serving rc.6
      frontends, which keep accepting and landing. rc.6 frontends serve, and
-     restart, at every step, warning of the migrations they don't know. A later
-     `migrate`, such as a cutover's, then finds every migration recorded and
-     changes nothing.
+     restart, at every step, warning of the migrations they don't know.
+     #773's R1 test runs this step beside rc.6 frontends under load, restarting
+     A during 031's build and B once 31 is recorded, and its p0 test shows
+     the step never rewrites the ledger's data partition
+     ([above](#the-31-dual-writer)).
+     A later `migrate`, such as a cutover's, then finds every migration
+     recorded and changes nothing.
   2. **Then replace the binary** on every frontend and tool, and on the
      `public-api` service. A frontend or tool of this candidate refuses the
      database until 31 is recorded. Nothing refuses a mix of rc.6 and this
@@ -303,7 +330,7 @@ migrations it does not know.
 
 ## Verification
 
-The runtime changes between rc.6 and this candidate are:
+The changes between rc.6 and this candidate, and their evidence, are:
 - #770, merged as `4c134913`: `import-audits` only, with
   `tests/import_audits_settlement_lock.rs` (13 gated tests: a session taking
   `SETTLEMENT_LOCK` every 20 ms beside the throttled import of a 107 MB body
@@ -321,8 +348,11 @@ The runtime changes between rc.6 and this candidate are:
   listed in `test/prism-gated-tests.txt`, and plain ones such as
   `stratum_admission_gate` and `window_cut_bundles`. The required
   `prism-dual-writer` CI lane runs the E2E fast lane on every pull request,
-  and all 24 scenarios of the matrix run on this version-bump pull request
+  and all 26 tests of the matrix run on this version-bump pull request
   (`dual-writer-nightly`, by its `run-dual-writer-e2e` label).
+- #773, merged as `4b1aefee`: tests only. R1 runs 3.0.0-rc.6 frontends
+  beside this candidate's `migrate`, and p0 runs that `migrate` on an
+  rc.6-migrated ledger under appends, both in the fast lane and the matrix.
 
 The serving path's single-writer statements keep 3.0's results, so the
 serving evidence the 3.0.0-rc.3 notes cite still applies to a single writer: the D1
