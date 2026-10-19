@@ -1,5 +1,5 @@
 //! The pre-migrate on a populated ledger: 3.1's `migrate` against a database
-//! rc.7 migrated and filled, with appends running beside it as a frontend's
+//! rc.6 migrated and filled, with appends running beside it as a frontend's
 //! would, on one PostgreSQL 16 cluster that logs every statement.
 //!
 //! It answers two questions the cutover's pre-migrate depends on, with no
@@ -494,12 +494,12 @@ async fn appender(url: String, every: Duration, stop: Arc<AtomicBool>, clock: In
     appends
 }
 
-/// Build a cluster under `work`, migrate it with rc.7's `rc7`, seed it per
+/// Build a cluster under `work`, migrate it with rc.6's `rc6`, seed it per
 /// `plan`, then run this workspace's `server` `migrate` with the appender
 /// running, and report.
 pub async fn run(
     pg_bin: &Path,
-    rc7: &Path,
+    rc6: &Path,
     server: &Path,
     work: &Path,
     plan: Plan,
@@ -525,10 +525,10 @@ pub async fn run(
     create_owner(&node).await?;
     let url = node.url(OWNER_ROLE, DATABASE);
 
-    let output = server_command(rc7, &url, &["migrate"]).output().await?;
+    let output = server_command(rc6, &url, &["migrate"]).output().await?;
     ensure!(
         output.status.success(),
-        "rc.7's migrate failed: {}{}",
+        "rc.6's migrate failed: {}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

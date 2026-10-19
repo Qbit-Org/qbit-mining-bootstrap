@@ -27,7 +27,7 @@ use qbit_prism_server::ledger::peer_sync::CarriedColumns;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-mod rc7_premigrate;
+mod rc6_premigrate;
 
 /// A block found on purpose must land and confirm within this: its share is
 /// answered after commit, then the frontend offers it to its node, lands
@@ -198,9 +198,9 @@ pub enum Scenario {
     S11CarryOwnerTransfer,
     /// S10: dual mode off, the 3.0 pair, A's frontend killed under load.
     S10SingleWriter,
-    /// R1: the 3.0 pair serving on 3.0.0-rc.7 while 3.1's `migrate` takes its
+    /// R1: the 3.0 pair serving on 3.0.0-rc.6 while 3.1's `migrate` takes its
     /// database to 27, 28 and 31 before the cutover.
-    R01Rc7Premigrate,
+    R01Rc6Premigrate,
 }
 
 impl Scenario {
@@ -237,7 +237,7 @@ impl Scenario {
             Scenario::S09Migration => "s09-migration".into(),
             Scenario::S11CarryOwnerTransfer => "s11-carry-owner-transfer".into(),
             Scenario::S10SingleWriter => "s10-single-writer".into(),
-            Scenario::R01Rc7Premigrate => "r01-rc7-premigrate".into(),
+            Scenario::R01Rc6Premigrate => "r01-rc6-premigrate".into(),
         }
     }
 
@@ -292,8 +292,8 @@ impl Scenario {
             Scenario::S10SingleWriter => {
                 "Single-writer regression: the 3.0 pair keeps every share and pays exactly through a frontend kill".into()
             }
-            Scenario::R01Rc7Premigrate => {
-                "Pre-migrate: rc.7 keeps serving, landing and restarting while 3.1's migrate applies 027, 028 and 031 online".into()
+            Scenario::R01Rc6Premigrate => {
+                "Pre-migrate: rc.6 keeps serving, landing and restarting while 3.1's migrate applies 027, 028 and 031 online".into()
             }
         }
     }
@@ -301,7 +301,7 @@ impl Scenario {
     fn topology(self) -> Topology {
         match self {
             Scenario::CheckerControl => Topology::Unsynced,
-            Scenario::S10SingleWriter | Scenario::S09Migration | Scenario::R01Rc7Premigrate => {
+            Scenario::S10SingleWriter | Scenario::S09Migration | Scenario::R01Rc6Premigrate => {
                 Topology::SingleWriter
             }
             _ => Topology::DualWriter,
@@ -310,8 +310,8 @@ impl Scenario {
 
     fn config(self) -> Result<SimConfig> {
         let mut config = SimConfig::new(&self.id(), self.topology())?;
-        if self == Scenario::R01Rc7Premigrate {
-            config.frontend_release = FrontendRelease::Rc7;
+        if self == Scenario::R01Rc6Premigrate {
+            config.frontend_release = FrontendRelease::Rc6;
         }
         if let Scenario::S08BlockAtDeath(case) = self {
             config.rpc_gates = true;
@@ -429,8 +429,8 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
             Scenario::S09Migration => s09_migration(&mut sim, body).await?,
             Scenario::S11CarryOwnerTransfer => s11_carry_owner_transfer(&mut sim, body).await?,
             Scenario::S10SingleWriter => s10_single_writer(&mut sim, body).await?,
-            Scenario::R01Rc7Premigrate => {
-                rc7_premigrate::r01_rc7_premigrate(&mut sim, body).await?
+            Scenario::R01Rc6Premigrate => {
+                rc6_premigrate::r01_rc6_premigrate(&mut sim, body).await?
             }
         }
         let records = sim.load()?.records();

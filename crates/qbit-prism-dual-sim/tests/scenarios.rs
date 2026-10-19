@@ -75,7 +75,7 @@ fn inputs(values: Vec<String>) -> Result<Inputs> {
             .context("profile directory has no parent")?
             .join("dual-sim-reports"),
         keep: false,
-        rc7_server: None,
+        rc6_server: None,
     })
 }
 
@@ -306,29 +306,29 @@ async fn s11_carry_owner_transfer_is_refused_while_an_own_block_is_unknown_then_
     run(Scenario::S11CarryOwnerTransfer, gated).await
 }
 
-/// The gate's inputs for the scenarios that also run 3.0.0-rc.7's server:
-/// the usual two, then rc.7's server in [`Inputs::rc7_server`].
-fn rc7_inputs(values: Vec<String>) -> Result<Inputs> {
-    let [pg_bin, qbitd, rc7] = <[String; 3]>::try_from(values)
+/// The gate's inputs for the scenarios that also run 3.0.0-rc.6's server:
+/// the usual two, then rc.6's server in [`Inputs::rc6_server`].
+fn rc6_inputs(values: Vec<String>) -> Result<Inputs> {
+    let [pg_bin, qbitd, rc6] = <[String; 3]>::try_from(values)
         .map_err(|_| anyhow::anyhow!("the gate returned the wrong number of inputs"))?;
     let mut inputs = inputs(vec![pg_bin, qbitd])?;
-    inputs.rc7_server = Some(rc7.into());
+    inputs.rc6_server = Some(rc6.into());
     Ok(inputs)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "dual-writer E2E: run explicitly by the fast lane and the nightly matrix"]
-async fn r01_rc7_pair_serves_lands_and_restarts_while_3_1_migrates_its_database_to_31() -> Result<()>
+async fn r01_rc6_pair_serves_lands_and_restarts_while_3_1_migrates_its_database_to_31() -> Result<()>
 {
     let gated = gate::required_inputs(
         gate::site!(),
         &[
             gate::Input::PgBinDir,
             gate::Input::QbitdBin,
-            gate::Input::Rc7ServerBin,
+            gate::Input::Rc6ServerBin,
         ],
     )?;
-    run_with(Scenario::R01Rc7Premigrate, rc7_inputs(gated)?).await
+    run_with(Scenario::R01Rc6Premigrate, rc6_inputs(gated)?).await
 }
 
 /// [`premigrate::run`] with `plan`, its outcome written to
@@ -339,7 +339,7 @@ async fn premigrate_outcome(
     values: Vec<String>,
 ) -> Result<premigrate::Outcome> {
     let _serial = SERIAL.lock().await;
-    let [pg_bin, rc7] = <[String; 2]>::try_from(values)
+    let [pg_bin, rc6] = <[String; 2]>::try_from(values)
         .map_err(|_| anyhow::anyhow!("the gate returned the wrong number of inputs"))?;
     let (server, _) = binaries()?;
     let profile = profile_dir()?;
@@ -350,7 +350,7 @@ async fn premigrate_outcome(
         .join(name);
     std::fs::create_dir_all(&report)?;
     let work = std::env::temp_dir().join("dual-sim").join(name);
-    let outcome = premigrate::run(pg_bin.as_ref(), rc7.as_ref(), &server, &work, plan).await;
+    let outcome = premigrate::run(pg_bin.as_ref(), rc6.as_ref(), &server, &work, plan).await;
     // The cluster's statement log and the migrate's output, pass or fail.
     for file in ["postgres.log", "migrate-3.1.log"] {
         let _ = std::fs::copy(work.join(file), report.join(file));
@@ -447,7 +447,7 @@ async fn r01_the_premigrate_never_rewrites_freezes_vacuums_or_analyzes_the_ledge
 ) -> Result<()> {
     let gated = gate::required_inputs(
         gate::site!(),
-        &[gate::Input::PgBinDir, gate::Input::Rc7ServerBin],
+        &[gate::Input::PgBinDir, gate::Input::Rc6ServerBin],
     )?;
     let plan = Plan {
         rows: 300_000,
@@ -483,7 +483,7 @@ fn measure_setting<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
 async fn r01_measure_the_premigrate_on_a_ledger_of_millions_of_rows() -> Result<()> {
     let gated = gate::required_inputs(
         gate::site!(),
-        &[gate::Input::PgBinDir, gate::Input::Rc7ServerBin],
+        &[gate::Input::PgBinDir, gate::Input::Rc6ServerBin],
     )?;
     let plan = Plan {
         rows: measure_setting("PRISM_PREMIGRATE_ROWS", 15_000_000)?,

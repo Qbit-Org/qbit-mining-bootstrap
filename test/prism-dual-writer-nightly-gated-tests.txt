@@ -8,7 +8,7 @@
 # `<package>::<binary>::<test>` id per line, sorted; each is named in
 # test/e2e-scenarios.toml.
 qbit-prism-dual-sim::scenarios::checker_control_two_unsynced_single_writers_fail_landing_and_share_presence_checks
-qbit-prism-dual-sim::scenarios::r01_rc7_pair_serves_lands_and_restarts_while_3_1_migrates_its_database_to_31
+qbit-prism-dual-sim::scenarios::r01_rc6_pair_serves_lands_and_restarts_while_3_1_migrates_its_database_to_31
 qbit-prism-dual-sim::scenarios::r01_the_premigrate_never_rewrites_freezes_vacuums_or_analyzes_the_ledgers_data_partition
 qbit-prism-dual-sim::scenarios::s01_steady_state_copies_a_shares_and_blocks_to_b_within_the_sync_interval
 qbit-prism-dual-sim::scenarios::s02_a_frontend_killed_miners_move_to_b_which_mines_carry_free_and_a_pays_down_on_return

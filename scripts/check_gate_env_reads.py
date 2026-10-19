@@ -2,7 +2,7 @@
 """Fail when a Rust file reads an integration-gate variable directly.
 
 Every test whose execution depends on `PRISM_TEST_DATABASE_URL`,
-`PRISM_TEST_PG_BIN_DIR`, `QBITD_BIN` or `PRISM_TEST_RC7_SERVER_BIN` must take the value through the shared
+`PRISM_TEST_PG_BIN_DIR`, `QBITD_BIN` or `PRISM_TEST_RC6_SERVER_BIN` must take the value through the shared
 gate crate (`crates/qbit-prism-test-gate`), which applies one decision table,
 records the execution manifest and prints the skip line. The same goes for the
 gate's own control variables, `PRISM_TEST_REQUIRE_INTEGRATION`,
@@ -36,7 +36,7 @@ GATE_VARIABLES = (
     "PRISM_TEST_DATABASE_URL",
     "PRISM_TEST_PG_BIN_DIR",
     "QBITD_BIN",
-    "PRISM_TEST_RC7_SERVER_BIN",
+    "PRISM_TEST_RC6_SERVER_BIN",
     "PRISM_TEST_REQUIRE_INTEGRATION",
     "PRISM_TEST_GATE_MANIFEST",
     "GITHUB_JOB",

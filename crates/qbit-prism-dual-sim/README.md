@@ -250,24 +250,24 @@ What each one does:
 ### The pre-migrate (R1)
 
 The 3.0 → 3.1 cutover can run 3.1's `migrate` against A's database before
-the window, while the 3.0 pair keeps serving on 3.0.0-rc.7. R1 holds that to
-what the cutover relies on. Its frontends run rc.7 (`FrontendRelease::Rc7`,
-the server the `prism-rc7-server` action builds from the pinned commit,
-passed as `PRISM_TEST_RC7_SERVER_BIN`): rc.7's `migrate` makes the database,
+the window, while the 3.0 pair keeps serving on 3.0.0-rc.6. R1 holds that to
+what the cutover relies on. Its frontends run rc.6 (`FrontendRelease::Rc6`,
+the server the `prism-rc6-server` action builds from the pinned commit,
+passed as `PRISM_TEST_RC6_SERVER_BIN`): rc.6's `migrate` makes the database,
 and every start runs with `PRISM_POSTGRES_INIT_SCHEMA=0`, as production's
 lanes do.
 
-- **R1** (`r01_rc7_pair_serves_…`): under load, A lands a block at 26. 3.1's
+- **R1** (`r01_rc6_pair_serves_…`): under load, A lands a block at 26. 3.1's
   `migrate` then runs once with A's frontend environment while a reader holds
   a snapshot, so 031's CREATE INDEX CONCURRENTLY is caught part-way. Checked:
   027 and 028 commit with no share refused (stale work aside) and none
   waiting 5 s; appends continue; A lands a block during the build; A's
   frontend restarts with 31 unrecorded and the index invalid, and warns of
   27 and 28. Once the reader ends: 31 ready and the index valid on the writer
-  and on the standby; B restarts at 31; a last landing; rc.7's rows take 027's
+  and on the standby; B restarts at 31; a last landing; rc.6's rows take 027's
   defaults; no frontend statement cancelled; the checker's invariants.
 - **p0** (`r01_the_premigrate_never_rewrites_…`, `src/premigrate.rs`): no
-  frontend, one cluster that logs every statement with autovacuum off. rc.7
+  frontend, one cluster that logs every statement with autovacuum off. rc.6
   migrates it, 300,000 synthetic rows fill p0, and an appender appends as a
   frontend does under a 5 s lock timeout while 3.1's `migrate` runs. Checked:
   p0 (and its TOAST table) keeps its relfilenode, relfrozenxid and

@@ -86,9 +86,9 @@ pub struct Inputs {
     pub report_root: PathBuf,
     /// Keep the scenario's data directories after a pass.
     pub keep: bool,
-    /// A `qbit-prism-server` built from 3.0.0-rc.7, for the scenarios whose
-    /// frontends run that release ([`FrontendRelease::Rc7`]).
-    pub rc7_server: Option<PathBuf>,
+    /// A `qbit-prism-server` built from 3.0.0-rc.6, for the scenarios whose
+    /// frontends run that release ([`FrontendRelease::Rc6`]).
+    pub rc6_server: Option<PathBuf>,
 }
 
 /// Which release the frontends run.
@@ -97,12 +97,12 @@ pub struct Inputs {
 pub enum FrontendRelease {
     /// This workspace's server, [`Inputs::server`].
     This,
-    /// 3.0.0-rc.7, [`Inputs::rc7_server`], as the 3.0 pair serves while 3.1's
+    /// 3.0.0-rc.6, [`Inputs::rc6_server`], as the 3.0 pair serves while 3.1's
     /// `migrate` runs against its database before the cutover. Its database
-    /// is migrated by rc.7's own `migrate` before the first start, and every
+    /// is migrated by rc.6's own `migrate` before the first start, and every
     /// start runs with `PRISM_POSTGRES_INIT_SCHEMA=0`, as production's lanes
-    /// do, so no rc.7 frontend ever migrates.
-    Rc7,
+    /// do, so no rc.6 frontend ever migrates.
+    Rc6,
 }
 
 /// What one scenario runs.
@@ -404,10 +404,10 @@ impl Sim {
         }
         let server_bin = match config.frontend_release {
             FrontendRelease::This => inputs.server.clone(),
-            FrontendRelease::Rc7 => inputs
-                .rc7_server
+            FrontendRelease::Rc6 => inputs
+                .rc6_server
                 .clone()
-                .context("the scenario's frontends run rc.7, and no rc.7 server was given")?,
+                .context("the scenario's frontends run rc.6, and no rc.6 server was given")?,
         };
         let mut frontends = BTreeMap::new();
         for node in Node::BOTH {
@@ -435,7 +435,7 @@ impl Sim {
                 sync_batch_rows: config.sync_batch_rows,
             });
             let mut overrides = config.overrides.get(&node).cloned().unwrap_or_default();
-            if config.frontend_release == FrontendRelease::Rc7 {
+            if config.frontend_release == FrontendRelease::Rc6 {
                 overrides.push(("PRISM_POSTGRES_INIT_SCHEMA".into(), "0".into()));
             }
             let spec = FrontendSpec {
@@ -482,15 +482,15 @@ impl Sim {
             }
         } else {
             // A migrates its database first; in the 3.0 pair B then finds
-            // the schema in place. rc.7's frontends never migrate: its own
+            // the schema in place. rc.6's frontends never migrate: its own
             // `migrate` does, once, as the 3.0 pair's database was.
-            if config.frontend_release == FrontendRelease::Rc7 {
+            if config.frontend_release == FrontendRelease::Rc6 {
                 let run = frontends[&Node::A]
                     .tool(&["migrate"], Duration::from_secs(300))
                     .await?;
                 ensure!(
                     run.success,
-                    "rc.7's migrate on node A failed ({:?}): {} {}",
+                    "rc.6's migrate on node A failed ({:?}): {} {}",
                     run.code,
                     run.stdout.trim(),
                     run.stderr.trim()

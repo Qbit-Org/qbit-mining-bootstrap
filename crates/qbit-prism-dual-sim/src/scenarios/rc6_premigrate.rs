@@ -1,9 +1,9 @@
-//! R1: the 3.0 pair keeps serving on rc.7 while 3.1's `migrate` takes its
+//! R1: the 3.0 pair keeps serving on rc.6 while 3.1's `migrate` takes its
 //! database to 27, 28 and 31, before the cutover (the pre-migrate).
 //!
-//! rc.7 accepts the migrated database: its start gate
+//! rc.6 accepts the migrated database: its start gate
 //! (`require_schema_version` in `crates/qbit-prism-server/src/ledger/
-//! migration.rs` at 3.0.0-rc.7) refuses only a database missing one of the
+//! migration.rs` at 3.0.0-rc.6) refuses only a database missing one of the
 //! migrations it requires, 2 to 26, and names any it does not know in a
 //! warning, and none of 027, 028 and 031 declares a capability, so its
 //! connect-time capability gate passes too. This scenario holds the running
@@ -21,7 +21,7 @@ const APPEND_LOCK_TIMEOUT_MS: u64 = 5_000;
 /// What a frontend's log says when one of its statements was cancelled, by
 /// its lock timeout or its statement timeout.
 const CANCELLED: &str = "canceling statement due to";
-/// rc.7's warning for a migration it does not know.
+/// rc.6's warning for a migration it does not know.
 const UNKNOWN_MIGRATIONS: &str = "database has schema migrations this server does not know";
 
 async fn versions(pool: &PgPool) -> Result<Vec<i32>> {
@@ -81,7 +81,7 @@ struct Restart {
     up_at_ms: u64,
 }
 
-/// Restart `node`'s rc.7 frontend with a graceful stop, as `docker stop`
+/// Restart `node`'s rc.6 frontend with a graceful stop, as `docker stop`
 /// does, once the balancer has marked it down, and wait until it is ready
 /// and the balancer has it up again.
 async fn restart(sim: &mut Sim, node: Node) -> Result<Restart> {
@@ -104,7 +104,7 @@ async fn restart(sim: &mut Sim, node: Node) -> Result<Restart> {
     })
 }
 
-/// The 3.0 pair on rc.7 (A's database the writer, B's its standby, both
+/// The 3.0 pair on rc.6 (A's database the writer, B's its standby, both
 /// frontends writing A's) under load. A lands a block at schema 26. Then 3.1's
 /// `migrate` runs once against A's database, as the pre-migrate runs it: a
 /// one-off command with A's frontend environment (its writer role and DSN),
@@ -118,17 +118,17 @@ async fn restart(sim: &mut Sim, node: Node) -> Result<Restart> {
 /// is valid on the primary and on the standby, B's frontend restarts and
 /// serves at 31, and A lands a block on the migrated schema, its rows taking
 /// 027's defaults. No frontend statement is cancelled throughout.
-pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result<()> {
+pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.load()?.resume();
     steady(sim, 6).await;
-    let first = find_block(sim, body, Node::A, "A on rc.7 at schema 26", None).await?;
+    let first = find_block(sim, body, Node::A, "A on rc.6 at schema 26", None).await?;
     // The landing supersedes the work miners hold; their shares on it are
     // refused as stale for a moment, which is not the migrate's doing.
     steady(sim, 2).await;
     let pool = sim.pool(Node::A).await?;
     let before = versions(&pool).await?;
     body.expect(
-        "the database starts at rc.7's schema",
+        "the database starts at rc.6's schema",
         before.last() == Some(&26),
         format!("recorded migrations {before:?}"),
     );
@@ -243,13 +243,13 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     let mid_build = find_block(sim, body, Node::A, "A while 031 builds", None).await?;
     let restarted = restart(sim, Node::A).await?;
     sim.mark(&format!(
-        "A's rc.7 frontend restarted mid-build, ready in {:.1} s",
+        "A's rc.6 frontend restarted mid-build, ready in {:.1} s",
         restarted.ready_in.as_secs_f64()
     ));
     let still = versions(&pool).await?;
     let warned = log_lines(sim, Node::A, UNKNOWN_MIGRATIONS);
     body.expect(
-        "rc.7 stops gracefully, restarts and serves mid-build, warning of 27 and 28",
+        "rc.6 stops gracefully, restarts and serves mid-build, warning of 27 and 28",
         restarted.graceful
             && !still.contains(&31)
             && warned.iter().any(|line| line.contains("27, 28")),
@@ -299,12 +299,12 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
 
     let restarted = restart(sim, Node::B).await?;
     sim.mark(&format!(
-        "B's rc.7 frontend restarted at 31, ready in {:.1} s",
+        "B's rc.6 frontend restarted at 31, ready in {:.1} s",
         restarted.ready_in.as_secs_f64()
     ));
     let warned = log_lines(sim, Node::B, UNKNOWN_MIGRATIONS);
     body.expect(
-        "rc.7 stops gracefully, restarts and serves at 31, warning of 27, 28 and 31",
+        "rc.6 stops gracefully, restarts and serves at 31, warning of 27, 28 and 31",
         restarted.graceful && warned.iter().any(|line| line.contains("27, 28, 31")),
         format!(
             "stopped gracefully {}; B's warnings {warned:?}",
@@ -313,8 +313,8 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     );
     let last = find_block(sim, body, Node::A, "A at 31", None).await?;
 
-    // Rows rc.7 wrote after 027 take its defaults: node 0, and a sync_seq
-    // from qbit_prism_next_sync_seq(), which rc.7's role may call. The block
+    // Rows rc.6 wrote after 027 take its defaults: node 0, and a sync_seq
+    // from qbit_prism_next_sync_seq(), which rc.6's role may call. The block
     // landed before 027 has none.
     let blocks: Vec<(String, i16, Option<i64>)> = sqlx::query_as(
         "SELECT block_hash, origin_node, sync_seq FROM qbit_pool_blocks \
@@ -330,7 +330,7 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
             .map(|(_, origin, seq)| (*origin, *seq))
     };
     body.expect(
-        "rc.7's landings after 027 take its defaults",
+        "rc.6's landings after 027 take its defaults",
         matches!(sync_of(&first), Some((0, None)))
             && matches!(sync_of(&mid_build), Some((0, Some(_))))
             && matches!(sync_of(&last), Some((0, Some(_)))),
@@ -343,7 +343,7 @@ pub(super) async fn r01_rc7_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     .fetch_one(&pool)
     .await?;
     body.expect(
-        "rc.7's jobs after 027 take its defaults",
+        "rc.6's jobs after 027 take its defaults",
         jobs.0 > 0 && jobs.1 == 0,
         format!(
             "{} jobs with a sync_seq, {} of another node",
