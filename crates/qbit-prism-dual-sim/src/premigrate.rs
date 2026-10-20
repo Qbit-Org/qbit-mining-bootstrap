@@ -72,6 +72,8 @@ pub struct Plan {
     /// CREATE INDEX CONCURRENTLY uses them.
     pub maintenance_work_mem: String,
     pub maintenance_workers: u32,
+    /// PostgreSQL's `shared_buffers` for the run.
+    pub shared_buffers: String,
     /// The appender's pace: one append every this many milliseconds.
     pub append_every_ms: u64,
 }
@@ -388,6 +390,10 @@ async fn seed(pool: &PgPool, plan: &Plan) -> Result<()> {
     let mut done = 0;
     while done < plan.rows {
         let count = plan.batch.min(plan.rows - done);
+        // The share id leads with the row's number, so the unique index on it
+        // grows at its right edge as the seed appends: random ids make every
+        // batch beyond the cache a random write per row (hours at 15M rows),
+        // and 031 never reads that index.
         // About 450 bytes a row, a production ledger's average: a share id
         // of `<job>:<extranonce>:<ntime>:<nonce>:<header hash>`, a miner,
         // a payout key and a job id of realistic lengths.
@@ -396,7 +402,7 @@ async fn seed(pool: &PgPool, plan: &Plan) -> Result<()> {
                (share_id, miner_id, payout_order_key, p2mr_program, share_difficulty, \
                 network_difficulty, template_height, job_id, job_issued_at, ntime, \
                 writer_id, writer_epoch, accepted_at) \
-             SELECT 'prism-a-' || md5(g::text) || ':' || lpad(to_hex(g), 16, '0') || ':6a1f2c3d:' \
+             SELECT 'prism-a-' || lpad(to_hex(g), 16, '0') || md5(g::text) || ':6a1f2c3d:' \
                         || lpad(to_hex(g * 7), 8, '0') || ':' || md5(g::text || 'h') || md5(g::text || 'i'), \
                     'bc1p' || md5((g % 997)::text) || md5((g % 991)::text), \
                     'p2mr:' || md5((g % 997)::text) || md5((g % 991)::text) || ':0001', \
@@ -520,6 +526,7 @@ pub async fn run(
             plan.maintenance_workers
         ),
         "max_wal_size = '8GB'".to_owned(),
+        format!("shared_buffers = '{}'", plan.shared_buffers),
     ];
     let node = PgNode::init("premigrate", pg_bin, &work.join("pg"), &log, &settings)?;
     create_owner(&node).await?;
