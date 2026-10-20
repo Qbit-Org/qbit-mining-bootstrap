@@ -10,7 +10,9 @@ the release candidates' notes, [3.0.0-rc.1](release-notes-3.0.0-rc.1.md),
 [3.0.0-rc.3](release-notes-3.0.0-rc.3.md),
 [3.0.0-rc.4](release-notes-3.0.0-rc.4.md),
 [3.0.0-rc.5](release-notes-3.0.0-rc.5.md) and
-[3.0.0-rc.6](release-notes-3.0.0-rc.6.md).
+[3.0.0-rc.6](release-notes-3.0.0-rc.6.md). The next candidate on this line is
+[3.1.0-rc.1](release-notes-3.1.0-rc.1.md): rc.6, its fixes since, and the 3.1
+dual writer, which is off by default.
 
 ## Migration and recovery (D5)
 
