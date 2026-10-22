@@ -1,6 +1,7 @@
 # qbit-mining-bootstrap 3.0.0 Release Notes
 
-Release date: 2026-10-22 (tag `v3.0.0`, cut from the `3.0.x` branch).
+Release date: 2026-10-22 (tag `v3.0.0` on `main`; the release branch is
+`3.0.x`).
 
 3.0.0 is 3.0.0-rc.6 plus #770's fix for #765, in which `import-audits` held
 `SETTLEMENT_LOCK` while it sent and stored each legacy audit body, so a large
