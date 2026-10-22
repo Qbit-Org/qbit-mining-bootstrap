@@ -1,0 +1,95 @@
+//! `qbit-prism-load`: drive real Stratum sockets against real PRISM frontends
+//! and produce a capacity-evidence artifact plus a side report.
+
+use clap::Parser;
+use qbit_prism_load::{cli::Args, external, frontend, preset, run};
+
+fn main() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // External-target mode has a command line of its own, read before the
+    // preset expansion below: its flags are not the harness's, so no preset
+    // pins them and none can be added to them.
+    if let Some(command) = external::Command::of(&argv) {
+        // Kept until the process exits: dropping a runtime waits for its
+        // blocking tasks, and the stats are already written by then.
+        let runtime = runtime();
+        let code = runtime.block_on(external::main(command, argv));
+        match code {
+            Ok(code) => std::process::exit(code),
+            Err(error) => fail(error),
+        }
+    }
+    // A `--preset` file's flags join the command line before clap reads it,
+    // so a flag the preset pins cannot be given twice (#521).
+    let (argv, preset) = match preset::expand_command_line(argv) {
+        Ok(expanded) => expanded,
+        Err(error) => fail(error),
+    };
+    let args = Args::parse_from(argv);
+    let runtime = runtime();
+    // The harness owns child processes and two PostgreSQL clusters. A signal
+    // must unwind through the same teardown as a normal exit, so it cancels
+    // the run rather than killing the process where it stands.
+    let code = runtime.block_on(async move {
+        tokio::select! {
+            result = run::execute_with_preset(args, preset) => result,
+            reason = signal() => {
+                eprintln!("qbit-prism-load: {reason}; tearing down");
+                Ok(run::EXIT_ABORTED)
+            }
+        }
+    });
+    match code {
+        Ok(code) => std::process::exit(code),
+        Err(error) => fail(error),
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("prism-load")
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => fail(error.into()),
+    }
+}
+
+/// Print the error and exit with the documented code for a harness error.
+///
+/// Returning the error from `main` printed it verbatim and exited 1, while
+/// the README promises 2 for "the harness failed with an error": `EXIT_ERROR`
+/// was defined and never produced. The text goes out through the same
+/// redaction the failure report applies, because stderr is a sink like any
+/// other and the error chain can name a URL (EP-OBSERVABILITY).
+fn fail(error: anyhow::Error) -> ! {
+    eprintln!(
+        "qbit-prism-load: error: {}",
+        frontend::redact_secrets_in_text(&format!("{error:#}"))
+    );
+    std::process::exit(run::EXIT_ERROR);
+}
+
+async fn signal() -> String {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(handle) => handle,
+        Err(_) => return "signal handling unavailable".into(),
+    };
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(handle) => handle,
+        Err(_) => return "signal handling unavailable".into(),
+    };
+    tokio::select! {
+        _ = interrupt.recv() => "interrupted".into(),
+        _ = terminate.recv() => "terminated".into(),
+    }
+}

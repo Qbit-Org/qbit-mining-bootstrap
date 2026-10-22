@@ -1,0 +1,658 @@
+use super::*;
+use qbit_prism::FoundBlock;
+use sqlx::{pool::PoolConnection, PgConnection};
+
+/// Audit history available from shared PostgreSQL storage, without relying on
+/// a filesystem mount on the public tier. This checks presence, not integrity:
+/// the import and read paths still authenticate the bytes and reconstructed
+/// native snapshots before serving an artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AuditCompleteness {
+    pub missing_stored_bodies: i64,
+    /// Native bodies with an existing immutable snapshot can reconstruct the
+    /// bytes and do not need `canonical_audit_bytes` to be stored separately.
+    pub missing_canonical_bytes: i64,
+}
+
+impl AuditCompleteness {
+    pub fn require_complete(&self) -> Result<()> {
+        ensure!(
+            self.missing_stored_bodies == 0 && self.missing_canonical_bytes == 0,
+            "audit history is incomplete: {} rows lack stored bodies and {} rows lack canonical bytes; run import-audits and repair any remaining rows before production cutover",
+            self.missing_stored_bodies,
+            self.missing_canonical_bytes,
+        );
+        Ok(())
+    }
+}
+
+/// Count each missing representation in one database snapshot. A legacy body
+/// stored inline needs canonical import; an external-only legacy body needs
+/// both. Imported canonical bytes themselves are a stored body. Native bodies
+/// need their referenced snapshot to make canonical reconstruction available.
+pub async fn audit_completeness<'e>(
+    executor: impl sqlx::Executor<'e, Database = Postgres>,
+) -> Result<AuditCompleteness> {
+    let (missing_stored_bodies, missing_canonical_bytes) = sqlx::query_as(
+        "SELECT \
+         count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object'), \
+         count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND (jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object' \
+                 OR NOT EXISTS (SELECT 1 FROM qbit_prism_audit_snapshots s \
+                     WHERE s.snapshot_sha256=a.share_snapshot_sha256))) \
+         FROM qbit_pool_audit_bundles a",
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(AuditCompleteness {
+        missing_stored_bodies,
+        missing_canonical_bytes,
+    })
+}
+
+/// Where a reconstruction reads from: the pool, or one connection.
+///
+/// The public read pool applies a request's remaining deadline to each
+/// checkout (`api/public_service.rs`), so a reconstruction serving a request
+/// takes one checkout per statement; retaining one would give a late range
+/// scan the first statement's whole budget. A maintenance command runs every
+/// statement on one connection of its own instead: a production window is
+/// hundreds of megabytes, and its unpaged range read does not finish inside
+/// the pool's ordinary `statement_timeout`, which that connection has lifted.
+pub enum AuditReader<'a> {
+    /// One checkout per statement, each under the pool's own settings.
+    Pool(&'a PgPool),
+    /// Every statement on this connection, under its session settings.
+    Connection(&'a mut PgConnection),
+}
+
+impl<'a> From<&'a PgPool> for AuditReader<'a> {
+    fn from(pool: &'a PgPool) -> Self {
+        Self::Pool(pool)
+    }
+}
+
+impl<'a> From<&'a mut PgConnection> for AuditReader<'a> {
+    fn from(connection: &'a mut PgConnection) -> Self {
+        Self::Connection(connection)
+    }
+}
+
+/// A reborrow, so one reader serves a reconstruction and the rebuild it
+/// delegates to without giving up its connection.
+impl<'a> From<&'a mut AuditReader<'_>> for AuditReader<'a> {
+    fn from(reader: &'a mut AuditReader<'_>) -> Self {
+        match reader {
+            AuditReader::Pool(pool) => Self::Pool(pool),
+            AuditReader::Connection(connection) => Self::Connection(connection),
+        }
+    }
+}
+
+impl AuditReader<'_> {
+    /// The connection for the next statement: a fresh checkout from the
+    /// pool, returned when the statement is done, or the one connection.
+    async fn connection(
+        &mut self,
+        metrics: Option<&crate::metrics::Metrics>,
+    ) -> Result<AuditConnection<'_>> {
+        Ok(match self {
+            Self::Pool(pool) => AuditConnection::Pooled(
+                crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?,
+            ),
+            Self::Connection(connection) => AuditConnection::Borrowed(connection),
+        })
+    }
+}
+
+enum AuditConnection<'c> {
+    Pooled(PoolConnection<Postgres>),
+    Borrowed(&'c mut PgConnection),
+}
+
+impl std::ops::Deref for AuditConnection<'_> {
+    type Target = PgConnection;
+
+    fn deref(&self) -> &PgConnection {
+        match self {
+            Self::Pooled(connection) => connection,
+            Self::Borrowed(connection) => connection,
+        }
+    }
+}
+
+impl std::ops::DerefMut for AuditConnection<'_> {
+    fn deref_mut(&mut self) -> &mut PgConnection {
+        match self {
+            Self::Pooled(connection) => connection,
+            Self::Borrowed(connection) => connection,
+        }
+    }
+}
+
+/// Exact content-addressed bytes for the public artifact route. Imported
+/// legacy bytes are authoritative; missing legacy sidecars permit the old
+/// logical-JSON fallback. Native bodies are reproducible from their immutable
+/// share snapshot and never need a second stored copy of the full window.
+pub async fn audit_canonical_bytes<'a>(
+    reader: impl Into<AuditReader<'a>>,
+    block_hash: &str,
+) -> Result<Option<Vec<u8>>> {
+    audit_canonical_bytes_admitted(reader, block_hash, None).await
+}
+
+/// [`audit_canonical_bytes`] under an admission `permit`. The stored bytes'
+/// digest and parse, and a native row's rebuild and canonical serialization,
+/// are proportional to the window, so they run on one blocking thread that
+/// holds the permit itself: Tokio keeps running that job after its awaiting
+/// caller is dropped, and the permit must bound it anyway. Callers outside the
+/// public API pass `None`.
+pub async fn audit_canonical_bytes_admitted<'a>(
+    reader: impl Into<AuditReader<'a>>,
+    block_hash: &str,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Option<Vec<u8>>> {
+    let mut reader = reader.into();
+    let row = sqlx::query("SELECT audit_bundle,audit_bundle_sha256,share_snapshot_sha256,canonical_audit_bytes FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+        .bind(block_hash).fetch_optional(&mut *reader.connection(None).await?).await?;
+    let Some(row) = row else { return Ok(None) };
+    let expected: String = row.try_get("audit_bundle_sha256")?;
+    let canonical: Option<Vec<u8>> = row.try_get("canonical_audit_bytes")?;
+    let snapshot: Option<String> = row.try_get("share_snapshot_sha256")?;
+    let body: Option<Value> = match (&canonical, &snapshot) {
+        (None, Some(_)) => row.try_get("audit_bundle")?,
+        _ => None,
+    };
+    // The row still holds its own copy of the bytes; free it before the
+    // blocking job instead of keeping two copies alive across the await.
+    drop(row);
+    if let Some(bytes) = canonical {
+        return tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let _permit = permit;
+            ensure!(
+                hex::encode(Sha256::digest(&bytes)) == expected,
+                "stored canonical audit bytes have a digest mismatch"
+            );
+            let value: Value = serde_json::from_slice(&bytes)?;
+            ensure!(
+                value.is_object(),
+                "stored canonical audit bytes must contain a JSON object"
+            );
+            Ok(Some(bytes))
+        })
+        .await?;
+    }
+    if snapshot.is_none() {
+        return Ok(None);
+    }
+    let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
+    // The rebuild's own blocking job also produces the canonical bytes it
+    // proves against the digest, so the permit spans both in one job.
+    let bytes = materialize_audit_row_with_metrics(&mut reader, &mut logical, permit, None, true)
+        .await?
+        .context("canonical reconstruction produced no bytes")?;
+    Ok(Some(bytes))
+}
+
+/// Logical audit body of an imported row, decoded from its stored canonical
+/// bytes. The bytes must match the row's declared digest and parse with the
+/// shared audit parser; the result is the value the import once stored inline.
+/// A two-copy body is hundreds of megabytes at production window sizes, so the
+/// digest, parse and serialization all stay off the runtime threads. A
+/// `permit` is held by the blocking job itself: Tokio keeps running that job
+/// after its awaiting caller is dropped, and the permit must bound it anyway.
+pub async fn decode_canonical_audit_body(
+    bytes: Vec<u8>,
+    expected: String,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Value> {
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let _permit = permit;
+        ensure!(
+            hex::encode(Sha256::digest(&bytes)) == expected,
+            "stored canonical audit bytes have a digest mismatch"
+        );
+        let value: Value = serde_json::from_slice(&bytes)?;
+        // Canonical bytes are always a flat bundle. The shared parser would
+        // also resolve an envelope, including files relative to this process.
+        ensure!(
+            !matches!(
+                value["schema"].as_str(),
+                Some(qbit_prism::AUDIT_BODY_REF_SCHEMA | qbit_prism::AUDIT_BUNDLE_V2_SCHEMA)
+            ),
+            "stored canonical audit bytes hold an audit envelope, not a bundle"
+        );
+        let bundle = qbit_prism::parse_audit_bundle_value(value, None)?;
+        Ok(serde_json::to_value(&bundle)?)
+    })
+    .await?
+}
+
+/// Hydrate the `audit_bundle` member of an API/database row. The range and
+/// checksum are verified before exposing the logical legacy v1 audit format.
+///
+/// A native row stores the body without its share window. Rows written
+/// before #267 keep `reward_manifest.shares`; rows written since keep only the
+/// [`PrismRewardManifestHeader`] and the counted window is rebuilt here from
+/// the same immutable shares, through [`restore_reward_manifest`], which
+/// refuses a header the rebuild does not reproduce. The canonical digest check
+/// at the end then proves the rebuilt body is byte-identical to the one that
+/// was signed, whichever shape the row has. Both arms are total: the header
+/// type denies a `shares` key, and the full manifest requires one.
+///
+/// The snapshot digest, the rebuild and the canonical digest are all
+/// proportional to the window, hundreds of megabytes at production sizes, so
+/// they run on one blocking thread. A `permit` is held by that job itself:
+/// Tokio keeps running it after its awaiting caller is dropped, and the permit
+/// must bound it anyway. Callers outside the public API pass `None`.
+pub async fn materialize_audit_row<'a>(
+    reader: impl Into<AuditReader<'a>>,
+    row: &mut Value,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
+    // Public and maintenance readers have no metrics owner. Ledger reconstruction
+    // supplies its attached handle through the private helper below.
+    materialize_audit_row_with_metrics(reader, row, permit, None, false).await?;
+    Ok(())
+}
+
+/// With `canonical`, the blocking job returns the canonical bytes it proved
+/// against `audit_bundle_sha256` and drops the body, leaving `audit_bundle`
+/// null; without it, the body is materialized into `row` and nothing returns.
+async fn materialize_audit_row_with_metrics<'a>(
+    reader: impl Into<AuditReader<'a>>,
+    row: &mut Value,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    metrics: Option<&crate::metrics::Metrics>,
+    canonical: bool,
+) -> Result<Option<Vec<u8>>> {
+    let Some(digest) = row.get("share_snapshot_sha256").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let digest = digest.to_owned();
+    let mut reader = reader.into();
+    // Snapshots and their share history are immutable, and both hashes below
+    // authenticate the reconstruction. Each statement takes the reader's
+    // connection on its own: from the pool, a separate checkout per statement
+    // lets the public read pool apply the remaining request deadline to each;
+    // retaining one transaction would give a late range scan the first
+    // query's full budget.
+    let snapshot = sqlx::query("SELECT first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares FROM qbit_prism_audit_snapshots WHERE snapshot_sha256=$1").bind(&digest).fetch_one(&mut *reader.connection(metrics).await?).await?;
+    let inline: Option<Value> = snapshot.try_get("inline_shares")?;
+    let shares: Vec<AcceptedShare> = if let Some(inline) = inline {
+        serde_json::from_value(inline)?
+    } else {
+        read_range(
+            &mut reader,
+            snapshot.try_get("first_share_seq")?,
+            snapshot.try_get("last_share_seq")?,
+            snapshot.try_get("anchor_ms")?,
+            metrics,
+        )
+        .await?
+    };
+    ensure!(
+        i64::try_from(shares.len())? == snapshot.try_get::<i64, _>("share_count")?,
+        "audit share history is incomplete"
+    );
+    let body = row
+        .get_mut("audit_bundle")
+        .and_then(Value::as_object_mut)
+        .context("audit metadata body is missing")?;
+    // The body moves into the blocking job and comes back materialized; the
+    // row holds no second copy of it across the await.
+    let body = std::mem::take(body);
+    let expected = row["audit_bundle_sha256"].as_str().map(str::to_owned);
+    ensure!(
+        !canonical || expected.is_some(),
+        "canonical reconstruction needs the row's audit digest"
+    );
+    let (materialized, bytes) =
+        tokio::task::spawn_blocking(move || -> Result<(Value, Option<Vec<u8>>)> {
+            let _permit = permit;
+            ensure!(
+                hex::encode(Sha256::digest(serde_json::to_vec(&shares)?)) == digest,
+                "audit share snapshot digest mismatch"
+            );
+            let mut body = body;
+            let normalized = body
+                .get("reward_manifest")
+                .and_then(Value::as_object)
+                .is_some_and(|manifest| !manifest.contains_key("shares"));
+            if normalized {
+                let header: qbit_prism::PrismRewardManifestHeader = serde_json::from_value(
+                    body.remove("reward_manifest")
+                        .context("audit body has no reward manifest")?,
+                )?;
+                let found_block = FoundBlock::deserialize(
+                    body.get("found_block")
+                        .context("audit body has no found block")?,
+                )?;
+                let manifest = qbit_prism::restore_reward_manifest(header, &shares, &found_block)?;
+                body.insert("reward_manifest".into(), serde_json::to_value(&manifest)?);
+            }
+            body.insert("shares".into(), serde_json::to_value(shares)?);
+            let body = Value::Object(body);
+            if let Some(expected) = expected {
+                let bundle = AuditBundle::deserialize(&body)?;
+                let bytes = qbit_prism::canonical_audit_bundle_bytes(&bundle)?;
+                ensure!(
+                    hex::encode(Sha256::digest(&bytes)) == expected,
+                    "materialized audit body digest mismatch"
+                );
+                if canonical {
+                    return Ok((Value::Null, Some(bytes)));
+                }
+            }
+            Ok((body, None))
+        })
+        .await??;
+    row["audit_bundle"] = materialized;
+    Ok(bytes)
+}
+
+impl Ledger {
+    /// Stored canonical bytes, then range-backed bodies, then old inline
+    /// bodies. Legacy filesystem bodies are imported by the migration command
+    /// or resolved by the public API reader. Stored bytes that fail their
+    /// digest or parse are an error, never a fallback to another source.
+    ///
+    /// Stored bytes win whatever the row's shape (#144). A native row is
+    /// sealed before its shares are archived, and after the detach the
+    /// reconstruction it used to serve has nothing to read: the block keeps
+    /// its advertised `audit_bundle_sha256` only because the bytes proved
+    /// against that digest at seal time are preferred here.
+    pub async fn audit_bundle(&self, block_hash: &str) -> Result<Option<Value>> {
+        // Load only the representation that will be served: the inline body is
+        // needed for a reconstruction, which only happens without bytes.
+        let row = sqlx::query("SELECT audit_bundle_sha256,share_snapshot_sha256,canonical_audit_bytes,CASE WHEN canonical_audit_bytes IS NULL THEN audit_bundle END AS audit_bundle FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+            .bind(block_hash)
+            .fetch_optional(&mut *self.acquire().await?)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let expected: String = row.try_get("audit_bundle_sha256")?;
+        let snapshot: Option<String> = row.try_get("share_snapshot_sha256")?;
+        let body: Option<Value> = row.try_get("audit_bundle")?;
+        let canonical: Option<Vec<u8>> = row.try_get("canonical_audit_bytes")?;
+        // The row still holds its own copy of the bytes; free it before the
+        // decode instead of keeping two copies alive across the await.
+        drop(row);
+        if let Some(bytes) = canonical {
+            return Ok(Some(
+                decode_canonical_audit_body(bytes, expected, None).await?,
+            ));
+        }
+        if snapshot.is_some() {
+            let mut logical = serde_json::json!({"audit_bundle":body,"audit_bundle_sha256":expected,"share_snapshot_sha256":snapshot});
+            materialize_audit_row_with_metrics(
+                &self.pool,
+                &mut logical,
+                None,
+                self.metrics.as_deref(),
+                false,
+            )
+            .await?;
+            return Ok(Some(logical["audit_bundle"].take()).filter(|body| !body.is_null()));
+        }
+        Ok(body.filter(|body| !body.is_null()))
+    }
+}
+
+/// What landing writes to `qbit_prism_audit_snapshots`, produced off the
+/// runtime from the claim's parts: the digest, the reference's range, and the
+/// shares the range must be proved against.
+pub(super) struct AuditSnapshotWrite {
+    pub digest: String,
+    pub first_share_seq: i64,
+    pub last_share_seq: i64,
+    pub anchor_ms: i64,
+    /// Issued difficulty from the verified found block, not share-row metadata
+    /// or a weight inferred from the selected range.
+    pub network_difficulty: u128,
+    pub share_count: i64,
+    /// The bootstrap window's one synthetic share, which is not in the ledger
+    /// and so is stored inline rather than referenced. This is `Some` exactly
+    /// when the candidate's window reference carries no share range, so the
+    /// exemption below is decided by the reference the block committed to
+    /// rather than by a share's id and job id.
+    pub inline: Option<Value>,
+    pub shares: std::sync::Arc<Vec<AcceptedShare>>,
+}
+
+/// Rows per page of [`verify_durable_range`]. The same page the window reader
+/// in `ledger/window.rs` uses; at the ~600 B a decoded production share
+/// occupies, one page is about 2.5 MB, so concurrent landings each hold one
+/// page of decoded rows, never a second copy of the window.
+const VERIFY_PAGE_ROWS: i64 = 4096;
+
+/// The same anchored eligibility at selection, proof, persistence and readback.
+/// `anchor_parameter` is a SQL bind position supplied only by these call sites.
+pub(super) fn anchored_eligibility_sql(anchor_parameter: usize) -> String {
+    format!("accepted AND accepted_at<=to_timestamp(${anchor_parameter}::double precision/1000) AND job_issued_at<=to_timestamp(${anchor_parameter}::double precision/1000)")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OldestBoundary {
+    Crossing,
+    /// Valid only if no older eligible history exists.
+    Partial,
+}
+
+/// Classify a fully verified, oldest-first window at a positive target weight.
+/// Saturating subtraction matches the snapshot's reverse walk without summing
+/// difficulties that can exceed u128::MAX. Equality retains the crossing row.
+fn oldest_boundary(weight: u128, shares: &[AcceptedShare]) -> Result<OldestBoundary> {
+    let remaining_without_oldest = shares.iter().skip(1).fold(weight, |left, share| {
+        left.saturating_sub(share.share_difficulty)
+    });
+    ensure!(
+        remaining_without_oldest > 0,
+        "audit share snapshot extends past canonical oldest share"
+    );
+    let oldest = shares
+        .first()
+        .context("audit share snapshot cannot be empty")?;
+    Ok(if remaining_without_oldest > oldest.share_difficulty {
+        OldestBoundary::Partial
+    } else {
+        OldestBoundary::Crossing
+    })
+}
+
+/// Prove the candidate's window is exactly what the immutable ledger holds for
+/// its issued anchor and difficulty, before the settlement lock is taken.
+///
+/// Boundary decision (#356): re-derive the extent (issue option 3). A
+/// `WindowRef` is made from `Snapshot.shares`, so agreement with its copied
+/// endpoints/count/digest cannot catch a selection bug. The independent inputs
+/// are the anchor issued by `Ledger::snapshot`'s database timestamp barrier and
+/// the template difficulty carried by the verified found block. This still
+/// trusts issuance of those inputs; it does not certify the node template.
+///
+/// After full equality, an anchored probe rejects any newer eligible row.
+/// Folding the verified difficulties except the oldest must leave positive
+/// weight: that oldest row is the first one to reach/cross the target, or the
+/// ledger must have no older eligible row. This also accepts a partial window
+/// when history runs out. An inline bootstrap requires an empty anchored
+/// ledger, independently of its empty reference. No endpoint comes from a
+/// second copy of the claim's own selection.
+///
+/// The predicate, the `share_seq` ordering and the full equality over every
+/// field are unchanged from the read that used to sit inside the settlement
+/// transaction: pages are compared in order against the same positions of the
+/// claim's shares, a longer or shorter durable range is a mismatch, and the
+/// first mismatched page fails the landing. Each page is decoded and compared
+/// on the blocking thread that mapped it, so neither the lock nor a runtime
+/// thread ever carries a window-sized read.
+///
+/// The anchored set is frozen once the anchor is issued and ledger rows never
+/// change, so nothing this proves can change before the transaction; the
+/// in-transaction count guard in [`persist_audit_snapshot`] covers cardinality
+/// again under the lock. It does not establish the boundaries by itself.
+// Observe each checkout at its statement boundary, before comparison or folding.
+pub(super) async fn verify_durable_range(
+    pool: &PgPool,
+    snapshot: &AuditSnapshotWrite,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<()> {
+    ensure!(
+        snapshot.share_count > 0,
+        "audit share snapshot cannot be empty"
+    );
+    if snapshot.inline.is_some() {
+        let any: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE {})",
+            anchored_eligibility_sql(1)
+        ))
+        .bind(snapshot.anchor_ms)
+        .fetch_one(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?)
+        .await?;
+        ensure!(!any, "bootstrap audit window omits canonical shares");
+        return Ok(());
+    }
+    let weight = snapshot
+        .network_difficulty
+        .checked_mul(qbit_prism::PRISM_WINDOW_MULTIPLIER)
+        .context("window difficulty overflow")?;
+    ensure!(weight > 0, "network difficulty must be positive");
+    let shares = &snapshot.shares;
+    let last = snapshot.last_share_seq;
+    let anchor = snapshot.anchor_ms;
+    let mut cursor = snapshot.first_share_seq - 1;
+    let mut matched = 0usize;
+    while cursor < last {
+        // Release this page's checkout before its blocking comparison and the
+        // next page, observing each acquisition rather than the whole proof.
+        // Planned per page with its bounds, as `read_range_owned` does
+        // (`ledger/window.rs`): a cached generic plan for a `share_seq` range
+        // sorts the partitioned ledger instead of walking it in order.
+        let rows = sqlx::query(&format!("{SELECT_SHARE} WHERE {} AND share_seq>$1 AND share_seq<=$2 ORDER BY share_seq LIMIT $4", anchored_eligibility_sql(3)))
+            .persistent(false)
+            .bind(cursor).bind(last).bind(anchor).bind(VERIFY_PAGE_ROWS).fetch_all(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+        if rows.is_empty() {
+            break;
+        }
+        // The page's counterpart in the candidate window, bounded by the page
+        // size. A page that runs past the window is a longer durable range.
+        let expected: Vec<AcceptedShare> =
+            shares[matched.min(shares.len())..(matched + rows.len()).min(shares.len())].to_vec();
+        let page_len = rows.len();
+        cursor = tokio::task::spawn_blocking(move || -> Result<i64> {
+            let durable = rows
+                .iter()
+                .map(share_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                durable == expected,
+                "audit share snapshot differs from canonical database history"
+            );
+            Ok(i64::try_from(durable[durable.len() - 1].share_seq)?)
+        })
+        .await??;
+        matched += page_len;
+    }
+    ensure!(
+        matched == shares.len(),
+        "audit share snapshot differs from canonical database history"
+    );
+    // Keep the ordered LIMIT as a scalar row query: EXISTS can discard its
+    // ordering and choose a full-ledger sequential scan for an older anchor.
+    // This probe can scan all post-anchor history: delayed landings grow its
+    // cost with share volume. The connection's statement_timeout (15 s by
+    // default) is the ceiling per query, not a total proof budget; expiry fails
+    // landing closed before persistence. Revisit if delayed candidates exhaust
+    // that budget or the reference gains the anchor-time sequence cutoff.
+    // Checking only the next accepted row would assume monotone accepted_at
+    // and job_issued_at <= accepted_at, guaranteed by native append under the
+    // ordering lock but not by legacy/raw rows. Those rows may hide a later
+    // eligible share behind an ineligible one, so keep both timestamp filters.
+    let newer: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq>$1 ORDER BY share_seq LIMIT 1", anchored_eligibility_sql(2)))
+        .bind(last).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+    ensure!(
+        newer.is_none(),
+        "audit share snapshot omits newest canonical share"
+    );
+    // Equality above authenticates every share used by the pure rule. Keep
+    // this window-sized fold off the runtime and after the newest refusal so
+    // a window failing both boundaries retains its existing error precedence.
+    let boundary = tokio::task::spawn_blocking({
+        let shares = std::sync::Arc::clone(shares);
+        move || oldest_boundary(weight, &shares)
+    })
+    .await??;
+    if boundary == OldestBoundary::Partial {
+        let older: Option<i64> = sqlx::query_scalar(&format!("SELECT share_seq FROM qbit_share_ledger WHERE {} AND share_seq<$1 ORDER BY share_seq DESC LIMIT 1", anchored_eligibility_sql(2)))
+            .bind(snapshot.first_share_seq).bind(anchor).fetch_optional(&mut *crate::metrics::time_pool_acquire(metrics, pool.acquire()).await?).await?;
+        ensure!(
+            older.is_none(),
+            "audit share snapshot omits oldest canonical shares"
+        );
+    }
+    Ok(())
+}
+
+/// Persist the share snapshot inside the landing transaction.
+///
+/// The full-equality and independent boundary proof ran before the lock, in
+/// [`verify_durable_range`]. This count alone only authenticates cardinality
+/// within the supplied range; it cannot detect an omitted endpoint.
+/// Under the lock only the row count of the same anchored predicate is
+/// re-read: no share payload crosses this transaction, so the settlement lock
+/// is never held for a window-sized read.
+pub(super) async fn persist_audit_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &AuditSnapshotWrite,
+) -> Result<String> {
+    ensure!(
+        snapshot.share_count > 0,
+        "audit share snapshot cannot be empty"
+    );
+    if snapshot.inline.is_none() {
+        let durable: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM qbit_share_ledger WHERE {} AND share_seq BETWEEN $1 AND $2",
+            anchored_eligibility_sql(3)
+        ))
+        .bind(snapshot.first_share_seq)
+        .bind(snapshot.last_share_seq)
+        .bind(snapshot.anchor_ms)
+        .fetch_one(&mut **tx)
+        .await?;
+        ensure!(
+            durable == snapshot.share_count,
+            "audit share snapshot count differs from canonical database history"
+        );
+    }
+    sqlx::query("INSERT INTO qbit_prism_audit_snapshots(snapshot_sha256,first_share_seq,last_share_seq,anchor_ms,share_count,inline_shares) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+        .bind(&snapshot.digest).bind(snapshot.first_share_seq).bind(snapshot.last_share_seq).bind(snapshot.anchor_ms).bind(snapshot.share_count).bind(&snapshot.inline).execute(&mut **tx).await?;
+    Ok(snapshot.digest.clone())
+}
+
+/// The unpaged range read the API's `materialize_audit_row` keeps. Landing no
+/// longer uses it; its re-read is paged.
+async fn read_range(
+    reader: &mut AuditReader<'_>,
+    first: i64,
+    last: i64,
+    anchor: i64,
+    metrics: Option<&crate::metrics::Metrics>,
+) -> Result<Vec<AcceptedShare>> {
+    // Release the range checkout at the SQL boundary, before decoding rows.
+    let rows = sqlx::query(&format!(
+        "{SELECT_SHARE} WHERE {} AND share_seq BETWEEN $1 AND $2 ORDER BY share_seq",
+        anchored_eligibility_sql(3)
+    ))
+    // Planned with its bounds; see `read_range_owned` in `ledger/window.rs`.
+    .persistent(false)
+    .bind(first)
+    .bind(last)
+    .bind(anchor)
+    .fetch_all(&mut *reader.connection(metrics).await?)
+    .await?;
+    rows.iter().map(share_from_row).collect()
+}
+
+#[cfg(test)]
+mod tests;

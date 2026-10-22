@@ -734,7 +734,7 @@ fn t7d_500_output_coinbase_under_max_block_weight() {
 #[test]
 fn t7e_coinbase_weight_bytes_are_reported_separately_from_entitlement_weight() {
     // The coordinator computes weight headroom as 2_000_000 - len(hex)//2
-    // (prism_coordinator.py:921), assuming WSF=1 so weight == serialized
+    // used by the coordinator, assuming WSF=1 so weight == serialized
     // bytes. The Rust builder exposes total_weight as the sum of entitlement
     // WEIGHTS, not block weight, and exposes byte weight separately.
     let req = CoinbaseBuildRequest {

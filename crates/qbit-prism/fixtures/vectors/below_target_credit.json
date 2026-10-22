@@ -1,0 +1,2074 @@
+{
+  "cases": [
+    {
+      "d2_entry": "d2b-below-target-credit",
+      "entry_point": "bundle_payout",
+      "expected_2xx": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 4000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 8000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 3000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 250000000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 250000000,
+                "onchain_amount_sats": 250000000,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 187500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 187500000,
+                "onchain_amount_sats": 187500000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 62500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 62500000,
+                "onchain_amount_sats": 62500000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 250000000
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 187500000
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 62500000
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "expected_3xx": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 6000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 83333334,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 83333334,
+                "onchain_amount_sats": 83333334,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 333333333,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 333333333,
+                "onchain_amount_sats": 333333333,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 83333333,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 83333333,
+                "onchain_amount_sats": 83333333,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 83333334
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 333333333
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 83333333
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "input": {
+        "bundle_2xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 4000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "bundle_3xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 1000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "rule": {
+          "decision_2xx": {
+            "assigned_share_difficulty": 4000000,
+            "block_worthy": true,
+            "credit_share_on_accept": true,
+            "credited": true,
+            "credited_at": "node acceptance of the block (synchronous submit)",
+            "credited_difficulty": 4000000,
+            "implemented_at": [
+              "lab/prism/share_submission.py:360 classify_submit_work",
+              "lab/prism/share_writer.py:281 runtime.accepted_share_difficulty(context)",
+              "lab/prism/prism_coordinator.py:8410 accepted_share_difficulty",
+              "lab/prism/prism_coordinator.py:8155 _submit_synchronous_credit_candidate",
+              "lab/prism/block_finalization.py:2027 append_accepted_share when credit_share_on_accept"
+            ],
+            "network_difficulty": 1000000,
+            "rejection": null,
+            "route": "synchronous_block"
+          },
+          "decision_3xx": {
+            "credited": true,
+            "credited_at": "confirmation transaction after node acceptance; the submit acknowledgement waits for it",
+            "credited_difficulty": 1000000,
+            "implemented_at": [
+              "crates/qbit-prism-server/src/coordinator.rs:1648-1654 network difficulty for a block-only proof",
+              "crates/qbit-prism-server/src/coordinator.rs:1698 deferred_share held with the block candidate",
+              "crates/qbit-prism-server/src/coordinator.rs:1726-1747 submit waits for the credit row or fails",
+              "crates/qbit-prism-server/src/ledger/blocks.rs:200 credit_deferred_share on confirmation"
+            ]
+          },
+          "scenario": {
+            "block_pass": true,
+            "credited_share": {
+              "accepted_at_ms": 9003,
+              "job_issued_at_ms": 9003,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4
+            },
+            "ledger_shares": [
+              {
+                "accepted_at_ms": 9000,
+                "job_id": "job-9000",
+                "job_issued_at_ms": 9000,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9001,
+                "job_id": "job-9001",
+                "job_issued_at_ms": 9001,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9002,
+                "job_id": "job-9002",
+                "job_issued_at_ms": 9002,
+                "miner_id": "miner-c",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1000000,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 100
+              }
+            ],
+            "network_target": 57896037716911750921221705069588091649609539881711309849342236841432341020672,
+            "next_block": {
+              "anchor_job_issued_at_ms": 9010,
+              "block_height": 202,
+              "coinbase_value_sats": 500000000,
+              "network_difficulty": 1000000
+            },
+            "node_outcome": "accepted",
+            "share_pass": false,
+            "share_target": 14474009429227937730305426267397022912402384970427827462335559210358085255168,
+            "solver": {
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "payout_address": "miner-a"
+            }
+          }
+        }
+      },
+      "name": "block-only-proof-accepted",
+      "topic": 9,
+      "why": "The hash meets the network target but not the floor-raised share target, and the node accepts the block."
+    },
+    {
+      "d2_entry": "d2b-below-target-credit",
+      "entry_point": "bundle_payout",
+      "expected_2xx": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 4000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 8000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 3000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 250000000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 250000000,
+                "onchain_amount_sats": 250000000,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 187500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 187500000,
+                "onchain_amount_sats": 187500000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 62500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 62500000,
+                "onchain_amount_sats": 62500000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 250000000
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 187500000
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 62500000
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "expected_3xx": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 6000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 83333334,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 83333334,
+                "onchain_amount_sats": 83333334,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 333333333,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 333333333,
+                "onchain_amount_sats": 333333333,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 83333333,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 83333333,
+                "onchain_amount_sats": 83333333,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 83333334
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 333333333
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 83333333
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "input": {
+        "bundle_2xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 4000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "bundle_3xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 1000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "rule": {
+          "decision_2xx": {
+            "assigned_share_difficulty": 4000000,
+            "block_worthy": true,
+            "credit_share_on_accept": true,
+            "credited": true,
+            "credited_at": "node acceptance of the block; later confirmation adds nothing",
+            "credited_difficulty": 4000000,
+            "implemented_at": [
+              "lab/prism/share_submission.py:360 classify_submit_work",
+              "lab/prism/share_writer.py:281 runtime.accepted_share_difficulty(context)",
+              "lab/prism/prism_coordinator.py:8410 accepted_share_difficulty",
+              "lab/prism/block_finalization.py:2027 append_accepted_share when credit_share_on_accept"
+            ],
+            "network_difficulty": 1000000,
+            "rejection": null,
+            "route": "synchronous_block"
+          },
+          "decision_3xx": {
+            "credited": true,
+            "credited_at": "reconciliation's confirmation transaction",
+            "credited_difficulty": 1000000,
+            "implemented_at": [
+              "crates/qbit-prism-server/src/coordinator.rs:1648-1654 network difficulty for a block-only proof",
+              "crates/qbit-prism-server/src/coordinator.rs:1698 deferred_share held with the block candidate",
+              "crates/qbit-prism-server/src/coordinator.rs:1726-1747 submit waits for the credit row or fails",
+              "crates/qbit-prism-server/src/ledger/blocks.rs:295 credit_deferred_share on reconciled confirmation"
+            ]
+          },
+          "scenario": {
+            "block_pass": true,
+            "credited_share": {
+              "accepted_at_ms": 9003,
+              "job_issued_at_ms": 9003,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4
+            },
+            "ledger_shares": [
+              {
+                "accepted_at_ms": 9000,
+                "job_id": "job-9000",
+                "job_issued_at_ms": 9000,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9001,
+                "job_id": "job-9001",
+                "job_issued_at_ms": 9001,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9002,
+                "job_id": "job-9002",
+                "job_issued_at_ms": 9002,
+                "miner_id": "miner-c",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1000000,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 100
+              }
+            ],
+            "network_target": 57896037716911750921221705069588091649609539881711309849342236841432341020672,
+            "next_block": {
+              "anchor_job_issued_at_ms": 9010,
+              "block_height": 202,
+              "coinbase_value_sats": 500000000,
+              "network_difficulty": 1000000
+            },
+            "node_outcome": "confirmed-after-reconciliation",
+            "share_pass": false,
+            "share_target": 14474009429227937730305426267397022912402384970427827462335559210358085255168,
+            "solver": {
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "payout_address": "miner-a"
+            }
+          }
+        }
+      },
+      "name": "block-only-proof-confirmed-after-reconciliation",
+      "topic": 9,
+      "why": "The node accepted the block but the durable acknowledgement was lost; reconciliation later finds it on the active chain."
+    },
+    {
+      "d2_entry": "d2b-below-target-credit",
+      "entry_point": "bundle_payout",
+      "expected_2xx": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 4000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 8000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 3000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 250000000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 250000000,
+                "onchain_amount_sats": 250000000,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 187500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 187500000,
+                "onchain_amount_sats": 187500000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 62500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 62500000,
+                "onchain_amount_sats": 62500000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 250000000
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 187500000
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 62500000
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "expected_3xx": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 6000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 1000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 83333334,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 83333334,
+                "onchain_amount_sats": 83333334,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 333333333,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 333333333,
+                "onchain_amount_sats": 333333333,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 83333333,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 83333333,
+                "onchain_amount_sats": 83333333,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 83333334
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 333333333
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 83333333
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "input": {
+        "bundle_2xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 4000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "bundle_3xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 1000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "rule": {
+          "decision_2xx": {
+            "assigned_share_difficulty": 4000000,
+            "block_worthy": true,
+            "credit_share_on_accept": true,
+            "credited": true,
+            "credited_at": "node acceptance; the share row survives the disconnect",
+            "credited_difficulty": 4000000,
+            "implemented_at": [
+              "lab/prism/share_submission.py:360 classify_submit_work",
+              "lab/prism/share_writer.py:281 runtime.accepted_share_difficulty(context)",
+              "lab/prism/prism_coordinator.py:8410 accepted_share_difficulty",
+              "lab/prism/block_finalization.py:2027 append_accepted_share when credit_share_on_accept",
+              "lab/prism/accepted_preview_telemetry.py:144 no reorg path updates or deletes qbit_share_ledger"
+            ],
+            "network_difficulty": 1000000,
+            "rejection": null,
+            "route": "synchronous_block"
+          },
+          "decision_3xx": {
+            "credited": true,
+            "credited_at": "confirmation transaction; the share row survives the later disconnect",
+            "credited_difficulty": 1000000,
+            "implemented_at": [
+              "crates/qbit-prism-server/src/coordinator.rs:1648-1654 network difficulty for a block-only proof",
+              "crates/qbit-prism-server/src/coordinator.rs:1698 deferred_share held with the block candidate",
+              "crates/qbit-prism-server/src/coordinator.rs:1726-1747 submit waits for the credit row or fails",
+              "crates/qbit-prism-server/src/ledger/blocks.rs:200 credit_deferred_share on confirmation; no server statement updates or deletes qbit_share_ledger"
+            ]
+          },
+          "scenario": {
+            "block_pass": true,
+            "credited_share": {
+              "accepted_at_ms": 9003,
+              "job_issued_at_ms": 9003,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4
+            },
+            "ledger_shares": [
+              {
+                "accepted_at_ms": 9000,
+                "job_id": "job-9000",
+                "job_issued_at_ms": 9000,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9001,
+                "job_id": "job-9001",
+                "job_issued_at_ms": 9001,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9002,
+                "job_id": "job-9002",
+                "job_issued_at_ms": 9002,
+                "miner_id": "miner-c",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1000000,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 100
+              }
+            ],
+            "network_target": 57896037716911750921221705069588091649609539881711309849342236841432341020672,
+            "next_block": {
+              "anchor_job_issued_at_ms": 9010,
+              "block_height": 202,
+              "coinbase_value_sats": 500000000,
+              "network_difficulty": 1000000
+            },
+            "node_outcome": "reorged-after-acceptance",
+            "share_pass": false,
+            "share_target": 14474009429227937730305426267397022912402384970427827462335559210358085255168,
+            "solver": {
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "payout_address": "miner-a"
+            }
+          }
+        }
+      },
+      "name": "block-only-proof-reorged-after-acceptance",
+      "topic": 9,
+      "why": "The block was accepted and credited, then disconnected by a reorg; the next block's window is built afterwards."
+    },
+    {
+      "entry_point": "bundle_payout",
+      "expected": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 5000000,
+          "entitlements": [
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 400000000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 400000000,
+                "onchain_amount_sats": 400000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 100000000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 100000000,
+                "onchain_amount_sats": 100000000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 400000000
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 100000000
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "input": {
+        "bundle_2xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            }
+          ]
+        },
+        "bundle_3xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            }
+          ]
+        },
+        "rule": {
+          "decision_2xx": {
+            "assigned_share_difficulty": 4000000,
+            "block_worthy": true,
+            "credit_share_on_accept": true,
+            "credited": false,
+            "credited_at": null,
+            "credited_difficulty": null,
+            "implemented_at": [
+              "lab/prism/share_submission.py:360 classify_submit_work",
+              "lab/prism/share_writer.py:281 runtime.accepted_share_difficulty(context)",
+              "lab/prism/prism_coordinator.py:8410 accepted_share_difficulty",
+              "lab/prism/prism_coordinator.py:8221 block_landed false rejects low difficulty share"
+            ],
+            "network_difficulty": 1000000,
+            "rejection": null,
+            "route": "synchronous_block"
+          },
+          "decision_3xx": {
+            "credited": false,
+            "credited_at": "never: the submission fails with block-only proof was not accepted on the active chain",
+            "credited_difficulty": null,
+            "implemented_at": [
+              "crates/qbit-prism-server/src/coordinator.rs:1648-1654 network difficulty for a block-only proof",
+              "crates/qbit-prism-server/src/coordinator.rs:1698 deferred_share held with the block candidate",
+              "crates/qbit-prism-server/src/coordinator.rs:1726-1747 submit waits for the credit row or fails"
+            ]
+          },
+          "scenario": {
+            "block_pass": true,
+            "credited_share": {
+              "accepted_at_ms": 9003,
+              "job_issued_at_ms": 9003,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4
+            },
+            "ledger_shares": [
+              {
+                "accepted_at_ms": 9000,
+                "job_id": "job-9000",
+                "job_issued_at_ms": 9000,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9001,
+                "job_id": "job-9001",
+                "job_issued_at_ms": 9001,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9002,
+                "job_id": "job-9002",
+                "job_issued_at_ms": 9002,
+                "miner_id": "miner-c",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1000000,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 100
+              }
+            ],
+            "network_target": 57896037716911750921221705069588091649609539881711309849342236841432341020672,
+            "next_block": {
+              "anchor_job_issued_at_ms": 9010,
+              "block_height": 202,
+              "coinbase_value_sats": 500000000,
+              "network_difficulty": 1000000
+            },
+            "node_outcome": "rejected",
+            "share_pass": false,
+            "share_target": 14474009429227937730305426267397022912402384970427827462335559210358085255168,
+            "solver": {
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "payout_address": "miner-a"
+            }
+          }
+        }
+      },
+      "name": "block-only-proof-rejected",
+      "topic": 9,
+      "why": "The node rejects the block, or it is never on the active chain: no credit on either version."
+    },
+    {
+      "entry_point": "bundle_payout",
+      "expected": {
+        "ok": {
+          "counted_shares": [
+            {
+              "counted_difficulty": 4000000,
+              "miner_id": "miner-a",
+              "share_seq": 4
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-c",
+              "share_seq": 3
+            },
+            {
+              "counted_difficulty": 2000000,
+              "miner_id": "miner-b",
+              "share_seq": 2
+            },
+            {
+              "counted_difficulty": 1000000,
+              "miner_id": "miner-b",
+              "share_seq": 1
+            }
+          ],
+          "counted_window_weight": 8000000,
+          "entitlements": [
+            {
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a",
+              "weight": 4000000
+            },
+            {
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "miner-b",
+              "weight": 3000000
+            },
+            {
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "miner-c",
+              "weight": 1000000
+            }
+          ],
+          "payout_policy_manifest": {
+            "accounts": [
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 250000000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 250000000,
+                "onchain_amount_sats": 250000000,
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-a"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 187500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 187500000,
+                "onchain_amount_sats": 187500000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-b"
+              },
+              {
+                "action": "onchain",
+                "candidate_balance_sats": 62500000,
+                "carry_forward_balance_sats": 0,
+                "gross_amount_sats": 62500000,
+                "onchain_amount_sats": 62500000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "prior_balance_sats": 0,
+                "recipient_id": "miner-c"
+              }
+            ],
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "floor_formula": "3680 bytes/input * 1 sat/byte * 4x safety",
+            "min_output_sats": 14720,
+            "onchain_entitlements": [
+              {
+                "order_key": "miner-a",
+                "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                "recipient_id": "miner-a",
+                "weight": 250000000
+              },
+              {
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "recipient_id": "miner-b",
+                "weight": 187500000
+              },
+              {
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "recipient_id": "miner-c",
+                "weight": 62500000
+              }
+            ],
+            "schema": "qbit.prism.payout-policy.v1"
+          }
+        }
+      },
+      "input": {
+        "bundle_2xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 4000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "bundle_3xx": {
+          "found_block": {
+            "anchor_job_issued_at_ms": 9010,
+            "block_height": 202,
+            "coinbase_value_sats": 500000000,
+            "network_difficulty": 1000000
+          },
+          "policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "safety_multiplier": 4,
+            "target_feerate_sats_per_byte": 1
+          },
+          "prior_balances": [],
+          "shares": [
+            {
+              "accepted_at_ms": 9000,
+              "job_id": "job-9000",
+              "job_issued_at_ms": 9000,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-1",
+              "share_seq": 1,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9001,
+              "job_id": "job-9001",
+              "job_issued_at_ms": 9001,
+              "miner_id": "miner-b",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-b",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "share_difficulty": 2000000,
+              "share_id": "share-2",
+              "share_seq": 2,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9002,
+              "job_id": "job-9002",
+              "job_issued_at_ms": 9002,
+              "miner_id": "miner-c",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-c",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "share_difficulty": 1000000,
+              "share_id": "share-3",
+              "share_seq": 3,
+              "template_height": 100
+            },
+            {
+              "accepted_at_ms": 9003,
+              "job_id": "job-below-target",
+              "job_issued_at_ms": 9003,
+              "miner_id": "miner-a",
+              "network_difficulty": 1000000,
+              "ntime": 1800000000,
+              "order_key": "miner-a",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "share_difficulty": 4000000,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4,
+              "template_height": 200
+            }
+          ]
+        },
+        "rule": {
+          "decision_2xx": {
+            "assigned_share_difficulty": 4000000,
+            "block_worthy": true,
+            "credit_share_on_accept": false,
+            "credited": true,
+            "credited_at": "share acceptance (share passed its target)",
+            "credited_difficulty": 4000000,
+            "implemented_at": [
+              "lab/prism/share_submission.py:360 classify_submit_work",
+              "lab/prism/share_writer.py:281 runtime.accepted_share_difficulty(context)",
+              "lab/prism/prism_coordinator.py:8410 accepted_share_difficulty"
+            ],
+            "network_difficulty": 1000000,
+            "rejection": null,
+            "route": "async_block"
+          },
+          "decision_3xx": {
+            "credited": true,
+            "credited_at": "share acceptance (share passed its target)",
+            "credited_difficulty": 4000000,
+            "implemented_at": [
+              "crates/qbit-prism-server/src/coordinator.rs:1649-1651 share target difficulty when the share passes"
+            ]
+          },
+          "scenario": {
+            "block_pass": true,
+            "credited_share": {
+              "accepted_at_ms": 9003,
+              "job_issued_at_ms": 9003,
+              "share_id": "miner-a.rig:abababababababababababababababababababababababababababababababab",
+              "share_seq": 4
+            },
+            "ledger_shares": [
+              {
+                "accepted_at_ms": 9000,
+                "job_id": "job-9000",
+                "job_issued_at_ms": 9000,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-1",
+                "share_seq": 1,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9001,
+                "job_id": "job-9001",
+                "job_issued_at_ms": 9001,
+                "miner_id": "miner-b",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-b",
+                "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                "share_difficulty": 2000000,
+                "share_id": "share-2",
+                "share_seq": 2,
+                "template_height": 100
+              },
+              {
+                "accepted_at_ms": 9002,
+                "job_id": "job-9002",
+                "job_issued_at_ms": 9002,
+                "miner_id": "miner-c",
+                "network_difficulty": 1000000,
+                "ntime": 1800000000,
+                "order_key": "miner-c",
+                "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                "share_difficulty": 1000000,
+                "share_id": "share-3",
+                "share_seq": 3,
+                "template_height": 100
+              }
+            ],
+            "network_target": 57896037716911750921221705069588091649609539881711309849342236841432341020672,
+            "next_block": {
+              "anchor_job_issued_at_ms": 9010,
+              "block_height": 202,
+              "coinbase_value_sats": 500000000,
+              "network_difficulty": 1000000
+            },
+            "node_outcome": "accepted",
+            "share_pass": true,
+            "share_target": 14474009429227937730305426267397022912402384970427827462335559210358085255168,
+            "solver": {
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "payout_address": "miner-a"
+            }
+          }
+        }
+      },
+      "name": "share-and-block-proof-control",
+      "topic": 9,
+      "why": "Control: the hash also meets the share target, so both versions credit the assigned share difficulty."
+    }
+  ],
+  "produced_by": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 crates/qbit-prism/examples/export_rule_decisions.py | cargo run --locked -q -p qbit-prism --example export_money_path_vectors -- vectors-out",
+  "schema": "qbit.prism.money-path-vectors.v1",
+  "source_commit": "504846cc0b72e8f86ed17f896d4ccbbe196a31dc",
+  "topics": [
+    {
+      "id": 9,
+      "name": "below-target block credit"
+    }
+  ]
+}

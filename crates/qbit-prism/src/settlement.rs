@@ -1144,10 +1144,10 @@ mod tests {
         assert_eq!(decision.fanout_recipient_count, 2_000);
         assert_eq!(decision.fanout_chunk_count, 2);
         assert_eq!(decision.coinbase_settlement_output_count, 3);
-        assert!(decision
-            .fanout_chunks
+        assert!(decision.fanout_chunks.iter().all(|chunk| chunk
+            .recipients
             .iter()
-            .all(|chunk| chunk.recipients.iter().all(|r| r.recipient_id != "pool-fee")));
+            .all(|r| r.recipient_id != "pool-fee")));
     }
 
     #[test]

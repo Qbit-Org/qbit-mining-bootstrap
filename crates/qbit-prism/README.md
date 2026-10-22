@@ -17,27 +17,25 @@ The Postgres schema in [`sql/001_share_ledger.sql`](sql/001_share_ledger.sql)
 defines:
 
 - `qbit_share_ledger`: append-only canonical share log ordered by `share_seq`
-- `qbit_ledger_writer_lease`: one-row coordination table for a single logical
-  writer/failover epoch
-- `qbit_pool_blocks.audit_publication_sequence`: durable confirmation and
-  reactivation order for current audit evidence, independent of block height
+- `qbit_ledger_writer_lease`: retained legacy migration metadata; native servers
+  do not acquire this application writer lease
 - `qbit_prism_window(...)`: deterministic newest-backward window query with
   partial oldest-share weighting
 
-The schema file is cumulative and idempotent. Existing deployments must rerun
-it before upgrading when automatic schema initialization is disabled; see the
-[ledger operations contract](../../docs/prism-ledger-ops.md#audit-publication-ordering-migration).
-
-Stratum frontends should enqueue share submissions outside this table. Only the
-active ledger writer inserts rows into `qbit_share_ledger`; that is what keeps
-all miners in the same reward universe.
+The native [`qbit-prism-server`](../qbit-prism-server/README.md) applies the
+additive [multi-instance migration](../qbit-prism-server/migrations/002_multi_instance.sql)
+and [2.x compatibility migration](../qbit-prism-server/migrations/003_2x_compatibility.sql).
+All instances append through short PostgreSQL transactions sharing an ordering
+lock, and successful ordinary share ACKs follow commit. A single global share
+order gives all miners the same reward universe without electing one frontend
+as writer. The migration prevents a legacy Python writer from restarting
+against the upgraded database.
 
 [`sql/001_share_ledger_revert_audit_publication_sequence.sql`](sql/001_share_ledger_revert_audit_publication_sequence.sql)
-returns `qbit_pool_blocks` to its pre-publication-ordinal shape for operators
-rolling back past that migration; it discards assigned ordinals, so read
-"Publication Ordinal Rollback And Schema Revert" in
-[`docs/prism-ledger-ops.md`](../../docs/prism-ledger-ops.md) before applying
-it.
+is retained only for legacy Python databases and refuses native databases.
+It discards assigned ordinals. Native rollback requires stopping all writers
+and restoring the pre-migration backup, as described in the
+[cutover and rollback guide](../../docs/prism-rust-migration.md).
 
 ## Reward Rule
 
@@ -139,12 +137,19 @@ accepted share slice, found-block anchor, prior carry-forward balances, payout
 floor parameters, PRISM reward manifest, payout-policy/accrual manifest, and the
 signed deterministic coinbase manifest.
 
-The verifier and canonicalizer also accept storage-oriented compact artifacts:
+Native database audits store non-share bundle fields and an immutable share
+snapshot reference. The server reconstructs the canonical slice from the shared
+ledger and verifies its digest and full bundle SHA before serving the logical
+v1/v1.1 body. Accepted ledger rows cannot be changed or deleted, so overlapping
+block windows reuse existing share storage without changing published hashes.
+
+The verifier and canonicalizer also accept historical storage-oriented artifacts:
 legacy `qbit.prism.audit-body-ref.v1` files and
 `qbit.prism.audit-bundle.v2` proof bodies. Those formats keep share payloads in
 referenced segment files, verify each segment or range hash, and reconstruct the
 same canonical v1 bundle before checking payout math. Public `/public/v1`
-responses remain logical v1 bundles.
+responses remain logical v1/v1.1 bundles. Import legacy filesystem bodies into
+the shared database during [native cutover](../../docs/prism-rust-migration.md).
 
 `verify_audit_bundle` recomputes the full path from exported data and a
 verifier-supplied trusted ledger writer public key. The ledger attestation binds

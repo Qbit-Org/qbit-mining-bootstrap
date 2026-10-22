@@ -1,14 +1,19 @@
 # Publishing a release
 
-`main` is the release promotion branch; `2.x.x` is the development branch for
-the 2.x series. A version is published only when its tag and GitHub release
-exist. A version bump or merged preparation PR alone does not publish it.
+`main` is the release promotion branch. `3.x.x` is the development branch for
+the 3.x series, now carrying 3.1; `2.x.x` is the maintenance branch of the
+2.x series. A release cut from an earlier point of a development branch gets
+its own branch at that cutoff, as `3.0.x` does for 3.0.0. A version is
+published only when its tag and GitHub release exist. A version bump or
+merged preparation PR alone does not publish it.
 
 ## Prepare one release candidate
 
-Keep one pending release version across `VERSION`, the `qbit-prism` and
-`qbit-pool-builder` package versions in their `Cargo.toml` files and `Cargo.lock`,
-and `doc/release-notes-<version>.md`. Ordinary development PRs contribute to
+Keep one pending release version across `VERSION`, `[workspace.package].version`
+in the root `Cargo.toml` (which every crate inherits), both `Cargo.lock` files
+(the root and `crates/qbit-prism-server/fuzz`), and
+`doc/release-notes-<version>.md`. `scripts/check_version_skew.py` checks the
+first three agree. Ordinary development PRs contribute to
 that pending release's notes; they do not each create a patch release.
 Choose the next version after reconciling the last published release and
 any identifiers already distributed to operators.
@@ -20,31 +25,48 @@ Their changes and migration requirements are consolidated in
 [the 2.0.0 notes](../doc/release-notes-2.0.0.md). Do not create retrospective
 2.0.1 or 2.0.2 tags for those preparation commits.
 
+For 3.0.0, the cutoff is `4c134913` on `3.x.x`, the last commit before the
+3.1 dual writer. `3.0.x` starts there and takes the version bump, the 3.0.0
+notes and the release's dependency fixes (#776, merged as `aabe470f`). Unlike
+2.0.0, `v3.0.0` was tagged and published on `3.0.x` at `aabe470f`, before the
+promotion. The promotion into `main` (#778) then gives `main` the tagged tree,
+plus this guide and a README banner that doesn't name a branch; it adds no
+tag. The 3.0.0-rc.N pre-releases were tagged on `3.x.x`. 3.0.0-rc.7 was
+prepared (#772) but never tagged, and its changes ship in 3.0.0. The L3
+matrix for the release is recorded in #779.
+
 Merge the intended development cutoff into the promotion branch and retain
-fixes already made during promotion review. Check package versions together,
+fixes already made during promotion review. The repository allows only squash
+and rebase merges, so the promotion lands on `main` as one squashed commit. Check package versions together,
 run Docker lint and the relevant test gates, and review upgrade and rollback
 instructions. Leave the release date out while publication is unscheduled;
 set the actual release date in a reviewed commit before the final merge.
 
 ## Publish the reviewed main commit
 
-After the promotion PR passes required checks and is merged, identify the
-exact resulting commit on `main`. A squash or rebase merge produces a different
+Tag the promoted `main` commit unless the release was already tagged on its
+release branch, as 3.0.0 was. After the promotion PR passes required checks
+and is merged, identify the exact resulting commit on `main`. A squash or rebase merge produces a different
 commit from the promotion branch head. Verify the resulting commit's checks,
 version metadata and dated release notes before tagging it.
 
-For 2.0.0, after confirming that `v2.0.0` does not already exist, use the
-reviewed main commit in place of `<release-main-sha>`:
+After confirming that the tag doesn't already exist, use the reviewed main
+commit in place of `<release-main-sha>`, and the version in place of
+`<version>` (as `v2.0.0` and `v3.0.0` were):
 
 ```sh
 git fetch origin main --tags
-git tag -s v2.0.0 <release-main-sha> -m 'qbit-mining-bootstrap 2.0.0'
-git verify-tag v2.0.0
-git push origin refs/tags/v2.0.0
-git show v2.0.0:doc/release-notes-2.0.0.md > /tmp/qbit-release-2.0.0-notes.md
-gh release create v2.0.0 --verify-tag --title 'qbit-mining-bootstrap 2.0.0' \
-  --notes-file /tmp/qbit-release-2.0.0-notes.md
+git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
+git verify-tag v<version>
+git push origin refs/tags/v<version>
+git show v<version>:doc/release-notes-<version>.md > /tmp/qbit-release-notes.md
+gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
+  --notes-file /tmp/qbit-release-notes.md
 ```
+
+Pushing a `v*` tag also runs the L3 production-window matrix
+(`prism-load-l3.yml`), which promotes the promotion PR's run on the same tree
+or runs `l3-full` (#608).
 
 Run publication commands only when authorized to publish. If a tag or release
 already exists, inspect its target and contents instead of replacing it.
@@ -55,7 +77,9 @@ release version.
 ## Reconcile the development branch
 
 After promotion, open a synchronization PR from a branch that merges the
-released `main` commit into the latest `2.x.x`. Preserve subsequent development
+released `main` commit into the latest development branch (`3.x.x` after
+3.0.0, `2.x.x` after 2.0.0), and into a release branch such as `3.0.x` that
+will take patch releases. Preserve subsequent development
 and resolve metadata and notes deliberately; do not reset or force-push the
 shared branch. Run its checks before merging.
 

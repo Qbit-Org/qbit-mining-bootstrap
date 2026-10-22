@@ -1,0 +1,148 @@
+//! Durable coordination for interchangeable PRISM servers.
+//!
+//! Proof-of-work verification is concurrent. Only assignment of the canonical
+//! share order and capture of a job's accounting boundary are serialized. The
+//! locks are transaction scoped, so disconnects and database failover release
+//! ownership without an application lease election.
+use anyhow::{bail, ensure, Context, Result};
+use chrono::{DateTime, Utc};
+use qbit_prism::{AcceptedShare, AuditBundle, CarryForwardBalance};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{
+    postgres::{PgPoolOptions, PgRow},
+    PgPool, Postgres, Row, Transaction,
+};
+use uuid::Uuid;
+
+mod append_admission;
+mod blocks;
+pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
+/// Share ledger retention: the operator commands behind `share-archive`.
+pub mod archive;
+mod audit;
+pub use audit::{
+    audit_canonical_bytes, audit_canonical_bytes_admitted, audit_completeness,
+    decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReader,
+};
+mod candidates;
+#[cfg(test)]
+pub(crate) use candidates::faults as candidate_faults;
+mod claim_observer;
+pub use candidates::revoke_candidate_claims;
+pub use candidates::{
+    adoption_evidence, authenticate_landed_audit, build_claim_parts,
+    coinbase_witness_reserved_value, header_bits_hex, Candidate, CandidateClaim, CandidateCtv,
+    CandidateState, ClaimLifecycle, ClaimParts, LandedAudit, OfferOutcome, OfferRecord,
+    RecoveryClaim, RecoveryReader, RecoveryRow, RecoveryTakeover, SignerKeys,
+    ADOPTED_OFFER_REPLY_PREFIX, LANDING_FAILED_REASON_PREFIX, OFFER_NOT_SENT_REASON_PREFIX,
+    ORPHANED_STATE, SIDE_CHAIN_REPLIES,
+};
+use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
+mod connect;
+pub(crate) use connect::shielded_begin;
+use connect::{check_writable, require_revision, writable, writable_unless_held, WRITABLE_COLUMNS};
+pub use connect::{MigrateOptions, SessionAllocationExhausted, SessionId};
+mod difficulty;
+mod divergence;
+pub use divergence::{
+    landing_divergence, overpay_bound, overpay_ceiling_sats, payout_divergence_line,
+    rows_divergence, AccountOverpay, CarryRow, LandingDivergence, OfferReservation, OverpayBound,
+};
+mod fanout;
+pub use fanout::revoke_fanout_claims;
+mod fatal_state;
+pub use fatal_state::{integrity_report_bounded, require_operator_reason, FATAL_STATE_CLEAR_BOUND};
+mod instances;
+mod policy_transition;
+mod signing_transition;
+mod standby_durability;
+mod submission_hold;
+pub(crate) use instances::{live_instances, unavailable_live_instances, LiveInstancesReport};
+pub use instances::{HeartbeatHealth, HeartbeatStatus};
+pub use standby_durability::{
+    OfferStandbyReport, OfferStandbyWait, StandbyDurability, StandbyWait,
+};
+pub use submission_hold::{SubmissionHeld, SubmissionHold, SubmissionHoldCleared};
+mod jobs;
+pub use jobs::{
+    BlobPruneCursor, BlobPruneResult, CompactBatchAttempt, CompactDependency, CompactIssuedJob,
+    CompactPrepared, CompactRepair, IssuedJobSave, PreparedAuditHashes, PreparedDependency,
+    PreparedTemplate, StoredCompactPrepared,
+};
+mod migration;
+pub use migration::{
+    required_schema_versions, schema_version_list, IndexBuildMode, MigrationSource,
+    ShareHashBackfill, SourceState, SourceStateRule, NOT_VALID_EXEMPT, REQUIRED_SCHEMA_VERSIONS,
+    SOURCE_STATES,
+};
+pub use migration::{ImportAuditRow, ImportAuditsOptions, ImportStopped};
+pub use migration::{ShareHashBackfillFinished, ShareHashBackfillPending, ShareHashThrottle};
+mod window;
+pub use difficulty::WorkerDifficulty;
+pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
+pub use window::{
+    probe_share_rows, probe_window_holding, put_balance_snapshot, read_range_paged, AppendResult,
+    BalanceSource, ChainObservationState, ChainTransition, PayoutState, ShareRange, Snapshot,
+    Window, WindowError, WindowHolding, WindowNotHeld, WindowRef, WriterTimeline,
+};
+use window::{read_prior_balances, share_from_row};
+pub(crate) use window::{
+    AcquisitionReport, ChainObservationBehind, ChainObservationRetry, LeafWitness, RefreshProbe,
+    RetainedShares, SnapshotCapture, WRITER_TIMELINE_SQL,
+};
+pub use window::{CommitGateClosed, MovedRevision, PayoutRevisionChanged};
+
+const MIGRATION_LOCK: i64 = 0x505249534d000001;
+const ORDER_LOCK: i64 = 0x505249534d000002;
+const SETTLEMENT_LOCK: i64 = 0x505249534d000003;
+/// The class of the two-key session-level advisory lock the online
+/// migration runner takes on its own connection, outside any transaction
+/// (`migration::apply_online_migration`), so two starting frontends never
+/// build the same index twice. The second key is the ledger's schema: the
+/// migration's DDL creates there, and a database hosting several ledger
+/// schemas builds each on its own.
+const ONLINE_DDL_LOCK_CLASS: i32 = 0x5052_4953;
+const SELECT_SHARE: &str = "SELECT share_seq,share_id,miner_id,payout_order_key,encode(p2mr_program,'hex') AS program,share_difficulty::text AS difficulty,network_difficulty::text AS network_difficulty,template_height,job_id,job_issued_at,accepted_at,ntime,credit_policy FROM qbit_share_ledger";
+
+#[derive(Clone)]
+pub struct Ledger {
+    pub pool: PgPool,
+    pub instance_id: String,
+    session_owner: std::sync::Arc<connect::SessionOwner>,
+    /// Native wait telemetry, when the process has a registry to record into.
+    /// Without a handle nothing is recorded and behaviour is identical, so
+    /// tests keep using [`Ledger::connect`] and the database-only commands
+    /// [`Ledger::connect_tool`] without one.
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    /// The cluster fingerprint [`Ledger::configure`] pinned or verified, read
+    /// back through [`Ledger::config_fingerprint`]. Shared across clones, so
+    /// every handle to one frontend's ledger sees the same pinned value: the
+    /// writer fence re-reads `qbit_prism_cluster.config_fingerprint` `FOR
+    /// SHARE` in its own transaction and compares it against this.
+    config_fingerprint: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The candidate claims this frontend has watched, each timed on its own
+    /// monotonic clock (#581). Shared across clones: one process, one clock
+    /// per claim.
+    claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
+    /// The CTV fanout claims this frontend has watched, timed the same way
+    /// (#654).
+    fanout_claim_observer: std::sync::Arc<claim_observer::ClaimObserver>,
+    #[cfg(test)]
+    pub(crate) compact_decode_hook: std::sync::Arc<std::sync::Mutex<Option<CompactDecodeHook>>>,
+    #[cfg(test)]
+    pub(crate) snapshot_decode_hook: std::sync::Arc<std::sync::Mutex<Option<SnapshotDecodeHook>>>,
+}
+
+#[cfg(test)]
+type CompactDecodeHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+type SnapshotDecodeHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
+#[cfg(test)]
+mod authority_contract_tests;
+#[cfg(test)]
+#[path = "../tests/support/ledger_execution_proxy.rs"]
+mod execution_proxy;

@@ -845,11 +845,14 @@ class QbitCkpoolSupervisorTests(unittest.TestCase):
     def test_supervisor_forwards_term_and_int_and_reaps_child(self) -> None:
         from tests.test_ckpool_startup import FakeRpcServer
 
+        # Publish readiness atomically so the parent cannot read an empty PID.
         child_code = (
             "import os,signal,sys,time; ready,out=sys.argv[1:]; "
+            "from pathlib import Path; "
             "stop=lambda sig,frame:(open(out,'w').write(str(sig)),sys.exit(0)); "
             "signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop); "
-            "open(ready,'w').write(str(os.getpid())); "
+            "pending=Path(ready+'.tmp'); "
+            "pending.write_text(str(os.getpid()),encoding='utf-8'); pending.replace(ready); "
             "exec('while True:\\n time.sleep(0.02)')"
         )
         for signum in (signal.SIGTERM, signal.SIGINT):

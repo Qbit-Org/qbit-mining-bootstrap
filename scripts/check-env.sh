@@ -3,6 +3,25 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Compose must see the caller's environment, not the shell-only example defaults
+# loaded below. Preserve even explicit empty overrides without putting values in
+# external command arguments, files, or diagnostics.
+COMPOSE_INPUT_NAMES=()
+COMPOSE_INPUT_VALUES=()
+COMPOSE_INPUT_COUNT=0
+COMPOSE_INPUT_KEYS='|'
+while IFS= read -r name; do
+  COMPOSE_INPUT_KEYS+="${name}|"
+  # Readonly shell internals cannot be changed by sourced configuration and
+  # must not be assigned during restoration (some also vary in subshells).
+  declaration="$(declare -p "${name}")"
+  declaration="${declaration#declare -}"
+  [[ "${declaration%% *}" != *r* ]] || continue
+  COMPOSE_INPUT_NAMES+=("${name}")
+  COMPOSE_INPUT_VALUES+=("${!name}")
+  COMPOSE_INPUT_COUNT=$((COMPOSE_INPUT_COUNT + 1))
+done < <(compgen -e)
+PUBLIC_COMPOSE_FILES=()
 ENV_DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-}"
 ENV_QBIT_PROVIDER="${QBIT_PROVIDER:-}"
 ENV_MINING_LANES="${MINING_LANES:-}"
@@ -27,8 +46,8 @@ ENV_QBIT_DATA_SOURCE="${QBIT_DATA_SOURCE:-}"
 ENV_BITCOIN_DATA_SOURCE="${BITCOIN_DATA_SOURCE:-}"
 ENV_PRISM_POSTGRES_DATA_SOURCE="${PRISM_POSTGRES_DATA_SOURCE:-}"
 ENV_PRISM_POSTGRES_WAL_SOURCE="${PRISM_POSTGRES_WAL_SOURCE:-}"
-ENV_PRISM_POSTGRES_REPLICA_DATA_SOURCE="${PRISM_POSTGRES_REPLICA_DATA_SOURCE:-}"
 ENV_PRISM_AUDIT_DATA_SOURCE="${PRISM_AUDIT_DATA_SOURCE:-}"
+ENV_PRISM_SECRETS_SOURCE="${PRISM_SECRETS_SOURCE:-}"
 ENV_QBIT_CHAIN="${QBIT_CHAIN:-}"
 ENV_QBIT_CHAIN_FLAG="${QBIT_CHAIN_FLAG:-}"
 ENV_QBIT_EXPECTED_GENESIS_HASH="${QBIT_EXPECTED_GENESIS_HASH:-}"
@@ -65,20 +84,19 @@ ENV_BITCOIN_RPC_PASSWORD="${BITCOIN_RPC_PASSWORD:-}"
 ENV_BITCOIN_RPC_PORT_HOST="${BITCOIN_RPC_PORT_HOST:-}"
 ENV_PRISM_DATABASE_URL="${PRISM_DATABASE_URL:-}"
 ENV_PRISM_POSTGRES_PASSWORD="${PRISM_POSTGRES_PASSWORD:-}"
-ENV_PRISM_POSTGRES_PSQL_COMMAND="${PRISM_POSTGRES_PSQL_COMMAND:-}"
-ENV_PRISM_LEDGER_WRITER_ID="${PRISM_LEDGER_WRITER_ID:-}"
-ENV_PRISM_LEDGER_WRITER_EPOCH="${PRISM_LEDGER_WRITER_EPOCH:-}"
 ENV_PRISM_LEDGER_WRITER_SESSION_TOKEN="${PRISM_LEDGER_WRITER_SESSION_TOKEN:-}"
 ENV_PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="${PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX:-}"
 ENV_PRISM_MANIFEST_SIGNING_SEED_HEX="${PRISM_MANIFEST_SIGNING_SEED_HEX:-}"
 ENV_PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX="${PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX:-}"
 ENV_PRISM_AUDIT_DIR="${PRISM_AUDIT_DIR:-}"
-ENV_PRISM_EVIDENCE_PATH="${PRISM_EVIDENCE_PATH:-}"
 ENV_PRISM_ALLOW_MEMORY_LEDGER="${PRISM_ALLOW_MEMORY_LEDGER:-}"
 ENV_PRISM_ALLOW_TEST_SIGNING_SEEDS="${PRISM_ALLOW_TEST_SIGNING_SEEDS:-}"
 ENV_PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY="${PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY:-}"
 ENV_PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN="${PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN:-}"
 ENV_PRISM_CTV_SETTLEMENT_ENABLED="${PRISM_CTV_SETTLEMENT_ENABLED:-}"
+ENV_PRISM_POOL_FEE_ENABLED="${PRISM_POOL_FEE_ENABLED:-}"
+ENV_PRISM_POOL_FEE_ADDRESS="${PRISM_POOL_FEE_ADDRESS:-}"
+ENV_PRISM_POOL_FEE_P2MR_PROGRAM_HEX="${PRISM_POOL_FEE_P2MR_PROGRAM_HEX:-}"
 ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT="${PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT:-}"
 ENV_PRISM_CTV_FANOUT_FEE_PREMIUM_BPS="${PRISM_CTV_FANOUT_FEE_PREMIUM_BPS:-}"
 ENV_PRISM_STRATUM_SHARE_DIFF="${PRISM_STRATUM_SHARE_DIFF:-}"
@@ -92,9 +110,6 @@ ENV_PRISM_STRATUM_VARDIFF_MAX_STEP_UP="${PRISM_STRATUM_VARDIFF_MAX_STEP_UP:-}"
 ENV_PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN="${PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN:-}"
 ENV_PRISM_STRATUM_VARDIFF_EWMA_ALPHA="${PRISM_STRATUM_VARDIFF_EWMA_ALPHA:-}"
 ENV_PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE="${PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE:-}"
-ENV_PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS="${PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS:-}"
-ENV_PRISM_SHARE_COMMIT_BATCH_SIZE="${PRISM_SHARE_COMMIT_BATCH_SIZE:-}"
-ENV_PRISM_SHARE_COMMIT_LINGER_MILLISECONDS="${PRISM_SHARE_COMMIT_LINGER_MILLISECONDS:-}"
 ENV_PRISM_SHARE_COMMIT_TIMEOUT_SECONDS="${PRISM_SHARE_COMMIT_TIMEOUT_SECONDS:-}"
 ENV_PRISM_STRATUM_SEND_TIMEOUT_SECONDS="${PRISM_STRATUM_SEND_TIMEOUT_SECONDS:-}"
 ENV_PRISM_STRATUM_STALE_GRACE_SECONDS="${PRISM_STRATUM_STALE_GRACE_SECONDS:-}"
@@ -166,8 +181,8 @@ for name in \
   BITCOIN_DATA_SOURCE \
   PRISM_POSTGRES_DATA_SOURCE \
   PRISM_POSTGRES_WAL_SOURCE \
-  PRISM_POSTGRES_REPLICA_DATA_SOURCE \
-  PRISM_AUDIT_DATA_SOURCE; do
+  PRISM_AUDIT_DATA_SOURCE \
+  PRISM_SECRETS_SOURCE; do
   override_name="ENV_${name}"
   if [[ -n "${!override_name}" ]]; then
     printf -v "${name}" '%s' "${!override_name}"
@@ -278,17 +293,8 @@ fi
 if [[ -n "${ENV_PRISM_DATABASE_URL}" ]]; then
   PRISM_DATABASE_URL="${ENV_PRISM_DATABASE_URL}"
 fi
-if [[ -n "${ENV_PRISM_POSTGRES_PSQL_COMMAND}" ]]; then
-  PRISM_POSTGRES_PSQL_COMMAND="${ENV_PRISM_POSTGRES_PSQL_COMMAND}"
-fi
 if [[ -n "${ENV_PRISM_POSTGRES_PASSWORD}" ]]; then
   PRISM_POSTGRES_PASSWORD="${ENV_PRISM_POSTGRES_PASSWORD}"
-fi
-if [[ -n "${ENV_PRISM_LEDGER_WRITER_ID}" ]]; then
-  PRISM_LEDGER_WRITER_ID="${ENV_PRISM_LEDGER_WRITER_ID}"
-fi
-if [[ -n "${ENV_PRISM_LEDGER_WRITER_EPOCH}" ]]; then
-  PRISM_LEDGER_WRITER_EPOCH="${ENV_PRISM_LEDGER_WRITER_EPOCH}"
 fi
 if [[ -n "${ENV_PRISM_LEDGER_WRITER_SESSION_TOKEN}" ]]; then
   PRISM_LEDGER_WRITER_SESSION_TOKEN="${ENV_PRISM_LEDGER_WRITER_SESSION_TOKEN}"
@@ -305,9 +311,6 @@ fi
 if [[ -n "${ENV_PRISM_AUDIT_DIR}" ]]; then
   PRISM_AUDIT_DIR="${ENV_PRISM_AUDIT_DIR}"
 fi
-if [[ -n "${ENV_PRISM_EVIDENCE_PATH}" ]]; then
-  PRISM_EVIDENCE_PATH="${ENV_PRISM_EVIDENCE_PATH}"
-fi
 if [[ -n "${ENV_PRISM_ALLOW_MEMORY_LEDGER}" ]]; then
   PRISM_ALLOW_MEMORY_LEDGER="${ENV_PRISM_ALLOW_MEMORY_LEDGER}"
 fi
@@ -322,6 +325,15 @@ if [[ -n "${ENV_PRISM_ALLOW_FIXED_LEDGER_SESSION_TOKEN}" ]]; then
 fi
 if [[ -n "${ENV_PRISM_CTV_SETTLEMENT_ENABLED}" ]]; then
   PRISM_CTV_SETTLEMENT_ENABLED="${ENV_PRISM_CTV_SETTLEMENT_ENABLED}"
+fi
+if [[ -n "${ENV_PRISM_POOL_FEE_ENABLED}" ]]; then
+  PRISM_POOL_FEE_ENABLED="${ENV_PRISM_POOL_FEE_ENABLED}"
+fi
+if [[ -n "${ENV_PRISM_POOL_FEE_ADDRESS}" ]]; then
+  PRISM_POOL_FEE_ADDRESS="${ENV_PRISM_POOL_FEE_ADDRESS}"
+fi
+if [[ -n "${ENV_PRISM_POOL_FEE_P2MR_PROGRAM_HEX}" ]]; then
+  PRISM_POOL_FEE_P2MR_PROGRAM_HEX="${ENV_PRISM_POOL_FEE_P2MR_PROGRAM_HEX}"
 fi
 if [[ -n "${ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT}" ]]; then
   PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT="${ENV_PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT}"
@@ -338,7 +350,6 @@ for name in \
   PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN \
   PRISM_STRATUM_VARDIFF_EWMA_ALPHA \
   PRISM_STRATUM_VARDIFF_RETARGET_TOLERANCE \
-  PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS \
   PRISM_SHARE_COMMIT_TIMEOUT_SECONDS \
   PRISM_STRATUM_SEND_TIMEOUT_SECONDS; do
   override_name="ENV_${name}"
@@ -354,12 +365,6 @@ if [[ -n "${ENV_PRISM_STRATUM_VARDIFF_MIN_DIFF}" ]]; then
 fi
 if [[ -n "${ENV_PRISM_STRATUM_VARDIFF_START_DIFF}" ]]; then
   PRISM_STRATUM_VARDIFF_START_DIFF="${ENV_PRISM_STRATUM_VARDIFF_START_DIFF}"
-fi
-if [[ -n "${ENV_PRISM_SHARE_COMMIT_BATCH_SIZE}" ]]; then
-  PRISM_SHARE_COMMIT_BATCH_SIZE="${ENV_PRISM_SHARE_COMMIT_BATCH_SIZE}"
-fi
-if [[ -n "${ENV_PRISM_SHARE_COMMIT_LINGER_MILLISECONDS}" ]]; then
-  PRISM_SHARE_COMMIT_LINGER_MILLISECONDS="${ENV_PRISM_SHARE_COMMIT_LINGER_MILLISECONDS}"
 fi
 if [[ -n "${ENV_PRISM_STRATUM_STALE_GRACE_SECONDS}" ]]; then
   PRISM_STRATUM_STALE_GRACE_SECONDS="${ENV_PRISM_STRATUM_STALE_GRACE_SECONDS}"
@@ -597,40 +602,22 @@ check_absolute_storage_source() {
 
 check_distinct_storage_sources() {
   local names=("$@")
-  local args=() name output
-  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate storage paths"
-  for name in "${names[@]}"; do
-    args+=("${name}" "${!name}")
-  done
-  if ! output="$(python3 - "${args[@]}" <<'PYTHON'
-from pathlib import Path
-import sys
+  local left right
+  local left_name right_name
+  local left_value right_value
 
-sources = []
-try:
-    for name, raw in zip(sys.argv[1::2], sys.argv[2::2]):
-        path = Path(raw).resolve()
-        identities = []
-        for parent in (path, *path.parents):
-            try:
-                stat = parent.stat()
-                identities.append((stat.st_dev, stat.st_ino))
-            except FileNotFoundError:
-                identities.append(None)
-        for other_name, other_path, other_ids in sources:
-            if (path == other_path or path in other_path.parents
-                    or other_path in path.parents
-                    or identities[0] is not None and identities[0] in other_ids
-                    or other_ids[0] is not None and other_ids[0] in identities):
-                sys.exit(f"release provenance storage sources {other_name} and {name} "
-                         "must be distinct and non-overlapping (including filesystem aliases)")
-        sources.append((name, path, identities))
-except (OSError, RuntimeError):
-    sys.exit(f"cannot safely resolve release provenance storage source {name}")
-PYTHON
-  )"; then
-    fail "${output}"
-  fi
+  for ((left = 0; left < ${#names[@]}; left++)); do
+    left_name="${names[left]}"
+    left_value="${!left_name}"
+    left_value="${left_value%/}"
+    for ((right = left + 1; right < ${#names[@]}; right++)); do
+      right_name="${names[right]}"
+      right_value="${!right_name}"
+      right_value="${right_value%/}"
+      [[ "${left_value}" != "${right_value}" ]] || \
+        fail "release provenance storage sources ${left_name} and ${right_name} must be distinct"
+    done
+  done
 }
 
 check_production_deployment_inputs() {
@@ -652,13 +639,13 @@ check_production_deployment_inputs() {
     check_digest_image PRISM_POSTGRES_IMAGE
     check_absolute_storage_source PRISM_POSTGRES_DATA_SOURCE
     check_absolute_storage_source PRISM_POSTGRES_WAL_SOURCE
-    check_absolute_storage_source PRISM_POSTGRES_REPLICA_DATA_SOURCE
     check_absolute_storage_source PRISM_AUDIT_DATA_SOURCE
+    check_absolute_storage_source PRISM_SECRETS_SOURCE
     storage_names+=(
       PRISM_POSTGRES_DATA_SOURCE
       PRISM_POSTGRES_WAL_SOURCE
-      PRISM_POSTGRES_REPLICA_DATA_SOURCE
       PRISM_AUDIT_DATA_SOURCE
+      PRISM_SECRETS_SOURCE
     )
   fi
   check_distinct_storage_sources "${storage_names[@]}"
@@ -683,40 +670,32 @@ require_lab_mode() {
 check_prism_production_difficulty() {
   local output
 
-  command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate production PRISM difficulty"
-  if ! output="$(python3 - \
-    "${PRISM_STRATUM_SHARE_DIFF:-}" \
-    "${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
-    "${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
-    "${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" 2>&1 <<'PY'
-from decimal import Decimal, InvalidOperation
-import sys
-
-names = (
-    "PRISM_STRATUM_SHARE_DIFF",
-    "PRISM_STRATUM_VARDIFF_MIN_DIFF",
-    "PRISM_STRATUM_VARDIFF_START_DIFF",
-    "PRISM_STRATUM_VARDIFF_MAX_DIFF",
-)
-values = {}
-for name, raw_value in zip(names, sys.argv[1:]):
-    if not raw_value:
-        raise SystemExit(f"production mode requires an explicit {name}")
-    try:
-        value = Decimal(raw_value)
-    except InvalidOperation:
-        raise SystemExit(f"{name} must be a decimal number")
-    if not value.is_finite() or value <= 0:
-        raise SystemExit(f"{name} must be positive")
-    if value == Decimal("0.000000001"):
-        raise SystemExit(f"{name} cannot use the lab-only 1e-9 difficulty")
-    values[name] = value
-if values["PRISM_STRATUM_VARDIFF_MIN_DIFF"] > values["PRISM_STRATUM_VARDIFF_START_DIFF"]:
-    raise SystemExit("production vardiff minimum exceeds its start difficulty")
-if values["PRISM_STRATUM_VARDIFF_START_DIFF"] > values["PRISM_STRATUM_VARDIFF_MAX_DIFF"]:
-    raise SystemExit("production vardiff start exceeds its maximum difficulty")
-PY
-  )"; then
+  # The native server validates the same bounds on startup. Keep the host-side
+  # Compose preflight independent of a Python interpreter or a host Rust build.
+  # ENVIRON preserves literal backslashes that awk -v would interpret.
+  if ! output="$(PRISM_CHECK_SHARE_DIFF="${PRISM_STRATUM_SHARE_DIFF:-}" \
+    PRISM_CHECK_MIN_DIFF="${PRISM_STRATUM_VARDIFF_MIN_DIFF:-}" \
+    PRISM_CHECK_START_DIFF="${PRISM_STRATUM_VARDIFF_START_DIFF:-}" \
+    PRISM_CHECK_MAX_DIFF="${PRISM_STRATUM_VARDIFF_MAX_DIFF:-}" LC_ALL=C awk 'BEGIN {
+      share=ENVIRON["PRISM_CHECK_SHARE_DIFF"];
+      minimum=ENVIRON["PRISM_CHECK_MIN_DIFF"];
+      start=ENVIRON["PRISM_CHECK_START_DIFF"];
+      maximum=ENVIRON["PRISM_CHECK_MAX_DIFF"];
+      names[1]="PRISM_STRATUM_SHARE_DIFF"; values[1]=share;
+      names[2]="PRISM_STRATUM_VARDIFF_MIN_DIFF"; values[2]=minimum;
+      names[3]="PRISM_STRATUM_VARDIFF_START_DIFF"; values[3]=start;
+      names[4]="PRISM_STRATUM_VARDIFF_MAX_DIFF"; values[4]=maximum;
+      for (i=1;i<=4;i++) {
+        if (values[i]=="") {print "production mode requires an explicit " names[i];exit 1}
+        if (values[i] ~ /^-/ || tolower(values[i]) ~ /^(nan|inf|infinity)$/) {print names[i] " must be positive";exit 1}
+        if (values[i] !~ /^[+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) {print names[i] " must be a decimal number";exit 1}
+        n=values[i]+0;
+        if (n<=0 || n>1.7976931348623157e308) {print names[i] " must be positive and finite";exit 1}
+        if (n==1e-9) {print names[i] " cannot use the lab-only 1e-9 difficulty";exit 1}
+      }
+      if (minimum+0>start+0) {print "production vardiff minimum exceeds its start difficulty";exit 1}
+      if (start+0>maximum+0) {print "production vardiff start exceeds its maximum difficulty";exit 1}
+    }')"; then
     fail "${output}"
   fi
 }
@@ -727,6 +706,7 @@ check_production_gate() {
   local qbit_tools_production=0
   local readiness_gate
   local launch_readiness_checks="unset"
+  local name value
 
   if production_mode_enabled; then
     production_enabled=1
@@ -766,17 +746,21 @@ check_production_gate() {
         fail "production mode rejects ${name}=1"
       fi
     done
-    [[ -n "${PRISM_DATABASE_URL:-}" || -n "${PRISM_POSTGRES_PSQL_COMMAND:-}" ]] || fail "production mode requires PRISM_DATABASE_URL or PRISM_POSTGRES_PSQL_COMMAND"
+    [[ -n "${PRISM_DATABASE_URL:-}" ]] || fail "production mode requires PRISM_DATABASE_URL"
     [[ "${PRISM_POSTGRES_PASSWORD:-}" != "change-this" ]] || fail "production mode requires a non-default PRISM_POSTGRES_PASSWORD"
     [[ "${PRISM_DATABASE_URL:-}" != *"change-this"* ]] || fail "production mode requires a non-default PRISM_DATABASE_URL"
-    [[ -n "${PRISM_MANIFEST_SIGNING_SEED_HEX:-}" ]] || fail "production mode requires PRISM_MANIFEST_SIGNING_SEED_HEX"
-    [[ -n "${PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX:-}" ]] || fail "production mode requires PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"
+    # Production frontends read signing seeds only from mounted files; a
+    # direct value (anything but whitespace, as the native reader trims it)
+    # would put the seed in the process environment.
+    for name in \
+      PRISM_MANIFEST_SIGNING_SEED_HEX \
+      PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX; do
+      value="${!name:-}"
+      [[ -z "${value//[[:space:]]/}" ]] || \
+        fail "production mode requires mounted ${name}_FILE; unset ${name}"
+    done
     [[ -n "${PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX:-}" ]] || fail "production mode requires PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX"
-    [[ -n "${PRISM_LEDGER_WRITER_ID:-}" ]] || fail "production mode requires PRISM_LEDGER_WRITER_ID"
-    [[ -n "${PRISM_LEDGER_WRITER_EPOCH:-}" ]] || fail "production mode requires PRISM_LEDGER_WRITER_EPOCH"
-    [[ -z "${PRISM_LEDGER_WRITER_SESSION_TOKEN:-}" ]] || fail "production mode requires managed ledger session tokens; unset PRISM_LEDGER_WRITER_SESSION_TOKEN"
-    [[ -n "${PRISM_AUDIT_DIR:-}" ]] || fail "production mode requires PRISM_AUDIT_DIR"
-    [[ -n "${PRISM_EVIDENCE_PATH:-}" ]] || fail "production mode requires PRISM_EVIDENCE_PATH"
+    [[ -z "${PRISM_LEDGER_WRITER_SESSION_TOKEN:-}" ]] || fail "Rust PRISM manages database claims; unset PRISM_LEDGER_WRITER_SESSION_TOKEN"
   fi
 
   if mining_lane_enabled ckpool; then
@@ -922,29 +906,18 @@ check_bitcoin_chain_selection() {
 check_prism_stale_grace() {
   mining_lane_enabled prism || return 0
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    # Production already requires python3 (check_prism_production_difficulty);
-    # lab bring-up does not, so skip rather than add a prerequisite there.
-    if production_mode_enabled; then
-      fail "python3 is required to validate PRISM_STRATUM_STALE_GRACE_SECONDS"
-    fi
-    printf 'doctor: python3 not found; skipping PRISM_STRATUM_STALE_GRACE_SECONDS validation\n'
-    return 0
-  fi
-  # Mirror the coordinator's env_nonnegative_float(): the runtime's float
-  # syntax and range, finite and non-negative.
-  if ! python3 - "${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" >/dev/null 2>&1 <<'PY'
-import math
-import sys
-
-try:
-    value = float(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-raise SystemExit(0 if math.isfinite(value) and value >= 0 else 1)
-PY
+  # Match Rust's decimal f64 parser and Duration::try_from_secs_f64: finite,
+  # non-negative and strictly below 2^64 seconds after float conversion.
+  # ENVIRON preserves literal backslashes that awk -v would interpret.
+  if ! PRISM_CHECK_STALE_GRACE="${PRISM_STRATUM_STALE_GRACE_SECONDS:-3}" LC_ALL=C awk 'BEGIN {
+    value=ENVIRON["PRISM_CHECK_STALE_GRACE"];
+    if (value ~ /^[[:space:]]*$/) exit 0;
+    if (value !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) exit 1;
+    n=value+0;
+    exit !(n>=0 && n<18446744073709551616);
+  }'
   then
-    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number"
+    fail "PRISM_STRATUM_STALE_GRACE_SECONDS must be a finite non-negative number below 18446744073709551616 seconds"
   fi
 }
 
@@ -966,6 +939,32 @@ check_ctv_fee_config() {
   fi
 }
 
+# .env.example's lab pool fee recipient, which the server refuses in production.
+DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX=dfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfee
+
+# #525, #535: the server refuses a fee-off pool in every settlement mode at
+# startup, in check-config and in self-check.
+check_pool_fee_config() {
+  mining_lane_enabled prism || return 0
+  local mode="direct settlement (PRISM_CTV_SETTLEMENT_ENABLED=0)"
+  if is_true_env "$(ascii_lower "${PRISM_CTV_SETTLEMENT_ENABLED:-0}")"; then
+    mode="PRISM_CTV_SETTLEMENT_ENABLED=1"
+  fi
+  is_true_env "$(ascii_lower "${PRISM_POOL_FEE_ENABLED:-0}")" \
+    || fail "${mode} requires PRISM_POOL_FEE_ENABLED=1 (PRISM_POOL_FEE_BPS=0 is allowed) with a pool fee recipient: without a pool fee, sub-floor dust cannot be settled and the first balance below the payout floor stops mining"
+  local address="${PRISM_POOL_FEE_ADDRESS:-}"
+  local program
+  program="$(ascii_lower "${PRISM_POOL_FEE_P2MR_PROGRAM_HEX:-}")"
+  [[ -n "${address}" || -n "${program}" ]] \
+    || fail "PRISM_POOL_FEE_ENABLED=1 needs a pool fee recipient: PRISM_POOL_FEE_ADDRESS, or PRISM_POOL_FEE_P2MR_PROGRAM_HEX with PRISM_POOL_FEE_RECIPIENT_ID"
+  # The lab program is sourced from .env.example beneath every env file here,
+  # so it is refused only where no address replaces it; an address beside it
+  # is left to the server, which sees only what Compose passes.
+  if production_mode_enabled && [[ -z "${address}" && "${program}" == "${DEVELOPMENT_POOL_FEE_P2MR_PROGRAM_HEX}" ]]; then
+    fail "production rejects the development pool fee recipient from .env.example; set PRISM_POOL_FEE_ADDRESS (and clear PRISM_POOL_FEE_P2MR_PROGRAM_HEX) or your own PRISM_POOL_FEE_P2MR_PROGRAM_HEX"
+  fi
+}
+
 check_bitcoin_peer_bootstrap() {
   mining_lane_enabled auxpow || return 0
   local chain="${BITCOIN_CHAIN:-regtest}"
@@ -984,15 +983,102 @@ check_bitcoin_peer_bootstrap() {
   fi
 }
 
-case "${1:-}" in
-  "") ;;
+check_public_reader_credentials() (
+  local name index output production=0 prepare_lab_image=0
+  local -a compose_args
+  if [[ "${make_deployment}" == 1 ]]; then
+    if production_mode_enabled || [[ "${QBIT_CHAIN:-regtest}" == main || "${QBIT_CHAIN:-regtest}" == mainnet ]]; then
+      production=1
+    else
+      # Reader image preparation follows the qbit production selector. The
+      # full preflight validates other chains only for their enabled lanes.
+      check_qbit_chain_selection
+      # Pinned artifacts are prepared explicitly, including in a lab. Tagged
+      # lab images are rebuilt so an older image cannot omit the validator.
+      [[ "${PRISM_COORDINATOR_IMAGE:-}" == *@sha256:* ]] || prepare_lab_image=1
+    fi
+  fi
+  # Restore precisely the environment Compose would receive from the caller.
+  while IFS= read -r name; do
+    [[ "${COMPOSE_INPUT_KEYS}" == *"|${name}|"* ]] || export -n "${name?}"
+  done < <(compgen -e)
+  for ((index=0; index<COMPOSE_INPUT_COUNT; index++)); do
+    export "${COMPOSE_INPUT_NAMES[index]}=${COMPOSE_INPUT_VALUES[index]}"
+  done
+  compose_args=(compose --env-file "${ROOT_DIR}/config/upstream.env.example")
+  if [[ -f "${ROOT_DIR}/config/upstream.env" ]]; then
+    compose_args=(compose --env-file "${ROOT_DIR}/config/upstream.env")
+  fi
+  if [[ -n "${ENV_DEPLOY_ENV_FILE}" ]]; then
+    local deploy_file="${ENV_DEPLOY_ENV_FILE}"
+    [[ "${deploy_file}" == /* ]] || deploy_file="${ROOT_DIR}/${deploy_file}"
+    compose_args+=(--env-file "${deploy_file}")
+  elif [[ -f "${ROOT_DIR}/.env" ]]; then
+    compose_args+=(--env-file "${ROOT_DIR}/.env")
+  fi
+  compose_args+=(-f "${ROOT_DIR}/compose.yaml")
+  if [[ "${production}" == 1 ]]; then
+    compose_args+=(-f "${ROOT_DIR}/compose.production.yaml")
+  fi
+  for name in "${PUBLIC_COMPOSE_FILES[@]-}"; do
+    [[ -n "${name}" ]] || continue
+    compose_args+=(-f "${name}")
+  done
+  if [[ "${prepare_lab_image}" == 1 ]]; then
+    printf 'doctor: preparing the selected PRISM lab image for reader validation\n'
+    if ! output="$(docker "${compose_args[@]}" --profile prism build --quiet prism-public-api 2>&1)"; then
+      fail "public reader image preparation failed; check the selected lab build configuration"
+    fi
+  fi
+  # Run the same public image/environment as deployment, without starting its
+  # database dependencies or publishing ports. The validator does no network IO.
+  # Capture Docker/Compose output: even a launcher error may contain env values.
+  # Compose run otherwise builds an absent image implicitly, even with --pull
+  # never. Remove only the build recipe in this final, credential-free overlay.
+  if output="$(printf 'services:\n  prism-public-api:\n    build: !reset null\n' | \
+      docker "${compose_args[@]}" -f - --profile prism run --rm --no-deps --pull never -T \
+      prism-public-api qbit-prism-server check-public-database-config 2>&1)"; then
+    [[ "${output}" == *"PRISM public database configuration valid; authentication is checked by readiness"* ]] || \
+      fail "public reader validation returned no result; use an image supporting check-public-database-config"
+    printf 'doctor: public reader configuration valid; database authentication remains a readiness check\n'
+  else
+    # Emit only known, value-free configuration errors, never raw launcher logs.
+    for name in \
+      'PRISM_DATABASE_URL is required by the public service' \
+      'public PRISM_DATABASE_URL must use postgres or postgresql' \
+      'invalid public PRISM_DATABASE_URL connection options' \
+      'invalid public PRISM_DATABASE_URL' \
+      'production requires non-default database credentials'; do
+      [[ "${output}" != *"${name}"* ]] || fail "public reader: ${name}"
+    done
+    fail "public reader validation failed; prepare the selected PRISM image and ensure Docker Compose and the image support check-public-database-config"
+  fi
+)
+
+public_reader_only=0
+make_deployment=0
+while [[ $# -gt 0 ]]; do
+case "$1" in
   --require-lab)
     validate_mining_lanes
     require_lab_mode
     exit 0
     ;;
+  --public-reader-only) public_reader_only=1 ;;
+  --make-deployment) make_deployment=1 ;;
+  --compose-file)
+    [[ $# -ge 2 && -n "$2" ]] || fail "--compose-file requires a file"
+    PUBLIC_COMPOSE_FILES+=("$2")
+    shift
+    ;;
   *) fail "unknown argument: ${1}" ;;
 esac
+shift
+done
+if [[ "${public_reader_only}" == 1 ]]; then
+  check_public_reader_credentials
+  exit 0
+fi
 
 export QBIT_PRODUCTION QBIT_TOOLS_PRODUCTION QBIT_CHAIN CKPOOL_NON_TEST_READINESS_GATE
 export QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED
@@ -1015,6 +1101,7 @@ if mining_lane_enabled auxpow; then
 fi
 check_prism_stale_grace
 check_ctv_fee_config
+check_pool_fee_config
 
 check_production_gate
 check_release_provenance_gate
@@ -1024,6 +1111,9 @@ fi
 
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not reachable"
+if mining_lane_enabled prism; then
+  check_public_reader_credentials
+fi
 
 case "${QBIT_PROVIDER}" in
   source)

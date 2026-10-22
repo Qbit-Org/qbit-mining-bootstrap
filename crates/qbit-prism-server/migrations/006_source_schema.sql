@@ -1,0 +1,138 @@
+-- Pin the 2.x.x source schema the migrator accepts, and record what it
+-- migrated. The native migrator applies 001_share_ledger.sql and its own
+-- numbered migrations; it never applies 2.x.x's 002_candidate_bodies.sql and
+-- it does not import #258's chunked candidate bodies. Before any DDL it
+-- classifies the database into one of these source states. The same table is
+-- data in ledger/migration.rs (SOURCE_STATES); this comment is its record.
+--
+--   source state   evidence                                             verdict
+--   fresh          no 001 or 002 object at all                          accept
+--   partial 001    no qbit_share_ledger, but some 001 object present    refuse before any DDL, naming the objects present
+--   pre-#258       no qbit_prism_schema_capabilities, no 002 object     accept after the drain check
+--   #258 applied   candidate_storage_version = 2, every 002 object     accept after the drain check
+--   partial 002    some 002 objects or the capability row, not all      refuse, naming the missing object
+--   newer          candidate_storage_version > 2, unknown capability    refuse before any DDL
+--   native         an object or column a native migration creates is    refuse before any DDL, naming the objects
+--   collision      already present in a 2.x.x or empty database
+--   drifted 001    a 001 (or 002) object whose definition, after 001     refuse transactionally, naming the object
+--                  has run, differs from the frozen release
+--
+-- The drain check looks at outbox rows, never at the capability row: 002
+-- upserts candidate_storage_version = 2 whatever the 2.x.x writer stored, so
+-- the row proves 002 ran, not that v2 rows exist or do not. The same check,
+-- with the predicate built from the columns the outbox has, also runs on a
+-- database an earlier 3.x.x build migrated to native schema 3, 4 or 5, before
+-- 004, 005 and this migration: that build's v1-only predicate never counted
+-- a v2 row, so one can still be pending there. Its capability rows are
+-- checked before that drain check, and before 004, 005 and this migration
+-- (or 009 on a database already at 6) run: a row beyond this release is
+-- refused before any DDL, the newer verdict above, so migrate never alters
+-- a database a newer release wrote. Connect refuses the same rows again. A
+-- record with 3 and not 2, which no native build writes, is refused before
+-- any DDL too: nothing re-runs 002 on a database at 3 or records it unseen.
+--
+-- The release definitions come from the migrator applying the same release
+-- SQL (001, plus 002 for a #258 source) to a scratch schema under a
+-- savepoint in the migration transaction, reading every table, column,
+-- constraint, index, trigger, function and sequence it created, then
+-- applying the native migrations there in order and reading again, and
+-- rolling the savepoint back, all before any DDL touches the source. The
+-- second reading minus the first is the reserved set: every table,
+-- sequence, index, trigger and function a native migration creates and the
+-- release does not (qbit_prism_schema_migrations, the migrator's own, is
+-- never reserved), and, per release table, every column a native migration
+-- adds to it with ADD COLUMN IF NOT EXISTS. A source that already has one
+-- of them, or holds a reserved relation name with a relation of another
+-- kind (a view, an index backing an operator's constraint), is a native
+-- collision, refused before any DDL and naming the objects: a native
+-- migration's IF NOT EXISTS would keep such an object or column whatever it
+-- holds, or skip its own object for the name, and the migration would
+-- record a schema it did not build. Nothing is dropped; the operator restores the backup or
+-- removes the objects. An object or column in both readings, the
+-- capability table on a #258 source for instance, or the outbox's
+-- storage_version there (002 added it; on a pre-#258 source this migration
+-- adds it, so it is reserved), stays governed by the release checks.
+--
+-- A database without qbit_share_ledger (and without any 002 object) is
+-- fresh only if it has no table, sequence, index, trigger or function that
+-- 001 creates; otherwise it is a partial 001, a selective restore or a
+-- hand-installed piece of the schema, refused before any DDL and naming the
+-- objects present. Objects the release does not create do not disqualify a
+-- fresh database; they are kept and logged.
+--
+-- The last row is decided after 001_share_ledger.sql has run on the source
+-- and before any native DDL: 001 is idempotent and repairs what it
+-- re-asserts, but its IF NOT EXISTS leaves an existing table, column, index,
+-- sequence or named constraint as it is. The migrator requires an equivalent
+-- of every release definition in the source schema, on a fresh database too,
+-- where 001 has just created everything. A table or sequence must have the
+-- release's persistence: an UNLOGGED or temporary one is drift whatever its
+-- columns say, because PostgreSQL truncates it after a crash. A table must
+-- have the release's row-level security flags (ENABLE and FORCE ROW LEVEL
+-- SECURITY, neither set by the release) and exactly the release's policies
+-- (none), each compared by command, permissive or restrictive, roles, USING
+-- and WITH CHECK: a policy that hides rows from the migrate role, or forced
+-- security with no policy, would make the drain check see an empty outbox
+-- and the native claim lane never see the legacy rows, so a policy on a
+-- release table is drift, not an extra. So is a trigger the release does
+-- not create on a release table: it can refuse rows the migrator and
+-- the native writers put there (a guard rejecting
+-- writer_epoch = 0, which every native share insert writes) or rewrite
+-- them; a trigger on an operator's own table is theirs and is kept. A
+-- release table must have no child table and no parent: a child created
+-- with INHERITS has its rows read with the parent's, unchecked by the
+-- release constraints. A sequence is
+-- compared by its structure (type, start, increment, bounds, cache, cycle),
+-- never by the value it has reached. A constraint's validation state is
+-- compared: a release constraint left NOT VALID in the source is drift,
+-- except qbit_share_ledger_credit_policy_check, which 001 itself adds NOT
+-- VALID on an upgraded table (NOT_VALID_EXEMPT in ledger/migration.rs, pinned
+-- to the frozen release by a test). The enabled state of the internal
+-- triggers that enforce a foreign key is compared too: disabled by a
+-- superuser, the constraint keeps its definition and validation while no
+-- new row is checked against it. Column order, comments and auto-generated
+-- constraint names are ignored. All extra indexes on release tables are
+-- drift, even when not valid for queries: plain indexes can evaluate native
+-- writes through their access methods or operator classes too. Indexes on
+-- operator-owned tables remain accepted.
+-- Accepted extra objects are kept and logged; a
+-- missing or different one fails the migration, which rolls back whole.
+
+-- What the database came from, written once by the migration that accepted
+-- it. Later starts and operators read it; a repeated migrate never rewrites it.
+CREATE TABLE IF NOT EXISTS qbit_prism_migration_source (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    source_state text NOT NULL
+        CHECK (source_state IN ('fresh', 'pre_258', '258_applied', 'native')),
+    source_release text,
+    source_commit text,
+    candidate_storage_version integer,
+    prior_schema_version integer NOT NULL CHECK (prior_schema_version >= 0),
+    migrated_by text NOT NULL,
+    migrated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Every native database declares its capabilities, so a process refuses a
+-- database newer than itself at connect. Every migrated source declares the
+-- version 1 JSONB candidates native writers can process; a #258 source's
+-- former declaration of 2 is retained in qbit_prism_migration_source.
+-- The migrator validates and drains the source before this update. Nothing native
+-- removes the table or the row: a database at 6 without either is refused
+-- at connect, and before any DDL at migrate, rather than read as a legacy
+-- state.
+CREATE TABLE IF NOT EXISTS qbit_prism_schema_capabilities (
+    capability text PRIMARY KEY,
+    capability_value integer NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+INSERT INTO qbit_prism_schema_capabilities (capability, capability_value)
+VALUES ('candidate_storage_version', 1)
+ON CONFLICT (capability) DO UPDATE SET capability_value=EXCLUDED.capability_value;
+
+-- The claim lane decodes a candidate by its storage version. 002 added this
+-- column on a #258 source; every other source gets the same column with the
+-- same default so one claim statement serves them all. The chunk tables and
+-- the body reference are not carried: a v2 pending row is drained before
+-- migration, and the claim lane parks any that appears later.
+ALTER TABLE qbit_block_candidate_outbox
+    ADD COLUMN IF NOT EXISTS storage_version integer NOT NULL DEFAULT 1;

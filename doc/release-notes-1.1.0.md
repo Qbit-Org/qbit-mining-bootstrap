@@ -20,7 +20,7 @@ Release date: 2026-08-17
   prefetch, and single-flight job builds that resolve or evict abandoned
   promises.
 - Makes payout-artifact builds incremental and debounced, and re-lands
-  event-driven artifact reuse behind the `PRISM_PAYOUT_ARTIFACT_REUSE`
+  event-driven artifact reuse behind the `PRISM_PAYOUT_ARTIFACT_REUSE` <!-- retired-setting: PRISM_PAYOUT_ARTIFACT_REUSE -->
   kill switch after the earlier anchor-scoped attempt was reverted.
 - Adds the reward-window leaderboard to the public dashboard API. `window=reward`
   ranks the canonical live PRISM work window using counted share difficulty
@@ -57,7 +57,7 @@ The qbit mainnet genesis hash for this release line is unchanged:
 - Configuration is additive. No `.env.example` key was removed or renamed
   since 1.0.0. The two new behaviour switches are
   `PRISM_COINBASE_OUTPUT_POLICY`, which defaults to `canonical` and preserves
-  the 1.0.0 coinbase ordering, and `PRISM_PAYOUT_ARTIFACT_REUSE`, which
+  the 1.0.0 coinbase ordering, and `PRISM_PAYOUT_ARTIFACT_REUSE`, which <!-- retired-setting: PRISM_PAYOUT_ARTIFACT_REUSE -->
   defaults to `1` and can be set to `0` to fall back to full artifact builds.
 - The remaining new keys are PRISM tuning and capacity knobs covering block
   submit and landing timeouts, writer-lease TTL, tip-refresh fanout and worker

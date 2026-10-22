@@ -1,0 +1,1095 @@
+//! Miner credit decisions, independently fenced from current-work candidates.
+//!
+//! A share's acknowledgement never outruns its ledger outcome. The append runs
+//! in its own task behind a [`CommitGate`]: at `share_commit_timeout` the
+//! acknowledgement either closes the gate, so COMMIT is never sent, or finds
+//! COMMIT already in flight and waits `share_commit_grace` for its reply. An
+//! outcome still unknown at the deadline is answered `ledger-outcome-unknown`,
+//! never as a failure. An append carrying a found block follows the same
+//! deadline and grace but is never refused, so it runs on past an unknown
+//! answer. Block-only proofs wait for their candidate's disposition up to
+//! `share_commit_timeout` itself (#574).
+//! A block-bearing submission still pending at its bound is answered
+//! `ledger-outcome-unknown` and counted in `block_proof_ack_capped_total`; the
+//! bound only ends the wait, never the probe, enqueue, append or landing.
+use super::submit_ledger::{Appended, CommitGate, GateClosure, GateState};
+use super::*;
+use crate::ledger::CommitGateClosed;
+use crate::metrics::{BlockAckPath, StaleJobCause};
+use sqlx::postgres::{PgDatabaseError, PgSeverity};
+use tokio::task::{JoinError, JoinHandle};
+
+#[cfg(test)]
+#[path = "miner_submit_acquire_tests.rs"]
+mod acquire_tests;
+
+/// How a persistence attempt ended, as far as its acknowledgement can tell.
+#[derive(Debug)]
+pub(super) enum SaveOutcome {
+    Accepted,
+    Duplicate,
+    /// The original lease expired or was replaced before COMMIT: `stale-job`.
+    Stale,
+    /// The lease's commit gate could not read or prove its chain authority
+    /// before COMMIT (#716): nothing was written, and neither a stale race
+    /// nor a ledger failure is proven. Answered as admission answers
+    /// readiness it cannot prove: `backend-rpc-unavailable`, or
+    /// `backend-database-unavailable` when the refresh failed on the ledger
+    /// database.
+    AuthorityUnavailable,
+    /// The ledger did not record the share: `ledger-confirmation-failed`.
+    Failed(anyhow::Error),
+    /// A block-only proof whose block is stale by the pool's own decision,
+    /// not by a ledger failure: its candidate was abandoned before its offer
+    /// (a parent change, the #478 overpay ceiling, or capture turned off), or
+    /// it is block-only work, whose share is never credited. Also a
+    /// share-pass append the payout-revision fence refused before any write
+    /// (#675). `stale-job`, with the cause recorded once.
+    Superseded(StaleJobCause),
+    /// Not known by the acknowledgement deadline; the share may still be
+    /// credited.
+    Unknown {
+        phase: &'static str,
+        detail: String,
+    },
+}
+
+/// How a block-only proof's spawned duplicate probe and candidate enqueue
+/// ended. The task runs to completion whatever happens to the submission
+/// (#574), so an acknowledgement bound or a cancelled session never stops a
+/// found block short of the outbox.
+enum EnqueueStep {
+    /// The share is already in the ledger; nothing was enqueued.
+    Recorded,
+    /// The probe failed before anything was written: a definite failure.
+    ProbeFailed(anyhow::Error),
+    /// The enqueue's own result: `true` enqueued, `false` already enqueued.
+    Enqueue(Result<bool>),
+}
+
+/// Leave a probe and candidate enqueue that outlived the acknowledgement
+/// bound running, and log its outcome once it resolves. Cancelling it could
+/// strand a COMMIT that was already sent, or leave the block unenqueued.
+fn follow_enqueue(handle: JoinHandle<EnqueueStep>, share_id: String, block_hash: String) {
+    tokio::spawn(async move {
+        let (outcome, error) = match handle.await {
+            Ok(EnqueueStep::Enqueue(Ok(true))) => ("enqueued", None),
+            Ok(EnqueueStep::Enqueue(Ok(false))) => ("already-enqueued", None),
+            Ok(EnqueueStep::Recorded) => ("already-recorded", None),
+            Ok(EnqueueStep::ProbeFailed(error)) => ("probe-error", Some(format!("{error:#}"))),
+            Ok(EnqueueStep::Enqueue(Err(error))) => ("error", Some(format!("{error:#}"))),
+            Err(error) => ("task-ended", Some(error.to_string())),
+        };
+        tracing::warn!(
+            share_id,
+            block_hash,
+            path = "block-only",
+            phase = "enqueue-pending",
+            outcome,
+            error,
+            "unknown share outcome resolved"
+        );
+    });
+}
+
+/// Before `Committing`, COMMIT was never sent, so every error is definite.
+/// After it, only a severity-ERROR reply to COMMIT proves a rollback; any
+/// other failure may follow a durable commit. A success whose COMMIT took the
+/// whole `statement_timeout` may be a cancelled synchronous-replication wait
+/// that committed only locally.
+pub(super) fn classify_share_append(
+    joined: std::result::Result<Result<bool>, JoinError>,
+    state: GateState,
+    commit_elapsed: Option<Duration>,
+    statement_timeout: Option<Duration>,
+) -> SaveOutcome {
+    if state != GateState::Committing {
+        return match joined {
+            Ok(Ok(true)) => SaveOutcome::Accepted,
+            Ok(Ok(false)) => SaveOutcome::Duplicate,
+            Ok(Err(error)) => SaveOutcome::Failed(error),
+            Err(error) => SaveOutcome::Failed(error.into()),
+        };
+    }
+    match joined {
+        Ok(Ok(true)) => {
+            sync_rep_unknown(commit_elapsed, statement_timeout).unwrap_or(SaveOutcome::Accepted)
+        }
+        Ok(Ok(false)) => SaveOutcome::Duplicate,
+        Ok(Err(error)) if database_error_severity(&error) == Some(PgSeverity::Error) => {
+            SaveOutcome::Failed(error)
+        }
+        Ok(Err(error)) => SaveOutcome::Unknown {
+            phase: "commit-error",
+            detail: format!("{error:#}"),
+        },
+        Err(error) => SaveOutcome::Unknown {
+            phase: "commit-error",
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// A successful COMMIT that took the whole `statement_timeout` may be a
+/// cancelled synchronous-replication wait that committed only locally, so it
+/// is answered unknown rather than as a confirmation.
+fn sync_rep_unknown(
+    commit_elapsed: Option<Duration>,
+    statement_timeout: Option<Duration>,
+) -> Option<SaveOutcome> {
+    match statement_timeout {
+        Some(limit) if commit_elapsed.is_none_or(|elapsed| elapsed >= limit) => {
+            Some(SaveOutcome::Unknown {
+                phase: "sync-rep-guard",
+                detail: format!(
+                    "possible sync-rep cancellation: COMMIT took {commit_elapsed:?}, at least statement_timeout {limit:?}"
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The outcome of a share whose commit gate closed before COMMIT, decided by
+/// the closure that won the gate; `error` is the refusal the append reported.
+/// - A proven stale lease is a stale race.
+/// - #716: a lease fence that could not read or prove its chain authority
+///   (a tip poll, a fee or readiness write, or the publication held or
+///   awaited a lock; or readiness or the tip authority lapsed) proves neither
+///   stale work nor a ledger failure. It is answered as admission answers
+///   readiness it cannot prove, not as `ledger-confirmation-failed`, which
+///   feeds the share-append failure warning.
+/// - A deadline closure, or a refusal that recorded none, stays strict.
+fn closed_gate_outcome(closure: Option<GateClosure>, error: anyhow::Error) -> SaveOutcome {
+    match closure {
+        Some(GateClosure::StaleAuthority) => SaveOutcome::Stale,
+        Some(GateClosure::AuthorityUnavailable) => {
+            tracing::info!(
+                %error,
+                closure = "authority-unavailable",
+                "share commit gate refused before COMMIT"
+            );
+            SaveOutcome::AuthorityUnavailable
+        }
+        Some(GateClosure::DeadlineOrCancelled) | None => {
+            tracing::info!(
+                %error,
+                closure = if closure.is_some() { "deadline-or-cancelled" } else { "unspecified" },
+                "share commit gate refused before COMMIT"
+            );
+            SaveOutcome::Failed(error)
+        }
+    }
+}
+
+fn sqlx_error(error: &anyhow::Error) -> Option<&sqlx::Error> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+}
+
+fn database_error_severity(error: &anyhow::Error) -> Option<PgSeverity> {
+    match sqlx_error(error)? {
+        sqlx::Error::Database(error) => error
+            .try_downcast_ref::<PgDatabaseError>()
+            .map(|error| error.severity()),
+        _ => None,
+    }
+}
+
+/// Whether a failed candidate enqueue provably committed nothing: the pool
+/// never handed out a connection, the server answered with a severity-ERROR
+/// response, or no database I/O failed at all.
+pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
+    match sqlx_error(error) {
+        None | Some(sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed) => true,
+        Some(_) => database_error_severity(error) == Some(PgSeverity::Error),
+    }
+}
+
+/// A spawned share append. If the submission itself is cancelled first, an
+/// append that may still be refused is closed and aborted, as dropping it
+/// did before; one already committing, or carrying a block, runs on.
+/// An append's result, how long COMMIT took, and when the append finished.
+/// Both times are taken inside the task, so a late poll of this handle can
+/// neither count scheduler delay as database time nor make an on-time
+/// confirmation look late.
+type AppendJoin = (Result<Appended>, Option<Duration>, tokio::time::Instant);
+
+struct AppendTask {
+    handle: Option<JoinHandle<AppendJoin>>,
+    gate: Arc<CommitGate>,
+    refusable: bool,
+}
+
+impl AppendTask {
+    /// The task's result, if it finishes by `deadline`.
+    async fn finish_by(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Option<std::result::Result<AppendJoin, JoinError>> {
+        let handle = self.handle.as_mut()?;
+        let joined = tokio::time::timeout_at(deadline, handle).await.ok()?;
+        self.handle = None;
+        Some(joined)
+    }
+
+    /// Cancel an append whose gate is closed. Every await before COMMIT rolls
+    /// back when dropped, so the doomed append stops queueing for the pool and
+    /// `ORDER_LOCK` now instead of running to the hook's refusal. The one
+    /// await that could not roll back, the reply to `BEGIN`, retires its
+    /// connection instead (`ledger::append_admission`, #482).
+    fn abort(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+
+    /// Leave an append whose outcome was answered unknown running, and log
+    /// that outcome once it resolves.
+    fn follow(mut self, share_id: String, path: &'static str, phase: &'static str) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            match handle.await {
+                Ok((Ok(Appended::Inserted), _, _)) => {
+                    tracing::warn!(
+                        share_id,
+                        path,
+                        phase,
+                        outcome = "committed",
+                        "unknown share outcome resolved"
+                    )
+                }
+                Ok((Ok(Appended::Recorded), _, _)) => {
+                    tracing::warn!(
+                        share_id,
+                        path,
+                        phase,
+                        outcome = "already-recorded",
+                        "unknown share outcome resolved"
+                    )
+                }
+                // #657: the block was captured, its share deferred; the
+                // candidate loop offers it and confirmation credits the share.
+                Ok((Ok(Appended::Captured), _, _)) => {
+                    tracing::warn!(
+                        share_id,
+                        path,
+                        phase,
+                        outcome = "captured",
+                        "unknown share outcome resolved"
+                    )
+                }
+                Ok((Err(error), _, _)) => {
+                    tracing::warn!(share_id, path, phase, outcome = "error", %error, "unknown share outcome resolved")
+                }
+                Err(error) => {
+                    tracing::warn!(share_id, path, phase, outcome = "task-ended", %error, "unknown share outcome resolved")
+                }
+            }
+        });
+    }
+}
+
+impl Drop for AppendTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            if self.refusable && !handle.is_finished() && self.gate.close() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Construct the durable candidate from the job's immutable issued inputs.
+pub(super) async fn submission_candidate(
+    job: &MiningJob<JobContext>,
+    submission: codec::Submission,
+    deferred_share: Option<AcceptedShare>,
+) -> Result<Candidate> {
+    let context = Arc::clone(&job.context);
+    let job_id = job.wire.job_id.clone();
+    let extranonce1 = job.wire.extranonce1.clone();
+    let extranonce2_size = job.wire.extranonce2_size;
+    // The job context is shared; the recipient-sized copy and block encoding
+    // belong on a blocking worker, before the ledger transaction begins.
+    tokio::task::spawn_blocking(move || {
+        let original = context
+            .bundle
+            .coinbase_script_sig_suffix_hex
+            .as_ref()
+            .context("job coinbase suffix missing")?;
+        let placeholder_length = (4 + extranonce2_size) * 2;
+        let prefix = original
+            .get(
+                ..original
+                    .len()
+                    .checked_sub(placeholder_length)
+                    .context("job coinbase suffix too short")?,
+            )
+            .context("invalid job suffix")?;
+        let suffix = format!("{prefix}{}{}", extranonce1, submission.extranonce2_hex);
+        // The slim candidate: the window reference `refresh_once`
+        // already computed, the stored inputs the job was built with,
+        // and the block as bytes. Nothing here walks the window, clones
+        // the bundle or reads configuration. The as-issued balances,
+        // O(recipients), travel beside the document so the enqueue can
+        // write the snapshot the post-offer landing rebuilds from.
+        let inputs = &context.prepared.inputs;
+        let block_bytes = hex::decode(&submission.block_hex)?;
+        anyhow::Ok(Candidate {
+            block_hash: submission.block_hash_hex,
+            block_sha256: Candidate::block_digest_hex(&block_bytes),
+            job_id,
+            payout_revision: context.prepared.snapshot.payout_revision,
+            window: context.prepared.window,
+            bootstrap_share: context.bootstrap_share.clone(),
+            found_block: context.bundle.found_block.clone(),
+            payout_policy: inputs.payout_policy.clone(),
+            ctv: inputs.ctv.clone(),
+            audit_builder_version: inputs.audit_builder_version,
+            signer_keys: inputs.signer_keys.clone(),
+            leased: false,
+            coinbase_suffix_hex: suffix,
+            deferred_share,
+            block_bytes,
+            as_issued_balances: (*context.prepared.reservation.balances).clone(),
+        })
+    })
+    .await
+    .context("candidate construction worker failed")?
+}
+
+impl Coordinator {
+    /// Record the internal cause at its refusal branch. The response stays the
+    /// generic `stale-job` answer that miners and the share observation see.
+    fn stale_job(&self, cause: StaleJobCause) -> StratumError {
+        self.metrics.record_stale_job_rejection(cause);
+        protocol_error("stale-job", "stale job")
+    }
+
+    pub(super) async fn submit_share(
+        &self,
+        _worker: &Worker,
+        job: &MiningJob<JobContext>,
+        submission: codec::Submission,
+        stale_grace: StaleGrace,
+    ) -> Result<(), StratumError> {
+        // The proof-observation boundary of the first-offer latency: this
+        // frontend's wall clock as the locally validated block proof enters
+        // the coordinator, before any await. Recorded on the candidate row
+        // at enqueue; a clock before the epoch leaves it unknown.
+        let proof_observed_at_ms = submission.block_pass.then(|| unix_ms_now().ok()).flatten();
+        let (last_poll, readiness_generation, refresh_failed_on_database) = {
+            let readiness = self.readiness.read().await;
+            let last_poll = readiness.last_poll.ok_or_else(|| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                )
+            })?;
+            (
+                last_poll,
+                readiness.generation,
+                readiness.refresh_failed_on_database,
+            )
+        };
+        let context = &job.context;
+        self.ensure_job_fee_current(context.prepared.fee)
+            .await
+            .map_err(|_| {
+                self.metrics
+                    .record_stale_job_rejection(StaleJobCause::FeeFloor);
+                protocol_error("stale-job", "job CTV fee is below the current relay floor")
+            })?;
+        let tip_observation::SubmitAdmission {
+            current,
+            tip: selected,
+            lease,
+        } = self.submit_admission().await?;
+        if lease.is_none()
+            && last_poll.elapsed() >= self.config.health_timeout
+            && !selected.share_lease
+        {
+            // #581: readiness ages out when neither a refresh nor a guarded
+            // tip poll (#622) renews it; the reason names the dependency the
+            // latest refresh failed on, or (#655) the one the refresh in
+            // flight is still blocked on past its deadline.
+            return Err(protocol_error(
+                self.stale_readiness_reason(refresh_failed_on_database),
+                "current chain state is unavailable",
+            ));
+        }
+        let revision = if let Some(lease) = &lease {
+            // Re-reading only a revision here would pair a newer transaction
+            // fence with the older balance digest checked by lease admission.
+            lease
+                .revision_for(&context.prepared)
+                .ok_or_else(|| protocol_error("stale-job", "stale job"))?
+        } else {
+            self.submit_ledger.payout_revision().await.map_err(|_| {
+                protocol_error(DATABASE_UNAVAILABLE, "current payout state is unavailable")
+            })?
+        };
+        let parent_stale = selected.hash != job.wire.previousblockhash;
+        // One observation of the published tip, shared by the block-capture
+        // admission and the ordinary candidate-currency check below, so a tip
+        // that moves between them cannot make one see a current parent and the
+        // other a stale one.
+        let observed_tip_is_parent =
+            self.observed_tip.read().await.as_deref() == Some(job.wire.previousblockhash.as_str());
+        // #478 block capture: a block-bearing proof whose parent is still the
+        // active tip is offered to the node even when its payout revision was
+        // superseded by a same-parent settlement bump. The block is valid on
+        // this parent; only the pool's payout snapshot moved. Share credit
+        // stays fenced on the current revision (the deferred/block-only path),
+        // and the block lands as-issued at the observed revision, carrying any
+        // divergence as debt in the additive balance (see `land_offered`).
+        // `PRISM_CAPTURE_OVERPAY_CEILING_BPS=0` turns capture off: such a
+        // proof is refused `stale-job` exactly as before #478.
+        let block_capture = self.config.capture_overpay_ceiling_bps > 0
+            && submission.block_pass
+            && !parent_stale
+            && !selected.share_lease
+            && observed_tip_is_parent;
+        // #478: work a same-parent payout replacement retired is block-only.
+        // It is fenced here, before any grace branch, so it reaches no credit
+        // path at all: not stale grace or parent grace after a flip, not the
+        // ordinary current-revision credit, and (below) not the deferred share
+        // of its captured block. Only a block on the active parent passes.
+        let block_only = job.wire.kind == codec::JobKind::BlockOnly;
+        if block_only && !block_capture {
+            return Err(self.stale_job(if parent_stale {
+                StaleJobCause::ParentGrace
+            } else {
+                StaleJobCause::PayoutRevision
+            }));
+        }
+        let grace =
+            parent_stale && stale_grace.eligible_for(&selected.hash) && selected.transitioned;
+        if grace {
+            let parent = self.tip_parent(&selected).await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current tip parent is unavailable",
+                )
+            })?;
+            if parent != job.wire.previousblockhash {
+                return Err(self.stale_job(StaleJobCause::ParentGrace));
+            }
+        } else if parent_stale {
+            // A stale parent is attributed before any coincident revision change.
+            return Err(self.stale_job(StaleJobCause::ParentGrace));
+        } else if !block_capture
+            && ((context.prepared.snapshot.payout_revision != revision
+                && !(selected.share_lease
+                    && context.prepared.snapshot.payout_revision
+                        == current.snapshot.payout_revision
+                    && current.template["previousblockhash"].as_str()
+                        == Some(job.wire.previousblockhash.as_str())))
+                || (current.snapshot.payout_revision != revision && !selected.share_lease))
+        {
+            // A plain share on a superseded revision is still refused for
+            // credit; only a block-bearing proof on the current tip is spared,
+            // and it is spared for capture, not credit.
+            return Err(self.stale_job(StaleJobCause::PayoutRevision));
+        }
+        // Prior-parent share credit deliberately uses the current durable
+        // revision. That exception never admits an obsolete block candidate.
+        let stale = parent_stale;
+        let candidate_current = !stale
+            && !selected.share_lease
+            && context.prepared.snapshot.payout_revision == revision
+            && current.snapshot.payout_revision == revision
+            && observed_tip_is_parent;
+        // #478: a block on the current tip whose revision has moved, or any
+        // block from block-only work. It is captured (offered and landed
+        // as-issued) but its share is never credited at the current revision.
+        // `block_capture` already requires `submission.block_pass &&
+        // !parent_stale && observed tip`, so this is exactly a current-tip
+        // block that must not take the credited path.
+        let capture_stale = block_capture && (block_only || !candidate_current);
+        if !submission.share_pass
+            && !(submission.block_pass && (candidate_current || capture_stale))
+        {
+            return Err(protocol_error("low-difficulty", "low difficulty share"));
+        }
+        let network = context.bundle.found_block.network_difficulty;
+        let difficulty = if submission.share_pass {
+            codec::scaled_target_difficulty(&job.wire.share_target)
+                .map_err(|_| protocol_error("internal-error", "difficulty overflow"))?
+        } else {
+            network
+        };
+        let share = AcceptedShare {
+            share_seq: 0,
+            share_id: format!("{}:{}", context.worker.username, submission.block_hash_hex),
+            miner_id: context.worker.payout_address.clone(),
+            order_key: context.worker.payout_address.clone(),
+            p2mr_program_hex: context.worker.p2mr_program_hex.clone(),
+            share_difficulty: difficulty,
+            network_difficulty: network,
+            template_height: template_parent_height(context.bundle.found_block.block_height)
+                .map_err(|_| protocol_error("internal-error", "invalid candidate block height"))?,
+            job_id: job.wire.job_id.clone(),
+            job_issued_at_ms: context.prepared.snapshot.anchor_ms,
+            accepted_at_ms: 0,
+            ntime: submission.ntime,
+            credit_policy: stale.then(|| "stale-grace".into()),
+        };
+        {
+            // An explicit unsafe/unknown observation during revision or parent
+            // I/O revokes this admission even if a later poll recovers trust.
+            let readiness = self.readiness.read().await;
+            if readiness.generation != readiness_generation || readiness.last_poll.is_none() {
+                return Err(protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                ));
+            }
+        }
+        if let Some(lease) = &lease {
+            if !self.revalidate_published_lease(lease).await.map_err(|_| {
+                protocol_error(
+                    "backend-rpc-unavailable",
+                    "current chain state is unavailable",
+                )
+            })? {
+                return Err(protocol_error("stale-job", "stale job"));
+            }
+        }
+        // Both acknowledgement bounds are measured from here.
+        let start = tokio::time::Instant::now();
+        let share_id = share.share_id.clone();
+        let block_hash = submission.block_hash_hex.clone();
+        // Credit the share now, defer it to its block's confirmation (a
+        // below-target block proof, or a block captured on a superseded
+        // revision, #478), or never (block-only work, #478).
+        let credit_now = submission.share_pass && !capture_stale;
+        let deferred_share = (!credit_now && !block_only).then(|| share.clone());
+        let candidate = if submission.block_pass && (candidate_current || capture_stale) {
+            submission_candidate(job, submission, deferred_share)
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        let outcome = match candidate {
+            Err(error) => SaveOutcome::Failed(error),
+            // A captured stale-revision block goes through the block-only path:
+            // its share is deferred (credited only if the block confirms), so
+            // no share is credited against the superseded revision.
+            Ok(candidate) if credit_now => {
+                // Ordinary current-tip/candidate admission keeps its existing
+                // credit contract, including a proof that returned from lease
+                // selection to ordinary authority before admission finished.
+                let fence = lease
+                    .filter(|_| selected.share_lease)
+                    .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
+                self.persist_share_pass(
+                    share,
+                    candidate,
+                    proof_observed_at_ms,
+                    revision,
+                    &block_hash,
+                    start,
+                    fence,
+                )
+                .await
+            }
+            Ok(candidate) => {
+                self.persist_block_only(&share, candidate, proof_observed_at_ms, &block_hash, start)
+                    .await
+            }
+        };
+        match outcome {
+            SaveOutcome::Accepted => {
+                self.accepted.fetch_add(1, Ordering::Relaxed);
+                if grace {
+                    self.metrics.record_grace_credit();
+                }
+                if current.bundle.is_none() {
+                    self.wake.notify_one();
+                }
+                Ok(())
+            }
+            SaveOutcome::Duplicate => Err(protocol_error("duplicate-share", "duplicate share")),
+            SaveOutcome::Stale => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(protocol_error("stale-job", "stale job"))
+            }
+            SaveOutcome::AuthorityUnavailable => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                // As admission answers readiness it cannot prove, from the
+                // same readiness read: the ledger database when the latest
+                // refresh failed on it or the refresh in flight is still
+                // blocked on it (#581, #655), the node otherwise. The
+                // readiness lock is not read again: its contention may be
+                // what closed the gate.
+                Err(protocol_error(
+                    self.stale_readiness_reason(refresh_failed_on_database),
+                    "current chain state is unavailable",
+                ))
+            }
+            SaveOutcome::Superseded(cause) => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(self.stale_job(cause))
+            }
+            // The enqueue refused the block before COMMIT: this primary does
+            // not hold the window its coinbase pays (#619). The job's
+            // authority is stale, not the ledger failing, so the answer is
+            // `stale-job`; nothing was written or offered. The ledger counted
+            // `window_not_held` at the refusal itself, so a refusal that
+            // finishes after this answer's deadline is counted too; it is not
+            // counted again here.
+            SaveOutcome::Failed(error)
+                if error
+                    .downcast_ref::<crate::ledger::WindowNotHeld>()
+                    .is_some() =>
+            {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                Err(protocol_error("stale-job", "stale job"))
+            }
+            SaveOutcome::Failed(error) => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                if error.downcast_ref::<CommitGateClosed>().is_some() {
+                    // A refused local gate proves COMMIT was never sent, and
+                    // `persist_share_pass` logged its closure. A deadline
+                    // closure or an unspecified refusal has no proven cause:
+                    // it remains strict.
+                    return Err(protocol_error(
+                        "ledger-confirmation-failed",
+                        "share was not committed because its commit gate closed",
+                    ));
+                }
+                if error.to_string().contains("duplicate-share")
+                    || error.to_string().contains("duplicate share_id")
+                {
+                    return Err(protocol_error("duplicate-share", "duplicate share"));
+                }
+                tracing::warn!(%error,"share persistence failed");
+                Err(protocol_error(
+                    "ledger-confirmation-failed",
+                    "share was not confirmed by the database",
+                ))
+            }
+            SaveOutcome::Unknown { phase, detail } => {
+                // An error response like any other rejection; the share may
+                // still be credited, so its ID is logged for reconciliation.
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                let path = if credit_now { "share" } else { "block-only" };
+                tracing::warn!(
+                    share_id,
+                    block_hash,
+                    path,
+                    phase,
+                    detail,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "share outcome unknown at the acknowledgement deadline"
+                );
+                Err(protocol_error(
+                    "ledger-outcome-unknown",
+                    "share outcome is not yet known",
+                ))
+            }
+        }
+    }
+
+    /// Append a share-pass submission under a commit gate. The only
+    /// acknowledgement deadline is `share_commit_timeout`, plus
+    /// `share_commit_grace` once COMMIT is in flight. An append that carries a
+    /// block candidate gets the same deadline and grace (#574: never less than
+    /// a plain share) but is never refused, so it runs on past the answer.
+    /// If the payout revision moved before its commit, such an append
+    /// captures its block instead (#657), and the answer follows the block's
+    /// disposition, as a block-only proof's does.
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_share_pass(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        block_hash: &str,
+        start: tokio::time::Instant,
+        lease: Option<publication_authority::LeaseCommitFence>,
+    ) -> SaveOutcome {
+        let share_id = share.share_id.clone();
+        // #657: with capture on, a block whose revision moved before its
+        // commit is captured, as the submit check captures one whose revision
+        // already moved; with it off, the fence refuses it as before.
+        let moved = if self.config.capture_overpay_ceiling_bps > 0 {
+            crate::ledger::MovedRevision::Capture
+        } else {
+            crate::ledger::MovedRevision::Refuse
+        };
+        let gate = Arc::new(CommitGate::with_lease(lease));
+        // A found block commits with its share, and the outbox is the only
+        // path to submitblock, so a candidate-bearing append is never refused.
+        let refusable = candidate.is_none();
+        let ledger = self.submit_ledger.clone();
+        let task_gate = gate.clone();
+        let mut task = AppendTask {
+            handle: Some(tokio::spawn(async move {
+                let result = ledger
+                    .append_at_revision_observed(
+                        share,
+                        candidate,
+                        proof_observed_at_ms,
+                        revision,
+                        moved,
+                        task_gate.clone(),
+                    )
+                    .await;
+                // Measured here, not at the join: a coordinator task that is
+                // scheduled late must not turn a durable commit into unknown.
+                let commit_elapsed = task_gate.committing_since().map(|since| since.elapsed());
+                (result, commit_elapsed, tokio::time::Instant::now())
+            })),
+            gate: gate.clone(),
+            refusable,
+        };
+        let deadline = start + self.config.share_commit_timeout;
+        let (joined, phase) = match task.finish_by(deadline).await {
+            Some(joined) => (Some(joined), "commit-in-flight"),
+            None if refusable && gate.close() => {
+                task.abort();
+                // `close` also reports a gate that a lease fence closed first,
+                // at the pre-COMMIT hook, while the append's ROLLBACK was still
+                // in flight. The deadline did not win that gate, so the
+                // fence's closure decides the answer, as it does once the
+                // append returns (#716).
+                return match gate.closure() {
+                    closure @ Some(
+                        GateClosure::StaleAuthority | GateClosure::AuthorityUnavailable,
+                    ) => closed_gate_outcome(closure, CommitGateClosed.into()),
+                    Some(GateClosure::DeadlineOrCancelled) | None => SaveOutcome::Failed(
+                        anyhow::anyhow!("share commit deadline passed before COMMIT was sent"),
+                    ),
+                };
+            }
+            // A refusable gate that would not close is already committing.
+            None if refusable || gate.state() == GateState::Committing => (
+                task.finish_by(deadline + self.config.share_commit_grace)
+                    .await,
+                "commit-in-flight",
+            ),
+            None => (None, "candidate-pending"),
+        };
+        let Some(joined) = joined else {
+            task.follow(share_id, "share", phase);
+            if !refusable {
+                self.metrics.record_block_ack_capped(BlockAckPath::Share);
+            }
+            return SaveOutcome::Unknown {
+                phase,
+                detail: "the append had not finished by the acknowledgement deadline".into(),
+            };
+        };
+        let (joined, commit_elapsed, finished_at) = match joined {
+            Ok((result, commit_elapsed, finished_at)) => {
+                (Ok(result), commit_elapsed, Some(finished_at))
+            }
+            Err(error) => (Err(error), None, None),
+        };
+        // #657: the payout revision moved after the submit check, so the
+        // append committed the block as a capture and deferred the share. As
+        // for a block-only proof, the answer is the block's disposition: the
+        // share is credited if the block confirms within the bound.
+        // A capture commits only after `begin_commit`, so its COMMIT time is
+        // known and the sync-rep guard applies to it as to any commit.
+        if matches!(joined, Ok(Ok(Appended::Captured))) {
+            if let Some(unknown) = sync_rep_unknown(commit_elapsed, self.statement_timeout) {
+                return unknown;
+            }
+            return self
+                .deferred_share_disposition(
+                    &share_id,
+                    block_hash,
+                    start + self.config.share_commit_timeout,
+                    "candidate-pending",
+                    (BlockAckPath::Share, "share"),
+                )
+                .await;
+        }
+        let joined = joined.map(|appended| appended.map(|appended| appended == Appended::Inserted));
+        let outcome =
+            classify_share_append(joined, gate.state(), commit_elapsed, self.statement_timeout);
+        let outcome = match outcome {
+            // A refused local gate proves COMMIT was never sent; the closure
+            // that won it decides the answer.
+            SaveOutcome::Failed(error) if error.downcast_ref::<CommitGateClosed>().is_some() => {
+                closed_gate_outcome(gate.closure(), error)
+            }
+            // The append's payout-revision fence refused the share before any
+            // write: a settlement moved the revision between the submit check
+            // and the append's read under `ORDER_LOCK`. Its work was
+            // superseded, which the submit check itself answers `stale-job`
+            // with cause `payout_revision` a moment later, so the answer is
+            // the same (#675). The ledger is healthy: this is not
+            // `ledger-confirmation-failed`, which feeds the share-append
+            // failure warning. A block-bearing append is refused here only
+            // with capture off, and its found block is then never offered, as
+            // the submit check drops one; that loss is logged.
+            SaveOutcome::Failed(error)
+                if error
+                    .downcast_ref::<crate::ledger::PayoutRevisionChanged>()
+                    .is_some() =>
+            {
+                if !refusable {
+                    tracing::warn!(
+                        %error,
+                        block_hash,
+                        "found block refused at the payout-revision fence with capture off; it is not offered"
+                    );
+                }
+                SaveOutcome::Superseded(StaleJobCause::PayoutRevision)
+            }
+            outcome => outcome,
+        };
+        // Count the confirmation from when the append finished. Classifying
+        // here can happen arbitrarily later, and an on-time confirmation must
+        // not be reported as a late one.
+        if matches!(outcome, SaveOutcome::Accepted)
+            && finished_at.is_some_and(|at| at >= start + self.config.share_commit_timeout)
+        {
+            self.metrics.record_late_confirmation();
+        }
+        outcome
+    }
+
+    /// Credit a block-only proof once its candidate is confirmed on the active
+    /// chain, waiting at most `share_commit_timeout` from `start` (#574): a
+    /// captured proof's answer used to wait up to `max(share_commit_timeout,
+    /// 60 s)` for its own frontend's landing, and the miner's session can
+    /// submit nothing else meanwhile. At the bound the proof is answered
+    /// `ledger-outcome-unknown`, as any share still pending at its deadline
+    /// is; the block and any deferred share are still landed and credited
+    /// once, because only the wait ends there.
+    async fn persist_block_only(
+        &self,
+        share: &AcceptedShare,
+        candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
+        block_hash: &str,
+        start: tokio::time::Instant,
+    ) -> SaveOutcome {
+        let bound = start + self.config.share_commit_timeout;
+        let candidate = match candidate.context("missing candidate") {
+            Ok(candidate) => candidate,
+            Err(error) => return SaveOutcome::Failed(error),
+        };
+        // Block-only work (#478) defers no share: no credit will ever appear,
+        // so once its block is captured the share is refused at once rather
+        // than acknowledged at confirmation.
+        let defers_share = candidate.deferred_share.is_some();
+        // The probe and the enqueue run in one spawned task that the bound
+        // never cancels: only the wait for it is bounded (#574). A probe cut
+        // off at the bound would answer before anything was written and
+        // never enqueue the block. Past the bound the task is followed, so a
+        // slow probe or a degraded database delays the block's offer, never
+        // drops it.
+        //
+        // The ledger is partitioned by `share_seq` (migration 016) and holds
+        // no global `share_id` index, so an unbounded probe descends one
+        // per-leaf index per attached partition. This share was submitted by
+        // the connection that is still waiting for its acknowledgement, so it
+        // can only be in the newest leaves: `qbit_prism_share_probe_floor()`
+        // is the lower bound of the partition two below the one the next
+        // `share_seq` lands in, which prunes the probe to at most three
+        // leaves holding rows at executor start, whatever width each
+        // partition was created with.
+        //
+        // The enqueue commits the pending outbox row and the deferred share
+        // together, so it is never cut off either: dropping it could discard
+        // the reply to a COMMIT that was already sent.
+        let mut phase = "candidate-pending";
+        let ledger = self.ledger.clone();
+        let share_id = share.share_id.clone();
+        let mut enqueue = tokio::spawn(async move {
+            let probed = async {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
+                )
+                .bind(&share_id)
+                .fetch_one(&mut *ledger.acquire().await?)
+                .await
+            }
+            .await;
+            match probed {
+                Ok(true) => EnqueueStep::Recorded,
+                Ok(false) => EnqueueStep::Enqueue(
+                    ledger
+                        .enqueue_candidate_observed(candidate, proof_observed_at_ms)
+                        .await,
+                ),
+                Err(error) => EnqueueStep::ProbeFailed(error.into()),
+            }
+        });
+        match tokio::time::timeout_at(bound, &mut enqueue).await {
+            Ok(Ok(EnqueueStep::Recorded)) => return SaveOutcome::Duplicate,
+            // Nothing is written before the enqueue, so every failure up to
+            // it is definite.
+            Ok(Ok(EnqueueStep::ProbeFailed(error))) => return SaveOutcome::Failed(error),
+            Ok(Ok(EnqueueStep::Enqueue(Ok(true)))) => {}
+            Ok(Ok(EnqueueStep::Enqueue(Ok(false)))) => return SaveOutcome::Duplicate,
+            Ok(Ok(EnqueueStep::Enqueue(Err(error)))) if enqueue_failed_before_commit(&error) => {
+                return SaveOutcome::Failed(error)
+            }
+            Ok(Ok(EnqueueStep::Enqueue(Err(error)))) => {
+                tracing::warn!(
+                    share_id = %share.share_id,
+                    block_hash,
+                    path = "block-only",
+                    %error,
+                    "block-only enqueue outcome unknown; following the outbox"
+                );
+                phase = "enqueue-unknown";
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    share_id = %share.share_id,
+                    block_hash,
+                    path = "block-only",
+                    %error,
+                    "block-only enqueue task ended without a result; following the outbox"
+                );
+                phase = "enqueue-unknown";
+            }
+            Err(_) => {
+                follow_enqueue(enqueue, share.share_id.clone(), block_hash.to_string());
+                self.metrics
+                    .record_block_ack_capped(BlockAckPath::BlockOnly);
+                return SaveOutcome::Unknown {
+                    phase: "enqueue-pending",
+                    detail: "the duplicate probe or candidate enqueue had not finished by the acknowledgement bound"
+                        .into(),
+                };
+            }
+        }
+        if !defers_share {
+            // The block is captured (enqueued, or being followed); the share
+            // of block-only work is never credited, so it is refused now.
+            if phase == "enqueue-unknown" {
+                tracing::warn!(
+                    share_id = %share.share_id,
+                    block_hash,
+                    "block-only capture enqueue outcome unknown; the candidate loop offers it if it committed, and the share is refused"
+                );
+            }
+            return SaveOutcome::Superseded(StaleJobCause::PayoutRevision);
+        }
+        // A block below the advertised share target earns only proven network
+        // work, and only after active-chain confirmation.
+        self.deferred_share_disposition(
+            &share.share_id,
+            block_hash,
+            bound,
+            phase,
+            (BlockAckPath::BlockOnly, "block-only"),
+        )
+        .await
+    }
+
+    /// Follow a captured block until its confirmation credits the proof's
+    /// deferred solver share, or its candidate settles otherwise, waiting at
+    /// most until `bound` (#574). Used by a block-only proof after its
+    /// enqueue, and by a share-pass proof whose append captured its block when
+    /// the payout revision moved before its commit (#657). Past the bound the
+    /// answer is `ledger-outcome-unknown`; the landing runs on and credits the
+    /// share once, whenever it commits. `path` labels the logs and
+    /// `block_proof_ack_capped_total`.
+    async fn deferred_share_disposition(
+        &self,
+        share_id: &str,
+        block_hash: &str,
+        bound: tokio::time::Instant,
+        mut phase: &'static str,
+        (capped, log_path): (BlockAckPath, &'static str),
+    ) -> SaveOutcome {
+        loop {
+            // Observe credit and disposition in one MVCC snapshot so
+            // finalization cannot fall between two separate reads. The credit
+            // this polls for is written by the reconciliation of the block
+            // this call is still acknowledging, so it lands in the newest
+            // leaves and carries the same probe floor as the probe above:
+            // without it, every poll of this loop would descend one per-leaf
+            // `share_id` index per attached partition.
+            let poll = tokio::time::timeout_at(bound, async {
+                sqlx::query_as::<_, (bool, Option<String>, Option<String>, Option<String>)>(
+                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
+                )
+                .bind(share_id)
+                .bind(block_hash)
+                .fetch_one(&mut *self.ledger.acquire().await?)
+                .await
+            })
+            .await;
+            match poll {
+                Err(_) => break,
+                Ok(Ok((true, _, _, _))) => return SaveOutcome::Accepted,
+                // A candidate abandoned before its offer never reached the
+                // node: the pool itself decided the block is stale (its
+                // parent changed, the #478 overpay ceiling refused it, or
+                // capture is off). That is `stale-job`, as base answered such
+                // a proof at submit, never a ledger failure: the ledger wrote
+                // the candidate, and `ledger-confirmation-failed` feeds the
+                // share-append failure warning.
+                Ok(Ok((false, Some(state), _, reason))) if state == "abandoned" => {
+                    return SaveOutcome::Superseded(
+                        if reason.as_deref() == Some("parent superseded") {
+                            StaleJobCause::ParentGrace
+                        } else {
+                            StaleJobCause::PayoutRevision
+                        },
+                    )
+                }
+                // D2b's answer for a candidate the node refused after the
+                // offer (kept in reconciliation with the rejected outcome),
+                // or one the chain proved an orphan after the offer (#415,
+                // terminal with its evidence). It is not a proof:
+                // reconciliation still credits the deferred share if the
+                // block later becomes active, and so does the reorg
+                // reconciler for an orphaned block, from its landed audit.
+                Ok(Ok((false, Some(state), outcome, _)))
+                    if state == ORPHANED_STATE
+                        || (state == CandidateState::Reconciliation.as_str()
+                            && outcome.as_deref() == Some(OfferOutcome::Rejected.as_str())) =>
+                {
+                    return SaveOutcome::Failed(anyhow::anyhow!(
+                        "block-only proof was not accepted on the active chain"
+                    ))
+                }
+                Ok(Ok((false, Some(_), _, _))) => phase = "candidate-pending",
+                Ok(Ok((false, None, _, _))) => {}
+                // The candidate is already durable, so a failed read proves
+                // nothing about its credit.
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        share_id,
+                        block_hash,
+                        path = log_path,
+                        %error,
+                        "{log_path} disposition poll failed; retrying"
+                    );
+                    phase = "poll-error";
+                }
+            }
+            if tokio::time::timeout_at(bound, tokio::time::sleep(Duration::from_millis(50)))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // The landing runs on without this wait: its confirmation credits the
+        // deferred share once, whenever it commits.
+        self.metrics.record_block_ack_capped(capped);
+        SaveOutcome::Unknown {
+            phase,
+            detail: "the block candidate had no disposition by share_commit_timeout".into(),
+        }
+    }
+}

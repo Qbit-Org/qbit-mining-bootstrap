@@ -1,485 +1,491 @@
-# PRISM payout-artifact before/after measurement
+# Measure native Prism performance
 
-This is a production runbook for a human operator. Every database statement is
-read-only. Do not run it from a development workspace, and do not reset
-`pg_stat_statements`: compare cumulative snapshots by `queryid` instead.
+Measure the Rust deployment with the intended payout window, miner population,
+database, and frontend count. The removed Python incremental-window scheduler,
+subprocess builder, and its event names are not measurement targets for the
+native server. A faster synthetic builder result alone does not demonstrate
+miner-facing capacity or HA durability.
 
-Use matching observation windows (one hour minimum; 24 hours preferred) before
-and after rollout. Record the rollout commit and image digest, UTC start/end,
-tip count, accepted-share count, connected-miner range, and network difficulty.
-Keep all raw CSV and log extracts with the rollout evidence.
+## Native builder benchmark
 
-## 1. Capture `pg_stat_statements`
+The built-in benchmark builds and verifies actual signed audit bundles in
+process using synthetic shares:
 
-Run both captures immediately before and after each observation window. Save
-the reset timestamp beside each CSV; any change in `stats_reset` invalidates
-the subtraction (restart the observation window instead of comparing across a
-Postgres restart or statistics reset):
+```sh
+cargo run --locked --release -p qbit-prism-server -- benchmark \
+  --shares 100000 --miners 100 --iterations 20 \
+  --output-json /tmp/prism-native-builder.json
+```
+
+Record the commit, binary/image digest, compiler/build mode, CPU allocation,
+memory limit, and exact dimensions. Output schema
+`qbit.prism.native-builder-benchmark.v1` reports:
+
+- `build_and_verify_p50_ms` and `build_and_verify_p99_ms`
+- `canonical_audit_bytes`
+- `shares`, `miners`, `iterations`, and `engine`
+
+The timings include native construction and verification. They exclude Stratum
+networking, PostgreSQL commits, node RPC, multi-instance contention, and durable
+CTV broadcasting. The benchmark uses direct settlement with synthetic data;
+measure the configured CTV path in a real integration run as well. A percentile
+from few iterations is descriptive, not a well-sampled latency tail.
+
+## Miner-facing load measurement
+
+Use controlled miners or a load generator that submits valid work to the actual
+Stratum listeners. Keep load bounded and run against isolated test infrastructure
+before a production canary. Measure at least:
+
+| Measurement | Why it matters |
+| --- | --- |
+| Valid submissions, successful ACKs, unique committed proofs | Establishes throughput and accounting reconciliation |
+| ACK p50/p95/p99 and maximum | Captures database, target validation, and routing latency |
+| Subscribe/authorize to initial difficulty/job | Detects reconnect admission or delivery stalls |
+| Tip observation to fresh job delivery | Measures usable mining work under refresh load |
+| RSS and CPU per frontend, peak concurrent builders | Shows actual resource use and window memory cost |
+| Database lock waits, pool utilization, statement latency | Reveals the shared database bottleneck |
+| WAL bytes and table/index growth | Quantifies durability/storage cost |
+| Candidate submit-to-active and active-to-accounted latency | Separates node acceptance from durable settlement |
+| Reclaimed candidate/CTV work after interruption | Exercises recovery rather than process uptime alone |
+
+Capture steady state, reconnect bursts, slow database service, a frontend
+restart, and actual HA database failover if zero acknowledged-share loss is a
+requirement. Reconcile unique ACKed proofs against database identifiers after
+in-flight transactions have resolved. Do not count exact duplicate resubmissions
+as additional accepted work.
+
+Record the same workload against one and several frontends, with total miner
+load and total CPU allocation stated separately. More frontends provide routing
+and process redundancy, but every share still crosses one PostgreSQL commit and
+ordering boundary. Report measured scaling; do not infer it from thread count.
+
+The retained [optional v3 qualification validator](prism-capacity-readiness.md)
+checks a strict evidence record. The repository's synthetic builder benchmark
+does not generate a qualification artifact or replace the complete load runner.
+
+## Compare database query costs
+
+If `pg_stat_statements` is enabled in the reviewed database profile, capture
+cumulative counters at the start and end of matching observation intervals.
+Do not reset shared production statistics. A reset invalidates the subtraction:
 
 ```sql
 SELECT now() AT TIME ZONE 'UTC' AS captured_at_utc, stats_reset
 FROM pg_stat_statements_info;
+
+SELECT queryid, calls, total_exec_time, rows, shared_blks_hit,
+       shared_blks_read, temp_blks_read, temp_blks_written, query
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+ORDER BY total_exec_time DESC;
 ```
 
-The capture keeps the overall top 25 plus every known full-window, delta, and
-carry-balance query even when one falls outside the top-N at one boundary:
+Capture every query row or explicitly retain all relevant ledger, snapshot,
+carry-forward, audit, and outbox queries at both boundaries. Absence from a top-N
+list does not mean a zero counter. For matching query IDs, compute differences
+in calls, execution time, reads, and temporary I/O; interval mean execution time
+is `total_exec_time_delta / calls_delta`.
 
-```sql
-COPY (
-    WITH normalized AS (
-        SELECT
-            queryid,
-            calls,
-            total_exec_time,
-            mean_exec_time,
-            rows,
-            shared_blks_hit,
-            shared_blks_read,
-            shared_blk_read_time,
-            temp_blks_read,
-            temp_blks_written,
-            regexp_replace(query, E'\\s+', ' ', 'g') AS normalized_query
-        FROM pg_stat_statements
-        WHERE dbid = (
-            SELECT oid FROM pg_database WHERE datname = current_database()
-        )
-    ), ranked AS (
-        SELECT *, row_number() OVER (ORDER BY total_exec_time DESC) AS total_rank
-        FROM normalized
-    )
-    SELECT
-        now() AT TIME ZONE 'UTC' AS captured_at_utc,
-        queryid,
-        calls,
-        total_exec_time,
-        mean_exec_time,
-        rows,
-        shared_blks_hit,
-        shared_blks_read,
-        shared_blk_read_time,
-        temp_blks_read,
-        temp_blks_written,
-        left(normalized_query, 500) AS query
-    FROM ranked
-    WHERE total_rank <= 25
-       OR normalized_query LIKE '%WITH RECURSIVE pages AS (%'
-       OR (
-           normalized_query LIKE '%qbit_share_ledger%'
-           AND normalized_query LIKE '%accepted_at > to_timestamp%'
-           AND normalized_query LIKE '%job_issued_at > to_timestamp%'
-       )
-       OR normalized_query LIKE '%qbit_current_carry_forward_balances()%'
-    ORDER BY total_exec_time DESC
-) TO STDOUT WITH (FORMAT CSV, HEADER TRUE);
-```
+Use the actual native query with representative arguments when inspecting a
+plan. `EXPLAIN ANALYZE` executes the query, so use an isolated restored database
+for expensive window/audit probes. Keep a statement timeout and read-only
+transaction. Native reward windows use eight times network difficulty; the old
+Python prefetch's sixteen-times scan is not the current reward policy.
 
-For each `queryid`, subtract the opening snapshot from the closing snapshot.
-Report calls, total execution time, shared blocks read, shared-block read time,
-and temp blocks. Calculate the interval mean as
-`total_exec_time_delta / calls_delta`. Keep separate filtered views for the
-pages oracle, delta query, and carry aggregate. If a captured queryid is absent
-from the explicit filters at either boundary, mark it not comparable and fix
-the capture before the next window; top-N membership alone must never imply a
-zero counter.
+## Storage and audit response measurement
 
-Expected after rollout: the pages CTE runs only for cold start, explicit
-reconcile/correction fallback, invariant fallback, and periodic self-check. It
-should disappear from steady-state top consumers.
+Record `pg_total_relation_size` deltas for the ledger, proof registry, audit
+snapshots, non-share audit bodies, job records, and payout/CTV tables. Count
+native snapshot references separately from imported legacy inline bundles.
+Measure full public audit serialization time and response bytes for large
+windows; normalization reduces persistent duplication but the compatible public
+response still contains the logical share array.
 
-The carry-balance aggregate should likewise be limited to cold publication or
-forced payout mutations. Normal and debounced artifact logs should report
-`prior_balances_source:"published"`.
+Verify sampled reconstructed bundles against their canonical SHA, the trusted
+ledger public key, and recorded coinbase. A reduced storage footprint is useful
+only when old and new audits remain independently reproducible.
 
-## 2. Explain the full-rescan oracle
+## Comparison record
 
-Take `anchor_ms`, `window_shares`, and network difficulty from one coordinator
-build event. Set `window_weight` to `16 * network_difficulty`. Use the same
-window weight before and after rollout. Run the following in `psql`, supplying
-integer variables `anchor_ms` and `window_weight`:
+Retain raw measurements and a concise record containing revision/image,
+configuration, database profile and durability settings, workload, observation
+start/end, frontend/resource counts, latency distributions, unique-commit
+reconciliation, storage/WAL growth, and recovery outcomes. State omissions and
+sample sizes. Compare matched workloads and label predictions separately from
+observed results.
 
-`EXPLAIN ANALYZE` executes the query. Prefer a production replica with
-representative data; otherwise run off-peak with operator approval and retain
-the statement timeout below. It is read-only, but it can still consume material
-I/O and CPU.
+## JSONB ceiling gate and 400k-share baselines
 
-```sql
-BEGIN READ ONLY;
-SET LOCAL statement_timeout = '5min';
+PostgreSQL refuses a JSONB container whose elements exceed 268,435,455 bytes.
+Two native writes still embed the whole payout window and therefore grow
+linearly with the share count, so the payout window has a hard storage ceiling
+that arrives well before any capacity limit. The landing write was a third until
+#267 normalized the stored audit body; it is now flat in the window. The gate at
+`crates/qbit-prism-server/tests/jsonb_ceiling_gate.rs` measures those writes and
+holds the line while they are being removed. The legacy audit import was a
+fourth until #265. It now stores only the canonical bytes, as `bytea`, and
+writes no JSONB value.
 
-EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-WITH RECURSIVE pages AS (
-    SELECT page.min_share_seq,
-           page.page_weight,
-           page.page_weight AS cumulative_weight
-    FROM LATERAL (
-        SELECT min(page_rows.share_seq) AS min_share_seq,
-               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
-        FROM (
-            SELECT ledger.share_seq, ledger.share_difficulty
-            FROM qbit_share_ledger ledger
-            WHERE ledger.accepted
-              AND ledger.job_issued_at <=
-                  to_timestamp((:anchor_ms)::double precision / 1000.0)
-              AND ledger.accepted_at <=
-                  to_timestamp((:anchor_ms)::double precision / 1000.0)
-            ORDER BY ledger.share_seq DESC
-            LIMIT 4096
-        ) page_rows
-    ) page
-    UNION ALL
-    SELECT page.min_share_seq,
-           page.page_weight,
-           pages.cumulative_weight + page.page_weight
-    FROM pages
-    CROSS JOIN LATERAL (
-        SELECT min(page_rows.share_seq) AS min_share_seq,
-               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
-        FROM (
-            SELECT ledger.share_seq, ledger.share_difficulty
-            FROM qbit_share_ledger ledger
-            WHERE ledger.accepted
-              AND ledger.job_issued_at <=
-                  to_timestamp((:anchor_ms)::double precision / 1000.0)
-              AND ledger.accepted_at <=
-                  to_timestamp((:anchor_ms)::double precision / 1000.0)
-              AND ledger.share_seq < pages.min_share_seq
-            ORDER BY ledger.share_seq DESC
-            LIMIT 4096
-        ) page_rows
-    ) page
-    WHERE pages.cumulative_weight < (:window_weight)::numeric
-      AND pages.min_share_seq IS NOT NULL
-),
-page_cutoff AS (
-    SELECT min(min_share_seq) AS min_share_seq
-    FROM pages
-    WHERE min_share_seq IS NOT NULL
-),
-ranked AS (
-    SELECT ledger.*,
-           sum(ledger.share_difficulty) OVER (
-               ORDER BY ledger.share_seq DESC
-               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-           )::numeric AS cumulative_difficulty
-    FROM qbit_share_ledger ledger
-    CROSS JOIN page_cutoff
-    WHERE ledger.accepted
-      AND ledger.job_issued_at <=
-          to_timestamp((:anchor_ms)::double precision / 1000.0)
-      AND ledger.accepted_at <=
-          to_timestamp((:anchor_ms)::double precision / 1000.0)
-      AND ledger.share_seq >= page_cutoff.min_share_seq
-),
-rows AS (
-    SELECT *
-    FROM ranked
-    WHERE cumulative_difficulty - share_difficulty
-          < (:window_weight)::numeric
-)
-SELECT count(*), min(share_seq), max(share_seq), sum(share_difficulty)
-FROM rows;
+### Running it
 
-ROLLBACK;
-```
-
-Capture execution/planning time, recursive loops, shared hit/read blocks, read
-I/O time, and temp blocks. The isolated full oracle may remain expensive; the
-success criterion is that its call frequency collapses.
-
-After rollout, also explain one normal delta query from
-`pg_stat_statements`. Confirm both timestamp-range branches use indexes, the
-returned rows approximate `delta_rows`, and no recursive pages CTE appears.
-
-## 3. Extract artifact events
-
-Use the exact UTC observation range. Preserve the original timestamped log and
-also extract parseable coordinator payloads:
+Reduced sizes, which is what `cargo test --locked -p qbit-prism-server
+--all-targets` and the `prism-native-postgres` CI job already run. The
+database-free `rust-tests` job skips it by name
+(`--skip jsonb_ceiling_ratchet_at_reduced_sizes`), because with `CI` set and no
+database the gate fails instead of skipping:
 
 ```sh
-rg '"event": "payout_artifact_' "$PRISM_COORDINATOR_LOG" \
-  | sed -E 's/^.*prism coordinator: //' \
-  > "$PRISM_ARTIFACT_EVENTS"
-jq -e . "$PRISM_ARTIFACT_EVENTS" >/dev/null
+PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
+  cargo test --locked -p qbit-prism-server --test jsonb_ceiling_gate
 ```
 
-### Build duration p50/p95
+Full size (400,000 shares) against a disposable cluster the repository script
+starts and cleans up itself:
 
 ```sh
-jq -s '
-  def percentile($p):
-    sort as $v
-    | if length == 0 then null else $v[((length * $p | ceil) - 1)] end;
-  [.[]
-   | select(.event == "payout_artifact_built")
-   | .duration_seconds]
-  | {
-      count: length,
-      p50_seconds: percentile(0.50),
-      p95_seconds: percentile(0.95),
-      max_seconds: (if length == 0 then null else max end)
-    }
-' "$PRISM_ARTIFACT_EVENTS"
+test/prism-native-tests.sh cargo-args \
+  --locked -p qbit-prism-server --test jsonb_ceiling_gate \
+  -- --ignored --nocapture --exact jsonb_ceiling_ratchet_at_full_size
 ```
 
-Repeat grouped by `.window_build_mode`. Report `incremental`, `full_rescan`,
-`self_check_match`, `self_check_mismatch`, and
-`incremental_self_check_failed` separately. A self-check mismatch is a release
-blocker and must be investigated even though runtime resets to the full oracle.
+Always name the test: `--ignored` without a filter also starts
+`jsonb_ceiling_baseline_sweep` in the same process, against the same cluster.
 
-### Time spent building during publication
+The full-size run measures the reduced pair first, then 400,000 shares. It needs
+the reduced pair's projections to attribute the writes PostgreSQL refuses at
+full size, so budget its wall clock on top.
 
-Set `PRISM_OBSERVATION_SECONDS` to the exact interval length. Include actual
-builds, debounced retags, publication aborts, and cached found-block fallbacks
-so the duty calculation cannot hide remaining publication work:
+Full size against a PostgreSQL you already have:
 
 ```sh
-jq -s --argjson seconds "$PRISM_OBSERVATION_SECONDS" '
-  [.[]
-   | select(.event == "payout_artifact_built"
-            or .event == "payout_artifact_build_debounced"
-            or .event == "payout_artifact_build_aborted"
-            or .event == "payout_artifact_found_block_cached")
-   | select(.during_publication == true)
-   | (.duration_seconds // 0)]
-  | {
-      publication_build_seconds: (add // 0),
-      observation_seconds: $seconds,
-      duty_cycle_fraction: ((add // 0) / $seconds),
-      duty_cycle_percent: (((add // 0) / $seconds) * 100)
-    }
-' "$PRISM_ARTIFACT_EVENTS"
+PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
+  cargo test --locked -p qbit-prism-server --test jsonb_ceiling_gate \
+  -- --ignored --nocapture jsonb_ceiling_ratchet_at_full_size
 ```
 
-The after-rollout target is less than 20% of wall-clock. The legacy baseline
-does not label every synchronous scan consistently; record that limitation and
-cross-check adjacent `payout_artifact_installed` events with
-`during_publication:true`.
-
-Also retain counts and bounded-work fields:
+The baseline sweep that produced the table below. It also runs the reduced pair,
+5,000 and 20,000, for the CI projection it checks its own sizes against, and
+skips a size the list already contains:
 
 ```sh
-jq -s '
-  group_by(.event + ":" + (.window_build_mode // "legacy"))
-  | map({
-      key: (.[0].event + ":" + (.[0].window_build_mode // "legacy")),
-      count: length,
-      delta_rows: ([.[].delta_rows // 0] | add),
-      touched_pages: ([.[].touched_pages // 0] | add)
-    })
-' "$PRISM_ARTIFACT_EVENTS"
+PRISM_JSONB_GATE_BASELINE_SIZES=50000,100000,200000 \
+PRISM_TEST_DATABASE_URL=postgresql://user@127.0.0.1:5432/postgres \
+  cargo test --locked -p qbit-prism-server --test jsonb_ceiling_gate \
+  -- --ignored --nocapture jsonb_ceiling_baseline_sweep
 ```
 
-## 4. Sidecar failure rate and reconcile symptom
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PRISM_TEST_DATABASE_URL` | none | PostgreSQL to test against. Missing while `CI` is set is a failure, never a skip. |
+| `PRISM_JSONB_GATE_TARGET_SHARES` | `400000` | share count the reduced run projects to |
+| `PRISM_JSONB_GATE_N1` | `5000` | smaller reduced size |
+| `PRISM_JSONB_GATE_N2` | `20000` | larger reduced size |
+| `PRISM_JSONB_GATE_STATEMENT_TIMEOUT_MS` | `600000` | exported as `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` before the first `Ledger::connect` |
+| `PRISM_JSONB_GATE_BASELINE_SIZES` | `50000,100000,200000` | sizes for the baseline sweep: at least two, strictly increasing, each dividing the window weight; checked before anything runs |
 
-Adjust the sidecar expression only if its deployed message differs, and keep
-sample matching lines:
+Every share count must divide the window weight (8,000,000) exactly, and
+`0 < n1 < n2 <= target` must hold. A missing variable takes the default; an
+empty, malformed, zero, negative or out-of-range value fails loudly and is never
+replaced by the default.
 
-```sh
-PRISM_SIDECAR_FAILURES=$(rg -c \
-  'mining\.subscribe.*(fail|timeout|timed out|error)' \
-  "$PRISM_SIDECAR_LOG" || true)
-awk -v failures="$PRISM_SIDECAR_FAILURES" \
-    -v seconds="$PRISM_OBSERVATION_SECONDS" \
-  'BEGIN { printf "failures=%d rate_per_hour=%.3f\n", failures, failures * 3600 / seconds }'
+### What it measures
 
-PRISM_RECONCILE_TIMEOUTS=$(rg -c \
-  'reconcile prefetch join exceeded 20s' \
-  "$PRISM_COORDINATOR_LOG" || true)
-awk -v failures="$PRISM_RECONCILE_TIMEOUTS" \
-    -v seconds="$PRISM_OBSERVATION_SECONDS" \
-  'BEGIN { printf "events=%d rate_per_hour=%.3f\n", failures, failures * 3600 / seconds }'
+The gate drives five phases against a real PostgreSQL 16 with an in-process fake
+node. No phase submits a block, so none of them needs `QBITD_BIN`.
+
+| Phase | Call | Write |
+| --- | --- | --- |
+| refresh | `Coordinator::refresh_once` | `qbit_prism_jobs.payload` |
+| enqueue | `Ledger::append(share, Some(candidate))` | `qbit_block_candidate_outbox.candidate` |
+| claim | `Ledger::claim_candidate` | lease columns only |
+| landing | `Ledger::land_candidate` then `finish_candidate` | `qbit_pool_audit_bundles.audit_bundle` |
+| import | `Ledger::import_legacy_audits` | `qbit_pool_audit_bundles.audit_bundle` and `canonical_audit_bytes` |
+
+After every phase it discovers every JSONB column through
+`information_schema.columns` (17 at this base commit, all present only after
+`Ledger::connect(.., true)` has applied `001_share_ledger.sql` and migrations
+002-005) and records, per row:
+
+- `pg_column_size(col)`, the TOAST-compressed stored size;
+- `octet_length(col::text)`, the JSON text form;
+- `pg_column_size(col::text::jsonb)`, the **uncompressed** JSONB container. The
+  268,435,455-byte ceiling applies to the uncompressed container, so the
+  compressed on-disk size must not be what a threshold compares against. A
+  computed datum is never TOAST-compressed, so the round trip through `text`
+  reports the real container size. Measured, it comes out at 1.07 times
+  `octet_length(col::text)` and about 27 to 35 times `pg_column_size(col)` for
+  share-heavy documents on the synthetic fixture: 27.4 for the 50,000-share
+  refresh payload, 34.7 for the 400,000-share landing body.
+
+A value is attributed to the phase whose write created its row or changed its
+value, compared by `md5(col::text)`. Attributing by `xmin` alone would be wrong:
+the claim UPDATE touches only the lease columns, but the new tuple version
+carries the unchanged TOAST pointer forward, so `xmin` alone blames claim for
+the candidate that enqueue wrote. The gate prints every such tuple rewrite as an
+`attribution:` line so the distinction stays visible.
+
+### How the ratchet works
+
+A write **crosses** when its size at the target exceeds 67,108,863 bytes, 25% of
+the hard limit, or when PostgreSQL refuses it outright. The reduced run fits
+`size(n) = a + b*n` through its two sizes and projects to the target. A negative
+slope fails the gate instead of quietly passing, and so does an intercept more
+negative than 5% of the `n1` measurement: that write grew faster than linearly
+between the two sizes, and a straight line would understate it. The measured
+window-carrying writes sit under 0.3%. A positive intercept, up to the `n1` size
+itself for a constant-size write, is a fixed per-write overhead and is allowed.
+The full-size run compares the measured size directly.
+
+A refusal is a result rather than a crash, but PostgreSQL's ceiling error names
+neither the table nor the column, and the server adds no context that would.
+The gate therefore attributes every refusal by projection: among the columns the
+refused phase writes, exactly one has to project past 90% of the hard limit at
+the refused share count, and it has to be the write the gate expected there. No
+candidate, two candidates, or a single candidate that is not the expected write
+each fail the gate, naming what was found and what was expected, so a second
+oversized write in the same phase can never be recorded as the one already
+known. The projections come from the reduced pair, which is why the full-size
+run and the baseline sweep both run that pair first; at the reduced sizes
+themselves a refusal at `n2` is attributed from the `n1` measurement, and that scaled measurement stays
+the write's projection for the full-size run and the sweep, so a violation
+already refused at `n2` is still explained at the target. A refusal at `n1`
+fails the gate, since nothing smaller was accepted to attribute it from. The ratchet row says how: `refused at n=400000 (attributed by
+projection)`, and never a byte count.
+Until a refusal is attributed, the measurement table shows it by phase
+only, under `(not attributed)`, never under the column its call site
+assumed; each run attributes before it prints.
+
+The gate passes only when the set of crossing writes equals `KNOWN_VIOLATIONS`
+exactly. An unlisted write that crosses fails it as a new violation. A listed
+write that stops crossing also fails it, with a message naming the entry to
+delete, so #265, #267 and #273 are forced to shrink the list as they land. The
+full table is printed on every run, passing or failing.
+
+### Baseline, measured at the base commit plus the gate's own test files
+
+All numbers below are **measured**, unless a cell says "projected". Recorded on
+2026-09-10 by the gate as committed in `0c62751`, which is base commit
+`1398bbc1f6e00972c53595bc6f27a6e57adf386c` plus only the three new test files,
+with `cargo test` in **debug** (rustc 1.97.1) against a local disposable
+PostgreSQL **16.15** cluster with stock settings, on a single host: 8 vCPU
+(Intel Core, Haswell-class) and 22 GiB RAM, no swap. One host, one table; do not
+mix in numbers from another machine.
+
+Later commits changed how the gate reports and validates: refusals, the
+substitute row, units, unknown values, the fit checks and the settings checks.
+They did not change what the pipeline writes or how a JSONB size is measured,
+so the sizes here stand. The one measurement they did change is the claim
+phase's peak RSS, now reset before claim; see the note below the
+per-phase table.
+
+Largest JSONB write per path. "Uncompressed" is `pg_column_size(col::text::jsonb)`,
+the size the 268,435,455-byte ceiling applies to; "stored" is the
+TOAST-compressed `pg_column_size(col)`. The stored size varies by a few bytes
+from run to run: the payload embeds a random `storage_key` and schema UUID, so
+the pglz output differs. The gate thresholds on the uncompressed size, which is
+byte-identical across runs and hosts.
+
+| Shares | Path | Column | Uncompressed B | Text B | Stored B |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 50,000 | refresh | `qbit_prism_jobs.payload` | 94,694,334 | 88,230,523 | 3,460,299 |
+| 50,000 | enqueue | `qbit_block_candidate_outbox.candidate` | 61,934,708 | 57,742,014 | 2,160,865 |
+| 50,000 | claim | none | - | - | - |
+| 50,000 | landing | `qbit_pool_audit_bundles.audit_bundle` | 29,173,666 | 27,252,045 | 861,409 |
+| 50,000 | import | `qbit_pool_audit_bundles.audit_bundle` | 61,933,626 | 57,740,951 | 2,160,601 |
+| 100,000 | refresh | `qbit_prism_jobs.payload` | 189,894,214 | 176,380,550 | 6,923,912 |
+| 100,000 | enqueue | `qbit_block_candidate_outbox.candidate` | 124,334,648 | 115,392,039 | 4,315,575 |
+| 100,000 | claim | none | - | - | - |
+| 100,000 | landing | `qbit_pool_audit_bundles.audit_bundle` | 58,773,666 | 54,402,069 | 1,707,202 |
+| 100,000 | import | `qbit_pool_audit_bundles.audit_bundle` | 124,333,566 | 115,390,976 | 4,315,311 |
+| 200,000 | refresh | `qbit_prism_jobs.payload` | **refused** | - | - |
+| 200,000 | enqueue | `qbit_block_candidate_outbox.candidate` | 248,734,408 | 230,992,039 | 8,626,824 |
+| 200,000 | claim | none | - | - | - |
+| 200,000 | landing | `qbit_pool_audit_bundles.audit_bundle` | 117,573,546 | 108,902,069 | 3,399,850 |
+| 200,000 | import | `qbit_pool_audit_bundles.audit_bundle` | 248,733,326 | 230,990,976 | 8,626,557 |
+
+The claim phase writes no JSONB value at any size; it updates only the lease
+columns. That row is a measured zero-copy result, not a missing measurement.
+
+At 200,000 shares the prepared job is already refused:
+
+```text
+error returned from database: total size of jsonb object elements exceeds the
+maximum of 268435455 bytes
 ```
 
-Before rollout, confirm the sidecar calculation reproduces the known 50–115
-failures/hour range. Expected after rollout: approximately zero background
-sidecar failures, zero normal-operation reconcile-prefetch timeouts, and
-`PrismStratumCheckFailureRateHigh` clears after its lookback interval.
+The enqueued candidate and the imported audit body are at 248.7 MB there, inside
+the limit by 7%. One more doubling puts both over it.
 
-## 5. Comparison record
+Wall time, WAL and peak resident set, per phase. WAL is
+`pg_wal_lsn_diff` around the one operation and includes full-page writes, so it
+moves with checkpoint timing rather than purely with the payload. Peak RSS is
+`VmHWM` of the **test process** (the gate plus the native library, not the
+PostgreSQL backend), with `/proc/self/clear_refs` resetting the high-water mark
+at the start of each phase. On an OS without a resettable `VmHWM` (macOS) the
+gate prints `not measured on this OS` for every phase instead of a number. When
+these tables and the 400,000-share table below were recorded, the claim phase
+did not reset the mark, so its peak RSS spans enqueue and claim together; the
+gate now resets it before claim too.
 
-| Metric | Before | After | Target |
-|---|---:|---:|---:|
-| Artifact build p50 / p95 (seconds) | | | Incremental scales with delta |
-| Publication build duty cycle | | | <20% |
-| Full pages-CTE calls/hour | | | Cold/correction/check only |
-| Pages-CTE execution time/hour | | | Near-zero background |
-| Pages-CTE shared blocks read/hour | | | Near-zero background |
-| Carry-balance aggregate calls/hour | | | Cold/payout mutation only |
-| Reconcile-prefetch >20s events/hour | | | 0 |
-| Sidecar subscribe failures/hour | 50–115 | | Approximately 0 background |
-| `PrismStratumCheckFailureRateHigh` | Firing | | Clear |
+**WAL and stored sizes here are measured on synthetic shares and are
+optimistic.** The fixture repeats five miner identities and a padded `miner_id`,
+so the window compresses about 29:1 in TOAST
+(`uncompressed / pg_column_size(col)` = 27.4 to 34.7 across these runs), while
+production data is assumed to compress about 3:1. That 3:1 is the assumption
+stated in issue #273, not a measurement. Do not carry these WAL or stored figures into
+a production estimate without restating that ratio. The gate prints the same
+caveat on every run. The uncompressed sizes, which are what the JSONB ceiling
+applies to and what the gate thresholds on, are unaffected.
 
-Do not claim the production win from local simulation. Until both captures are
-complete, report these as expected effects and attach the raw before/after
-evidence to the rollout record.
+| Shares | Phase | Result | Seconds | WAL B | Peak RSS KiB |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 50,000 | refresh | ran | 17.66 | 3,704,648 | 655,244 |
+| 50,000 | enqueue | ran | 14.91 | 2,501,664 | 1,028,772 |
+| 50,000 | claim | ran | 11.25 | 896 | 1,101,840 |
+| 50,000 | landing | ran | 33.05 | 1,040,592 | 1,082,872 |
+| 50,000 | import | ran | 50.25 | 4,617,296 | 1,248,072 |
+| 100,000 | refresh | ran | 35.73 | 7,419,792 | 1,638,612 |
+| 100,000 | enqueue | ran | 30.06 | 4,638,512 | 1,924,400 |
+| 100,000 | claim | ran | 22.13 | 896 | 2,149,764 |
+| 100,000 | landing | ran | 67.16 | 2,023,304 | 2,088,428 |
+| 100,000 | import | ran | 101.06 | 9,385,664 | 2,293,936 |
+| 200,000 | refresh | refused | 74.10 | 1,145,896 | 3,230,884 |
+| 200,000 | enqueue | ran | 60.03 | 9,252,776 | 3,984,264 |
+| 200,000 | claim | ran | 44.70 | 78,856 | 4,435,528 |
+| 200,000 | landing | ran | 133.45 | 12,776,016 | 4,312,596 |
+| 200,000 | import | ran | 203.34 | 18,528,496 | 4,862,096 |
 
-## 6. Full-rescan attribution (issue #228)
+Whole-pipeline wall clock: 177.6 s at 50,000, 357.6 s at 100,000 and 702.9 s at
+200,000. The fixture load itself is a small part of that: 15,000 rows/s, so
+3.3 s, 6.5 s and 13.5 s respectively.
 
-Every `payout_artifact_built` and `payout_artifact_build_debounced` line now
-says why the build was requested. Read these fields together:
+`qbit_pool_audit_bundles.canonical_audit_bytes` is bytea, so the JSONB ceiling
+does not apply to it; it is reported only. After import it holds 55,640,585 B at
+50,000 shares, 111,190,610 B at 100,000 and 222,590,610 B at 200,000, against
+268,435,456 B, which is 25% of the 1 GiB varlena limit. Projected to 400,000
+shares it is ~445 MB, over that reporting line but still inside the varlena
+limit.
 
-| Field | Meaning |
-|---|---|
-| `invalidation_cause` | The payout-state source cause the candidate was captured with, verbatim (`external_tip`, `accepted_block_preview`, `accepted_block_preview_withdrawn`, `direct_block_uncertain`, `payout_only`, `startup`); `null` for a background preparation, which carries no candidate. |
-| `force_origin` | What marked the build as a payout mutation: `caller_flag` (the caller passed `force_full_window_rescan`), `reserved_cause` (the captured cause was `accepted_block_preview_withdrawn` and this preparation consumed it), `caller_flag+reserved_cause`, or `none`. |
-| `cause_inherited` | `true` when the capture found a cause another preparation had already acted on. The source tuple is deliberately sticky (candidate supersession and the finalizer's pending-cause read depend on it); before this change every such capture re-forced the full oracle. An inherited cause never forces anything now, so a `true` here with `force_origin: "none"` is the expected shape. |
-| `payout_mutated` | Balances were re-read from the ledger because pool-block, payout-entry or carry rows moved (a reorg, a maturity, a withdrawal), by either flag below. |
-| `prior_balances_read_forced` | The caller passed `force_prior_balances_read` (the reorg reconciler after a confirmed mutation, issue #224): the accepted-share ledger is append-only, so the window advances from its delta and only the carry aggregate is reread. Never a full rescan. |
-| `window_oracle_forced` | The caller passed `force_full_window_rescan`: the fail-closed full oracle, which also rereads balances. In production that is the preview-withdrawal path and the reconciler's error path after an uncertain mutation. |
-| `self_check_deferred` | An overdue periodic self-check was left for the next build off the tip-refresh path because this build's cached window was inside the accepted staleness bound (below). |
-| `self_check_recentered` | The periodic self-check re-centered an oversized window at the live weight (issue #207). |
-| `phase_seconds` | The phase split of this build, see section 7. |
+#### At 400,000 shares
 
-Which builds run the full oracle (`window_build_mode: "full_rescan"`), by
-`full_rescan_reason`:
+Measured on the same 8 vCPU / 22 GiB host as the table above, which is close to
+its limit at this size (see the allocator note at the end of this subsection).
+A run on a larger, dedicated host should be recorded in its own host-labelled
+table rather than merged into this one.
 
-| Reason | Trigger | Expected rate |
-|---|---|---|
-| `cold_start` | No cached window (process start, or reuse re-enabled). | Once per process. |
-| `late_visible_append` | The append-invalidation epoch moved: a share committed below an already-walked anchor. The epoch check is the guard that keeps a failed reorg check from resuming append-only state; it is unchanged. | Rare; alert if sustained. |
-| `snapshot_window_weight_out_of_band`, `anchor_regression`, `window_pipeline_mode_changed`, `incremental_invariant_failed`, `window_mirror_divergence`, `window_value_out_of_range`, `delta_api_unavailable` | Genuine epoch breaks detected inside materialization. | Rare. |
-| `window_daemon_state_lost` | The Rust daemon no longer holds the base digest after a respawn or LRU eviction. Recovery is one oracle read that re-prepares the daemon. | Tracks daemon restarts. |
-| `window_daemon_busy`, `window_daemon_unavailable`, `window_value_out_of_range`, `window_mirror_divergence` (after a `self_check_recentered: true` build) | A periodic self-check adopted a window the daemon could not be prepared for at the time, and the reason names what declined the preparation; the next advance rebuilt through the oracle. A deliberate coordinator adoption, never reported as daemon state loss (issue #207). | Rare. |
-| `reconcile_invalidation` | A caller passed `force_full_window_rescan`: the preview-withdrawal path and the reconciler's error path after an uncertain mutation. Since PR #230, reorg reconciliation and payout maturity ask for a prior-balances reread instead (`prior_balances_read_forced: true`, an incremental build), so this reason no longer tracks block cadence. | Withdrawals and reconciler errors only. |
+The full-size run completes and the ratchet holds: every phase is reached, and
+the crossing set is exactly the four known violations. Three of the four writes
+are refused by PostgreSQL outright, each with
 
-Self-check builds (`self_check_match` / `self_check_mismatch`) report
-`periodic_self_check`, with `self_check_recentered: true` when the cached
-weight sat more than 25% above the live snapshot weight and the window was
-re-centered at the live weight. With the Rust pipeline on, the re-center
-prepares the daemon for the adopted digest in the same build, so the next
-build advances incrementally; a second full ledger snapshot on the following
-build is the regression issue #207 fixed. The rescan reason vocabulary is
-closed (`lab/prism/accepted_preview_telemetry.py`, exported as
-`qbit_prism_payout_window_full_rescan_seconds{reason,path}`), so the
-re-center is a flag on the build rather than a reason of its own.
-
-`payout_artifact_tip_refresh_cached` marks a routine candidate that found the
-preparation lock busy and reused the armed window instead of queueing (see
-section 8). It counts under `qbit_prism_payout_artifact_events_total{event="tip_refresh_cached"}`
-once the tip-refresh exporter lists the event; until then count it from logs.
-
-Per-hour full-rescan count from the extract in section 3:
-
-```sh
-jq -r '
-  select(.event == "payout_artifact_built" and .window_build_mode == "full_rescan")
-  | "\(.full_rescan_reason) \(.force_origin) \(.cause_inherited)"
-' "$PRISM_ARTIFACT_EVENTS" | sort | uniq -c
+```text
+error returned from database: total size of jsonb object elements exceeds the
+maximum of 268435455 bytes
 ```
 
-## 7. Build phase attribution (issue #228)
+| Path | Result | Uncompressed B | Text B | Stored B | Seconds | WAL B | Peak RSS KiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| refresh, `qbit_prism_jobs.payload` | refused | - | - | - | 128.28 | 692,280 | 5,094,428 |
+| enqueue, `qbit_block_candidate_outbox.candidate` | refused | - | - | - | 111.91 | 23,264 | 4,149,832 |
+| claim, of the gate-written substitute row | ran, writes no JSONB | - | - | - | 0.01 | 808 | 4,150,152 |
+| landing, `qbit_pool_audit_bundles.audit_bundle` | ran | 235,173,306 | 217,902,069 | 6,785,157 | 266.81 | 7,305,224 | 4,584,516 |
+| import, `qbit_pool_audit_bundles.audit_bundle` | refused | - | - | - | 399.19 | 166,864 | 5,610,676 |
 
-`qbit_prism_payout_window_build_phase_seconds{phase=...,outcome=...}` is a
-histogram over the same buckets as the other payout timings, observed once
-per build for each of a closed phase set, under a closed `outcome`:
-`completed`, `debounced`, `aborted` (a lost generation race, an anchor past
-the audit ceiling, an empty window) or `failed` (the build died with the
-ledger). Every exit observes, so a build slow enough to lose its generation
-race keeps the time it measured instead of vanishing from the family; read
-the `aborted` and `failed` cells first during an incident. No per-tip,
-per-generation or per-reason label exists in this family.
+Whole pipeline: 1,222.9 s, of which 27.7 s is the fixture load (400,000 rows at
+14,465 rows/s, 585.7 B per serialized share, 223.4 MiB of window). Peak RSS of
+the test process was 5.6 GiB. `canonical_audit_bytes` is never written at this
+size because the import that would write it is refused first.
 
-| `phase` | What it measures |
-|---|---|
-| `ledger_read` | Every PostgreSQL read the build issued: the full oracle, the delta query, the periodic self-check's oracle read, and the carry-balance aggregate when balances were not reused. |
-| `record_conversion` | In-process work on records: folding into pages, canonical JSON and digests, mirror verification. |
-| `daemon_prepare` | Round trips to the Rust daemon (`prepare_window` full or advance), including any window upload. |
-| `lock_wait` | Time queued for the payout-state preparation lock before the build could start. |
+Two notes on reading the 400,000-share table. The enqueue write is refused, and
+the gate reports it only as refused: `rejected` in its size columns,
+`refused at n=400000 (attributed by projection)` in the ratchet, and
+PostgreSQL's error text underneath.
+After the refusal the gate writes a window-free **substitute** outbox row itself,
+so that the claim, landing and import writes stay measurable instead of being
+reported as unreached. The substitute is not the enqueue write and never enters
+the ratchet; the report lists it on its own line labelled `SUBSTITUTE`. In the
+run recorded here it measured 14,880 B uncompressed, a figure that run's report,
+produced before the substitute was labelled, printed in the enqueue row. The
+claim row above claimed that substitute, so its seconds, WAL and peak RSS
+describe claiming a window-free row, not a production candidate. And the landing
+write survives at 400,000 shares only because it carries
+one window copy rather than two or three: at 235 MB it is inside the hard limit
+but 3.5 times over the gate threshold, and one more doubling of the window puts
+it over the ceiling as well.
 
-The same split is on each build line as `phase_seconds`. The phases account
-for the build's `duration_seconds` up to artifact construction and the cheap
-accepted-share count. A build whose `ledger_read` dominates is a database
-problem; one whose `lock_wait` dominates is queued behind another build; one
-whose `daemon_prepare` dominates is the daemon or its upload.
+The measured landing size confirms the projections: 235,173,306 B measured
+against 233,066,529 B projected from the CI pair (0.90% low) and 236,373,666 B
+projected from 50,000 and 100,000 shares (0.51% high).
 
-## 8. Accepted staleness on the tip-refresh path (issue #228)
+**Run the full-size test on a host with memory to spare.** At 400,000 shares the
+test process needs several GiB and PostgreSQL needs several more at the same
+time. Without
+`MALLOC_ARENA_MAX=1 MALLOC_MMAP_THRESHOLD_=65536 MALLOC_TRIM_THRESHOLD_=65536`
+the test process retained about 7 GiB of freed allocations by the landing phase;
+with them it peaked at 5.6 GiB and finished. Set those for the full-size run on
+any machine that is not dedicated to it, and budget for PostgreSQL alongside.
+Nothing in CI is affected: CI runs only the reduced sizes.
 
-`PRISM_TIP_REFRESH_WINDOW_STALENESS_SECONDS` (60 s, in `lab/prism/payout_state.py`)
-is the staleness the coordinator accepts for a routine candidate build, the
-one a tip refresh publishes for a new tip. Two rules key on it:
+The reduced-size gate itself, at its default 5,000 and 20,000 shares, pinned to
+two cores with `taskset -c 0,1` and `CARGO_BUILD_JOBS=2` on the same host, took
+**88.3 s** of test time (17.8 s at 5,000, 70.4 s at 20,000). In CI it runs in
+the `prism-native-postgres` job, a 2 vCPU runner with `timeout-minutes: 20`
+(`.github/workflows/ci.yml`). That job's test step took about 4m41s at `3.x.x`
+`f316eb9`, before this gate existed. The 88.3 s comes from the recording host,
+not a CI runner, so treat the sum as an estimate of the headroom, not a
+measurement of it.
 
-- If the preparation lock is busy and an armed window exists whose anchor is
-  no older than the bound (and whose payout generation, append epoch and
-  balances are current, and whose difficulty is inside the snapshot-weight
-  band), the candidate reuses that window instead of queueing behind the
-  lock holder. This is the found-block degrade of issue #188 applied to the
-  tip-refresh path.
-- If a periodic self-check is overdue when a routine candidate builds, and
-  the cached window's anchor is within the bound of the anchor being built,
-  the check is deferred, but never for more than one staleness bound past
-  its due time. The grace is measured from the last self-check attempt, not
-  from the last build, so candidates arriving faster than the bound cannot
-  push it out. A deferral also marks the check owed: the next payout
-  publication requests a background preparation, which normally runs the
-  check off the critical path well inside the grace. If nothing else runs
-  it, the first routine build after the grace runs it on the critical path.
+Fit stability. The baseline sweep computes and checks this itself, per write. It
+runs the reduced CI pair (5,000 and 20,000) alongside its own sizes, projects
+every write to 400,000 shares from that pair and again from the largest pair of
+sweep sizes at which **that write** was accepted, and fails when the two differ
+by more than 5% of the larger-pair projection. The pair has to be chosen per
+write because the writes are refused at different sizes - refresh is already
+refused at 200,000 while the other three are not - so no single pair fits all
+four. A write accepted at fewer than two sweep sizes fails the sweep by name
+rather than going unchecked, and a CI projection below 1 MiB is reported as not
+compared, because a relative difference that small is fixed per-write overhead
+and not the window's growth. The table below was recorded before the check was
+per write, against 50,000 and 100,000 - the largest pair at which all four
+writes were accepted - and the two projections agree to well inside the
+tolerance. Re-running the same sweep now pairs enqueue, import and landing at
+100,000 and 200,000, where the measurements above show them still accepted;
+refresh, refused at 200,000, keeps 50,000 and 100,000:
 
-Why 60 s: it is one background re-anchor interval. In steady state the
-re-anchor keeps the armed window younger than this, so a window inside the
-bound is one the delivery path is already serving to new jobs as fresh, and
-a fanout that reuses it declares an anchor no older than reuse itself
-declares. Past the bound the wave pays the (incremental) build: the
-re-anchor has already flagged that window for replacement, and carrying it
-into a new payout generation would let a stalled background walker pin a
-stale anchor for every following generation. It sits well inside the 300 s
-audit ceiling that bounds how far any served window may trail the live
-ledger.
+| Path | From 5,000 and 20,000 | From 50,000 and 100,000 | Difference |
+| --- | ---: | ---: | ---: |
+| refresh | 756,772,922 B | 761,093,494 B | 0.57% |
+| enqueue | 494,920,433 B | 498,734,288 B | 0.76% |
+| import | 494,919,351 B | 498,733,206 B | 0.76% |
+| landing | 233,066,529 B | 236,373,666 B | 1.40% |
 
-What this does not bound: the reorg reconciler acquires the preparation lock
-before it captures its source, so a wave still waits for a background build
-that holds the lock through a periodic self-check. That wait is one oracle
-read at the self-check cadence (two in 48 h on mainnet), not one per
-invalidation.
+### After #265's import change
 
-The bookkeeping behind `cause_inherited` is one integer, the highest source
-generation any candidate preparation has acted on, plus a one-shot
-entitlement carried by the tuple a reservation hands back to its caller. A
-capture acts only above that mark; the reserver's own preparation acts once
-by presenting its reserved tuple, whatever happened at other generations in
-between. Nothing accumulates, so there is nothing to prune or to watch.
+The baseline above predates #265, whose import stores the canonical audit
+bytes instead of an inline JSONB body. With that change, at 400,000 shares the
+import writes no JSONB value: it ran in 129.5 s with 18.7 MB of WAL, and
+`canonical_audit_bytes` holds 445,390,610 B (bytea, reported only). The ratchet
+holds with three known violations. This run was measured on a different host
+from the baseline (Apple M-series, debug build, PostgreSQL 16), so compare its
+timings with the tables above only loosely.
 
-## 9. Deliberate re-center versus daemon state loss (issue #207)
+### Fixture
 
-| Signal | Deliberate re-center | Genuine daemon eviction or restart |
-|---|---|---|
-| Self-check build line | `full_rescan_reason: "periodic_self_check"`, `self_check_recentered: true` | not applicable |
-| Next build, daemon prepared | `window_build_mode: "incremental"`, no reason | `full_rescan_reason: "window_daemon_state_lost"` |
-| Next build, daemon could not be prepared at adoption | the daemon's outcome at adoption: `window_daemon_busy`, `window_daemon_unavailable`, `window_value_out_of_range` or `window_mirror_divergence` | `window_daemon_state_lost` |
-| Daemon counters | one extra `window_prepares` at the self-check build | `spawns` increments on a restart |
+The window is loaded by `crates/qbit-prism-server/tests/support/window_fixture.rs`
+with one server-side `INSERT ... SELECT FROM generate_series` per 50,000 rows,
+then the `qbit_prism_share_hashes` backfill migration 002 performs. Shares are a
+pure function of the share index: no wall clock, no OS randomness, and the same
+parameters always produce byte-identical shares. The row shape follows the #258
+measurement fixture; `miner_id` is padded so one serialized `AcceptedShare` is
+exactly 581 bytes at share index 1 and averages 583.7 to 584.9 bytes over a
+window, against the ~581 bytes per share measured on the production window in
+#254 (372,257 shares, ~232 MB canonical).
 
-Both recoveries take the existing path: one full oracle read that
-re-prepares the daemon, after which the cache is a daemon mirror again. The
-byte-exact parity of the window, the 5/8 band floor, the 2x ceiling and the
->1.25x re-center threshold are unchanged.
-
-## 10. Testnet soak thresholds (issue #228)
-
-Operator-run; the deterministic equivalents are in
-`tests/test_prism_payout_state.py` (`PayoutWindowRescanBoundTests`) and
-`tests/test_prism_payout_window_daemon_recenter.py`. Run a 24 h soak on
-testnet with `PRISM_WINDOW_PIPELINE_RUST=1` and extract events as in section
-3, then:
-
-```sh
-jq -s '
-  [.[] | select(.event == "payout_artifact_built")] as $built
-  | {
-      full_rescans: ($built | map(select(.window_build_mode == "full_rescan")) | length),
-      reconcile_invalidation: ($built | map(select(.full_rescan_reason == "reconcile_invalidation")) | length),
-      daemon_state_lost: ($built | map(select(.full_rescan_reason == "window_daemon_state_lost")) | length),
-      inherited_forces: ($built | map(select(.cause_inherited == true and .force_origin != "none")) | length),
-      p95_build_seconds: ($built | map(.duration_seconds) | sort | .[((length * 0.95 | ceil) - 1)])
-    }
-' "$PRISM_ARTIFACT_EVENTS"
-```
-
-Pass criteria for the 24 h window, before any mainnet rollout:
-
-| Measure | Threshold |
-|---|---|
-| Full rescans per hour (`full_rescans / 24`) | at most 2 |
-| `reconcile_invalidation` full rescans | 0 |
-| `window_daemon_state_lost` full rescans | at most the daemon `spawns` count over the window |
-| `inherited_forces` | 0 |
-| p95 `duration_seconds` of `payout_artifact_built` | at most 3 s |
-| Tip-refresh waves with elapsed above 3 s whose outcome is `fanout_superseded` | none attributable to a payout build (`phase_seconds.lock_wait` under 1 s on every build during the wave) |
+Two deviations from #258 are deliberate. `share_difficulty` is scaled to
+`8,000,000 / n` so exactly `n` shares fill the payout window, instead of #258's
+21-digit value; keeping that value would require a network difficulty of ~5e24
+at 400,000 shares, which the 24-bit compact-bits mantissa cannot express
+exactly, so the window length would stop being an exact function of `n`. And the
+share index inside `share_id` is zero-padded to a fixed width. Both cost bytes
+that the `miner_id` padding gives back, which is why the serialized share size
+is the same at every window size and the two-point linear fit is sound.

@@ -31,9 +31,9 @@ jobs:
           python-version: "3.14"
 
       - name: Install lint tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck
+        uses: ./.github/actions/apt-install
+        with:
+          packages: shellcheck
 
       - name: Check shell syntax
         run: git ls-files -z '*.sh' | xargs -0 -n 1 bash -n
@@ -45,6 +45,38 @@ jobs:
 
       - name: Compile Python sources
         run: python -m compileall -q docker lab tests examples scripts
+
+      - name: Check native alert PromQL and pool-exhaustion regressions
+        run: |
+          set -euo pipefail
+          python -m pip install PyYAML==6.0.3
+          prism_prometheus_dir="${RUNNER_TEMP}/prism-prometheus"
+          mkdir -p "${prism_prometheus_dir}"
+          curl --fail --location --retry 3 \
+            --output "${prism_prometheus_dir}/prometheus.tar.gz" \
+            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz
+          printf '%s  %s\n' \
+            f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d \
+            "${prism_prometheus_dir}/prometheus.tar.gz" | sha256sum --check
+          tar -xzf "${prism_prometheus_dir}/prometheus.tar.gz" -C "${prism_prometheus_dir}" \
+            prometheus-3.14.0.linux-amd64/promtool
+          python scripts/test_prism_alert_promql.py \
+            --promtool "${prism_prometheus_dir}/prometheus-3.14.0.linux-amd64/promtool"
+
+      - name: Check that gated tests read their inputs only through the shared gate
+        run: python3 scripts/check_gate_env_reads.py
+
+      - name: Check that the Rust toolchain pin is held in one version
+        run: python3 scripts/check_toolchain_pin.py
+
+      - name: Check PRISM setting inventories and retired-setting guidance
+        run: python3 scripts/check_prism_settings.py
+
+      - name: Check that the deleted-test map cites real tests and counts its own rows
+        run: python3 scripts/check_deleted_test_map.py
+
+      - name: Test the pinned-tool installer's outage and integrity guards
+        run: bash .github/scripts/test-install-pinned-tool.sh
 
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
@@ -61,6 +93,32 @@ jobs:
               -f compose.yaml \
               --profile "$profile" \
               config --quiet
+          done
+          docker compose --env-file config/upstream.env.example --env-file .env.example \
+            -f compose.yaml -f compose.prism-external-db.yaml --profile prism config --quiet
+
+      - name: Validate PRISM HA Compose stacks
+        run: |
+          export QBIT_SRC_DIR="$PWD"
+          for overlays in "" "-f compose.production.yaml" "-f compose.prism-external-db.yaml" "-f compose.production.yaml -f compose.prism-external-db.yaml"; do
+            (
+              unset PRISM_DATABASE_URL
+              if [[ "$overlays" == *compose.prism-external-db.yaml* ]]; then
+                export PRISM_DATABASE_URL=postgresql://fixture:fixture@writer.example:5432/prism
+              fi
+              docker compose --env-file config/upstream.env.example --env-file .env.example \
+                -f compose.yaml $overlays -f compose.prism-ha.yaml --profile prism config --format json |
+                jq -e '
+                  [.services["prism-coordinator"], .services["prism-coordinator-2"]] as $pair |
+                  ($pair | all(.environment.PRISM_AUDIT_BIND == "0.0.0.0")) and
+                  ($pair | all(. as $s |
+                    (.environment.PRISM_AUDIT_PORT | tonumber) > 0 and
+                    any(.ports[]; .target == ($s.environment.PRISM_AUDIT_PORT | tonumber)))) and
+                  ([$pair[].environment.PRISM_INSTANCE_ID] | unique | length == 2) and
+                  ([$pair[].environment.PRISM_DATABASE_URL] | unique | length == 1) and
+                  ([$pair[].ports[] | select(.published != "0") | .published] |
+                    length == (unique | length))'
+            )
           done
 
   python-tests:
@@ -81,37 +139,13 @@ jobs:
           python-version: "3.14"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
 
       - name: Run Python unit test shard
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_COUNT: ${{ strategy.job-total }}
         run: GIT_CONFIG_GLOBAL=/dev/null python scripts/run_python_test_shard.py --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT"
-
-  postgres-tests:
-    name: Postgres tests (${{ matrix.suite }})
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [ledger, scale, native-ledger, candidate-storage]
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-
-      - name: Run Postgres test suite
-        env:
-          SUITE: ${{ matrix.suite }}
-        run: |
-          python -m pip install 'psycopg[binary]==3.2.*'
-          make "test-prism-postgres-$SUITE"
 
   rust-tests:
     name: Rust tests
@@ -122,16 +156,137 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Check VERSION against every workspace crate
+        run: python3 scripts/check_version_skew.py
 
       - name: Run Rust tests
+        # This job has no database, qbitd or PostgreSQL server tools, so every
+        # gated test prints its skip line here and runs in prism-native-postgres,
+        # whose execution manifest proves it.
         run: cargo test --locked --workspace --all-targets
+
+      - name: Test the legacy audit sidecar tools against the real canonicalizer
+        # cargo test built qbit-prism's executables for its integration tests.
+        env:
+          PRISM_AUDIT_CANONICALIZE_BIN: target/debug/qbit-prism-audit-canonicalize
+        run: >-
+          python3 -m unittest -v tests.test_prism_legacy_range_sidecars
+          tests.test_prism_legacy_parts_digest_check
+
+  rust-fmt:
+    name: Rust formatting
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  rust-clippy:
+    name: Rust lints
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Lint every target with clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  cargo-deny:
+    name: Dependency audit
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Compute the cargo-deny cache key
+        id: pinned-tool
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ runner.temp }}/pinned-tool-cache
+        run: bash .github/scripts/install-pinned-tool.sh --cache-metadata cargo-deny
+
+      - name: Restore the cargo-deny release cache
+        id: restore-pinned-tool
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
+
+      - name: Install pinned cargo-deny
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ steps.pinned-tool.outputs.cache-dir }}
+        run: |
+          bash .github/scripts/install-pinned-tool.sh cargo-deny "${RUNNER_TEMP}/bin"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Save the cargo-deny release cache
+        if: steps.restore-pinned-tool.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --locked check
+
+  dockerfile-lint:
+    name: Dockerfile lint
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Compute the hadolint cache key
+        id: pinned-tool
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ runner.temp }}/pinned-tool-cache
+        run: bash .github/scripts/install-pinned-tool.sh --cache-metadata hadolint
+
+      - name: Restore the hadolint release cache
+        id: restore-pinned-tool
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
+
+      - name: Install pinned hadolint
+        env:
+          PINNED_TOOL_CACHE_DIR: ${{ steps.pinned-tool.outputs.cache-dir }}
+        run: |
+          bash .github/scripts/install-pinned-tool.sh hadolint "${RUNNER_TEMP}/bin"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Save the hadolint release cache
+        if: steps.restore-pinned-tool.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.pinned-tool.outputs.path }}
+          key: ${{ steps.pinned-tool.outputs.key }}
+
+      - name: Lint every Dockerfile
+        run: git ls-files -z '*Dockerfile*' | xargs -0 hadolint
 
   checks:
     # Preserve the existing check name for branch protection and consumers.
     name: Lint, compile, and test
     if: ${{ always() }}
-    needs: [lint-compile-compose, python-tests, postgres-tests, rust-tests]
+    needs: [lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-native-postgres, prism-integration-proof]
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -141,6 +296,30 @@ jobs:
         run: |
           echo "$RESULTS"
           echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
+  deleted-test-map-owner-issues:
+    # Deliberately not in `checks`: an issue closing must not block unrelated
+    # pull requests. A red job here is how a stale owner link gets noticed, so
+    # it must stay able to fail (no continue-on-error).
+    name: Deleted-test map names only open issues as gap owners (advisory)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      issues: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Check that no uncovered behaviour is owned by a closed issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_deleted_test_map.py --check-issues
 
   ckpool-rejects-observability:
     name: ckpool rejects observability live suite
@@ -157,40 +336,198 @@ jobs:
           python-version: "3.14"
 
       - name: Install ckpool build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            autoconf automake build-essential libtool pkgconf yasm \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            autoconf automake build-essential libtool pkgconf yasm
             libcurl4-openssl-dev libjansson-dev libzmq3-dev
 
       - name: Build patched ckpool and run live regression and load tests
         run: make test-ckpool-rejects-observability
 
-  postgres-native-client:
-    name: PostgreSQL ledger API with production psycopg
+  prism-native-postgres:
+    name: Rust PRISM PostgreSQL and multi-instance contracts (shard ${{ matrix.shard }})
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
-
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    # Interim for #647: shards ran 25-35 min on slow runners against a 30 min
+    # cap. scripts/run_rust_test_shard.py now balances them to about 17 min of
+    # tests each; lower this again once the job summaries confirm that.
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: prism_test
+          POSTGRES_USER: prism_test
+          POSTGRES_PASSWORD: prism_test
+        ports:
+          - 5432:5432
+        # This service's data directory is a tmpfs. fsync, full_page_writes
+        # and synchronous_commit stay on (the ledger refuses a server without
+        # the first two, and the fixtures check all three), but a flush costs
+        # nothing, so its commits no longer queue behind Cargo's writeback or
+        # a neighbour's disk on the shared host. The disposable clusters some
+        # tests start from PRISM_TEST_PG_BIN_DIR stay on disk. Measured over
+        # all four shards, the container peaked at 0.8 GB of memory, tmpfs
+        # included; the cap is half of the runner's 8 GB.
+        options: >-
+          --health-cmd "pg_isready -U prism_test -d prism_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+          --tmpfs /var/lib/postgresql/data:rw,size=4g
+    env:
+      PRISM_TEST_DATABASE_URL: postgresql://prism_test:prism_test@127.0.0.1:5432/prism_test
+      PRISM_TEST_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+      # The statement_timeout of the ledger pools the tests open in process
+      # (Ledger::connect reads it). Production keeps its 15 s default, and so
+      # do the servers and operator tools the tests spawn, which drop
+      # inherited PRISM_ settings (authorization_rpc forwards this one to the
+      # re-run of its own test binary). These 2 vCPU runners run the heaviest
+      # statements (a migration's catalog fingerprint, a 300,000-recipient
+      # balance snapshot) in 1 to 4 s, and in a slow spell on a busy host past
+      # 15 s, failing tests that changed nothing near them. Tests of timeout
+      # behaviour set their own values.
+      PRISM_DATABASE_STATEMENT_TIMEOUT_MS: "60000"
+      # Every gated test must execute across these shards: a missing
+      # input fails the test instead of skipping it (the shared gate also keys
+      # on GITHUB_JOB=prism-native-postgres, so keep this job id). The gate
+      # appends one line per decision to PRISM_TEST_GATE_MANIFEST, named
+      # below; prism-integration-proof checks their union against the full list.
+      PRISM_TEST_REQUIRE_INTEGRATION: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Name the gate manifest and the test log
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          printf 'PRISM_TEST_GATE_MANIFEST=%s/prism-gate-manifest-%s.txt\n' "${RUNNER_TEMP}" "${SHARD_INDEX}" >> "${GITHUB_ENV}"
+          printf 'PRISM_TEST_LOG=%s/prism-native-tests-%s.log\n' "${RUNNER_TEMP}" "${SHARD_INDEX}" >> "${GITHUB_ENV}"
+      # The runner prints the service's log when the job ends; with these
+      # settings a statement that nears the timeout, and the lock it waited
+      # on, name themselves there. Diagnostics only, so it never fails a shard.
+      - name: Log slow statements and lock waits in the PostgreSQL service
+        continue-on-error: true
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "${PG_CONTAINER}" psql -U prism_test -d prism_test -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET log_min_duration_statement = '1s'" \
+            -c "ALTER SYSTEM SET log_parameter_max_length = 64" \
+            -c "ALTER SYSTEM SET log_lock_waits = on" \
+            -c "ALTER SYSTEM SET log_line_prefix = '%m [%p] %a '" \
+            -c "SELECT pg_reload_conf()"
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+      - name: Install tools for disposable primary and standby failover test
+        uses: ./.github/actions/apt-install
         with:
-          python-version: "3.14"
+          packages: postgresql-16
+      # The pinned qbit tarball is cached under a key tied to the install
+      # script (which holds the version and digest), so a run after the first
+      # needs no release download at all. The script verifies the digest of
+      # whatever it uses, cached or downloaded, before extracting, and falls
+      # back from the github.com release route to the release-asset API route
+      # when the first is unavailable. A cache-service error only logs a
+      # warning here; it never fails the job.
+      - name: Restore the pinned qbit release from the cache
+        id: prism-qbit-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Install pinned qbit for native mining and CTV integration
+        run: |
+          set -euo pipefail
+          PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
+            bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
+      - name: Save the pinned qbit release to the cache
+        if: steps.prism-qbit-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/prism-qbit
+          key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
+      - name: Run workspace test shard in required integration mode
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ strategy.job-total }}
+        run: |
+          set -euo pipefail
+          python3 scripts/run_rust_test_shard.py \
+            --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT" \
+            2>&1 | tee "${PRISM_TEST_LOG}"
+      # The Python shards run the import admission gate's hermetic tests. Its SQL against a
+      # schema `qbit-prism-server migrate` made needs this job's PostgreSQL and the server binary.
+      - name: Test the import admission gate's SQL against a migrated schema
+        if: matrix.shard == 3
+        run: |
+          set -euo pipefail
+          cargo build --locked -p qbit-prism-server --bin qbit-prism-server
+          PRISM_ADMISSION_GATE_SERVER_BIN="${GITHUB_WORKSPACE}/target/debug/qbit-prism-server" \
+            python3 -m unittest -v tests.test_prism_legacy_import_admission_gate.RealSchemaTests
+      - name: Upload the shard gate manifest and test log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-gate-shard-${{ matrix.shard }}
+          # Retried uploads can receive a lower ID; downloads choose the
+          # highest ID per name, so replace the previous attempt's evidence.
+          overwrite: true
+          path: |
+            ${{ env.PRISM_TEST_GATE_MANIFEST }}
+            ${{ env.PRISM_TEST_LOG }}
+          if-no-files-found: error
 
-      - name: Install production PostgreSQL client dependency
-        run: python -m pip install "psycopg[binary]==3.2.*"
+      - name: Upload share-append throughput diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-throughput-shard-${{ matrix.shard }}
+          overwrite: true
+          # The owning shard writes this even when the throughput floor fails.
+          # Keep it separate so gate-manifest download paths stay unchanged.
+          path: target/prism-postgres-throughput-share_append_throughput_floor.json
+          # Other shards do not run this target; an earlier failure may also
+          # prevent the owning shard from reaching it.
+          if-no-files-found: ignore
 
-      - name: Run complete share-ledger API suite with psycopg installed
-        run: python -m unittest tests.test_prism_share_ledger
-
-      - name: Run native PostgreSQL ledger integration tests
-        run: make test-prism-postgres-native-ledger
-
-      - name: Run carry-forward seed guard regression tests
-        run: make test-prism-postgres-seed-guard
+  prism-integration-proof:
+    name: Prove every Rust PRISM gated test executed
+    if: ${{ !cancelled() }}
+    needs: [prism-native-postgres]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Require every shard to pass
+        env:
+          SHARD_RESULT: ${{ needs.prism-native-postgres.result }}
+        run: test "$SHARD_RESULT" = success
+      - name: Download shard manifests and test logs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: prism-gate-shard-*
+          path: prism-gate-shards
+          merge-multiple: true
+      - name: Prove every gated test executed across the shards
+        run: |
+          set -euo pipefail
+          cat prism-gate-shards/prism-gate-manifest-*.txt > prism-gate-manifest.txt
+          cat prism-gate-shards/prism-native-tests-*.log > prism-native-tests.log
+          python3 scripts/check_gate_manifest.py \
+            --manifest prism-gate-manifest.txt \
+            --expected test/prism-gated-tests.txt \
+            --log prism-native-tests.log
+      - name: Upload the combined gate manifest
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: prism-gate-manifest
+          overwrite: true
+          path: prism-gate-manifest.txt
+          if-no-files-found: error
 
   docker-builds:
     name: Build lightweight Docker images
@@ -217,36 +554,46 @@ jobs:
             -f lab/auxpow/Dockerfile \
             .
 
+      - name: Build the PRISM builder stage and assert its toolchain is the pin
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --build-context qbit-src=/tmp/qbit-functional-fixture \
+            --load \
+            --target build \
+            --tag qbit-lab-prism:build \
+            -f lab/prism/Dockerfile \
+            .
+          pin="$(python3 scripts/check_toolchain_pin.py --print-pin)"
+          for tool in cargo rustc; do
+            reported="$(docker run --rm --network none qbit-lab-prism:build "${tool}" --version)"
+            printf '%s\n' "${reported}"
+            if [[ "${reported}" != "${tool} ${pin} "* ]]; then
+              printf 'builder stage %s is not the pinned %s\n' "${tool}" "${pin}" >&2
+              exit 1
+            fi
+          done
+
       - name: Build PRISM coordinator image
         run: |
           docker buildx build \
             --build-context qbit-src=/tmp/qbit-functional-fixture \
             --load \
-            --tag qbit-prism:ci \
+            --tag qbit-lab-prism:ci \
             -f lab/prism/Dockerfile \
             .
 
-      - name: Run payout-window parity with Python adapter
+      - name: Smoke native PRISM runtime image
         run: |
-          docker run --rm \
-            --volume "$PWD:/workspace:ro" \
-            --workdir /workspace \
-            --env PYTHONDONTWRITEBYTECODE=1 \
-            --env PYTHONPATH=/workspace \
-            --env QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=python \
-            qbit-prism:ci \
-            python3 -m tests.window_pipeline_parity_gate
+          docker run --rm --network none qbit-lab-prism:ci qbit-prism-server --help
+          docker run --rm --network none --cpus 1 --memory 512m \
+            qbit-lab-prism:ci qbit-prism-server benchmark \
+            --shares 32 --miners 4 --iterations 1
 
-      - name: Run payout-window parity with real Rust daemon
-        run: |
-          docker run --rm \
-            --volume "$PWD:/workspace:ro" \
-            --workdir /workspace \
-            --env PYTHONDONTWRITEBYTECODE=1 \
-            --env PYTHONPATH=/workspace \
-            --env QBIT_WINDOW_PIPELINE_PARITY_ADAPTER=rust-daemon \
-            qbit-prism:ci \
-            python3 -m tests.window_pipeline_parity_gate
+      - name: Smoke PRISM image user, core limit, and health probes
+        env:
+          PRISM_IMAGE: qbit-lab-prism:ci
+        run: bash .github/scripts/test-prism-image-runtime.sh
 
   qbit-runtime-image:
     name: Build and smoke real qbitd image
@@ -260,6 +607,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Build native target-difficulty probe
+        run: cargo build --locked -p qbit-prism-server --bin qbit-prism-server
 
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@v1

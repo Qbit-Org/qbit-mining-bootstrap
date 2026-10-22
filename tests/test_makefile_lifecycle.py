@@ -181,6 +181,77 @@ class MakefileLifecycleTests(unittest.TestCase):
                     expected,
                 )
 
+    def run_prism_signing_preflight(self, **environment: str) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            compose_env = root / "compose.env"
+            compose_env.write_text(
+                "".join(f"{name}={value}\n" for name, value in environment.items()),
+                encoding="utf-8",
+            )
+            fake_compose = root / "fake-compose"
+            fake_compose.write_text(
+                "#!/bin/sh\n"
+                'if [ "${1:-}" = config ] && [ "${2:-}" = --environment ]; then\n'
+                f"  exec cat {shlex.quote(str(compose_env))}\n"
+                "fi\n"
+                "exit 9\n",
+                encoding="utf-8",
+            )
+            fake_compose.chmod(0o755)
+            wrapper = root / "Makefile"
+            wrapper.write_text(
+                f"include {ROOT / 'Makefile'}\n\n"
+                "check-prism-signing:\n"
+                "\t@$(COMPOSE_ENV_HELPERS) $(PRISM_SIGNING_PREFLIGHT) printf 'preflight passed\\n'\n",
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                ["make", "--no-print-directory", "-s", "-f", str(wrapper),
+                 "check-prism-signing", f"COMPOSE={fake_compose}"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+    def test_prism_signing_preflight_requires_mounted_seeds_only_in_production(self) -> None:
+        key = {"PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX": "44" * 32}
+        direct = {
+            "PRISM_MANIFEST_SIGNING_SEED_HEX": "42" * 32,
+            "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32,
+        }
+        for environment in (
+            {**key, **direct},
+            {
+                **key,
+                "PRISM_MANIFEST_SIGNING_SEED_HEX_FILE": "/run/secrets/manifest",
+                "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE": "/run/secrets/ledger",
+            },
+            {**key, "QBIT_PRODUCTION": "1", "PRISM_SECRETS_SOURCE": "/srv/prism/secrets"},
+        ):
+            with self.subTest(environment=sorted(environment)):
+                result = self.run_prism_signing_preflight(**environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("preflight passed", result.stdout)
+
+        for environment, message in (
+            (
+                {**key, "PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX": "43" * 32},
+                "PRISM_MANIFEST_SIGNING_SEED_HEX or PRISM_MANIFEST_SIGNING_SEED_HEX_FILE is required",
+            ),
+            ({**key, **direct, "QBIT_PRODUCTION": "1"}, "PRISM_SECRETS_SOURCE is required"),
+            (
+                {"QBIT_CHAIN": "mainnet", "PRISM_SECRETS_SOURCE": "/srv/prism/secrets"},
+                "PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX is required",
+            ),
+        ):
+            with self.subTest(message=message):
+                result = self.run_prism_signing_preflight(**environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("preflight passed", result.stdout)
+
     def test_host_entrypoint_scripts_avoid_bash_4_case_expansion(self) -> None:
         for relative_path in (
             "scripts/check-env.sh",
@@ -211,7 +282,6 @@ class MakefileLifecycleTests(unittest.TestCase):
         bitcoin_node_extra_args: str = "",
         compose_config_fails: bool = False,
         confirm: bool = False,
-        prism_public_stratum_url: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -230,12 +300,6 @@ class MakefileLifecycleTests(unittest.TestCase):
                       printf 'QBIT_CHAIN_FLAG=%s\\n' "$FAKE_QBIT_CHAIN_FLAG"
                       printf 'BITCOIN_CHAIN=%s\\n' "$FAKE_BITCOIN_CHAIN"
                       printf 'BITCOIN_CHAIN_FLAG=%s\\n' "$FAKE_BITCOIN_CHAIN_FLAG"
-                      for key in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX; do
-                        printf '%s=%s\\n' "$key" "$FAKE_PRISM_SIGNING_KEY"
-                      done
-                      if [ "${FAKE_PRISM_PUBLIC_STRATUM_URL+x}" = x ]; then
-                        printf 'PRISM_PUBLIC_STRATUM_URL=%s\\n' "$FAKE_PRISM_PUBLIC_STRATUM_URL"
-                      fi
                       exit 0
                     fi
                     printf '%s\\n' "$*" >> "$FAKE_COMPOSE_CALL_LOG"
@@ -261,12 +325,8 @@ class MakefileLifecycleTests(unittest.TestCase):
                     "BITCOIN_CHAIN_FLAG": bitcoin_chain_flag,
                     "QBIT_NODE_EXTRA_ARG": qbit_node_extra_arg,
                     "BITCOIN_NODE_EXTRA_ARGS": bitcoin_node_extra_args,
-                    "FAKE_PRISM_SIGNING_KEY": "11" * 32,
                 }
             )
-            env.pop("FAKE_PRISM_PUBLIC_STRATUM_URL", None)
-            if prism_public_stratum_url is not None:
-                env["FAKE_PRISM_PUBLIC_STRATUM_URL"] = prism_public_stratum_url
             if confirm:
                 env["PURGE_CONFIRM"] = "delete-all-local-mining-data"
             else:
@@ -280,10 +340,6 @@ class MakefileLifecycleTests(unittest.TestCase):
                     target,
                     f"COMPOSE={fake_compose}",
                     f"COMPOSE_ALL_PROFILES={fake_compose}",
-                    f"PRODUCTION_COMPOSE={fake_compose}",
-                    # Source staging is covered separately; exercise the
-                    # target's own preflight before any service can start.
-                    "WITH_RESOLVED_QBIT=set -euo pipefail;",
                 ],
                 cwd=ROOT,
                 env=env,
@@ -293,36 +349,6 @@ class MakefileLifecycleTests(unittest.TestCase):
             )
             calls = call_log.read_text(encoding="utf-8").splitlines() if call_log.exists() else []
             return result, calls
-
-    def test_prism_start_rejects_missing_or_blank_public_stratum_url(self) -> None:
-        for production in ("0", "1"):
-            for url in (None, "", " \t "):
-                with self.subTest(production=production, url=url):
-                    result, calls = self.run_target(
-                        "up-prism-pool",
-                        qbit_production=production,
-                        prism_public_stratum_url=url,
-                    )
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("PRISM_PUBLIC_STRATUM_URL is required", result.stderr)
-                    self.assertEqual(calls, [])
-
-    def test_prism_start_with_public_stratum_url_launches_both_services(self) -> None:
-        for production, launch_flags in (
-            ("0", "up --build"),
-            ("1", "up -d --no-build --pull never"),
-        ):
-            with self.subTest(production=production):
-                result, calls = self.run_target(
-                    "up-prism-pool",
-                    qbit_production=production,
-                    prism_public_stratum_url="stratum+tcp://pool.example:3340",
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    calls,
-                    [f"--profile prism {launch_flags} qbitd prism-postgres prism-coordinator prism-public-api"],
-                )
 
     def test_down_stops_all_profiles_without_deleting_volumes(self) -> None:
         result, calls = self.run_target("down")

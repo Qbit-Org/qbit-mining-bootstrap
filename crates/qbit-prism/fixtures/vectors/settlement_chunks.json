@@ -1,0 +1,748 @@
+{
+  "cases": [
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "ok": {
+          "coinbase_settlement_output_count": 3,
+          "direct_amount_sats": 0,
+          "direct_recipient_count": 0,
+          "direct_recipients": [],
+          "fanout_amount_sats": 5000,
+          "fanout_chunk_count": 3,
+          "fanout_chunks": [
+            {
+              "amount_sats": 2000,
+              "chunk_index": 0,
+              "recipient_count": 2,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "01",
+                  "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                  "recipient_id": "dust-1"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "02",
+                  "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                  "recipient_id": "dust-2"
+                }
+              ]
+            },
+            {
+              "amount_sats": 2000,
+              "chunk_index": 1,
+              "recipient_count": 2,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "03",
+                  "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                  "recipient_id": "dust-3"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "04",
+                  "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                  "recipient_id": "dust-4"
+                }
+              ]
+            },
+            {
+              "amount_sats": 1000,
+              "chunk_index": 2,
+              "recipient_count": 1,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "05",
+                  "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                  "recipient_id": "dust-5"
+                }
+              ]
+            }
+          ],
+          "fanout_recipient_count": 5,
+          "mode": "ctv_fanout",
+          "reason": "5 recipients routed to 3 CTV fanout chunk(s) capped at 2 recipients each; 3 coinbase settlement outputs used",
+          "reserved_coinbase_output_count": 0,
+          "total_amount_sats": 5000
+        }
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 16,
+          "max_direct_coinbase_outputs": 12,
+          "max_fanout_recipients_per_transaction": 2,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 1000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "dust-1"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "dust-2"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "dust-3"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "recipient_id": "dust-4"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "05",
+            "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+            "recipient_id": "dust-5"
+          }
+        ]
+      },
+      "name": "all-sub-floor-into-bounded-chunks",
+      "topic": 7,
+      "why": "Five sub-floor recipients with at most two per fanout become three chunks, filled in canonical order."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "ok": {
+          "coinbase_settlement_output_count": 4,
+          "direct_amount_sats": 90000,
+          "direct_recipient_count": 2,
+          "direct_recipients": [
+            {
+              "amount_sats": 50000,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "direct-a"
+            },
+            {
+              "amount_sats": 40000,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "direct-b"
+            }
+          ],
+          "fanout_amount_sats": 39000,
+          "fanout_chunk_count": 2,
+          "fanout_chunks": [
+            {
+              "amount_sats": 35000,
+              "chunk_index": 0,
+              "recipient_count": 2,
+              "recipients": [
+                {
+                  "amount_sats": 30000,
+                  "order_key": "03",
+                  "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                  "recipient_id": "overflow"
+                },
+                {
+                  "amount_sats": 5000,
+                  "order_key": "04",
+                  "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                  "recipient_id": "dust-a"
+                }
+              ]
+            },
+            {
+              "amount_sats": 4000,
+              "chunk_index": 1,
+              "recipient_count": 1,
+              "recipients": [
+                {
+                  "amount_sats": 4000,
+                  "order_key": "05",
+                  "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                  "recipient_id": "dust-b"
+                }
+              ]
+            }
+          ],
+          "fanout_recipient_count": 3,
+          "mode": "hybrid_coinbase_ctv_fanout",
+          "reason": "2 recipients paid directly by largest-liability priority; 3 recipients routed to 2 CTV fanout chunk(s); 4 of 500 coinbase settlement outputs used",
+          "reserved_coinbase_output_count": 0,
+          "total_amount_sats": 129000
+        }
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 500,
+          "max_direct_coinbase_outputs": 2,
+          "max_fanout_recipients_per_transaction": 2,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 4000,
+            "order_key": "05",
+            "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+            "recipient_id": "dust-b"
+          },
+          {
+            "amount_sats": 40000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "direct-b"
+          },
+          {
+            "amount_sats": 30000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "overflow"
+          },
+          {
+            "amount_sats": 50000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "direct-a"
+          },
+          {
+            "amount_sats": 5000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "recipient_id": "dust-a"
+          }
+        ]
+      },
+      "name": "hybrid-largest-direct-and-chunks",
+      "topic": 7,
+      "why": "Two direct slots go to the largest floor-crossing liabilities; the overflow above the floor and the dust are chunked."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "ok": {
+          "coinbase_settlement_output_count": 3,
+          "direct_amount_sats": 40001,
+          "direct_recipient_count": 2,
+          "direct_recipients": [
+            {
+              "amount_sats": 20000,
+              "order_key": "02",
+              "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+              "recipient_id": "at"
+            },
+            {
+              "amount_sats": 20001,
+              "order_key": "03",
+              "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+              "recipient_id": "above"
+            }
+          ],
+          "fanout_amount_sats": 19999,
+          "fanout_chunk_count": 1,
+          "fanout_chunks": [
+            {
+              "amount_sats": 19999,
+              "chunk_index": 0,
+              "recipient_count": 1,
+              "recipients": [
+                {
+                  "amount_sats": 19999,
+                  "order_key": "01",
+                  "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                  "recipient_id": "below"
+                }
+              ]
+            }
+          ],
+          "fanout_recipient_count": 1,
+          "mode": "hybrid_coinbase_ctv_fanout",
+          "reason": "2 recipients paid directly by largest-liability priority; 1 recipients routed to 1 CTV fanout chunk(s); 3 of 500 coinbase settlement outputs used",
+          "reserved_coinbase_output_count": 0,
+          "total_amount_sats": 60000
+        }
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 500,
+          "max_direct_coinbase_outputs": 10,
+          "max_fanout_recipients_per_transaction": 10,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 19999,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "below"
+          },
+          {
+            "amount_sats": 20000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "at"
+          },
+          {
+            "amount_sats": 20001,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "above"
+          }
+        ]
+      },
+      "name": "direct-floor-boundary",
+      "topic": 7,
+      "why": "One sat under the direct floor routes to fanout; exactly at and above it are direct."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "ok": {
+          "coinbase_settlement_output_count": 3,
+          "direct_amount_sats": 0,
+          "direct_recipient_count": 0,
+          "direct_recipients": [],
+          "fanout_amount_sats": 6000,
+          "fanout_chunk_count": 3,
+          "fanout_chunks": [
+            {
+              "amount_sats": 2000,
+              "chunk_index": 0,
+              "recipient_count": 2,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "01",
+                  "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                  "recipient_id": "dust-1"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "02",
+                  "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                  "recipient_id": "dust-2"
+                }
+              ]
+            },
+            {
+              "amount_sats": 2000,
+              "chunk_index": 1,
+              "recipient_count": 2,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "03",
+                  "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                  "recipient_id": "dust-3"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "04",
+                  "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+                  "recipient_id": "dust-4"
+                }
+              ]
+            },
+            {
+              "amount_sats": 2000,
+              "chunk_index": 2,
+              "recipient_count": 2,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "05",
+                  "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+                  "recipient_id": "dust-5"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "06",
+                  "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+                  "recipient_id": "dust-6"
+                }
+              ]
+            }
+          ],
+          "fanout_recipient_count": 6,
+          "mode": "ctv_fanout",
+          "reason": "6 recipients routed to 3 CTV fanout chunk(s) capped at 2 recipients each; 3 coinbase settlement outputs used",
+          "reserved_coinbase_output_count": 0,
+          "total_amount_sats": 6000
+        }
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 3,
+          "max_direct_coinbase_outputs": 0,
+          "max_fanout_recipients_per_transaction": 2,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 1000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "dust-1"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "dust-2"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "dust-3"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "recipient_id": "dust-4"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "05",
+            "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+            "recipient_id": "dust-5"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "06",
+            "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+            "recipient_id": "dust-6"
+          }
+        ]
+      },
+      "name": "chunks-at-the-output-cap",
+      "topic": 7,
+      "why": "Six sub-floor recipients at two per chunk need exactly the three-output coinbase budget."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "error": "cannot select a settlement mode: recipient partition requires more than 3 coinbase settlement outputs"
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 3,
+          "max_direct_coinbase_outputs": 0,
+          "max_fanout_recipients_per_transaction": 2,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 1000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "dust-1"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "dust-2"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "dust-3"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "04",
+            "p2mr_program_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "recipient_id": "dust-4"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "05",
+            "p2mr_program_hex": "0505050505050505050505050505050505050505050505050505050505050505",
+            "recipient_id": "dust-5"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "06",
+            "p2mr_program_hex": "0606060606060606060606060606060606060606060606060606060606060606",
+            "recipient_id": "dust-6"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "07",
+            "p2mr_program_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+            "recipient_id": "dust-7"
+          }
+        ]
+      },
+      "name": "chunks-one-over-the-output-cap-is-an-error",
+      "topic": 7,
+      "why": "A seventh recipient needs a fourth chunk, one more than the three-output budget."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "ok": {
+          "coinbase_settlement_output_count": 1,
+          "direct_amount_sats": 0,
+          "direct_recipient_count": 0,
+          "direct_recipients": [],
+          "fanout_amount_sats": 3000,
+          "fanout_chunk_count": 1,
+          "fanout_chunks": [
+            {
+              "amount_sats": 3000,
+              "chunk_index": 0,
+              "recipient_count": 3,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "01",
+                  "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+                  "recipient_id": "dust-1"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "02",
+                  "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                  "recipient_id": "dust-2"
+                },
+                {
+                  "amount_sats": 1000,
+                  "order_key": "03",
+                  "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+                  "recipient_id": "dust-3"
+                }
+              ]
+            }
+          ],
+          "fanout_recipient_count": 3,
+          "mode": "ctv_fanout",
+          "reason": "3 recipients routed to 1 CTV fanout chunk(s) capped at 1160 recipients each; 1 coinbase settlement outputs used",
+          "reserved_coinbase_output_count": 0,
+          "total_amount_sats": 3000
+        }
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 16,
+          "max_direct_coinbase_outputs": 12,
+          "max_fanout_recipients_per_transaction": 1160,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 1000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "dust-1"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "dust-2"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "dust-3"
+          }
+        ]
+      },
+      "name": "fanout-size-at-the-truc-cap",
+      "topic": 7,
+      "why": "1160 recipients per fanout (49973 weight bytes) is the largest chunk size under the 50000-byte TRUC limit."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "error": "cannot select a settlement mode: max_fanout_recipients_per_transaction must be <= 1160"
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 16,
+          "max_direct_coinbase_outputs": 12,
+          "max_fanout_recipients_per_transaction": 1161,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": null,
+        "recipients": [
+          {
+            "amount_sats": 1000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "dust-1"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "dust-2"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "03",
+            "p2mr_program_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "recipient_id": "dust-3"
+          }
+        ]
+      },
+      "name": "fanout-size-one-over-the-truc-cap-is-an-error",
+      "topic": 7,
+      "why": "1161 recipients per fanout exceeds the per-transaction maximum."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "ok": {
+          "coinbase_settlement_output_count": 3,
+          "direct_amount_sats": 30025,
+          "direct_recipient_count": 2,
+          "direct_recipients": [
+            {
+              "amount_sats": 30000,
+              "order_key": "01",
+              "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+              "recipient_id": "miner-a"
+            },
+            {
+              "amount_sats": 25,
+              "order_key": "ff",
+              "p2mr_program_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              "recipient_id": "pool-fee"
+            }
+          ],
+          "fanout_amount_sats": 1000,
+          "fanout_chunk_count": 1,
+          "fanout_chunks": [
+            {
+              "amount_sats": 1000,
+              "chunk_index": 0,
+              "recipient_count": 1,
+              "recipients": [
+                {
+                  "amount_sats": 1000,
+                  "order_key": "02",
+                  "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+                  "recipient_id": "miner-b"
+                }
+              ]
+            }
+          ],
+          "fanout_recipient_count": 1,
+          "mode": "hybrid_coinbase_ctv_fanout",
+          "reason": "2 recipients paid directly by largest-liability priority; 1 recipients routed to 1 CTV fanout chunk(s); 3 of 500 coinbase settlement outputs used; 1 direct settlement slot(s) pinned by the coinbase output policy",
+          "reserved_coinbase_output_count": 0,
+          "total_amount_sats": 31025
+        }
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 500,
+          "max_direct_coinbase_outputs": 2,
+          "max_fanout_recipients_per_transaction": 1000,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": {
+          "amount_sats": 25,
+          "order_key": "ff",
+          "p2mr_program_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "recipient_id": "pool-fee"
+        },
+        "recipients": [
+          {
+            "amount_sats": 30000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "miner-a"
+          },
+          {
+            "amount_sats": 1000,
+            "order_key": "02",
+            "p2mr_program_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+            "recipient_id": "miner-b"
+          },
+          {
+            "amount_sats": 25,
+            "order_key": "ff",
+            "p2mr_program_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "recipient_id": "pool-fee"
+          }
+        ]
+      },
+      "name": "pinned-direct-below-floor",
+      "topic": 7,
+      "why": "A 25-sat pinned pool fee is settled directly, takes one of the two direct slots, and never enters a fanout chunk."
+    },
+    {
+      "entry_point": "select_settlement_mode",
+      "expected": {
+        "error": "cannot select a settlement mode: pinned direct recipient requires max_direct_coinbase_outputs >= 1"
+      },
+      "input": {
+        "config": {
+          "max_coinbase_settlement_outputs": 500,
+          "max_direct_coinbase_outputs": 0,
+          "max_fanout_recipients_per_transaction": 1000,
+          "reserved_coinbase_outputs": 0
+        },
+        "direct_floor_sats": 20000,
+        "pinned_direct": {
+          "amount_sats": 25,
+          "order_key": "ff",
+          "p2mr_program_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "recipient_id": "pool-fee"
+        },
+        "recipients": [
+          {
+            "amount_sats": 30000,
+            "order_key": "01",
+            "p2mr_program_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+            "recipient_id": "miner-a"
+          },
+          {
+            "amount_sats": 25,
+            "order_key": "ff",
+            "p2mr_program_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "recipient_id": "pool-fee"
+          }
+        ]
+      },
+      "name": "pinned-direct-without-a-direct-slot-is-an-error",
+      "topic": 7,
+      "why": "A pinned recipient needs max_direct_coinbase_outputs of at least one."
+    }
+  ],
+  "produced_by": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 crates/qbit-prism/examples/export_rule_decisions.py | cargo run --locked -q -p qbit-prism --example export_money_path_vectors -- vectors-out",
+  "schema": "qbit.prism.money-path-vectors.v1",
+  "source_commit": "504846cc0b72e8f86ed17f896d4ccbbe196a31dc",
+  "topics": [
+    {
+      "id": 7,
+      "name": "CTV chunk splits"
+    }
+  ]
+}

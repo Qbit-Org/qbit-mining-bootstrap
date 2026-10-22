@@ -25,10 +25,6 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 IMAGE = "qbit-runtime-smoke-fixture:test"
 GENESIS_HASH = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
 
-sys.path.insert(0, str(ROOT))
-
-from lab.prism.block_candidates import _collapse_scaled_difficulty  # noqa: E402
-from lab.prism.template_artifacts import scaled_network_difficulty  # noqa: E402
 
 
 # A stand-in for the docker CLI covering exactly the subcommands the smoke
@@ -211,6 +207,13 @@ sys.exit(main(sys.argv[1:]))
 
 
 class QbitImageRuntimeSmokeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        subprocess.run(
+            ["cargo", "build", "--locked", "-p", "qbit-prism-server", "--bin", "qbit-prism-server"],
+            cwd=ROOT, check=True, capture_output=True, text=True,
+        )
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -278,8 +281,7 @@ class QbitImageRuntimeSmokeTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("qbit runtime image smoke: PASS", result.stdout)
-        expected = _collapse_scaled_difficulty("207fffff")
-        self.assertIsNotNone(expected)
+        expected = 1_000_000
         self.assertIn(
             f"bits 207fffff scaled difficulty {expected}",
             result.stdout,
@@ -313,9 +315,8 @@ class QbitImageRuntimeSmokeTests(unittest.TestCase):
         result = self.run_smoke(bits="1b0404cb")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        expected = scaled_network_difficulty("1b0404cb")
+        expected = 35020450001492753689
         self.assertGreater(expected, 2**63)
-        self.assertEqual(expected, _collapse_scaled_difficulty("1b0404cb"))
         self.assertIn(f"bits 1b0404cb scaled difficulty {expected}", result.stdout)
 
     def test_smoke_fails_when_header_bits_are_too_short(self) -> None:
@@ -349,9 +350,8 @@ class QbitImageRuntimeSmokeTests(unittest.TestCase):
         # which is exactly the shape collapse fails its page closed on.
         result = self.run_smoke(bits="00000000")
 
-        self.assertIsNone(_collapse_scaled_difficulty("00000000"))
         self.assert_smoke_failed(result, "did not derive PRISM's scaled difficulty")
-        self.assertIn("collapse rejected the compact bits", result.stderr)
+        self.assertIn("negative or zero compact target", result.stderr)
 
     def test_smoke_fails_when_best_block_hash_is_not_a_block_hash(self) -> None:
         self.assert_smoke_failed(
@@ -418,26 +418,15 @@ class QbitImageRuntimeSmokeSourceTests(unittest.TestCase):
             self.script,
         )
 
-    def test_scaled_difficulty_comes_from_the_production_helpers(self) -> None:
-        self.assertIn(
-            "from lab.prism.block_candidates import _collapse_scaled_difficulty",
-            self.script,
-        )
-        self.assertIn(
-            "from lab.prism.template_artifacts import scaled_network_difficulty",
-            self.script,
-        )
-        # The scale and the powLimit belong to the production helpers. A copy
-        # of either here could drift away from collapse with no test noticing.
-        for constant in ("1000000", "1_000_000", "207fffff"):
-            with self.subTest(constant=constant):
-                self.assertNotIn(constant, self.script)
+    def test_scaled_difficulty_comes_from_the_native_runtime(self) -> None:
+        self.assertIn('header-difficulty --bits "${bits}"', self.script)
+        self.assertNotIn("lab.prism", self.script)
 
-    def test_ci_runs_the_smoke_with_an_interpreter_for_the_helpers(self) -> None:
+    def test_ci_builds_the_native_header_probe(self) -> None:
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         job = workflow.split("Build and smoke real qbitd image", 1)[1]
         self.assertIn("bash .github/scripts/test-qbit-image-runtime.sh", job)
-        self.assertIn("uses: actions/setup-python@v6", job)
+        self.assertIn("cargo build --locked -p qbit-prism-server --bin qbit-prism-server", job)
 
 
 if __name__ == "__main__":

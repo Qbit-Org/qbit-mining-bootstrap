@@ -1,8 +1,16 @@
 # PRISM Postgres read replica
 
-`prism-public-api` — the public dashboard and audit read tier extracted from
-the coordinator in issue #145 — answers from a hot standby, not from the
-coordinator's primary. This document covers how that standby is provisioned in
+For two mining frontends, the operator TCP load-balancer contract and the approved
+D3 promotion/ACK policy, see the [HA reference architecture](prism-ha-reference-architecture.md).
+D3 selects one primary plus one **dedicated asynchronous failover standby**,
+separate from this public-read replica. ACKs require local WAL durability without
+waiting for the standby; primary loss can lose the replication gap. The bundled
+public-read replica does not provision the dedicated HA standby.
+
+`prism-public-api` runs `qbit-prism-server public-api` and serves public reads
+from a hot standby in the default Compose topology. The native process uses a
+separate SQL pool, requires no signing keys, and serves canonical audit bytes
+from PostgreSQL without an artifact filesystem mount. This document covers how that standby is provisioned in
 compose, what a production deployment has to do by hand instead, and how to
 operate the replication slot it depends on.
 
@@ -94,22 +102,11 @@ connection from host ...`.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `PRISM_POSTGRES_REPLICATION_SLOT` | `prism_public_replica` | Physical slot the standby creates and streams through. |
-| `PRISM_POSTGRES_REPLICA_DATA_SOURCE` | `prism-postgres-replica-data` | Volume or host path backing the standby's data directory. Release-provenance validation requires an absolute host path that neither overlaps nor aliases any other enabled state source (including ancestors, descendants and symlinks). Pre-create it before production startup. |
-| `PRISM_PUBLIC_DATABASE_URL` | Empty (derived by the public service) | Read-only DSN `prism-public-api` uses. Empty builds a URL for `prism-postgres-replica:5432` using `PRISM_POSTGRES_USER`, `PRISM_POSTGRES_PASSWORD`, and `PRISM_POSTGRES_DB`. An explicit URL overrides that default. Compose passes an explicit URL as `PRISM_DATABASE_URL`; otherwise the public service percent-encodes the separate credentials when constructing its URL. The coordinator keeps its separate primary DSN. |
-| `PRISM_PUBLIC_PSQL_COMMAND` | Empty | Optional command for the public psql backend. Compose passes it as `PRISM_POSTGRES_PSQL_COMMAND` only to the public service; empty derives `psql` from `PRISM_PUBLIC_DATABASE_URL`. The coordinator keeps its own `PRISM_POSTGRES_PSQL_COMMAND`. |
+| `PRISM_POSTGRES_REPLICA_DATA_SOURCE` | `prism-postgres-replica-data` | Volume or host path backing the standby's data directory. |
+| `PRISM_PUBLIC_DATABASE_URL` | `postgresql://qbit:change-this@prism-postgres-replica:5432/qbit` | Read-only DSN `prism-public-api` uses. Compose passes it into the container as `PRISM_DATABASE_URL`; it is a separate operator knob because `PRISM_DATABASE_URL` names the primary, which the coordinator needs it to. |
+| `PRISM_PUBLIC_POSTGRES_PASSWORD` | Empty | Optional dedicated public-reader password, passed by Compose as `PGPASSWORD`. Used when the public DSN omits its password; never defaults to `PRISM_POSTGRES_PASSWORD`. |
 | `PRISM_PUBLIC_REPLICA_MODE` | `require` in compose, `off` in code | `require` refuses replica-backed routes unless the backing server is in recovery with a live replication stream. `off` serves whatever the DSN names — the behaviour before a standby existed. |
 | `PRISM_PUBLIC_REPLICA_MAX_LAG_SECONDS` | `60` | How long the standby's replication stream may be silent before its answers stop counting as current. |
-
-Leave `PRISM_PUBLIC_DATABASE_URL` empty for the built-in standby so the public
-connection follows the configured Postgres credentials. For an external standby
-or separate read credentials, set the full URL explicitly and update it when
-those credentials change.
-
-With `PRISM_POSTGRES_NATIVE_CLIENT=psql`, the public service must still connect
-to the standby. Leave `PRISM_PUBLIC_PSQL_COMMAND` empty to use the public DSN,
-or set a separate command that reaches the replica if a wrapper or extra psql
-arguments are required. The coordinator's primary command is never inherited
-by the public service.
 
 `PRISM_PUBLIC_REPLICA_MODE` defaults to `off` in the code and `require` in the
 shipped compose. That split is deliberate: merging the replica work must not
@@ -117,6 +114,137 @@ shipped compose. That split is deliberate: merging the replica work must not
 the stack up from this repository's compose gets the enforced contract without
 having to opt in. Cut over by provisioning the standby, pointing
 `PRISM_PUBLIC_DATABASE_URL` at it, and then setting `require`.
+
+### Public-reader credentials
+
+For a dedicated reader, set `PRISM_PUBLIC_DATABASE_URL` to that role's complete
+DSN, including its own password (percent-encode reserved URL characters):
+
+```dotenv
+PRISM_PUBLIC_DATABASE_URL=postgresql://prism_reader:<encoded-reader-password>@standby.internal:5432/qbit?sslmode=verify-full
+```
+
+Alternatively, omit the password from the DSN and set
+`PRISM_PUBLIC_POSTGRES_PASSWORD` to the reader's raw password. In `.env` files,
+single-quote that value so Compose preserves dollar signs and comment characters
+literally; do not percent-encode this separate carrier. For example, these
+synthetic values preserve the password `reader$literal #:@/383`:
+
+```dotenv
+PRISM_PUBLIC_DATABASE_URL=postgresql://prism_reader@standby.internal:5432/qbit?sslmode=verify-full
+PRISM_PUBLIC_POSTGRES_PASSWORD='reader$literal #:@/383'
+```
+
+If the password contains a single quote, use the percent-encoded DSN form above
+so the `.env` file also remains valid for the shell-based preflight scripts.
+Set the passwordless reader DSN as well: the carrier alone does not select a
+reader role, and a default DSN with an embedded bootstrap password still takes
+precedence.
+Compose maps these two settings to `PRISM_DATABASE_URL` and `PGPASSWORD` inside
+`prism-public-api`.
+The native SQLx driver loads PostgreSQL environment defaults before applying
+the DSN; a DSN password takes precedence over `PGPASSWORD`. The public process
+receives no extra bootstrap password, even when production, external-database
+or HA overlays are applied. Keep reader and bootstrap passwords distinct.
+
+Create the reader on the primary so the role and grants reach its physical
+standby. Grant `CONNECT` on the database, `USAGE` on the application schema and
+`SELECT` on the tables used by the public read models. It must not own the
+database or tables, inherit a writer role, or have superuser, replication,
+create-role or create-database privileges. Reconcile read grants when migrations
+add public tables. In `require` mode it also needs `pg_read_all_stats` so the
+readiness probe can see `pg_stat_wal_receiver.last_msg_receipt_time`; this
+monitoring grant does not permit replication or application writes. Role
+provisioning remains an operator task.
+
+With password authentication required by PostgreSQL, an omitted, empty or
+incorrect reader password leaves `/healthz` unready with an authentication
+error; database-backed public reads return 503 and
+`qbit-prism-server healthcheck --public-api` exits unsuccessfully. The listener
+stays up to report the failure and retry its readiness probe. It does not borrow
+`PRISM_POSTGRES_PASSWORD`. The HTTP healthcheck needs no database password of
+its own. Non-database public metadata can still be served while unready.
+
+Compatibility: an unset or empty `PRISM_PUBLIC_DATABASE_URL` retains the base
+Compose lab DSN with the bootstrap password embedded; the external-database
+overlay instead retains its fallback to `PRISM_DATABASE_URL` and replica mode
+`off`. These defaults do not provide a dedicated-reader boundary. For an
+external fallback DSN without a password, explicitly supply the intended
+public credential with `PRISM_PUBLIC_POSTGRES_PASSWORD`. The former implicit
+bootstrap `PGPASSWORD` is no longer supplied. A direct binary or `docker run`
+invocation still uses `PRISM_DATABASE_URL` and SQLx's native PostgreSQL settings;
+the `PRISM_PUBLIC_*` credential names above are Compose inputs only. Supply only
+reader credentials to that process, including any `PGPASSWORD` or password file.
+The shipped Compose service sets `PGPASSWORD` to empty when its reader carrier
+is unset, so it does not select a password file as an implicit replacement.
+
+#### Preflight and production policy
+
+`public-api` and `check-public-database-config` use the same SQLx options parser
+and production policy. The existing `DatabaseConfig` contract rejects the
+`change-this` marker anywhere in a production DSN. Public-reader validation also
+rejects that marker in the **effective decoded password**, including a URI or
+query password, `PGPASSWORD`, or a native SQLx password-file entry. An unused
+carrier does not override or invalidate an explicit non-default DSN password.
+The `qbit` role name is permitted; the lab password remains permitted outside
+production. This is a default-credential check, not a password-strength or
+database-role privilege check.
+
+Production is selected by the public process's `QBIT_PRODUCTION`,
+`QBIT_TOOLS_PRODUCTION`, or a `QBIT_CHAIN` of `main`/`mainnet`, following
+`DatabaseConfig`. A missing, empty, malformed, unsupported-scheme, or invalid
+SQLx-options **effective DSN** fails before connecting or opening the listener,
+with a value-free configuration error. Missing, empty, or incorrect **passwords**
+are not rejected solely for their absence: PostgreSQL may use another supported
+authentication mechanism. Password authentication failures remain readiness
+failures as described above. Validation neither connects to PostgreSQL nor
+proves authentication, grants, schema availability, or replication health.
+
+`scripts/check-env.sh` now runs this native validator for the Prism lane through
+the selected Compose public service, using the image and effective environment
+that deployment will use. `make doctor` and `make up-prism-pool` prepare tagged
+lab images before validation, including rebuilding an older image that lacks
+the validator. Production and digest-pinned artifacts must be pulled explicitly
+before doctor, following the mainnet runbook. The standalone script likewise
+requires a prepared image. The check starts no service dependencies and publishes no ports;
+its one-shot container is removed on exit. A missing/old image or failed
+launcher is a failed preflight, never a passing or skipped credential check.
+For Make entry points, use the same additional overlays in deployment order:
+
+```sh
+export COMPOSE_OVERLAY_FILES="compose.prism-external-db.yaml compose.prism-ha.yaml"
+MINING_LANES=prism make doctor
+make up-prism-pool
+```
+
+Make inserts `compose.production.yaml` before these overlays when either
+production flag or the main chain selects production. Set
+`PRISM_COMPOSE_SERVICES="qbitd prism-coordinator prism-coordinator-2 prism-public-api"`
+to start both HA frontends. Database dependencies follow the selected overlay.
+For standalone preflight, pass every overlay explicitly, for example from the
+repository root (relative `--compose-file` paths use the caller's directory):
+
+```sh
+DEPLOY_ENV_FILE=/absolute/path/deployment.env bash scripts/check-env.sh \
+  --compose-file compose.production.yaml \
+  --compose-file compose.prism-external-db.yaml \
+  --compose-file compose.prism-ha.yaml
+```
+
+`--public-reader-only` runs just this credential configuration preflight; it
+does not replace the other deployment checks. The preflight preserves Compose's
+environment precedence, explicit empty overrides, and base/external DSN
+fallbacks, without sourcing shell example defaults into the container. It
+uses only the public service's reader carrier and does not add a bootstrap or
+writer password. For direct binary execution, export the reader's
+`PRISM_DATABASE_URL` and, if needed, its `PGPASSWORD` or `PGPASSFILE`, then run
+`qbit-prism-server check-public-database-config` before `public-api`.
+Parser warnings are suppressed because they can contain configuration values.
+When a native password file does not authenticate, check its existence,
+ownership, restrictive permissions, and matching reader entry locally without
+printing its contents. Authentication tests require a disposable PostgreSQL
+fixture with password authentication enabled; a trust-auth fixture cannot
+exercise rejected passwords.
 
 ### What the bound actually bounds
 
@@ -144,8 +272,8 @@ rather than an indefinite 200.
 Routes that read no replica state are not gated — today that is
 `/public/v1/mining-configuration`, assembled from environment, and the
 content-addressed `/public/v1/artifacts/{sha256}`, whose body either hashes to
-the requested digest or does not. The classification comes from
-`lab/prism/endpoint_registry.py`, not a hand-kept list.
+the requested digest or does not. The native route classification preserves these two freshness-independent
+responses; artifact bytes still undergo content-hash verification.
 | `PRISM_POSTGRES_REPLICA_BASEBACKUP_ATTEMPTS` | `60` | Bootstrap retry budget. |
 | `PRISM_POSTGRES_REPLICA_BASEBACKUP_RETRY_SECONDS` | `5` | Delay between bootstrap attempts. |
 
@@ -233,18 +361,22 @@ path for a slot invalidated with `wal_status = 'lost'`.
 
 ## Failover semantics
 
-The replica is a **read scaling tier, not a failover target**.
+The supplied public replica provides read scaling. Its default asynchronous
+replication does not guarantee preservation of acknowledged shares after loss
+of the primary. No cluster manager or automatic promotion is configured by
+these Compose files.
 
-- It is read-only. Writes fail with `cannot execute INSERT in a read-only
-  transaction`.
-- There is **no automated promotion anywhere in this repository** — no
-  `pg_promote` call, no `promote_trigger_file`, no cluster manager. A standby
-  only becomes writable if an operator promotes it by hand.
-- Promotion is not a supported operation for this standby. The coordinator's
-  writer lease, ledger attestation, and audit invariants are all defined
-  against the primary; promoting the read replica does not produce a valid
-  PRISM primary. Losing the primary is a primary-restore problem, and
-  `docs/prism-ledger-ops.md` is the relevant runbook.
-- Because promotion is out of scope, the standby's healthcheck fails when
-  `pg_is_in_recovery()` stops returning `t`. A promoted standby is a
-  misconfiguration, and it is meant to be loud.
+Native mining frontends can recover through a stable HA writer endpoint after
+promotion of the eligible dedicated standby. Follow the approved async D3
+policy, fencing and reconciliation in the [HA reference architecture](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint);
+acknowledged shares absent from the promoted replica can be lost. Preserve the
+signing configuration and reconcile the surviving accounting history; there is
+no application writer lease to elect. The [HA migration guide](prism-rust-migration.md#ha-durability-and-failover)
+also describes the distinct requirements for a no-loss policy, which D3 does not select.
+
+A public process configured with `PRISM_PUBLIC_REPLICA_MODE=require` refuses a
+server after it is promoted: it is now a writer rather than the required
+standby. Repoint the public read endpoint at the separate public-read replica, or
+explicitly use `off` to serve bounded reads from the new primary. Keep mining
+and settlement connections on the authoritative writer endpoint, and keep public
+queries off the dedicated HA standby.

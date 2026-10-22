@@ -336,7 +336,7 @@ Practical starting point:
 
 - Start your initial share difficulty at roughly one tenth of your Bitcoin default
 - Use `CKPOOL_MINDIFF`, `CKPOOL_STARTDIFF`, and optionally `CKPOOL_MAXDIFF` to bound ckpool vardiff behavior
-- For direct PRISM Stratum, keep the idle sweep enabled so a miner that receives too-hard work and produces no submitted or accepted shares can still step down after `PRISM_STRATUM_VARDIFF_RETARGET_SECONDS`; the sweep cadence is `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS`, and `0` disables it.
+- For direct PRISM Stratum, each session re-evaluates vardiff on its own one-second timer, so a miner that receives too-hard work and produces no submitted or accepted shares still steps down after `PRISM_STRATUM_VARDIFF_RETARGET_SECONDS`, by at most `PRISM_STRATUM_VARDIFF_MAX_STEP_DOWN` per retarget; the native server has no separate idle-sweep setting.
 - Document a lower floor for small solo miners so shares do not become too sparse
 - Keep `CKPOOL_PUBLIC_DIFF_POLICY=explicit` for signet/mainnet-style deployments so startup fails before serving miners when policy values are missing
 

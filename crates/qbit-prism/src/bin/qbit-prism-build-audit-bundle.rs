@@ -576,7 +576,11 @@ fn serve_requests(
         let bundle = match bundle_result {
             Ok(bundle) => bundle,
             Err(error) => {
-                respond_error(&stdout, &format!("audit bundle build failed: {error}"), false)?;
+                respond_error(
+                    &stdout,
+                    &format!("audit bundle build failed: {error}"),
+                    false,
+                )?;
                 continue;
             }
         };
@@ -682,7 +686,11 @@ fn serve_prepare_window(
     match request.mode.as_deref() {
         Some("full") => {
             let Some(window_weight) = request.window_weight else {
-                respond_error(stdout, "prepare_window full carries no window_weight", false)?;
+                respond_error(
+                    stdout,
+                    "prepare_window full carries no window_weight",
+                    false,
+                )?;
                 return Ok(());
             };
             let page_size = request.page_size.unwrap_or(DEFAULT_WINDOW_PAGE_SIZE);
@@ -773,7 +781,11 @@ fn serve_prepare_window(
         }
         Some("advance") => {
             let Some(base_digest) = request.base_digest else {
-                respond_error(stdout, "prepare_window advance carries no base_digest", false)?;
+                respond_error(
+                    stdout,
+                    "prepare_window advance carries no base_digest",
+                    false,
+                )?;
                 return Ok(());
             };
             let position = window_cache.iter().position(|(key, state)| {

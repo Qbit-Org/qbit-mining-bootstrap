@@ -1,320 +1,425 @@
-# PRISM Storage and VM Sizing
+# PRISM Storage and Resource Planning
 
-This document sizes the PRISM pool storage footprint for operator planning. It
-separates hot Postgres, audit artifacts, qbit/Bitcoin chain data, Docker
-overhead, WAL, and backups because those are different capacity problems.
+Native Prism keeps the canonical ledger, block accounting, audit metadata,
+normalized audit snapshots, and CTV recovery state in PostgreSQL. Multiple
+frontends use this shared database; new accepted-block audits do not require a
+shared local filesystem.
 
-## Scope
+## What is retained
 
-PRISM stores permanent accounting data in Postgres and writes public audit
-artifacts under `PRISM_AUDIT_DIR`.
+| Data | Storage and lifetime |
+| --- | --- |
+| Accepted shares | Immutable PostgreSQL rows, never updated, deleted or truncated. Online while the share is inside the online horizon, then archived outside PostgreSQL one whole partition at a time and the partition dropped |
+| Proof identity (`qbit_prism_share_hashes`) | Permanent immutable PostgreSQL rows, one per share, about 150 B each. Not partitioned and never removed: it is the global `share_id` authority the append path consults first |
+| Blocks, payouts, carry-forward, maturity/reorg state | Permanent PostgreSQL accounting history |
+| Native audit share snapshots | Permanent range/count/anchor/digest metadata referencing immutable shares |
+| Native audit bodies | Non-share JSON plus snapshot reference in PostgreSQL: the logical bundle minus its top-level `shares` and minus `reward_manifest.shares`, both rebuilt on read. Rows landed before 3.x.x #267 still hold `reward_manifest.shares` and stay readable as they are. Before the shares a body depends on are archived, the body is sealed: its full canonical artifact is stored in `canonical_audit_bytes` and served from there instead of being rebuilt, which costs the artifact size back per archived block, about 22 MB at a 20,000-share window and about 111 MB at 100,000 (`audit_body_byte_len` in the table below), TOAST-compressed in the column |
+| Imported legacy audits | Digest-checked canonical bytes (bytea) plus non-share metadata in PostgreSQL; an inline body survives only on inline-only rows; original backup retained |
+| CTV manifests, transactions, outcomes | Durable PostgreSQL recovery and audit state |
+| CPFP funding reservations and signed child packages | Durable recovery records; retain until reconciled |
+| Pending block candidates and deferred credit | Durable until resolved; retained identity/status afterward |
+| Jobs and prepared snapshots | Expiring shared records for reconnect/job recovery |
+| Per-process HTTP caches and socket state | Reconstructible memory |
+| qbit/Bitcoin chain data | Separate node storage, sized independently |
 
-Base Compose uses named volumes for local development:
+Accepted ledger rows cannot be updated, deleted, or truncated. Native audits
+reconstruct their exact share slice from those rows, rebuild the counted-share
+window of `reward_manifest` from that slice (the stored header must match the
+rebuilt one field for field), and verify the snapshot digest and the canonical
+bundle hash of the whole body. Overlapping windows therefore share ledger
+storage instead of embedding another copy of every share in every
+accepted-block audit.
 
-- `prism-postgres-data` at `/var/lib/postgresql/data`
-- `prism-postgres-wal` at `/var/lib/postgresql/wal`
-- `prism-audit-data` at `/var/lib/qbit-prism/audit`
-- `qbit-data` at `/var/lib/qbit`
+Retention of that history is detach-and-archive, never deletion. There is no
+row-level prune or share-compaction command, and no `DELETE` runs on the
+ledger. `qbit-prism-server share-archive` retires a whole partition once no
+online reader can still need it: seal the audits that depend on it, write the
+partition to an archive outside PostgreSQL, verify the archive against the live
+rows, detach, and only then drop the detached relation, with the archive as the
+copy of record from then on. Size and retain that archive as accounting data,
+not as a cache. The procedure, the online horizon it checks and the archive
+format are in
+[ledger operations](prism-ledger-ops.md#share-ledger-partitions-and-retention).
 
-Production Compose replaces these with pre-created absolute bind mounts supplied
-through `PRISM_POSTGRES_DATA_SOURCE`, `PRISM_POSTGRES_WAL_SOURCE`,
-`PRISM_AUDIT_DATA_SOURCE`, and `QBIT_DATA_SOURCE`. The data and live WAL sources
-must be distinct paths and should be monitored as separate capacity boundaries.
+### Archived share partitions
 
-The current production storage target is:
+A partition at the default width holds 2^24 = 16,777,216 rows, about 7.5 GB of
+heap plus about 20 GB of indexes at the production row shape. Archiving it
+writes newline-delimited canonical JSON, one object per ledger row with every
+column, gzipped. Uncompressed that JSON is larger than the heap it came from,
+since numerics and timestamps become decimal strings and the program becomes
+hex; gzip on rows of this shape should recover roughly 5:1. Treat that as an
+estimate to be replaced by a measurement, not a planning number: the manifest
+of the first real `archive` run records `rows_bytes` and `rows_gz_bytes` and
+gives the exact ratio for this pool's row shape.
 
-- keep the canonical accepted-share ledger in Postgres, or in a verified
-  immutable archive when a future archive flow exists
-- keep block, payout, carry-forward, maturity, reorg, and settlement state
-  durable
-- keep canonical audit artifact hashes in Postgres
-- keep large exact audit artifact bodies outside hot Postgres once the artifact
-  externalization work lands
+The archive is an additional copy, not a saving on the database volume until
+the partition is dropped. Budget both for the interval between `archive` and
+`drop`, plus whatever the archive retention policy keeps off-host.
 
-## Pilot Baseline
+### Native audit body size
 
-A small pilot deployment measured on 2026-06-30 showed active PRISM state at
-about 1.2 GB before long-term growth. The useful planning signal is the
-composition of that active state:
+Measured with `cargo test -p qbit-prism-server --test audit_body_normalization
+-- --ignored measure_landing_body_and_settlement_lock_hold` (release build, one
+landed block, the synthetic five-recipient window of
+`tests/support/window_fixture.rs` at about 581 B per share):
 
-| Active PRISM item | Size / count |
-| --- | ---: |
-| Postgres volume | about 195 MB |
-| Database size | about 140 MB |
-| Audit file volume | about 989 MB |
-| qbit data volume | about 61 MB |
-| Active PRISM total | about 1.2 GB |
+| Window (counted shares) | Stored `audit_bundle` as JSON text | Stored on disk, `pg_column_size` (TOAST-compressed) | `audit_body_byte_len` (full canonical artifact) |
+| ---: | ---: | ---: | ---: |
+| 20,000, landed before #267 | 10,901,855 B | 353,091 B | 22,250,397 B |
+| 20,000, landed since #267 | 12,949 B | 3,087 B | 22,250,397 B |
+| 100,000, landed before #267 | 54,401,879 B | 1,707,134 B | 111,190,422 B |
+| 100,000, landed since #267 | 12,972 B | 3,088 B | 111,190,422 B |
 
-The active table breakdown was:
+Before #267 the stored body kept `reward_manifest.shares`, one record per
+counted share, so it grew by about 545 B of JSON text per share: the production
+window of 372,257 shares measured about 235 MB as one JSONB value (issue #267),
+88% of PostgreSQL's 268,435,455-byte limit, and the reduced-size JSONB ceiling
+gate projected 233 MB at 400,000 synthetic shares. The body landed since #267
+does not grow with the window. Its residual size is O(distinct miners and payout accounts),
+not a fixed bound: `reward_manifest.entitlements`, the payout policy manifest's
+accounts, `prior_balances`, and the CTV fanout manifests scale with the number
+of distinct payout programs, and the synthetic window above has five. A pool
+paying thousands of distinct programs stores proportionally more per block.
+The synthetic window also compresses about 27:1 in TOAST, so the on-disk column
+is optimistic for production data; the JSON text column is not.
 
-| Table | Size / rows |
-| --- | ---: |
-| `qbit_pool_audit_bundles` | 126 MB, 571 rows |
-| `qbit_share_ledger` | 3.7 MB, 5,624 accepted shares |
-| payout, carry-forward, and block tables | about 2.5 MB combined |
+Two lengths describe one native audit and neither is derivable from the other:
+`audit_body_byte_len` is the length of the full canonical artifact, both share
+copies included, exactly as `/public/v1/artifacts/<sha256>` serves it;
+`sum(pg_column_size(audit_bundle))` (the storage query below) is the stored,
+compressed length of the non-share body.
 
-The accepted-share ledger was not the disk driver in that pilot. Inline audit
-bundle bodies dominated the hot database footprint, which is why newer artifact
-externalization and share-segment formats matter for production planning.
+Serving a native audit rebuilds the window on every request: the range read,
+the counted-window fold, and the canonical hash. The same harness measured that
+read at 1.0 s for 20,000 and 5.4 s for 100,000 shares (release build, one
+request, no contention); budget CPU and the public read deadline for it.
 
-## Growth Model
+### Memory bound on artifact reads
 
-qbit targets 60-second aggregate block spacing, so the network produces about
-1,440 blocks per day. PRISM vardiff targets about one accepted share per active
-worker every 15 seconds.
-
-Use:
+`/public/v1/artifacts/<sha256>` holds a whole window in memory per read,
+whichever shape the row has: an unsealed native block is rebuilt from its share
+range, and a sealed one has its stored canonical bytes digested and parsed.
+Since #267's admission half, both run under
+`PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY` (default 1), which is independent of
+`PRISM_POSTGRES_READ_CONCURRENCY`: raising the read concurrency admits more
+ordinary reads and **no** more window-sized reads *of this route*, and its
+transient memory is
 
 ```text
-accepted_shares_per_second = active_workers / 15
-accepted_shares_per_year = accepted_shares_per_second * 31,536,000
-hot_share_ledger_bytes = accepted_shares_per_year * 1.2 KB
-pool_blocks_per_day = 1,440 * pool_share_of_blocks
+artifact_read_bytes = PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY x peak_bytes_per_read
 ```
 
-The measured share-ledger cost is about 0.7 to 0.8 KB per accepted share across
-pilot data and local schema probes. Use 1.2 KB per share for planning to cover
-indexes, bloat, and operational headroom.
+That bound is the artifact route's alone. `/public/v1/blocks/<hash>/settlement-artifacts`
+falls back to the audit-bundle reader when the block has no CTV fanout set, and
+that reader still rebuilds or decodes the same window under the shared
+imported-audit decode limit, which is sized from `PRISM_POSTGRES_READ_CONCURRENCY`.
+Its bound is therefore `PRISM_POSTGRES_READ_CONCURRENCY x peak_bytes_per_read`,
+and raising the read concurrency does raise it; size a public process for both.
+Moving that route under the artifact limit is a behaviour change on another
+route and is not part of #267's admission half.
 
-The estimates below assume the optimized Postgres pattern: hot Postgres keeps
-the canonical ledger, block/payout/carry rows, and artifact metadata, not the
-full audit JSONB body for every block. If exact artifact bodies remain local,
-provision artifact storage separately.
+What the bound covers is the work admitted under the permit: the range read and
+fold, the canonical serialization, and the stored bytes' digest and parse. It
+does not cover the response body, which stays alive after the permit is
+released until the client has drained it, so a read's resident footprint
+outlasts its permit by about one more copy of the artifact.
 
-Externalizing exact current artifacts reduces hot Postgres size. It does not
-reduce total retained bytes unless artifacts are compressed or replaced by a
-future reduced/window proof format.
+CPU outside the permit matters as much as memory. Serving an audit artifact used
+to hash the whole body twice more on a runtime worker thread — once to check the
+returned bytes against the requested address, once for the ETag. One SHA-256
+pass over a 111 MB artifact measures 1.6-1.8 s in a debug build, so at 50
+requests per second those passes saturated the public process's worker threads:
+a task that only sleeps overshot by 23.5 s, the node RPC behind
+`/public/v1/pool-summary` timed out, and that route failed its 20 s deadline
+even though the read pool was idle (p99 pool-summary latency 0.107 s in the same
+run). Both passes are gone. The bytes are digested against `audit_bundle_sha256`
+inside the blocking job, under the permit; the row is found by that column, so
+the route compares it to the requested address as a string; and the ETag is that
+same address rather than a fresh hash of the body. The verification is the same
+digest it always was, and responses are byte-identical. After the change, the
+same load holds pool-summary at 0.118-0.364 s maximum with no failed sample and
+the sleeping probe's overshoot at 0.32-0.44 s. A public process still needs CPU
+headroom for the rebuild itself, which is what the permit bounds.
 
-## One-Year Hot Postgres Scenarios
+The legacy fallback body — an audit row with neither canonical bytes nor a share
+snapshot, served through the audit-bundle reader — is still hashed on a runtime
+thread for its ETag, because it has no proven content address to carry. It is a
+pre-#267 import shape, and it is not admitted by the rebuild limit either.
 
-| Scenario | Active workers | Shares/sec | Pool share of blocks | Blocks/day | Estimated hot Postgres live data/year | Practical VM disk if backups/artifacts are not local |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Testnet / pilot | 15 | 1 | 1% | 14 | about 38 GB | 250-500 GB |
-| Early public | 150 | 10 | 5% | 72 | about 386 GB | 1.5-2 TB |
-| Serious pool | 1,500 | 100 | 20% | 288 | about 4.1 TB | 8-10 TB |
-| Very large | 7,500 | 500 | 50% | 720 | about 22 TB | 45-60 TB |
+`peak_bytes_per_read` is a multiple of the canonical artifact length, which is
+`audit_body_byte_len` in the table above. Measured at a 5,000-share window by
+`cargo test -p qbit-prism-server --test artifact_admission -- --nocapture
+artifact_route_load_keeps_pool_summary_within_its_read_deadline` (debug build,
+process peak resident memory across one uncontended read, `VmHWM` reset before
+each): the canonical artifact was 5,570,372 B (**1,114 B per share**, measured),
+one rebuild peaked about **34 MiB** above the resident baseline (about 6x the
+artifact) and one sealed decode about **11 MiB** (about 2x). Those multiples are
+what the bound below extrapolates; they are measured only at that window and in
+a debug build, and the test process also holds the response body.
 
-If local artifact bodies, local physical backups, or WAL archives are kept on
-the same VM, increase the practical disk target:
+Derived, not measured, at the sizes this pool plans for: at 1,114 B per share a
+400,000-share window is a **445 MB** canonical artifact, so one rebuild is on
+the order of **2.5 GB** of transient memory and one sealed decode on the order
+of **1 GB**, times the rebuild concurrency. No measurement at 400,000 shares
+exists; run the `#[ignore]` variant
+(`artifact_route_load_at_a_large_window`, `PRISM_ARTIFACT_ADMISSION_SHARES`) on
+a machine with that headroom before raising the setting. The default of 1 keeps
+one window in flight per public process; the in-flight cap
+(`PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT`, default 32) bounds only how many
+requests may queue for it, not memory, because a queued request holds neither a
+read connection nor a window.
 
-| Scenario | Practical disk with local artifacts/backups |
-| --- | ---: |
-| Testnet / pilot | 500 GB-1 TB |
-| Early public | 4-8 TB |
-| Serious pool | 15-25 TB or dedicated database storage |
-| Very large | dedicated storage architecture, not a single small VM |
+Legacy external body refs and v2 segment files remain readable by the offline
+Rust tools. During [migration](prism-rust-migration.md), import these into the
+shared database before relying on another frontend to serve old audits. Preserve
+all referenced bodies and segments in the migration backup. A small live-evidence
+envelope or a stored SHA cannot replace missing artifact bytes.
 
-## Permanent Data
+### Refresh build memory per frontend
 
-Keep these forever in hot storage or a verified immutable archive:
+Since #502 the refresh build serializes the share array and folds the counted
+shares in chunks on the frontend's builder pool (`PRISM_REFRESH_BUILD_THREADS`,
+default three quarters of the host's cores clamped to 1..4, `0` for the serial
+build, at most 64), and it holds more memory per frontend process than the
+serial build did. The trade is accepted. #502's own confirmation pair on its
+merge base measured per-frontend RSS after the tips at 328-342 MiB before and
+568-608 MiB after, and peak RSS at 557 MiB before and 669 MiB after; an
+independent 400,000-share probe measured 251-254 MiB retained after the drop
+with the serial build against 284-330 MiB with eight workers. Budget roughly
+0.5 GiB more retained memory on a two-frontend host.
 
-- accepted shares with exact `share_seq` order
-- `share_id`, miner/payout identity, payout order key, and P2MR program
-- share difficulty/work amount and network difficulty context
-- job/template metadata, `job_issued_at`, `accepted_at`, and proof identifiers
-- block reward-window anchors
-- block, payout, carry-forward, maturity, reorg, and reversal rows
-- payout policy inputs, fee policy, minimum payout/floor settings, and
-  settlement-mode decisions
-- canonical audit artifact hashes and verifier/schema versions
-- coinbase txid/hex and manifest hashes needed to match chain evidence
-- CTV/fanout settlement artifacts needed for third-party verification or
-  broadcast recovery
+Two things hold that memory. The pool's threads keep the counted-share strings
+and chunk buffers in their own allocator arenas, one per thread, so the retained
+part grows with the thread count (at 400,000 shares, sixteen threads retained
+about 130 MiB more per frontend than four for the same refresh time); the
+thread count is the knob that bounds it, and on a memory-tight host
+`MALLOC_ARENA_MAX` (for example `MALLOC_ARENA_MAX=2` in the frontend's
+environment) caps glibc's arenas whatever the thread count. And the build slot
+(`PRISM_JOB_BUILD_EXECUTOR_WORKERS`) is released before the previous refresh's counted-share
+body is freed, so the slot count no longer bounds the number of live
+counted-share bodies exactly: expect one extra body per slot, transiently, on
+top of the bound the slot gives.
 
-Do not prune `qbit_share_ledger` until the archive contract in
-`docs/prism-ledger-ops.md` is implemented and verified.
+### Landing memory per frontend
 
-## Archiveable Or Ephemeral Data
+Landing a block rebuilds its payout window and audit on the frontend that
+lands it. At a 400,000-share window the live heap goes from about 260 MiB to a
+1.6 GiB peak and back within the landing (#600). glibc keeps what the landing
+frees in the arenas of the threads that did the work and does not return it,
+so without a trim the landing frontend's resident set climbs with each of its
+landings to a plateau of 3.2–3.3 GB after four to six of them, with a
+high-water mark of 3.9 GB, while its live heap stays at about 250 MiB. A
+frontend that has not landed a block stays at 0.6–0.7 GB.
 
-These can have bounded retention once the policy is explicit:
+Since #600 the frontend that landed calls `malloc_trim(0)` once the landing's
+transaction has ended and its rebuilt window is released. The trim runs on
+the blocking thread that released the window, never on a runtime worker and
+never under a lock or a database transaction, and returns every free page in
+every arena to the kernel. It locks each glibc arena in turn while it does,
+so a thread that allocates from that arena meanwhile, a runtime worker
+included, waits for it: `qbit_prism_landing_malloc_trim_seconds` bounds that
+pause. It is on by default;
+`PRISM_LANDING_MALLOC_TRIM_ENABLED=0` turns it off. glibc builds only (the
+image and release binaries); elsewhere it does nothing.
+`qbit_prism_landing_malloc_trim_seconds`,
+`qbit_prism_landing_malloc_trim_released_bytes_total` and
+`qbit_prism_landing_malloc_trim_resident_bytes` (the resident set right after
+the latest trim, the frontend's floor) report each trim.
 
-- rejected-share details after operational/debug retention
-- non-canonical candidate audit artifacts that never became accepted blocks
-- dashboard caches and rollups that can be regenerated or are intentionally
-  lower resolution over time
-- verbose broadcast attempts after terminal status, if latest status, error
-  summary, attempt count, and final artifacts are retained. The live schema
-  now stores this summary on `qbit_ctv_fanout_artifacts` and caps retained
-  detail rows with `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT`.
-- Docker images, Docker build cache, and old non-active TIDES volumes after
-  backup or decommission confirmation
+Measured with the same binary, trim off and on, two 30-minute runs of each
+over the weekly soak's 400k-window two-frontend shape (six blocks per run,
+pinned to four cores). The floor is the lowest resident set in each
+10-minute cycle; landings are the blocks that frontend rebuilt and landed,
+its trims with the trim on and its post-landing work deliveries, which can
+miss one, with it off (#600):
 
-Inactive PRISM blocks are not deletion candidates simply because they are
-inactive. They can reactivate after a reorg.
+| trim | frontend | landings | cycle floors (MiB) | peak (MiB) |
+| --- | --- | ---: | --- | ---: |
+| off | fe-1 | 4 | 420, 2,110, 2,540 | 3,166 |
+| off | fe-1 | 5 | 419, 1,374, 2,026 | 2,635 |
+| off | fe-0 | 1 | 354, 634, 1,349 | 1,436 |
+| off | fe-0 | 0 | 356, 614, 632 | 709 |
+| on | fe-0 | 6 | 426, 579, 593 | 1,367 |
+| on | fe-0 | 3 | 412, 538, 551 | 745 |
+| on | fe-1 | 3 | 387, 605, 685 | 1,642 |
+| on | fe-1 | 0 | 447, 651, 674 | 766 |
 
-## Artifact Storage Strategy
+Each trim took 62–100 ms and returned about 1 GB, leaving the frontend at
+about 400 MiB. With the trim on, the landing frontend's accepted block
+reached miners as post-landing work in 5.4–6.2 s, against 5.2–8.4 s with it
+off, and its block offers took 31–105 ms against 27–99 ms. Share
+acknowledgements slower than 50 ms or 250 ms were no more frequent within
+6 s of a trim than elsewhere in the run.
 
-The live coordinator stores accepted-block audit artifacts with these rules:
+Set the per-frontend memory limit from the peak, not the floor, and leave
+headroom for a larger landing:
 
-1. Exact artifact externalization: Postgres stores hash/pointer metadata while
-   every reader still resolves the body to the logical
-   `qbit.prism.audit-bundle.v1` expected by public API and verifier callers.
-   New rows also store `audit_body_byte_len` so the canonical row has the
-   artifact hash, stored byte size, schema version, and body pointer.
-2. Share-segment proof bodies: when `PRISM_AUDIT_SHARE_SEGMENT_SIZE` is
-   positive, new external body files use `qbit.prism.audit-bundle.v2`. The v2
-   body keeps non-share bundle sections inline, stores a
-   `qbit.prism.window-completeness-proof.v1`, and points at stable
-   `qbit.prism.audit-share-segment.v1` segment-slot files with per-range hashes.
-   This removes the old repeated inline tail/partial-window share arrays while
-   preserving the same reconstructed v1 bundle hash.
-3. Legacy body refs: older compact files using `qbit.prism.audit-body-ref.v1`
-   remain readable. The Rust `qbit-prism-audit-verify` and
-   `qbit-prism-audit-canonicalize` tools accept full v1 bundles, legacy body
-   refs, and v2 proof bodies, verifying referenced segment/range hashes before
-   reconstructing the canonical v1 bundle.
+| 400k window, per frontend | memory limit | RSS warning |
+| --- | ---: | ---: |
+| trim on (default) | 3 GiB | 2.5 GiB |
+| trim off | 5 GiB | 4 GiB |
 
-`prism-live-audit-bundle-*.json` files are now small operator envelopes that
-point at the canonical body URI. They are not the durable audit body. Retention
-may prune live envelopes and old candidates; it must not prune
-`prism-audit-bundle-body-*` or `prism-audit-share-segment-*` unless those
-artifacts have first been archived and the resolver policy is explicit. Stable
-`prism-audit-share-segment-slot-*` files may grow as adjacent ranges are first
-referenced, so old body files verify their original range hash against the
-selected slice rather than against the whole mutable slot file.
+Scale both roughly linearly with the window: at 200k the floor without a trim
+plateaued at 1.0–1.06 GB. Two frontends on one host need twice the limit plus
+PostgreSQL. `PrismResidentMemoryHigh` fires at 4 GiB, the trim-off warning:
+with a 3 GiB limit, lower it to 2.5 GiB or the frontend is killed before it
+fires.
 
-CTV broadcast retries are bounded separately from audit bodies:
+## Estimate from measured ingest
 
-- `PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT` keeps only the newest N detailed
-  rows per fanout in `qbit_ctv_fanout_broadcast_attempts`.
-- `qbit_ctv_fanout_artifacts` retains total attempt count, per-status counts,
-  first/last timestamps, last package txids/hexes, last submit result, last
-  error, and retry backoff state.
-- `rejected` and `failed` attempts move a fanout to terminal `failed`, and
-  terminal failed fanouts are not selected for broadcast work.
+Estimate share growth from accepted share rate, not miner hashrate alone:
 
-## VM Recommendations
+```text
+accepted_shares_per_second ≈ active_workers / target_share_interval_seconds
+accepted_shares_per_year = accepted_shares_per_second × 31,536,000
+annual_ledger_bytes = accepted_shares_per_year × measured_bytes_per_share
+```
 
-For near-term production or a pilot after audit artifact externalization:
+At a 15-second target, 150 active workers produce about ten accepted shares per
+second. Vardiff bounds, hashrate changes, reconnects, and listener profiles can
+change the actual rate; measure it under the intended configuration.
 
-- Use at least 2 TB NVMe if audit bodies and backups are externalized.
-- Use 4 TB if keeping a local artifact mirror.
-- Use 4-8 TB if compact artifact bodies remain local and the pool is expected
-  to grow beyond pilot traffic.
+The following is arithmetic using a **planning assumption** of 1.2 kB per
+accepted share including indexes. It is not a measured native capacity claim:
 
-For a serious public pool:
+| Accepted shares/second | Shares/year | Ledger bytes/year at 1,200 bytes/share |
+| ---: | ---: | ---: |
+| 1 | 31.5 million | 37.8 GB |
+| 10 | 315 million | 378 GB |
+| 100 | 3.15 billion | 3.78 TB |
+| 500 | 15.8 billion | 18.9 TB |
 
-- Treat Postgres as a dedicated service or dedicated volume.
-- Plan 10 TB or more for hot Postgres at roughly 100 accepted shares/sec.
-- Keep immutable audit artifacts and backups in separate object or cold
-  storage.
-- Treat artifact availability separately from artifact integrity. Hashes prove
-  fetched bytes are correct; backups and restore tests prove bytes remain
-  available.
+Native proof deduplication adds indexed rows; measure its footprint alongside
+the ledger. Non-share audit sections, per-recipient payouts/carry rows, CTV
+transactions, and imported legacy inline bodies add independent growth. The
+number of recipients and pool-found blocks can matter as much as the share rate.
+Do not multiply just one table's row size and call it the database requirement.
 
-## Postgres Durability And Recovery
+Measure a representative interval after migration and under load. Record table
+and index growth, WAL generation, pending outbox size, expiring job storage,
+backup size, and process peak RSS. Include cold startup and simultaneous job
+refresh across all frontends. Large historical reward windows still require
+memory and CPU to construct or export a full logical audit, even though their
+persistent shares are normalized.
 
-Postgres always uses write-ahead logging (WAL). WAL is the database transaction
-log, not a second application-level share queue: changes are recorded in WAL
-before their modified table pages are written. Keep `fsync=on`,
-`full_page_writes=on`, and `synchronous_commit=on`. Disabling any of those to
-reduce share-accept latency weakens the meaning of a committed share and is not
-a production tuning option.
+Provision headroom for peak ingest, autovacuum, index growth, restore staging,
+backups, and the time needed to respond to disk alerts. Estimate replicas and
+backup retention separately; they are additional copies, not free capacity.
 
-The production Compose contract sets `POSTGRES_INITDB_WALDIR` to the separately
-mounted live WAL path. That setting is honored only when the official Postgres
-entrypoint creates a fresh cluster. It does not move `pg_wal` for an existing
-cluster. Verify the initialized cluster before admitting shares:
+## Local and external database deployments
+
+Local development Compose uses:
+
+- `prism-postgres-data` for PostgreSQL data
+- `prism-postgres-wal` for live WAL
+- `prism-audit-data` for legacy artifact access/import
+- `qbit-data` for the qbit node
+
+Production Compose maps these to pre-created absolute paths through
+`PRISM_POSTGRES_DATA_SOURCE`, `PRISM_POSTGRES_WAL_SOURCE`,
+`PRISM_AUDIT_DATA_SOURCE`, and `QBIT_DATA_SOURCE`. The audit mount remains useful
+for migration and archived operator artifacts; the native runtime does not
+write repeated live audit bodies there for every block.
+
+For several physical frontends, use the external-database Compose overlay and
+one HA writer endpoint. Size the external database's data, WAL, replicas, and
+backup archive according to its deployment profile. Frontend hosts primarily
+need CPU, memory, logs, image storage, and any locally managed qbit chain data.
+A separate qbit node per frontend has its own chain-storage requirement.
+CTV recovery without transaction indexing needs retained historical blocks for
+its durable bounded scan; account for that when choosing a node pruning policy.
+
+The native runtime uses `PRISM_RUNTIME_WORKERS` and a bounded
+`PRISM_JOB_BUILD_EXECUTOR_WORKERS` CPU builder limit. Increasing threads cannot
+remove PostgreSQL commit or storage bottlenecks. Sum
+`PRISM_DATABASE_MAX_CONNECTIONS` across frontends before setting the database
+connection budget; reserve operational connections as well.
+
+## Durability, WAL, and recovery
+
+Keep `fsync=on`, `full_page_writes=on`, and `synchronous_commit=on`. WAL is the
+PostgreSQL transaction log, not a second application share queue. Durable share
+ACKs depend on successful commit; disabling these settings to improve benchmark
+numbers changes that guarantee.
+
+The production local database sets `POSTGRES_INITDB_WALDIR` to the separately
+mounted WAL path. This setting applies only when creating a fresh cluster and
+does not relocate an existing `pg_wal`. Inspect the actual filesystem link and
+mounts after initialization as well as the SQL settings:
 
 ```sql
 SHOW data_directory;
+SHOW fsync;
+SHOW full_page_writes;
+SHOW synchronous_commit;
+SHOW synchronous_standby_names;
 SELECT pg_current_wal_lsn(), pg_walfile_name(pg_current_wal_lsn());
 ```
 
-Also verify that `readlink -f /var/lib/postgresql/data/pg_wal` inside the
-container resolves to `/var/lib/postgresql/wal` and that the container mount
-table maps that target to `PRISM_POSTGRES_WAL_SOURCE`; SQL alone cannot prove
-the storage separation. Losing either the live data path or live WAL path makes
-the primary unavailable, so snapshotting only one is not a recoverable backup.
+A primary-local durable commit survives a frontend crash. To preserve every
+acknowledged share after loss of the database primary, configure synchronous
+replication on independent storage and fail over only to a standby containing
+those flushed commits. An asynchronous standby or a highly available DNS name
+does not establish this recovery point objective.
 
-A commit on one Postgres primary protects against a coordinator restart, but it
-does not by itself protect against loss of that primary and its storage. Choose
-the recovery objective explicitly:
+Keep encrypted off-host base backups plus continuous WAL archives and conduct
+isolated restore drills. Replicas do not replace recovery history: accidental
+changes and corruption can replicate. A restore drill should verify schema,
+share order, representative canonical audit hashes, carry-forward integrity,
+CTV state, and application reads. Include unimported external audit artifacts
+and signing-key recovery material in the recovery plan.
 
-- For a non-zero recovery point objective, use encrypted off-host base backups
-  plus continuous WAL archiving and document the maximum acceptable data loss.
-- For zero loss of acknowledged commits after primary storage failure, add a
-  synchronous standby on independent failure-domain storage. Configure
-  `synchronous_standby_names` and keep `synchronous_commit=on` so commit waits
-  for the selected standby to durably flush WAL. Do not silently fall back to
-  asynchronous replication when that guarantee is required.
-- Replicas do not replace backups. Operator error, corruption, and accidental
-  deletion can replicate immediately, so retain independent point-in-time
-  recovery material.
+Live WAL and archived WAL are distinct. Failed archiving or an inactive
+replication slot can retain live WAL without bound. Measure peak WAL generation
+and reserve enough capacity for the incident response interval. Alert on live
+WAL growth, retained slot bytes, archive failures, standby flush/replay lag,
+synchronous standby availability, backup age, and the last successful restore.
 
-Point-in-time recovery requires a compatible physical base backup and every WAL
-segment from that backup through the requested recovery time. Store both
-encrypted outside the database host, apply a tested retention policy, and run a
-scheduled restore drill into an isolated Postgres instance. A drill is complete
-only after schema checks, ledger continuity checks, artifact-pointer checks, and
-an application read test pass.
-
-Live WAL and archived WAL are different storage classes. Postgres writes active
-segments to `pg_wal`; an archive command copies completed segments to the
-independent point-in-time-recovery archive. The separate Compose WAL mount holds
-the former, not the latter.
-
-WAL consumes disk according to write volume and checkpoint behavior, not just
-accepted-share row size. Healthy archived segments can be recycled from live
-WAL; a failed archive command or an inactive replication slot can retain live
-WAL without bound and fill its filesystem. Measure WAL generated during a
-production-like load test, reserve several times the measured peak between
-operator response windows, and alert on:
-
-- time and bytes since the last successful archived WAL segment
-- `pg_wal` bytes and growth rate
-- replication slot retained bytes and standby replay/flush lag
-- base-backup age and the last successful restore drill
-- synchronous standby count whenever zero acknowledged-share loss is required
-
-Treat recovery as a release gate: perform at least one full backup, primary-loss
-simulation, point-in-time restore, and application verification before accepting
-shares with economic value.
-
-## Monitoring
-
-Track at least:
+## Read-only storage inspection
 
 ```sql
 SELECT pg_size_pretty(pg_database_size(current_database()));
 
-SELECT
-  relname,
-  n_live_tup::bigint AS est_rows,
-  pg_size_pretty(pg_total_relation_size(relid)) AS total
+SELECT relname, n_live_tup::bigint AS estimated_rows,
+       pg_size_pretty(pg_total_relation_size(relid)) AS total_with_indexes
 FROM pg_stat_user_tables
 ORDER BY pg_total_relation_size(relid) DESC;
 
-SELECT count(*) FROM qbit_share_ledger WHERE accepted;
+SELECT count(*) AS audit_count,
+       count(*) FILTER (WHERE share_snapshot_sha256 IS NOT NULL) AS native_references,
+       count(*) FILTER (WHERE audit_bundle IS NULL AND body_uri IS NOT NULL) AS external_bodies,
+       coalesce(sum(pg_column_size(audit_bundle)), 0) AS stored_audit_json_bytes
+FROM qbit_pool_audit_bundles;
 
-SELECT
-  count(*) AS bundles,
-  pg_size_pretty(sum(pg_column_size(audit_bundle))::bigint) AS inline_jsonb
-FROM qbit_pool_audit_bundles
-WHERE audit_bundle IS NOT NULL;
+SELECT count(*) AS snapshots,
+       coalesce(sum(share_count), 0) AS referenced_shares_with_reuse
+FROM qbit_prism_audit_snapshots;
+
+SELECT slot_name, active,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
+FROM pg_replication_slots;
 ```
 
-Filesystem checks:
+`referenced_shares_with_reuse` counts references across snapshots, not unique
+stored share rows. `n_live_tup` is an estimate and can lag; exact counts can be
+expensive on a large ledger. `stored_audit_json_bytes` is the compressed
+non-share body; the full logical audit each native row serves is
+`audit_body_byte_len` bytes, orders of magnitude larger, and
+`sum(audit_body_byte_len)` is the size of the artifacts the public route can be
+asked for, not of anything stored.
+
+Inspect data/WAL/legacy artifact filesystems and container image/log usage:
 
 ```sh
-df -h /
 df -h "$PRISM_POSTGRES_DATA_SOURCE" "$PRISM_POSTGRES_WAL_SOURCE" "$PRISM_AUDIT_DATA_SOURCE"
-du -sh "$PRISM_POSTGRES_DATA_SOURCE" "$PRISM_POSTGRES_WAL_SOURCE" "$PRISM_AUDIT_DATA_SOURCE"
-du -sh /var/lib/docker /var/lib/containerd
 docker system df
-docker volume ls
 ```
 
-Add alerts for:
-
-- hot Postgres disk over 70% and 85%
-- WAL or backup archive growth exceeding expected daily ingest
-- audit artifact storage growth exceeding the block/artifact model
-- `qbit_pool_audit_bundles` rows whose inline body remains large after artifact
-  externalization lands
-- missing or hash-mismatched artifact objects
-- `/metrics` gauges `qbit_prism_audit_artifact_bytes` and
-  `qbit_prism_audit_artifact_files`, split by body, share segment, live bundle,
-  candidate, and other artifact kinds
-- CTV retry pressure via `qbit_prism_ctv_fanouts_failed` and the fanout-row
-  broadcast summary fields
+Use explicit retention for logs, expired operational records, and image caches.
+Do not delete inactive pool blocks, referenced shares, snapshots, or canonical
+settlement evidence as routine cleanup. Aged shares leave through
+`share-archive` and its checks, one partition at a time, and never through a
+`DELETE`. Track storage growth and restore time against the measured ingest
+model rather than relying on the former Python pilot's repeated-audit-file
+footprint.

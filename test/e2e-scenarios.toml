@@ -1,0 +1,924 @@
+# End-to-end and load scenario manifest (#543, #487 S14).
+#
+# Every end-to-end and load scenario we care about before production, with the
+# lane that runs it, the issue that owns it, what it must show to pass, and
+# whether it runs today. scripts/check_e2e_scenarios.py holds this file to
+# what the lanes actually run; its docstring has the rules. In short:
+#
+# - A scenario with `runs = true` cites its evidence, and the evidence decides
+#   its lanes: `tests` are gated test ids (test/prism-gated-tests.txt runs in
+#   `pr`, test/prism-nightly-gated-tests.txt in `nightly`,
+#   test/prism-weekly-gated-tests.txt in `weekly`), `presets` are
+#   crates/qbit-prism-load/presets (a nightly preset runs in `nightly`, a
+#   weekly one in `weekly`, a manual one in `dispatch`, `smoke` in `pr`),
+#   `unit_tests` are
+#   `<file>::<fn>` ungated tests that `cargo test --workspace` runs in `pr`,
+#   and `lane_checks` are the named checks of scripts/prism_shipped_image_lane.py,
+#   which run in `L6`.
+# - A scenario with `runs = false` cites no evidence and gives a `reason`; its
+#   `owner` is the linked issue, and its `lanes` are the lanes it is planned
+#   for (#487's definition of done: nothing unexercised without both).
+# - Every live_regtest and load_smoke test in the PR gated list, every opt-in
+#   nightly and weekly test, every preset and every L6 check must be cited by
+#   a running scenario.
+#
+# Scenarios whose fixtures belong to #521 or #474 are listed under those
+# issues; #487's lanes run them under load without redefining what they
+# assert (#487's division of work).
+
+schema = "qbit.e2e-scenarios.v1"
+
+# ---------------------------------------------------------------------------
+# Lanes. `pr`, `nightly`, `dispatch`, `weekly` and L6 run today; L2 to L5 are #487's
+# lanes that do not exist yet, each owned by the sub-issue that builds it.
+# ---------------------------------------------------------------------------
+
+[lanes.pr]
+title = "Every PR and push: the required ci.yml shards (#487 L0 and L1)"
+runs = true
+workflow = ".github/workflows/ci.yml"
+
+[lanes.nightly]
+title = "Nightly on 3.x.x: nightly presets and the opt-in live variants (#521 item 6)"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
+
+[lanes.dispatch]
+title = "On demand only: the manual presets through workflow_dispatch"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
+
+[lanes.weekly]
+title = "Weekly on 3.x.x: the long soak's weekly presets (#575 item 2) and the live-weekly job's opt-in live_regtest tests (#487 L4)"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
+
+[lanes.L2]
+title = "Nightly load regression with repeats, a trend and a regression rule"
+runs = false
+owner = "#549"
+
+[lanes.L3]
+title = "Production-window matrix: full on the version bump, reduced weekly (#550)"
+runs = true
+owner = "#550"
+workflow = ".github/workflows/prism-load-l3.yml"
+
+[lanes.L4]
+title = "Real-node scenarios under session load"
+runs = false
+owner = "#553"
+
+[lanes.L5]
+title = "Two-hour soak and chaos"
+runs = false
+owner = "#556"
+
+[lanes.L6]
+title = "Shipped images: the Compose prism profile with the HA overlay, weekly and on Dockerfile or Compose changes (#544)"
+runs = true
+workflow = ".github/workflows/prism-load-nightly.yml"
+
+# ---------------------------------------------------------------------------
+# Real-node baseline in the PR shards (#487 "Where we are": live_regtest).
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "live-two-frontend-mining-failover-audit-reorg"
+title = "Two server processes on a real qbitd: mining, frontend failover, audit and a reorg"
+owner = "#487"
+lanes = ["pr"]
+criteria = "Both frontends mine real blocks; a miner fails over between them; the audit verifies against the real coinbase; a reorg is followed without duplicate credit."
+runs = true
+tests = ["qbit-prism-server::live_regtest::real_two_server_mining_failover_audit_and_reorg"]
+notes = "Built with the native server (#244); #487 lists it as the L0 baseline."
+
+[[scenario]]
+id = "live-ctv-maturity-and-confirmation"
+title = "CTV payouts reach maturity, broadcast and confirm on a real qbitd"
+owner = "#487"
+lanes = ["pr"]
+criteria = "A won block's CTV fanout matures, is broadcast and confirms on the real chain."
+runs = true
+tests = ["qbit-prism-server::live_regtest::real_ctv_maturity_broadcast_and_confirmation"]
+
+[[scenario]]
+id = "live-ctv-cpfp-recovery"
+title = "CTV CPFP funding recovers from an owner crash, an abandoned child and a spent reservation"
+owner = "#487"
+lanes = ["pr"]
+criteria = "Each CPFP fault is repaired against the real wallet without losing or double-spending the reserved funding."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::cpfp_tests::real_cpfp_abandoned_child_repair_retains_unremovable_spent_lock",
+  "qbit-prism-server::live_regtest::cpfp_tests::real_cpfp_recovers_reserved_funding_after_owner_crash",
+  "qbit-prism-server::live_regtest::cpfp_tests::real_cpfp_replaces_unsigned_funding_spent_after_reservation_before_wallet_lock",
+]
+
+[[scenario]]
+id = "live-large-template-compact-runtime"
+title = "A large real template: first insertion, resume and mining on the compact runtime"
+owner = "#397"
+lanes = ["pr"]
+criteria = "The first large template is stored, resumed and mined with bounded JSONB and WAL."
+runs = true
+tests = ["qbit-prism-server::live_regtest::compact_runtime_tests::real_large_template_first_insertion_resumes_and_mines_with_bounded_jsonb_and_wal"]
+
+# ---------------------------------------------------------------------------
+# Functional entries from #487's catalogue, mapped to the tests that cover
+# them (#543). Only vardiff convergence had no test; #558 added it.
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "highdiff-listener"
+title = "The high-difficulty listener: binding, floors, block-only proofs and shared admission"
+owner = "#487"
+lanes = ["pr"]
+criteria = "The listener binds only when configured and fails startup on a held port; a valid block below the share target is still forwarded; a block-only proof waits for active-chain credit on a real node; the per-source cap is one budget across both listeners."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::highdiff_tests::observability_grace_counter_moves_only_after_real_durable_credit",
+  "qbit-prism-server::live_regtest::highdiff_tests::observed_tip_advance_fences_old_prepared_jobs_and_health",
+  "qbit-prism-server::live_regtest::highdiff_tests::real_highdiff_block_only_proof_waits_for_active_chain_credit",
+  "qbit-prism-server::live_regtest::highdiff_tests::real_share_height_queries_use_template_parent_height",
+  "qbit-prism-server::stratum_restart_bind::a_configured_highdiff_port_is_bound_and_accepts",
+  "qbit-prism-server::stratum_restart_bind::held_highdiff_port_fails_startup_before_registration",
+  "qbit-prism-server::stratum_restart_bind::without_a_highdiff_port_only_the_primary_listener_is_bound",
+]
+unit_tests = [
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::highdiff_floor_still_forwards_valid_block_below_share_target",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::per_source_cap_is_one_budget_across_the_default_and_highdiff_listeners",
+]
+
+[[scenario]]
+id = "version-rolling"
+title = "Version rolling: mask negotiation, rolled submits and the mask kept across frontends"
+owner = "#487"
+lanes = ["pr"]
+criteria = "mining.configure negotiates the template's mask; a share rolled under that mask is accepted, including after reconnecting to another listener that negotiated none; issued work keeps its original mask."
+runs = true
+tests = ["qbit-prism-server::compact_runtime_e2e::real_socket_reconnect_resumes_original_entropy_mask_and_submits_once"]
+unit_tests = [
+  "crates/qbit-prism-server/tests/stratum_codec.rs::version_mask_advertisement_is_authoritative",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::negotiation_reauthorization_retains_original_job_worker_and_grace_expires",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::reconnect_on_another_listener_preserves_original_entropy_mask_and_expiry",
+]
+
+[[scenario]]
+id = "malformed-frames-and-admission-limits"
+title = "Malformed and oversized frames, and the admission limits"
+owner = "#468"
+lanes = ["pr"]
+criteria = "Oversized frames close the connection; malformed frames, authorize cycling and unknown-job misses are charged to per-session budgets that disconnect; the per-source cap refuses at accept without backend work; a disconnect releases every permit; recommended budgets admit honest traffic; invalid settings are refused by name."
+runs = true
+tests = [
+  "qbit-prism-server::stratum_admission_postgres::ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence",
+  "qbit-prism-server::stratum_admission_postgres::unknown_job_budget_bounds_ledger_queries_and_a_capped_source_runs_none",
+  "qbit-prism-server::stratum_admission_postgres::wrap_exhaustion_leaves_subscription_retryable_and_disconnect_releases_guard",
+]
+unit_tests = [
+  "crates/qbit-prism-server/tests/stratum_admission.rs::malformed_subscribe_does_not_allocate_then_pipelined_subscribes_reuse_identity",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::oversized_frames_close_connection_and_fragmented_json_survives_timer_ticks",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::malformed_frame_budget_counts_frames_not_bytes_and_then_disconnects",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::every_unknown_job_miss_is_requeried_and_charged_until_the_budget_disconnects",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::authorize_budget_bounds_username_cycling_and_keeps_reauthorization_working",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::per_source_cap_refuses_at_accept_without_backend_work_and_frees_the_slot_on_close",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::per_source_cap_of_zero_admits_every_connection_from_one_address",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::a_budget_disconnect_releases_the_global_per_source_and_per_username_permits",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::recommended_budgets_admit_a_thousand_valid_submits_and_an_honest_stale_burst",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::admission_settings_reject_malformed_and_out_of_range_values_by_name",
+]
+
+[[scenario]]
+id = "cross-frontend-authorisation"
+title = "Cross-frontend authorisation: a job issued by A submitted to B, a wrong worker, a duplicate on both (#281 criterion 1)"
+owner = "#281"
+lanes = ["pr", "L6"]
+criteria = "Work issued by frontend A is accepted once on B over a real socket; another worker cannot resume or submit it; the same share replayed on B, or appended through a second instance's ledger, is rejected as a duplicate and credited once."
+runs = true
+tests = [
+  "qbit-prism-server::compact_runtime_e2e::real_socket_reconnect_resumes_original_entropy_mask_and_submits_once",
+  "qbit-prism-server::compact_runtime_e2e::refresh_issue_resume_preserves_original_work_and_compact_storage",
+  "qbit-prism-server::ledger_postgres::global_duplicates_idempotence_and_config_fencing",
+]
+unit_tests = ["crates/qbit-prism-server/tests/stratum_protocol.rs::reconnect_on_another_listener_preserves_original_entropy_mask_and_expiry"]
+lane_checks = ["cross-frontend-resume"]
+notes = "L6 runs #281's Compose exercise of this criterion on the shipped images and the HA overlay: work issued by frontend 1 is accepted once on frontend 2, another worker's submission and a replay on either frontend are refused, and the ledger credits it once."
+
+[[scenario]]
+id = "vardiff-retarget-steps"
+title = "Vardiff retarget steps and their delivery"
+owner = "#487"
+lanes = ["pr"]
+criteria = "One retarget uses accepted work, bounds its early and idle steps, is delivered or restored with its paired job, and a lowered idle difficulty is kept across reconnect."
+runs = true
+unit_tests = [
+  "crates/qbit-prism-server/src/vardiff.rs::fast_arrival_uses_one_bounded_evidence_gate_and_normal_steps_after_delivery",
+  "crates/qbit-prism-server/src/vardiff.rs::normal_arrivals_do_not_repeatedly_test_the_initial_noise_gate",
+  "crates/qbit-prism-server/tests/stratum_codec.rs::vardiff_uses_actual_accepted_work_and_limits_idle_step",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::fast_arrival_retries_failed_paired_delivery_and_only_proven_difficulty_resumes",
+  "crates/qbit-prism-server/tests/stratum_protocol.rs::idle_retarget_lowers_reconnect_difficulty_without_renewing_evidence",
+]
+
+[[scenario]]
+id = "vardiff-convergence"
+title = "Vardiff convergence per session over a real Stratum socket"
+owner = "#558"
+lanes = ["pr"]
+criteria = "Sessions starting well below and well above their target settle within a stated number of retargets into the target share-interval band and do not oscillate."
+runs = true
+unit_tests = ["crates/qbit-prism-server/tests/vardiff_convergence.rs::sessions_below_and_above_their_target_settle_into_the_share_interval_band"]
+notes = "Two miners 16x below and 16x above their target over a real socket to the native listener, each settling within 6 retarget periods and 4 adjustments (2 expected) into 1.5x of the target share interval, every adjustment closer to the target and none reversing direction, and changing at most once more over the next 8 retarget periods. It takes 8 s of wall time and little CPU, so it runs per PR."
+
+# ---------------------------------------------------------------------------
+# #521's scenarios: #521 owns the fixtures and assertions; #487's L4 and L5
+# run them under load (S15, S16, S18).
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "r521-1-lost-same-height-race"
+title = "#521 scenario 1: an own block loses a same-height race and is orphaned"
+owner = "#521"
+lanes = ["pr"]
+criteria = "On a second qbitd, the own block is orphaned, credited once on the reorg back, with no duplicate header."
+runs = true
+tests = ["qbit-prism-server::live_regtest::two_node_tests::real_own_block_loses_same_height_race_is_orphaned_and_credited_once_on_reorg_back"]
+
+[[scenario]]
+id = "r521-2-deep-reorg"
+title = "#521 scenario 2: a reorg deeper than the orphan-confirmation depth, own blocks on both branches"
+owner = "#521"
+lanes = ["pr"]
+criteria = "Credit, balances and fanouts are exact after the reorg."
+runs = true
+tests = ["qbit-prism-server::live_regtest::two_node_tests::real_deep_reorg_with_own_blocks_on_both_branches_keeps_credit_balances_and_fanouts_exact"]
+
+[[scenario]]
+id = "r521-3-postgres-failover-mid-landing"
+title = "#521 scenario 3: PostgreSQL failover with a found block mid-landing"
+owner = "#521"
+lanes = ["pr"]
+criteria = "Fenced failover keeps every acknowledged share; async failover loses only the replication gap, and the block lands; with the standby flush wait (#529), a block offered at a replication cut survives the promotion and lands once."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::pg_failover_tests::offer_standby::a_found_block_offered_after_the_standby_flush_survives_a_replication_cut_at_submitblock",
+  "qbit-prism-server::live_regtest::pg_failover_tests::real_async_failover_mid_landing_loses_only_the_replication_gap",
+  "qbit-prism-server::live_regtest::pg_failover_tests::real_fenced_failover_mid_landing_keeps_every_acknowledged_share",
+]
+
+[[scenario]]
+id = "r521-4-qbitd-outage-around-submitblock"
+title = "#521 scenario 4: a qbitd stop or crash around submitblock"
+owner = "#521"
+lanes = ["pr"]
+criteria = "Each block is offered once and lands, or is reconciled, after the node returns."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::node_outage_tests::node_killed_after_accepting_reconciles_the_lost_block_once",
+  "qbit-prism-server::live_regtest::node_outage_tests::node_killed_before_submitblock_lands_the_block_once_after_restart",
+  "qbit-prism-server::live_regtest::node_outage_tests::node_restarted_into_warmup_before_submitblock_lands_the_block_once",
+  "qbit-prism-server::live_regtest::node_outage_tests::node_stopped_after_accepting_lands_the_block_once_after_resume",
+  "qbit-prism-server::live_regtest::node_outage_tests::node_stopped_before_submitblock_lands_the_block_once_after_resume",
+]
+
+[[scenario]]
+id = "r521-4-qbitd-reindex-nightly"
+title = "#521 scenario 4, opt-in: the node is killed after accepting and restarted with -reindex"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "The accepted block is recovered from the block files and lands once."
+runs = true
+tests = ["qbit-prism-server::live_regtest::node_outage_tests::node_killed_after_accepting_and_reindexed_lands_the_block_once"]
+
+[[scenario]]
+id = "r521-5-dense-cadence-soak"
+title = "#521 scenario 5: dense-cadence landings and a 10-minute nightly soak on a real node"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "Every block found on live work is a candidate that settles (submitted, orphaned, or abandoned only for a superseded parent); each server's accepted-block-to-revision-work p99 stays within 5 s with no degraded landing; RSS stays flat."
+runs = true
+tests = ["qbit-prism-server::live_regtest::dense_soak_tests::dense_cadence_soak_lands_every_block_rebuilds_in_budget_and_holds_rss_flat"]
+
+[[scenario]]
+id = "r521-6-pr-smoke"
+title = "#521 item 6: the per-PR load-harness smoke (#487 L1's harness half)"
+owner = "#521"
+lanes = ["pr"]
+criteria = "A debug frontend serves every session and every tip and the run reconciles exactly under the smoke preset's gates."
+runs = true
+tests = ["qbit-prism-load::load_smoke::the_smoke_preset_serves_every_session_every_tip_and_reconciles"]
+presets = ["pr-smoke"]
+
+[[scenario]]
+id = "r548-ctv-fanout-settlement-under-load"
+title = "#548: CTV fanout settlement in the load harness (#487 S9)"
+owner = "#548"
+lanes = ["pr"]
+criteria = "With --ctv-settlement, a fake-node run whose 400 payable recipients overflow the direct-output cap lands its block with 12 direct recipients and the rest in one fanout chunk, reconciles exactly, and its side report's settlement block counts the direct, fanout and carried recipients from the server's landing rows."
+runs = true
+tests = ["qbit-prism-load::ctv_settlement::a_ctv_run_pays_the_direct_overflow_through_fanout_and_counts_the_split"]
+unit_tests = [
+  "crates/qbit-prism-load/tests/harness.rs::ctv_settlement_sets_mainnets_ctv_keys_and_leaves_the_broadcaster_off",
+  "crates/qbit-prism-load/tests/harness.rs::the_settlement_block_keeps_unmeasured_apart_from_zero",
+]
+notes = "The economic assertions on spent fanout outputs stay with r521-7 on the real node; this adds the settlement path under load only."
+
+[[scenario]]
+id = "r521-7-weighted-recipients-share-to-spend"
+title = "#521 scenario 7: weighted multi-address shares to spent outputs (#487 L1's wallet half)"
+owner = "#521"
+lanes = ["pr"]
+criteria = "40 weighted payout addresses receive exact PPLNS outputs through fanout, and the owning wallets spend them."
+runs = true
+tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::real_weighted_recipients_pay_exact_pplns_outputs_through_fanout_spend"]
+
+[[scenario]]
+id = "r521-7-mainnet-floor-recipients-nightly"
+title = "#521 scenario 7, opt-in: 130 mainnet-floor recipients through six blocks"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "As scenario 7, at the mainnet-floor recipient shape."
+runs = true
+tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::nightly_mainnet_floor_weighted_recipients_share_to_spend"]
+
+[[scenario]]
+id = "real-node-harness-smoke"
+title = "#547: the per-PR real-node harness smoke on a managed regtest qbitd pair"
+owner = "#547"
+lanes = ["pr"]
+criteria = "Exit 0: every share reconciled against PostgreSQL, every block above the ramp exactly one peer mint or one accepted relay submission at the ramped bits, and the cadence band stated; fake-node mode byte-identical to before real-node mode existed."
+runs = true
+tests = ["qbit-prism-load::real_node::real_node_smoke_reconciles_against_postgres_and_the_chain"]
+presets = ["real-node-smoke"]
+unit_tests = ["crates/qbit-prism-load/tests/real_node.rs::fake_node_mode_is_unchanged"]
+
+[[scenario]]
+id = "real-node-short-plan-pair"
+title = "#547: the short plan on the real and the fake node, differing only in --node"
+owner = "#547"
+lanes = ["nightly"]
+criteria = "Both exit 0 under the presets' gates; the real-node run's chain reconciles and its report states the cadence band."
+runs = true
+presets = ["short-plan-real-node", "short-plan-fake-node"]
+
+# #575's pre-release gaps on a real node: resource exhaustion (item 5) and
+# the replay of recorded Stratum transcripts (item 3's automatable half).
+
+[[scenario]]
+id = "b575-5-postgres-disk-full"
+title = "#575 item 5: PostgreSQL's data volume fills under mining and is freed"
+owner = "#575"
+lanes = ["nightly"]
+criteria = "Every acknowledged share is durable; the full state is refused explicitly, and PrismDatabaseUnavailable and at least one more rule hold for their `for` on every server (#581); once space is freed the same server processes accept shares and land a block with clean carry integrity."
+runs = true
+tests = ["qbit-prism-server::live_regtest::disk_exhaustion_tests::postgres_volume_full_refuses_shares_cleanly_and_recovers_once_space_is_freed"]
+
+[[scenario]]
+id = "b575-5-wall-clock-jumps"
+title = "#575 item 5: server and database wall clocks jump minutes and hours, including mid-landing"
+owner = "#575"
+lanes = ["nightly"]
+criteria = "Every acknowledged share is credited once with a monotonic ledger clock; every block is offered exactly once, lands once and matches its audit bundle; a server far ahead of the node serves no work and PrismWorkRefreshStalledCritical fires; every outbox row finishes, and neither block held across a database clock step is taken over (#581)."
+runs = true
+tests = ["qbit-prism-server::live_regtest::clock_jump_tests::wall_clock_jumps_keep_windows_claims_and_payouts_and_land_every_block_once"]
+
+[[scenario]]
+id = "b575-3-stratum-transcript-replay"
+title = "#575 item 3: recorded Stratum client transcripts replayed against a live server"
+owner = "#575"
+lanes = ["pr"]
+criteria = "Every replayed request of every corpus transcript gets an answer the recorded client accepts, every notification has the shape miners parse, and every accepted replayed share is in the ledger."
+runs = true
+tests = ["qbit-prism-server::live_regtest::transcript_replay_tests::recorded_stratum_transcripts_replay_compatibly_against_a_live_server"]
+unit_tests = ["crates/qbit-prism-server/tests/support/live_transcript_replay.rs::stratum_transcript_corpus_is_well_formed_and_labelled"]
+
+# The load-harness presets #521 item 6 runs (fake node). Each preset states
+# its own gates; #549 turns the nightly set into L2 with repeats and a trend.
+
+[[scenario]]
+id = "load-d1-20k"
+title = "D1 plan over the 20k window, uniform and Zipf(1.1) recipients"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "Exit 0 with exact reconciliation, no durability finding, shortfall 0 and #473's D1 verdict in steady state."
+runs = true
+presets = ["throughput-20k-window-1fe", "throughput-20k-window-1fe-500-addresses"]
+
+[[scenario]]
+id = "load-d1-400k-fe1-async"
+title = "#473's production-window baseline cell: 400k, one frontend, async standby"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "The preset's gates, with #473's D1 verdict."
+runs = true
+presets = ["throughput-400k-window-1fe-async"]
+
+[[scenario]]
+id = "load-tip-delivery-275"
+title = "#275's tip-delivery benchmark: 2,000 miners, 400k window, two frontends, retargeting tips"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "The preset's gates, with the tip-to-last-notify p99 within 2,500 ms."
+runs = true
+presets = ["tip-delivery-2000-miners-400k-2fe-retarget"]
+
+[[scenario]]
+id = "load-tip-delivery-275-500-addresses"
+title = "#275's tip-delivery benchmark with 500 Zipf(1.1) payout addresses"
+owner = "#521"
+lanes = ["dispatch"]
+criteria = "The preset's gates, with the tip-to-last-notify p99 within 2,500 ms."
+runs = true
+presets = ["tip-delivery-2000-miners-400k-2fe-retarget-500-addresses"]
+
+[[scenario]]
+id = "load-runner-probe-short-plan"
+title = "#541's runner probe: the short plan over the 20k-window fixture on one frontend"
+owner = "#541"
+lanes = ["dispatch"]
+criteria = "The preset's gates on the runner under probe: exact reconciliation, no acknowledged share missing, zero shortfall in each gated phase."
+runs = true
+presets = ["short-plan-20k-window-1fe"]
+
+[[scenario]]
+id = "load-mainnet-floor"
+title = "Mainnet-shaped floor: 130 recipients, one whale, bursty arrivals"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "The preset's gates, with the tip-to-last-notify p99 within 3,000 ms."
+runs = true
+presets = ["mainnet-shape-130-addresses"]
+
+[[scenario]]
+id = "load-growth-5x"
+title = "Mainnet floor scaled five times: 650 recipients, 2,000 sessions"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "The preset's gates, with the tip-to-last-notify p99 within 3,000 ms."
+runs = true
+presets = ["mainnet-shape-650-addresses"]
+
+[[scenario]]
+id = "load-rental-churn"
+title = "Rental churn over the mainnet-floor population: bursts, abrupt departures, reconnect storms"
+owner = "#521"
+lanes = ["nightly"]
+criteria = "The preset's gates, including the churn tip-delivery and new-session first-job budgets."
+runs = true
+presets = ["rental-churn-bursts-and-storms"]
+
+[[scenario]]
+id = "load-growth-20x"
+title = "Mainnet floor scaled twenty times: 2,600 recipients, 8,000 sessions on four frontends"
+owner = "#521"
+lanes = ["dispatch"]
+criteria = "The preset's gates, with the tip-to-last-notify p99 within 5,000 ms."
+runs = true
+presets = ["mainnet-shape-2600-addresses"]
+
+[[scenario]]
+id = "load-d1-473-cells"
+title = "#473's other D1 cells: 200k, 400k and 500k at 1, 2 and 4 frontends, async and sync"
+owner = "#521"
+lanes = ["dispatch"]
+criteria = "Each preset's gates, with #473's D1 verdict."
+runs = true
+presets = [
+  "throughput-200k-window-1fe-async",
+  "throughput-400k-window-2fe-async",
+  "throughput-400k-window-2fe-sync",
+  "throughput-400k-window-4fe-async",
+  "throughput-500k-window-1fe-async",
+  "throughput-500k-window-2fe-async",
+  "throughput-500k-window-4fe-async",
+]
+notes = "Also in L3 (#550): l3-full runs every one of them, l3-reduced the 400k async ones (l3-production-window-matrix)."
+
+# ---------------------------------------------------------------------------
+# #474's scenarios. Its A item's CTV case is #521 scenario 7 (#524), which
+# #474 A extends with the signed audit bundle and the owning wallets; A adds
+# direct settlement and the 1,001-recipient case. B and C have not landed.
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "r474-a-direct-recipients-share-to-spend"
+title = "#474 A: weighted recipients through direct coinbase settlement (CTV off) to spent outputs"
+owner = "#474"
+lanes = ["pr"]
+criteria = "Six addresses from six wallets with unequal weights, carry below the floor and the pool fee's dust sweep: exact direct outputs, ledger accounts and signed audit bundle against an independent model; the owning wallets spend a payee output of every block."
+runs = true
+tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::real_weighted_recipients_pay_exact_direct_outputs_without_ctv"]
+
+[[scenario]]
+id = "r474-a-1001-recipients"
+title = "#474 A: 1,001 payable recipients across the 1,000-recipient chunk boundary"
+owner = "#474"
+lanes = ["nightly"]
+criteria = "Seeded (Ledger::append) and Stratum-submitted recipient counts reported separately; all 1,001 recipients paid exactly across two fanout chunks per the model and the signed audit bundle; the owning wallets spend an output of each chunk."
+runs = true
+tests = ["qbit-prism-server::live_regtest::weighted_recipients_tests::recipient_boundary::nightly_1001_recipients_cross_the_fanout_chunk_boundary_to_spent_outputs"]
+
+[[scenario]]
+id = "r474-b-async-promotion-under-live-miners"
+title = "#474 B: async promotion while miners and frontend caches survive"
+owner = "#474"
+lanes = ["pr"]
+criteria = "Set by #474: exact offered, ACKed, rejected and unknown share identities reconciled against the promoted ledger under D3."
+runs = true
+tests = ["qbit-prism-server::live_regtest::pg_failover_tests::async_live_miners::async_promotion_with_live_miners_accounts_for_every_share_and_lands_a_block"]
+notes = "Four scripted miners on two frontends through a replication cut and a fence with a COMMIT held in flight; every ACKed-but-missing share named, sessions and kept work survive the promotion, and a post-promotion block pays a full read of the promoted window. The block solved on a job issued inside the gap must be refused as stale or pay only promoted rows (#619; refused before its offer since #645)."
+
+[[scenario]]
+id = "r474-c-lost-node-replies"
+title = "#474 C: the node accepted the operation but its reply was lost"
+owner = "#474"
+lanes = ["pr"]
+criteria = "Set by #474: no fabricated rejection, duplicate credit or second payout after the owning frontend is killed."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_sendrawtransaction_reply_owner_killed_survivor_confirms_the_fanout_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_submitblock_reply_owner_killed_survivor_lands_the_block_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::lost_submitpackage_reply_owner_killed_survivor_confirms_the_cpfp_package_once",
+  "qbit-prism-server::live_regtest::lost_reply_tests::share_credited_but_ack_lost_retry_is_deduplicated_exactly",
+]
+notes = "A proxy withholds qbitd's reply to submitblock, sendrawtransaction or submitpackage after the node accepted it; the owning frontend is killed before it journals the outcome and the survivor reconciles. The miner case withholds a durably credited share's acknowledgement and closes the connection; the retry is a duplicate on both frontends."
+
+[[scenario]]
+id = "r619-gap-work-after-async-promotion"
+title = "#619: work prepared in the replication gap is not payout authority after an async promotion"
+owner = "#619"
+lanes = ["pr"]
+criteria = "After a D3 promotion that lost the gap and reissued its share_seq values, a block on a held gap job is refused stale-job before its enqueue (window_not_held, share not credited), a new session is not issued the gap work and the refresh rebuilds under writer_timeline; a fenced switchover with full replay and a job persisted before the cut keep their authority and land."
+runs = true
+tests = [
+  "qbit-prism-server::b619_gap_work_after_promotion::a_block_on_a_job_issued_in_the_gap_is_refused_stale_job_before_its_offer",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_candidate_accepted_before_the_promotion_cannot_be_published_after_it",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_fenced_switchover_with_full_replay_keeps_pre_switch_work_and_lands_its_block",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_job_persisted_before_the_cut_is_resumed_after_an_async_promotion_and_lands",
+  "qbit-prism-server::b619_gap_work_after_promotion::a_refusal_that_finishes_after_the_acknowledgement_deadline_is_still_counted_once",
+  "qbit-prism-server::b619_gap_work_after_promotion::work_prepared_in_the_gap_is_not_issued_to_a_new_session_after_an_async_promotion",
+]
+notes = "Disposable PostgreSQL 16 primary and async standby, one native frontend and the fake node, no qbitd. See docs/prism-async-promotion-gap-blocks.md."
+
+# ---------------------------------------------------------------------------
+# #487's catalogue entries that no lane runs yet, under the sub-issue that
+# builds each.
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "wallets-2000-cap"
+title = "2,000 wallets at the production window on #521 scenario 7's fixture"
+owner = "#553"
+lanes = ["L4"]
+criteria = "#521 scenario 7's assertions unchanged at 2,000 payees (two fanout chunks per block): attribution, coinbase, CTV outputs and carry-forward balances match an independent PPLNS recomputation, and the fanouts reach the wallets and are spent (decision 7)."
+runs = false
+reason = "Blocked by #621 and #622. In debug, since #604, the fixture opens all of its about 1,500 worker sessions per frontend, but at its 1 s reanchor every session always has a job rebuild queued, and a session answers a submit only after that rebuild completes, so some submit gets no reply within the fixture's 30 s (#621). In release every session opens, and a later round's new tip reaches some worker late while the frontends defer job preparation on stale tip polling (#622). The live_regtest case wallets_2000_share_to_spend_waits_on_submit_acks_until_621_is_fixed reproduces #621 by hand."
+
+[[scenario]]
+id = "chain-events-under-load"
+title = "#521 scenarios 1, 2, 4 and 5 at L4's session counts"
+owner = "#553"
+lanes = ["nightly", "weekly"]
+criteria = "#521's assertions for each scenario, unchanged, under 2,000 share-only sessions at 100 shares/s; and the load's own: every acknowledged share durable and no refused share credited (ledger-outcome-unknown counts as unanswered), every refusal one a correct miner can earn (an allow-list), and every session on a ready frontend given work on every tip that lasts 15 s within 15 s."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_deep_reorg_under_2000_sessions_keeps_balances_exact_and_serves_every_session",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_lost_race_under_2000_sessions_orphans_once_and_serves_every_session",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_node_killed_after_accepting_under_2000_sessions_reconciles_the_lost_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_dense_soak_under_2000_sessions_lands_every_block_and_holds_rss_flat",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_killed_before_submitblock_under_2000_sessions_lands_the_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_restarted_into_warmup_under_2000_sessions_lands_the_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_after_accepting_under_2000_sessions_lands_the_block_once",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_node_stopped_before_submitblock_under_2000_sessions_lands_the_block_once",
+]
+notes = "The frontends run #575's share-only settings and the production 60 s payout reanchor (scenario one-frontend-fast-reanchor runs the fixture's 1 s as #598's guard). Scenarios 1 and 2 and scenario 4's crash case run nightly; scenario 4's other four cases and scenario 5's 20-minute soak at 400 shares/s run weekly."
+
+[[scenario]]
+id = "one-frontend-fast-reanchor"
+title = "#598's guard: 2,000 sessions on one frontend at a 1 s reanchor"
+owner = "#598"
+lanes = ["nightly"]
+criteria = "With at least 99% of 2,000 sessions on the one frontend holding work, each of three external tips 20 s apart reaches every session holding work within 15 s at the live fixture's 1 s reanchor and 5 shares/s, with the load's own checks. Before #598's fix almost no session got work on the 2nd and 3rd tips. Debug only: in release the fan-out outruns the reanchor even without the fix."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_2000_sessions_on_one_frontend_at_a_1s_reanchor_get_work_on_every_tip"]
+
+[[scenario]]
+id = "external-tips-time-to-usable-work"
+title = "External tips at a realistic cadence; time to usable work per frontend (#481)"
+owner = "#553"
+lanes = ["nightly", "weekly"]
+criteria = "External tips from a second node at qbit's 60 s target spacing (seeded exponential gaps) to 2,000 sessions on two frontends: every tip that lasts 15 s reaches every session on both frontends within 15 s, and #481's time to usable work (node stamp to first notify on that parent) is reported per frontend and per tip, replaced tips counted apart."
+runs = true
+tests = [
+  "qbit-prism-server::live_regtest::chain_events_load_tests::nightly_external_tips_at_target_spacing_reach_every_session_on_both_frontends",
+  "qbit-prism-server::live_regtest::chain_events_load_tests::weekly_external_tips_at_target_spacing_reach_every_session_on_both_frontends",
+]
+notes = "5 minutes at 100 shares/s nightly; 45 minutes at 400 shares/s weekly."
+
+[[scenario]]
+id = "node-loses-peer"
+title = "The node loses its peer while miners are connected"
+owner = "#553"
+lanes = ["nightly"]
+criteria = "Regtest exempts the peer floor (readiness_rpc.rs pins both sides), so: with its only peer partitioned away, the pool mines on an isolated node, its own block there is deactivated when the node reorganizes onto the peer's longer chain and credited exactly once, with no payout divergence or duplicate header, and every one of 2,000 sessions gets work on the isolated block and on the healed chain within 15 s."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_node_loses_its_peer_under_2000_sessions_orphans_the_isolated_block_and_recovers"]
+
+[[scenario]]
+id = "two-frontends-disagree-on-tip"
+title = "Two frontends on two nodes that briefly disagree about the tip"
+owner = "#553"
+lanes = ["nightly"]
+criteria = "Propagation lag and a partitioned split at equal work: the ledger takes one side's tip, the frontend on the other side reports itself unready and gives no work on its node's tip, no payout divergence or duplicate header follows, and after convergence every session on both frontends has work on the converged tip within 15 s."
+runs = true
+tests = ["qbit-prism-server::live_regtest::chain_events_load_tests::nightly_two_frontends_on_two_nodes_disagree_briefly_and_converge_under_2000_sessions"]
+
+[[scenario]]
+id = "l2-load-regression"
+title = "D1 at 20k and 100k with repeats against the trailing same-class baseline"
+owner = "#549"
+lanes = ["L2"]
+criteria = "Median of three repeats within the noise-floor rule of the trailing baseline, per phase (steady_state, burst, reconnect, slow_database)."
+runs = false
+reason = "The nightly runs throughput-20k-window-1fe once and gates it alone; repeats, the trend and the regression rule are #549 and #551."
+
+[[scenario]]
+id = "bridging-fake-and-real-node"
+title = "The same short plan against the fake and the real node on one runner"
+owner = "#552"
+lanes = ["nightly"]
+criteria = "Each run writes a comparison row stating the real node's cost as real minus fake (ACK latency, time to usable work, peak RSS; submitblock latency, which only the real node has, stays unknown on the fake side). It is not a D1 verdict."
+runs = true
+presets = ["short-plan-fake-node", "short-plan-real-node"]
+notes = "prism-load-nightly.yml's bridging job runs both presets on one runner, alternating the order, and scripts/prism_load_bridge.py writes the row; tests/test_prism_load_bridge.py holds that job's wiring. The matrix still runs each half on its own runner (real-node-short-plan-pair)."
+
+[[scenario]]
+id = "l3-production-window-matrix"
+title = "#447's full production-window matrix on the version-bump PR and the tag, and its reduced weekly set"
+owner = "#550"
+lanes = ["dispatch", "L3"]
+criteria = "Every cell's gates; the correctness and regression rows count toward #291, the rates do not (decision 5)."
+runs = true
+suites = ["l3-full", "l3-reduced"]
+presets = [
+  "throughput-400k-window-2fe-async-3-blocks",
+  "dense-cadence-400k-window-1fe-async",
+  "dense-cadence-400k-window-2fe-async",
+]
+notes = "l3-full runs every #473 cell three times: the eight rate cells (load-d1-473-cells and the nightly 400k baseline), the found-block run and dense cadence at 1 and 2 frontends, listed here. The 20k dense attempt (exit 6) and #473's flush and build controls are not presets. The reduced weekly suite (l3-reduced) is 400k at 1, 2 and 4 frontends, async."
+
+[[scenario]]
+id = "session-points"
+title = "2,000, 5,000 and 10,000 sessions at 500 shares/s, plus the 10,000-session burst"
+owner = "#555"
+lanes = ["dispatch", "L3"]
+criteria = "Per-session cost and ACK path under connection count, weekly (decision 7)."
+runs = true
+suites = ["l3-reduced"]
+presets = [
+  "throughput-400k-window-2fe-async",
+  "session-point-5000-sessions-400k-2fe-async",
+  "session-point-10000-sessions-400k-2fe-async",
+]
+notes = "Capacity-envelope points, not D1 verdicts (decision 5): the 5,000 and 10,000 points gate reconciliation and a steady_state that places every offer, and report refused and unanswered shares. All three are the 400k window on 2 async frontends in the D1 plan; the 10,000 point's burst phase (2,000 shares/s for 60 s) is the burst variant. Admission is sessions per frontend + 16, as the 2,000-session cell ran it."
+
+[[scenario]]
+id = "recipient-point-10000"
+title = "10,000 distinct payout addresses in the window, ten fanout chunks per block"
+owner = "#555"
+lanes = ["L3"]
+criteria = "Window-rebuild and payout-revision cost stays linear; seeded and submitted counts reported separately."
+runs = false
+reason = "No preset yet (#555): ten fanout chunks per block need CTV fanout settlement, which qbit-prism-load has had since #548 (--ctv-settlement, #644), so the preset can now be written with it on."
+notes = "The 50,000-recipient run's trigger (#555): this point costs more than 25% more per recipient than the same preset at 1,000 recipients (one fanout chunk), run on the same runner class the same week, in window rebuild (the tip-to-last-notify p99 over its tips) or in payout revision (from a landing to every session holding the new revision's work, the median over landings). A fixed cost only lowers the per-recipient figure at the larger size, so a linear cost never fires it. Evaluated once this point's preset exists and both presets run weekly (crates/qbit-prism-load/README.md, L3)."
+
+[[scenario]]
+id = "mainnet-shapes-reduced-l3"
+title = "The mainnet-shape presets (130, 650 and 2,600 addresses) and rental churn in the reduced weekly L3"
+owner = "#555"
+lanes = ["nightly", "dispatch", "L3"]
+criteria = "Each preset's gates on the L3 runner class (decision 11)."
+runs = true
+suites = ["l3-reduced"]
+presets = [
+  "mainnet-shape-130-addresses",
+  "mainnet-shape-650-addresses",
+  "mainnet-shape-2600-addresses",
+  "rental-churn-bursts-and-storms",
+]
+notes = "l3-reduced runs each once a week on the 32 vCPU class, beside their nightly (8 vCPU) or dispatch (16 vCPU) runs; rates compare only within one class. Not D1 verdicts."
+
+# ---------------------------------------------------------------------------
+# Faults under load (#554, #487 S16). The load harness's `faults` phase
+# (crates/qbit-prism-load/src/fault/) injects each fault while the sessions
+# keep mining, then holds it to the criteria below on top of the run's own
+# contract: every acknowledged share in PostgreSQL, no committed share left
+# unanswered mid-run, one submitblock per block hash. The criteria follow
+# D3's async loss policy and #585's shutdown and lease behaviour.
+# ---------------------------------------------------------------------------
+
+[[scenario]]
+id = "fault-sigterm-drain-offer-in-flight"
+title = "SIGTERM of a frontend while a found block's submitblock is in flight"
+owner = "#554"
+lanes = ["nightly", "pr", "weekly"]
+criteria = "The shutdown logs that it waits for the offer and no budget ALERT, the frontend exits 0 within 35 s, the block reaches the node exactly once, the node's accepted is recorded on the candidate before the process exits (#578, #585), and the frontend serves again after its relaunch; within 60 s of that the relaunch lands the block and every frontend serves work at the payout revision the landing committed, before the next fault starts (#686)."
+runs = true
+tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
+presets = ["faults-long-real-node", "faults-pr-smoke", "faults-short-real-node"]
+notes = "Per PR on the fake node with one frontend; nightly on the real node with two frontends and 500 sessions."
+
+[[scenario]]
+id = "fault-settlement-lock-holder"
+title = "A long SETTLEMENT_LOCK holder while the sessions keep mining, with a tip minted during the hold"
+owner = "#554"
+lanes = ["nightly", "pr", "weekly"]
+criteria = "The lock is taken once every frontend serves current work with no settlement under way, or 60 s from the injection have passed, so a block an earlier fault landed is settled and republished first, and a reading under the lock finds every frontend serving work at the revision it keeps (#692); no share waits on the holder (answer p99 over the whole hold within --ack-p99-limit-ms); shares on retained work are accepted (at least 90%) until the refresh has been stalled for PRISM_SUBMIT_TIP_MAX_AGE_SECONDS, after which the server's refusals are counted; no session gets work on the new tip before the release, and every session has it within 10 s of the release. The share-ACK p50, p99 and max over the hold are recorded."
+runs = true
+tests = ["qbit-prism-load::faults::faults_under_load_drain_an_offer_in_flight_and_outlast_a_settlement_lock_holder"]
+presets = ["faults-long-real-node", "faults-pr-smoke", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-slow-database"
+title = "The frontends' database path delayed by the proxy under load"
+owner = "#554"
+lanes = ["nightly", "weekly"]
+criteria = "The delay is shown on the frontends' URL (SELECT 1 at least twice the one-way delay); every answer stays truthful (no loss, no divergence); no frontend exits; the second half of the recovery window offers the full rate with ACK p99 within max(--ack-p99-limit-ms, twice the baseline's)."
+runs = true
+presets = ["faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-connection-exhaustion"
+title = "PostgreSQL at max_connections with the frontends' idle backends terminated"
+owner = "#554"
+lanes = ["nightly", "weekly"]
+criteria = "PostgreSQL refuses a connection for want of a slot (53300) and at least one frontend backend is terminated into the full server; no loss and no divergence; no frontend exits; full rate and normal ACK p99 in the second half of the recovery window. The frontends' pool-acquire outcomes are recorded."
+runs = true
+presets = ["faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-frontend-sigkill-holding-a-block"
+title = "SIGKILL of the frontend holding a found block the node has accepted, before its answer is recorded"
+owner = "#554"
+lanes = ["nightly", "weekly"]
+criteria = "The node accepted the block and the frontend is killed inside its 1 s submitblock deadline; its in-flight shares are censused and re-offered and credited once; the block reached the node exactly once and lands without a second offer. The time until it lands is reported, not gated: the dead holder's claim waits for the 120 s candidate lease, which is #529's option-A gap that #585 left open."
+runs = true
+presets = ["faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-rolling-restart"
+title = "SIGTERM and relaunch of each frontend in turn, its sessions moved to the one serving"
+owner = "#554"
+lanes = ["nightly", "weekly"]
+criteria = "Each frontend exits 0 within 35 s, every moved session has work on the serving frontend within 30 s, no committed share goes unanswered, and the full rate returns after the rebalance."
+runs = true
+presets = ["faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-reconnect-storm-under-load"
+title = "Half the sessions drop abruptly and return within 5 s, on the real node"
+owner = "#554"
+lanes = ["nightly", "weekly"]
+criteria = "Every stormed session has work again within 10 s of its return; the abandoned submits are the storm's, never a divergence; full rate afterwards."
+runs = true
+presets = ["faults-long-real-node", "faults-short-real-node"]
+notes = "The fake-node rental-churn shapes (load-rental-churn) run nightly beside it."
+
+[[scenario]]
+id = "read-tier-independence"
+title = "The public API and every /metrics scraped at a realistic rate throughout the faults"
+owner = "#554"
+lanes = ["nightly", "weekly"]
+criteria = "A separate public-api process on the standby, polled at 5 requests a second, answers at least 99% 2xx with p99 at most 1 s over each fault and the whole phase (excluding a PostgreSQL at max_connections only when the public API reads the primary, whose slots that takes); every live frontend's /metrics answers within 1 s (#189's class, #469)."
+runs = true
+presets = ["faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-primary-kill-under-load"
+title = "PostgreSQL primary lost under mining load with async promotion, and the fenced switch (#474 B and #521 scenario 3 at load)"
+owner = "#554"
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "Under D3 (primary-kill): a barrier shows the standby flushed the primary's position, replication is cut and the primary keeps acknowledging, then it is stopped immediately and the standby promoted; every acknowledged share missing on the promoted primary is listed by id, none was acknowledged before the barrier, each is absent from what the standby had received (promotion kept all of that), and the cut left WAL the standby never received; every frontend accepts a share on the new primary within 30 s of the promotion without a restart; a new standby streams afterwards. The fenced switch (primary-switch: writers fenced, the standby replayed through the old primary's flush position) loses nothing."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
+notes = "Every writer reaches the primary through a writer endpoint the fault moves after the promotion; the proven gap losses are excused from the run's durability finding, any other loss is not."
+
+[[scenario]]
+id = "fault-block-mid-landing-failover-under-load"
+title = "A found block mid-landing across an async failover, under load"
+owner = "#554"
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "The block's submitblock is held at the relay while replication is cut and the primary stopped, then let through; with #529's standby wait on, its reservation is on the promoted primary; it reaches the node exactly once and lands within 30 s of the promotion with outcome unknown or accepted (#585); blocks forwarded around the failover whose rows the gap took are counted with the node's answer."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "fault-wal-disk-full-under-load"
+title = "The WAL volume fills under load, then space is freed and PostgreSQL returns"
+owner = "#554"
+lanes = ["dispatch", "weekly"]
+criteria = "PostgreSQL PANICs on the full WAL volume (#575's DiskFullInjector), which is filled again for the hold whenever its crash recovery finds room; no acknowledged share is lost and none is acknowledged inside the intervals PostgreSQL's own log shows it down; every frontend accepts shares again within 30 s without a restart; every frontend's /metrics shows #575's paging condition (qbit_prism_collector_available{collector=\"database\"} == 0) during the outage; a PostgreSQL that cannot be brought back ends the run with its log."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node"]
+notes = "Needs fuse2fs, fuse3 and /dev/fuse on the runner; the primary's pg_wal is on the volume for the whole run."
+
+[[scenario]]
+id = "fault-restart-with-candidate-backlog"
+title = "Both frontends restarted over a pending candidate backlog (#187's class)"
+owner = "#554"
+lanes = ["dispatch", "nightly", "weekly"]
+criteria = "While the node answers submitblock with its warmup error (#526), found blocks build a backlog of unfinished candidates; every frontend exits 0 within 35 s and is relaunched; once the node heals, every backlog row reaches a terminal state (a lost race is orphaned once the fault mints the winner's confirmations), none reaches the node twice, one lands through a single offer, and every row counted before the restart is there after it."
+runs = true
+presets = ["faults-failover-fake-node", "faults-long-real-node", "faults-short-real-node"]
+
+[[scenario]]
+id = "soak-weekly-one-lifetime"
+title = "#575 item 2: a 5.5 h soak of one server lifetime looping the mainnet-shape, rental-churn and tip-delivery workloads"
+owner = "#575"
+lanes = ["weekly"]
+criteria = "No frontend restart; RSS window-peak slope at most 16 MiB/h after an hour and within 2x the warm-up peak; descriptors at most 2/h; connections at most 24 per frontend with no drift; pg_wal at most 2 GiB; at least three partition rollovers and two partitions archived and dropped by share-archive under the load; zero shortfall, tip delivery within budget, and exact reconciliation including the restored archives."
+runs = true
+presets = ["soak-weekly"]
+
+[[scenario]]
+id = "soak-short-leak-gate"
+title = "#575 item 2: a 25-minute soak whose RSS gate a leaking server fails"
+owner = "#575"
+lanes = ["dispatch"]
+criteria = "The preset's gates; a server built with the test-only soak-leak-mutant feature (16 KiB per accepted share) fails the RSS window-peak slope and the 2x warm-up-peak bound."
+runs = true
+presets = ["soak-short"]
+
+[[scenario]]
+id = "soak-smoke-rollover-retention"
+title = "#575 item 2: a four-minute soak smoke with forced rollovers and the full share-archive cycle under load"
+owner = "#575"
+lanes = ["nightly", "dispatch"]
+criteria = "Two rollovers; two partitions sealed, archived, verified, detached and dropped under load and restored for an exact reconciliation; every sample readable; every tip delivered."
+runs = true
+tests = ["qbit-prism-load::soak_smoke::the_soak_smoke_preset_rolls_over_archives_and_holds_its_gates"]
+presets = ["soak-smoke"]
+
+[[scenario]]
+id = "soak-two-hours"
+title = "Two hours at steady state with tips, own blocks and a fault every few minutes"
+owner = "#556"
+lanes = ["L5"]
+criteria = "#291's criteria on #278's metric families: RSS bound, restart count, late wakes, lock-wait and ACK distributions, exact reconciliation."
+runs = false
+reason = "Needs S16's faults (#554); #521 scenario 5's 10-minute soak (r521-5-dense-cadence-soak) is its base."
+
+[[scenario]]
+id = "migration-lifecycle"
+title = "A seeded 2.x.x-schema database migrated, mined on, reconciled and rolled back"
+owner = "#545"
+lanes = ["weekly"]
+criteria = "Set by #545: the drained source's evidence and backup, an isolated restore reconciling exactly before any native acknowledgement, migrate and import-audits rehearsed then run for the cutover, both native servers landing their own blocks on the real node with the history untouched, and the post-ACK boundary of the migration guide's rollback section. #291's rehearsal stays the authority on production-sized data."
+runs = true
+tests = ["qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_2x_ledger_migrates_mines_reconciles_and_restores_in_isolation"]
+
+[[scenario]]
+id = "cutover-rehearsal"
+title = "A mainnet-shaped 2.x.x ledger cut over as the migration guide runs it, measured"
+owner = "#575"
+lanes = ["pr", "weekly"]
+criteria = "Recovery evidence, every 2.x.x table's counts and sums, every address's balances (SQL and the running API) and the payout window are unchanged; a frontend on the result is ready, issues a first job and passes self-check; each step's wall time and longest lock are reported."
+runs = true
+tests = [
+  "qbit-prism-server::migration_rollback::cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance",
+  "qbit-prism-server::live_regtest::migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation",
+]
+notes = "The PR case rehearses a pg_dump of a PR-sized ledger. The weekly live_regtest variant cuts over 1x at 1/16 of the rows (about 4.1M) on a real regtest chain, at the server's default statement timeout, and `make prism-cutover-rehearsal` runs the same checks on an operator's snapshot."
+
+[[scenario]]
+id = "external-target-load-through-a-balancer"
+title = "#291: the load harness's client driving frontends it did not launch, through a TCP balancer"
+owner = "#291"
+lanes = ["pr"]
+criteria = "Two external-target client processes drive two in-repo frontends through a round-robin TCP balancer, one asking for its own share difficulty with d=, and each mines at the difficulty the frontend advertised. A frontend SIGKILLed and relaunched mid-run costs reconnects, not acknowledgements: every disconnected session reconnects, no share is refused as mined wrong, every acknowledged share id is committed, every committed id was acknowledged or went unanswered, and the two processes' stats merge into their sums."
+runs = true
+tests = ["qbit-prism-load::external_frontend::external_load_through_a_balancer_reaches_the_in_repo_frontends_and_reconciles"]
+unit_tests = [
+  "crates/qbit-prism-load/tests/external_target.rs::a_run_mines_the_advertised_difficulty_and_counts_what_the_target_did",
+  "crates/qbit-prism-load/tests/external_target.rs::documents_from_two_processes_merge_into_their_sum",
+  "crates/qbit-prism-load/tests/external_target.rs::without_the_guard_flag_nothing_is_sent",
+]
+notes = "The fixture for #291's failover drill, load-balancer exercise and soak, which run `qbit-prism-load external` against the deployed pair behind the operator's balancer; those runs, and their reconciliation against the promoted primary, stay #291's."
+
+[[scenario]]
+id = "shipped-image-lane"
+title = "The Compose prism profile with the HA overlay under modest real-miner load"
+owner = "#544"
+lanes = ["L6"]
+criteria = "Built by `docker compose build`, the stack runs both overlay frontends ready with distinct IDs that each one's self-check observes; cpuminer-opt on one frontend and qbit-prism-miner on the other each solve a block the node keeps, whose audit bundle both frontends serve identically and which verifies against the node's coinbase and the ledger key; each client's ledger rows equal the shares it saw acknowledged, with every submission answered; the public API lists the verified blocks; and #281 criterion 1 holds on the images."
+runs = true
+lane_checks = [
+  "ha-frontends-ready",
+  "cross-frontend-resume",
+  "cpuminer-found-block",
+  "prism-miner-found-block",
+  "found-block-audit-verifies",
+  "ledger-reconciles",
+  "public-api-lists-found-blocks",
+]
+notes = "scripts/prism_shipped_image_lane.py; the report, client logs and Compose logs are the `prism-shipped-images` artifact."

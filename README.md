@@ -1,3 +1,9 @@
+> **Version 3.0.0: the Rust PRISM server
+> ([#244](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/244)).**
+> Deploy it from the `v3.0.0` tag, and upgrade from `2.x.x` only as the
+> [3.0.0 release notes](doc/release-notes-3.0.0.md#upgrading) describe: native
+> migration is one-way. `3.x.x` continues as 3.1 and is not this release.
+
 # qbit-mining-bootstrap
 
 `qbit-mining-bootstrap` is the runnable mining lab for qbit. It stays outside qbit core on purpose: qbit owns node, RPC, and validation behavior; this repo owns operator workflows, Docker Compose, pool configs, helper services, runbooks, and end-to-end mining validation.
@@ -70,11 +76,18 @@ $EDITOR .env
 make up
 ```
 
-To validate the environment without starting containers, run:
+To validate the environment before starting the operator services, run:
 
 ```bash
 make doctor
 ```
+
+For the PRISM lane, doctor prepares the tagged lab image and runs its one-shot
+reader-configuration validator, without starting database dependencies or
+publishing ports. Production and digest-pinned images must be pulled beforehand
+as described in the [mainnet runbook](docs/mainnet-deployment.md). Use the same
+ordered `COMPOSE_OVERLAY_FILES` with doctor and `make up-prism-pool`; see the
+[reader preflight examples](docs/prism-postgres-replica.md#public-reader-credentials).
 
 To validate a running PRISM operator stack, run:
 
@@ -82,16 +95,25 @@ To validate a running PRISM operator stack, run:
 make prism-self-check
 ```
 
-`prism-self-check` prints PASS/WARN/FAIL rows for qbit RPC, coordinator
-health, Stratum reachability, Postgres readiness, audit-dir writability,
-production key material, forbidden test flags, and basic mining
-configuration. It exits non-zero on hard failures.
+`prism-self-check` runs the native `qbit-prism-server self-check` command in the
+coordinator container. It validates node identity, configuration, live HTTP
+readiness, database durability, and carry-forward integrity, then emits
+structured JSON. It exits nonzero on failure. When the optional high-difficulty
+listener is enabled, it also checks its initial difficulty through Stratum.
 
 ### Run PRISM Pool
 
-Direct PRISM Stratum requires Postgres, three key values, and an advertised
-Stratum URL before `make up-prism-pool` starts. Generate unique deployment
-seeds and derive the trusted ledger public key from the ledger attestation seed:
+Prism runs entirely in Rust with a multithreaded runtime and can serve several
+physical frontends against one shared HA PostgreSQL writer endpoint. Existing
+Python deployments must use the coordinated [Rust migration
+procedure](docs/prism-rust-migration.md); the old and new runtimes must not write
+to the same database together. See the [native server
+commands](crates/qbit-prism-server/README.md) for deployment and operator tools.
+
+Direct PRISM Stratum requires Postgres, two signing seeds, and the trusted
+ledger public key before `make up-prism-pool` starts. Generate unique
+deployment seeds and derive the
+trusted ledger public key from the ledger attestation seed:
 
 ```bash
 PRISM_MANIFEST_SIGNING_SEED_HEX="$(openssl rand -hex 32)"
@@ -103,8 +125,13 @@ PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX="$(
 )"
 ```
 
-Store those values in `.env`, keep all `PRISM_ALLOW_*` flags at `0`, and set
-`QBIT_PRODUCTION=1` for non-regtest deployments. Production also requires
+Store `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX` in `.env`, keep all `PRISM_ALLOW_*`
+flags at `0`, and set `QBIT_PRODUCTION=1` for non-regtest deployments.
+Production reads the seeds only from files in the directory named by
+`PRISM_SECRETS_SOURCE`, readable by the image's UID 10001, and rejects the
+direct seed variables; see [PRISM signing
+secrets](docs/mainnet-deployment.md#prism-signing-secrets). A local lab may
+store both seeds in `.env` instead. Production also requires
 explicit, reviewed, positive values for `PRISM_STRATUM_SHARE_DIFF` and the
 `PRISM_STRATUM_VARDIFF_MIN_DIFF`, `PRISM_STRATUM_VARDIFF_START_DIFF`, and
 `PRISM_STRATUM_VARDIFF_MAX_DIFF` bounds. The local-lab `1e-9` values are
@@ -112,15 +139,7 @@ rejected, and the vardiff bounds must satisfy `minimum <= start <= maximum`.
 The public ledger key must be distributed to verifiers out of band; do not ask
 verifiers to trust a key copied from the audit bundle they are checking.
 
-Also set `PRISM_PUBLIC_STRATUM_URL` in the same environment file to the endpoint
-miners can reach. Replace the example hostname and port with your pool's:
-
-```dotenv
-PRISM_PUBLIC_STRATUM_URL=stratum+tcp://pool.example:3340
-```
-
-The target rejects a missing or blank URL before starting services. Then start
-and validate the pool:
+Then start and validate the pool:
 
 ```bash
 make up-prism-pool
@@ -128,8 +147,8 @@ make prism-self-check
 ```
 
 `make up-prism-pool` prints the Stratum URL. Miners authorize with
-`<qbit-payout-address>[.<worker>]` usernames. The separate `prism-public-api`
-service serves `/public/v1` on port `3342` by default. Keep `/audit/*`,
+`<qbit-payout-address>[.<worker>]` usernames. The coordinator serves `/public/v1`
+from its audit HTTP listener for dashboard-safe read models. Keep `/audit/*`,
 `/metrics`, `/healthz`, Postgres, qbit RPC, ckpool command sockets, and Docker
 volumes private unless you intentionally proxy them with access controls. See
 [`docs/prism-storage-sizing.md`](docs/prism-storage-sizing.md) for PRISM
@@ -149,8 +168,8 @@ Useful entrypoints:
 - `make up-auxpow-pool`
 - `make up-prism-pool`
 - `make prism-self-check`
+- `make test-prism-postgres`
 - `make test-prism-regtest`
-- `make test-prism-stratum-regtest-live`
 - `make up-dual-pools`
 - `make test-auxpow`
 - `make test-auxpow-stratum`
@@ -471,8 +490,6 @@ qbit has its own JSON-RPC defaults. The qbit-specific `8355` value is the mainne
 
 ## Operator Notes
 
-- Release preparation, publication, and development-branch synchronization are
-  documented in [Publishing a release](docs/releasing.md).
 - Public qbit networks use P2MR-only wallet output types. Use default wallet-generated payout addresses, and keep payout transactions inside qbit's allowed output policy.
 - Direct PRISM Stratum accepts `<qbit-payout-address>[.<worker>]` usernames. On qbit test chains, an invalid username payout falls back to `tq1zlsq9dpxz8mennhdpr9nf9s0f2tjtq6gxs9m84k6xglhkfp92q2zszzu4m3` unless `PRISM_USERNAME_FALLBACK_ADDRESS` is set.
 - Direct PRISM Stratum tags its coinbase scriptSig with `PRISM_COINBASE_TAG` before the Stratum extranonce. The default is `/PRISM/`; set `PRISM_COINBASE_TAG=` to disable it or set another short printable ASCII tag.

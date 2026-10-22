@@ -1,0 +1,10 @@
+#cfg retarget=0.001 initial_min=0.001 initial_shares=1 bits=1d00ffff
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}
+#sleep
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}
+#sleep
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}
+{"id":5,"method":"mining.submit","params":["$user","$job1","$en2","$ntime","$nonce"]}
+{"id":6,"method":"mining.suggest_difficulty","params":[1e-9]}

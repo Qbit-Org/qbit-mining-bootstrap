@@ -3,10 +3,13 @@
 PRISM rejection reason IDs are stable machine-readable strings. Operator logs,
 Prometheus metrics, Stratum error data, ledger rejected-row fixtures, and future
 dashboard/API surfaces should use these IDs instead of parsing human messages.
+This reference includes legacy IDs retained for historical records. The
+[native metric inventory](prism-native-metrics.md) lists the current closed
+share-rejection label set.
 
 | Reason ID | Meaning |
 | --- | --- |
-| `stale-job` | The submitted share or block candidate was built on an obsolete qbit tip/template outside the stale-grace credit window. |
+| `stale-job` | The submitted share or block candidate no longer has valid job authority, including an obsolete tip/template outside stale grace, a payout revision that moved before the share's commit, or an expired/replaced publication lease refused before COMMIT. |
 | `duplicate-share` | The same miner submitted a share with an already-seen header. |
 | `low-difficulty` | The submitted share did not satisfy the miner's assigned share target. |
 | `malformed-submit` | The `mining.submit` payload could not be parsed or assembled. |
@@ -14,19 +17,31 @@ dashboard/API surfaces should use these IDs instead of parsing human messages.
 | `unknown-job` | The job ID was unknown or no longer active for that client. |
 | `invalid-extranonce` | The extranonce field had an invalid shape for this coordinator. |
 | `invalid-ntime-or-nonce` | `ntime` or `nonce` was not a 4-byte hex string. |
-| `candidate-audit-mismatch` | The final PRISM audit bundle did not match the submitted coinbase. |
-| `submitblock-rejected` | qbit `submitblock` rejected the candidate or did not advance to the submitted block. |
-| `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission, including stale-grace parent lookup. |
+| `candidate-audit-mismatch` | Legacy taxonomy; no native share producer. The final PRISM audit bundle did not match the submitted coinbase. |
+| `submitblock-rejected` | Legacy taxonomy; no native share producer. qbit `submitblock` rejected the candidate or did not advance to the submitted block. |
+| `backend-rpc-unavailable` | A backend RPC dependency was unavailable while classifying a submission, including stale-grace parent lookup. Also chain authority the frontend could not prove (`current chain state is unavailable`) when no database failure explains it, including a published-work lease whose commit gate could not read or prove that authority immediately before COMMIT (#716; see "Commit-gate refusals"). |
+| `backend-database-unavailable` | A ledger database statement failed, or did not answer in time, while authorizing a session, a job or a submission (#581, #655): a database session allocation (`database unavailable`), issued-job persistence or resume (persistence that outlived the issued job's own deadline while it waited on the database included, whichever of that deadline and the statement it cut short failed first), the payout revision and payout state a submission is checked against (`current payout state is unavailable`), and readiness that aged out because the latest template refresh failed on the database (`current chain state is unavailable`). A Stratum session's own deadline that passes while the coordinator is still waiting on the database lands here too, with the session's message (`session allocation timed out`, `job persistence timed out`, `job resume timed out`, `initial job delivery timed out`; #655): the coordinator names each step it waits on the database for, and the session reads that at its deadline. For issued-job persistence those steps are its clock and revision reads and its batch or repair write; a compact repair's lock, build admission and encoding are not (a persistence that outlives the issued job's own deadline stays the database's whatever it was doing, as #581 decided). So does readiness that aged out while the refresh in flight has outlived its deadline, the health timeout, and is still waiting on the database, although it has not failed yet (`current chain state is unavailable`). So does a published-work lease's commit gate that cannot prove its authority while either holds (#716). A lock held past its bound, a full connection pool and PostgreSQL down land here; so does a cluster halted by its fatal state or a read-only database, whose payout read returns no row. A refusal on a path that also reads the node is attributed to whichever dependency failed, or, for a timeout, to the one the work was still waiting on. Not here: corrupt or changed stored data and a failed blocking task (`backend-rpc-unavailable`, as before), and a session timeout that passes while the work waits on anything the coordinator does not name as the database, such as the node, CPU work or admission behind other work (`backend-rpc-unavailable`, as before #655). |
 | `internal-error` | An internal coordinator failure prevented normal classification. |
 | `pool-closed` | The coordinator was no longer accepting shares. |
-| `block-stale` | The block candidate height was stale against the active qbit tip. |
-| `ledger-confirmation-failed` | The ledger did not confirm a block that qbit appeared to accept. |
+| `block-stale` | Legacy taxonomy; no native share producer. The block candidate height was stale against the active qbit tip. |
+| `ledger-confirmation-failed` | The ledger did not record the share. For share-pass submissions, the commit was not sent or was rolled back. A share whose payout revision moved between its submit check and its commit is not answered here: the append's fence refuses it before any write as `stale-job`, cause `payout_revision` (#675), and while capture is on (`PRISM_CAPTURE_OVERPAY_CEILING_BPS` > 0) a share-pass submission that carries a found block is not refused at all: its block is captured and its answer follows the block's, as for a block-only proof (#657). Nor is a share whose published-work lease's commit gate could not read or prove its authority: since #716 that is answered as admission answers readiness it cannot prove (see "Commit-gate refusals"). For block-only proofs, the block was not on the active chain when its candidate was abandoned, refused by the node after the offer, or settled as a proven orphan (#415); a later reorg or late landing can still credit it. |
+| `ledger-outcome-unknown` | The ledger outcome was not known by the acknowledgement deadline; the share may still be credited (logged with `share_id`). |
 
-The coordinator exposes these IDs in:
+The native coordinator exposes its produced reason IDs in:
 
 - Stratum JSON-RPC error data as `{"reason_id": "<id>"}` when a rejection is
   classified.
 - Prometheus as `qbit_prism_rejections_total{reason_id="<id>"}`.
+
+For share telemetry, present unknown or empty IDs normalize to the bounded
+`unrecognised` label. This is a metrics-only fallback, not a new protocol
+response: the numeric error, message and reason metadata stay unchanged.
+Explicit `internal-error` and missing (`None`) IDs retain the `internal-error`
+label. The existing reason-less username-limit refusal is an authorization
+event and never enters share-rejection telemetry. See the
+[native inventory](prism-native-metrics.md) for the per-reason alert implications;
+an `unrecognised` count indicates a real rejection with a reason outside the
+known taxonomy, not a healthy or absent event.
 
 For ready-pool refreshes, share validation follows the last qbit tip for which
 the refresh path has a coherent, final-validated replacement bundle ready to
@@ -93,28 +108,126 @@ divergence (later detected tips do not renew it). If refresh or reconciliation
 stalls beyond that budget, submits fall back to the live RPC read instead of
 accepting shares against a frozen snapshot.
 
+## Commit-gate refusals
+
+A share admitted under the published-work replacement lease must still hold
+that original authority immediately before COMMIT. If its publication has
+been replaced or its fixed lease/resume deadline expired, a completed typed
+gate refusal produces the existing `stale-job` response:
+numeric code **21**, message **`stale job`**. This is the same authority check
+used before persistence, performed again after database waits. It changes
+classification, not payout eligibility, stale grace, candidate authority or
+the share acknowledgement deadline. No new credit is recorded for this refusal.
+
+Gate closure alone does **not** prove stale work. Authority the gate cannot
+read or prove is answered as admission answers readiness it cannot prove
+(#716): code **20**, message **`current chain state is unavailable`**. The
+reason is `backend-rpc-unavailable`, or `backend-database-unavailable` when
+the latest template refresh failed on the ledger database or the refresh in
+flight is still blocked on it (#581, #655). That covers:
+- an authority lock the gate could not take without waiting, because the tip
+  poll, a fee or readiness write, or the publication itself held or was
+  queued for it;
+- unhealthy or unknown readiness;
+- an unavailable tip observation.
+
+Before #716 these were `ledger-confirmation-failed`. Nothing is written, and
+neither a stale race nor a ledger failure is proven. A share acknowledgement
+deadline that closes the gate before COMMIT, or a refusal that records no
+closure, remains `ledger-confirmation-failed` (code **20**). The first
+closure wins: if a lease fence closed the gate and its ROLLBACK is still in
+flight at the deadline, the fence's answer stands.
+
+For example, a non-refresh probe may observe a return to the published
+parent while its cached observation has aged out. That does not prove the
+unchanged publication or the original lease expired, so the refused append
+is answered `current chain state is unavailable`, not `stale-job`. The winning
+closure cause is fixed atomically: a subsequent tip change cannot turn a
+timeout or backend refusal into an expected stale race. Once COMMIT has
+started, later lease changes cannot change its result: confirmed credit stays
+accepted, a definite rollback stays failed, and an unresolved outcome stays
+`ledger-outcome-unknown`. An identical share already durably credited retains
+its duplicate outcome even if a later gate refuses.
+
+If the append has not returned by the acknowledgement deadline, the existing
+timeout/unknown handling still applies; gate state alone does not replace a
+completed ledger result, including its immutable-row duplicate check.
+
+**Telling the cases apart in logs.** A gate refusal that isn't a proven stale
+lease logs INFO `share commit gate refused before COMMIT`, with a `closure`
+field:
+- `authority-unavailable`: the gate could not read or prove its authority.
+  - Within seconds of a tip change, this is ordinary lock contention with
+    that tip's poll, fee and readiness writes, or publication.
+  - Away from tip changes, or alongside stale readiness, it is a readiness
+    or tip-observation loss; investigate that as you would the same answer
+    at admission.
+- `deadline-or-cancelled` or `unspecified`: a strict refusal.
+
+A WARN `share persistence failed` is a real ledger failure. That includes
+`share commit deadline passed before COMMIT was sent`: a share that waited
+out its acknowledgement deadline.
+`PrismShareAppendFailures` counts only `ledger-confirmation-failed` and
+`ledger-outcome-unknown`, so contention at a tip change no longer fires it.
+These refusals count under `backend-rpc-unavailable`, or
+`backend-database-unavailable` as above, in `qbit_prism_rejections_total`.
+The credit-preserving fix, which retries the append once the authority is
+readable instead of refusing, remains open in #716.
+
+The load harness follows the stable reason ID, including for mixed producer
+versions and saved reports:
+
+| Wire reason | Harness class before and after this change |
+| --- | --- |
+| `stale-job` | Expected race; excluded from `rejected_valid_shares`, never counted as accepted credit. |
+| `ledger-confirmation-failed` | Backend refusal; remains in `rejected_valid_shares`, including the historical message `share was not committed because its commit gate closed`. |
+| `backend-rpc-unavailable`, `backend-database-unavailable` | Backend refusal; remains in `rejected_valid_shares`. Since #716 they also cover a lease whose commit gate could not read or prove its authority (`current chain state is unavailable`). |
+| `ledger-outcome-unknown` | Backend/uncertain outcome; remains in `rejected_valid_shares` and reconciliation. |
+| Missing or unrecognised gate reason | Unknown; no stale exemption from the message alone. |
+
+Older producers used the generic gate-closed message for both stale authority
+and backend causes. Neither that message nor proximity to a tip change can
+retroactively distinguish them. The raw #447 matrix reports are unavailable
+for this change, so no historical verdict recomputation is claimed; the
+recorded verdicts and D1 rule remain unchanged. Any future comparison must
+name its source reports and show the old/new policy explicitly, preserving
+ambiguous failures unless independent causal evidence resolves them.
+
 Rejections are counted, never logged per share or written to the ledger.
-Diagnose reject spikes from `qbit_prism_rejections_total`, the
-`qbit_prism_job_build_seconds` histogram, and the
-`qbit_prism_tip_refresh_seconds` histograms. Per-share/per-job stdout logging
-exists only behind `PRISM_HOT_PATH_LOG=1` for debugging and must stay off in
-production. Prepared fanout passes validate tip and chain-view trust once per
+Diagnose reject spikes from `qbit_prism_rejections_total{reason_id}` and
+`qbit_prism_share_ack_seconds{result="rejected"}`, then use the stale-job
+causes below. The native runtime has no
+per-share or per-job stdout logging; it does not read the retired Python
+`PRISM_HOT_PATH_LOG` <!-- retired-setting: PRISM_HOT_PATH_LOG --> debugging switch. Prepared fanout passes validate tip and chain-view trust once per
 pass (minting a validation token; per-client deliveries consult only
 in-memory token state) plus a post-fanout re-validation, so per-client RPC
 round trips never return to the delivery path.
 
-Additional private metrics relevant to attribution and grace behavior:
+## Stale-job causes
 
-- `qbit_prism_grace_credited_shares_total`
-- `qbit_prism_vardiff_idle_retargets_total`
-- `qbit_prism_worker_submitted_shares_total{worker="<bounded-label>"}`
-- `qbit_prism_worker_accepted_shares_total{worker="<bounded-label>"}`
-- `qbit_prism_worker_grace_credited_shares_total{worker="<bounded-label>"}`
-- `qbit_prism_worker_rejections_total{worker="<bounded-label>",reason_id="<id>"}`
-- `qbit_prism_evicted_job_contexts{class="same_tip|stale_grace"}`
-- `qbit_prism_evicted_job_submits_total{outcome="accepted_same_tip|credited_stale_grace"}`
-- `qbit_prism_evicted_job_expirations_total{class="same_tip|stale_grace"}`
-- `qbit_prism_evicted_job_capacity_evictions_total{scope="connection"}`
+Every `stale-job` rejection keeps its wire reason, numeric code 21 and message.
+`qbit_prism_stale_job_rejections_total{cause}` records which of the five
+decisions below refused the share, once, at that decision. The share observation
+counts the same rejection once as `reason_id="stale-job"`. Lease admission,
+lease revalidation and commit-gate refusals use that coarse reason without a
+label in this five-cause series; its sum is not a total of all stale responses.
+`unknown-job` has no cause series. Stale-grace credit is an accepted
+share, counted by `qbit_prism_grace_credited_shares_total`, not a cause.
 
-`PRISM_WORKER_METRICS_LIMIT` caps distinct worker labels. New workers beyond
-the cap aggregate into `_other`.
+The decisions run in this order, and a share that would fail several is
+counted only under the first one it reaches. No later check runs just to choose
+a cause, and backend-unavailable answers are never stale-job causes.
+
+| Cause | Decision | What to check |
+| --- | --- | --- |
+| `resume_expired` | Stratum found the job's absolute resume lease expired after restoring it for a reconnected miner, before submitting to the coordinator. Message `stale job`. | Reconnect churn and how long miners take to resubmit old work: `qbit_prism_connections`, `qbit_prism_stratum_connection_refusals_total` and the retention settings `PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS` and `PRISM_STRATUM_STALE_GRACE_SECONDS`, whichever is longer. |
+| `fee_floor` | The coordinator found the job's CTV fanout fee below the live relay floor, or the floor unavailable. Message `job CTV fee is below the current relay floor`. | Node relay policy and mempool minimum fee, then whether replacement work reached miners: `qbit_prism_authorized_missing_current_work` and `qbit_prism_stratum_current_tip_coverage_gap_seconds`. |
+| `parent_grace` | The job's parent is not the published tip, and stale grace was unavailable, expired, or the job's parent is not the new tip's immediate parent. Block-only work (#478) is counted here after a tip change without any grace check, and so is a capture abandoned before its offer because its parent is no longer the tip. Message `stale job`. | Tip freshness and delivery: `qbit_prism_stratum_semantic_current_work_ratio`, `qbit_prism_authorized_missing_current_work`, `qbit_prism_stratum_current_tip_coverage_gap_seconds`, `qbit_prism_job_delivery_failures_total` and `qbit_prism_grace_credited_shares_total`. |
+| `payout_revision` | The parent is current, but either the job's payout snapshot or the current published payout snapshot disagrees with the durable payout revision, and no share-lease exception applies. Since #478 a block-bearing proof from ordinary work on the active tip is captured instead and is not counted here. Counted here: block-only work, which a same-parent payout replacement retired (its plain shares, and the share of a block captured from it), and a capture abandoned before its offer by the overpay ceiling or with capture off. Also counted here, after every check above passed (a stale-grace share included): a share-pass submission whose revision a settlement moved before the append's fence read it under `ORDER_LOCK`, refused there before any write (#675). That is a plain share, or a block-bearing one with capture off, whose lost block a WARN names; with capture on its block is captured instead (#657). It is counted when the miner is answered `stale-job`; a block-bearing append still waiting at its acknowledgement deadline was answered `ledger-outcome-unknown` instead and is not. Message `stale job`. | Payout revision changes and replacement delivery: `qbit_prism_pending_job_builds`, `qbit_prism_job_delivery_successes_total`, `qbit_prism_job_delivery_failures_total` and the coverage series above. |
+| `window_not_held` | A block-bearing proof passed every check above, but the candidate enqueue, in the transaction that would write the candidate, found that the current primary does not hold the window its coinbase pays: the window's last row is absent or is another share credited after the window's anchor (#619). After an asynchronous promotion that lost the end of the replication gap, a session can still hold a job on work read from the lost history. The block is never enqueued or offered, and the share it carried is not credited. Message `stale job`; a WARN names the block and #619. The ledger counts the refusal itself, so one that finishes after the miner's acknowledgement deadline (the miner then saw `ledger-outcome-unknown`) is counted too. | A database promotion: the refresh logs and `qbit_prism_refresh_seconds{trigger="writer_timeline"}`, then the HA reference's promotion steps. See [the #619 design note](prism-async-promotion-gap-blocks.md). |
+
+The native registry has no per-worker, evicted-job, job-build or tip-refresh
+histograms; `docs/prism-native-metrics.md` is the complete inventory.
+
+The native runtime does not read the retired Python worker-label cap
+`PRISM_WORKER_METRICS_LIMIT` <!-- retired-setting: PRISM_WORKER_METRICS_LIMIT -->.

@@ -1,0 +1,249 @@
+//! The two storage boundaries used by ordinary share admission.
+//!
+//! Tests replace I/O here, not Coordinator's classification/accounting logic.
+//! Production appends retain the transaction-scoped payout revision check.
+use super::publication_authority::{LeaseCommitFence, LeaseCommitRefusal};
+use super::*;
+use crate::ledger::MovedRevision;
+use futures_util::future::BoxFuture;
+use std::sync::{atomic::AtomicU8, OnceLock};
+
+const OPEN: u8 = 0;
+const COMMITTING: u8 = 1;
+
+/// Stored atomically with closure: later observations cannot change why the
+/// first refusal won, or replace an already-started COMMIT with staleness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum GateClosure {
+    DeadlineOrCancelled = 2,
+    AuthorityUnavailable = 3,
+    StaleAuthority = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GateState {
+    Open,
+    Committing,
+    Closed,
+}
+
+/// One-shot arbiter between an append's COMMIT and its acknowledgement
+/// deadline. Both transitions leave `Open` by compare-and-swap, so exactly one
+/// of them wins: an append sends COMMIT only after `begin_commit` succeeds,
+/// and once `close` succeeds it never will.
+#[derive(Default)]
+pub(super) struct CommitGate {
+    state: AtomicU8,
+    committing_since: OnceLock<Instant>,
+    lease: Option<LeaseCommitFence>,
+}
+
+impl CommitGate {
+    pub(super) fn with_lease(lease: Option<LeaseCommitFence>) -> Self {
+        Self {
+            lease,
+            ..Self::default()
+        }
+    }
+    /// The append's pre-commit hook. `true` lets COMMIT be sent, and records
+    /// when it started.
+    pub(super) fn begin_commit(&self) -> bool {
+        if let Some(lease) = &self.lease {
+            return match lease.with_authority(|| self.begin_authorized_commit()) {
+                Ok(won) => won,
+                Err(refusal) => {
+                    self.close_for(match refusal {
+                        LeaseCommitRefusal::Stale => GateClosure::StaleAuthority,
+                        LeaseCommitRefusal::Unavailable => GateClosure::AuthorityUnavailable,
+                    });
+                    false
+                }
+            };
+        }
+        self.begin_authorized_commit()
+    }
+
+    fn begin_authorized_commit(&self) -> bool {
+        let now = Instant::now();
+        let won = self
+            .state
+            .compare_exchange(OPEN, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if won {
+            let _ = self.committing_since.set(now);
+        }
+        won
+    }
+
+    /// The acknowledgement deadline. `true` means COMMIT was not sent and never
+    /// will be; `false` means the gate was already `Committing`.
+    pub(super) fn close(&self) -> bool {
+        self.close_for(GateClosure::DeadlineOrCancelled)
+    }
+
+    /// Close the gate for `reason`, as the deadline or a lease fence does.
+    #[cfg(test)]
+    pub(super) fn close_for_test(&self, reason: GateClosure) -> bool {
+        self.close_for(reason)
+    }
+
+    fn close_for(&self, reason: GateClosure) -> bool {
+        match self
+            .state
+            .compare_exchange(OPEN, reason as u8, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(current) => current != COMMITTING,
+        }
+    }
+
+    pub(super) fn closure(&self) -> Option<GateClosure> {
+        match self.state.load(Ordering::Acquire) {
+            2 => Some(GateClosure::DeadlineOrCancelled),
+            3 => Some(GateClosure::AuthorityUnavailable),
+            4 => Some(GateClosure::StaleAuthority),
+            _ => None,
+        }
+    }
+
+    pub(super) fn state(&self) -> GateState {
+        match self.state.load(Ordering::Acquire) {
+            OPEN => GateState::Open,
+            COMMITTING => GateState::Committing,
+            _ => GateState::Closed,
+        }
+    }
+
+    /// When COMMIT started, once the gate is `Committing`.
+    pub(super) fn committing_since(&self) -> Option<Instant> {
+        self.committing_since.get().copied()
+    }
+}
+
+/// What a committed share append wrote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Appended {
+    /// The share, and its candidate if it carried one.
+    Inserted,
+    /// Nothing: the immutable row was already durable (a duplicate).
+    Recorded,
+    /// #657: the payout revision moved after the submit check, so the
+    /// append captured its block instead of crediting the share. The block
+    /// is enqueued as a #478 capture, the share deferred until it confirms.
+    Captured,
+}
+
+pub(super) trait SubmitLedger: Send + Sync {
+    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>>;
+    /// Append at `revision`, sending COMMIT only if `gate.begin_commit()`
+    /// succeeds immediately before it.
+    fn append_at_revision(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        revision: i64,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>>;
+    /// [`SubmitLedger::append_at_revision`], recording when the candidate's
+    /// locally validated block proof was observed (a wall clock, UNIX ms),
+    /// and capturing a candidate-bearing append's block if the revision
+    /// moved when `moved` allows it (#657). A store without a durable
+    /// candidate row has nowhere to keep either and keeps the plain append.
+    fn append_at_revision_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        _proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        _moved: MovedRevision,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision(share, candidate, revision, gate)
+    }
+}
+
+impl SubmitLedger for Ledger {
+    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
+        Box::pin(Ledger::payout_revision(self))
+    }
+
+    fn append_at_revision(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        revision: i64,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            MovedRevision::Refuse,
+            gate,
+        )
+    }
+
+    fn append_at_revision_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        moved: MovedRevision,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
+        Box::pin(async move {
+            let pre_commit = || gate.begin_commit();
+            let appended = Ledger::append_at_revision_gated_observed(
+                self,
+                share,
+                candidate,
+                proof_observed_at_ms,
+                revision,
+                &pre_commit,
+                moved,
+            )
+            .await?;
+            Ok(if appended.captured {
+                Appended::Captured
+            } else if appended.inserted {
+                Appended::Inserted
+            } else {
+                Appended::Recorded
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_gate_closure_wins_and_cannot_replace_commit() {
+        let causes = [
+            GateClosure::DeadlineOrCancelled,
+            GateClosure::AuthorityUnavailable,
+            GateClosure::StaleAuthority,
+        ];
+        for first in causes {
+            for later in causes {
+                let gate = CommitGate::default();
+                assert!(gate.close_for(first));
+                assert!(gate.close_for(later));
+                assert!(gate.close());
+                assert!(!gate.begin_commit());
+                assert_eq!(gate.closure(), Some(first));
+                assert_eq!(gate.state(), GateState::Closed);
+                assert!(gate.committing_since().is_none());
+            }
+            let gate = CommitGate::default();
+            assert!(gate.begin_commit());
+            assert!(!gate.close_for(first));
+            assert_eq!(gate.closure(), None);
+            assert_eq!(gate.state(), GateState::Committing);
+        }
+    }
+}

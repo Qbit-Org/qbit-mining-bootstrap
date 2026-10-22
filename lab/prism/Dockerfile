@@ -1,60 +1,51 @@
 # syntax=docker/dockerfile:1.7
 
-FROM python:3.14-slim-trixie
-
-WORKDIR /app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        cargo \
-        postgresql-client \
-        rustc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Persistent pooled Postgres client for the share-ledger hot path. The psql
-# binary stays installed as the fallback backend (PRISM_POSTGRES_NATIVE_CLIENT=0).
-RUN pip install --no-cache-dir "psycopg[binary]==3.2.*"
-
+# The builder is the toolchain pinned in rust-toolchain.toml, by version and by
+# the multi-arch index digest of that tag on Docker Hub; the docker-builds CI
+# job asserts the stage's cargo reports the pin, and
+# scripts/check_toolchain_pin.py holds the version here to the pin.
+FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa AS build
+WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-COPY lab/auxpow/ ./lab/auxpow/
-COPY lab/prism/ ./lab/prism/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --locked --release -p qbit-prism-server -p qbit-prism --bins
 
-ENV PYTHONPATH=/app
-
-# Release profile plus a direct-binary path: the coordinator shells out to
-# these tools on the job build hot path, so it must not pay `cargo run`
-# build-graph checks per invocation nor debug-profile execution time.
-RUN cargo build --locked --release -p qbit-prism --bins
-
-ENV PRISM_TOOL_BIN_DIR=/app/target/release
-
-# Issue #226: glibc malloc arena policy, set deliberately rather than left to
-# glibc. The mainnet coordinator runs about 64 threads and its memory map is
-# hundreds of 4-64 MiB anonymous regions -- the per-thread arena signature --
-# on a host where glibc's default arena limit is 8 x cores = 256, so every
-# thread that ever mallocs owns an arena and that arena's retained free lists.
-# Two arenas is the default because it is safe before the soak decides
-# between 2 and 4: under the GIL at most one Python thread allocates at a
-# time, so arena-lock contention can only come from GIL-released native code
-# (libpq I/O on a handful of pooled connections), and the audit-builder
-# daemon this process spawns inherits the setting but is single-threaded. The
-# failure mode of too few arenas is measurable lock wait on /metrics share-ack
-# latency; the failure mode of too many is the 17.7 GB resident set. Override
-# at build time with --build-arg MALLOC_ARENA_MAX=4 or at run time with
-# -e MALLOC_ARENA_MAX=4; docs/mainnet-deployment.md records the decision and
-# docs/prism-capacity-readiness.md the soak that revisits it.
-#
-# PYTHONMALLOC is deliberately unset: pymalloc keeps objects of 512 bytes and
-# under out of glibc entirely, and routing them through glibc would enlarge
-# the very arenas this bounds. No other MALLOC_* variable is set here. Never
-# set one to an empty value: glibc parses "" as 0, and MALLOC_MMAP_THRESHOLD_=0
-# would send every allocation through mmap. tests/test_prism_heap_census.py
-# pins exactly this allocator environment.
-ARG MALLOC_ARENA_MAX=2
-ENV MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX}
-
-# Keep Python as PID 1 so watchdog os._exit(1) reaches Docker unchanged. Any
-# future wrapper must exec the coordinator or explicitly propagate its status.
-CMD ["python3", "-m", "lab.prism.prism_coordinator"]
+# The runtime base is pinned by the multi-arch index digest of bookworm-slim;
+# move the digest deliberately to take a Debian point or security release.
+# Packages still resolve from the archive at build time: Debian drops
+# superseded versions, so exact apt pins would break the next rebuild.
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 prism \
+    && useradd --system --uid 10001 --gid prism --home-dir /nonexistent \
+        --no-create-home --shell /usr/sbin/nologin prism \
+    && install -d -m 0750 -o prism -g prism /var/lib/qbit-prism/audit
+WORKDIR /app
+COPY --from=build /build/target/release/qbit-prism-server /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-miner /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-audit-canonicalize /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-audit-verify /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-build-audit-bundle /usr/local/bin/
+COPY --from=build /build/target/release/qbit-prism-reorg-verify /usr/local/bin/
+ENV RUST_LOG=info
+EXPOSE 3340 3341
+STOPSIGNAL SIGTERM
+# A numeric UID lets orchestrators verify the non-root policy. Mounted secrets
+# and the audit directory must be readable by UID/GID 10001.
+USER 10001:10001
+# Mining frontends hold signing seeds in memory (#260 D4), so a core dump could
+# write them to disk. Lowering the soft and hard limits here holds under plain
+# `docker run` too; exec keeps the command as PID 1 to receive SIGTERM.
+ENTRYPOINT ["/bin/sh", "-c", "ulimit -c 0 && exec \"$@\"", "qbit-prism"]
+# Probes the operator listener, sending PRISM_OPERATOR_BEARER_TOKEN when set,
+# or Stratum when that listener is disabled. The public-api role overrides it
+# with `healthcheck --public-api`; run qbit-prism-miner and one-shot tools with
+# --no-healthcheck.
+HEALTHCHECK --interval=5s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["qbit-prism-server", "healthcheck"]
+CMD ["qbit-prism-server"]
