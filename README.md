@@ -1,9 +1,8 @@
-> **WARNING: `3.x.x` is a development line and is not production-ready.**
-> The production line is `2.x.x`. This branch carries the Rust PRISM server
-> rewrite ([#244](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/244)),
-> which has not been through a production release. Do not deploy it and do not
-> point a production database at it. See
-> [#283](https://github.com/Qbit-Org/qbit-mining-bootstrap/issues/283).
+> **This is the `3.0.x` release branch: version 3.0.0 of the Rust PRISM server
+> ([#244](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/244)).**
+> Deploy it from the `v3.0.0` tag, and upgrade from `2.x.x` only as the
+> [3.0.0 release notes](doc/release-notes-3.0.0.md#upgrading) describe: native
+> migration is one-way. `3.x.x` continues as 3.1 and is not this release.
 
 # qbit-mining-bootstrap
 
