@@ -1,0 +1,544 @@
+[
+  {
+    "answers": [
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bestblockhash": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+          "blocks": 100,
+          "chain": "test",
+          "chainwork": "65",
+          "headers": 100,
+          "initialblockdownload": false
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "connections": 2
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bits": "1e7fffff",
+          "coinbasevalue": 5000000000,
+          "curtime": "<now>",
+          "height": 101,
+          "mintime": "<now - 1>",
+          "previousblockhash": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+          "transactions": [],
+          "version": 536870912
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "0eae7271846d637573f2a920ddd3866b36a5e2fd596b4829b64081db6c23fbed"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca"
+      },
+      {
+        "error": {
+          "code": -8,
+          "message": "Block height out of range"
+        },
+        "id": 42,
+        "result": null
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "previousblockhash": "9ef27a51445f97798ad98cbccc9b3a4f8b2eaf89089ddb3e8edf045464d2a2ea"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {}
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "isvalid": true,
+          "scriptPubKey": "5220e9c47480f0900fc05f96938967ee508701f5f554c21d3d06302456778f5de3af"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "isvalid": false
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "bad-block-hex"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "bad-block-length"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "prev-blk-not-found"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": null
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "hash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7",
+          "height": 101
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "feerate": "0.00001"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "mempoolminfee": "0.00001",
+          "minrelaytxfee": "0.00001"
+        }
+      },
+      {
+        "error": {
+          "code": -32601,
+          "message": "unexpected RPC"
+        },
+        "id": 42,
+        "result": null
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bestblockhash": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f",
+          "blocks": 102,
+          "chain": "test",
+          "chainwork": "67",
+          "headers": 102,
+          "initialblockdownload": false
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bits": "1e7fffff",
+          "coinbasevalue": 5000000000,
+          "curtime": "<now>",
+          "height": 103,
+          "mintime": "<now - 1>",
+          "previousblockhash": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f",
+          "transactions": [],
+          "version": 536870912
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "previousblockhash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f"
+      }
+    ],
+    "chainwork": "67",
+    "retarget": false,
+    "rpc_call_counts": [
+      [
+        "estimatesmartfee",
+        1
+      ],
+      [
+        "getbestblockhash",
+        1
+      ],
+      [
+        "getblockchaininfo",
+        2
+      ],
+      [
+        "getblockcount",
+        1
+      ],
+      [
+        "getblockhash",
+        5
+      ],
+      [
+        "getblockheader",
+        3
+      ],
+      [
+        "getblocktemplate",
+        2
+      ],
+      [
+        "getmempoolinfo",
+        1
+      ],
+      [
+        "getnetworkinfo",
+        1
+      ],
+      [
+        "submitblock",
+        4
+      ],
+      [
+        "validateaddress",
+        2
+      ],
+      [
+        "waitfornewblock",
+        1
+      ]
+    ],
+    "submissions": [
+      {
+        "accepted": false,
+        "block_bytes": 145,
+        "block_hash": "a4663b895738c58196f1d83018e9a2a55ab64c67c22accadf0dcb3f5147722a6",
+        "height": 101,
+        "parent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "rejection": "prev-blk-not-found"
+      },
+      {
+        "accepted": true,
+        "block_bytes": 145,
+        "block_hash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7",
+        "height": 101,
+        "parent": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+        "rejection": null
+      }
+    ],
+    "tip_changes": [
+      {
+        "hash": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+        "height": 100,
+        "next_template_bits": "1e7fffff",
+        "origin": "bootstrap"
+      },
+      {
+        "hash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7",
+        "height": 101,
+        "next_template_bits": "1e7fffff",
+        "origin": "pool"
+      },
+      {
+        "hash": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f",
+        "height": 102,
+        "next_template_bits": "1e7fffff",
+        "origin": "external"
+      }
+    ]
+  },
+  {
+    "answers": [
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bestblockhash": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+          "blocks": 100,
+          "chain": "test",
+          "chainwork": "65",
+          "headers": 100,
+          "initialblockdownload": false
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "connections": 2
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bits": "1e7b0004",
+          "coinbasevalue": 5000000000,
+          "curtime": "<now>",
+          "height": 101,
+          "mintime": "<now - 1>",
+          "previousblockhash": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+          "transactions": [],
+          "version": 536870912
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "0eae7271846d637573f2a920ddd3866b36a5e2fd596b4829b64081db6c23fbed"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca"
+      },
+      {
+        "error": {
+          "code": -8,
+          "message": "Block height out of range"
+        },
+        "id": 42,
+        "result": null
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "previousblockhash": "9ef27a51445f97798ad98cbccc9b3a4f8b2eaf89089ddb3e8edf045464d2a2ea"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {}
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "isvalid": true,
+          "scriptPubKey": "5220e9c47480f0900fc05f96938967ee508701f5f554c21d3d06302456778f5de3af"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "isvalid": false
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "bad-block-hex"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "bad-block-length"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "prev-blk-not-found"
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": null
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "hash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7",
+          "height": 101
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "feerate": "0.00001"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "mempoolminfee": "0.00001",
+          "minrelaytxfee": "0.00001"
+        }
+      },
+      {
+        "error": {
+          "code": -32601,
+          "message": "unexpected RPC"
+        },
+        "id": 42,
+        "result": null
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bestblockhash": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f",
+          "blocks": 102,
+          "chain": "test",
+          "chainwork": "67",
+          "headers": 102,
+          "initialblockdownload": false
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "bits": "1e790006",
+          "coinbasevalue": 5000000000,
+          "curtime": "<now>",
+          "height": 103,
+          "mintime": "<now - 1>",
+          "previousblockhash": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f",
+          "transactions": [],
+          "version": 536870912
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": {
+          "previousblockhash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7"
+        }
+      },
+      {
+        "error": null,
+        "id": 42,
+        "result": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f"
+      }
+    ],
+    "chainwork": "67",
+    "retarget": true,
+    "rpc_call_counts": [
+      [
+        "estimatesmartfee",
+        1
+      ],
+      [
+        "getbestblockhash",
+        1
+      ],
+      [
+        "getblockchaininfo",
+        2
+      ],
+      [
+        "getblockcount",
+        1
+      ],
+      [
+        "getblockhash",
+        5
+      ],
+      [
+        "getblockheader",
+        3
+      ],
+      [
+        "getblocktemplate",
+        2
+      ],
+      [
+        "getmempoolinfo",
+        1
+      ],
+      [
+        "getnetworkinfo",
+        1
+      ],
+      [
+        "submitblock",
+        4
+      ],
+      [
+        "validateaddress",
+        2
+      ],
+      [
+        "waitfornewblock",
+        1
+      ]
+    ],
+    "submissions": [
+      {
+        "accepted": false,
+        "block_bytes": 145,
+        "block_hash": "a4663b895738c58196f1d83018e9a2a55ab64c67c22accadf0dcb3f5147722a6",
+        "height": 101,
+        "parent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "rejection": "prev-blk-not-found"
+      },
+      {
+        "accepted": true,
+        "block_bytes": 145,
+        "block_hash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7",
+        "height": 101,
+        "parent": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+        "rejection": null
+      }
+    ],
+    "tip_changes": [
+      {
+        "hash": "d60df5e3312519b68a8aedbce4a8b951d5a9f58fa576688c6c292e4603cc30ca",
+        "height": 100,
+        "next_template_bits": "1e7b0004",
+        "origin": "bootstrap"
+      },
+      {
+        "hash": "2adc995086550eebe8eedd06e4a447e380c68973ef67d4eff99fbc643ff146f7",
+        "height": 101,
+        "next_template_bits": "1e7a0005",
+        "origin": "pool"
+      },
+      {
+        "hash": "b09dd52c6772d36f8941f101a557a11535e9b4f852fba9a6b0ded8f4ed350f2f",
+        "height": 102,
+        "next_template_bits": "1e790006",
+        "origin": "external"
+      }
+    ]
+  }
+]

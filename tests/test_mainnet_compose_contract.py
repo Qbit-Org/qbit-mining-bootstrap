@@ -14,6 +14,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "mainnet-compose.env"
+SECRETS_TARGET = "/run/secrets/qbit-prism"
 OPERATOR_SERVICES = {
     "qbitd",
     "ckpool",
@@ -90,6 +91,89 @@ class MainnetComposeContractTests(unittest.TestCase):
                 f"stderr:\n{completed.stderr}"
             )
         cls.config = json.loads(completed.stdout)
+        cls.compose_env = env
+        cls.ha_config = cls.render_ha()
+
+    @classmethod
+    def render_ha(cls, **overrides: str) -> dict[str, Any]:
+        completed = subprocess.run(
+            [cls.docker, "compose", "--env-file", str(ROOT / "config/upstream.env.example"),
+             "--env-file", str(FIXTURE), "-f", str(ROOT / "compose.yaml"),
+             "-f", str(ROOT / "compose.production.yaml"),
+             "-f", str(ROOT / "compose.prism-ha.yaml"),
+             "--project-name", "qbit-mainnet-ha-contract", "--profile", "prism",
+             "config", "--format", "json"],
+            cwd=ROOT, env={**cls.compose_env, **overrides}, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(f"HA compose render failed: {completed.stderr}")
+        return json.loads(completed.stdout)
+
+    def test_ha_preserves_global_rpc_and_shared_database(self) -> None:
+        base = self._environment("prism-coordinator")
+        for name in ("prism-coordinator", "prism-coordinator-2"):
+            with self.subTest(service=name):
+                env = self.ha_config["services"][name]["environment"]
+                for key in ("QBIT_RPC_HOST", "QBIT_RPC_URL", "PRISM_DATABASE_URL"):
+                    self.assertEqual(env[key], base[key], key)
+                self.assertEqual(env["PRISM_AUDIT_BIND"], "0.0.0.0")
+
+    def test_ha_frontends_have_distinct_ids_and_published_ports(self) -> None:
+        pair = [self.ha_config["services"][name]
+                for name in ("prism-coordinator", "prism-coordinator-2")]
+        self.assertEqual(len({s["environment"]["PRISM_INSTANCE_ID"] for s in pair}), 2)
+        ports = [str(p["published"]) for s in pair for p in s["ports"]
+                 if str(p["published"]) != "0"]
+        self.assertEqual(len(ports), len(set(ports)))
+
+    def test_block_submission_kill_switch_defaults_on_and_reaches_both_frontends(self) -> None:
+        # #291: production submits; a rehearsal holds every frontend of the pair.
+        self.assertEqual(
+            self._environment("prism-coordinator")["PRISM_BLOCK_SUBMIT_ENABLED"], "1"
+        )
+        held = self.render_ha(PRISM_BLOCK_SUBMIT_ENABLED="0")
+        for name in ("prism-coordinator", "prism-coordinator-2"):
+            with self.subTest(service=name):
+                default = self.ha_config["services"][name]["environment"]
+                self.assertEqual(default["PRISM_BLOCK_SUBMIT_ENABLED"], "1")
+                env = held["services"][name]["environment"]
+                self.assertEqual(env["PRISM_BLOCK_SUBMIT_ENABLED"], "0")
+
+    def test_ha_requires_http_health_despite_base_listener_disable(self) -> None:
+        for port in ("3341", "25351"):
+            config = self.render_ha(PRISM_AUDIT_PORT="0", PRISM_HA_AUDIT_PORT=port)
+            for name in ("prism-coordinator", "prism-coordinator-2"):
+                with self.subTest(service=name, port=port):
+                    service = config["services"][name]
+                    self.assertEqual(service["environment"]["PRISM_AUDIT_PORT"], port)
+                    self.assertIn(int(port), [p["target"] for p in service["ports"]])
+
+    def test_ha_per_frontend_overrides_win_over_base_values(self) -> None:
+        config = self.render_ha(
+            PRISM_HA_RPC_URL_1="https://east.example.invalid/rpc",
+            PRISM_HA_RPC_URL_2="https://west.example.invalid/rpc",
+            PRISM_HA_RPC_HOST_1="east.example.invalid",
+            PRISM_HA_RPC_HOST_2="west.example.invalid",
+            PRISM_HA_INSTANCE_ID_1="verify-east", PRISM_HA_INSTANCE_ID_2="verify-west",
+            PRISM_HA_STRATUM_PORT_HOST_1="127.0.0.1:25340",
+            PRISM_HA_STRATUM_PORT_HOST_2="127.0.0.1:25343",
+            PRISM_HA_HIGHDIFF_PORT_HOST_1="127.0.0.1:25345",
+            PRISM_HA_HIGHDIFF_PORT_HOST_2="127.0.0.1:25346",
+            PRISM_HA_AUDIT_BIND="::",
+        )
+        for name, side, ports in (
+            ("prism-coordinator", "east", {"25340", "25345"}),
+            ("prism-coordinator-2", "west", {"25343", "25346"}),
+        ):
+            with self.subTest(service=name):
+                service = config["services"][name]
+                env = service["environment"]
+                self.assertEqual(env["PRISM_INSTANCE_ID"], f"verify-{side}")
+                self.assertEqual(env["QBIT_RPC_HOST"], f"{side}.example.invalid")
+                self.assertEqual(env["QBIT_RPC_URL"], f"https://{side}.example.invalid/rpc")
+                self.assertEqual(env["PRISM_AUDIT_BIND"], "::")
+                self.assertLessEqual(ports, {str(p["published"]) for p in service["ports"]})
 
     def test_profiles_render_expected_service_graph(self) -> None:
         services = set(self.config["services"])
@@ -156,6 +240,64 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"], "1000")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"], "12000")
 
+    def test_ctv_settlement_runs_with_a_pool_fee(self) -> None:
+        # #525: without one, the first sub-floor balance stops all work.
+        env = self._environment("prism-coordinator")
+
+        self.assertEqual(env["PRISM_CTV_SETTLEMENT_ENABLED"], "1")
+        self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "1")
+        self.assertEqual(env["PRISM_POOL_FEE_BPS"], "200")
+        self.assertEqual(env["PRISM_POOL_FEE_ADDRESS"], "qb1syntheticmainnetpoolfeeaddress")
+
+    def test_role_rendered_compose_names_exactly_one_pool_fee_recipient(self) -> None:
+        # #535: the deploy role runs compose.yaml alone and renders the fee
+        # address without a program line. A recipient default in compose.yaml
+        # would put a program beside that address, and every server refuses
+        # "configure exactly one pool fee address or P2MR program".
+        fixture = [
+            line
+            for line in FIXTURE.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("PRISM_POOL_FEE_P2MR_PROGRAM_HEX=")
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "role.env"
+            deploy_env.write_text("\n".join(fixture) + "\n", encoding="utf-8")
+            for ctv in ("1", "0"):
+                with self.subTest(ctv=ctv):
+                    env = self._render_coordinator(
+                        deploy_env, PRISM_CTV_SETTLEMENT_ENABLED=ctv
+                    )
+                    self.assertEqual(env["PRISM_CTV_SETTLEMENT_ENABLED"], ctv)
+                    self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "1")
+                    self.assertEqual(
+                        env["PRISM_POOL_FEE_ADDRESS"], "qb1syntheticmainnetpoolfeeaddress"
+                    )
+                    self.assertEqual(env["PRISM_POOL_FEE_P2MR_PROGRAM_HEX"], "")
+        # A deployment that names no fee gets none and no recipient: the
+        # server refuses to run with the settings to set, while every tool,
+        # policy-transition's current side included, still reads it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deploy_env = Path(temp_dir) / "bare.env"
+            deploy_env.write_text("MINING_LANES=prism\n", encoding="utf-8")
+            env = self._render_coordinator(deploy_env)
+            self.assertEqual(env["PRISM_POOL_FEE_ENABLED"], "0")
+            self.assertEqual(env["PRISM_POOL_FEE_BPS"], "")
+            self.assertEqual(env["PRISM_POOL_FEE_ADDRESS"], "")
+            self.assertEqual(env["PRISM_POOL_FEE_P2MR_PROGRAM_HEX"], "")
+
+    def _render_coordinator(self, deploy_env: Path, **overrides: str) -> dict[str, str]:
+        completed = subprocess.run(
+            [self.docker, "compose", "--env-file", str(ROOT / "config/upstream.env.example"),
+             "--env-file", str(deploy_env), "-f", str(ROOT / "compose.yaml"),
+             "--project-name", "qbit-role-pool-fee-contract", "--profile", "prism",
+             "config", "--format", "json", "prism-coordinator"],
+            cwd=ROOT, env={**self.compose_env, **overrides}, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        raw_env = json.loads(completed.stdout)["services"]["prism-coordinator"]["environment"]
+        return {str(key): str(value) for key, value in raw_env.items()}
+
     def test_prism_uses_explicit_non_lab_difficulty_profile(self) -> None:
         env = self._environment("prism-coordinator")
 
@@ -163,8 +305,35 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MIN_DIFF"], "1024")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_START_DIFF"], "4096")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_MAX_DIFF"], "65536")
-        self.assertEqual(env["PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS"], "120")
-        self.assertEqual(env["PRISM_COORDINATION_BLOCKED_EXIT_SECONDS"], "900")
+        self.assertEqual(env["PRISM_DATABASE_MAX_CONNECTIONS"], "16")
+        self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "15")
+
+    def test_prism_services_receive_the_complete_rpc_endpoint_override(self) -> None:
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                self.assertEqual(
+                    self._environment(service)["QBIT_RPC_URL"],
+                    "https://rpc.example.invalid:8443/qbit/mainnet/rpc",
+                )
+
+    def test_prism_services_receive_configured_database_and_read_limits(self) -> None:
+        writer = self._environment("prism-coordinator")
+        self.assertEqual(writer["QBIT_TOOLS_PRODUCTION"], "1")
+        self.assertEqual(writer["PRISM_DATABASE_STATEMENT_TIMEOUT_MS"], "23000")
+        self.assertEqual(writer["PRISM_DATABASE_LOCK_TIMEOUT_MS"], "7000")
+        self.assertEqual(writer["PRISM_SHARE_COMMIT_TIMEOUT_SECONDS"], "19")
+        self.assertEqual(writer["PRISM_RPC_TIMEOUT_SECONDS"], "21")
+        self.assertEqual(writer["PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS"], "2")
+        self.assertEqual(writer["PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS"], "17")
+        for service in ("prism-coordinator", "prism-public-api"):
+            with self.subTest(service=service):
+                env = self._environment(service)
+                self.assertEqual(env["PRISM_PUBLIC_READ_STATEMENT_TIMEOUT_SECONDS"], "9")
+                self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "3")
+                self.assertEqual(env["PRISM_PUBLIC_AUDIT_REBUILD_CONCURRENCY"], "2")
+                self.assertEqual(env["PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT"], "11")
+                self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_BITS"], "24576")
+                self.assertEqual(env["PRISM_PAYOUT_MIN_OUTPUT_SATS"], "24576")
 
     def test_prism_runtime_has_no_capacity_evidence_dependency(self) -> None:
         env = self._environment("prism-coordinator")
@@ -207,9 +376,6 @@ class MainnetComposeContractTests(unittest.TestCase):
             ("prism-postgres-replica", "/var/lib/postgresql/data"): (
                 "/srv/qbit-mining-bootstrap/mainnet/postgres-replica/data"
             ),
-            ("prism-public-api", "/var/lib/qbit-prism/audit"): (
-                "/srv/qbit-mining-bootstrap/mainnet/prism/audit"
-            ),
         }
 
         for (service, target), source in expected.items():
@@ -226,6 +392,10 @@ class MainnetComposeContractTests(unittest.TestCase):
                 self.assertFalse(
                     mounts[0].get("bind", {}).get("create_host_path", False)
                 )
+
+        public = self.config["services"]["prism-public-api"]
+        self.assertEqual(public["command"], ["qbit-prism-server", "public-api"])
+        self.assertFalse(public.get("volumes"), "native public audits come from PostgreSQL")
 
     def test_postgres_wal_has_a_separate_storage_boundary(self) -> None:
         postgres = self.config["services"]["prism-postgres"]
@@ -359,13 +529,65 @@ class MainnetComposeContractTests(unittest.TestCase):
         self.assertNotIn("-rpcpassword=change-this", bitcoin_command)
         self.assertNotEqual(postgres_env["POSTGRES_PASSWORD"], "change-this")
         self.assertNotIn("change-this", prism_env["PRISM_DATABASE_URL"])
-        self.assertEqual(prism_env["PRISM_LEDGER_WRITER_SESSION_TOKEN"], "")
-        self.assertEqual(len(prism_env["PRISM_MANIFEST_SIGNING_SEED_HEX"]), 64)
-        self.assertEqual(len(prism_env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"]), 64)
-        self.assertNotEqual(
-            prism_env["PRISM_MANIFEST_SIGNING_SEED_HEX"],
-            prism_env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"],
+        self.assertNotIn("PRISM_LEDGER_WRITER_SESSION_TOKEN", prism_env)
+        self.assertNotIn("d" * 64, json.dumps(self.config))
+        self.assertNotIn("e" * 64, json.dumps(self.config))
+
+    def test_frontends_read_signing_seeds_only_from_the_read_only_mount(self) -> None:
+        # Issue #260 D4: the fixture's stale direct seeds must not reach a
+        # production frontend, including the second HA frontend.
+        for config, name in (
+            (self.config, "prism-coordinator"),
+            (self.ha_config, "prism-coordinator"),
+            (self.ha_config, "prism-coordinator-2"),
+        ):
+            with self.subTest(service=name, ha=config is self.ha_config):
+                service = config["services"][name]
+                env = service["environment"]
+                self.assertEqual(env["PRISM_MANIFEST_SIGNING_SEED_HEX"], "")
+                self.assertEqual(env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX"], "")
+                self.assertEqual(env["PRISM_ALLOW_TEST_SIGNING_SEEDS"], "0")
+                self.assertEqual(
+                    env["PRISM_MANIFEST_SIGNING_SEED_HEX_FILE"],
+                    f"{SECRETS_TARGET}/manifest-signing-seed-hex",
+                )
+                self.assertEqual(
+                    env["PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX_FILE"],
+                    f"{SECRETS_TARGET}/ledger-attestation-signing-seed-hex",
+                )
+                mounts = [
+                    volume for volume in service["volumes"]
+                    if isinstance(volume, dict) and volume.get("target") == SECRETS_TARGET
+                ]
+                self.assertEqual(len(mounts), 1)
+                self.assertEqual(mounts[0]["type"], "bind")
+                self.assertEqual(
+                    mounts[0]["source"], "/srv/qbit-mining-bootstrap/mainnet/prism/secrets"
+                )
+                self.assertTrue(mounts[0].get("read_only"))
+                self.assertFalse(mounts[0].get("bind", {}).get("create_host_path", False))
+
+    def test_public_read_tier_is_seedless(self) -> None:
+        public = self.config["services"]["prism-public-api"]
+        self.assertFalse(
+            [name for name in public["environment"]
+             if "SIGNING_SEED" in name or "OPERATOR_BEARER_TOKEN" in name]
         )
+        self.assertFalse(public.get("volumes"))
+
+    def test_prism_containers_disable_core_dumps(self) -> None:
+        for config, name in (
+            (self.config, "prism-coordinator"),
+            (self.config, "prism-public-api"),
+            (self.ha_config, "prism-coordinator-2"),
+        ):
+            with self.subTest(service=name):
+                core = config["services"][name]["ulimits"]["core"]
+                # The rendered form omits zero-valued soft and hard limits.
+                limits = (
+                    (core.get("soft", 0), core.get("hard", 0)) if isinstance(core, dict) else (core, core)
+                )
+                self.assertEqual(limits, (0, 0))
 
     def test_bitcoin_build_uses_architecture_specific_checksums(self) -> None:
         args = self.config["services"]["bitcoind"]["build"]["args"]
@@ -483,6 +705,12 @@ class MainnetComposeContractTests(unittest.TestCase):
                 if isinstance(volume, dict)
             )
         )
+        secrets = [
+            volume for volume in config["services"]["prism-coordinator"]["volumes"]
+            if isinstance(volume, dict) and volume.get("target") == SECRETS_TARGET
+        ]
+        self.assertEqual(len(secrets), 1)
+        self.assertTrue(secrets[0]["source"].startswith("/production-source-not-configured/"))
 
     @staticmethod
     def _network_selectors(command: list[str]) -> list[str]:

@@ -1,5 +1,12 @@
 # PRISM Overload and Backlog Alert Specification
 
+Historical specification for the removed Python coordinator. Its scheduler,
+delivery, and backlog metric names do not describe the native runtime. Use the
+current [native metric inventory](prism-native-metrics.md) and
+[deployed-alert migration](prism-alert-migration.md) when adapting deployment
+alerts for Rust. The remaining document records the original rationale;
+its undeployed rules are not the native alert specification.
+
 Issue #188. This document specifies the alerting rules for PRISM's
 landing-path, delivery, and backlog overload classes. It is a
 specification only.
@@ -70,7 +77,7 @@ unresolved-transitions count.
 What the gauge task adds and corrects:
 
 **Adds the cap.** Before it, the configured unresolved-depth cap
-(`PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX`, default 8, in
+(`PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX` <!-- retired-setting: PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX -->, default 8, in
 `lab/prism/coordinator_config.py`) was readable only from process
 configuration, so no rule could express "at or near the cap" without
 hard-coding a deployment-specific constant. Exporting the cap as
@@ -298,7 +305,7 @@ Severity convention: `warning` means investigate within the working day;
   ```
 - **`for`:** `1m` (warning), `5m` (critical)
 - **Interpretation / first action:** 15 s is the default
-  `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS`, i.e. the point at which
+  `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` <!-- retired-setting: PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS -->, i.e. the point at which
   the coordinator's own health evaluator considers the refresh overdue.
   Firing here means the process is already reporting itself degraded on
   this axis. If the deployment overrides that environment variable, the
@@ -415,8 +422,8 @@ Before these rules are trusted on mainnet:
 2. Recompute the *cadence-dependent* thresholds only — the critical
    timeout count in rule 1 and both candidate-count thresholds in rule 4.
 3. Leave the configuration-derived thresholds alone unless the underlying
-   defaults change; if `PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX`,
-   `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS`, or the metrics refresh
+   defaults change; if `PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX` <!-- retired-setting: PRISM_ACCEPTED_PARENT_UNRESOLVED_DEPTH_MAX -->,
+   `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` <!-- retired-setting: PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS -->, or the metrics refresh
    interval is overridden in deployment, update rules 2, 6, and 7
    respectively.
 4. Confirm the target build contains #184 — that a stale complete snapshot
@@ -490,7 +497,7 @@ reads as "two filled an empty backlog, four were declined".
 
 ### Configuration knob
 
-`PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX` (default
+`PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX` <!-- retired-setting: PRISM_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX --> (default
 `DEFAULT_BLOCK_CANDIDATE_CLEANUP_RETRY_BACKLOG_MAX = 4096`, loaded into
 `BlockConfig.candidate_cleanup_retry_backlog_max` in
 `lab/prism/coordinator_config.py`). Startup refuses a non-integer, a
@@ -687,8 +694,9 @@ warning or the 5 s accepted-parent child wait budget
   still-exact accepted-share window (`force_prior_balances_read=True`,
   `force_full_window_rescan=False`) instead of the O(window) oracle rescan.
   This rests on the verified invariant that reconciliation never writes
-  `qbit_share_ledger` (proved in `test/test-prism-postgres-ledger.sh`,
-  `share-ledger-identity=inactive+reactivate+mature`). Every other full
+  `qbit_share_ledger` (proved on 2.x.x in `test/test-prism-postgres-ledger.sh`,
+  `share-ledger-identity=inactive+reactivate+mature`; the 3.x.x native ledger
+  suite runs through `make test-prism-postgres`). Every other full
   rescan trigger is unchanged, including the fail-closed one below.
 - The landing, the reconciler and the payout-window oracle record
   fixed-cardinality attribution families (below). Every label is a closed
@@ -853,7 +861,7 @@ sum by (reason, path) (increase(qbit_prism_payout_window_full_rescan_seconds_cou
 
 During normal forward progress expect `cold_start` once per process
 start, one of the `periodic_self_check*` reasons at most about once per
-`PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS` (default 3600 s), and every
+`PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS` <!-- retired-setting: PRISM_PAYOUT_ARTIFACT_FULL_RESCAN_SECONDS --> (default 3600 s), and every
 other cell, `reconcile_invalidation` included, at zero. A successful #224
 reread has **no family of its own**: it is one
 `qbit_prism_ledger_read_calls_total{operation="current_prior_balances"}`

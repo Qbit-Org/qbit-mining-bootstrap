@@ -18,7 +18,12 @@ export COMPOSE_PROJECT_NAME
 export DEPLOY_ENV_FILE
 
 COMPOSE := docker compose $(COMPOSE_ENV_FILES) -f compose.yaml --project-name $(COMPOSE_PROJECT_NAME)
-PRODUCTION_COMPOSE ?= $(COMPOSE) -f compose.production.yaml
+# Ordered additional overlays shared by doctor and the PRISM deployment.
+COMPOSE_OVERLAY_FILES ?=
+COMPOSE_OVERLAY_ARGS = $(foreach file,$(COMPOSE_OVERLAY_FILES),-f "$(file)")
+PRODUCTION_COMPOSE ?= $(COMPOSE) -f compose.production.yaml $(COMPOSE_OVERLAY_ARGS)
+# Dependencies select bundled databases only when the overlay retains them.
+PRISM_COMPOSE_SERVICES ?= qbitd prism-coordinator prism-public-api
 # Shared profile set for disposable test cleanup; ordinary down adds PRISM but preserves volumes.
 COMPOSE_ALL_PROFILES := $(COMPOSE) --profile permissionless --profile real-miner-smoke --profile auxpow
 # Destructive integration cleanup is confined to a fresh, invocation-specific
@@ -31,14 +36,14 @@ set -euo pipefail; \
 QBIT_SRC_RESOLVED="$$(bash scripts/prepare-qbit-source.sh)"; \
 export QBIT_SRC_DIR="$$QBIT_SRC_RESOLVED"; \
 export QBIT_SRC_DIR_OVERRIDE="$$QBIT_SRC_RESOLVED"; \
-bash scripts/check-env.sh; \
+bash scripts/check-env.sh --make-deployment $(foreach file,$(COMPOSE_OVERLAY_FILES),--compose-file "$(file)"); \
 printf 'doctor: staged qbit source=%s\n' "$$QBIT_SRC_RESOLVED";
 endef
 
 define COMPOSE_ENV_HELPERS
 compose_env="$$(mktemp)"; \
 trap 'rm -f "$$compose_env"' EXIT; \
-$(COMPOSE) config --environment > "$$compose_env"; \
+$(COMPOSE) $(COMPOSE_OVERLAY_ARGS) config --environment > "$$compose_env"; \
 compose_env_value() { \
 	awk -F= -v key="$$1" -v dflt="$${2:-}" '$$1 == key { print substr($$0, index($$0, "=") + 1); found=1 } END { if (!found) print dflt }' "$$compose_env"; \
 }; \
@@ -59,13 +64,40 @@ compose_env_value() { \
 	};
 endef
 
-.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-scale test-prism-postgres-native-ledger test-prism-postgres-seed-guard test-prism-postgres-throughput test-prism-public-read-replica test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
+# Production mounts both signing seeds from PRISM_SECRETS_SOURCE (#260 D4);
+# a lab may set each seed directly or through its _FILE form.
+define PRISM_SIGNING_PREFLIGHT
+missing=0; \
+if [ -z "$$(compose_env_value PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX)" ]; then \
+	printf 'prism operator env: PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX is required\n' >&2; \
+	missing=1; \
+fi; \
+if [ "$$(operator_build_mode)" = no-build ]; then \
+	if [ -z "$$(compose_env_value PRISM_SECRETS_SOURCE)" ]; then \
+		printf 'prism operator env: PRISM_SECRETS_SOURCE is required; production mounts the signing seed files from it\n' >&2; \
+		missing=1; \
+	fi; \
+else \
+	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX; do \
+		if [ -z "$$(compose_env_value "$$name")" ] && [ -z "$$(compose_env_value "$${name}_FILE")" ]; then \
+			printf 'prism operator env: %s or %s_FILE is required\n' "$$name" "$$name" >&2; \
+			missing=1; \
+		fi; \
+	done; \
+fi; \
+if [ "$${missing}" -ne 0 ]; then \
+	printf 'prism operator env: provide real PRISM signing seeds before running make up-prism-pool; see README.md\n' >&2; \
+	printf 'prism operator env: keep PRISM_ALLOW_TEST_SIGNING_SEEDS=0 and PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0 for deploys\n' >&2; \
+	exit 1; \
+fi;
+endef
+
+.PHONY: doctor prism-self-check check-version-skew require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres test-prism-postgres-throughput test-prism-public-read-replica test-prism-legacy-range-sidecars test-compose-prism-config prism-cutover-rehearsal prism-cutover-rehearsal-dump prism-cutover-rehearsal-generated up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
 	@bash scripts/check-env.sh --require-lab
 
-test-builder-regtest test-prism-regtest test-prism-stratum-regtest-live \
-test-prism-stratum-postgres-regtest-live test-prism-combined-regtest \
+test-builder-regtest test-prism-regtest \
 test-permissionless test-permissionless-p2mr test-ckpool-bip310 \
 test-real-miner test-auxpow test-auxpow-stratum \
 test-auxpow-stratum-bip310 test-auxpow-stratum-age: require-lab-mode
@@ -77,7 +109,10 @@ doctor:
 
 prism-self-check: export MINING_LANES=prism
 prism-self-check:
-	python3 scripts/prism-self-check.py
+	$(COMPOSE) --profile prism exec -T prism-coordinator qbit-prism-server self-check
+
+check-version-skew:
+	python3 scripts/check_version_skew.py
 
 test-builder:
 	cargo test --workspace
@@ -86,42 +121,38 @@ test-builder-regtest:
 	@$(WITH_RESOLVED_QBIT) \
 	bash test/test-builder-regtest.sh
 
+# One target per native suite; each maps to a mode of test/prism-native-tests.sh.
 test-prism-regtest:
-	@$(WITH_RESOLVED_QBIT) \
-	bash test/test-prism-regtest.sh
+	bash test/prism-native-tests.sh live
 
-test-prism-postgres-ledger:
-	bash test/test-prism-postgres-ledger.sh
-
-test-prism-postgres-scale:
-	bash test/test-prism-postgres-scale.sh
-
-test-prism-postgres-native-ledger:
-	bash test/test-prism-postgres-native-ledger.sh
-
-test-prism-postgres-candidate-storage:
-	bash test/test-prism-postgres-candidate-storage.sh
-
-test-prism-postgres-seed-guard:
-	bash test/test-prism-postgres-seed-guard.sh
+test-prism-postgres:
+	bash test/prism-native-tests.sh
 
 test-prism-postgres-throughput:
 	bash test/test-prism-postgres-throughput.sh
 
 test-prism-public-read-replica:
-	bash test/test-prism-public-read-replica.sh
+	bash test/prism-native-tests.sh replica
 
-test-prism-stratum-regtest-live:
-	@$(WITH_RESOLVED_QBIT) \
-	bash test/test-prism-stratum-regtest-live.sh
+# The legacy audit sidecar tools (#709, #731) against the real 3.x canonicalizer.
+test-prism-legacy-range-sidecars:
+	cargo build --locked -p qbit-prism --bin qbit-prism-audit-canonicalize --bin qbit-prism-build-audit-bundle
+	PRISM_AUDIT_CANONICALIZE_BIN="$${CARGO_TARGET_DIR:-target}/debug/qbit-prism-audit-canonicalize" \
+	python3 -m unittest -v tests.test_prism_legacy_range_sidecars tests.test_prism_legacy_parts_digest_check
 
-test-prism-stratum-postgres-regtest-live:
-	@$(WITH_RESOLVED_QBIT) \
-	QBIT_PRISM_LIVE_POSTGRES=1 QBIT_PRISM_LIVE_AUDIT_API=1 bash test/test-prism-stratum-regtest-live.sh
+# The 2.x.x -> 3.x.x cutover rehearsal on an operator's pg_dump, in a private
+# PostgreSQL cluster (#575): make prism-cutover-rehearsal DUMP=... LEDGER_KEY=...
+# See docs/prism-rust-migration.md#rehearse-the-cutover-on-a-snapshot.
+prism-cutover-rehearsal:
+	bash test/prism-cutover-rehearsal.sh rehearse
 
-test-prism-combined-regtest:
-	@$(WITH_RESOLVED_QBIT) \
-	bash test/test-prism-combined-regtest.sh
+# A mainnet-shaped 2.x.x dump to rehearse: make prism-cutover-rehearsal-dump OUT=...
+prism-cutover-rehearsal-dump:
+	bash test/prism-cutover-rehearsal.sh dump
+
+# Both in one command, for any branch: make prism-cutover-rehearsal-generated DENSITY=0.0625
+prism-cutover-rehearsal-generated:
+	bash test/prism-cutover-rehearsal.sh generated
 
 test-compose-prism-config:
 	@QBIT_SRC_DIR="$(CURDIR)" \
@@ -277,19 +308,7 @@ up-prism-pool: export MINING_LANES=prism
 up-prism-pool:
 	@$(WITH_RESOLVED_QBIT) \
 	$(COMPOSE_ENV_HELPERS) \
-	missing=0; \
-	for name in PRISM_MANIFEST_SIGNING_SEED_HEX PRISM_LEDGER_ATTESTATION_SIGNING_SEED_HEX PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX PRISM_PUBLIC_STRATUM_URL; do \
-		value="$$(compose_env_value "$$name")"; \
-		if [[ -z "$${value//[[:space:]]/}" ]]; then \
-			printf 'prism operator env: %s is required\n' "$$name" >&2; \
-			missing=1; \
-		fi; \
-	done; \
-	if [ "$${missing}" -ne 0 ]; then \
-		printf 'prism operator env: set PRISM signing keys and PRISM_PUBLIC_STRATUM_URL in .env or DEPLOY_ENV_FILE before running make up-prism-pool\n' >&2; \
-		printf 'prism operator env: keep PRISM_ALLOW_TEST_SIGNING_SEEDS=0 and PRISM_ALLOW_BUNDLE_EMBEDDED_LEDGER_KEY=0 for deploys\n' >&2; \
-		exit 1; \
-	fi; \
+	$(PRISM_SIGNING_PREFLIGHT) \
 	printf 'PRISM operator mode: direct qbit Stratum with Postgres ledger\n'; \
 	printf 'connect to stratum+tcp://%s\n' "$$(stratum_endpoint "$$(compose_env_value PRISM_STRATUM_PORT_HOST 3340)")"; \
 	if [ -n "$$(compose_env_value PRISM_STRATUM_HIGHDIFF_PORT "")" ]; then \
@@ -302,9 +321,9 @@ up-prism-pool:
 	fi; \
 	printf 'audit HTTP stays inside the coordinator namespace at %s:%s\n' "$$(compose_env_value PRISM_AUDIT_BIND 127.0.0.1)" "$$(compose_env_value PRISM_AUDIT_PORT 3341)"; \
 	if [[ "$$(operator_build_mode)" == no-build ]]; then \
-		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never qbitd prism-postgres prism-coordinator prism-public-api; \
+		$(PRODUCTION_COMPOSE) --profile prism up -d --no-build --pull never $(PRISM_COMPOSE_SERVICES); \
 	else \
-		$(COMPOSE) --profile prism up --build qbitd prism-postgres prism-coordinator prism-public-api; \
+		$(COMPOSE) $(COMPOSE_OVERLAY_ARGS) --profile prism up --build $(PRISM_COMPOSE_SERVICES); \
 	fi
 
 up-dual-pools: export MINING_LANES=ckpool,auxpow

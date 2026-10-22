@@ -1,8 +1,8 @@
 -- Canonical ordered share ledger for qbit PRISM mining.
 --
--- Invariant: only one logical writer inserts into qbit_share_ledger. Stratum
--- frontends may scale horizontally, but they must feed that writer through a
--- queue instead of inserting shares independently.
+-- Base schema retained for migration of existing ledgers. The native server's
+-- 002_multi_instance.sql migration replaces the process writer lease with
+-- short transaction locks that order commits from every active frontend.
 --
 -- The whole file applies inside exactly one transaction, enforced by the
 -- BEGIN/COMMIT wrapper below rather than by any caller's flags. This is what
@@ -1136,7 +1136,7 @@ AS $$
     -- strictly positive (schema CHECK): positivity keeps the cumulative
     -- weight strictly increasing, which guarantees the crossing row lies
     -- inside the last fetched page. Relaxing that constraint requires
-    -- revisiting this walk and the matching one in lab/prism/share_ledger.py.
+    -- revisiting this walk and the native server's ledger window scan.
     WITH RECURSIVE pages AS (
         SELECT page.min_share_seq,
                page.page_weight,

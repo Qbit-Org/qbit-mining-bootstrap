@@ -37,17 +37,38 @@ references. For public-facing navigation, prefer the short path below.
 
 This is useful for reviewers and operators who need implementation detail:
 
-- [prism-ledger-ops.md](prism-ledger-ops.md): formal ledger invariants,
-  writer-lease behavior, compaction contract, and readiness probes.
+- [prism-rust-migration.md](prism-rust-migration.md): coordinated cutover from
+  Python 2.x, native multi-instance operation, and rollback.
+- [prism-ledger-ops.md](prism-ledger-ops.md): native ledger invariants,
+  transaction ordering, retention, and readiness probes.
+- [prism-share-ledger-partitioning.md](prism-share-ledger-partitioning.md):
+  the design record for share ledger partitioning and retention (#144): the
+  online horizon, the sealing rule, the conversion, the archive format, and
+  every native reader against the partition key.
+- [prism-native-metrics.md](prism-native-metrics.md): native cutover metric
+  inventory, measurement boundaries, and failure semantics.
 - [prism-overload-alerts.md](prism-overload-alerts.md): specification for
-  the PRISM overload and backlog alert rules (issue #188), including signal
-  inventory, thresholds and their provenance, and the ordering dependency on
-  #184. Not live: this repository holds no monitoring configuration.
+  historical Python overload and backlog alert rules (issue #188). Native
+  metrics are documented in [prism-native-metrics.md](prism-native-metrics.md);
+  this repository holds no live monitoring configuration.
 - [prism-capacity-readiness.md](prism-capacity-readiness.md): optional
   Stratum-to-Postgres qualification artifact and standalone validator contract.
 - [prism-coordinator-refactor/README.md](prism-coordinator-refactor/README.md):
-  completed coordinator decomposition, ownership map, validation evidence, and
-  stacked-PR publication plan.
+  historical Python coordinator decomposition and validation evidence.
+- [prism-integration-test-gate.md](prism-integration-test-gate.md): the
+  shared gate every environment-dependent Rust test goes through, its
+  required-mode switch, the execution manifest CI proves against, and how to
+  add a gated test.
+- [prism-e2e-load-ci.md](prism-e2e-load-ci.md): the end-to-end and load CI
+  lanes (#487 L0-L6): what each proves and does not, how to dispatch and read
+  a run, where its evidence lives and how to reproduce it locally.
+- [prism-stratum-fuzzing.md](prism-stratum-fuzzing.md): the Stratum
+  cargo-fuzz targets, their invariants and nightly job, and the per-PR
+  property tests for the line codec and target conversions (#575).
+- [prism-deleted-test-map.md](prism-deleted-test-map.md): every 2.x.x test
+  file absent on 3.x.x, grouped by area, with its native replacement or the
+  open issue that closes the gap. `scripts/check_deleted_test_map.py` fails CI
+  when a test it cites is gone or its counts drift from its rows.
 
 ## Public-Site Guidance
 

@@ -1,187 +1,123 @@
 #!/usr/bin/env bash
+# Full-size share-append throughput floor for the native ledger (issue #271).
+#
+# This runs the real production share path: every share is one `Ledger::append`
+# transaction that takes the cluster-wide ORDER_LOCK advisory lock, so the rate
+# it reports is the rate at which that serialized transaction retires, measured
+# at 1, 2 and 4 concurrent appenders.
+#
+# It replaces the CPU-only audit-builder benchmark this script used to run. That
+# benchmark still exists and is still worth running; it just answers a different
+# question (builder CPU cost, no database):
+#
+#     cargo run --release -p qbit-prism-server -- benchmark \
+#         --shares 100000 --miners 100 --iterations 10
+#
+# The numbers here are also NOT comparable with the 2.x.x
+# `qbit.prism.postgres-throughput.v1` report, which timed one bulk
+# `INSERT ... SELECT ... FROM generate_series`: one statement, one commit, no
+# advisory lock, no concurrency. The report this script writes carries the
+# schema `qbit.prism.postgres-throughput.v2` for that reason.
+#
+# RUN THIS AGAINST A DATABASE NOTHING ELSE IS APPENDING TO.
+#   ORDER_LOCK is a PostgreSQL advisory lock, and an advisory lock is scoped to
+#   the database, not to the per-run schema the test creates. Any other backend
+#   appending shares into the same database serializes against this run and
+#   roughly halves the rate reported here. The test does not trust the operator
+#   to get that right: every connection it opens carries a per-run
+#   `application_name`, the ORDER_LOCK sampler separates this run's waiters from
+#   everyone else's, and a level during which a foreign backend held or waited
+#   on the lock is marked `contaminated: true` in the report and in the failure
+#   message. A contaminated level is still measured and still gated, but its
+#   number describes two workloads sharing one lock and must not be carried
+#   forward as a property of the append path. Leaving PRISM_TEST_DATABASE_URL
+#   unset gives you a disposable cluster of your own, which is the safe default.
+#
+# A CANCELLED RUN LEAVES ITS SCHEMA BEHIND.
+#   The test drops its `prism_throughput_<uuid>` schema on every exit path it
+#   controls, but Ctrl-C kills the process before the drop runs. Adding a signal
+#   handler would mean a new dependency the test is not allowed to take, so the
+#   leftovers are swept by hand. On a server you keep, after cancelling a run:
+#
+#     SELECT nspname FROM pg_namespace WHERE nspname LIKE 'prism\_throughput\_%';
+#     DROP SCHEMA prism_throughput_0ee059ccc0314cbb8a814c0319f846d5 CASCADE;
+#
+#   Do that only when no run is in flight; a live run's schema matches the same
+#   pattern. A disposable cluster (PRISM_TEST_DATABASE_URL unset) needs none of
+#   this: it is thrown away whole.
+#
+# Environment:
+#   PRISM_TEST_DATABASE_URL        an existing PostgreSQL 16; when unset, a
+#                                  disposable cluster is started from the local
+#                                  server binaries and torn down afterwards.
+#   QBIT_PRISM_MIN_SHARES_PER_SEC  the floor; unset uses the test's compiled-in
+#                                  constant.
+#   QBIT_PRISM_THROUGHPUT_*        window size, shares per level, appender
+#                                  counts, lock sampling interval (1..=1000 ms),
+#                                  report path. Every one of these is inherited
+#                                  by the test process unchanged; this script
+#                                  reads none of them except to work out where
+#                                  the report should have landed.
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=test/prism-postgres-lib.sh
-source "${ROOT_DIR}/test/prism-postgres-lib.sh"
+# Each test writes its own report, so the two floor tests cannot overwrite each
+# other. This script runs the full-size one.
+test_name=share_append_throughput_floor_full_size
 
-POSTGRES_IMAGE="${QBIT_PRISM_POSTGRES_IMAGE:-postgres:16-alpine}"
-POSTGRES_CONTAINER="${QBIT_PRISM_POSTGRES_CONTAINER:-qbit-prism-throughput-pg-$$}"
-SHARE_COUNT="${QBIT_PRISM_THROUGHPUT_SHARES:-20000}"
-MIN_SHARES_PER_SECOND="${QBIT_PRISM_MIN_SHARES_PER_SEC:-0}"
-REPORT_PATH="${QBIT_PRISM_THROUGHPUT_REPORT:-${ROOT_DIR}/build/prism-postgres-throughput.json}"
-
-require_executable() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "missing required executable: $1" >&2
-    exit 1
-  }
-}
-
-cleanup() {
-  docker rm -f "${POSTGRES_CONTAINER}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-require_executable docker
-require_executable python3
-
-docker rm -f "${POSTGRES_CONTAINER}" >/dev/null 2>&1 || true
-docker run \
-  --rm \
-  --detach \
-  --name "${POSTGRES_CONTAINER}" \
-  -e POSTGRES_USER=qbit \
-  -e POSTGRES_PASSWORD=qbit \
-  -e POSTGRES_DB=qbit \
-  "${POSTGRES_IMAGE}" >/dev/null
-
-wait_for_prism_postgres_container "${POSTGRES_CONTAINER}"
-
-mkdir -p "$(dirname "${REPORT_PATH}")"
-
-(
-  cd "${ROOT_DIR}"
-  POSTGRES_CONTAINER="${POSTGRES_CONTAINER}" \
-  SHARE_COUNT="${SHARE_COUNT}" \
-  MIN_SHARES_PER_SECOND="${MIN_SHARES_PER_SECOND}" \
-  REPORT_PATH="${REPORT_PATH}" \
-    python3 <<'PY'
-from __future__ import annotations
-
-import json
-import os
-import platform
-import subprocess
-import time
-from pathlib import Path
-
-
-ROOT_DIR = Path.cwd()
-SCHEMA_PATH = ROOT_DIR / "crates/qbit-prism/sql/001_share_ledger.sql"
-container = os.environ["POSTGRES_CONTAINER"]
-share_count = int(os.environ["SHARE_COUNT"])
-min_shares_per_second = float(os.environ["MIN_SHARES_PER_SECOND"])
-report_path = Path(os.environ["REPORT_PATH"])
-
-if share_count <= 0:
-    raise SystemExit("QBIT_PRISM_THROUGHPUT_SHARES must be positive")
-if min_shares_per_second < 0:
-    raise SystemExit("QBIT_PRISM_MIN_SHARES_PER_SEC must be non-negative")
-
-
-def psql(sql: str) -> str:
-    completed = subprocess.run(
-        [
-            "docker",
-            "exec",
-            "-i",
-            container,
-            "psql",
-            "--no-psqlrc",
-            "--set",
-            "ON_ERROR_STOP=1",
-            "--tuples-only",
-            "--no-align",
-            "--quiet",
-            "-U",
-            "qbit",
-            "-d",
-            "qbit",
-        ],
-        input=sql,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "psql command failed "
-            f"(exit {completed.returncode}): {completed.stderr.strip()}"
-        )
-    return completed.stdout
-
-
-psql(SCHEMA_PATH.read_text(encoding="utf-8"))
-postgres_version = psql("SELECT version();").strip()
-
-insert_sql = f"""
-TRUNCATE qbit_share_ledger RESTART IDENTITY CASCADE;
-INSERT INTO qbit_share_ledger (
-    share_id,
-    miner_id,
-    payout_order_key,
-    p2mr_program,
-    share_difficulty,
-    network_difficulty,
-    template_height,
-    job_id,
-    job_issued_at,
-    ntime,
-    accepted_at,
-    accepted,
-    writer_id,
-    writer_epoch
+# Release, unlike the CI-sized run: this is the "how fast can this host go"
+# measurement, and a debug build would report the compiler's overhead as the
+# ledger's. The CI floor is calibrated separately, in debug.
+# Without the leading `test`: the direct call below adds it, and
+# `prism-native-tests.sh cargo-args` runs `cargo test "$@"` itself. Passing
+# `test` here too would make the second one a test-name filter, and the run
+# would select nothing and exit 0 having measured nothing.
+cargo_args=(
+  --locked --release -p qbit-prism-server --test throughput_floor --
+  --ignored --exact "${test_name}" --nocapture
 )
-SELECT
-    'bench-' || gs::text,
-    'miner-' || (gs % 1024)::text,
-    lpad((gs % 1024)::text, 8, '0'),
-    decode(lpad(to_hex(gs), 64, '0'), 'hex'),
-    1 + (gs % 4096),
-    1000000,
-    1000 + (gs / 1000),
-    'job-' || (gs / 1000)::text,
-    to_timestamp(1700000000) + make_interval(secs => gs::double precision / 1000.0),
-    1700000000 + gs,
-    to_timestamp(1700000000) + make_interval(secs => gs::double precision / 1000.0),
-    true,
-    'throughput',
-    1
-FROM generate_series(1, {share_count}) AS gs;
-"""
 
-started = time.perf_counter()
-psql(insert_sql)
-insert_seconds = time.perf_counter() - started
-observed_count = int(psql("SELECT count(*) FROM qbit_share_ledger WHERE accepted;").strip())
-shares_per_second = observed_count / max(insert_seconds, 0.001)
+# The test writes its report before it asserts the floor, so a run that fails
+# the floor still leaves the evidence behind. `set -e` is suspended around the
+# test for exactly that reason: the path is worth printing on a red run, and the
+# status is re-raised immediately afterwards.
+# A report from an earlier run must not be announced as this run's evidence.
+# Timestamps cannot tell the two apart reliably -- a warm build and a small
+# window can finish inside one filesystem timestamp tick, and then a fresh
+# report looks no newer than the moment the run started -- so the earlier file
+# is moved aside instead, and the presence of the report afterwards is proof
+# that this run wrote it. It is put back if this run writes nothing, so a run
+# that dies during compilation or cluster setup does not destroy the evidence
+# the previous one produced.
+report="${QBIT_PRISM_THROUGHPUT_REPORT:-$(pwd)/target/prism-postgres-throughput-${test_name}.json}"
+previous="${report}.previous"
+rm -f "${previous}"
+if [[ -f "${report}" ]]; then
+  mv "${report}" "${previous}"
+fi
 
-anchor_seconds = 1700000000 + (share_count / 1000.0)
-explain_sql = f"""
-EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
-SELECT *
-FROM qbit_audit_share_window(to_timestamp({anchor_seconds:.3f}), 100000::numeric);
-"""
-explain_text = psql(explain_sql).strip()
+status=0
+if [[ -n "${PRISM_TEST_DATABASE_URL:-}" ]]; then
+  cargo test "${cargo_args[@]}" || status=$?
+else
+  # prism-native-tests.sh initdb's a throwaway cluster on a random loopback
+  # port, exports PRISM_TEST_DATABASE_URL for the command it runs, and stops
+  # and removes it on exit.
+  test/prism-native-tests.sh cargo-args "${cargo_args[@]}" || status=$?
+fi
 
-report = {
-    "schema": "qbit.prism.postgres-throughput.v1",
-    "share_count": observed_count,
-    "insert_seconds": insert_seconds,
-    "shares_per_second": shares_per_second,
-    "min_shares_per_second": min_shares_per_second,
-    "passed_minimum": shares_per_second >= min_shares_per_second,
-    "postgres_version": postgres_version,
-    "machine": {
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-        "cpu_count": os.cpu_count(),
-    },
-    "audit_window_explain_analyze": explain_text,
-}
-report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-print(
-    "prism postgres throughput "
-    f"shares={observed_count} seconds={insert_seconds:.3f} "
-    f"shares_per_second={shares_per_second:.1f} report={report_path}"
-)
-if shares_per_second < min_shares_per_second:
-    raise SystemExit(
-        "Postgres throughput below QBIT_PRISM_MIN_SHARES_PER_SEC: "
-        f"{shares_per_second:.1f} < {min_shares_per_second:.1f}"
-    )
-PY
-)
+# Announce the report only if this run wrote one. A run that died before the
+# test started — no database, no server binaries, a rejected variable — writes
+# nothing, and printing a path to a file that does not exist sends the reader
+# looking for evidence that was never produced. A file left by an earlier run is
+# worse than nothing: it is evidence, just not of this run.
+if [[ -f "${report}" ]]; then
+  echo "PRISM share-append throughput report: ${report}"
+  rm -f "${previous}"
+elif [[ -f "${previous}" ]]; then
+  mv "${previous}" "${report}"
+  echo "PRISM share-append throughput: this run wrote no report; the file at ${report} is from an earlier run"
+else
+  echo "PRISM share-append throughput: no report was written (expected it at ${report})"
+fi
+exit "${status}"

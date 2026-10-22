@@ -1,0 +1,866 @@
+//! Ungated decision tests: real Coordinator::submit, fake I/O, frozen economics.
+//! Legacy reference: 95ffe063846d51f83999a66cc654da5f7476fdef,
+//! tests/test_prism_retained_jobs.py and tests/test_prism_hot_path.py.
+use super::*;
+use axum::{extract::State, routing::post, Json, Router};
+use futures_util::future::BoxFuture;
+use std::sync::{
+    atomic::{AtomicBool, AtomicI64, AtomicUsize},
+    Mutex as StdMutex,
+};
+use submit_ledger::{Appended, CommitGate};
+
+mod admission_races;
+mod authority_lease;
+mod block_only;
+mod blockwait;
+mod candidate_preparation;
+mod commit_reconcile;
+mod compact_authority;
+mod compact_prepared;
+mod config;
+mod credit;
+mod fence_capture;
+mod interleavings;
+mod observations;
+mod prepared_expiry;
+mod published_lease;
+mod refresh;
+mod refresh_window;
+mod resume_inputs;
+mod runtime_recovery;
+pub(crate) mod stale_causes;
+pub(crate) mod tip_poll;
+mod work_store;
+
+pub(super) fn hash(byte: u8) -> String {
+    format!("{byte:02x}").repeat(32)
+}
+
+#[derive(Default)]
+pub(crate) struct Gate {
+    pub entered: Notify,
+    pub release: Notify,
+}
+
+#[derive(Default)]
+pub(crate) struct MemoryLedger {
+    pub revision: AtomicI64,
+    pub chain_epoch: AtomicI64,
+    pub records: StdMutex<Vec<(AcceptedShare, Option<Candidate>, i64)>>,
+    pub revision_gate: StdMutex<Option<Arc<Gate>>>,
+    pub append_gate: StdMutex<Option<Arc<Gate>>>,
+    pub fail_revision: AtomicBool,
+    pub jobs: StdMutex<HashMap<String, work_store::MemoryJob>>,
+    pub compact: work_store::CompactStore,
+    pub clock_offset_ms: AtomicI64,
+    pub snapshot: StdMutex<Option<Snapshot>>,
+    /// Full originals belong to the fixture, never to runtime Prepared views.
+    originals: StdMutex<HashMap<String, Arc<StoredPrepared>>>,
+    pub snapshots: StdMutex<Vec<Snapshot>>,
+    pub tip: StdMutex<Option<String>>,
+    pub save_gate: StdMutex<Option<Arc<Gate>>>,
+    pub fail_save: AtomicBool,
+    /// Holds an append after its gate reached `Committing` and before its
+    /// record is visible: COMMIT in flight.
+    pub commit_gate: StdMutex<Option<Arc<Gate>>>,
+    /// Fails the next COMMIT with an indeterminate error.
+    pub fail_commit: StdMutex<Option<FailCommit>>,
+    /// Refuses the next plain append at its pre-COMMIT hook as a closed gate
+    /// (#716). With `Some(closure)` that closure wins the gate first, as the
+    /// deadline or a lease fence does. With `None` the refusal records no
+    /// closure at all.
+    pub(super) refuse_commit: StdMutex<Option<Option<submit_ledger::GateClosure>>>,
+    /// Holds a refused append before it returns, as a slow ROLLBACK does.
+    pub rollback_gate: StdMutex<Option<Arc<Gate>>>,
+    /// Appends dropped before they returned, as an aborted task is.
+    pub cancelled: AtomicUsize,
+    /// #657: block-bearing appends the revision fence captured instead:
+    /// the deferred share, the credited candidate it carried, and the
+    /// revision the fence read.
+    pub captures: StdMutex<Vec<(AcceptedShare, Candidate, i64)>>,
+}
+
+/// An indeterminate COMMIT failure: the reply was lost, before or after the
+/// commit became durable.
+#[derive(Clone, Copy)]
+pub(crate) enum FailCommit {
+    NotRecorded,
+    Recorded,
+}
+
+/// Counts a future dropped before it disarms the probe.
+struct CancelProbe<'a>(&'a AtomicUsize, bool);
+
+impl Drop for CancelProbe<'_> {
+    fn drop(&mut self) {
+        if !self.1 {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl MemoryLedger {
+    async fn append_gated(
+        &self,
+        mut share: AcceptedShare,
+        candidate: Option<Candidate>,
+        revision: i64,
+        moved: crate::ledger::MovedRevision,
+        commit: &CommitGate,
+    ) -> Result<Appended> {
+        let gate = self.append_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        // Model the production atomic append fence, not share decisions: a
+        // moved revision refuses a plain share before any write, and a
+        // block-bearing share captures its block instead when capture is on
+        // (#657).
+        let current = self.revision.load(Ordering::SeqCst);
+        if revision != current {
+            let Some(candidate) =
+                candidate.filter(|_| moved == crate::ledger::MovedRevision::Capture)
+            else {
+                return Err(crate::ledger::PayoutRevisionChanged {
+                    expected: revision,
+                    observed: current,
+                }
+                .into());
+            };
+            if !commit.begin_commit() {
+                return Err(crate::ledger::CommitGateClosed.into());
+            }
+            let (failure, lost) = self.commit_in_flight().await;
+            if matches!(failure, Some(FailCommit::NotRecorded)) {
+                return Err(lost.into());
+            }
+            self.captures
+                .lock()
+                .unwrap()
+                .push((share, candidate, current));
+            if matches!(failure, Some(FailCommit::Recorded)) {
+                return Err(lost.into());
+            }
+            return Ok(Appended::Captured);
+        }
+        let existing = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(old, _, _)| old.share_id == share.share_id)
+            .map(|(old, _, _)| old.clone());
+        if let Some(old) = &existing {
+            share.share_seq = old.share_seq;
+            share.accepted_at_ms = old.accepted_at_ms;
+            ensure!(share == *old, "duplicate share_id payload mismatch");
+        }
+        // Model the production pre-commit hook: every statement has run.
+        let refusal = self.refuse_commit.lock().unwrap().take();
+        if let Some(Some(closure)) = refusal {
+            commit.close_for_test(closure);
+        }
+        if refusal == Some(None) || !commit.begin_commit() {
+            if existing.is_some() && candidate.is_none() {
+                return Ok(Appended::Recorded);
+            }
+            // The refused append rolls back before it returns.
+            let rollback = self.rollback_gate.lock().unwrap().take();
+            if let Some(rollback) = rollback {
+                rollback.entered.notify_one();
+                rollback.release.notified().await;
+            }
+            return Err(crate::ledger::CommitGateClosed.into());
+        }
+        let (failure, lost) = self.commit_in_flight().await;
+        if matches!(failure, Some(FailCommit::NotRecorded)) {
+            return Err(lost.into());
+        }
+        let mut records = self.records.lock().unwrap();
+        if records
+            .iter()
+            .any(|(old, _, _)| old.share_id == share.share_id)
+        {
+            return Ok(Appended::Recorded);
+        }
+        records.push((share, candidate, revision));
+        if matches!(failure, Some(FailCommit::Recorded)) {
+            return Err(lost.into());
+        }
+        Ok(Appended::Inserted)
+    }
+
+    /// COMMIT in flight: hold at `commit_gate` if one is set, then take the
+    /// planned failure of this COMMIT and the error a lost reply surfaces as.
+    async fn commit_in_flight(&self) -> (Option<FailCommit>, sqlx::Error) {
+        let gate = self.commit_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        let failure = self.fail_commit.lock().unwrap().take();
+        (
+            failure,
+            sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into()),
+        )
+    }
+}
+
+impl submit_ledger::SubmitLedger for MemoryLedger {
+    fn payout_revision(&self) -> BoxFuture<'_, Result<i64>> {
+        Box::pin(async move {
+            let revision = self.revision.load(Ordering::SeqCst);
+            let gate = self.revision_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            // A database read's failure, as the real ledger reports it.
+            if self.fail_revision.load(Ordering::SeqCst) {
+                return Err(sqlx::Error::PoolClosed.into());
+            }
+            Ok(revision)
+        })
+    }
+    fn append_at_revision(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        revision: i64,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
+        self.append_at_revision_observed(
+            share,
+            candidate,
+            None,
+            revision,
+            crate::ledger::MovedRevision::Refuse,
+            gate,
+        )
+    }
+    fn append_at_revision_observed(
+        &self,
+        share: AcceptedShare,
+        candidate: Option<Candidate>,
+        _proof_observed_at_ms: Option<i64>,
+        revision: i64,
+        moved: crate::ledger::MovedRevision,
+        gate: Arc<CommitGate>,
+    ) -> BoxFuture<'_, Result<Appended>> {
+        Box::pin(async move {
+            let mut probe = CancelProbe(&self.cancelled, false);
+            let result = self
+                .append_gated(share, candidate, revision, moved, &gate)
+                .await;
+            probe.1 = true;
+            result
+        })
+    }
+}
+
+/// A `tracing` sink tests can read back, to see the phase and share ID that
+/// an unknown answer logs for the operator.
+#[derive(Clone, Default)]
+pub(crate) struct SharedLog(Arc<StdMutex<Vec<u8>>>);
+
+impl SharedLog {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    pub fn dispatch(&self) -> tracing::Dispatch {
+        self.dispatch_at(tracing::Level::WARN)
+    }
+
+    pub fn dispatch_at(&self, level: tracing::Level) -> tracing::Dispatch {
+        Undecided::install();
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(level)
+                .finish(),
+        )
+    }
+}
+
+impl std::io::Write for SharedLog {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The global default under every [`SharedLog`] (#649). It records nothing,
+/// and answers every callsite `sometimes`, so no thread can cache `never`.
+///
+/// `tracing` caches one interest per callsite for the whole process. While a
+/// single dispatcher is registered, a callsite's first hit asks only the
+/// hitting thread's default. A test without a subscriber that reaches a
+/// callsite first, on its own thread, while one `SharedLog` is live, therefore
+/// caches `never` for it, and that `SharedLog` silently loses the event. With
+/// this default registered there are always two dispatchers, and it is the
+/// default of any thread without its own, so the cache can only hold
+/// `sometimes` or better and each event asks the current dispatcher.
+struct Undecided;
+
+impl Undecided {
+    fn install() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            // Only `main` sets a global default; a test binary never does.
+            let _ = tracing::subscriber::set_global_default(Undecided);
+        });
+    }
+}
+
+impl tracing::Subscriber for Undecided {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    // The live dispatchers' own hints set the global maximum level.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// #649: a callsite first reached on a thread without a subscriber, while
+/// this `SharedLog` is the only one registered, is still captured.
+#[test]
+fn shared_log_captures_a_callsite_first_reached_without_a_subscriber() {
+    fn emit() {
+        tracing::warn!("shared-log #649 probe");
+    }
+    let log = SharedLog::default();
+    let dispatch = log.dispatch();
+    std::thread::spawn(emit)
+        .join()
+        .expect("the probe thread panicked");
+    tracing::dispatcher::with_default(&dispatch, emit);
+    assert!(
+        log.text().contains("shared-log #649 probe"),
+        "the SharedLog lost an event whose callsite was first reached elsewhere:\n{}",
+        log.text()
+    );
+}
+
+pub(crate) struct Node {
+    pub tip: String,
+    /// `getmempoolinfo`'s answer, when a case moves the relay floor.
+    pub mempool: Option<Value>,
+    pub template: Option<Value>,
+    pub parents: HashMap<String, String>,
+    pub calls: Vec<String>,
+    pub fail: Option<String>,
+    pub gate: Option<(String, Arc<Gate>)>,
+}
+
+async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Value>) -> Json<Value> {
+    let method = request["method"].as_str().unwrap();
+    let (result, failed, gate) = {
+        let mut node = node.lock().unwrap();
+        node.calls.push(method.into());
+        let gate = if node
+            .gate
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == method)
+        {
+            node.gate.take().map(|(_, gate)| gate)
+        } else {
+            None
+        };
+        let result = match method {
+            "waitfornewblock" => json!({"hash":node.tip,"height":100}),
+            "getbestblockhash" | "getblockhash" => json!(node.tip),
+            "getblocktemplate" => node.template.clone().unwrap_or_else(|| {
+                json!({"version":0x20000000u32,"bits":"207fffff",
+                "curtime":chrono::Utc::now().timestamp(),"previousblockhash":node.tip,
+                "transactions":[],"height":101,"coinbasevalue":500_000_000})
+            }),
+            "getblockheader" => {
+                json!({"previousblockhash":node.parents.get(request["params"][0].as_str().unwrap())})
+            }
+            "getblockchaininfo" => {
+                json!({"chain":"regtest","initialblockdownload":false,"blocks":100,"headers":100,"bestblockhash":node.tip,"chainwork":"01"})
+            }
+            "estimatesmartfee" => json!({"feerate":0.001,"blocks":2}),
+            "getmempoolinfo" => node
+                .mempool
+                .clone()
+                .unwrap_or_else(|| json!({"minrelaytxfee":0.00001,"mempoolminfee":0.00001})),
+            _ => panic!("unexpected node RPC {method}"),
+        };
+        (result, node.fail.as_deref() == Some(method), gate)
+    };
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    } else if method == "waitfornewblock" {
+        // Model the real idle long-poll instead of allowing a mock hot loop to
+        // repair a discarded notification with an immediate second response.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    Json(
+        json!({"id":request["id"],"result":if failed {Value::Null} else {result},
+        "error":if failed {json!({"code":-1,"message":"controlled node failure"})} else {Value::Null}}),
+    )
+}
+
+pub(crate) struct Fixture {
+    pub coordinator: Arc<Coordinator>,
+    pub store: Arc<MemoryLedger>,
+    pub node: Arc<StdMutex<Node>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+impl Fixture {
+    pub async fn new(max_age: Duration) -> Self {
+        Self::build(max_age, |_| {}, None).await
+    }
+
+    /// A fixture whose configuration `tune` adjusts, with the ledger sessions'
+    /// effective `statement_timeout`.
+    pub async fn build(
+        max_age: Duration,
+        tune: impl FnOnce(&mut Config),
+        statement_timeout: Option<Duration>,
+    ) -> Self {
+        Self::build_with_ledger(
+            max_age,
+            tune,
+            statement_timeout,
+            "postgresql://unused@127.0.0.1:1/unused",
+        )
+        .await
+    }
+
+    /// [`Fixture::build`], with the coordinator's own `Ledger` (session
+    /// allocation) connecting to `ledger_url` instead of a refused port.
+    pub async fn build_with_ledger(
+        max_age: Duration,
+        tune: impl FnOnce(&mut Config),
+        statement_timeout: Option<Duration>,
+        ledger_url: &str,
+    ) -> Self {
+        let node = Arc::new(StdMutex::new(Node {
+            tip: hash(1),
+            mempool: None,
+            template: None,
+            parents: [(hash(1), hash(0)), (hash(2), hash(1)), (hash(3), hash(2))].into(),
+            calls: vec![],
+            fail: None,
+            gate: None,
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/", post(reply))
+            .with_state(node.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = Arc::new(MemoryLedger::default());
+        let mut config = config::test_config();
+        config.rpc_url = url.clone();
+        config.submit_tip_max_age = max_age;
+        tune(&mut config);
+        let ledger = Arc::new(Ledger::offline_for_tests(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy(ledger_url)
+                .unwrap(),
+            "offline-decisions".into(),
+        ));
+        let (refresh, _) = watch::channel(1);
+        let coordinator = Arc::new(Coordinator {
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+            rpc: Rpc::new(url, "test".into(), "test".into(), Duration::from_secs(5)).unwrap(),
+            config: Arc::new(config),
+            ledger,
+            submit_ledger: store.clone(),
+            work_ledger: store.clone(),
+            issued_batcher: issued_batcher::IssuedBatcher::without_dwell_for_tests(store.clone()),
+            prepared: Arc::new(RwLock::new(None)),
+            refresh,
+            wake: Notify::new(),
+            accepted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            blocks: AtomicU64::new(0),
+            readiness: Arc::new(RwLock::new(ReadinessState {
+                last_poll: Some(Instant::now()),
+                ..Default::default()
+            })),
+            observed_tip: Arc::new(RwLock::new(TipState::default())),
+            last_error: RwLock::new(None),
+            refreshed_at: std::sync::Mutex::new(Instant::now()),
+            build_slots: Arc::new(Semaphore::new(1)),
+            window_reads: Arc::new(Semaphore::new(1)),
+            refresh_lock: Mutex::new(RefreshState::default()),
+            refresh_in_flight: std::sync::Mutex::new(None),
+            clocked_flights: clocked_flight::ClockedFlights::default(),
+            resume_flights: compact_resume::ResumeFlights::new(1),
+            identities: Mutex::new(HashMap::new()),
+            chain_cache: Mutex::new(None),
+            statement_timeout,
+            offer_probe: Default::default(),
+            offer_reserved_probe: Default::default(),
+            build_job_probe: Default::default(),
+            offer_sections: Default::default(),
+            landing_trim: Default::default(),
+            submission_hold: Default::default(),
+        });
+        let fixture = Self {
+            coordinator,
+            store,
+            node,
+            server,
+        };
+        let job = fixture.job(1, 0, "original.worker");
+        *fixture.store.snapshot.lock().unwrap() =
+            Some((*fixture.original(&job.context.prepared).snapshot).clone());
+        *fixture.coordinator.prepared.write().await = Some(job.context.prepared.clone());
+        fixture
+    }
+
+    pub async fn observe(&self, tip: u8, cache_parent: bool) {
+        self.node.lock().unwrap().tip = hash(tip);
+        self.coordinator.observe_chain_info(true).await.unwrap();
+        if cache_parent {
+            self.coordinator.cache_tip_parent(&hash(tip)).await.unwrap();
+        }
+        // Publication in production always couples the observed tip to work
+        // built for that tip while holding the publication boundary. Keep the
+        // fixture on that reachable path instead of publishing a new tip with
+        // the previous tip's prepared work.
+        let revision = self
+            .coordinator
+            .prepared
+            .read()
+            .await
+            .as_ref()
+            .map(|prepared| prepared.snapshot.payout_revision)
+            .unwrap_or_default();
+        let job = self.job(tip, revision, "original.worker");
+        *self.store.snapshot.lock().unwrap() =
+            Some((*self.original(&job.context.prepared).snapshot).clone());
+        *self.coordinator.prepared.write().await = Some(job.context.prepared.clone());
+        self.coordinator
+            .observed_tip
+            .write()
+            .await
+            .publish(&hash(tip))
+            .unwrap();
+    }
+
+    pub async fn detect(&self, tip: u8) {
+        self.node.lock().unwrap().tip = hash(tip);
+        self.coordinator.observe_chain_info(true).await.unwrap();
+    }
+
+    pub fn job(&self, tip: u8, revision: i64, username: &str) -> MiningJob<JobContext> {
+        let worker = Worker {
+            username: username.into(),
+            payout_address: "miner-original".into(),
+            worker_name: Some("worker".into()),
+            p2mr_program_hex: hash(0xab),
+        };
+        let share = AcceptedShare {
+            share_seq: 1,
+            share_id: "fixture-share".into(),
+            miner_id: worker.payout_address.clone(),
+            order_key: worker.payout_address.clone(),
+            p2mr_program_hex: worker.p2mr_program_hex.clone(),
+            share_difficulty: 1_000_000,
+            network_difficulty: 1_000_000,
+            template_height: 100,
+            job_id: "seed".into(),
+            job_issued_at_ms: 100_000,
+            accepted_at_ms: 100_000,
+            ntime: 1_800_000_000,
+            credit_policy: None,
+        };
+        let snapshot = Arc::new(Snapshot {
+            anchor_ms: 100_000,
+            share_seq: 1,
+            payout_revision: revision,
+            shares: vec![share.clone()],
+            prior_balances: vec![],
+        });
+        let bundle = Arc::new(
+            qbit_prism::build_audit_bundle_with_coinbase_options(
+                vec![share],
+                FoundBlock {
+                    block_height: 101,
+                    coinbase_value_sats: 500_000_000,
+                    network_difficulty: 1_000_000,
+                    anchor_job_issued_at_ms: 100_000,
+                },
+                vec![],
+                qbit_prism::PayoutPolicy::day_one_default(),
+                Some("00".repeat(12)),
+                vec![],
+                &ManifestSigningKey::from_seed_hex(&hash(0x11)).unwrap(),
+                &ManifestSigningKey::from_seed_hex(&hash(0x22)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let template = json!({"version":0x20000000u32,"bits":"207fffff","curtime":1_800_000_000u32,
+            "previousblockhash":hash(tip),"transactions":[],"height":101,"coinbasevalue":500_000_000u64});
+        let mut wire = codec::Job::from_manifest(
+            "issued-job".into(),
+            &template,
+            &bundle.signed_coinbase_manifest.manifest,
+            "00000000",
+            8,
+            1e-12,
+            0.0,
+            true,
+        )
+        .unwrap();
+        // Frozen target/difficulty pair: full regtest network target credits
+        // exactly 1,000,000 scaled units, independently asserted by the tests.
+        wire.share_target = codec::target_from_compact(0x207fffff).unwrap();
+        wire.payout_revision = revision;
+        let inputs = BundleInputs {
+            payout_policy: qbit_prism::PayoutPolicy::day_one_default(),
+            ctv: None,
+            signer_keys: SignerKeys::of(
+                &ManifestSigningKey::from_seed_hex(&hash(0x11)).unwrap(),
+                &ManifestSigningKey::from_seed_hex(&hash(0x22)).unwrap(),
+            ),
+            audit_builder_version: qbit_prism::AUDIT_BUILDER_VERSION,
+        };
+        let stored = Arc::new(StoredPrepared {
+            template: template.clone(),
+            snapshot: snapshot.clone(),
+            bundle: Some(bundle.clone()),
+            inputs: Some(inputs.clone()),
+            fee: None,
+            fingerprint: "fixture".into(),
+            generation: 1,
+            parent_of_tip: hash(tip.saturating_sub(1)),
+            coinbase_suffix: "00".repeat(12),
+        });
+        let key = format!(
+            "prepared:fixture:{}",
+            hex::encode(&Sha256::digest(format!("{tip}:{revision}"))[..16])
+        );
+        self.store
+            .originals
+            .lock()
+            .unwrap()
+            .insert(key.clone(), stored.clone());
+        let window = WindowRef::from_snapshot(&snapshot).expect("fixture window reference");
+        let encoded = crate::ledger::PreparedTemplate::encode(&template).unwrap();
+        let record = crate::ledger::CompactPrepared::from_original_build(
+            &stored,
+            window,
+            &inputs,
+            &encoded,
+            Some(crate::ledger::PreparedAuditHashes {
+                audit_bundle_sha256: prepared_storage::compact::canonical_json_sha256(&bundle)
+                    .unwrap(),
+                coinbase_manifest_sha256: prepared_storage::compact::canonical_json_sha256(
+                    &bundle.signed_coinbase_manifest.manifest,
+                )
+                .unwrap(),
+            }),
+        )
+        .unwrap();
+        let captured = prepared_storage::compact::assemble_captured(
+            key,
+            record,
+            encoded,
+            template,
+            snapshot.prior_balances.clone(),
+            Some(PreparedBundle::from(&*bundle)),
+            Some(wire.clone()),
+            self.store.database_now() + 86_400_000,
+            Instant::now(),
+            None,
+            Some(crate::ledger::WriterTimeline::new(1)),
+        )
+        .unwrap();
+        let prepared = captured.original;
+        assert!(tip_observation::PreparedIdentity::from_stored(
+            &prepared.storage_key,
+            &stored,
+            window
+        )
+        .matches(&prepared));
+        assert!(tip_observation::PreparedIdentity::from_compact(
+            &prepared.storage_key,
+            &prepared.reservation.record
+        )
+        .matches(&prepared));
+        let bundle = prepared.bundle.clone().unwrap();
+        MiningJob {
+            wire,
+            context: Arc::new(JobContext {
+                prepared,
+                worker,
+                bundle,
+                bootstrap_share: None,
+                issuance_authority: None,
+            }),
+        }
+    }
+
+    /// The fixture, not Prepared, owns full originals used by legacy codec and
+    /// corruption controls. A runtime refresh can be observed from its exact
+    /// captured window and reservation without changing production retention.
+    fn original(&self, prepared: &Prepared) -> Arc<StoredPrepared> {
+        if let Some(original) = self
+            .store
+            .originals
+            .lock()
+            .unwrap()
+            .get(&prepared.storage_key)
+            .cloned()
+        {
+            return original;
+        }
+        let mut snapshot = self
+            .store
+            .snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(
+                self.store
+                    .originals
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|stored| &*stored.snapshot),
+            )
+            .find(|snapshot| WindowRef::from_snapshot(snapshot).unwrap() == prepared.window)
+            .cloned()
+            .unwrap_or_else(|| {
+                assert!(
+                    prepared.window.shares.is_none(),
+                    "fixture did not retain original snapshot"
+                );
+                Snapshot {
+                    anchor_ms: prepared.snapshot.anchor_ms,
+                    share_seq: prepared.snapshot.share_seq,
+                    payout_revision: prepared.snapshot.payout_revision,
+                    shares: vec![],
+                    prior_balances: (*prepared.reservation.balances).clone(),
+                }
+            });
+        snapshot.prior_balances = (*prepared.reservation.balances).clone();
+        let bundle = prepared.bundle.as_ref().map(|_| {
+            let body = bundle_build::build_body(
+                &self.coordinator.config,
+                &snapshot,
+                &prepared.template,
+                None,
+                prepared.reservation.record.coinbase_suffix_hex.clone(),
+                prepared.inputs.clone(),
+            )
+            .unwrap()
+            .0;
+            Arc::new(body.into_bundle(snapshot.shares.clone()))
+        });
+        let original = Arc::new(StoredPrepared {
+            template: prepared.template.clone(),
+            snapshot: Arc::new(snapshot),
+            bundle,
+            inputs: Some(prepared.inputs.clone()),
+            fee: prepared.fee,
+            fingerprint: prepared.fingerprint.clone(),
+            generation: prepared.generation,
+            parent_of_tip: prepared.parent_of_tip.clone(),
+            coinbase_suffix: prepared.reservation.record.coinbase_suffix_hex.clone(),
+        });
+        self.store
+            .originals
+            .lock()
+            .unwrap()
+            .insert(prepared.storage_key.clone(), original.clone());
+        original
+    }
+
+    pub fn proof(&self, job: &MiningJob<JobContext>, nonce: u32) -> codec::Submission {
+        // Coordinator consumes codec-validated submissions. Use the real codec
+        // and only choose a valid proof; tests may toggle block_pass to cover
+        // candidate fencing after the shared difficulty validation boundary.
+        (nonce..nonce + 10_000)
+            .find_map(|nonce| {
+                let proof = job
+                    .wire
+                    .assemble_submission(
+                        &"00".repeat(8),
+                        "6b49d200",
+                        &format!("{nonce:08x}"),
+                        None,
+                        0,
+                    )
+                    .unwrap();
+                proof.share_pass.then_some(proof)
+            })
+            .unwrap()
+    }
+
+    pub async fn submit(
+        &self,
+        job: &MiningJob<JobContext>,
+        grace: impl Into<StaleGrace>,
+    ) -> Result<(), StratumError> {
+        self.coordinator
+            .submit(&job.context.worker, job, self.proof(job, 0), grace.into())
+            .await
+    }
+}
+
+/// Raise the live relay floor above the fixture's CTV fee policy, as a refresh
+/// observing a higher node floor would.
+pub(crate) async fn raise_ctv_fee_floor(coordinator: &Coordinator) {
+    coordinator.readiness.write().await.ctv_fee_floor = Some(2000);
+}
+
+pub(super) fn assert_error(error: StratumError, reason: &str, message: &str) {
+    let response = error.response(json!(41));
+    assert_eq!(response["error"][1], message);
+    assert_eq!(response["error"][2]["reason_id"], reason);
+}

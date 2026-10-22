@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Run a deterministic shard of workspace Rust targets in required integration CI.
+
+Keep each test binary intact so its fixtures and process-wide locks retain
+Cargo's normal semantics. Discover targets from Cargo so new suites join CI.
+Balance shards by each target's typical duration, longest first.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+COMPACT_SCALE = ("qbit-prism-server", "test", "compact_runtime_scale")
+# These ignored database contracts must be selected explicitly. Run each only
+# on the shard that owns its ordinary test target; test/prism-native-tests.sh
+# runs the same selections locally.
+IGNORED = {
+    ("qbit-prism-server", "test", "stratum_admission_postgres"): [
+        "--exact",
+        "ten_thousand_unsubscribed_connections_do_not_advance_postgres_sequence",
+    ],
+    ("qbit-prism-server", "test", "observability_database"): [],
+    # Run the real scale cases serially under optimized runtime code; each
+    # owns a private durable primary for its insert-LSN measurements.
+    COMPACT_SCALE: ["--test-threads=1"],
+    ("qbit-prism-server", "test", "issued_job_dependency"): ["--test-threads=2"],
+}
+# Typical seconds per target, build included, from the PostgreSQL shard logs
+# of 2026-10-01 (#647). Round-robin put the first three on one shard, which
+# then ran into the job's cap. Every other target averages about 20 s.
+# Re-measure from the job summary's per-command table when shards drift.
+DURATION_SECONDS = {
+    ("qbit-prism-server", "test", "live_regtest"): 700,
+    ("qbit-prism-server", "lib", "qbit_prism_server"): 330,
+    ("qbit-prism-server", "test", "candidate_storm_restart"): 270,
+    COMPACT_SCALE: 240,
+    ("qbit-prism-server", "test", "ledger_postgres"): 210,
+}
+DEFAULT_DURATION_SECONDS = 20
+
+
+def typical_seconds(target: tuple[str, str, str]) -> int:
+    return DURATION_SECONDS.get(target, DEFAULT_DURATION_SECONDS)
+
+
+def workspace_targets(metadata: dict) -> list[tuple[str, str, str]]:
+    targets = []
+    for package in metadata["packages"]:
+        if package["id"] not in metadata["workspace_members"]:
+            continue
+        for target in package["targets"]:
+            kinds = target["kind"]
+            if kinds == ["custom-build"]:
+                continue
+            if len(kinds) != 1 or kinds[0] not in ("lib", "bin", "test", "bench", "example"):
+                raise ValueError(f"unsupported target kind: {kinds}")
+            targets.append((package["name"], kinds[0], target["name"]))
+    return sorted(targets)
+
+
+def shard_commands(metadata: dict, index: int, count: int) -> list[list[str]]:
+    if count < 1 or not 0 <= index < count:
+        raise ValueError("require shard-count > 0 and 0 <= shard-index < shard-count")
+    loads = [0] * count
+    shards: list[list[tuple[str, str, str]]] = [[] for _ in range(count)]
+    for target in sorted(workspace_targets(metadata), key=lambda target: (-typical_seconds(target), target)):
+        lightest = min(range(count), key=lambda shard: (loads[shard], shard))
+        loads[lightest] += typical_seconds(target)
+        shards[lightest].append(target)
+    targets = sorted(shards[index])
+    if not targets:
+        raise ValueError("shard contains no targets; reduce shard-count")
+    commands = []
+    for package, kind, name in targets:
+        command = ["cargo", "test", "--locked", "-p", package, f"--{kind}"]
+        if kind != "lib":
+            command.append(name)
+        commands.append(command + ["--", "--nocapture"])
+        if (package, kind, name) in IGNORED:
+            profile = ["--release"] if (package, kind, name) == COMPACT_SCALE else []
+            commands.append(command + profile + ["--", "--ignored", "--nocapture"] + IGNORED[package, kind, name])
+    return commands
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--shard-index", type=int, required=True)
+    parser.add_argument("--shard-count", type=int, required=True)
+    parser.add_argument("--dry-run", action="store_true", help="print commands without running tests")
+    args = parser.parse_args(argv)
+    try:
+        metadata = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
+            cwd=ROOT, text=True,
+        ))
+        commands = shard_commands(metadata, args.shard_index, args.shard_count)
+        summary = None if args.dry_run else os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write("| Command | Seconds |\n| --- | ---: |\n")
+        for command in commands:
+            print(shlex.join(command), flush=True)
+            if not args.dry_run:
+                started = time.monotonic()
+                try:
+                    subprocess.run(command, cwd=ROOT, check=True)
+                finally:
+                    if summary:
+                        # Per-command durations are the data for the next re-balance.
+                        with open(summary, "a", encoding="utf-8") as handle:
+                            handle.write(f"| `{shlex.join(command)}` | {time.monotonic() - started:.0f} |\n")
+    except ValueError as error:
+        parser.error(str(error))
+    except subprocess.CalledProcessError as error:
+        return error.returncode if error.returncode > 0 else 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

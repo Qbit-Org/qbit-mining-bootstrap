@@ -1,0 +1,7 @@
+#cfg bits=1d00ffff
+{"id":0,"method":"mining.suggest_difficulty","params":[1000]}
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}
+{"id":3,"method":"mining.suggest_difficulty","params":["1e-300"]}
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}

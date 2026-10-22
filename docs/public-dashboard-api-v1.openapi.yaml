@@ -241,8 +241,8 @@ paths:
             default: active
           description: >
             Omit or pass `active` for the `prism.dashboard.blocks.v1` response,
-            which hides reorged-out blocks exactly as before this parameter
-            existed. `all` includes every recorded pool block and `reversed`
+            which includes currently confirmed blocks and hides unaccepted native
+            candidate records. `all` includes every recorded pool block and `reversed`
             returns only blocks the pool once landed that a chain
             reorganization later disconnected; both return
             `prism.dashboard.blocks.v2` rows carrying `chain_state` and
@@ -851,9 +851,9 @@ components:
           type: integer
           minimum: 0
           description: >
-            Every pool block not reversed by a chain reorganization. Excludes
-            `reversed` blocks by design; it is not the sum of the per-state
-            counters below.
+            Every currently confirmed pool block. Native candidate records are
+            persisted before node acceptance and are excluded until confirmed;
+            this is not the sum of the per-state counters below.
         prism_blocks_total:
           type: integer
           minimum: 0
@@ -1090,7 +1090,7 @@ components:
         block_count:
           type: integer
           minimum: 1
-          description: Every non-reversed block found in the bucket, listed or not.
+          description: Every confirmed block found in the bucket, listed or not.
         blocks:
           type: array
           maxItems: 3
@@ -1130,7 +1130,7 @@ components:
         total_blocks:
           type: integer
           minimum: 0
-          description: All non-reversed found blocks inside the range.
+          description: All confirmed found blocks inside the range.
         points:
           type: array
           items:

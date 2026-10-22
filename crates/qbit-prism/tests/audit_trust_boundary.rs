@@ -217,9 +217,11 @@ fn insolvent_dust_block_is_rejected() {
     ));
 }
 
-// Rust window selection matches the Python/SQL job+accept contract.
+// Shares issued or accepted after the anchor are excluded from the window. The Python
+// differential for the window fold is the frozen corpus replay (`window_frozen_vectors`,
+// `window_daemon_gate`); no test on this branch runs the ledger's SQL window read against it.
 #[test]
-fn window_converges_with_python_sql() {
+fn window_excludes_shares_after_the_anchor() {
     let anchor = 1001i64;
     let nd = 10u128;
     let shares = vec![

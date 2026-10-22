@@ -1,0 +1,432 @@
+{
+  "native": {
+    "refresh_window_acquisitions_total": {
+      "labels": {
+        "outcome": "WindowAcquisition"
+      },
+      "status": "Counted once per refresh snapshot by the coordinator's ledger, at the decision between the delta path and the full newest-first scan. `advanced` is the delta path: the retired window's rows were reused for the fresh anchor, cutoff and network difficulty, including a retarget in either direction and a multi-page delta. Every other outcome names why the full scan ran: `no_prior` (no retired window was exclusively owned, as at the first refresh or after a cancelled build kept a reference), `empty_prior` (the retired window had no rows), `tail_mismatch` (the retired window's last row was not its accepted cutoff, which only legacy or raw rows with a future timestamp at the top of the ledger can cause), `anchor_regressed`, `cutoff_regressed`, `delta_too_large` (more than 262,144 new sequence slots), `no_evidence` (the retired window had no single-leaf witness, as across a partition boundary), `leaf_changed` (the retained range's partition was detached, reattached or restored, or the writer timeline changed, before the delta was read), `margin_too_large` (a heavier target needed more than 16 older pages), `partial` (history ran out before the target, so the full scan decides), `witness_changed` (the merged range's leaf, incarnation or timeline differed when re-read after the pages, including a margin that crossed into another leaf), `count_mismatch` (the anchored row count of the merged range differed, as after a retroactive insert or newly eligible timestamp) and `invariant` (the merged window failed its own ordering or crossing check, logged at error). Every outcome is initialized to zero. A high full-scan share is a cost signal, never an error; `invariant` is a defect signal."
+    },
+    "refresh_seconds": {
+      "labels": {
+        "trigger": "RefreshTrigger",
+        "acquisition": "RefreshAcquisition"
+      },
+      "status": "Observed once per refresh that published rebuilt work, from the refresh's entry (after the poll or block-wait wake) to its publication, on the coordinator's monotonic clock. A refresh that reused the published work unchanged, or that failed, records nothing. `trigger` names what invalidated the published work, by the label's own precedence when several inputs changed on one poll: `initial` (nothing published yet), then `writer_timeline` (the database writer's timeline moved, a promotion: #619), `tip` (the template parent changed), `revision` (the payout revision changed), `balances` (the carry-forward balances changed), `reanchor` (the cached window aged past `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS`, or no cached window was held while work was published), `shares` (new shares with no cached bundle), `fee` (the relay fee floor changed) and `template` (any other template or publication change, including a cached window that no longer matches the published reference). The reuse test itself checks these inputs in a different order; the label is a classification of the same inputs, never a decision. On a same-template poll the revision, balances and share inputs are the ledger probe's; on a new template the ledger is not probed at entry, and the label compares the published work with the window the rebuild used, so a revision or balance change that had landed by the rebuild's admission is named ahead of `template`. `acquisition` says where the window came from: `delta` or `full` for a fresh ledger snapshot by that path, `cached` when the previous refresh's window was reused and only the body was rebuilt. Series appear on their first observation. Default buckets."
+    },
+    "capture_offer_decisions_total": {
+      "labels": {
+        "decision": "CaptureDecision"
+      },
+      "status": "#478 block capture. `offered`: the block's positive as-issued float (the most debt its confirmation can create, in any order) was within `PRISM_CAPTURE_OVERPAY_CEILING_BPS` of the coinbase value, and the block was reserved for its one offer, decided in the reservation's transaction. `abandoned_ceiling`: the float exceeded the ceiling and the pending block was abandoned; the WARN log names the bound and the ceiling, and `qbit_prism_payout_divergences` keeps both. `abandoned_disabled`: the ceiling is 0, so the block was abandoned as before #478 (recorded as decision `disabled`). The miner of an abandoned capture is answered `stale-job`, never `ledger-confirmation-failed`. A bound that cannot be computed abandons nothing: the offer fails and is retried. Process-local; every series starts at zero. No firing rule."
+    },
+    "block_proof_ack_capped_total": {
+      "labels": {
+        "path": "BlockAckPath"
+      },
+      "status": "Counted once per block-bearing submission answered before its outcome was known (#574). `block_only`: a captured (#478) or below-target block proof whose deferred share waits for its own frontend's landing, or for its duplicate probe and candidate enqueue, past `share_commit_timeout` itself (`PRISM_SHARE_COMMIT_TIMEOUT_SECONDS`, 15 s by default; it was at least 60 s before #574). `share`: a share-pass append carrying a found block that had not committed by the share deadline, or by its grace when COMMIT was already in flight, the same bounds as a plain share; it is never refused, so it runs on; and a share-pass append that captured its block because the payout revision moved before its commit (#657), whose deferred share then waits for its block's landing as a `block_only` proof's does, up to the same share deadline. Either is answered `ledger-outcome-unknown` (Stratum error 20, \"share outcome is not yet known\"), the same reply as any share still pending at its deadline, so it also counts in `qbit_prism_rejections_total{reason_id=\"ledger-outcome-unknown\"}` and feeds PrismShareAppendFailures; the WARN log names the block hash, share id, phase and elapsed_ms. Only the wait ends at the bound: the probe, enqueue, append and landing run on, so the block is still offered and landed and its share is credited once when that commits. Process-local; both series start at zero. No firing rule of its own."
+    },
+    "block_offer_standby_wait_total": {
+      "labels": {
+        "outcome": "StandbyWaitOutcome"
+      },
+      "status": "Counted once per found-block offer when PRISM_OFFER_STANDBY_APPLICATION_NAME is set and PRISM_OFFER_STANDBY_FLUSH_WAIT_MS is positive, after the offer reservation commits and immediately before submitblock (#529). `confirmed`: the flush_lsn in pg_stat_replication of every standby connected under that name reached the primary's WAL flush position read after the reservation, so the candidate row and reservation survive the standby's promotion. `absent`: no standby connected under that name (streaming or catching up), so the offer did not wait. `lagging`: the standby was still behind at the bound; the WARN log carries lag_bytes. `failed`: the positions could not be read (a database error, no answer before the bound, or a writer role without pg_read_all_stats, which pg_monitor includes). Every outcome is offered; every outcome but `confirmed` logs the block hash at WARN for post-failover reconciliation. The wait itself is logged per block as waited_us. Process-local; every series starts at zero. Warns through PrismBlockOfferStandbyUnconfirmed."
+    },
+    "divergent_landings_total": {
+      "status": "Counted at the confirmation, when a landed block's rows start to count: it is divergent when those rows meet canonical balances other than the as-issued ones its coinbase commits to (#478 captures, and the pre-existing case of a block whose work predates an earlier confirmation). Each is recorded in `qbit_prism_payout_divergences`, in the confirming transaction, with its per-account overpay; a frontend without #478 records and counts nothing. Process-local; starts at zero. No firing rule."
+    },
+    "divergent_landing_overpay_sats_total": {
+      "status": "The sum over committed divergent confirmations of the carry-forward debt each created: per account, the increase in max(0, -balance) when the block's rows start to count. Unrecovered while the indebted miner earns no further gross; see the ledger operations guide for the accepted-cost bound. Process-local; starts at zero. No firing rule."
+    },
+    "carry_forward_debt_sats": {
+      "status": "Read from the canonical balances after every confirmation or deactivation this frontend commits and at every full refresh snapshot; zero when no account is negative. Process-local. No firing rule."
+    },
+    "ctv_fanout_broadcaster_tip_refresh_yields_total": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_tip_refresh_yields_total"]
+    },
+    "ctv_fanout_broadcaster_chunk_rows": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_rows"],
+      "status": "Values are rows, not seconds: instead of the default time ladder this histogram exports the single finite bound `le=\"1\"` plus `+Inf`, so `_count` is the number of claimed fanout attempts and `_sum` equals `_count`. The 2.x.x ladder (1, 2, 5, 10, 25, 50, 100) is not exported; a query for a higher `le` matches no series."
+    },
+    "ctv_fanout_broadcaster_chunk_seconds": {
+      "replaces": ["qbit_prism_ctv_fanout_broadcaster_chunk_seconds"],
+      "status": "Default histogram ladder in seconds; one observation per claimed attempt, recorded even when persisting the attempt's completion fails."
+    },
+    "accepted_shares_total": {
+      "replaces": [
+        "qbit_prism_accepted_shares_total"
+      ],
+      "status": "Process-local counter; legacy canonical ledger count was persistent. Read from the Stratum listeners at scrape time and overlaid on cached metric bodies (#581), so the share-refusal rules see acceptances stop while the health publisher, and with it the cached body, waits on an unavailable database."
+    },
+    "share_ack_seconds": {
+      "replaces": [
+        "qbit_prism_share_ack_seconds"
+      ],
+      "labels": {
+        "result": "AckResult"
+      },
+      "status": "Uses the default histogram ladder plus 15 and 20 seconds; these are elapsed ACK bounds, not measured ledger deadlines."
+    },
+    "share_ack_landing_window_seconds": {
+      "labels": {
+        "result": "AckResult"
+      },
+      "status": "Each observation is also in `share_ack_seconds`, on the same ladder: steady state is `share_ack_seconds` minus this family, bucket by bucket. A landing window opens when this frontend first observes a pool block's acceptance, its own `submitblock` acceptance, or a peer frontend's block on the active chain, first seen either before it is confirmed or already confirmed at the tip (a buried block first seen confirmed, as after a restart, opens none; a restart whose tip is a pool block opens one), and admits every submission that arrives within 30 seconds of it; an acceptance while a window admits extends it. A submission in flight at the acceptance is in the window. Both series start at zero. Fed by PrismLandingAckP99Slow and PrismLandingAckP99High through `share_ack_slow_landing_windows`."
+    },
+    "share_ack_slow_landing_windows": {
+      "labels": {
+        "p99_above_seconds": "LandingAckBound"
+      },
+      "status": "A landing window (see `share_ack_landing_window_seconds`) is judged 30 seconds after it stops admitting submissions, so late acknowledgements can complete, or at the next acceptance if that comes first. Its nearest-rank p99 is over a bound exactly when more than one percent of its acknowledgements took longer than the bound, which the process counts exactly rather than reading from buckets. A window with no acknowledgement has no verdict and leaves the count unchanged; a window at or under the bound resets it to zero. -1 until the first verdict since process start. Per frontend: each frontend judges the landings it observed. PrismLandingAckP99Slow tickets at three for the 2-second bound, PrismLandingAckP99High warns at one for the 10-second bound."
+    },
+    "rejections_total": {
+      "replaces": [
+        "qbit_prism_rejections_total"
+      ],
+      "labels": {
+        "reason_id": "RejectReason"
+      },
+      "status": "Present unknown or empty IDs map to unrecognised; missing IDs and explicit internal-error retain internal-error. Normalization does not change the protocol response. backend-rpc-unavailable names the node, backend-database-unavailable the ledger database (#581): a refusal on a path that reads both names whichever failed, and a timeout or aged-out readiness names the ledger database while the work it waited for was still waiting on it (#655). A published-work lease whose commit gate cannot read or prove its chain authority before COMMIT is answered the same way as readiness it cannot prove (#716), so contention with no failed dependency counts as backend-rpc-unavailable. Incremented per refusal and overlaid on cached metric bodies at scrape time (#581), so refusals during a database outage are counted while the cached body is stale."
+    },
+    "stale_shares_total": {
+      "replaces": [
+        "qbit_prism_stale_shares_total"
+      ]
+    },
+    "duplicate_shares_total": {
+      "replaces": [
+        "qbit_prism_duplicate_shares_total"
+      ]
+    },
+    "low_difficulty_shares_total": {
+      "replaces": [
+        "qbit_prism_low_difficulty_shares_total"
+      ]
+    },
+    "grace_credited_shares_total": {
+      "replaces": [
+        "qbit_prism_grace_credited_shares_total"
+      ]
+    },
+    "stratum_pending_initial_jobs": {
+      "replaces": [
+        "qbit_prism_stratum_pending_initial_jobs"
+      ]
+    },
+    "stratum_oldest_pending_initial_job_seconds": {
+      "replaces": [
+        "qbit_prism_stratum_oldest_pending_initial_job_seconds"
+      ]
+    },
+    "stratum_request_delivery_wait_seconds": {
+      "status": "Default histogram ladder. One observation per waiting request, when its session handles it, whether the delivery it waited for was announced or failed; none when the session ends first. A delivery is the admission, build and persistence of the session's next job and its announcement. A frame that is not a JSON object is answered at once and never waits. A submit queued behind a waiting request is read only after it, and `share_ack_seconds` starts at that read, so this family, not the ACK histogram, carries that wait. Registered at startup: every bucket, `_sum` and `_count` reads 0 until the first wait. No rule of its own."
+    },
+    "job_delivery_cancellations_total": {
+      "status": "Process-local counter, 0 at startup. A delivery is counted once, at its end, in exactly one of `job_delivery_successes_total`, `job_delivery_failures_total` and this family (#621). Counted here: a delivery still being admitted, built or persisted, or built but not yet announced, when its session ends, which since #621 a session notices while a delivery is in flight. A delivery whose announcement write fails still counts as a failure. No rule of its own."
+    },
+    "job_delivery_failures_total": {
+      "status": "A build, admission or persistence error or deadline, or a failed announcement write. A delivery its session abandons before the announcement counts in `job_delivery_cancellations_total` instead (#621)."
+    },
+    "stratum_current_tip_coverage_gap_seconds": {
+      "replaces": [
+        "qbit_prism_stratum_current_tip_coverage_gap_seconds"
+      ]
+    },
+    "stratum_semantic_current_work_ratio": {
+      "replaces": [
+        "qbit_prism_stratum_semantic_current_work_ratio"
+      ],
+      "status": "-1 before observation; one when no clients are authorized."
+    },
+    "block_submit_seconds": {
+      "replaces": [
+        "qbit_prism_block_submit_seconds"
+      ],
+      "status": "Observed once per block by the offering frontend after its one submitblock call returned, from the enqueuing frontend's proof-observation wall clock to the offering frontend's wall clock immediately before the send (A/#266). No sample for a row without a proof time, for a negative interval (host clock skew) or on a recovery; a crash between the call and its outcome commit may lose the sample. No firing rule."
+    },
+    "block_candidates_pending": {
+      "replaces": [
+        "qbit_prism_block_candidates_pending"
+      ],
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. Since #493 the paging rule reads block_candidate_oldest_unacknowledged_seconds instead, so an acknowledged lost race in reconciliation warns but never pages; this gauge keeps its all-unfinished meaning and feeds the 15-second warning and the 30-minute stuck warning."
+    },
+    "block_candidate_oldest_pending_seconds": {
+      "replaces": [
+        "qbit_prism_block_candidate_oldest_pending_seconds"
+      ],
+      "status": "Counts every unfinished outbox state: pending, offer_reserved, offered and reconciliation (A/#266). Excludes rows settled as proven orphans (#415, migration 015): those are terminal, so a lost tip race leaves these gauges once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations at its height. Since #493 the paging rule reads block_candidate_oldest_unacknowledged_seconds instead, so an acknowledged lost race in reconciliation warns but never pages; this gauge keeps its all-unfinished meaning and feeds the 15-second warning and the 30-minute stuck warning."
+    },
+    "block_candidate_oldest_unacknowledged_seconds": {
+      "status": "Read in the same database snapshot as the two all-unfinished gauges (#493): the unfinished rows the node has not accepted are pending and offer_reserved rows, offered or reconciliation rows whose one submitblock outcome is unknown (a transport failure or timeout, or a reservation whose call was lost with its frontend; a row adopted on the node's own evidence that its block is active carries the adoption reply and is excluded), and rows the node definitively rejected unless the reply names a side-chain block (inconclusive, duplicate, duplicate-inconclusive: a lost tip race). A node-accepted lost race awaiting its orphan proof and a landing that keeps failing after acceptance are unfinished but accepted, so they age only block_candidate_oldest_pending_seconds (and the landing-failed gauge). PrismBlockCandidateOldestPendingCritical pages on this gauge, falling back to the all-unfinished age on a target that does not export it yet; PrismBlockCandidateStuck warns on the all-unfinished age at 30 minutes. -1 with the other candidate gauges when the collector fails."
+    },
+    "block_candidate_oldest_landing_failed_seconds": {
+      "status": "Read in the same database snapshot as the other candidate gauges (#493 review M1): the oldest offered or reconciliation row whose landing has not committed (the landing transaction is the only writer of the block's qbit_pool_blocks row, so its absence is the durable fact) or whose last_error carries the landing-failed prefix the coordinator and the collector share (a landed row that no longer authenticates): a row the node accepted or rejected whose audit rebuild, verification or ledger landing keeps refusing and is retried at the reconciliation backoff. Since #510 an offered row counts before its first landing outcome too: a won block whose landing hangs in offered (waiting for build capacity, which has no deadline, while its heartbeat keeps the claim) ages here instead of reading zero, and a healthy offered row lands within the 60-second rebuild deadline, well inside the warning dwell. A retry that fails for a transient node or database reason, or a refused operator recovery, overwrites last_error but not the missing pool-block row, so the age never reads zero while nothing has landed. Measured from offer_reserved_at, the start of the post-offer lifecycle, so pre-offer retry backoff never counts toward it. Zero for a lost race and for a rejection once its audit has landed, because the landing runs before the chain verdict and writes the pool-block row. PrismBlockCandidateLandingFailed warns at 60 s for 3 m and PrismBlockCandidateLandingFailedCritical pages at 307 s for 1 m, the same floor and dwell the revision-work critical applies when the landing fails after the frontend's own active-chain observation, so a won block whose landing keeps failing is never silent. -1 with the other candidate gauges when the collector fails."
+    },
+    "blocks_total": {
+      "status": "Process-local count of first block confirmations observed after a successful settlement or reconciliation commit. Reconciliation includes a previously orphaned candidate that later becomes active; the durable audit publication marker prevents repeat counting on later disconnect/reconnect cycles. Cancellation or restart after commit can lose an increment."
+    },
+    "block_candidates_orphaned_total": {
+      "status": "Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
+    },
+    "node_peers": {
+      "status": "Recorded only when the readiness attempt reached getnetworkinfo and it answered, which is never on regtest, during initial block download, or while blocks and headers disagree; observation adds no RPC call. -1 means the latest attempt did not learn the count, including RPC failure; the gauge never keeps an earlier reading. An answered zero is a real zero, and it is below every configured PRISM_MIN_PEERS floor."
+    },
+    "node_initial_block_download": {
+      "status": "Recorded whenever the latest getblockchaininfo answered with the boolean, including the 1 that then makes readiness fail. -1 means startup, a failed call, or a field that was not a boolean."
+    },
+    "node_observation_age_seconds": {
+      "status": "Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. Peers and the sync flag come from the latest attempt to start, so a slower older attempt landing late cannot roll them back, while the age keeps the latest answer any attempt received."
+    },
+    "hashrate_rollup_watermark_lag_seconds": {
+      "status": "The stored watermark is a share sequence, not a time; a caught-up pass is one that advanced the watermark within its batch bound, leaving no unfolded share. A pass that lost the race to another frontend leaves the stamp unchanged, so a frontend that keeps losing reads high: alert on the minimum across instances. -1 runs from loop start until its first such pass, and PRISM_HASHRATE_ROLLUP_ENABLED=0 leaves the family declared with no sample at all."
+    },
+    "work_refresh_stalled_seconds": {
+      "status": "Stamped when Coordinator::refresh_once succeeds (#525), whether it published new work or revalidated the current work; readiness, which job, share and block admission require within the health timeout, is renewed by that success and, since #622, also by a refresh-grade node poll that finds the published tip; `qbit_prism_tip_poll_age_seconds` is its age, so a frontend whose rebuilds stall while its polls answer reads young there and grows here. A healthy frontend reads at most about one poll interval. A refresh that keeps failing, on a new tip or the same parent (for example PayoutExceedsCandidateBalance when sub-floor dust exists without a pool fee, on either settlement path), or that hangs, grows it without bound, while semantic coverage keeps reading one because sessions still hold the latest published generation. Counted from coordinator start until the first success, so a restart into a stall still grows; -1 only before the health publisher first runs. Pages through PrismWorkRefreshStalledCritical."
+    },
+    "tip_poll_age_seconds": {
+      "status": "Computed when the health publisher runs, from the monotonic stamp readiness keeps (#622). A refresh renews it when it publishes or revalidates work. A node poll renews it, to when the poll was sent, only when no newer observation has found another tip, it found the published tip, no readiness revocation raced it, the published template is within PRISM_TEMPLATE_MAX_AGE_SECONDS, readiness was not already revoked, no refresh has since found the cluster on a heavier chain, and, under CTV settlement, a relay floor read no older than the poll is recorded and the published work's fee meets it: the refresh's own poll at its start, once that refresh's chain observation and reconciliation agree and it has read the relay floor, and the block wait's, which polls on an unchanged notification only once readiness is at least one interval old and at most once per interval, with PRISM_BLOCKWAIT_ENABLED: a third of PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS and at most 5 s (5 s at the default 15 s; a short timeout polls that often), which is also how long the idle block wait waits for a new block. That poll is one readiness check: getblockchaininfo, getnetworkinfo on a public chain (the peer floor) and, under CTV settlement, getmempoolinfo (the relay floor); a failed floor read renews nothing. A healthy frontend reads at most about one poll interval. At PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS job preparation defers with `tip polling stale`, share and block admission answer backend-rpc-unavailable and /healthz reports unready. -1 means readiness is unavailable: never established, or revoked by a failed node observation, a stale template, an unavailable fee floor or, under CTV settlement, a relay floor read above the published work's fee (a refresh's or the block wait's), until a refresh restores it; it is never a reading of zero. Read it with `qbit_prism_work_refresh_stalled_seconds`: young here and old there is a stalled rebuild on a responsive node."
+    },
+    "job_preparation_deferrals_total": {
+      "labels": {
+        "reason": "JobDeferral"
+      },
+      "status": "Counted once per `job preparation deferred` WARN, with the first check that refused the preparation (#622): `tip_polling_stale` (readiness older than PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS and no replacement lease), `tip_polling_unavailable` (readiness revoked), `new_tip_pending` (a newer tip is observed and its work is not published yet), `work_retired` (the authority the work was read with is retired, logged as `payout snapshot stale` for a payout revision or prior-balance change, including a same-tip build a later publication overtook without keeping them, a newer tip's published work replacing its parent, or a lease or publication the work no longer matches, and as `window_not_held` when this primary does not hold the work's window after a writer timeline change (#619)), `fee_floor` (the job's CTV fee is below the live relay floor, or the floor is unknown) and `other` (readiness changed during admission, a database or node error, or a build failure). Tip authority is checked before the payout revision, so `tip_polling_stale` can mask retired work behind it. The session retries on its next timer tick or publication, so one session can count many. Process-local; every series starts at zero."
+    },
+    "share_ledger_partition_lead_rows": {
+      "status": "max(upper_seq) over the attached rows of qbit_prism_share_partitions minus the next share_seq, read by the database collector with the pending-candidate counts (#144). -1 means the collector's last attempt failed or the ledger is not partitioned yet; it is never a report of exhausted headroom. Falling steadily means the maintenance task is not attaching the lead: the next append past the last bound is refused and retried once after attaching it."
+    },
+    "process_resident_memory_bytes": {
+      "replaces": [
+        "qbit_prism_process_resident_memory_bytes"
+      ]
+    },
+    "database_pool_acquire_seconds": {
+      "labels": {
+        "result": "Outcome"
+      },
+      "status": "Client-observed `PgPool::acquire` time: waiting for a pool permit, the idle-connection liveness ping and, when the pool grows, connection setup; excludes transaction BEGIN and the queries that follow. Recorded by the metrics collector, instrumented coordinator ledger transactions and covered direct ledger queries, rollup transactions and share-partition maintenance. The histogram aggregates observed checkout attempts at covered callers. Public-role read pools, private audit HTTP endpoints and shared API read-model helpers, startup/migration gates, operator tools and telemetry-free compatibility wrappers remain excluded; see the acquisition guide for the source census and exclusion policy. `failure` includes acquire errors, the 15-second acquire timeout and acquisitions abandoned by cancellation, recorded with the elapsed wait. Buckets, count and sum are read together from the live registry on each scrape, independently of cached-body publication; scraping does not create observations or renew snapshot freshness."
+    },
+    "database_advisory_lock_wait_seconds": {
+      "labels": {
+        "lock": "LockKind",
+        "result": "Outcome"
+      },
+      "status": "Client-observed duration of the `pg_advisory_xact_lock` statement, including one database round trip, recorded by the coordinator's ledger for the migration, order and settlement locks; the migration lock is taken only when the coordinator initializes the schema. `failure` includes lock timeout (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5 seconds), statement timeout, deadlock and connection errors, and waits abandoned by cancellation. The CPFP funding lock is not observed (#328). Series appear on their first observation, so a restart's first failure is not visible to `increase()`."
+    },
+    "database_order_lock_hold_seconds": {
+      "labels": {
+        "holder": "OrderLockHolder"
+      },
+      "status": "Measured by the coordinator's ledger from the instant `pg_advisory_xact_lock` returned for `ORDER_LOCK` to the instant the holding transaction's COMMIT or ROLLBACK returned (#602); a transaction abandoned by an error ends its hold as it unwinds, a moment before its queued ROLLBACK releases the lock. `append` is the share append, which every miner's acknowledgement waits behind; `first_confirmation` is the offering frontend's settlement that confirmed its block for the first time and `settlement` every other one, including an abandon; `reconcile` is the reorg reconciler, which runs on every template build and can also confirm a block; `first_confirmation` and `settlement` are per attempt, so a settlement that rolls back and is retried records twice; `prepared` is the refresh's window snapshot that prepared work is built from; `candidate_insert` a block-only candidate's insert; `cleanup` blob garbage collection; `fatal_state` fatal-state recovery; `operator` the policy and signing transitions and archive verify and restore, when run with a registry. The schema cutover's hold and archive's statement-scoped append drain are not observed. #602's R2 budget is 250 ms for every holder but `append`. Own ladder from 1 ms to 10 s. Series appear on their first observation. No firing rule of its own."
+    },
+    "collector_available": {
+      "labels": {
+        "collector": "Collector"
+      }
+    },
+    "collector_success": {
+      "labels": {
+        "collector": "Collector"
+      }
+    },
+    "collector_age_seconds": {
+      "labels": {
+        "collector": "Collector"
+      }
+    },
+    "runtime_poll_lag_seconds": {
+      "labels": {
+        "task": "TaskKind"
+      }
+    },
+    "runtime_progress_age_seconds": {
+      "labels": {
+        "task": "TaskKind"
+      }
+    },
+    "runtime_task_stalled": {
+      "labels": {
+        "task": "TaskKind"
+      }
+    },
+    "connections": {
+      "replaces": [
+        "qbit_prism_connected_clients",
+        "qbit_prism_stratum_active_connections"
+      ]
+    },
+    "authorized_clients": {
+      "replaces": [
+        "qbit_prism_stratum_authorized_connections"
+      ]
+    },
+    "authorized_with_current_work": {
+      "replaces": [
+        "qbit_prism_stratum_clients_with_current_tip_jobs"
+      ]
+    },
+    "pending_job_builds": {
+      "replaces": [
+        "qbit_prism_job_delivery_queue_depth"
+      ],
+      "status": "Delivery count replaces the operational intent of queue depth, not its implementation."
+    },
+    "runtime_lag_seconds": {
+      "replaces": [
+        "qbit_prism_lease_heartbeat_monitor_wake_delay_window_max_seconds"
+      ],
+      "status": "Runtime-stall intent replaces lease wake delay; no native writer lease."
+    },
+    "metrics_snapshot_available": {
+      "replaces": [
+        "qbit_prism_metrics_snapshot_available"
+      ]
+    },
+    "metrics_snapshot_stale": {
+      "replaces": [
+        "qbit_prism_metrics_snapshot_stale"
+      ]
+    },
+    "metrics_snapshot_age_seconds": {
+      "replaces": [
+        "qbit_prism_metrics_snapshot_age_seconds"
+      ]
+    },
+    "blocks_total": {
+      "replaces": [
+        "qbit_prism_blocks_accepted_total"
+      ],
+      "status": "Native confirmed-block process counter; not the legacy node-acceptance accounting boundary."
+    },
+    "stratum_connection_refusals_total": {
+      "labels": {
+        "reason": "ConnectionRefusalReason"
+      },
+      "status": "`global_limit` counts a newly accepted socket closed because `PRISM_STRATUM_MAX_CONNECTIONS` permits were exhausted; `username_limit` counts a `mining.authorize` refused by `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME`; `ip_limit` counts a newly accepted socket closed at `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP`, before any permit, task or query. `malformed_frame_budget`, `unknown_job_budget` and `authorize_budget` count a session disconnected for exceeding `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL`, `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` or `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL`, once per session. Same-username reauthorization, reuse of a retained username permit and every disabled limit never count. Refusals are not share rejections, and no series carries a peer address. Process-local; every series starts at zero."
+    },
+    "stratum_connection_limit": {
+      "status": "Set from `PRISM_STRATUM_MAX_CONNECTIONS` when a Stratum listener starts. The primary and high-difficulty listeners share this limit and `qbit_prism_connections`."
+    },
+    "stale_job_rejections_total": {
+      "labels": {
+        "cause": "StaleJobCause"
+      },
+      "status": "Each series counts one existing stale-job decision: resumed-job absolute expiry, CTV relay-fee floor, stale parent or failed stale-grace parent check, and payout-revision mismatch, attributed in that execution order. `window_not_held` (#619) counts a block-bearing proof the candidate enqueue refused before COMMIT because the current primary does not hold the window its coinbase pays: the window's last row is absent or is another share, as after an asynchronous promotion lost the end of the history the work was read from. Nothing was enqueued or offered and the proof's share was not credited; each refusal also logs a WARN naming the block. The ledger counts it at the refusal itself, so a refusal that finishes after the miner's acknowledgement deadline, whose miner was answered `ledger-outcome-unknown`, is counted too. The wire reason and message are unchanged and still counted by `qbit_prism_rejections_total{reason_id=\"stale-job\"}`. Stale-grace credit is not a rejection. Since #478 a block-bearing proof from ordinary work on the active tip is captured whatever its payout revision, so it is no longer counted under `payout_revision`. Still counted: block-only work a same-parent payout replacement retired (its plain shares, and the share of a block captured from it) under `payout_revision`, or `parent_grace` after a tip change; and a capture abandoned before its offer, under `payout_revision` for a ceiling refusal or capture off and `parent_grace` for a lost race. Since #675 `payout_revision` also counts a share-pass submission that passed every submit check, a stale-grace share included, and that the append's payout-revision fence then refused before any write, because a settlement moved the revision first: a plain share, or a block-bearing one with capture off, whose lost block a WARN names. It is counted when the miner is answered `stale-job`, so a block-bearing append still waiting at its acknowledgement deadline (answered `ledger-outcome-unknown`) is not. The series does not separate fence refusals from submit-check ones. Process-local; every series starts at zero."
+    },
+    "accepted_block_to_revision_work_seconds": {
+      "labels": {
+        "result": "RevisionWorkResult"
+      },
+      "replaces": [
+        "qbit_prism_accepted_block_preview_publication_seconds"
+      ],
+      "status": "Frontend-local monotonic timing; no inference of a peer node acceptance timestamp. Every result ends at successful mining.notify write, not prepared publication or proof-to-first-offer. Superseded means a later payout revision arrived before delivery and measures through replacement-work delivery. The pending gauge retains unresolved delivery age. Finite buckets: 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 307 and 600 seconds."
+    },
+    "accepted_block_revision_work_pending_seconds": {
+      "status": "Computed at scrape time and overlaid on cached metric bodies. A second acceptance never resets the oldest known unresolved delivery wait; a failed build does not clear it. Unknown intervals are exposed independently by accepted_block_revision_work_tracking_unknown, so they cannot mask a separate measured stall. Lost ordering history makes pending age unknown. An offer the node accepted without an active-chain observation is an unlanded acceptance (#493): excluded here and reported by accepted_block_unlanded_seconds until an active-chain observation lands it on its original acceptance clock or a proven orphan closes it."
+    },
+    "accepted_block_revision_work_tracking_unknown": {
+      "status": "Process-local boolean, zero at a fresh start and one for incomplete observation, lost target knowledge or bounded tracking saturation. May be one alongside a positive known pending age; never treat a known age as proof that all tracking is complete. No labels."
+    },
+    "accepted_block_unlanded_seconds": {
+      "status": "Computed at scrape time and overlaid on cached metric bodies (#493). Set by the offering frontend at a definitive null submitblock reply; an active-chain observation (the post-offer landing observation, a reconcile proof or a settlement) lands the block, which then joins accepted_block_revision_work_pending_seconds on its original acceptance clock; a committed proven orphan closes it without a histogram sample. An unlanded acceptance never contributes to the known pending age, never attributes a build deadline and is not unknown tracking: a lost tip race is a known state. -1 only when none is tracked and identity tracking is saturated, so an unlanded acceptance may be untracked; a tracked unlanded age stays visible beside saturation, and the tracking-unknown gauge is one either way. While the terminal probe (the ten-second collector read that carries peer orphan evidence) fails or is cancelled, an unlanded-only frontend reads tracking unknown and a -1 pending age, because the lost race's orphan evidence is unreadable; this gauge keeps its age, and the next successful read restores the known state. Warned by PrismAcceptedBlockUnlanded at 30 minutes, never paged."
+    },
+    "revision_work_build_timeouts_total": {
+      "replaces": [
+        "qbit_prism_accepted_parent_preview_wait_timeouts_total"
+      ],
+      "status": "Counts actual existing deadline hits, once per operation; success, cancellation and ordinary errors are not timeout events. No deadline or fallback policy is introduced. Only a known open wait attributes a deadline hit here (#493): while tracking is unknown and no known wait remains (a lost or cancelled settlement COMMIT reply, an unsettled orphan verdict, bounded-tracking saturation or lost ordering history), a deadline hit is an ordinary job_delivery_failures_total event, accepted_block_revision_work_tracking_unknown reports the unknown state and the pending gauge stays -1; it is not counted here and does not stamp a wait recovered after the deadline degraded; a wait recovered before the deadline counts and is degraded as usual."
+    }
+  },
+  "public": {
+    "qbit_prism_public_requests_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Every routed request, including /healthz and /metrics; never use in a request-rate rule."
+    },
+    "qbit_prism_public_ledger_ready": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Schema/read probe succeeded and remains within its freshness budget; zero before a probe, after failure, or when stale. Does not include the separate replica heartbeat refusal."
+    },
+    "qbit_prism_public_ledger_probe_age_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Monotonic age of the last completed readiness probe (including failure); -1 before the first attempt."
+    },
+    "qbit_prism_public_staleness_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Responses refused for exceeding an endpoint cache-age budget."
+    },
+    "qbit_prism_public_replica_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Database-reading routes refused by the public replica contract."
+    },
+    "qbit_prism_public_audit_artifact_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Audit artifact requests refused with 503 audit_artifact_busy because PRISM_PUBLIC_AUDIT_ARTIFACT_MAX_IN_FLIGHT audit artifacts were already in flight. Public-api role only: the mining process serves the same route on its operator listener and applies the same cap there, but has no public-service metrics owner, so those refusals are uncounted."
+    },
+    "qbit_prism_public_degraded_responses_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Cached HIT responses served during database unavailability."
+    },
+    "qbit_prism_public_database_outage_refusals_total": {
+      "type": "counter",
+      "labels": "none",
+      "role": "public-api",
+      "meaning": "Uncached database reads refused during database unavailability."
+    },
+    "qbit_prism_public_responses_total": {
+      "type": "counter",
+      "labels": "`status` (HTTP status code)",
+      "role": "public-api",
+      "meaning": "HTTP responses by status, including health probes; appears after the first response."
+    },
+    "qbit_prism_public_cache_total": {
+      "type": "counter",
+      "labels": "`state=HIT,MISS,STALE,BYPASS`",
+      "role": "public-api",
+      "meaning": "Public route cache outcomes; appears after a public route request."
+    },
+    "qbit_prism_public_replica_in_recovery": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Last observed public read database recovery state; zero if never observed. Not the dedicated HA standby."
+    },
+    "qbit_prism_public_replica_heartbeat_age_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Last observed public WAL-receiver heartbeat age plus monotonic time since observation; -1 if unknown/disconnected."
+    },
+    "qbit_prism_public_replica_replay_lag_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Time since the last replayed transaction plus observation age; can increase on an idle primary and is not a byte-backlog or HA failover-loss measurement; -1 if unknown."
+    },
+    "qbit_prism_public_replica_apply_backlog_bytes": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Last observed receive-LSN minus replay-LSN bytes; -1 if unknown; may remain cached after probe failure."
+    },
+    "qbit_prism_public_replica_max_lag_seconds": {
+      "type": "gauge",
+      "labels": "none",
+      "role": "public-api (replica=require)",
+      "meaning": "Configured public read replica maximum lag/heartbeat-age budget in seconds."
+    }
+  }
+}

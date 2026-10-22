@@ -1,0 +1,599 @@
+{
+  "commit": "f1x7ure",
+  "fsync_band_edges_usecs_per_op": [
+    125,
+    250,
+    500,
+    1000,
+    2000,
+    4000
+  ],
+  "groups": [
+    {
+      "class": 8,
+      "disks": [
+        {
+          "fua": "0",
+          "model": "m",
+          "vms": 4,
+          "write_cache": "write back"
+        }
+      ],
+      "fsync_band": "all",
+      "fsync_usecs_per_op": {
+        "cv": 0.0,
+        "mad": 0.0,
+        "max": 500.0,
+        "median": 500.0,
+        "min": 500.0,
+        "n": 8,
+        "unknown": 0
+      },
+      "jobs": {
+        "planned": 4,
+        "with_row": 4
+      },
+      "metrics": {
+        "headroom_mib": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 23000.0,
+            "median": 23000.0,
+            "min": 23000.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "MiB, MemTotal minus the peak used",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 23000.0,
+            "median": 23000.0,
+            "min": 23000.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "peak_used_mib": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 9000.0,
+            "median": 9000.0,
+            "min": 9000.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "MiB, the host's MemTotal - MemAvailable sampled every second",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 9000.0,
+            "median": 9000.0,
+            "min": 9000.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "seed_seconds": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 10.0,
+            "median": 10.0,
+            "min": 10.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "seconds, as the harness reports the window seed",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 10.0,
+            "median": 10.0,
+            "min": 10.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.achieved_rate_shares_per_second": {
+          "all": {
+            "cv": 0.0016,
+            "mad": 0.1,
+            "max": 500.0,
+            "median": 499.9,
+            "min": 498.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0005,
+            "median_mad": 0.175
+          },
+          "unit": "shares per second, reconciled acknowledged count over the phase",
+          "vm_to_vm": {
+            "cv": 0.0016,
+            "mad": 0.125,
+            "max": 500.0,
+            "median": 499.825,
+            "min": 498.25,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.ack_p50_ms": {
+          "all": {
+            "cv": 0.0512,
+            "mad": 0.15,
+            "max": 11.2,
+            "median": 10.05,
+            "min": 9.8,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0134,
+            "median_mad": 0.1
+          },
+          "unit": "milliseconds, the client's monotonic clock, accepted shares",
+          "vm_to_vm": {
+            "cv": 0.054,
+            "mad": 0.075,
+            "max": 11.1,
+            "median": 10.025,
+            "min": 9.95,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.ack_p99_ms": {
+          "all": {
+            "cv": 0.0527,
+            "mad": 0.75,
+            "max": 45.0,
+            "median": 40.35,
+            "min": 39.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0167,
+            "median_mad": 0.5
+          },
+          "unit": "milliseconds, the client's monotonic clock, accepted shares",
+          "vm_to_vm": {
+            "cv": 0.0549,
+            "mad": 0.375,
+            "max": 44.5,
+            "median": 40.175,
+            "min": 39.75,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.shortfall": {
+          "all": {
+            "cv": null,
+            "mad": 0.0,
+            "max": 0,
+            "median": 0.0,
+            "min": 0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": null,
+            "median_mad": 0.0
+          },
+          "unit": "offers no session could take",
+          "vm_to_vm": {
+            "cv": null,
+            "mad": 0.0,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "tip_last_notify_p99_ms": {
+          "all": {
+            "cv": null,
+            "mad": null,
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "unknown": 8
+          },
+          "run_to_run": null,
+          "unit": "milliseconds, nearest-rank p99 of each tip's slowest session",
+          "vm_to_vm": {
+            "cv": null,
+            "mad": null,
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "unknown": 4
+          }
+        },
+        "wall_seconds": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 600.0,
+            "median": 600.0,
+            "min": 600.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "seconds, the runner's monotonic clock, around pg_test_fsync, the harness and the gate",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 600.0,
+            "median": 600.0,
+            "min": 600.0,
+            "n": 4,
+            "unknown": 0
+          }
+        }
+      },
+      "preset": "throughput-20k-window-1fe",
+      "runner": "blacksmith-8vcpu-ubuntu-2404",
+      "runs": {
+        "measured": 8,
+        "planned": 8,
+        "unknown": 0,
+        "unknown_reasons": {}
+      },
+      "size_evidence": {
+        "fits": true,
+        "gated_phases": [
+          "steady_state"
+        ],
+        "gated_shortfall_max": 0,
+        "headroom_fraction": 0.25,
+        "headroom_mib_min": 23000.0,
+        "headroom_mib_required": 8000.0,
+        "mem_total_mib_min": 32000.0,
+        "peak_used_mib_max": 9000.0,
+        "preset_min_mem_available_mib": 6144,
+        "runs_measured": 8,
+        "runs_planned": 8,
+        "runs_with_gated_shortfall": 0,
+        "why": "all 8 run(s) measured, no gated shortfall, headroom held"
+      }
+    },
+    {
+      "class": 8,
+      "disks": [
+        {
+          "fua": "0",
+          "model": "m",
+          "vms": 4,
+          "write_cache": "write back"
+        }
+      ],
+      "fsync_band": "500-1000us",
+      "fsync_usecs_per_op": {
+        "cv": 0.0,
+        "mad": 0.0,
+        "max": 500.0,
+        "median": 500.0,
+        "min": 500.0,
+        "n": 8,
+        "unknown": 0
+      },
+      "jobs": {
+        "planned": 4,
+        "with_row": 4
+      },
+      "metrics": {
+        "headroom_mib": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 23000.0,
+            "median": 23000.0,
+            "min": 23000.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "MiB, MemTotal minus the peak used",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 23000.0,
+            "median": 23000.0,
+            "min": 23000.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "peak_used_mib": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 9000.0,
+            "median": 9000.0,
+            "min": 9000.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "MiB, the host's MemTotal - MemAvailable sampled every second",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 9000.0,
+            "median": 9000.0,
+            "min": 9000.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "seed_seconds": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 10.0,
+            "median": 10.0,
+            "min": 10.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "seconds, as the harness reports the window seed",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 10.0,
+            "median": 10.0,
+            "min": 10.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.achieved_rate_shares_per_second": {
+          "all": {
+            "cv": 0.0016,
+            "mad": 0.1,
+            "max": 500.0,
+            "median": 499.9,
+            "min": 498.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0005,
+            "median_mad": 0.175
+          },
+          "unit": "shares per second, reconciled acknowledged count over the phase",
+          "vm_to_vm": {
+            "cv": 0.0016,
+            "mad": 0.125,
+            "max": 500.0,
+            "median": 499.825,
+            "min": 498.25,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.ack_p50_ms": {
+          "all": {
+            "cv": 0.0512,
+            "mad": 0.15,
+            "max": 11.2,
+            "median": 10.05,
+            "min": 9.8,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0134,
+            "median_mad": 0.1
+          },
+          "unit": "milliseconds, the client's monotonic clock, accepted shares",
+          "vm_to_vm": {
+            "cv": 0.054,
+            "mad": 0.075,
+            "max": 11.1,
+            "median": 10.025,
+            "min": 9.95,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.ack_p99_ms": {
+          "all": {
+            "cv": 0.0527,
+            "mad": 0.75,
+            "max": 45.0,
+            "median": 40.35,
+            "min": 39.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0167,
+            "median_mad": 0.5
+          },
+          "unit": "milliseconds, the client's monotonic clock, accepted shares",
+          "vm_to_vm": {
+            "cv": 0.0549,
+            "mad": 0.375,
+            "max": 44.5,
+            "median": 40.175,
+            "min": 39.75,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "steady_state.shortfall": {
+          "all": {
+            "cv": null,
+            "mad": 0.0,
+            "max": 0,
+            "median": 0.0,
+            "min": 0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": null,
+            "median_mad": 0.0
+          },
+          "unit": "offers no session could take",
+          "vm_to_vm": {
+            "cv": null,
+            "mad": 0.0,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "n": 4,
+            "unknown": 0
+          }
+        },
+        "tip_last_notify_p99_ms": {
+          "all": {
+            "cv": null,
+            "mad": null,
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "unknown": 8
+          },
+          "run_to_run": null,
+          "unit": "milliseconds, nearest-rank p99 of each tip's slowest session",
+          "vm_to_vm": {
+            "cv": null,
+            "mad": null,
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "unknown": 4
+          }
+        },
+        "wall_seconds": {
+          "all": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 600.0,
+            "median": 600.0,
+            "min": 600.0,
+            "n": 8,
+            "unknown": 0
+          },
+          "run_to_run": {
+            "jobs": 4,
+            "median_cv": 0.0,
+            "median_mad": 0.0
+          },
+          "unit": "seconds, the runner's monotonic clock, around pg_test_fsync, the harness and the gate",
+          "vm_to_vm": {
+            "cv": 0.0,
+            "mad": 0.0,
+            "max": 600.0,
+            "median": 600.0,
+            "min": 600.0,
+            "n": 4,
+            "unknown": 0
+          }
+        }
+      },
+      "preset": "throughput-20k-window-1fe",
+      "runner": "blacksmith-8vcpu-ubuntu-2404",
+      "runs": {
+        "measured": 8,
+        "planned": 8,
+        "unknown": 0,
+        "unknown_reasons": {}
+      },
+      "size_evidence": null
+    }
+  ],
+  "in_job_repeats": 2,
+  "jobs": {
+    "by_vm": [
+      {
+        "class": 8,
+        "fsync_band": "500-1000us",
+        "fsync_usecs_per_op": 500.0,
+        "repeat": 1,
+        "target_cache": "sticky-disk"
+      },
+      {
+        "class": 8,
+        "fsync_band": "500-1000us",
+        "fsync_usecs_per_op": 500.0,
+        "repeat": 2,
+        "target_cache": "sticky-disk"
+      },
+      {
+        "class": 8,
+        "fsync_band": "500-1000us",
+        "fsync_usecs_per_op": 500.0,
+        "repeat": 3,
+        "target_cache": "sticky-disk"
+      },
+      {
+        "class": 8,
+        "fsync_band": "500-1000us",
+        "fsync_usecs_per_op": 500.0,
+        "repeat": 4,
+        "target_cache": "sticky-disk"
+      }
+    ],
+    "missing": [],
+    "planned": 4,
+    "with_row": 4
+  },
+  "rows_without_commit": 0,
+  "schema": "qbit.prism.runner-probe-variance.v1"
+}

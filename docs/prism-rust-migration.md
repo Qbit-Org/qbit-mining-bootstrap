@@ -1,0 +1,2497 @@
+# Migrate Prism to Rust and multiple instances
+
+The Rust server replaces all Python Prism runtime and operator scripts from the
+`2.x.x` branch. Stratum, public/audit HTTP routes, signed audit formats, payout rules, and existing
+PostgreSQL accounting history remain compatible. The runtime uses native threads
+and allows multiple frontends to write to one shared PostgreSQL database.
+
+This is a coordinated cutover. **Do not run Python and Rust coordinators against
+the same database at the same time.** The additive native migration checks the
+legacy writer lease and prevents a Python process from acquiring it afterward.
+Stopping the Python services and retaining a recoverable backup are required
+before migration.
+
+## Prepare the deployment
+
+1. Pin the source revision and native image digest. Build and test the native
+   binary and validate the reviewed environment with `qbit-prism-server
+   check-config`. Keep the same manifest signing seed, ledger attestation seed,
+   trusted ledger public key, chain, payout policy, pool fee, and CTV policy.
+2. Choose the shared PostgreSQL writer endpoint. All frontends need access to
+   that same database and a synchronized qbitd on the same chain. Configure TLS,
+   credentials, connection limits, and replication through the database's
+   existing operating procedures.
+3. Give each frontend a unique `PRISM_INSTANCE_ID` or use generated UUIDs.
+   Configure `PRISM_RUNTIME_WORKERS`, `PRISM_JOB_BUILD_EXECUTOR_WORKERS`, and
+   `PRISM_DATABASE_MAX_CONNECTIONS` per host. Budget total database connections
+   across all frontends and administrative clients.
+4. Record a baseline: latest accepted `share_seq`, accepted share count, pool
+   blocks and pending candidates, carry-forward integrity report and
+   `audit_head_sha256`, CTV states, and representative audit SHA values. Save
+   canonical audit downloads and independently verify them against the trusted
+   ledger key and on-chain coinbase.
+5. Back up external audit bodies **and every referenced segment**, including
+   legacy compact body refs and v2 proof-body segments. A live evidence envelope
+   alone is not an audit backup. Preserve recorded file paths or plan a mount at
+   the original absolute path for import. Include the `2.x.x` canonical
+   `prism-audit-bundle-canonical-*.json.gz` sidecars.
+6. **Pre-migration canonical backfill rehearsal (required).** On an isolated
+   restore of the source database and artifact backup, run the native `migrate`
+   and `import-audits` commands in the recovery procedure below. Native import
+   is also the canonical backfill: if a sidecar never existed, it reconstructs
+   bytes from a recoverable inline bundle or external body/segments, verifies
+   the trusted ledger signature, recorded coinbase, and existing published SHA,
+   then stores the bytes. Both completeness counts must be zero before the
+   production migration. A missing body or a digest mismatch stops cutover;
+   recover the original evidence rather than changing the published SHA. This
+   uses the native equivalent, not the `2.x.x` canonical-backfill command, so
+   it does not depend on #174/#176 or mutate historical public content on the
+   source. Record restore, migrate, import, verification times and history size
+   on a production-sized copy; #291 supplies the release rehearsal evidence.
+   [`make prism-cutover-rehearsal`](#rehearse-the-cutover-on-a-snapshot) runs
+   this rehearsal on a `pg_dump` and records those times, the longest lock
+   each step held, and a pass/fail check of every invariant below.
+
+## Drain and migrate
+
+1. Remove the Python frontends from new connection routing, stop the Python
+coordinators, public read services, and standalone CTV broadcaster daemons, and wait for admitted
+writes and candidate accounting to finish. Inspect pending candidate state and
+resolve it while the old runtime is still available. Confirm every old process
+has stopped and its writer lease has been released or expired. A paused old
+process is not a completed shutdown.
+
+2. Take the final consistent database backup after draining, along with the audit
+filesystem backup and securely retained key/configuration recovery material.
+Retain the old pinned image for recovery. Rehearse restoring this backup into an
+isolated database before the production change.
+
+3. Run the following with the reviewed operator environment exported, using the
+new executable and the existing database:
+
+```sh
+qbit-prism-server check-config
+qbit-prism-server migrate
+qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+```
+
+4. Before admitting native traffic, compare the source and migrated recovery
+   evidence using the numbered procedure below, before running
+   `qbit-prism-server backfill-ctv`; record any intentional CTV repair delta
+   separately afterward. `import-audits` must report
+   `missing_stored_bodies: 0` and `missing_canonical_bytes: 0`. Run production
+   `self-check` with the intended services available and retain its JSON and
+   exit status. A missing body or canonical representation makes it fail in
+   production; lab mode reports the counts without failing for incompleteness.
+   Native normalized audits use their stored metadata and immutable snapshot
+   for canonical reconstruction, so they do not require a duplicate full byte
+   copy. These counts check availability; import and artifact reads authenticate
+   the contents. Fetch representative historical artifacts through the actual
+   public edge, including the oldest history, a sidecar-only import and a
+   reconstructed body. Require the exact SHA and matching ETag, as below.
+
+Nothing on the serving path reads a legacy row's canonical bytes. So
+frontends can admit traffic before `import-audits` finishes. From 3.0.0 an
+import beside them holds `SETTLEMENT_LOCK` only to check the write guard and
+commit each row. It sends and stores the row first, within
+`PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`; `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS`
+bounds its wait for the lock and its hold. SIGTERM stops it (#765). Through
+rc.6 it held the lock while it sent and stored each body, which stalls
+settlement and template refresh for as long, so run an earlier candidate's
+import beside serving frontends only under a guard that kills it with
+SIGKILL once a settlement waiter has waited a few seconds: as a container's
+PID 1 it ignores SIGTERM. Until `import-audits` finishes,
+production `self-check` fails at audit completeness and skips its other checks
+(#734). `scripts/prism_legacy_import_admission_gate.sh` checks every other fact
+`self-check` checks, against the frontend's own environment on each host. It
+reports legacy completeness as pending, and fails on any incomplete native
+audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
+for an audit whose 2.x body can't be read on that host (#735), and the block's
+audit view answers 404.
+
+The gate's carry-forward integrity check runs the same report `self-check`
+runs. At production size it took about a minute before migration 026 (#737).
+Since 026 it is estimated at about half a minute, the sum of its two checks'
+EXPLAIN ANALYZE times (20.29 s and 9.14 s), not a timed run. It holds one
+snapshot for as long. On a primary with live miners every share updates the
+cluster row, so a long snapshot there piles up dead row versions and slows
+the share append's lock (#738). Below about 200 shares/s that's harmless. Above it, set
+`PRISM_INTEGRITY_REPORT_DATABASE_URL` to a hot standby and the gate runs the
+report there. That standby must have `hot_standby_feedback` off, or the report
+holds back the writer all the same. Pause its replay first
+(`SELECT pg_wal_replay_pause();`, until `pg_get_wal_replay_pause_state()` reads
+`paused`; `pg_wal_replay_resume()` afterwards), or set
+`max_standby_streaming_delay` and `max_standby_archive_delay` to -1 there, so no
+recovery conflict cancels the report. Never pause a standby the writer waits on
+for apply (`synchronous_commit = remote_apply`): every commit would stall. The
+found-block offer standby (#529) waits only for flush, which a pause doesn't
+stop. The gate refuses a URL that isn't in recovery, isn't a replica of this
+writer's database on the writer's timeline, has feedback on, serves a writer
+that waits for apply, or whose last replayed transaction is older than
+`PRISM_INTEGRITY_REPORT_MAX_AGE_SECONDS` (default 300; the frontends' heartbeats
+keep a live writer committing). It records both WAL positions. Finish every
+query on the standby before `pg_wal_replay_resume()`: after a long pause, the
+replayed backlog cancels queries running at the resume or just after it. Or set `PRISM_GATE_INTEGRITY=skip`:
+the gate says so in a WARN line, and you record the report from wherever it
+ran. Every query the gate runs has a 15 s statement timeout and a 5 s lock
+timeout; the report gets 120 s on the writer and 600 s on a standby.
+
+`migrate` applies the existing schema and additive native migration under a
+transaction lock. It preserves share sequence/history, balances, audit metadata,
+and settlement rows. New tables hold shared configuration/revision, instance
+heartbeats, expiring jobs, immutable audit snapshots, and durable claim state.
+Migration 3 retains `2.x.x` publication ordinals, retained worker difficulty,
+hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
+source schema, records what was migrated, and declares the schema capability
+every later start checks. The base schema and native migrations apply in one
+transaction, including carry-forward summary repair, except 002's share-hash
+backfill and migrations 013, 017 and 024. On a ledger with rows, 002 maps the
+legacy shares' headers after the commit, in bounded batches, and records 2
+once every one is mapped
+([below](#migration-002s-share-hash-backfill-applied-online)). With
+`migrate --defer-share-hashes`, only the legacy shares near the tip are mapped
+before the database serves, and `backfill-share-hashes` maps the rest while
+frontends serve, in throttled batches
+([Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)).
+Migration 013, the share ledger index trim, builds its indexes after the
+commit with `CREATE INDEX CONCURRENTLY`
+([below](#migration-013-the-share-ledger-index-trim-applied-online)), and
+migration 024 builds the CTV fanout claim lane's index the same way (#668).
+With every frontend and tool stopped, `migrate --offline-indexes` builds both
+with a plain `CREATE INDEX` in one transaction instead, which reads each table
+once and waits for no other transaction.
+Migration 017, the share ledger partition conversion, validates its bound and
+swaps the table after the commit on a dedicated connection
+([below](#migration-017-the-share-ledger-partition-conversion-applied-online)).
+Where the ledger is empty all three stay inside the migration transaction,
+under the cutover locks that exclude writers (002's backfill then has nothing
+to map); otherwise each records its version only after its last change. The
+migration is
+idempotent; a refusal due to an old active writer, an unsupported source
+schema, or unresolved legacy work must be resolved before admitting native
+traffic.
+
+### Two drains, one for each era
+
+**Legacy rows and native rows have different drains.** Every `2.x.x` candidate
+must be drained with the pinned legacy image *before* migrating, as in step 1
+above and in [the drain requirement](#supported-2xx-source-schemas); the
+migrator refuses while any remains. The native `qbit-prism-server candidates`
+commands act on native-era rows only — they cannot read a chunked v2 body or a
+pre-migration v1 document, and running them neither satisfies nor bypasses the
+migrator's drain check.
+
+Use them after the cutover, on rows this release wrote:
+
+```sh
+qbit-prism-server candidates list
+qbit-prism-server candidates abandon --block-hash <hash> --reason "<nonblank explanation>"
+qbit-prism-server candidates recover --block-hash <hash> [--block-hash <hash> ...] [--apply]
+```
+
+`candidates list` exits zero on an empty list, so it is the check a `set -e`
+runbook waits on before stopping native frontends; `candidates abandon` applies
+to a `pending` row only and refuses everything the node may already have been
+offered. `candidates recover` lands a native-era block the node has already
+accepted, under an explicit allowlist, and never offers one; like the other
+two it cannot read a chunked v2 body or a pre-migration v1 document (exit 7
+and exit 8, evidence preserved), so it neither satisfies nor bypasses the
+migrator's drain check. All three are documented in full under
+[Candidate commands](prism-ledger-ops.md#candidate-commands). A pre-migration
+row reaching a native frontend is parked by the claim lane with a `last_error`
+naming its `storage_version`; `candidates list` shows it, but the answer is
+still the legacy drain, with the pinned `2.x.x` image, never an operator
+abandon.
+
+That rule is enforced, not only documented. A `2.x.x` v1 document is parked at
+`storage_version = 1`, the same version the native writer uses, so `abandon`
+tests the document rather than the version: it changes a row only when the
+`candidate` carries `payout_revision` and `block_hash` beside an inline
+`bundle` or a `window` reference — the predicate
+`refuse_undrained_outbox` classifies native rows with, above. A legacy document
+is refused atomically with exit 8 and keeps every column, so an operator
+sweeping a stalled outbox cannot delete the evidence this drain still needs.
+
+### Supported 2.x.x source schemas
+
+The minimum supported source release is **v2.0.1** (`95ffe06`). A v2.0.0
+(`f6854a0`) database has the identical schema and migrates as the same source
+state, but drain it with the v2.0.1 or later image, because the offline
+recovery command below first shipped in v2.0.1. The newest supported source is
+**v2.0.2** (`504846c`, #258). The SQL those releases applied is frozen
+byte-for-byte under `crates/qbit-prism-server/tests/fixtures/schema_2x/`. The
+migrator classifies the database before it runs any DDL, and after
+`001_share_ledger.sql` has run it checks that what 001 left alone is the
+release definition:
+
+| Source state | Evidence | Verdict |
+| --- | --- | --- |
+| fresh | no `qbit_share_ledger`, no other object `001_share_ledger.sql` creates, no `002_candidate_bodies.sql` object: an empty database, with or without objects of the operator's own | accept |
+| partial 001 | no `qbit_share_ledger`, but some table, sequence, index, trigger or function that 001 creates is present: a selective restore, or part of the schema installed by hand | refuse before any DDL, naming the objects present; restore the full pre-migration backup or migrate into an empty database |
+| pre-#258 (v2.0.0, v2.0.1) | `001_share_ledger.sql` only: no `qbit_prism_schema_capabilities`, no `002_candidate_bodies.sql` object | accept after the drain check |
+| #258 applied (v2.0.2) | `candidate_storage_version = 2` and every `002_candidate_bodies.sql` object present | accept after the drain check |
+| partial 002 | some 002 objects or the capability row, but not all (v2.0.2 applies 001 and 002 as two script calls, and a restart between them leaves this) | refuse, naming the missing object; finish 002 with the v2.0.2 release (`PRISM_POSTGRES_INIT_SCHEMA=1`) or restore the backup |
+| newer | `candidate_storage_version > 2`, or a capability this release does not know | refuse before any DDL; a newer PRISM release wrote the database. A native database also gets a capability check before later DDL; after migration 6, its candidate version must be 1, the format the native claim lane can process |
+| native collision | a table, sequence, index, trigger, function or column that a native migration (`002_multi_instance.sql` to `017_share_ledger_partitions.sql`) creates and the `2.x.x` release does not is already present, in an empty database or a `2.x.x` one, or a reserved relation name is held by a relation of another kind (a view, an index backing an operator's constraint): a leftover of an earlier native attempt, a selective restore, or something installed by hand | refuse before any DDL, naming the objects; nothing is dropped; restore the full pre-migration backup, or check what the objects hold and remove them, then migrate again |
+| drifted 001 | a 001 (or 002) object whose definition, after 001 has run, differs from the frozen release: a table, column, index, sequence or named constraint that 001's `IF NOT EXISTS` skipped, or any 002 object, with a dropped constraint, a changed type, nullability or default, a different index definition, an altered sequence (a lowered maximum, a different increment), a table or sequence made `UNLOGGED` (or temporary), a release constraint left `NOT VALID` (other than the pinned `qbit_share_ledger_credit_policy_check`), a release foreign key whose enforcement triggers were disabled, row-level security enabled or forced on a release table or a policy on one, a child table created with `INHERITS` on a release table or a release table made a child or partition of another, a replaced function body, a disabled trigger or a trigger the release does not create on a release table | refuse transactionally, naming each object and what differs; the migration rolls back and the database is unchanged; restore the pre-migration backup or bring the database to the release schema with the `2.x.x` release, then migrate again |
+
+Migration requires visible `qbit_` relations and functions to resolve in
+`current_schema()`, where its unqualified DDL creates objects. An empty first
+schema followed by a legacy ledger schema in `search_path` is refused before
+any DDL, preventing a parallel ledger from hiding accounting history.
+Set the intended ledger schema first and ensure no `qbit_` objects resolve
+from other schemas. A later empty schema or unrelated operator objects are
+allowed.
+
+**The release definitions.** They are not a stored fingerprint: before any
+DDL touches the source, inside the migration transaction, the migrator opens
+a savepoint, creates a scratch schema, applies the frozen 001 there (plus
+`002_candidate_bodies.sql` for a #258 source), reads every table, column,
+constraint, index, trigger, function and sequence that produced, and rolls
+the savepoint back, so the comparison is exact for the PostgreSQL version in
+use and nothing from the scratch apply survives. Both checks below use that
+one reading.
+
+**The fresh check.** A database without `qbit_share_ledger` and without any
+002 object is fresh only if it has none of the other objects 001 creates.
+Anything else, a `qbit_pool_blocks` restored on its own, a leftover
+`qbit_audit_publication_sequence_seq`, a hand-created function, is a partial
+001: 001's `IF NOT EXISTS` would keep it exactly as it is, so the migration
+is refused before any DDL, naming what is present:
+
+```
+refusing to migrate a partial 001 source before any DDL: the database has no qbit_share_ledger but
+holds 4 object(s) that the 2.x.x release's 001_share_ledger.sql creates (table qbit_pool_blocks;
+index qbit_pool_blocks_audit_publication_sequence_idx on qbit_pool_blocks; index
+qbit_pool_blocks_maturity_idx on qbit_pool_blocks; index qbit_pool_blocks_public_recent_idx on
+qbit_pool_blocks), so it is neither an empty database nor a 2.x.x ledger, and 001's IF NOT EXISTS
+would keep those objects whatever they hold. Nothing was changed. Restore the full pre-migration
+backup, or migrate into an empty database
+```
+
+Objects the release does not create, an operator's own table for instance,
+do not disqualify a fresh database; they are kept and logged at warning
+level.
+
+**The native-collision check.** The same scratch apply continues with the
+native migrations, in the order the migrator applies them, and is read
+again; the second reading minus the first is every table, sequence, index,
+trigger and function a native migration creates and the release does not
+(`qbit_prism_schema_migrations`, which the migrator creates itself, is never
+in it), and, per release table, every column a native migration adds to it
+(the claim columns 002 adds to the outbox and the fanout artifacts, for
+instance). A `2.x.x` database or an empty one that already has one of those
+objects or columns is refused before any DDL, whatever it holds: `CREATE
+TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS` and their kin would keep it
+as it is, the migration would then record a schema it did not build, and a
+writer would fail only afterwards. A reserved name held by a relation of
+another kind is the same collision, because `IF NOT EXISTS` looks at the
+name alone: a view under a native table's name, or an operator table whose
+unique constraint is named `qbit_prism_candidate_claim_idx` and whose index
+therefore owns that name, would make 002 skip the outbox index it meant to
+create and leave candidate polling to scan the outbox; each is named by
+what holds the name (`view qbit_prism_jobs`, `index
+qbit_prism_candidate_claim_idx backing constraint
+qbit_prism_candidate_claim_idx on operator_notes`). For example, a leftover
+`qbit_prism_cluster(singleton boolean PRIMARY KEY)` on an otherwise empty
+database is refused like this:
+
+```
+refusing to migrate a native collision source before any DDL: the empty database already holds
+1 object(s) that the native migrations create and the 2.x.x release does not (table
+qbit_prism_cluster), so a native migration's IF NOT EXISTS would keep each such table, sequence,
+index, trigger, function or column whatever it holds and the migration would record a schema it
+did not build. Nothing was changed. Restore the full pre-migration backup, or check what those
+objects hold and remove them yourself, then migrate again
+```
+
+A column already on a release table under a reserved name, a `claim_token
+integer` on the outbox say, is named as `column
+qbit_block_candidate_outbox.claim_token`. Nothing is dropped for you. An
+object or column in both readings, the capability table on a #258 source
+for instance, or the outbox's `storage_version` there (the release 002
+added it; on a pre-#258 source 006 adds it, so it is reserved), stays
+governed by the release checks.
+
+Migration 017 reserves a family of names rather than a list. The partitions of
+the share ledger are named `qbit_share_ledger_p<n>` in creation order, and their
+indexes take that name as a prefix, so any relation in the ledger's schema
+matching `qbit_share_ledger_p<n>` or `qbit_share_ledger_p<n>_<suffix>` is
+refused before the conversion takes its first step, whatever kind of relation
+it is. The names the swap itself takes are `qbit_share_ledger_p0` for the
+converted release table and `qbit_share_ledger_p0_pkey`,
+`qbit_share_ledger_p0_share_id_key`,
+`qbit_share_ledger_p0_accepted_recent_idx`,
+`qbit_share_ledger_p0_accepted_block_suffix_idx`,
+`qbit_share_ledger_p0_accepted_seq_walk_idx` and
+`qbit_share_ledger_p0_accepted_miner_history_idx` for its six indexes. An
+operator's own relation under one of those names is named in the refusal with
+its kind and is never adopted; rename it out of the `qbit_share_ledger_p`
+prefix, or move it aside, and migrate again.
+
+**The release-schema check.** 001 is the idempotent schema every `2.x.x`
+start re-applied, so the migrator applies it next: that repairs everything
+001 re-asserts (its functions, its triggers, the columns and constraints it
+alters or re-adds by name). What `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF
+NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` skip is checked after it, before
+`002_multi_instance.sql` or any later native migration alters those tables.
+It runs on a fresh database too, where 001 has just created everything and
+it passes trivially. Each object needs an equivalent in the schema the
+migrator runs in: for every table and sequence its persistence (the release
+creates ordinary logged relations, and an `UNLOGGED` or temporary table is
+one whose rows PostgreSQL truncates after a crash, so it is drift whatever
+its columns say; a sequence follows its table's persistence on PostgreSQL 15
+and later); for every table its row-level security, both flags (`ENABLE ROW
+LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY`) and every policy on it, by
+name, with its command, whether it is permissive or restrictive, its roles
+and its `USING` and `WITH CHECK` expressions (the release creates none of
+this; a policy that hides rows from the migrate role, or forced security
+with no policy at all, would make the drain check see an empty outbox and
+the native claim lane never see the legacy rows it left behind, so a policy
+on a release table is drift, not an extra: `table qbit_block_candidate_outbox
+differs: expected row-level security disabled, found enabled and forced`,
+`policy hide_pending on qbit_block_candidate_outbox: FOR ALL USING ((state
+<> 'pending'::text)); the release has no row-level security policy on this
+table`); for every table its inheritance, both ways (the release creates
+none: a child created with `INHERITS (qbit_share_ledger)` has its rows
+included in every query of the ledger, the share reads included, without
+the release constraints ever checking them, and a release table attached as
+a partition of or inheriting from another table is no longer the relation
+the release defined, so either is drift: `table qbit_share_ledger differs:
+expected no child table, found child table(s) qbit_share_ledger_2025`;
+inheritance among the operator's own tables is theirs to keep); column
+type, NOT NULL, default, identity and generated status, collation;
+constraints per table by definition, validation state and the enabled state
+of the internal triggers that enforce them; index definitions and validity;
+trigger definitions and enabled state; function arguments, result, language, body,
+volatility and settings; and for every sequence, the ones behind `bigserial`
+columns and the explicit `qbit_audit_publication_sequence_seq` alike, its
+data type, start, increment, minimum, maximum, cache and cycle. The value a
+sequence has reached is data and is not compared, so a ledger whose share
+sequence has advanced migrates and keeps its position. Schema qualification,
+column order, comments and the names of auto-generated constraints are
+ignored. A constraint's validation state is compared: a release constraint
+that is `NOT VALID` in the source, a foreign key or CHECK dropped and
+re-added without checking the rows that were there, is drift (`constraint
+qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox is
+NOT VALID; the release validates it`), because those rows may be orphaned
+or otherwise invalid. The one exemption is pinned:
+`qbit_share_ledger_credit_policy_check`, which the release 001 itself adds
+`NOT VALID` to a `qbit_share_ledger` upgraded from before the column
+existed and never validates, is accepted in either state. A test derives
+that list from the frozen release SQL, so it cannot drift from the release.
+The internal triggers that enforce a foreign key are compared the same way:
+a superuser's `ALTER TABLE ... DISABLE TRIGGER ALL` during a bulk load
+leaves the constraint's definition and validation state as they were while
+no new row is checked against it, and 001 never re-enables a trigger it did
+not create, so it is drift (`constraint
+qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox
+differs: enforcement triggers expected 4 enabled, found 4 disabled`).
+A trigger the release does not create on a release table is drift too, not
+an extra: it can refuse or rewrite rows the migrator and the native writers
+put there. A guard that rejects `writer_epoch =
+0`, say, lets the `2.x.x` writer's leased epochs through and fails every
+native share insert, which writes epoch 0, so it is named with what it runs
+(`trigger operator_epoch_guard on qbit_share_ledger: CREATE TRIGGER
+operator_epoch_guard BEFORE INSERT ON qbit_share_ledger FOR EACH ROW EXECUTE
+FUNCTION operator_reject_epoch_zero(); the release has no trigger on this
+table`); a trigger on a table the release does not create is the operator's
+own and is kept. Rewrite rules on release tables are compared by definition
+and enabled state too. An extra rule is refused even when disabled: an
+`ON INSERT DO INSTEAD` rule can suppress or redirect native inserts before
+triggers run. Rules on operator-only tables are kept.
+An extra constraint on a release table is also drift:
+`CHECK (writer_epoch > 0)` accepts legacy shares but rejects native shares,
+so migration refuses it by name and definition, regardless of validation or
+enforcement state. Foreign keys from operator tables into release tables are
+also refused, including owners in other schemas: their internal triggers can
+block native updates or deletes, such as pruning old fanout broadcast attempts.
+Constraints involving only operator tables are kept.
+An extra `NOT NULL` column on a release table without a default, identity
+or generated expression is also drift: native inserts omit it and would
+fail. Extra defaults, identities and generated expressions are also refused:
+PostgreSQL can evaluate them during native writes, and migration cannot prove
+that they will succeed (for example, a generated `10 / writer_epoch` fails
+for native epoch-zero shares). Only plain nullable extra columns remain
+accepted, and their types must not be domains. Domain defaults, constraints
+and nullability can reject an omitted value even when the column itself
+looks nullable. Columns on operator-only tables are unaffected. All extra
+indexes on release tables are refused, including plain nonunique indexes: an access method or custom operator
+class can execute code that rejects native writes. Unique, expression and
+partial indexes can also constrain or evaluate writes. The migrator reports
+the index without removing it; review and remove extra release-table indexes
+before migrating. Indexes on operator-only tables remain accepted.
+Accepted columns and extra tables, functions and sequences are kept and
+logged at warning level. A missing or different object refuses the migration:
+
+```
+refusing to migrate a drifted 001 source: after 001_share_ledger.sql ran, the database does not
+match the v2.0.x release schema (v2.0.1, 001_share_ledger.sql), 3 object(s) differ (column
+qbit_pool_blocks.parent_hash differs: expected NOT NULL, found nullable; sequence
+qbit_share_ledger_share_seq_seq differs: maximum expected 9223372036854775807, found 1000000;
+missing constraint qbit_block_candidate_outbox_share_id_fkey on qbit_block_candidate_outbox:
+FOREIGN KEY (share_id) REFERENCES qbit_share_ledger(share_id)). Nothing was changed: the migration
+rolled back. Restore the pre-migration backup, or bring the database to the release schema with the
+2.x.x release (v2.0.1 or later; v2.0.2 for a #258 database) and take a new backup, then migrate again
+```
+
+The check needs the migrate role to hold `CREATE` on the database, for the
+scratch schema; without it `migrate` refuses and names the grant. The
+migration record is unchanged by this check: `pre_258` still means the
+database is equivalent to the v2.0.1 release schema.
+
+`3.x.x` never applies `002_candidate_bodies.sql` and does not import #258's
+chunked candidate bodies. On a #258 source it keeps the 002 tables and
+triggers; native writers store version 1 JSONB candidates, which 002's
+dual-format rule accepts. After validating and draining the source, 006
+records its former capability value of 2 in the source metadata and changes
+the live declaration to 1. Version 2 is accepted as legacy source evidence,
+never as native runtime support.
+
+**#258's rollback floor.** Once a `storage_version = 2` outbox row exists, a
+writer that predates v2.0.2 must not run against the database (see the header
+of `002_candidate_bodies.sql`). The same floor applies to this cutover from the
+other side: `3.x.x` cannot replay a v2 row either, so every v2 row must be
+drained by the v2.0.2 coordinator before migration. Never roll a #258 database
+back below v2.0.2 to drain it.
+
+**The drain requirement covers v1 and v2 rows.** A pending v1 candidate
+(JSONB body without the native `payout_revision`, `bundle` and `block_hash`
+fields) and a pending v2 candidate (`candidate` NULL, body in the chunk
+tables) both cannot be replayed by Rust. `migrate` refuses them
+transactionally, without changing the schema, and names the blocking rows:
+
+```
+legacy Python block outbox is not drained: 2 pending 2.x.x candidate row(s) cannot be
+replayed natively (block_hash=... storage_version=1 ...; block_hash=... storage_version=2 ...).
+Drain them with the pinned 2.x.x release before migrating: ...
+```
+
+The check reads outbox rows, not the capability row: 002 declares
+`candidate_storage_version = 2` whatever the writer stored, so the row proves
+002 ran, not that v2 work is pending. Drain with the pinned `2.x.x` image:
+
+1. Start the `2.x.x` coordinator (v2.0.2 for a #258 database, v2.0.1 or later
+   otherwise) and let its block submitter finish every pending candidate; it
+   replays every durable pending row on start.
+2. For a block that is already accepted on the active chain but cannot complete
+   through normal replay, follow the
+   [pinned `2.x.x` offline recovery procedure](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/504846cc0b72e8f86ed17f896d4ccbbe196a31dc/docs/prism-ledger-ops.md#L372-L399)
+   from the `2.x.x` image, with the managed coordinator and its restart
+   supervisor stopped. Select the exact hashes with `--block-hash` and inspect
+   the read-only plan first; repeat the same allowlist with `--apply` to drain.
+
+   That command was removed from `3.x.x` with the Python runtime; it only
+   exists in the `2.x.x` image.
+3. Confirm `qbit_block_candidate_outbox` has no `pending` rows, then repeat the
+   backup and migration boundary. Do not delete pending rows merely to bypass
+   this check.
+
+A v2 row that reaches the native claim lane anyway (one written after the
+drain, for instance) is parked, not retried: the lane records why in
+`last_error`, releases the claim, and sets `next_attempt_at` to `infinity`, so
+no lease expiry offers it again. Find parked rows with
+`SELECT block_hash, storage_version, last_error FROM qbit_block_candidate_outbox
+WHERE state = 'pending' AND next_attempt_at = 'infinity'` and drain them with
+the `2.x.x` image as above. That replay advice applies to the legacy pending
+rows being drained before migration. After 011, changing `next_attempt_at`
+only reschedules reconciliation for a reserved or offered row; it never
+grants another offer. Follow [the offer lifecycle recovery guidance](prism-ledger-ops.md)
+for those rows and retain their evidence.
+
+**A database an earlier 3.x.x build migrated before 006.** `3.x.x` is a
+development line with no supported production upgrade, but a database an
+earlier `3.x.x` build brought to native schema 3, 4 or 5 can still hold a
+pending v2 row: that build's drain check used the v1-only predicate, which
+never counted a row whose `candidate` is NULL. `migrate` therefore runs the
+same column-aware drain check on a native schema 3, 4 or 5 before 004, 005
+and 006, and refuses before any DDL when such a row is pending, naming the
+rows as above:
+
+```
+refusing to apply migration 006 to a native database at schema migrations 2, 3, 4, 5, 8, 9: an earlier
+3.x.x build migrated it before the drain rule covered these rows, and the legacy Python block outbox is
+not drained: 1 pending 2.x.x candidate row(s) cannot be replayed natively (block_hash=...
+storage_version=2 ...). Nothing was changed. Restore the pre-migration 2.x.x backup and drain them with
+the pinned 2.x.x release ...
+```
+
+Before the drain check or native DDL, an existing outbox `storage_version`
+column must match `integer NOT NULL DEFAULT 1`, with no identity or generated
+expression. Migration 006 uses `ADD COLUMN IF NOT EXISTS`, so it would keep a
+malformed column that breaks subsequent native candidate inserts or claims.
+A mismatch refuses the upgrade, names the differing properties, and leaves
+the database unchanged. An absent column is accepted and created by 006.
+The `qbit_prism_migration_source` name must also be absent when migration 6
+is not recorded. A partial, complete or populated metadata table is refused
+before native DDL: 006 must create its own record, never retain unverified
+provenance through `IF NOT EXISTS`. Restore the full backup, or review and
+move the existing object aside before retrying; migration removes nothing.
+The pre-006 native outbox must have neither row-level security (`ENABLE` or
+`FORCE`) nor policies, including inactive policies. The drain check reads
+these settings from the catalog before counting pending candidates, so a
+policy cannot hide a legacy row and make the database appear drained.
+Refusal preserves the rows and security settings for operator review.
+
+Native pending rows the earlier build wrote carry the native fields and are
+not counted; a v2 body, a `body_id`, a `storage_version` other than 1, or a
+v1 body without the native fields is. The remedy is the one in the recovery
+section below: the `2.x.x` release is not supported against a native schema
+(its revert script refuses one, and this guide never points it at a migrated
+database), so restore the pre-migration `2.x.x` backup, drain there with the
+pinned image, take a new backup and migrate again. If native traffic was
+admitted after the earlier migration, that restore discards it and needs the
+reconciliation decision the recovery section describes.
+
+The capability rows of that database are checked before the drain check, so
+`migrate` never applies 004, 005 and 006 to a database a newer release wrote:
+one that declares `candidate_storage_version > 2` or a capability this
+release does not know is refused before any DDL, the "newer" verdict of the
+table above, and nothing is recorded for it. A database already at 6 gets
+the runtime check before 008 and 009: any candidate version above 1 is
+unsupported, even 2. The remedy is the startup gate's: upgrade the server.
+
+```
+refusing to migrate a native database at schema migrations 2, 3, 4, 5, 8, 9 before any DDL: database declares
+candidate_storage_version = 3, but this server understands candidate_storage_version 1 to 2 only: a newer
+PRISM release wrote this database; upgrade the server before starting it here
+```
+
+A migration record with 3 and not 2 is refused before any DDL as well. Every
+native build records both in the one transaction that applies them, so such
+a record was edited or restored selectively; every start refuses the gap,
+and `migrate` neither re-runs `002_multi_instance.sql` on a database at 3
+nor records it unseen, which would vouch for objects it never checked, so
+004 to 009 are not applied above it either. Restore the full pre-migration
+backup, or, once every object 002 creates is verified present, record it by
+hand (`INSERT INTO qbit_prism_schema_migrations(version) VALUES(2)`) and
+migrate again.
+
+Migration history itself is validated before its rows are trusted at startup
+or migration. `qbit_prism_schema_migrations` must retain its native logged-table,
+integer primary-key and timestamp definitions, without extra columns,
+constraints, indexes, triggers, rules, inheritance or row security. A fresh
+or 2.x.x source must not already hold this table without migration 3. Refusal
+leaves the database unchanged; restore the full backup or review and repair
+the history table (move a non-native object aside) before retrying.
+
+**What was migrated.** After a successful migration
+`qbit_prism_migration_source` holds one row: the accepted source state
+(`pre_258`, `258_applied`, `fresh`, or `native` for a database that was
+already on the Rust schema), the `2.x.x` release and commit that source
+corresponds to, the capability value the source declared, the highest
+schema migration recorded before this one, and which instance migrated it. `migrate` prints it,
+every start logs it, and a repeated `migrate` never rewrites it.
+Once migration 6 is recorded, both the table and its readable singleton row
+are required at startup and before applying later migrations. Missing or
+malformed metadata is refused without committing later DDL or migration
+versions. Restore the full backup, including the original source record;
+the migrator never invents provenance for an already-migrated database.
+
+**Startup gate.** Every start reads `qbit_prism_schema_migrations` and
+`qbit_prism_schema_capabilities`, with or without
+`PRISM_POSTGRES_INIT_SCHEMA`. This release requires every native migration
+it ships, from 2 on (`REQUIRED_SCHEMA_VERSIONS` in
+`crates/qbit-prism-server/src/ledger/migration.rs` lists them), each checked
+on its own rather than as a high-water mark: a later migration being present
+never stands in for an earlier missing migration. Stop all
+older frontends before applying 011; it refuses live pre-upgrade claims and
+quarantines previously attempted candidates for reconciliation without
+another offer. See [the offer lifecycle upgrade procedure](prism-ledger-ops.md)
+for the quiesce and recovery steps. Stop all frontends again before applying
+015 and restart only upgraded binaries; its capability gate runs at connect
+and does not evict older processes already serving the database. Keep automatic
+restarts disabled throughout the cutover. 013 is recorded only once its online
+index builds have completed, so a start after an interrupted build is
+refused until `migrate` finishes them. 017 is recorded the same way and for
+the same reason: it is recorded only after the swap has made the release table
+the first partition of the partitioned parent, so a start after an interrupted
+validation or an interrupted swap is refused until `migrate` has resumed and
+finished the conversion. Migration 018 adds the durable chain epoch
+and declares `chain_observation_epoch = 1`. Apply 018 only after stopping every old frontend,
+one-shot writer and paused startup, with restarts disabled, then start only
+epoch-aware binaries. The registered-instance shutdown check does not evict a
+connected writer or discover an unregistered old tool. See the
+[offline epoch upgrade contract](prism-ledger-ops.md#chain-observation-epoch-upgrade-018).
+The capability refuses older binaries at subsequent connects; deleting it or
+resetting the epoch is not a supported downgrade. A preexisting undeclared
+epoch column or capability causes migration refusal and transaction rollback.
+Migration 019 adds the immutable signing-key rotation journal
+(`qbit_prism_signing_transitions`). It is additive and declares no capability:
+a binary that does not know the table never reads or writes it. See
+[signing-key rotation](prism-ledger-ops.md#signing-key-rotation).
+Migration 020 adds the payout-divergence evidence of #478 block capture
+(`qbit_prism_payout_divergences`, `qbit_prism_payout_divergence_accounts`) and
+its report function (`qbit_prism_payout_divergence_report()`). It is additive
+and declares no capability. See
+[block capture and payout divergence](prism-ledger-ops.md#block-capture-and-payout-divergence-478).
+Migration 021 adds `claim_renewals` and `claim_lease_seconds` to the
+candidate outbox, a partial index over its claimed rows, and declares
+`candidate_claim_observed_lease = 1`: a claim is taken over only once the
+taker has watched it go unrenewed for its lease on its own monotonic clock,
+so a database clock step no longer ends or stretches a lease (#581). A
+pre-021 binary takes claims over by the database clock, so 021 is applied
+offline exactly as 018 is, and the capability refuses older binaries at
+later connects. See
+[candidate claim leases and database clock steps](prism-ledger-ops.md#candidate-claim-leases-and-database-clock-steps-021-581).
+Migration 022 does the same for CTV fanout claims (#654): it adds
+`claim_renewals` and `claim_lease_seconds` to `qbit_ctv_fanout_artifacts`, a
+partial index over its claimed rows, and declares
+`fanout_claim_observed_lease = 1`. A pre-022 binary takes fanout claims over
+by the database clock, so 022 is applied offline as 021 is. See
+[CTV fanout claim leases and database clock steps](prism-ledger-ops.md#ctv-fanout-claim-leases-and-database-clock-steps-022-654).
+Migration 023 adds the cluster-wide block submission hold (#664): the
+one-row table `qbit_prism_submission_hold`, its append-only journal
+`qbit_prism_submission_hold_events`, and the capability
+`block_submission_hold = 1`. A pre-023 binary would claim and offer
+candidates under a hold, so 023 is applied offline as 021 is, in the
+cutover's stopped window, and the capability refuses older binaries at later
+connects. See
+[holding the whole cluster](prism-ledger-ops.md#holding-the-whole-cluster-023-664).
+Migration 024 adds `qbit_ctv_fanout_artifacts_lane_idx`, a partial index over
+the fanouts the CTV claim lane may still claim, keyed by their schedule, so a
+claim reads only the fanouts due now and no longer the settled fanout history
+(#668). It is additive, as 019 and 020 are: no capability and no shutdown
+proof, and it is not applied offline. A binary that does not know the index
+never reads it. It is applied online, as 013 is: on an existing ledger
+`migrate` builds it with `CREATE INDEX CONCURRENTLY` after the migration
+transaction commits, so no write to `qbit_ctv_fanout_artifacts` waits for the
+build, a found block's landing included, and records 24 once it is valid. See
+[the claim lane](prism-ledger-ops.md#the-claim-lane-and-settled-history-024-668).
+Migration 025 replaces `qbit_carry_forward_integrity_mismatches()` (#708):
+rows landed before 011 are checked per payout program, as 2.x keeps their
+balances, instead of per case-sensitive label, so one program paid under two
+spellings of its bech32 address is one chain. On union's ledger the label
+rule found 5,506 false mismatches in such a program, which `self-check` and
+`fatal-state clear` refuse; the program rule finds none over all 2,753,849
+active rows. It changes no stored row and is applied in the migration
+transaction, with no capability and no shutdown proof: an earlier binary
+accepts the unknown migration with a warning and reads the corrected report.
+See [blocks, balances, and reorgs](prism-ledger-ops.md#blocks-balances-and-reorgs).
+Migration 026 replaces `qbit_carry_forward_integrity_report()` (#737) so
+that it runs `qbit_carry_forward_integrity_mismatches()` and
+`qbit_carry_forward_current_drift()` once each instead of twice. It keeps
+001's subqueries word for word, evaluates each once in 001's order, and
+takes each count from its listing. On union's ledger EXPLAIN ANALYZE put the
+two checks at 20.29 s and 9.14 s, and the report took about 57 s; once each
+is estimated at about 29 s, their sum, not a timed run. The report is
+evaluated the same way as 001's, by the same listing subqueries, so findings
+that tie on the listing's sort keys come out in the order those subqueries
+leave them, as in 001, whose own order for them is not fixed either.
+`migrate` runs 026 again whenever it runs 001, as it runs 025 again after
+011. Like 025, it changes no stored row and is applied in the migration
+transaction, with no capability and no shutdown proof: an earlier binary
+accepts the unknown migration with a warning and reads the same report.
+While a share-hash backfill that this release started is pending on a
+populated `2.x.x` source, the database declares
+`share_hash_backfill_pending = 1` (#669), raised to 2 once
+`migrate --defer-share-hashes` has permitted serving. It is declared with the
+backfill's cursor and removed with it when 2 is recorded, so every earlier
+build that checks capabilities is refused until then, and every build before
+rc.5 refuses 2. A backfill that a #582 build
+started carries no declaration (see
+[the backfill](#migration-002s-share-hash-backfill-applied-online)).
+A database missing any required migration is refused
+at connect, naming the gap, before any accounting statement runs, and so is
+one declaring a
+capability or a runtime `candidate_storage_version` other than 1. A native
+version-2 declaration is refused before the server can claim and park a
+newer writer's candidate; a #258 migration records its source version of 2
+separately and declares runtime version 1 within the migration transaction.
+The capability relation must be an ordinary table; views, materialized
+views, foreign tables and partitioned relations cannot substitute for it.
+Its catalog kind is checked before any capability rows are read, at startup
+and before migration DDL. Restore the original table from the full backup
+if a selective restore replaced it.
+The declaration must also belong to the current schema, where the migration
+history was verified: `search_path` resolves an unqualified name past a
+schema that lost its table to a later schema's, and that declaration
+describes another ledger. Startup refuses it, naming both schemas, instead
+of trusting a version-1 row from elsewhere; `migrate` already refuses any
+`qbit_` object resolved from another schema before any DDL.
+A database at 6 must declare its capabilities: 006 created
+`qbit_prism_schema_capabilities` and its `candidate_storage_version` row and
+nothing native removes them, so a start refuses a database missing either,
+naming the remedy, rather than reading the absence as a legacy state, and
+`migrate` refuses the same database before any DDL.
+The capability table must also have row-level security disabled, including
+its `FORCE` flag. Startup and migration check the catalog before trusting
+its rows, because a policy could hide an unknown capability while exposing
+the required candidate-version declaration. Nothing disables a policy
+automatically; operators must review the table before retrying.
+A migration this release does not know is accepted with a warning that names
+it: native migrations are additive, and a release whose format an older
+binary must not touch declares a capability. With the native default
+`PRISM_POSTGRES_INIT_SCHEMA=0` that means a newer binary refuses to start
+until `migrate` has run, instead of failing later in the claim path.
+
+`import-audits` processes database rows whose audit body is external. It resolves
+full v1/v1.1 bodies, legacy body refs, and v2 proof bodies, verifies segment
+references, the trusted ledger signature, recorded coinbase, and canonical
+bundle hash, then stores the logical body in PostgreSQL. Original files and
+published hashes are retained. Canonical gzip sidecars are verified against
+their uncompressed hash and stored byte-for-byte in the database. Content-addressed
+HTTP responses preserve these exact bytes. This makes history available on every frontend
+without a shared filesystem.
+
+`--root` resolves relative body paths and restricts imports to that directory;
+it does **not** rewrite an absolute URI to a different root. Mount old absolute
+paths at their recorded locations. Keep referenced segment paths readable as
+well. Import failure is a reason to repair the missing/corrupt artifact before
+continuing; a matching hash without recoverable bytes is insufficient. A legacy
+body that fails only because a range digest was written as escaped JSON is
+intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
+So is a 2.x v2 body that fails with `window proof share_parts_digest_hex
+mismatch`; [list those rows and write their sidecars](#2x-v2-bodies-whose-window-proof-parts-digest-3x-recomputes-differently-731).
+
+`backfill-ctv` scans verified stored bundles and restores missing fanout records.
+Run import first. It is idempotent for matching existing records and replaces the
+old Python repair command's individual-path/block selection interface.
+
+Neither `import-audits` nor `backfill-ctv` registers a frontend. Both pass the
+frontend's startup gates (schema version, declared capabilities, migration
+source and the halt refusal) and then write only the rows they repair, so a run
+leaves no `qbit_prism_instances` heartbeat for fatal-state recovery to refuse
+and never overwrites a running frontend's row. `self-check` and `broadcast-ctv`
+behave the same way.
+
+### Legacy bodies whose range digests use Python's escaped JSON (#709)
+
+`1.x` and `2.x` hashed each `segment_range` and `segment_prefix` share part
+over Python's `json.dumps`, which writes non-ASCII text as `\uXXXX` escapes;
+3.x recomputes that digest over raw UTF-8. A range whose shares carry
+non-ASCII text, usually a worker name in `miner_id`, therefore fails in 3.x
+although its content is intact, and `import-audits` stops on the body with
+`audit body ref hash mismatch`. When it stops this way,
+`scripts/prism_legacy_range_sidecars.py` proves such bodies and writes the
+canonical sidecars import reads before a body. For each row it inlines the
+failing ranges from their slot files and runs the 3.x canonicalizer on the
+result, which requires the canonical bundle to hash to the row's
+`audit_bundle_sha256`. In a checkout of the release that runs import, build
+the canonicalizer and export the rows import has not stored yet from the
+database it ran against (`prism-restore` in a rehearsal). Run the tool once to
+classify them and again with `--write`, then rerun import:
+
+```sh
+cargo build --release --locked -p qbit-prism --bin qbit-prism-audit-canonicalize
+PGSERVICE=prism-restore psql -Xq -v ON_ERROR_STOP=1 -c "COPY (
+  SELECT block_hash, body_uri, audit_bundle_sha256 FROM qbit_pool_audit_bundles
+  WHERE canonical_audit_bytes IS NULL AND share_snapshot_sha256 IS NULL
+    AND audit_bundle IS NULL AND body_uri IS NOT NULL ORDER BY block_hash
+) TO STDOUT WITH (FORMAT csv, HEADER)" > legacy-rows.csv
+python3 scripts/prism_legacy_range_sidecars.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --canonicalizer target/release/qbit-prism-audit-canonicalize \
+  --sidecar-dir /var/lib/qbit-prism/audit
+python3 scripts/prism_legacy_range_sidecars.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --canonicalizer target/release/qbit-prism-audit-canonicalize \
+  --sidecar-dir /var/lib/qbit-prism/audit --write
+time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+```
+
+- `--sidecar-dir` must be the directory passed to `import-audits --root`;
+  import looks for `prism-audit-bundle-canonical-<block>-<digest>.json.gz`
+  there, and resolves a relative body URI against it, as the tool does.
+  `--audit-root` is where the audit tree is mounted, and it replaces the
+  recorded `--uri-prefix`, by default `/var/lib/qbit-mining-pool/prism/audit`,
+  in body and slot URIs. Run the tool where the tree is at its recorded
+  paths, as above, so that only the bodies import refuses get sidecars.
+- The export leaves out rows with an inline `audit_bundle`: import reads
+  those from the database, not from `body_uri`. Every exported row goes
+  through the canonicalizer, so when the affected heights are known, narrow
+  the export to them through `qbit_pool_blocks`.
+- Each run reports every row in `legacy-range-sidecars.jsonl`, and the first
+  run writes nothing. A run exits 0 only when every row is `ok-in-3x` (it
+  verifies as it is), `proven` (`sidecar-written` with `--write`) or
+  `sidecar-ok` (an existing sidecar that holds the digest's bytes). Any other
+  status, such as a body the canonicalizer still refuses, exits 3: restore
+  that evidence instead.
+- The tool never replaces a sidecar. An existing one that does not hold the
+  digest's bytes is reported as `sidecar-bad` and named on stderr; import
+  would stop on it too. A new sidecar is published by hard-linking a complete
+  file, so the sidecar directory's filesystem must support hard links; import
+  never sees a partial one. Import re-verifies every sidecar against the
+  digest, the recorded coinbase and the trusted ledger key.
+
+The post-GA follow-up is #709: 3.x accepting the escaped form, so that these
+bodies verify without sidecars.
+
+### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
+
+2.x wrote each audit-bundle.v2 body's `share_parts_digest_hex` over its share
+parts in insertion order; 3.x recomputes it with sorted keys. 3.x therefore
+refuses every such body, and `import-audits` stops on the first one with
+`window proof share_parts_digest_hex mismatch`. The body is intact. Import
+reads a canonical sidecar before the body, so only a v2 body without one in the
+import root reaches the check. 2.x has written a sidecar beside each new v2
+body only since #173 reached a deployment. Union's bodies from before
+2026-08-24, about 9,500 of them, have none.
+`scripts/prism_legacy_parts_digest_check.py` lists those rows without
+reading any slot, and `scripts/prism_legacy_range_sidecars_sharded.sh` writes
+their sidecars with `scripts/prism_legacy_range_sidecars.py` in parallel
+shards. With `legacy-rows.csv` exported and the canonicalizer built as in the
+previous section:
+
+```sh
+python3 scripts/prism_legacy_parts_digest_check.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --sidecar-dir /var/lib/qbit-prism/audit \
+  --affected-csv refused-rows.csv --jobs 8 > parts-digest.jsonl
+scripts/prism_legacy_range_sidecars_sharded.sh refused-rows.csv \
+  /var/lib/qbit-mining-pool/prism/audit /var/lib/qbit-prism/audit \
+  target/release/qbit-prism-audit-canonicalize scripts/prism_legacy_range_sidecars.py \
+  legacy-sidecar-shards 8
+python3 scripts/prism_legacy_parts_digest_check.py --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --sidecar-dir /var/lib/qbit-prism/audit --jobs 8 > /dev/null
+time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+```
+
+- The checker reads each body once. A row whose sidecar is in `--sidecar-dir`
+  is `has-sidecar` and its body is not read. That status means only that the
+  file is there: import verifies the sidecar's bytes and stops on a bad one.
+  The sidecar tool checks an existing sidecar (`sidecar-ok` or `sidecar-bad`)
+  for every row it is given. `2x-order-only` and `matches-neither` rows are
+  the ones import refuses for this digest: `--affected-csv` lists them in the
+  tool's `--rows` format, and stderr counts them as `import_refuses`.
+- The checker exits 0 only when no row is refused for this digest, no body is
+  missing or unreadable, and no v2 body is for another digest. Restore any
+  `body-missing`, `body-unreadable` or `body-digest-differs` evidence instead.
+  It checks nothing else: a body-ref or plain bundle is `no-window-proof`, and
+  rows that import refuses for other reasons, such as the escaped range
+  digests above, need the previous section's classification run.
+- The runner splits the rows round robin into shards, each with its own CSV,
+  work directory and report, and runs the tool with `--write` on each. Its
+  last argument is the number of shards, 8 by default. The output directory
+  must be new or empty and outside the import root. The run exits 0 only when
+  every shard exits 0 and no temporary file is left in the import root. A
+  rerun verifies the sidecars already written (`sidecar-ok`) instead of
+  rewriting them.
+- The bodies are immutable, so both steps can run ahead of the cutover
+  against a copy of the tree, writing into the directory import will read.
+  In the window, rerun them for the rows added since.
+
+The post-cutover follow-up is #731: 3.x recomputing the digest in 2.x's
+order, so that these bodies verify without sidecars.
+
+### Migration 002's share-hash backfill, applied online
+
+Migration 002 creates `qbit_prism_share_hashes`, the header authority the
+native append consults before it credits a share, and maps the header of every
+accepted `2.x.x` share whose ID ends in 64 hex digits. Where legacy
+worker-scoped IDs repeat a header, the earliest `share_seq` wins; case is
+folded; rejected rows and IDs without a hex header are not mapped. Until #582
+the mapping was one `INSERT ... SELECT DISTINCT ON` inside the migration
+transaction, under `PRISM_DATABASE_STATEMENT_TIMEOUT_MS`. At the default 15 s
+it failed from about a million shares. Its cost per share rose with the ledger
+(37 µs at 1.03M shares, 78 µs at 4.13M), so the production ledger's 65.5M
+shares outgrew even the 600 s maximum.
+
+On a fresh deployment or an empty `2.x.x` source there is nothing to map, and
+2 is recorded in the migration transaction. On a `2.x.x` source with rows,
+002's file is still applied in the transaction, but 2 is not recorded there.
+The transaction also creates the backfill's cursor,
+`qbit_prism_share_hash_backfill`, one row covering every `share_seq` the ledger
+holds:
+
+| Column | Meaning |
+| --- | --- |
+| `start_seq` | the ledger's first `share_seq` when the transaction committed |
+| `next_seq` | the legacy shares from `start_seq` up to it are mapped |
+| `end_seq` | the ledger held no row at or above it when the transaction committed |
+| `started_at`, `updated_at` | when the cursor was created and last advanced |
+
+After the commit, and before 013, 017 and 024, `migrate` maps the legacy shares in
+batches of consecutive `share_seq`. Each batch is 002's statement restricted to
+its range: one statement, in a transaction that also advances the cursor. The
+first batch covers 10,000 `share_seq`; later ones double or halve toward half a
+second each, between 1,000 and 50,000. So every statement stays far inside the
+server's statement timeout whatever the ledger's size, and no setting has to be
+raised for `migrate`. The cap matters after a gap in `share_seq` or a run of
+rejected shares, where batches are cheap and grow. A batch that outlasts the
+timeout all the same, on a much slower disk, is rolled back and retried at
+half its size; only an operator's cancel stops the run. The last transaction
+waits for the migration lock and checks that the cursor has passed every row
+the ledger holds. It then drops the cursor table and records 2.
+
+The mapping is the single statement's, row for row. Batches run in ascending
+`share_seq`, so the earliest share of a repeated header is mapped by the batch
+that holds it. A later copy, in a later batch, meets `ON CONFLICT DO NOTHING`.
+The batches also skip the per-row foreign-key check the single statement paid:
+016 has dropped that key by the time they run.
+
+**Readiness: the server does not serve during the backfill**, unless
+`migrate --defer-share-hashes` has mapped its recent range and permitted
+serving, as
+[Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)
+describes. Otherwise, until 2 is recorded, every start refuses the database. That is this release's start and
+every earlier native build's, since each requires 2. The `2.x.x` writer is
+fenced by 002's lease trigger, which committed with the transaction. So no share
+can be appended, and none credited against a legacy header not yet mapped. The
+backfill is part of the cutover's outage, as 013's builds and 017's validation
+are on a populated ledger. A start, `self-check` and `import-audits` all refuse
+with:
+
+```
+database is not ready: migration 2's share-hash backfill has not finished (#582).
+The legacy shares from share_seq 1 up to 30001 are mapped in
+qbit_prism_share_hashes and those from 30001 up to 4129153 are not, and until
+every one is mapped a share could be credited twice. Run `qbit-prism-server
+migrate` to resume it from there, or `qbit-prism-server migrate
+--defer-share-hashes` to map only the legacy shares within 1000 template
+heights of the highest one and serve while `qbit-prism-server
+backfill-share-hashes` maps the rest; every start refuses the database until
+one of them has finished
+```
+
+A backfill that a build before #669 started is refused the same way, but its
+remedy names plain `migrate` alone: `--defer-share-hashes` refuses it. One
+that a `--defer-share-hashes` run claimed and left before its recent range
+was mapped is refused naming that run's retry first
+([Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)).
+
+They refuse the same way while the cursor table exists, even if 2 has been
+recorded by hand, and so does the recovery evidence export
+(`scripts/prism-recovery-evidence.sql`). Once serving is permitted, at
+`share_hash_backfill_pending = 2`, the export reads the database as every start
+does, and marks the share hashes deferred
+([Recovery evidence while the backfill is pending](#recovery-evidence-while-the-backfill-is-pending)).
+
+**Earlier builds are fenced off while the backfill is pending (#669).** A
+build from before #582 knows nothing of the cursor. Its `migrate` refuses 3
+without 2 as an edited record, and its remedy is to record 2 once 002's
+objects are present. On its own, that would let it serve with legacy headers
+unmapped. So the database also declares the capability
+`share_hash_backfill_pending = 1` while the backfill is pending:
+
+- the migration transaction that creates the cursor declares it, and nothing
+  declares it later;
+- the transaction that records 2 removes it with the cursor. It is the one
+  capability native code removes, because it describes a state, not a format.
+  That transaction first reads the declaration again under the migration lock.
+  At a value other than 1 or 2, a newer release declared it while the runner
+  mapped between holds of that lock, and the runner stops: the cursor, the
+  declaration and the record are that release's to finish;
+- between the two, `migrate --defer-share-hashes` raises it to 2 when it
+  permits serving, which the starts of rc.5 and later accept and every
+  earlier build refuses.
+
+An earlier build cannot remove the fence, so the fence must never coexist
+with an earlier build's runner, and that is why it is declared only with a new
+cursor. Migrations serialize on the migration lock, and no earlier build's
+`migrate` passes its capability check once the fence has committed. So any
+runner an earlier build started belongs to a cursor an earlier build created,
+which carries no fence. Declared later, by a resume, a fence could meet such a
+runner already past its check, still mapping or queued for the runners' lock.
+That runner would record 2 and leave the fence behind. The price: a backfill
+that a #582 build (before #669) started stays unfenced to its end. Resume it
+with this release, and don't record 2 by hand.
+
+How earlier builds react to a fenced backfill, once each checks declared
+capabilities at connect and at `migrate`:
+- **Every start** of an earlier build refuses the capability, so recording 2
+  by hand lets nothing serve. This release refuses the cursor itself, and so
+  does the evidence export.
+- **A build from before #582** still answers its first `migrate` with the
+  3-without-2 refusal and its remedy. Following that remedy changes nothing:
+  its next `migrate` refuses the capability.
+- **A #582 build** refuses the capability at once.
+
+A declaration whose cursor is gone can only be left by dropping the cursor by
+hand. Every `migrate` of this release refuses it, and so does every start once
+the record is otherwise complete. Restore the full pre-migration backup. If
+the mapping is verified complete instead, remove the declaration. This query
+counts the legacy headers that are not mapped to their earliest accepted
+share; the count must be 0:
+
+```sql
+SELECT count(*) AS unmapped
+FROM (SELECT DISTINCT ON (lower(right(share_id, 64)))
+             lower(right(share_id, 64)) AS header, share_id
+      FROM qbit_share_ledger
+      WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$'
+      ORDER BY lower(right(share_id, 64)), share_seq) expected
+LEFT JOIN qbit_prism_share_hashes mapped
+  ON mapped.header_hash = expected.header AND mapped.share_id = expected.share_id
+WHERE mapped.header_hash IS NULL;
+```
+
+**Progress.** No frontend runs while the backfill does, so there is no
+Prometheus series for it. `migrate` logs the backfill's start, a progress line
+every ten seconds (`next_seq`, `end_seq`, rows mapped, `share_seq` per second
+and the estimated seconds left) and its completion. Any session can read the
+cursor:
+
+```sql
+SELECT start_seq, next_seq, end_seq,
+       round(100.0 * (next_seq - start_seq) / greatest(end_seq - start_seq, 1), 1) AS percent,
+       started_at, updated_at
+FROM qbit_prism_share_hash_backfill;
+```
+
+**Interrupting and resuming.** Each batch commits with its cursor, so an
+interrupted `migrate` loses only the batch in flight. That holds for a killed
+process, a lost connection, and a cancelled or timed-out statement. Run
+`migrate` again. The migration transaction finds 3 recorded without 2 and the
+cursor table present, so it applies nothing, and the backfill resumes at
+`next_seq`; 013, 017 and 024 follow. A record with 3 and not 2 but no cursor table
+is still refused as an edited record.
+
+Resuming only goes forward. The migration transaction has committed, so the
+database is native, and the `2.x.x` writer cannot return to it. To go back,
+restore the pre-migration backup as in
+[Recovery and rollback](#recovery-and-rollback). No native share can have been
+acknowledged before 2 is recorded, so the whole backfill falls before the ACK
+boundary.
+
+**Refusals, and what each one means.**
+
+| Refusal | What to do |
+| --- | --- |
+| `refusing to migrate before any DDL: a table named qbit_prism_share_hash_backfill already exists, and migration 2 creates its share-hash backfill's progress table under that name. Nothing was changed. Check what it holds, then rename or move it aside and migrate again` | a `2.x.x` source holds a relation under the cursor's name; check what it holds, rename or move it aside, and migrate again |
+| `migration 2: backfilling qbit_prism_share_hashes for share_seq <a> to <b>; every earlier batch committed, so migrate again to resume from share_seq <a>` | the context on a failed batch statement: cancelled, timed out, or a lost connection. Migrate again |
+| `refusing to continue migration 2: its share-hash backfill's cursor is no longer at share_seq <a>, where this run, which holds the runner lock, left it; migrate again` | something other than the runner moved the cursor. Migrate again, which resumes from where the cursor is |
+| `a <kind> named qbit_prism_share_hash_backfill holds the name of migration 2's share-hash backfill progress table; check what it holds, then rename or move it aside` | on a native database, a relation that is not the cursor table holds its name; move it aside, then start or migrate again |
+| `qbit_prism_share_hash_backfill has no row: migration 2 created it with its cursor and nothing deletes the row, so it was edited or restored selectively. Restore the full backup` | the cursor table was edited; restore the full backup |
+| `database declares share_hash_backfill_pending = 1, but migration 2's share-hash backfill cursor qbit_prism_share_hash_backfill is gone. Only the transaction that records 2 removes them, and it removes both, so the cursor was dropped by hand and legacy shares may be unmapped (#669). Restore the full pre-migration backup and migrate again, or, once qbit_prism_share_hashes is verified to map every accepted share whose ID ends in 64 hex digits (...), remove the declaration with DELETE FROM qbit_prism_schema_capabilities WHERE capability='share_hash_backfill_pending' and migrate again` | from `migrate`, and from a start once every migration is recorded: the cursor was dropped by hand while the backfill was pending. Restore the full pre-migration backup, or verify the mapping with the query above and remove the declaration. At `= 2` frontends may have served since, so the message offers no backup: verify the mapping |
+| `refusing to record migration 2: while its share-hash backfill ran, a newer PRISM release declared share_hash_backfill_pending = <n>, but this server understands share_hash_backfill_pending 1 to 2 only. That release finishes the backfill; upgrade the server before starting or migrating here` | a newer release's `migrate` ran while this release's runner was mapping. Upgrade the server and migrate with the newer release |
+| `refusing to continue migration 2: its share-hash backfill's progress table is gone, but 2 is not recorded. Only the transaction that records 2 drops it, so it was dropped by hand. Restore the full backup` | the cursor table was dropped by hand during a run; restore the full backup |
+
+**Plan for the backfill on a large ledger.** The backfill writes every legacy
+share's header once more. The mapping takes about 490 bytes per share with its
+two indexes (4.0 GB at 8.1M shares), so budget about 32 GB for the production
+ledger's 65.5M shares, plus the WAL that comes with it.
+
+Its rate depends more on PostgreSQL's memory and checkpoint settings than on
+anything in `migrate`. Both indexes take random inserts. Once they no longer
+fit in `shared_buffers`, frequent checkpoints make most inserts write a full
+page image. These measurements are from a mainnet-shaped ledger of 8.25M
+shares, on PostgreSQL 16 with `fsync` on, on a shared 16-core host:
+
+| Settings | Backfill | Rate | WAL |
+| --- | --- | --- | --- |
+| server defaults (128 MB `shared_buffers`, 1 GB `max_wal_size`) | 348 to 413 s | about 40,000 `share_seq`/s until the indexes outgrew the cache at about 5M shares, about 13,000/s after | 16 GB |
+| `shared_buffers = 4GB`, `max_wal_size = 32GB`, `checkpoint_timeout = 30min` | 251 s | a steady 30,000 to 40,000/s | 5.8 GB |
+
+The batch sort is not the cost: 64 MB of `work_mem` changed nothing.
+
+For 65.5M shares, expect roughly 35 to 40 minutes with settings like the
+second row, and 80 minutes or more at the defaults. So give the database the
+larger settings for the cutover window: `shared_buffers` a quarter of memory,
+`max_wal_size` in tens of gigabytes, a long `checkpoint_timeout`, and the disk
+for the WAL. Restore them afterwards if they are not the server's normal ones.
+`make prism-cutover-rehearsal` runs its private cluster at the defaults, so
+the time it reports for the backfill is the pessimistic one.
+
+#### Serving with the backfill pending (fence 2)
+
+On a production-sized ledger the backfill is most of `migrate`'s time, as
+**Plan for the backfill on a large ledger** above estimates. Run
+`qbit-prism-server migrate --defer-share-hashes` to take it out of the
+cutover's outage. The flag is `migrate`'s alone, never an environment setting:
+compose starts frontends with `PRISM_POSTGRES_INIT_SCHEMA=1`, and they run the
+same migration at their start. Plain `migrate` behaves exactly as above.
+
+**What the deferred run does.**
+
+1. The migration transaction creates the cursor and declares
+   `share_hash_backfill_pending = 1`, as plain `migrate`'s does. It also
+   claims the backfill for the deferral before anything is mapped: it sets the
+   cursor's `deferred_at`, a column the code adds. On a cursor that an earlier
+   run left at fence 1, the claim is set the same way, and a retry keeps the
+   first claim's time.
+2. After the commit, in the slot the backfill takes otherwise, it maps the
+   *recent range*: every accepted legacy share whose template height is
+   within 1,000, the coinbase maturity, of the highest one.
+   - The range's lowest height is `H_min`, the highest template height of an
+     accepted legacy share less 1,000, and at least 0.
+   - Its first share is `S_min`, the first `share_seq` of an accepted share
+     at or above `H_min`.
+   - It runs 002's batches over `[S_min, end_seq)`, restricted to
+     `template_height >= H_min`, in ascending `share_seq`. 2.x's
+     `qbit_share_ledger_template_height_idx` serves the bounds, so the range
+     is mapped before 013 drops that index.
+3. One transaction then records `recent_min_height` (`H_min`) and
+   `recent_start_seq` (`S_min`, NULL when the ledger has no accepted share)
+   beside the cursor, and raises the fence to
+   `share_hash_backfill_pending = 2`. It refuses if the ledger holds a row past
+   `end_seq`: nothing should have appended.
+   - The same transaction keeps every native share at or above `end_seq`.
+     Native shares draw their `share_seq` from the sequence that
+     `qbit_share_ledger.share_seq` owns, found by that column. If the
+     sequence's next value would be below `end_seq`, it is moved to hand out
+     `end_seq` next (`setval(<sequence>, end_seq - 1, true)`), and an INFO
+     line names its old and new `last_value` and `is_called`. A sequence can
+     lag behind the rows after explicit inserts, or after a restore that left
+     it uncalled. A sequence that does not lag is not written to, so its
+     `last_value` and `is_called` stay exactly as the source had them. A
+     promoted physical copy is ahead already.
+4. 013, 017 and 024 follow as usual, with the cursor present. With
+   `--offline-indexes` beside the flag, as a cutover's migrate step can run
+   them, 013 and 024 build offline
+   ([migration 013](#migration-013-the-share-ledger-index-trim-applied-online)).
+5. `migrate` returns and says that 2 is deferred, naming `next_seq` and
+   `end_seq`. The cursor has not moved, and 2 is not recorded.
+
+The range is about 40,000 to 60,000 shares at the ledger's rate, so this takes
+seconds. A rerun of `--defer-share-hashes` after an interruption maps the
+range again, or, once the fence is 2, applies only what else is pending.
+
+**A deferred run that stops before serving is permitted** leaves the cursor
+at fence 1 with its claim. From there, only the operator's `migrate` maps
+anything:
+
+- `qbit-prism-server migrate --defer-share-hashes` again maps the range and
+  permits serving, as a first run does;
+- plain `qbit-prism-server migrate`, chosen explicitly, maps the whole backfill
+  and records 2 before anything serves, as without the flag.
+
+Every other connect that migrates refuses the database, as every start does,
+and changes nothing. That includes a frontend that compose starts with
+`PRISM_POSTGRES_INIT_SCHEMA=1`, a tool and an operator command. Such a
+connect runs neither the whole backfill, which would take hours while the
+operator's retry waited for the runners' lock, nor 013, which would drop the
+index that the range reads. A connect that planned the backfill before the
+claim, and then waited for the runners' lock, reads the claim again once it
+holds the lock, and refuses the same way. Without a claim, a backfill at
+fence 1 is run to its end by every connect, as before.
+
+**Why serving is safe with the rest unmapped.** A native share is credited
+only on a job this cluster issued, whose parent is the current tip or, within
+stale grace, the tip's parent. Its ID ends in the block hash, which commits to
+that parent. Every copy of a legacy header has the same parent, so the same
+template height. A credited native share can therefore repeat only a legacy
+header whose parent can be the tip at or after the cutover: one in the recent
+range, unless the chain reorganized more than 1,000 blocks below the legacy
+tip, which coinbase maturity does not survive either. Every such header is
+mapped before anything serves, so the append's header check refuses a repeat
+exactly as it would with the whole mapping. Each header in the range maps to
+its earliest copy: the range holds all of a header's copies. Nothing but that
+check reads `qbit_prism_share_hashes` at runtime; the window, balances,
+settlement and the broadcaster never do.
+
+**Which starts are allowed.**
+
+| The database holds | A start, `self-check`, `import-audits` and operator commands |
+| --- | --- |
+| the cursor and `share_hash_backfill_pending = 1` | refused, naming the cursor and both remedies |
+| the cursor, `share_hash_backfill_pending = 1` and a deferred run's claim | refused, naming the deferred run that stopped and its retry, `migrate --defer-share-hashes`; a connect that migrates maps nothing |
+| the cursor and no fence (a backfill a build before #669 started) | refused; `--defer-share-hashes` refuses it too, and plain `migrate` finishes it |
+| the cursor and `share_hash_backfill_pending = 2` | allowed without 2 recorded. Each start logs a warning naming `next_seq` and `end_seq` |
+| the fence at 1 or 2 without the cursor | refused: the cursor was dropped by hand |
+
+No build before rc.5 serves beside the pending backfill or finishes it. An
+earlier release candidate, rc.1 to rc.4, meets the cursor first at a start
+and refuses with the backfill's own message, `database is not ready:
+migration 2's share-hash backfill has not finished (#582) …`. That message's
+advice to run `migrate` holds only for rc.5 and later: the earlier build's
+`migrate`, and its start with `PRISM_POSTGRES_INIT_SCHEMA=1`, refuse the fence
+before any DDL (`… understands share_hash_backfill_pending 1 to 1 only …`).
+Finish the backfill with rc.5 or later, or go back to the pre-migrate backup.
+
+**Who finishes it: `backfill-share-hashes`, or plain `migrate`.** A frontend
+started with `PRISM_POSTGRES_INIT_SCHEMA=1`, a tool or an operator command
+migrates at its start, but leaves a backfill at fence 2 as it is. Once
+frontends serve, run `qbit-prism-server backfill-share-hashes`
+([below](#finishing-the-backfill-while-frontends-serve-backfill-share-hashes)),
+whose throttle the operator sets. Plain `qbit-prism-server migrate`, without
+the flag, runs the same backfill at the default throttle, after whatever else
+is pending. Either:
+
+- maps `[next_seq, end_seq)` while frontends serve, in batches that keep to a
+  throttle: each batch is one statement of at most 5,000 `share_seq` in a
+  transaction of its own, cancelled after 2 s and then tried again at half its
+  size, and the run rests between batches as long as each took. No statement
+  holds a snapshot on the primary longer than the statement timeout (#738).
+  rc.4's batches, up to 50,000 `share_seq` under the pool's 15 s, back to back,
+  run only before anything serves. A native share whose header a batch in
+  flight is mapping, which the argument above rules out, waits for that batch
+  and then fails on the header's uniqueness, uncredited
+  (`ledger-confirmation-failed`); a resubmission is refused as already
+  credited;
+- checks, before it maps anything, that recording 2 at fence 2 will find 017's
+  conversion bound. A plain `migrate` that planned the backfill at fence 1,
+  ahead of 017, can find the fence at 2 once it holds the runners' lock: a
+  deferred run raised it while this one waited. If 017 has not recorded the
+  bound, the run refuses at once, rather than at the record after hours of
+  batches; rerun `migrate`, which then applies 017 first;
+- **never extends the end.** Every row at or above the cursor's `end_seq` is a
+  native share, which mapped its own header in the transaction that appended
+  it. The end is never read again from `max(share_seq)`. Under the migration
+  lock, the record step checks that `end_seq` is at or below
+  `qbit_prism_share_partitioning.conversion_bound`, under which the release
+  table holds the legacy shares. Native shares go into that table too, until
+  the sequence passes the bound;
+- **refuses a double credit before it records 2.** It looks for a native share
+  that repeats the header of an accepted legacy share below `end_seq`. Such a
+  share was credited while its header was not yet mapped, and the batch that
+  reached the legacy copy met the native mapping and said nothing. The run
+  then refuses, naming the share, and leaves the cursor, the fence and the
+  missing record of 2 as they are. The mapping is complete by then, so no
+  later share can repeat a legacy header, and frontends keep serving. The
+  check probes 2.x's `qbit_share_ledger_accepted_block_suffix_idx` for each
+  native share, and the share ID index for a bare 64-digit legacy ID in lower
+  or upper case; a bare ID in mixed case is the one form it does not find.
+  It reads the native shares from `end_seq` up to the highest `share_seq` at
+  its start, before the migration lock, in chunks of consecutive `share_seq`
+  that keep to the same throttle as the batches: each chunk one short
+  statement in a transaction of its own under the throttle's statement
+  timeout, read again at half its size if it outlasts it, with the same rests
+  between chunks. Shares appended after the check starts need no reading:
+  every legacy header is mapped by then, so the append refuses a repeat as
+  already credited;
+- drops the cursor and the fence and records 2, in one short transaction.
+  While frontends serve it waits at most 2 s for the migration lock, which
+  every migrating start takes, and for the cursor table's lock, which every
+  reader of the cursor holds briefly. An attempt that waits longer is rolled
+  back, holding nothing, and tried again after a backoff, from 2 s doubling
+  to 30 s, 20 times, about ten minutes in all; the run then stops with 2
+  unrecorded, and a rerun goes straight to the double-credit check and the
+  record. After any failed attempt the run first reads whether the attempt
+  recorded 2 all the same, its COMMIT's reply lost: with 2 recorded and the
+  cursor gone the backfill is done, and the run says so and succeeds. It
+  reads on the attempt's own connection, unless that connection is lost:
+  dropped or reset, ended by the server (a restart, a crash, a failover, an
+  idle timeout), or silent past the attempt's own deadline, its statements'
+  timeouts and a few seconds, as a partition leaves it. Then it reads on a
+  fresh connection from the same URL under the same short timeouts,
+  connecting again after a backoff from 250 ms while the server turns it
+  away, and closes that connection again. A lost connection that showed 2
+  unrecorded stops the run instead of a retry: the runners' lock, which the
+  run holds on its connection, went with it, and a rerun takes it again and
+  goes straight to the double-credit check and the record.
+
+An interrupted run resumes at `next_seq`. `migrate --defer-share-hashes` on a
+backfill at fence 2 leaves it as it is.
+
+**Share archive is refused while pending.** `share-archive restore` refuses
+while the cursor exists, at any fence: an attached restore maps the headers of
+the rows it restores. So do `share-archive detach` and `drop` of every
+partition, whatever its bounds. The backfill reads the legacy shares below
+`end_seq` from the attached ledger, and before it records 2 the double-credit
+check reads every native share from `end_seq` up through the attached ledger
+too: a native partition that left the ledger would hide its shares from that
+check. Each refusal names `backfill-share-hashes` as the remedy, and plain
+`migrate`, which finishes it as well; archive the partition once 2 is
+recorded. `share-archive plan`, `seal`, `archive` and `verify` are unaffected.
+
+**Progress.** The cursor query above reads the same while the rest is pending;
+`recent_min_height` and `recent_start_seq` say what the recent range covered,
+and `deferred_at` when a deferred run first claimed the backfill. `self-check`
+reports the pending backfill in its `share_hash_backfill` field, and the run
+logs its progress
+([below](#finishing-the-backfill-while-frontends-serve-backfill-share-hashes)).
+
+**Refusals.**
+
+| Refusal | What to do |
+| --- | --- |
+| `refusing to defer migration 2's share-hash backfill: a build before #669 started it, so the database declares no share_hash_backfill_pending fence, ...` | the backfill carries no fence, and a resume never declares one. Run plain `migrate`, which finishes it before anything serves |
+| `refusing to permit serving with migration 2's share-hash backfill pending: the share ledger's end is share_seq <a>, not the end <b> the backfill was planned to, ...` | a writer appended around every gate before serving was permitted. Nothing serves. Run plain `migrate`, which maps every row and records 2 |
+| `database is not ready: migration 2's share-hash backfill has not finished (#582). ...`, saying that `qbit-prism-server migrate --defer-share-hashes` claimed it and stopped before its recent range was mapped | a deferred run stopped before it permitted serving; every start and every other connect that migrates refuses until the operator's `migrate` has run. Run `migrate --defer-share-hashes` again, or plain `migrate` to map everything before anything serves |
+| `refusing to permit serving with migration 2's share-hash backfill pending: the share_seq sequence <s> hands out <n> next, below the backfill's end <e>, ...` | moving the sequence up to the end did not hold. Nothing serves. Run `migrate --defer-share-hashes` again |
+| `refusing to permit serving with migration 2's share-hash backfill pending: no sequence is owned by qbit_share_ledger.share_seq, ...` | the ledger's `share_seq` column lost its sequence. Nothing serves. Run plain `migrate`, which maps every row and records 2 |
+| `refusing to finish migration 2's share-hash backfill before mapping anything: it permits serving now, ... The share-hash fence changed while this run waited for the runner lock. ...` | a deferred run raised the fence to 2 while this run waited, and stopped before 017. Nothing was mapped. Rerun `migrate`, which applies 017 before it finishes the backfill |
+| `migration 2: backfilling qbit_prism_share_hashes for share_seq <a> to <b> while frontends serve; every earlier batch committed. Resume from share_seq <a> with qbit-prism-server backfill-share-hashes` | a throttled batch failed, from `backfill-share-hashes` or plain `migrate`: a lost connection or a cancel, or, with `even a batch of <n> share_seq, the smallest, outlasted its <ms> ms statement timeout`, a batch that kept timing out down to the smallest size. Run `backfill-share-hashes`, for the latter with a smaller `--max-batch`, or else a larger `--statement-timeout-ms`, at most 5000 (the snapshot rule below); `migrate` takes no throttle flags |
+| `refusing to wait any longer to record migration 2: something held MIGRATION_LOCK or the share-hash cursor through <n> attempts over about <t>. ...` | every batch is done and no native share repeats a legacy header, but something held the migration lock, or a transaction that read the cursor stayed open, through every attempt. 2 is not recorded and frontends keep serving. Find the holder in `pg_locks`, then run `backfill-share-hashes` again, which goes straight to the check and the record |
+| `refusing to try recording migration 2 again: an attempt failed (...), and so did reading whether it had recorded 2 all the same. ...` or `... an attempt failed (...)[; the connection was lost while checking whether it had recorded 2 (...)], and reading whether it had recorded 2 on a fresh connection failed too. ...` | an attempt failed, and the database could not be read, on a fresh connection either when the attempt's own one was lost, before the run could tell whether the attempt committed. Run `backfill-share-hashes` again: it finds 2 recorded and says so, or goes straight to the check and the record |
+| `refusing to try recording migration 2 again: an attempt lost its connection, and on a fresh one 2 was not recorded when checked. ...` or `... an attempt failed, and the connection was lost while checking whether it had recorded 2 (...); on a fresh one 2 was not recorded when checked. ...` | the attempt's connection was lost, by the attempt or by the read after it, and the runners' lock went with it. 2 was not recorded when the run checked, and frontends keep serving. A COMMIT still in flight on the lost connection, waiting for a synchronous standby say, can land moments later. Run `backfill-share-hashes` again: it takes the lock, then finds 2 recorded and says so, or goes straight to the check and the record |
+| `refusing to record migration 2: after an attempt to record it failed, 2 is recorded, but its share-hash backfill's cursor ... still exists` or `... the cursor ... is gone, but 2 is not recorded` | only the transaction that records 2 drops the cursor, in the same commit, so the migration history or the cursor was edited while the run recorded 2. Find out which before changing anything; for a cursor dropped by hand, restore the full backup |
+| `migration 2: finding the last native share, ...` or `migration 2: checking the native shares from share_seq <a> to <b> for a header an accepted legacy share holds, before recording 2. ...` | a statement of the double-credit check failed, a chunk at its smallest size if it timed out. Every batch committed and 2 is not recorded. Run `backfill-share-hashes` again, which goes straight to the check |
+| `refusing to record migration 2: native share <id>, at share_seq <n>, repeats header <h> of an accepted legacy share below share_seq <end>, so that header was credited twice. ...` | the safety argument above failed for that header. Frontends may keep serving. Report it, and reconcile the double credit before anything records 2; never record 2 by hand over it |
+| `refusing to record migration 2: its share-hash backfill's end, share_seq <a>, lies above the conversion bound <b> ...` | the cursor or the partitioning catalog was edited. Restore the full backup |
+| `refusing to restore a share archive while migration 2's share-hash backfill is pending: ...`, `refusing to detach <partition> while migration 2's share-hash backfill is pending: ...`, `refusing to drop <partition> ...` | finish the backfill with `backfill-share-hashes` or plain `migrate`, then the archive step |
+
+#### Finishing the backfill while frontends serve: `backfill-share-hashes`
+
+`qbit-prism-server backfill-share-hashes` maps the rest of a backfill that
+`migrate --defer-share-hashes` left serving, and records 2. Run it after
+go-live, once frontends serve and `self-check` passes. It needs only
+`PRISM_DATABASE_URL`, connects as the operator does, passes the start gate as
+every start does, and registers no instance. Until it has recorded 2,
+`share-archive restore`, `detach` and `drop` refuse, whatever the partition,
+so archiving waits for it. On a production ledger it runs for hours, so run it
+in a session that survives a disconnect, with `RUST_LOG=info` for its progress
+lines:
+
+```sh
+RUST_LOG=info qbit-prism-server backfill-share-hashes 2>backfill-share-hashes.log
+```
+
+It prints what it did once 2 is recorded, as one JSON object: the rows it
+`mapped`, the `share_seq` values `[next_seq, end_seq)` it covered and their
+count `seqs`, `elapsed_ms`, `"recorded": true` and `"already_complete":
+false`. On a database whose backfill finished already there is nothing to
+map, and it succeeds all the same, with `"already_complete": true`,
+`"mapped": 0` and no range, so a retry after a lost reply is safe.
+
+**The snapshot rule (#738).** Every native share append updates the
+`qbit_prism_cluster` row inside `ORDER_LOCK`. A snapshot held anywhere on the
+primary keeps that row's dead versions, so each append's update costs more the
+longer it is held: at about 400 shares a second `ORDER_LOCK` saturates after
+18 to 20 seconds of held horizon, and at about 130 a second it takes about five
+minutes. So every statement the backfill issues on the primary is short, each
+in a transaction of its own, never one long snapshot: a batch statement is
+cancelled at its statement timeout, 2 s by default, and the run holds no
+transaction between batches. The double-credit check reads the native shares
+the same way, and so does the transaction that records 2. The statement
+timeout is at most 5 s for that reason; the default is 2 s.
+
+**The throttle.**
+
+| Flag | Default | What it bounds |
+| --- | --- | --- |
+| `--max-batch` | 5000 | the `share_seq` values one batch maps, at most as many legacy shares: about half a second at the 83 to 94 µs a row measured on a mainnet-shaped ledger. 1 to 50,000. Batches start at the smaller of 10,000 and this, and grow or shrink toward half a second within it, as rc.4's do within 1,000 to 50,000 |
+| `--statement-timeout-ms` | 2000 | each batch statement, each statement of the double-credit check and each of the record's, set for its own transaction (`SET LOCAL`). A batch that outlasts it is rolled back and tried again at half its size, down to the smaller of 1,000 and `--max-batch`, where a timeout stops the run instead. 1 to 5,000: no statement may hold a snapshot on the serving primary longer (#738) |
+| `--duty-cycle` | 0.5 | the share of the time batches take: after a batch that took `t`, the run rests `t * (1 - d) / d` outside any transaction, so at 0.5 as long as the batch took, at 0.25 three times as long. 0.01 to 1 |
+
+Each is checked before anything connects. A lower duty cycle spares the
+primary and takes longer in proportion. A larger batch makes fewer
+transactions, not shorter snapshots. Plain `migrate` runs the defaults. At
+the defaults and that per-row cost, a batch takes about half a second and so
+does its rest, about 5,500 `share_seq` a second: three to four hours for a
+65.9M-share ledger, an estimate the pair rehearsal is to measure beside live
+load.
+
+**What it does, and what it refuses.**
+
+1. It refuses, before it maps anything, a database whose backfill does not
+   permit serving. The start gate refuses one at fence 1, naming
+   `migrate --defer-share-hashes` and plain `migrate`, and one a build before
+   #669 started, naming plain `migrate`. A database whose backfill has finished
+   has nothing to map: the command says so and succeeds.
+2. It takes the runners' lock, as every online migration does, and holds it to
+   its end. A `migrate` or a second `backfill-share-hashes` started meanwhile
+   waits for it. Under the lock it reads the fence again and refuses any value
+   but 2, and checks 017's conversion bound, as plain `migrate` does.
+3. It maps `[next_seq, end_seq)` in throttled batches. Each batch commits with
+   the cursor, so an interrupted run, a killed process or a lost connection
+   loses only the batch in flight; run it again to resume at `next_seq`.
+4. It checks every native share for a double credit, throttled, and records 2
+   in one short transaction, retried behind a held lock for about ten minutes,
+   as above.
+
+**Watching it.**
+
+- Its log: `share-hash backfill batches throttled` once, naming the throttle,
+  then `share-hash backfill progress` every ten seconds, with `next_seq`,
+  `end_seq`, the rows `mapped`, the `percent` of the range this run started
+  with, the current `batch_seqs`, `seqs_per_second` over the whole run, rests
+  included, and the estimated seconds left, `remaining_s`. A batch that outlasted its timeout logs a
+  warning naming its retry size. The double-credit check logs its own progress
+  and its end, then `share-hash backfill complete; migration 2 recorded`.
+- Any session can read the cursor with the query above: a one-row read.
+  `updated_at` moves with every batch.
+- `self-check` reports `share_hash_backfill` with `"state": "pending"`, the
+  fence, `start_seq`, `next_seq`, `end_seq`, `remaining_seqs`, the recent
+  range and `updated_at`, and a warning line; neither fails the check. Both
+  are gone once 2 is recorded. A backfill self-check cannot read is reported
+  as `"state": "unknown"` with the error, and a warning, never as done.
+- A record attempt that waited out its lock timeout logs a warning naming the
+  attempt and its backoff.
+- On the primary, the run's backend holds no transaction longer than a few
+  seconds: in `pg_stat_activity` its `xact_start` stays within a few seconds
+  of now, and its `backend_xmin` moves on with every batch, the record's
+  attempts included, which wait at most 2 s for a lock. If
+  `qbit_prism_database_order_lock_hold_seconds{holder="append"}` or the share
+  acknowledgement percentiles from `qbit_prism_share_ack_seconds` rise while it
+  runs, stop it (Ctrl-C, or SIGTERM) and run it again later, or with a lower
+  `--duty-cycle`. Stopping loses only the batch in flight.
+
+**Interrupting and resuming.** Stopping it is always safe, and so is running
+it again. A run that stops in the double-credit check finds every batch done
+and goes straight to the check.
+
+#### Recovery evidence while the backfill is pending
+
+At `share_hash_backfill_pending = 2` the recovery evidence export
+(`scripts/prism-recovery-evidence.sql`, and the parallel export) reads the
+database, as every start does. The mapping is partial, so it exports no
+`share_hashes` row. It exports one `share_hashes_deferred` record instead,
+the cursor: `start_seq`, `next_seq`, `end_seq`, `recent_min_height` and
+`recent_start_seq`. It reads the cursor last, after the integrity report, in
+the export's snapshot, and no other part of the export reads the cursor
+table. So the export holds that table's lock only until it commits, right
+after, and the transaction that records 2, which waits at most 2 s an attempt
+for it, is never held up for long. If 2 was recorded after the export's
+snapshot, the cursor is gone by the time it is read, and the export fails:
+export again. The summarizer marks the kind deferred: the summary's
+`records.share_hashes` has count 0 and a `deferred` object holding the cursor,
+and a `note: share_hashes deferred` on stderr says so. Every other record is
+summarized as before. At fence 1 the export refuses the cursor, as startup
+does, naming `migrate --defer-share-hashes` to permit serving and plain
+`migrate` to finish the backfill. A cursor that a build before #669 started
+declares no fence, and the export refuses it naming plain `migrate` alone.
+
+So right after `migrate --defer-share-hashes`, before anything serves, the
+migrated summary equals the source's but for that kind. `cmp` fails on it, and
+the comparison leaves it out:
+
+```sh
+diff <(jq -S 'del(.records.share_hashes)' source.summary.json) \
+     <(jq -S 'del(.records.share_hashes)' migrated.summary.json)
+```
+
+Compare the share hashes once 2 is recorded. Before frontends serve, the
+summary is then the source's whole. After they have served, the mapping also
+holds the native shares' headers, so check the legacy part instead. The query
+counts the legacy headers, below the cursor's `end_seq` from the deferred
+summary, that are not mapped to their earliest accepted legacy share; the count
+must be 0:
+
+```sql
+SELECT count(*) AS unmapped
+FROM (SELECT DISTINCT ON (lower(right(share_id, 64)))
+             lower(right(share_id, 64)) AS header, share_id
+      FROM qbit_share_ledger
+      WHERE accepted AND share_id ~ '[0-9a-fA-F]{64}$' AND share_seq < :end_seq
+      ORDER BY lower(right(share_id, 64)), share_seq) expected
+LEFT JOIN qbit_prism_share_hashes mapped
+  ON mapped.header_hash = expected.header AND mapped.share_id = expected.share_id
+WHERE mapped.header_hash IS NULL;
+```
+
+It reads the whole legacy ledger in one snapshot, so with miners live run it on
+a standby with `hot_standby_feedback` off and replay paused, never on the
+primary (#738).
+
+### Migration 013: the share ledger index trim, applied online
+
+Migration 013 (#153) trims the secondary indexes of `qbit_share_ledger` to
+what the native readers use. It replaces
+`qbit_share_ledger_accepted_seq_window_idx`, a `share_seq DESC` index carrying
+seven INCLUDE columns that no native read ever fetched from it, with
+`qbit_share_ledger_accepted_seq_walk_idx`, whose INCLUDE is exactly what the
+newest-first page walk and the landing count read; replaces
+`qbit_share_ledger_accepted_miner_recent_idx` with
+`qbit_share_ledger_accepted_miner_history_idx`, without the unread
+`payout_order_key`; and drops `qbit_share_ledger_accepted_window_idx` and
+`qbit_share_ledger_template_height_idx`, which no native query uses. The
+[index inventory](prism-ledger-ops.md#share-ledger-indexes) maps every index
+to its readers and lists the measurements to take afterwards.
+
+On a fresh deployment or an empty 2.x.x source it is applied inside the
+migration transaction while the cutover locks exclude writers. Existing
+native ledgers always apply it outside that transaction, even when no
+shares are visible: the first share may still be uncommitted, and native
+writers do not take the migration lock. Populated 2.x.x sources also use
+this online path. `CREATE INDEX CONCURRENTLY` cannot run in a transaction
+block, and a plain `CREATE INDEX` holds a SHARE lock on the ledger for the
+whole build, so every append would queue behind it. Inside the migration
+transaction the file is then applied only to the scratch schema, so the
+migrator learns the index definitions as this PostgreSQL renders them. After
+the commit, on a dedicated connection with no statement or lock timeout and
+under a session-level advisory lock keyed by the ledger's schema, `migrate`
+(or a start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds each new index with
+`CREATE INDEX CONCURRENTLY`, drops each replaced one with `DROP INDEX
+CONCURRENTLY`, and records 13 last. Appends continue throughout. A
+concurrent build waits for the transactions that were already using the
+table, so a long payout-window read delays it without blocking anything
+else; two frontends starting together build once, the second waiting on the
+lock and finding the version recorded.
+
+Until 13 is recorded, every start refuses the database, naming it, like any
+other required migration. That is the resumable state: an interrupted build
+leaves an invalid index behind, still maintained by every insert, and the
+next `migrate` drops it and builds again; an index built before the
+interruption is kept when it is valid and matches the declared definition. A
+valid index under one of the two new names with any other definition, or a
+relation of another kind under one of the six names, is refused by name and
+left alone, as with every native collision:
+
+```
+refusing to apply migration 13: index qbit_share_ledger_accepted_seq_walk_idx on qbit_share_ledger
+already exists with a different definition (CREATE INDEX qbit_share_ledger_accepted_seq_walk_idx ON
+qbit_share_ledger USING btree (share_seq)); the migration declares CREATE INDEX
+qbit_share_ledger_accepted_seq_walk_idx ON qbit_share_ledger USING btree (share_seq DESC) INCLUDE
+(job_issued_at, accepted_at, share_difficulty) WHERE accepted. The migration is not recorded and
+nothing was changed by it. Check what that index serves, then rename or drop it and migrate again
+```
+
+Plan for the build on a large ledger. Both replacements are built before
+anything is dropped, so the transient footprint is the two new indexes on
+top of the existing ones; on the production ledger measured for #144 the two
+replaced indexes held 44 GB, and the replacements are a fraction of that, but
+keep that headroom free. A concurrent build reads the table twice. Run
+`migrate` from a shell where a multi-hour command is acceptable, rather than
+relying on a starting frontend, whose readiness stays down until the build
+completes. Then run `ANALYZE qbit_share_ledger` and take the measurements the
+inventory lists before scheduling #144.
+
+When nothing else runs against the database, as in the cutover's migrate step
+or on an isolated restore, `qbit-prism-server migrate --offline-indexes` builds
+013's indexes, and 024's, with a plain `CREATE INDEX` instead. It runs the same
+plan in one transaction per migration. Before any DDL it takes the migration
+lock and then, waiting at most 5 s for any other lock, refuses any instance
+that has not reported `drained` or `stopped` and a live legacy writer lease,
+and locks the table `ACCESS EXCLUSIVE`. Then it builds each index from its
+definition as this PostgreSQL renders it, drops the replaced ones with a plain
+`DROP INDEX`, checks the declared set and records 13 as it commits. A plain
+build reads the table once, may use parallel workers and waits for no other
+transaction. Every append and read of the table waits for the whole run, so
+start frontends only after `migrate` returns: one that starts during the run
+fails its startup. A transaction still open on the table, a missed writer or a
+running export, makes the migration fail at the lock timeout before it changes
+anything. An interrupted migration rolls back whole, leaving no invalid index
+and nothing dropped; the migrations the run recorded before it stay recorded.
+Plain `migrate` then builds concurrently and records without stopping
+frontends, which is also the way to finish a migration whose indexes an earlier
+run left built but unrecorded while frontends serve. The flag is `migrate`'s
+alone: a frontend started with `PRISM_POSTGRES_INIT_SCHEMA=1` always builds
+concurrently. Nothing after 013 depends on how its indexes were built: 017's
+conversion looks only for each index on the table, and PostgreSQL renders a
+plain build's definition exactly as a concurrent one's.
+
+`--index-build-workers` (default 4) caps the parallel workers of each build.
+They come out of the server's `max_worker_processes` and
+`max_parallel_workers`. A build's sort takes about `maintenance_work_mem` in
+all: PostgreSQL treats it as the limit of the whole build and divides it among
+the leader and the workers, at least 32 MB each, or launches fewer workers.
+The run sets it for its transaction to `--index-build-memory`, a size as
+PostgreSQL writes it (`512MB`, `2GB`), or without that flag to 2GB unless the
+server's setting is higher. Size it to the memory the database host has free
+beside the server's own. Without free slots or memory a build uses fewer
+workers, or none, which is slower but no less correct. Before it builds, the
+run logs the workers it asked for and those settings, and each build's
+`index built` line gives its time.
+
+### Migration 016: the partition catalog and solver attribution
+
+Migration 016 (#144) is everything the partition conversion needs before the
+table changes shape, and it is transactional: 017's SQL is the functions 016
+installs, so 016 must have committed before the online runner starts. It does
+four things.
+
+It drops the two foreign keys onto `qbit_share_ledger(share_id)`, the 001
+outbox key and the 002 `qbit_prism_share_hashes` key. A unique index on a
+partitioned table must include the partition key, so the global
+`UNIQUE (share_id)` cannot survive 017 and nothing can reference `share_id`
+afterwards. Both keys would also pin partitions: PostgreSQL re-validates
+inbound foreign keys at DETACH, and the outbox is never pruned, so a single
+retained outbox row would pin the partition holding its block's solving share
+forever. The outbox keeps its own `UNIQUE (share_id)`, and
+`qbit_prism_share_hashes` keeps its `UNIQUE (share_id)` and header-hash primary
+key and becomes the global uniqueness authority the append path consults first.
+The schema rule from here on is that **no object may carry a foreign key to
+`qbit_share_ledger`**.
+
+It creates the partition catalog, `qbit_prism_share_partitioning` (the one
+settings row: grid width, lead count, the conversion bound and when the swap
+completed) and `qbit_prism_share_partitions` (per partition: bounds, state,
+and the sealed, archived, verified, detached and dropped timestamps with the
+archive URI and digests). Both are documented column by column in
+[the ledger operations guide](prism-ledger-ops.md#share-ledger-partitions-and-retention).
+
+It creates the maintenance and conversion functions:
+`qbit_prism_share_next_seq()`, `qbit_prism_share_probe_floor()`,
+`qbit_prism_share_partition_create()`,
+`qbit_prism_share_partition_ensure()`, and the three steps of the conversion,
+`qbit_prism_share_ledger_convert_prepare()`,
+`qbit_prism_share_ledger_convert_validate()` and
+`qbit_prism_share_ledger_convert_swap()`. Defining them here is what lets the
+online runner and the transactional empty-ledger path run the same code.
+
+Finally it moves block solver attribution onto `qbit_pool_blocks`. Four
+dashboard queries found each block's solving share by suffix-matching every
+block's hash against the ledger on every request, and after a detach that
+lookup would silently blank a historical block's solver. The columns
+(`solver_miner_id`, `solver_share_id`, `solver_share_difficulty`,
+`solver_network_difficulty`) are added by 016, written at landing from now on,
+and read by the queries; for the blocks found before 016, the migrator fills
+them right after 016's file, in the same transaction. The backfill is one
+`accepted_block_suffix_idx` probe per block without a solver recorded, exactly
+the lookup those queries performed on every request. The number of probes
+follows the pool's block count, not the share count, but each probe is two
+random reads (an index leaf and a heap page). On a cold cache their cost grows
+with the ledger.
+
+Until #672 the probes were one statement in 016's file, under the migration
+transaction's statement timeout. On a mainnet-shaped ledger with all 13,566
+blocks, read from a fresh restore on a quiet disk, that statement took:
+
+| Ledger | Warm cache | Cold cache |
+| --- | --- | --- |
+| 8.25M shares | 3.0 s | 6.7 s |
+| 16.5M shares | 7.4 s | 11.2 s |
+
+On a busy disk it took about 30 s, and the 15 s default refused it. The
+migrator now makes the same probes right after the file, in the same
+transaction, in statements of at most 128 blocks taken in `block_hash` order
+(`ledger/migration/block_solvers.rs`). The attribution and the locks are the
+single statement's. On the same ledgers the longest of those 107 statements
+took 71 to 592 ms. With a concurrent writer saturating the disk, the single
+statement took 14.0 s at 8.25M, one second short of the default, and the
+longest batched one took 0.47 s. No statement comes near the timeout whatever
+the cache, so `migrate` needs no statement timeout above the default for 016.
+
+### Migration 017: the share ledger partition conversion, applied online
+
+Migration 017 (#144) converts `qbit_share_ledger` into a partitioned table,
+`RANGE (share_seq)`, with the release table attached as its first partition.
+Nothing is copied and no index is rebuilt: with a validated
+`CHECK (share_seq < bound)` on the release table, `ATTACH PARTITION` proves the
+bound from the constraint and adopts every existing index, so the swap is
+catalog work and takes milliseconds whatever the table holds. The layout it
+produces, the retention path it enables and the per-partition index set are in
+[the ledger operations guide](prism-ledger-ops.md#share-ledger-partitions-and-retention);
+the reasoning is in
+[the design record](prism-share-ledger-partitioning.md).
+
+On a fresh deployment or an empty `2.x.x` source the migration file is applied
+as written, inside the migration transaction, under the cutover locks that
+exclude writers; a fresh deployment's first partition is one grid cell.
+Everywhere else, including an existing native ledger whose first share is still
+uncommitted, the same three steps run after the commit, each in its own
+transaction on a dedicated connection with no statement timeout, resumable from
+whatever stage the database is in, and 16 is recorded last. Until then every
+start refuses the database, as for every other required migration. The
+migration transaction cannot do this work: its statement timeout and its lock
+hold would not survive a validation scan that runs for hours, and the swap's
+lock has to be taken with a short timeout and retried rather than queued.
+
+**1. Prepare.** `CHECK (share_seq < bound) NOT VALID` on the release table,
+where `bound` is the first grid boundary at least two partition widths above
+the next `share_seq`. That is 33.5 M rows of headroom at the default width:
+nineteen hours at 500 shares per second, ten days at 39. The constraint is
+enforced on new rows at once, and adding it takes the table lock only for the
+catalog change, which is why it is taken with the same short timeout and
+retries as the swap. The sequence is never restarted: rows keep landing in the
+release table until it reaches the bound, then in the next cell, so `share_seq`
+stays gap-free.
+
+**2. Validate.** `ALTER TABLE ... VALIDATE CONSTRAINT` for every `CHECK` the
+table still carries as NOT VALID, in name order. That is the bound, and the
+release's `qbit_share_ledger_credit_policy_check` where 001 left it pending on
+a ledger upgraded from before the column existed, which is the one NOT VALID
+constraint the migrator tolerates on a source. Each is one scan of the table
+under SHARE UPDATE EXCLUSIVE, which blocks neither appends nor reads, and each
+runs for hours on a production-sized ledger. ATTACH refuses a partition whose
+constraint is NOT VALID while the parent's is validated, so both have to be
+validated before the swap, not just the bound.
+
+**Re-bounding.** A run that is interrupted and resumed later may find the
+sequence has eaten the headroom. `prepare` is therefore called again at the
+start of the pending stage and of the validated stage: it returns the existing
+bound while at least one partition width of headroom is left, and otherwise
+drops the constraint, pending or validated, bounds further out and records the
+new bound, which then has to be validated again. That is the one case where a validation scan has to start
+over, and it is why an interrupted conversion is better resumed promptly than
+left for a week.
+
+**3. Swap.** One transaction of catalog work: rename the table and its six
+indexes to their `_p0` names; create the parent `LIKE` the release table, with
+the same columns, defaults and `CHECK` constraints under the same names, which
+is what ATTACH matches on; give the parent the primary key and the four
+secondary indexes under the release names; move the sequence's ownership and
+the grants across; `ATTACH PARTITION ... FROM (MINVALUE) TO (bound)`, which
+proves the bound from the validated constraint and adopts every existing index;
+recreate `qbit_shares_since_template_height`, the one release function bound to
+the old row type by OID; install the immutability trigger on the parent,
+because PostgreSQL does not clone a statement trigger to a partition; record the
+catalog; create the lead partitions. Measured on the container at 16 ms with
+5,000 rows, and none of its terms is a function of the row count. The swap needs
+ACCESS EXCLUSIVE, so it is requested with a two-second `lock_timeout` and
+retried for up to ten minutes: a long read delays the swap instead of holding
+every append queued behind an ACCESS EXCLUSIVE request. Each retry logs the
+wait so far. The function also counts the indexes on the partition afterwards
+and refuses if ATTACH built one instead of adopting it, because a build there
+would hold that lock for hours.
+
+**Resumability.** The runner reads the ledger's stage afresh before each step
+and after it, from the relation kind of `qbit_share_ledger`, the validation
+state of `qbit_share_ledger_p0_bound` and `converted_at` in the catalog:
+
+| Stage found | What it means | What the run does |
+| --- | --- | --- |
+| plain | an ordinary table with no bound | refuses the reserved names, prepares the bound, then validates and swaps |
+| pending | the bound is on the table and enforced on new rows, not yet validated | prepares again (which re-bounds only if the headroom is gone), validates every pending `CHECK`, then swaps |
+| validated | the bound is validated | prepares again (which re-bounds and validates again only if the headroom is gone), then swaps |
+| converted | the parent is partitioned and the catalog records the conversion | ensures the lead partitions and records 16 |
+
+Every name the run would take is checked while the ledger is still plain,
+before the first step, so a refusal at that point has changed nothing. A run
+that resumes from the pending or validated stage does not repeat that sweep,
+because the bound is already on the table; the swap re-checks the seven `_p0`
+names itself and refuses without changing anything if one has been taken since.
+The version is recorded in its own transaction under the migration lock, after
+the stage has been re-read and found still converted. A version another
+instance recorded meanwhile is not applied again.
+
+**Refusals, and what each one means.** From the runner:
+
+| Refusal | What to do |
+| --- | --- |
+| `refusing to apply migration 16: table qbit_share_ledger_p0 already hold names the share ledger partitions take. The migration is not recorded and nothing was changed by it. Check what they hold, then rename or move them aside and migrate again` | every relation named `qbit_share_ledger_p<k>` or `qbit_share_ledger_p<k>_<suffix>` is listed with its kind; rename or move each aside, then migrate again |
+| `migration 16: swapping the share ledger could not take its lock on qbit_share_ledger within 600 s; a transaction has held the table throughout (a long read, an open writer). Let it finish, or stop the frontends, and migrate again` | also raised for `preparing the partition bound` and `checking the partition bound`; find the holder in `pg_stat_activity` and `pg_locks`, let it finish or stop the frontends, and migrate again. Nothing after the last completed step was changed |
+| `qbit_share_ledger does not exist` | the runner was pointed at a schema without the ledger; check `search_path` and the database |
+| `qbit_share_ledger is a partitioned table but qbit_prism_share_partitioning does not record a conversion; the migrator did not partition it. Check what did, then restore the full backup or move the table aside and migrate again` | something other than this migrator partitioned the ledger; the runner will not adopt it |
+| `qbit_share_ledger is a relation of kind v, not a table; the migrator cannot partition it` | a view or other relation holds the ledger's name; restore the table from the full backup |
+| `refusing to record migration 16: qbit_share_ledger is no longer the converted table this run left; migrate again` | the ledger changed between the conversion and the recording; nothing is recorded, and the next run plans afresh from what it finds |
+| `validating the share ledger bound for migration 16; migrate again to resume` | the context on a failed or cancelled validation scan; the pending constraint stays, and the next `migrate` resumes from the pending stage |
+
+From the SQL functions that do the work:
+
+| Refusal | What to do |
+| --- | --- |
+| `share ledger is already converted` | raised by `prepare` and `swap` when `converted_at` is already set. The runner reads the stage first and never reaches them in that state, so this appears only when the functions are called by hand |
+| `qbit_share_ledger is not a plain table` | raised by `prepare`, `validate` and `swap` when the ledger is already partitioned or is not a table at all; see the runner refusals above |
+| `qbit_share_ledger_p0_bound exists with an unexpected definition: <definition>` | a constraint under the bound's name that is not `share_seq < <n>`; inspect it, drop it if it is not the migrator's, and migrate again |
+| `qbit_share_ledger_p0_bound is missing; run qbit_prism_share_ledger_convert_prepare() first` | the swap was called out of order; `migrate` calls the three in order, so this appears only when the functions are called by hand |
+| `qbit_share_ledger_p0_bound is not validated; run qbit_prism_share_ledger_convert_validate() first` | the same, one stage later |
+| `qbit_share_ledger carries a NOT VALID CHECK constraint (<names>); run qbit_prism_share_ledger_convert_validate() first` | a `CHECK` was added NOT VALID after the validation step ran; validate it, or drop it if it is not wanted, then migrate again |
+| `qbit_share_ledger_p0_bound reads <n> but the catalog recorded <m>` | the constraint and `qbit_prism_share_partitioning.conversion_bound` disagree, so one of them was edited; restore the full backup rather than reconciling them by hand |
+| `the share sequence has reached the conversion bound <n>; prepare again with more headroom` | the sequence passed the bound before the swap ran, which needs a full partition width of shares to land during the validation scan. The runner re-prepares only from the plain and pending stages, so a `migrate` from the validated stage repeats this refusal; drop `qbit_share_ledger_p0_bound` so that the next run prepares a new bound, and expect the validation scan again |
+| `refusing to convert the share ledger: a relation already holds the reserved name qbit_share_ledger_p0_pkey` | one of the seven `_p0` names is taken; rename or move that relation aside and migrate again |
+| `refusing to convert the share ledger: index qbit_share_ledger_accepted_recent_idx is not on qbit_share_ledger` | one of the six release indexes is missing or sits on another table, so 013 did not finish or an index was moved; repair the index set and migrate again |
+| `attaching qbit_share_ledger_p0 built 1 new index(es) instead of adopting the existing ones` | a release index did not match the parent's definition, so ATTACH built one; the transaction rolls back, nothing is converted, and the index definitions have to be reconciled with 013's declarations first |
+| `refusing to create share ledger partition qbit_share_ledger_p7: a relation already holds that name` | from `qbit_prism_share_partition_create`, at conversion time or later from the periodic ensure; rename or move that relation aside |
+| `share ledger is converted but no partition is attached in qbit_prism_share_partitions` | from the ensure function: the catalog has no attached row to extend from, so it was edited or selectively restored; restore the full backup |
+
+And from the scratch apply, which proves before any DDL that the migration file
+converts the table: `migration 16: qbit_share_ledger is missing before it`,
+`migration 16: qbit_share_ledger already has partitions before it`,
+`migration 16: qbit_share_ledger is missing after it`, and
+`migration 16: qbit_share_ledger_p0 is not a partition of qbit_share_ledger
+after it`. These refuse the binary's own migration file, not the source
+database, and mean the file and the runner have gone out of step.
+
+**Plan for the conversion on a large ledger.** Budget one full scan of the
+table per pending `CHECK` constraint, which is hours on a production-sized
+ledger: the bound always, and the release's
+`qbit_share_ledger_credit_policy_check` as well where 001 left it NOT VALID.
+Appends and reads continue throughout, at SHARE UPDATE EXCLUSIVE. The swap
+itself is milliseconds, but it needs ACCESS EXCLUSIVE, so allow for up to ten
+minutes of `lock_timeout` retries and stop long-running reports for that
+window if the retries are being exhausted. Run `migrate` from a shell where a
+multi-hour command is acceptable, not from a starting frontend, whose readiness
+stays down until the conversion completes. Unlike 013, this migration needs no
+extra disk and rebuilds no index: it copies no rows and every index is adopted
+by ATTACH. Run `ANALYZE qbit_share_ledger` afterwards and take the before and
+after measurements the
+[operations runbook](prism-ledger-ops.md#measuring-before-and-after) lists,
+which are acceptance criterion 4 of #144.
+
+**One-way, per decision D5.** No revert script ships. Reverting means a second
+cutover: rebuilding a global `UNIQUE (share_id)` over the whole table under
+ACCESS EXCLUSIVE, measured at 43 s over 5.5 M rows in the design spike and
+proportional to the table, and that rebuild fails at the end on the first
+duplicate `share_id` accepted across two leaves. Recovery is the
+[isolated-restore reconciliation](prism-ledger-ops.md#one-way-migration-and-isolated-restore-reconciliation)
+of #287, as for every other native migration.
+
+## Bring up native instances
+
+Start one instance first and verify readiness before admitting controlled miners:
+
+```sh
+qbit-prism-server run
+# In a separate shell with the same environment:
+qbit-prism-server healthcheck --url http://127.0.0.1:3341/healthz
+qbit-prism-server self-check
+```
+
+For the supplied external database Compose overlay:
+
+```sh
+# Public reads may use the writer, or a separate standby endpoint with mode=require.
+export PRISM_PUBLIC_DATABASE_URL="$PRISM_DATABASE_URL"
+export PRISM_PUBLIC_REPLICA_MODE=off
+docker compose -f compose.yaml -f compose.prism-external-db.yaml \
+  --profile prism up -d qbitd prism-coordinator prism-public-api
+```
+
+Set `PRISM_DATABASE_URL` to the external writer endpoint on every host. The
+overlay removes dependencies on the local primary and replica containers.
+Set `PRISM_PUBLIC_STRATUM_URL` to the advertised mining endpoint. The public
+service uses its own read pool and does not require signing keys or an audit
+filesystem mount. To read a standby, set `PRISM_PUBLIC_DATABASE_URL` to it and
+`PRISM_PUBLIC_REPLICA_MODE=require`; health then requires a recovering server
+and a fresh replication stream. Replay lag is reported separately.
+Use an up-to-date Docker Compose release supporting `!override`. Production
+operators should combine their pinned-image/storage production configuration
+with this overlay **last**, and render `docker compose ... config` before start.
+
+`QBIT_RPC_HOST` is overridable. With an already managed external qbitd, set its
+RPC connection and start only the coordinator with `up -d --no-deps
+prism-coordinator`. The local qbitd dependency then does not launch another node.
+The `make up-prism-pool` helper manages the local node/database/public-service stack; use the
+explicit Compose overlay commands for the external database topology.
+
+Add the remaining instances with identical signing and payout configuration.
+Keep TCP connection routing stable while a miner is connected; reconnects may
+land on another instance. Existing TCP sessions do not move between processes.
+The shared extranonce allocator, durable job records, proof deduplication, and
+canonical ledger provide cross-instance accounting continuity.
+
+Check these before restoring ordinary traffic:
+
+- Every frontend is healthy and follows the intended qbit chain/tip.
+- Controlled miners subscribe, authorize, receive difficulty/jobs, submit shares,
+  and recover after reconnect or a frontend restart.
+- Database share order and counts reconcile with unique committed proofs;
+  duplicate submission on another instance gives no second credit.
+- Baseline audit downloads have the same canonical hashes; carry-forward
+  integrity and CTV state agree with the pre-migration records.
+- Public dashboard and audit routes return the expected data on every instance.
+- Candidate and CTV claim recovery work after a process interruption.
+
+A subsequent rollout between compatible **Rust** versions may drain and replace
+one frontend at a time. Review each version's schema compatibility separately.
+Run the new release's `migrate` first; frontends still on the previous release
+keep starting on the newer schema while its migrations are additive and it
+declares no capability they do not understand, so they can be drained and
+replaced one at a time. A release that declares a new capability needs every
+frontend stopped first.
+
+## HA durability and failover
+
+Multiple frontends remove dependence on one Prism process. The database still
+has one authoritative primary/writer endpoint. All accounting writes and reads
+must reach that endpoint, rather than independent primaries or lagging read
+replicas. The separately served public dashboard may use a checked read replica;
+it never makes accounting or settlement decisions.
+
+Keep `fsync=on`, `full_page_writes=on`, and `synchronous_commit=on`. The last
+setting makes a local commit durable but does not create replication. If the
+requirement is no loss of acknowledged shares after primary storage loss,
+configure synchronous replication and promote only a standby holding all those
+durable commits. An asynchronous failover can lose already acknowledged work.
+Avoid silently degrading the required synchronous policy during an outage.
+The bundled public-read replica uses asynchronous replication by default; its
+presence alone does not provide this lossless accounting failover guarantee.
+
+Exercise the actual database failover endpoint under controlled mining load.
+Reconcile ACKed proof IDs with the promoted database and inspect retry/dedupe,
+payout, and candidate outcomes. Use independent backups and WAL archives even
+when replication is synchronous; replicas can reproduce operator mistakes.
+
+The repository also includes a disposable physical PostgreSQL failover test:
+
+```sh
+PRISM_TEST_PG_BIN_DIR=/usr/lib/postgresql/16/bin \
+  cargo test --locked -p qbit-prism-server --test postgres_failover -- --nocapture
+```
+
+It checks two ledger clients' acknowledged IDs through a stable TCP proxy,
+synchronous standby promotion after immediate primary loss, duplicate replay,
+and continued writes. Run it with installed PostgreSQL server tools as an
+unprivileged user. This test complements production-specific failover drills.
+
+## Configuration and observable changes
+
+Retained interfaces include miner username syntax, BIP310 version rolling,
+vardiff and high-difficulty listeners, the payout/CTV policy variables, public
+`/public/v1` routes, audit route aliases, canonical bundle hashes, and legacy
+`*_SATS` monetary aliases. Keep explicit mainnet share/vardiff bounds. As on
+`2.x.x`, mainnet permits bounded one-parent stale-share grace (default 3 seconds).
+The grace interval starts when that client receives replacement work; stale
+blocks are never submitted. Retained vardiff hints are shared by listener and
+exact username, with accepted-work evidence controlling their expiry.
+
+Native submit classification also preserves the published-tip authority used by
+`2.x.x` at `95ffe063846d51f83999a66cc654da5f7476fdef`. A detected tip immediately
+fences block candidates. Miner share credit continues against the last published
+work while replacement is prepared, including when stale grace is zero. Its
+ordinary freshness budget is `PRISM_SUBMIT_TIP_MAX_AGE_SECONDS` (default 10);
+zero forces a live tip RPC for each share. A detected replacement may extend
+published authority through `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS`
+(default 120), measured from the first departure. Repeated detections and failed
+refresh attempts do not restart that deadline. Once both budgets have expired,
+submit falls back to the node; RPC failures remain backend-unavailable.
+
+Successful work publication opens one-parent stale grace after the startup
+baseline. The deadline starts separately for each connection's first delivery
+of that tip, and same-tip refreshes do not slide it. An undelivered replacement
+keeps eligible retained work in a bounded per-connection graveyard;
+absolute reconnect-job expiry is never extended. Share credit retains the
+original issued worker, target, network difficulty and policy. Both ordinary
+published-work credit and stale-grace credit still commit under the current
+transactional payout revision. These are restorations of miner behavior, with
+ungated real-coordinator decision and socket/session regression tests; they do
+not relax current-chain candidate submission checks.
+See the [miner decision parity reference](prism-b8-miner-parity.md) for retained
+work bounds, the regression coverage map and disposable qualification commands.
+
+`PRISM_USERNAME_FALLBACK_ADDRESS` applies when validation explicitly identifies
+an invalid address or a recognized address type that Prism cannot pay. RPC
+failures and malformed validation responses reject authorization without
+substituting another payout recipient.
+
+Mainnet `check-config` and `run` require `QBIT_EXPECTED_GENESIS_HASH` to contain
+the trusted 64-hex genesis hash. Startup compares it to the connected node;
+production flags reject regtest. Public-chain readiness also requires completed
+initial block download, matching block/header heights, and at least
+`PRISM_MIN_PEERS` connected peers (default 1). Templates must satisfy
+`PRISM_TEMPLATE_MAX_AGE_SECONDS` (default 120). A failed readiness observation
+closes mining readiness until a fresh valid poll succeeds.
+
+General node and wallet RPCs use `PRISM_RPC_TIMEOUT_SECONDS` (15 seconds).
+The client keeps an idle node connection for at most 20 seconds (#759). Keep
+qbitd's `-rpcservertimeout`, and the idle timeout of any proxy in front of the
+node, above 20 seconds; qbitd's default is 30. Otherwise a call can be written
+into the idle close and fail after the connection existed, which `submitblock`
+records as an unknown outcome.
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
+ambiguous submission results retain the durable candidate for reconciliation.
+Candidate claims renew throughout processing, including waits for build workers.
+Losing the lease cancels the attempt; the durable row remains recoverable.
+Fresh candidates take priority over retries, with periodic oldest-due selection
+to keep older recovery work moving.
+Wallet selection preserves any configured `QBIT_RPC_URL` proxy path prefix.
+The independent public service retains its separate public read deadline.
+
+Canonical payout changes retire prior jobs even when the parent tip is
+unchanged. Miners receive replacement work with `clean_jobs=true`; ordinary
+same-tip refreshes keep valid retained jobs, and previous-parent share grace
+remains bounded by each connection's notification time.
+Reauthorizing a connection preserves the original payout identity of retained
+work. When `PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME` is enabled, that work
+also keeps its original username's capacity slot until it expires or is discarded.
+
+CTV fee policies, including explicit rates, are checked against the node's live
+`minrelaytxfee` and `mempoolminfee` before building payout artifacts. A configured
+rate or discounted premium below these floors fails the build; correct the fee
+policy before admitting mining work.
+
+Removed implementation settings include Python writer IDs/epochs/session leases,
+share batch/linger queues, psql/native-client selection, subprocess builders,
+incremental window schedulers, refresh rollout gates, and their watchdog knobs.
+Remove them from the operator environment; they do not tune the Rust runtime.
+The supported settings are documented in [.env.example](../.env.example) and the
+[native server README](../crates/qbit-prism-server/README.md).
+
+The combined audit/operator HTTP port remains 3341; the separate native
+`public-api` role preserves public port 3342. `/healthz` retains its readiness role;
+process metrics describe native work rather than the old Python scheduler.
+Migrate deployed alerts using the [native inventory](prism-native-metrics.md)
+and [complete alert migration and deployment diff](prism-alert-migration.md).
+Queue-pressure intent moves to `qbit_prism_share_ack_seconds` and
+`qbit_prism_rejections_total{reason_id}`; Python lease wake delay moves to
+`qbit_prism_runtime_lag_seconds`, retained `qbit_prism_runtime_poll_lag_seconds`
+and `qbit_prism_runtime_task_stalled`. Refresh impact uses
+`qbit_prism_stratum_oldest_pending_initial_job_seconds` and
+`qbit_prism_stratum_current_tip_coverage_gap_seconds`; pending-candidate age and
+count retain their names. Guard body-based rules with #277's
+`qbit_prism_metrics_snapshot_available` / `qbit_prism_metrics_snapshot_stale`
+and candidate count/age and RSS rules with `qbit_prism_collector_available` so
+unknown -1 is never healthy zero. The pool-wait histogram is read live at scrape
+time; its rule requires `up == 1` and sufficient per-instance observations instead
+of cached-body or collector availability. Deploy that producer on every target
+before activating this rule. The first-offer histogram is declared without samples
+(A/#266); advisory-lock waits are recorded since #328; rules for both remain
+deferred. D3's dedicated standby alerts require the
+primary's deployment-provided PostgreSQL exporter, not public read replica data.
+Dashboard totals continue to derive from the shared database. The native
+`self-check` emits structured JSON and fails nonzero on an error instead of
+printing the Python checker's old PASS/WARN/FAIL table.
+
+The newer block-marker, dual-rate chart, network-hashrate, and reorg-view
+contracts are retained. Native block intents are persisted before acceptance,
+so the default active block view, chart markers, and found-block totals include
+confirmed blocks only. Use `chain_state=all` to inspect every candidate with its
+explicit state. Previously landed blocks that disconnect appear as `reversed`
+with their disconnection time, while remaining eligible for native reactivation.
+Earnings and payout histories remain confirmed-only.
+
+Hashrate history uses the existing three rollup grains and raw tail. Any
+frontend may advance the shared watermark; an atomic comparison prevents
+concurrent passes from double-counting. `PRISM_HASHRATE_ROLLUP_ENABLED`,
+`PRISM_HASHRATE_ROLLUP_INTERVAL_SECONDS` (15), and
+`PRISM_HASHRATE_ROLLUP_BATCH_SHARES` (50000, maximum 100000) retain their roles.
+
+Bootstrap now pays the solver only when there are no historical shares; there
+is no three-miner readiness gate. A network-valid proof below its assigned share
+target is credited at network difficulty only after its block is confirmed on
+the active chain. These deliberate accounting simplifications were approved
+under decision D2 in #260, and belong in the operator release notes. Their
+payout effect is recorded in
+[Payout differences from 2.x.x (decision D2)](#payout-differences-from-2xx).
+
+`2.x.x` also read `PRISM_STRATUM_SHARE_WEIGHT` (default 1) and <!-- retired-setting: PRISM_STRATUM_SHARE_WEIGHT -->
+`PRISM_STRATUM_SHARE_WEIGHTS_JSON` (default empty), a JSON object keyed by miner <!-- retired-setting: PRISM_STRATUM_SHARE_WEIGHTS_JSON -->
+username or payout address. A worker with an entry in that object was credited
+`max(1, override)` instead of its share target's difficulty; the default weight
+only filled the job's delivered `share_weight` field. `3.x.x` does not support
+these per-worker credited-difficulty overrides. With the `2.x.x` defaults, which
+set no overrides, both versions credit a share at its share target's difficulty,
+so crediting is unchanged. A deployment that set either variable must remove it
+before cutover, because `3.x.x` ignores it.
+
+<a id="payout-differences-from-2xx"></a>
+
+## Payout differences from 2.x.x (decision D2)
+
+`crates/qbit-prism/fixtures/vectors/` holds money-path vectors exported from
+`2.x.x` at `504846cc0b72e8f86ed17f896d4ccbbe196a31dc`. They were computed by the `2.x.x` engine
+and rule code, not by hand. `crates/qbit-prism/tests/money_path_vectors.rs`
+replays every case through this engine. Window clipping, carry-only recipients,
+pool fees, dust recompute, remainder ties, and CTV chunking match `2.x.x`
+exactly. Every other difference is one of the entries below, under decision D2 of issue #260. Each
+differing case stores both the `2.x.x` and `3.x.x` payout and names its entry
+by anchor. The test fails if the anchors the vectors use differ from the
+entries below, and it pins every vector file's sha256, so a vector changes only
+through a re-export in a reviewed commit that updates the pin. All amounts are
+in sats.
+All vectors use the day-one floor of 14720 sats.
+
+<a id="d2a-bootstrap-pooling"></a>
+
+### D2a: bootstrap pooling
+
+- **Vector:** `bootstrap_transition.json`, case
+  `below-gate-with-other-miners-shares`.
+  - miner-a has a 30-difficulty share and miner-b a 20-difficulty share in the ledger.
+  - miner-b solves a 500000000-sat block.
+- **2.x.x:** miner-b is paid 500000000.
+  - Two distinct miners is below the `PRISM_MIN_READY_MINERS` gate (default 3). <!-- retired-setting: PRISM_MIN_READY_MINERS -->
+  - So the job is a collection job: one synthetic solver share, and the solver
+    is paid the whole coinbase.
+- **3.x.x:** miner-a is paid 300000000 and miner-b 200000000.
+  - The window is proportional as soon as any share exists.
+- **Reason:** `crates/qbit-prism-server/src/coordinator.rs` (bundle selection
+  after the ledger snapshot) builds the solver-only bundle only when
+  `snapshot.shares` is empty. There is no readiness gate.
+- **Matching cases:** `at-readiness-gate` (three miners, prior balances kept on
+  both) and `empty-ledger` (the solver is paid everything on both) match `2.x.x`.
+- **D2 item:** bootstrap pooling.
+
+<a id="d2b-below-target-credit"></a>
+
+### D2b: below-target block credit
+
+- **Vector:** `below_target_credit.json`, cases `block-only-proof-accepted`,
+  `block-only-proof-confirmed-after-reconciliation`, and
+  `block-only-proof-reorged-after-acceptance`.
+  - The listener floor holds the share target at difficulty 4000000.
+  - Network difficulty is 1000000.
+  - miner-a submits a proof that meets the network target but not the share
+    target.
+- **Credited amount:**
+  - **2.x.x:** the assigned share difficulty, 4000000.
+  - **3.x.x:** network difficulty, 1000000.
+- **Next block's payout** (8000000 window; miner-b has 2000000 + 2000000, miner-c 1000000):
+  - **2.x.x:** miner-a 250000000, miner-b 187500000, miner-c 62500000.
+    - The 9000000 of credited work overfills the window.
+    - miner-b's oldest share counts only 1000000.
+  - **3.x.x:** miner-a 83333334, miner-b 333333333, miner-c 83333333.
+    - The window holds 6000000.
+- **Timing:**
+  - **2.x.x:** credits at node acceptance of the block.
+  - **3.x.x:** credits inside the transaction that marks the block confirmed on the
+    active chain.
+    - That is either after acceptance or during reconciliation.
+    - The Stratum acknowledgement waits for that credit row.
+    - A block that is abandoned instead fails the submission with "block-only
+      proof was not accepted on the active chain".
+    - The acknowledgement waits at most `share_commit_timeout` (#574; it was
+      `max(60 s, share_commit_timeout)` before), and a candidate still pending
+      then is answered
+      `ledger-outcome-unknown` while its credit can still land.
+  - On both versions a credited share survives a later reorg.
+  - **Modeling assumption:** the `3.x.x` next-block payout assumes the
+    deferred credit lands before the next block's anchor, because the credit
+    row is stamped at confirmation, not at submission.
+- **Reason:**
+  - `crates/qbit-prism-server/src/coordinator/miner_submit.rs` credits `network` difficulty
+    when `share_pass` is false, and holds the share as the candidate's
+    `deferred_share` until the credit row exists.
+  - `crates/qbit-prism-server/src/ledger/blocks.rs` (`credit_deferred_share`)
+    appends it only on confirmation.
+- **Matching cases:** `block-only-proof-rejected` (no credit on either) and
+  `share-and-block-proof-control` (a share-passing proof is credited at the
+  assigned difficulty on both) match `2.x.x`.
+- **D2 item:** below-target credit.
+
+<a id="d2c-prior-balances-during-bootstrap"></a>
+
+### D2c: prior balances during bootstrap
+
+**Status:** approved on 2026-09-11 under decision D2 in #260. This entry is
+recorded separately from D2a because it was approved on its own.
+
+- **Vector:** `bootstrap_transition.json`, case
+  `bootstrap-carry-only-account-at-or-above-floor`.
+  - The share window is empty.
+  - miner-old has a 20000-sat carry and no share.
+  - miner-b solves a 500000000-sat block.
+- **2.x.x:** miner-b is paid 500000000.
+  - miner-old is not in the payout manifest and is not paid in this block.
+  - Its 20000-sat balance waits for a later block.
+- **3.x.x:** miner-old is paid 19999, and carries 1.
+  - miner-b is paid 499980001, and carries 19999.
+  - The engine allocates the coinbase over both accounts' candidate balances.
+- **Reason:**
+  - The `2.x.x` collection bundle passes `prior_balances=[]`
+    (`lab/prism/job_bundle.py` `build_collection_bundle`, which is `2.x.x`
+    code at `504846cc0b72e8f86ed17f896d4ccbbe196a31dc` and does not exist on
+    `3.x.x`).
+  - `crates/qbit-prism-server/src/coordinator.rs` `build_bundle` passes
+    `snapshot.prior_balances` in bootstrap too.
+  - So a carry-only account at or above the floor can be paid in a bootstrap
+    block.
+- **D2 item:** D2c, prior balances during bootstrap.
+
+## Retained mining work
+
+Same-connection active eviction preserves the original worker, target and
+version mask, including after reauthorization. The configured per-connection
+retention count N bounds both the existing active set and the same-tip graveyard.
+A previous parent can temporarily own its former active set plus graveyard;
+the graveyard has a conservative total cap of 3N (4N including active work).
+Same-tip graveyard TTL starts at eviction. Previous-parent entries require a
+published transition and delivery-based grace; unrelated parents and absolute
+resume expiries are removed. Original username admission permits remain held
+while this retained work can credit, and are released on actual expiry, capacity
+eviction, payout replacement or disconnect. Reauthorization reuses the same
+connection's permit. Cross-connection resume still requires the exact original
+worker, the current published template's parent and payout revision, and an
+unexpired absolute job deadline. The durable current-revision fence remains
+separate from those original published payout inputs.
+
+## Recovery and rollback
+
+D5 declares a **one-way migration with forward repair and isolated-restore
+reconciliation**. There are no down-migrations for native 002–010, including
+006/007/008, or permission to remove migration guards. The legacy publication
+ordinal revert refuses native schemas and points here. The following boundary
+matches the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md):
+
+> Before the first native share is acknowledged, restore the complete
+> pre-migration database and artifact backup and restart the pinned old image
+> in isolation from the migrated database. After the first native share is
+> acknowledged, restoring an older database loses those accepted records.
+> Any rollback that discards acknowledged history requires an explicit
+> accounting reconciliation and recovery decision; it is not an ordinary
+> image rollback. Keep every native frontend stopped while performing an
+> isolated restore/recovery operation against its replacement database.
+
+The ACK boundary does not prove that nothing else committed: a committed share
+can lose its reply, and candidate/CTV work can progress before admission. Always
+compare the complete evidence and retain the latest database. Prefer forward
+repair or a compatible native image preserving all durable history.
+
+An interrupted `migrate` is before this boundary as long as migration 2 is not
+recorded and `share_hash_backfill_pending` is not 2. On a populated source, 2 is
+recorded only after
+[002's share-hash backfill](#migration-002s-share-hash-backfill-applied-online),
+and every start refuses the database until then, so no native share can have
+been acknowledged. Resume it with `migrate`, or restore the pre-migration
+backup, as for any other pre-ACK failure. Once `migrate --defer-share-hashes`
+has raised the fence to 2, frontends may serve with 2 unrecorded, and the
+boundary is their first ACK, as on any served database
+([Serving with the backfill pending](#serving-with-the-backfill-pending-fence-2)).
+
+1. **Establish isolation and retain evidence.** Stop every native frontend,
+   public service, candidate worker and CTV broadcaster, and confirm no old
+   Python writer is running. Block their network access to the restore. Keep
+   the latest database and WAL, the drained pre-migration database backup, all
+   external bodies/segments, pinned images, and key/configuration recovery
+   material. Never restore over the current database. Record whether any native
+   share was acknowledged; an unknown boundary is treated as post-ACK.
+2. **Capture the drained source baseline before migration.** Configure named
+   libpq services `prism-source`, `prism-current`, and `prism-restore` for the
+   distinct databases, with the intended ledger schema first in `search_path`.
+   Keep credentials in protected libpq files, not the evidence. The export is a
+   single repeatable-read, read-only transaction. Reserve disk for ordered share
+   history; the summary hashes it a row at a time. With writers still stopped:
+
+   ```sh
+   umask 077
+   PGSERVICE=prism-source pg_dump --format=custom --file=pre-native.dump
+   PGSERVICE=prism-source psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
+     -f scripts/prism-recovery-evidence.sql > source.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py source.rows.jsonl > source.summary.json
+   ```
+
+   `FETCH_COUNT` makes psql print rows in batches instead of buffering each
+   whole result, which took 63 GB and was OOM-killed at 65.9M shares (#705).
+   The script defaults it to 10000 since #705; the flag covers copies from
+   before that.
+
+   The serial export took 85 minutes at 65.9M shares (#712). The
+   [parallel export](../scripts/prism-recovery-evidence-parallel.py) prints the
+   same rows byte for byte, so the summaries and every `cmp` below are
+   unchanged. It can replace the `psql` line of any export in this procedure:
+
+   ```sh
+   umask 077
+   PGSERVICE=prism-source python3 scripts/prism-recovery-evidence-parallel.py \
+     --jobs 8 > source.rows.jsonl
+   ```
+
+   A coordinator session runs the script's checks and exports its snapshot.
+   `--jobs` sessions import that snapshot. They export the shares in
+   `share_seq` ranges, the share hashes in header-hash ranges, and the other
+   kinds as the script does. Each range's sort may use `--work-mem` (default
+   256MB) before it spills to disk. Size `--jobs` to the database host's idle
+   cores; the export opens one connection more. No session may prompt for a
+   password, so keep it in the service's password file. Parts wait in
+   `--work-dir` (default: the current directory) until they can be printed in
+   order, so budget the export's size there as well. If any session fails,
+   the output has no completion marker, so the summarizer refuses it. On a
+   6M-share copy (4.6 GB of rows, a shared 16-core host), 8 jobs took 24 s
+   against 115 s serially on the `2.x.x` source, and 12 s against 57 s once
+   migrated.
+
+   The summarizer parses in parallel as well: `--jobs` worker processes
+   (default: the CPU count, at most 8) parse and canonicalize newline-aligned
+   ranges of the rows, and one process applies every check in file order. Its
+   summary, notes and refusals are those of `--jobs 1`, the serial summarizer,
+   byte for byte. From a range a worker cannot read as a text-mode read does
+   (invalid UTF-8, a read error) on, it reads the rows serially from the start,
+   so even a decoding error is the serial one. Size `--jobs` to the host's
+   idle cores. The serial pass ran at about 29 MB/s on the 65.9M-share restore
+   (about 80 GB, so about 45 minutes). On 3.25 GB of share and header rows on
+   a 16-core host, 8 jobs took 5.7 s against 36 s serially, and 12 jobs 4.4 s.
+
+   Keep the filesystem backup from the same drained boundary. Require
+   `unfinished_candidates` zero and both integrity mismatch counts zero. The
+   summary records ordered share counts/digests, accepted count and high-water
+   sequence, block/publication order, audit SHA identities, payout/carry and CTV
+   state. `audit_head_sha256` is the exact `2.x.x` active carry hash chain. The
+   SQL integrity function alone does **not** calculate that head; the companion
+   Python summarizer does. Compare it with the previously mirrored legacy head.
+   The checked-in SQL contains the exact reconciliation queries. The summarizer
+   checks legacy carry rows per payout program, as 025's validator does
+   (#708): a finding of `2.x.x`'s per-label rule that the program's chain
+   clears is named in a `note:` on stderr and left out of the summary, so the
+   source summarizes as its migrated copy will.
+3. **Restore and verify the pre-ACK recovery path.** Provision a new empty
+   database behind `prism-restore` on an isolated host with the matching
+   PostgreSQL version, roles and extensions. Restore the full backup (not a
+   selected table dump) and its filesystem backup at the original paths:
+
+   ```sh
+   pg_restore --exit-on-error --single-transaction \
+     --dbname='service=prism-restore' pre-native.dump
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
+     -f scripts/prism-recovery-evidence.sql > restored.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py restored.rows.jsonl > restored.summary.json
+   cmp source.summary.json restored.summary.json
+   ```
+
+   Require exact equality. Only after it passes may the pinned old image be
+   started against this isolated legacy database for recovery verification.
+   Keep miner routing and broadcast access disabled. Stop it before rehearsing
+   the native migration. Never point the old image at a native schema.
+4. **Rehearse forward migration and canonical repair.** Set the native tool's
+   `PRISM_DATABASE_URL` to the isolated restore, verify that endpoint, mount the
+   recovered artifacts, and supply the original trusted
+   `PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX`. The import does not need signing seeds:
+
+   ```sh
+   time qbit-prism-server migrate --offline-indexes
+   time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+   PGSERVICE=prism-restore psql -XqAt -v ON_ERROR_STOP=1 -v FETCH_COUNT=10000 \
+     -f scripts/prism-recovery-evidence.sql > migrated.rows.jsonl
+   python3 scripts/prism-recovery-evidence.py migrated.rows.jsonl > migrated.summary.json
+   cmp source.summary.json migrated.summary.json
+   ```
+
+   Import must exit zero with both completeness counts zero; it reconstructs
+   canonical bytes when recoverable bodies have no sidecar. A present corrupt
+   sidecar is an error, not permission to use a different body. It commits one
+   verified audit at a time; after restoring missing evidence, rerun it safely.
+   Check equality before running `backfill-ctv`, which can intentionally repair
+   missing CTV rows; retain and explain that repair's later evidence delta.
+   After `migrate --defer-share-hashes`, the migrated summary marks
+   `share_hashes` deferred, so compare every other record, and the share
+   hashes once 2 is recorded, as
+   [Recovery evidence while the backfill is pending](#recovery-evidence-while-the-backfill-is-pending)
+   describes.
+5. **Verify canonical reads and the public edge.** On the isolated public API,
+   fetch stored artifact SHA values from the audit export. Compare downloaded
+   bytes with the source backup, their SHA-256, and the quoted SHA ETag. After
+   actual cutover repeat through the configured public edge, not only origin:
+
+   ```sh
+   # PUBLIC_EDGE is the reviewed HTTPS public endpoint; SHA is a recorded audit SHA.
+   curl --fail --silent --show-error -D artifact.headers \
+     "$PUBLIC_EDGE/public/v1/artifacts/$SHA" -o artifact.json
+   printf '%s  artifact.json\n' "$SHA" | shasum -a 256 -c -
+   rg -i "^etag: \"$SHA\"" artifact.headers
+   ```
+
+   Require no `x-prism-artifact-canonical-state: missing` fallback header.
+   Successful canonical responses omit that header. If the edge still serves a cached
+   missing response, invalidate that affected cache entry and verify again
+   before admission. Published canonical bytes and hashes must not change.
+6. **Reconcile the post-ACK boundary.** Export `prism-current` with the same SQL
+   and summarizer into `current.rows.jsonl` and `current.summary.json`. Compare
+   with `restored.summary.json`, retaining the ordered JSONL when a digest
+   differs. The following exact query on the current database identifies the
+   accepted share tail beyond the source high-water mark; substitute the
+   recorded integer as the psql variable `source_last_share_seq`:
+
+   ```sql
+   SELECT share_seq, share_id, miner_id, share_difficulty, credit_policy
+   FROM qbit_share_ledger
+   WHERE accepted AND share_seq > :source_last_share_seq
+   ORDER BY share_seq;
+   SELECT state, count(*) FROM qbit_block_candidate_outbox GROUP BY state ORDER BY state;
+   SELECT qbit_carry_forward_integrity_report();
+   ```
+
+   Tail counts alone cannot prove equality: reconcile changed block states,
+   carry balances/head, payouts, pending candidates and CTV broadcasts against
+   chain evidence too. A nonempty native tail demonstrates records an older
+   restore would discard. Preserve that database and repair forward. Do not
+   copy rows into the legacy schema or resume miners until the accounting owner
+   has approved a documented plan preserving or explicitly reconciling every
+   difference, including any proposed loss of acknowledged history.
+7. **Complete the rehearsal and release gate.** Record backup/restore/migration/
+   import/verification durations, row counts, retained evidence locations,
+   artifact samples, image digests and the measured outage window. With the
+   intended native services available, run production `self-check`; require
+   zero completeness and integrity counts and successful readiness. #291 must
+   repeat this procedure on production-sized history and retain this exact data
+   loss boundary when completing `doc/release-notes-3.0.0.md` before rollout is approved.
+
+CI runs steps 2 to 7 every week on a scaled 2.x.x ledger built from the frozen
+release SQL: a pre-ACK isolated restore, `migrate` and `import-audits` with
+exact evidence equality, both native servers mining their own blocks on a
+real regtest node over the migrated history, `self-check`, and the post-ACK
+boundary (the tail query above names exactly the native shares, the isolated
+restore still equals the source, and the legacy revert refuses). The scenario
+is `migration_lifecycle_tests` in `crates/qbit-prism-server/tests/live_regtest.rs`,
+listed in `test/prism-weekly-gated-tests.txt`. It does not replace #291's
+rehearsal on production-sized history.
+
+## Rehearse the cutover on a snapshot
+
+`make prism-cutover-rehearsal` rehearses the whole cutover on a `pg_dump` of
+the drained `2.x.x` database, on a private host, and prints a pass/fail
+report (#575). It never connects to the database the dump came from, or to any
+database but the one it creates:
+
+1. It creates a private PostgreSQL cluster with `initdb` under `WORKDIR`
+   (`fsync`, `full_page_writes` and `synchronous_commit` on, listening on
+   loopback only) and restores the dump into it: a custom, directory or tar
+   archive with `pg_restore --no-owner --no-privileges`, a plain dump with
+   `psql` (take a plain dump with `--no-owner --no-privileges`: the cluster
+   has none of the source's roles). The cluster accepts only a random
+   password it keeps to itself, and is stopped and removed at the end.
+2. On the restored source it takes the [recovery evidence](#recovery-and-rollback)
+   (`scripts/prism-recovery-evidence.{sql,py}`) and the invariants below.
+3. It runs `check-config`, `migrate` and `import-audits --root <AUDIT_ROOT>`
+   with this build's `qbit-prism-server`, exactly as
+   [Drain and migrate](#drain-and-migrate) runs them, timing each and
+   sampling `pg_locks` for the statements they run.
+4. It takes the evidence and the invariants again and compares them with the
+   source's. Then it starts one frontend on the migrated ledger and checks
+   readiness, every address's balances through `/public/v1/miners/<address>`,
+   a first Stratum job (`mining.subscribe`, `mining.authorize` with an
+   address from the ledger, `mining.notify`) and `self-check`.
+
+The checks, each reported as PASS or FAIL:
+
+| Check | Holds when |
+| --- | --- |
+| restore reproduces the source | (per-PR test) the restored copy's evidence equals the database the dump was taken from |
+| source drained | the source evidence has no unfinished candidate |
+| check-config, migrate | the command exits 0; a refusal is reported with its error line |
+| import-audits complete | the import exits 0 with `missing_stored_bodies` and `missing_canonical_bytes` both 0 |
+| recovery evidence unchanged | the evidence summary after `migrate` and `import-audits` equals the source's, record for record, including `audit_head_sha256` |
+| row counts and sums unchanged | every `2.x.x` table has the same row count and the same sums: accepted shares and their difficulty, the highest `share_seq`, stale-grace rows, blocks by chain and maturity state, audit identities, gross, on-chain and carried sats, payout entries, outbox states, CTV rows, the hashrate rollups row by row and their watermark, retained worker difficulty, the writer lease, and every balance recomputed from the carry rows (`qbit_recomputed_carry_forward_balances()`) |
+| balances unchanged (SQL) | every address's owed, lifetime and pending-maturity balance, computed with the public API's own SQL, is unchanged |
+| payout window unchanged | the window is not empty, and the native snapshot a frontend builds its next job from holds exactly the shares `2.x.x`'s `qbit_prism_window` held, in the same order and with the same credit policy, at the latest network difficulty the ledger records |
+| window prior balances unchanged | the snapshot's prior balances equal `2.x.x`'s `qbit_current_carry_forward_balances()` |
+| frontend ready, first job issued | `/healthz` answers 200 and the frontend sends `mining.notify` |
+| API balances equal the source | every address's balances served by the running frontend equal the source's |
+| self-check, audit completeness | `self-check` exits 0 and reports both completeness counts 0 |
+| history unchanged after the frontend ran | once the frontend has started, reconciled and stopped, every fact above except retained worker difficulty (which it prunes past its TTL) is still the source's |
+
+Run it from a checkout of the release to be deployed, with a Rust toolchain
+and PostgreSQL 16's server binaries:
+
+```sh
+make prism-cutover-rehearsal \
+  DUMP=pre-native.dump \
+  LEDGER_KEY=<the trusted PRISM_LEDGER_WRITER_PUBLIC_KEY_HEX> \
+  AUDIT_ROOT=/var/lib/qbit-prism/audit \
+  STATEMENT_TIMEOUT_MS=<the PRISM_DATABASE_STATEMENT_TIMEOUT_MS migrate will use> \
+  REPORT=rehearsal.json WORKDIR=/srv/rehearsal
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `DUMP` | required: the dump to rehearse |
+| `LEDGER_KEY` | required: the trusted ledger public key the history was signed with, which `import-audits` verifies every body against |
+| `AUDIT_ROOT` | the external audit bodies, segments and canonical sidecars, mounted at their recorded paths as for the real import; without it only inline history can import, and the completeness check fails on any external body |
+| `SCHEMA` | the ledger schema; by default the one schema holding `qbit_share_ledger` |
+| `STATEMENT_TIMEOUT_MS` | the statement timeout the real `migrate` will run with; a statement that exceeds it fails the rehearsal as it would fail the cutover. Default: the server's 15000 |
+| `ENV_FILE` | the reviewed production environment the real cutover will use (`NAME=value` lines): its synced qbitd, chain, genesis pin, signing seeds, trusted ledger key and pool fee. Every command then runs with it, with only the database URL, the listen addresses and ports, and the instance ID replaced, so `check-config` and `self-check` check the production configuration. A synced node's tip is past the snapshot's, so the frontend may mature blocks the source left immature: the API check then compares owed and lifetime balances only. By default the rehearsal runs a lab configuration with test signing keys, against a node it serves from the dump itself: each confirmed pool block at its height and a synthetic hash at every other height, with the highest confirmed block as the tip, so the reconciler sees the recorded chain and matures nothing `2.x.x` had not |
+| `REPORT` | also write the report as JSON: steps, locks, the longest statements, checks, row counts and database sizes. Relative paths are resolved from where `make` runs |
+| `WORKDIR` | where the private cluster lives while it runs (default `TMPDIR`); budget the restored database twice over, plus the audit root |
+| `PG_BIN_DIR` | PostgreSQL 16 server binaries (default `pg_config --bindir`) |
+
+The frontend runs with test signing keys and pins its own cluster fingerprint
+on the restored copy, which is discarded; nothing it signs leaves the host and
+no miner connects to it but the rehearsal's one Stratum session. The report
+can name addresses and balances: keep it with the rest of the rehearsal
+evidence. It exits non-zero when any check fails.
+
+**Reading the report.** Each step has its wall time and the longest lock it
+held. The lock sampler polls `pg_locks` every 10 ms on a side connection for
+the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
+hold is continuous: a lock released and taken again counts as two holds. A
+hold shorter than one interval shows as 0 ms, and a very short one can be
+missed. `migrate` is split by what it was running: the migration transaction
+(`001` and native `002` to `023`, `025` and `026`), 002's share-hash backfill, 013's and 024's
+concurrent index builds, and 017's prepare, validate and swap. The transaction holds the
+cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
+whole length; the backfill's batches hold only ACCESS SHARE on it. The report
+also lists the statements `migrate` spent the most sampled time in.
+
+**Rehearsing without a snapshot.** `make prism-cutover-rehearsal-dump
+OUT=mainnet.dump SCALE=1 DENSITY=0.0625` writes a mainnet-shaped `2.x.x`
+database from the frozen release SQL and dumps it, with its audit bodies in
+`mainnet.audits` and the ledger key to pass as `LEDGER_KEY` printed in its
+summary. Its shape is #521's aggregates of mainnet `2.x.x` from 2026-07-15 to
+2026-09-28, seeded and deterministic:
+
+- 257 payout identities over 76 days in three eras, from 4 to about 130 of
+  them a day;
+- a whale holding 82-98% of a day's work on most days over a Zipf(1.1) tail;
+  worker difficulty over three orders of magnitude; hobby rigs whose credit
+  accrues under the payout floor;
+- 5-minute share rates with mean, maximum and coefficient of variation per
+  era of 8/92/1.24, 25/394/0.65 and 1.3/17/0.77 shares per second;
+- 13,566 blocks at mainnet's work per block, with signed audit bundles in the
+  three historical body layouts, PPLNS carry-forward chains and payout
+  entries, the newest blocks immature (pending payouts) and some inactive,
+  reversed and rejected;
+- CTV fanout rows for the last 40 days, terminal v1 and (after the #258
+  upgrade) v2 outbox rows, abandoned candidates, caught-up hashrate rollups,
+  retained worker difficulty, an expired writer lease, and the
+  `qbit_share_ledger_credit_policy_check` left NOT VALID as on a ledger
+  upgraded from before that column.
+
+`make prism-cutover-rehearsal-generated SCALE=1 DENSITY=0.0625` does both in
+one command: it writes the dump under `WORKDIR` (a temporary directory,
+removed afterwards unless `KEEP=1`) and rehearses it with the generator's
+ledger key, taking `STATEMENT_TIMEOUT_MS` and `REPORT` as above. Use it to
+rehearse a branch that changes a migration.
+
+`SCALE=3` multiplies the identities, the rate and the blocks, which is #521's
+growth shape. `DENSITY` keeps that fraction of the share rows, and each kept
+row carries `1/DENSITY` times a share's difficulty. The work per identity per
+5 minutes, the window weight and every balance therefore keep mainnet's
+shape, while the row-proportional costs (the 013 and 017 scans, 002's
+share-hash backfill and the evidence export) scale with the rows the report
+states. At `DENSITY=1` it is mainnet's 65.5M rows, about 105 GB before
+migrating.
+
+In CI, `migration_rollback`'s
+`cutover_rehearsal_tests::mainnet_shaped_2x_dump_rehearses_the_cutover_and_keeps_every_balance`
+runs this path on every pull request: a mainnet-shaped ledger of about 25,000
+rows and 40 blocks, dumped with `pg_dump` and rehearsed as above, with a
+payout window larger than one 4,096-row page. The weekly
+`live_regtest` scenario
+`migration_lifecycle_tests::weekly_mainnet_shaped_2x_ledger_cuts_over_measured_mines_and_restores_in_isolation`
+writes the mainnet shape at 1/16 of the rows, about 4.1M, over a real regtest
+chain. It cuts over with the same measured steps and checks, at the server's
+default statement timeout, and requires 002's share-hash backfill to have run
+as its own measured step (#582); then it mines and reconciles as the scenario
+above does.

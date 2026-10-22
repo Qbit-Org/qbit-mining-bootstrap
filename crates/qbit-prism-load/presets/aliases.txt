@@ -1,0 +1,19 @@
+# Deprecated preset names (#521), resolved by scripts/prism_load_matrix.py and
+# .github/scripts/prism-load-run.sh with a warning, for one release: old new
+d1-20k throughput-20k-window-1fe
+d1-20k-realistic throughput-20k-window-1fe-500-addresses
+d1-473-200k-fe1-async throughput-200k-window-1fe-async
+d1-473-400k-fe1-async throughput-400k-window-1fe-async
+d1-473-400k-fe2-async throughput-400k-window-2fe-async
+d1-473-400k-fe2-sync throughput-400k-window-2fe-sync
+d1-473-400k-fe4-async throughput-400k-window-4fe-async
+d1-473-500k-fe1-async throughput-500k-window-1fe-async
+d1-473-500k-fe2-async throughput-500k-window-2fe-async
+d1-473-500k-fe4-async throughput-500k-window-4fe-async
+growth-20x mainnet-shape-2600-addresses
+growth-5x mainnet-shape-650-addresses
+mainnet-floor mainnet-shape-130-addresses
+rental-churn rental-churn-bursts-and-storms
+smoke pr-smoke
+tip-275 tip-delivery-2000-miners-400k-2fe-retarget
+tip-275-realistic tip-delivery-2000-miners-400k-2fe-retarget-500-addresses

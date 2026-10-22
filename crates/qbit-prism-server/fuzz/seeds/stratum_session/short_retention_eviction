@@ -1,0 +1,9 @@
+#cfg retain=0.001 jobs=2
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+#revision
+#revision
+#refresh
+#sleep
+{"id":4,"method":"mining.submit","params":["$user","$job3","$en2","$ntime","$nonce"]}
+{"id":5,"method":"mining.submit","params":["$user","$job2","$en2","$ntime","$nonce"]}

@@ -1,0 +1,11 @@
+{"id":1,"method":"mining.subscribe","params":["cgminer/4.10.0"]}
+{"id":2,"method":"mining.authorize","params":["miner1.rig","x"]}
+#pipeline
+{"id":20,"method":"mining.submit","params":["miner1.rig","$job","$en2","$ntime","$nonce"]}
+{"id":21,"method":"mining.authorize","params":["miner1.rig","d=1"]}
+#again
+{"id":22,"method":"mining.suggest_difficulty","params":[0.5]}
+#refresh
+{"id":23,"method":"mining.submit","params":["miner1.rig","$job","$en2","$ntime","$nonce"]}
+#pipeline
+{"id":10,"method":"mining.submit","params":["$user","$job","$en2","$ntime","$nonce"]}

@@ -1,0 +1,868 @@
+//! Real runtime and durable database fixture, with no SQL proxy or write trigger.
+use anyhow::{ensure, Context, Result};
+use futures_util::{
+    future::{join_all, LocalBoxFuture},
+    stream, FutureExt, StreamExt, TryStreamExt,
+};
+use qbit_prism_server::{
+    coordinator::Coordinator, ledger::CompactDependency, metrics::Metrics, stratum::MiningBackend,
+};
+use serde_json::{json, Value};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::{
+    collections::{BTreeMap, HashSet},
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::time::{timeout, timeout_at, Instant};
+
+#[allow(dead_code)]
+#[path = "../fake_qbitd.rs"]
+mod fake_qbitd;
+mod socket;
+#[allow(dead_code)]
+#[path = "../window_fixture.rs"]
+mod window_fixture;
+
+// This identifies the historical report, not the runtime used by a new run.
+// Record the tested revision separately in that run's build/gate manifest.
+const HISTORICAL_BASELINE: &str = "1b0d409344c1b99f5f4bd04970890b9b034a9eeb";
+const SHARES: u64 = 16;
+const SETTLEMENT_LOCK: i64 = 0x5052_4953_4d00_0003;
+// Advisory locks are database-wide, so smoke cases in this binary serialize.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub struct Fixture {
+    frontends: Vec<Arc<Coordinator>>,
+    listeners: Vec<socket::Listener>,
+    node: fake_qbitd::FakeNode,
+    direct: PgPool,
+    admin: PgPool,
+    schema: String,
+    settings: Value,
+    shares: u64,
+    run_context: Value,
+}
+
+impl Fixture {
+    async fn open(raw: &str, count: usize, shares: u64, run_context: Value) -> Result<Self> {
+        ensure!((1..=2).contains(&count));
+        let admin = PgPoolOptions::new().max_connections(2).connect(raw).await?;
+        let row = sqlx::query("SELECT current_setting('server_version_num')::int AS version, current_setting('fsync') AS fsync, current_setting('full_page_writes') AS full_page_writes, current_setting('synchronous_commit') AS synchronous_commit")
+            .fetch_one(&admin).await?;
+        let version: i32 = row.try_get("version")?;
+        ensure!(
+            (160000..170000).contains(&version),
+            "measurement requires PostgreSQL16"
+        );
+        for key in ["fsync", "full_page_writes", "synchronous_commit"] {
+            ensure!(row.try_get::<String, _>(key)? == "on", "{key} must be on");
+        }
+        let settings = json!({"server_version_num":version,
+            "fsync":row.try_get::<String, _>("fsync")?,
+            "full_page_writes":row.try_get::<String, _>("full_page_writes")?,
+            "synchronous_commit":row.try_get::<String, _>("synchronous_commit")?});
+        let schema = format!("b275_measure_{}", uuid::Uuid::new_v4().simple());
+        let mut url = url::Url::parse(raw)?;
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"))
+            .append_pair("application_name", &schema);
+        // Open fallible resources before creating the schema. Once it exists,
+        // both partial setup and normal completion use the same teardown.
+        let direct = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(url.as_str())
+            .await?;
+        let node = fake_qbitd::FakeNode::open().await?;
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await?;
+        let mut fixture = Self {
+            frontends: Vec::new(),
+            listeners: Vec::new(),
+            node,
+            direct,
+            admin,
+            schema,
+            settings,
+            shares,
+            run_context,
+        };
+        let opened = async {
+            for index in 0..count {
+                let mut config = fake_qbitd::coordinator_config(
+                    url.to_string(),
+                    &fixture.node,
+                    &format!("b275-{index}"),
+                )?;
+                // Match the deployed default rather than the small unit-test pool.
+                config.database_connections = 16;
+                config.template_max_age = Duration::from_secs(600);
+                config.submit_tip_max_age = Duration::from_secs(600);
+                config.snapshot_interval = Duration::from_secs(600);
+                config.health_timeout = Duration::from_secs(600);
+                fixture
+                    .frontends
+                    .push(Coordinator::new(config, Arc::new(Metrics::default())).await?);
+            }
+            let plan = window_fixture::WindowPlan::new(shares)?;
+            let load = plan.load(&fixture.direct, "b275").await?;
+            plan.verify_round_trip(&fixture.direct, &[1, shares.div_ceil(2), shares]).await?;
+            sqlx::query("ANALYZE qbit_share_ledger").execute(&fixture.direct).await?;
+            println!("B275_FIXTURE {}", json!({"shares":load.rows,"serialized_bytes":load.serialized_bytes,"serialized_bytes_source":"WindowPlan modeled native shares; not measured SQL storage bytes","payout_recipients":5,"payout_order_keys":1,"load_seconds":load.seconds,"sampled_round_trip":true,"analyzed":true,"schema":fixture.schema,"node_endpoint":fixture.node.url,"run_context":fixture.run_context}));
+            for frontend in &fixture.frontends {
+                frontend.refresh_once().await?;
+                ensure!(frontend.prepared.read().await.as_ref().and_then(|p| p.window.shares).is_some_and(|r| r.share_count == shares), "initial prepared window has wrong share count");
+                fixture
+                    .listeners
+                    .push(socket::Listener::start(frontend).await?);
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match opened {
+            Ok(()) => Ok(fixture),
+            Err(error) => {
+                fixture
+                    .close()
+                    .await
+                    .context(format!("setup failed: {error:#}; cleanup failed"))?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn close(mut self) -> Result<()> {
+        // Try every cleanup even when an earlier listener failed to shut down.
+        let mut errors = Vec::new();
+        for listener in &mut self.listeners {
+            if let Err(error) = listener.close().await {
+                errors.push(format!("{error:#}"));
+            }
+        }
+        drop(self.listeners);
+        for frontend in &self.frontends {
+            frontend.ledger.pool.close().await;
+        }
+        drop(self.frontends);
+        self.direct.close().await;
+        let cleanup = timeout(
+            Duration::from_secs(15),
+            sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema)).execute(&self.admin),
+        )
+        .await;
+        if let Err(error) = cleanup
+            .context("schema cleanup timeout")
+            .and_then(|r| r.map_err(Into::into))
+        {
+            errors.push(format!("{error:#}"));
+        }
+        self.admin.close().await;
+        ensure!(errors.is_empty(), "cleanup failed: {}", errors.join("; "));
+        Ok(())
+    }
+
+    fn metrics(&self) -> Result<Vec<BTreeMap<String, f64>>> {
+        self.frontends
+            .iter()
+            .map(|frontend| {
+                frontend
+                    .metrics
+                    .render()
+                    .lines()
+                    .filter(|line| {
+                        let name = line.split(['{', ' ']).next().unwrap_or("");
+                        name.starts_with("qbit_prism_database_")
+                            && (name.ends_with("_count") || name.ends_with("_sum"))
+                    })
+                    .map(|line| {
+                        let (key, value) = line
+                            .rsplit_once(' ')
+                            .context("metric sample missing value")?;
+                        Ok((key.into(), value.parse()?))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn cluster_waiter(&self, blocker: i32) -> Result<i32> {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let waiting: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND application_name=$2 AND query LIKE 'SELECT config_fingerprint%' LIMIT 1")
+                    .bind(blocker).bind(&self.schema).fetch_optional(&self.direct).await?;
+                if let Some(pid) = waiting { return Ok::<_, anyhow::Error>(pid); }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.context("no authority row waiter observed")?
+    }
+}
+
+pub async fn run(
+    raw: &str,
+    frontends: usize,
+    body: impl for<'a> FnOnce(&'a Fixture, Instant) -> LocalBoxFuture<'a, Result<()>>,
+) -> Result<()> {
+    run_window(raw, frontends, SHARES, json!({"frontend_order":[frontends],"topology_position":0,"fixture_shares":SHARES,"control_source":"fixed regression fixture"}), body).await
+}
+
+pub async fn run_window(
+    raw: &str,
+    frontends: usize,
+    shares: u64,
+    run_context: Value,
+    body: impl for<'a> FnOnce(&'a Fixture, Instant) -> LocalBoxFuture<'a, Result<()>>,
+) -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let fixture = Fixture::open(raw, frontends, shares, run_context).await?;
+    let case_deadline = Instant::now() + Duration::from_secs(240);
+    let result = AssertUnwindSafe(timeout_at(case_deadline, body(&fixture, case_deadline)))
+        .catch_unwind()
+        .await;
+    let cleanup = fixture.close().await;
+    let result = match result {
+        Ok(result) => result
+            .context("measurement case exceeded 240 seconds")
+            .and_then(|r| r),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    match (result, cleanup) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("cleanup also failed: {cleanup:#}")))
+        }
+    }
+}
+
+fn metric_delta(
+    before: Vec<BTreeMap<String, f64>>,
+    after: Vec<BTreeMap<String, f64>>,
+) -> Result<Vec<BTreeMap<String, f64>>> {
+    before
+        .into_iter()
+        .zip(after)
+        .map(|(before, after)| {
+            after
+                .into_iter()
+                .map(|(key, value)| {
+                    let delta = value - before.get(&key).copied().unwrap_or(0.0);
+                    ensure!(
+                        delta >= 0.0 && delta.is_finite(),
+                        "metric counter reset: {key}"
+                    );
+                    Ok((key, delta))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub async fn delivery(fixture: &Fixture, sessions: usize, case_deadline: Instant) -> Result<()> {
+    let old_parent = "ab".repeat(32);
+    let parent = "ef".repeat(32);
+    let frontends = fixture.frontends.len();
+    ensure!(sessions > 0 && sessions.is_multiple_of(frontends));
+    // Reserve one second for reporting and validation before the outer budget.
+    let evidence_deadline = case_deadline - Duration::from_secs(1);
+    let login = stream::iter(0..sessions)
+        .map(|index| {
+            let address = fixture.listeners[index % frontends].address;
+            let old_parent = &old_parent;
+            async move {
+                Ok::<_, anyhow::Error>((
+                    index % frontends,
+                    socket::Client::login(address, index, old_parent).await?,
+                ))
+            }
+        })
+        .buffer_unordered(32)
+        .try_collect::<Vec<_>>();
+    let mut clients = match timeout_at(evidence_deadline, login)
+        .await
+        .context("case login budget elapsed")
+        .and_then(|r| r)
+    {
+        Ok(clients) => clients,
+        Err(error) => {
+            println!(
+                "B275_SETUP_FAILURE {}",
+                json!({"frontends":frontends,"sessions_total":sessions,"stage":"login","error":format!("{error:#}"),"delivery_started":false})
+            );
+            return Err(error);
+        }
+    };
+    let deliveries_before: Vec<_> = fixture
+        .listeners
+        .iter()
+        .map(|l| l.stats.snapshot(0))
+        .collect();
+    let before = fixture.metrics()?;
+    fixture.node.set_tip(&parent, &old_parent, 101, "02");
+    // Common monotonic boundary immediately before first poll of refresh_once
+    // on every frontend. No timer, poll-loop, or metrics publisher runs for us.
+    let start = Instant::now();
+    let deadline = (start + Duration::from_secs(120)).min(evidence_deadline);
+    let refresh = join_all(fixture.frontends.iter().map(|frontend| async {
+        timeout_at(deadline, frontend.refresh_once())
+            .await
+            .context("refresh deadline elapsed")??;
+        Ok::<_, anyhow::Error>(start.elapsed().as_secs_f64())
+    }));
+    let receives = join_all(clients.iter_mut().map(|(frontend, client)| {
+        let parent = &parent;
+        async move { (*frontend, client.receive(parent, start, deadline).await) }
+    }));
+    let (refreshes, deliveries) = tokio::join!(refresh, receives);
+    let metrics = metric_delta(before, fixture.metrics()?)?;
+    let delivery_attempts: Vec<_> = fixture
+        .listeners
+        .iter()
+        .zip(deliveries_before)
+        .map(|(listener, before)| {
+            let after = listener.stats.snapshot(0);
+            json!({"successes":after.job_delivery_successes-before.job_delivery_successes,
+            "failures":after.job_delivery_failures-before.job_delivery_failures})
+        })
+        .collect();
+    let failure_free = delivery_attempts.iter().all(|d| d["failures"] == 0);
+    let refresh_errors: Vec<_> = refreshes
+        .iter()
+        .filter_map(|r| r.as_ref().err().map(|e| format!("{e:#}")))
+        .collect();
+    let delivery_errors: Vec<_> = deliveries
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().err().map(|e| format!("{e:#}")))
+        .collect();
+    let mut seconds: Vec<_> = deliveries
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok().map(|(_, s)| *s))
+        .collect();
+    seconds.sort_by(f64::total_cmp);
+    let complete = seconds.len() == sessions && refresh_errors.is_empty() && failure_free;
+    let max = seconds.last().copied();
+    let report = json!({
+        "schema":"b275.delivery.v4", "historical_baseline_sha":HISTORICAL_BASELINE,
+        "frontends":frontends,"sessions_total":sessions,"sessions_per_frontend":sessions/frontends,
+        "fixture_shares":fixture.shares,"database":fixture.settings,
+        "run_context":fixture.run_context,
+        "runtime_threads":tokio::runtime::Handle::current().metrics().num_workers(),
+        "frontend_settings":fixture.frontends.iter().zip(&fixture.listeners).map(|(f,l)| json!({"build_workers":f.config.build_workers,"database_connections":f.config.database_connections,"listener":l.settings})).collect::<Vec<_>>(),
+        "delivery_attempt_deltas_per_frontend":delivery_attempts,"delivery_failure_free":failure_free,
+        "boundary":"before concurrent refresh_once polling to client decoded new-parent mining.notify",
+        "deadline_seconds":120,"effective_delivery_budget_seconds":deadline.saturating_duration_since(start).as_secs_f64(),"received":seconds.len(),"complete":complete,
+        "refresh_return_seconds":refreshes.iter().map(|r| r.as_ref().ok().copied()).collect::<Vec<_>>(),
+        "p50_delivery_seconds":seconds.get(seconds.len().saturating_sub(1)/2),
+        "p95_delivery_seconds":seconds.get((seconds.len()*95).div_ceil(100).saturating_sub(1)),
+        "quantiles":"p50 lower median (historical definition); p95 nearest rank; received clients only",
+        "quantile_population":{"received":seconds.len(),"requested":sessions},
+        "max_observed_delivery_seconds":max,
+        "all_sessions_within_one_second":complete && max.is_some_and(|s| s <= 1.0),
+        "refresh_errors":refresh_errors,"delivery_errors":delivery_errors,
+        "database_metric_deltas_per_frontend":metrics,
+        "metric_scope":"all instrumented frontend checkout/lock calls during refresh plus fanout; sums overlap across concurrent sessions",
+        "commit_seconds":null,"commit_timing":"not exposed by runtime instrumentation",
+        "performance_acceptance":"not established by this harness result alone"
+    });
+    println!("B275_MEASUREMENT {report}");
+    // join_all preserves the clients vector's order despite unordered logins.
+    // Retain every receipt even if a later SQL read cannot validate its identity.
+    println!(
+        "B275_RECEIVED_CHILDREN {}",
+        json!({"durability":"not yet checked",
+        "children":deliveries.iter().zip(&clients).filter_map(|((frontend, result),(_, client))| {
+            result.as_ref().ok().map(|(job_id, seconds)| json!({"frontend":frontend,"job_id":job_id,
+                "delivery_seconds":seconds,"subscribed_username":client.username,
+                "subscribed_extranonce1":client.extranonce1,"subscribed_extranonce2_size":client.extranonce2_size}))
+        }).collect::<Vec<_>>()})
+    );
+    let mut validation_errors = Vec::new();
+    let mut ids = HashSet::new();
+    for (_, received) in deliveries.iter().filter(|(_, r)| r.is_ok()) {
+        if !ids.insert(received.as_ref().unwrap().0.clone()) {
+            validation_errors.push("duplicate delivered job ID".to_owned());
+        }
+    }
+    // All SQL validation is after the measurement bracket, using a separate
+    // uninstrumented pool. Confirm actual durable rows, not just notifications.
+    for (index, frontend) in fixture.frontends.iter().enumerate() {
+        let validation = async {
+        let prepared = frontend
+            .prepared
+            .read()
+            .await
+            .clone()
+            .context("no prepared work")?;
+        ensure!(prepared.template["previousblockhash"] == parent, "frontend did not publish the measured parent");
+        ensure!(
+            prepared
+                .window
+                .shares
+                .context("no window range")?
+                .share_count
+                == fixture.shares,
+            "prepared window has wrong share count"
+        );
+        let original = frontend
+            .ledger
+            .compact_prepared(&prepared.storage_key)
+            .await?
+            .context("durable prepared record missing")?;
+        ensure!(original.record.payout_revision == prepared.snapshot.payout_revision, "durable prepared revision differs");
+        ensure!(original.record.window == prepared.window, "durable prepared window differs");
+        let hashes = original
+            .record
+            .audit_hashes
+            .as_ref()
+            .context("audit hashes absent")?;
+        ensure!(
+            hashes.audit_bundle_sha256.len() == 64 && hashes.coinbase_manifest_sha256.len() == 64,
+            "prepared audit hashes have wrong length"
+        );
+        let jobs: Vec<_> = deliveries
+            .iter()
+            .filter(|(f, r)| *f == index && r.is_ok())
+            .map(|(_, r)| r.as_ref().unwrap().0.clone())
+            .collect();
+        let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id=ANY($1) AND parent_hash=$2 AND payout_revision=$3 AND payload->>'prepared_key'=$4 AND expires_at>clock_timestamp()")
+            .bind(&jobs).bind(&parent).bind(prepared.snapshot.payout_revision).bind(&prepared.storage_key).fetch_one(&fixture.direct).await?;
+        ensure!(
+            valid as usize == jobs.len(),
+            "issued rows lost prepared identity or revision"
+        );
+        let rows = sqlx::query("SELECT job_id, instance_id, payload, (extract(epoch FROM expires_at)*1000)::bigint AS expires_at_ms FROM qbit_prism_jobs WHERE job_id=ANY($1)")
+            .bind(&jobs).fetch_all(&fixture.direct).await?;
+        let rows: BTreeMap<String, _> = rows
+            .into_iter()
+            .map(|row| Ok((row.try_get("job_id")?, row)))
+            .collect::<Result<_>>()?;
+        let mut children = Vec::new();
+        for ((owner, received), (_, client)) in deliveries.iter().zip(&clients) {
+            if *owner != index {
+                continue;
+            }
+            let Ok((job_id, seconds)) = received else {
+                continue;
+            };
+            let row = rows
+                .get(job_id)
+                .context("delivered child missing durable row")?;
+            let payload: Value = row.try_get("payload")?;
+            ensure!(
+                row.try_get::<String, _>("instance_id")? == frontend.config.instance_id,
+                "child belongs to another frontend"
+            );
+            ensure!(
+                payload["worker"]["username"] == client.username
+                    && payload["extranonce1"] == client.extranonce1
+                    && payload["extranonce2_size"] == client.extranonce2_size,
+                "durable child differs from subscribed client: {job_id}"
+            );
+            ensure!(
+                payload["expires_at_ms"] == row.try_get::<i64, _>("expires_at_ms")?,
+                "child expiry differs from durable row"
+            );
+            children.push(
+                json!({"job_id":job_id,"delivery_seconds":seconds,"subscribed_username":client.username,"subscribed_extranonce1":client.extranonce1,"subscribed_extranonce2_size":client.extranonce2_size,"durable_payload":payload}),
+            );
+        }
+        println!(
+            "B275_CHILD_IDENTITIES {}",
+            json!({"frontend":index,"children":children})
+        );
+        let issued: i64 = sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE instance_id=$1 AND parent_hash=$2 AND payload ? 'prepared_key'")
+            .bind(&frontend.config.instance_id).bind(&parent).fetch_one(&fixture.direct).await?;
+        println!(
+            "B275_ISSUED_ROWS {}",
+            json!({"frontend":index,"delivered":jobs.len(),"issued_rows":issued,
+                "unmatched_rows":complete.then_some(issued-valid),
+                "observed_issued_minus_valid":issued-valid,"delivery_complete":complete,
+                "scope":"post-bracket count; incomplete listeners may still commit rows"})
+        );
+        if complete {
+            ensure!(issued == valid, "committed issued rows were not delivered");
+        }
+        let after = frontend
+            .ledger
+            .compact_prepared(&prepared.storage_key)
+            .await?
+            .context("prepared dependency vanished")?;
+        ensure!(
+            after.record == original.record,
+            "readback rewrote immutable prepared bytes"
+        );
+        Ok::<_, anyhow::Error>(())
+        }.await;
+        if let Err(error) = validation {
+            let error = format!("frontend {index}: {error:#}");
+            println!(
+                "B275_DURABILITY_ERROR {}",
+                json!({"frontend":index,"error":error,"validation":"failed or unavailable"})
+            );
+            validation_errors.push(error);
+        }
+    }
+    println!(
+        "B275_DURABILITY {}",
+        json!({"frontends":frontends,"sessions":sessions,
+        "delivered":seconds.len(),"delivery_complete":complete,
+        "delivered_subset_verified":validation_errors.is_empty(),
+        "verified":complete&&validation_errors.is_empty(),"validation_errors":validation_errors})
+    );
+    delivery_outcome(complete, &report, &validation_errors)
+}
+
+fn delivery_outcome(complete: bool, report: &Value, validation_errors: &[String]) -> Result<()> {
+    ensure!(complete, "incomplete delivery measurement: {report}; durable validation errors: {validation_errors:?}");
+    ensure!(
+        validation_errors.is_empty(),
+        "delivery durability validation failed: {validation_errors:?}; measurement: {report}"
+    );
+    Ok(())
+}
+
+#[test]
+fn incomplete_delivery_keeps_primary_failure_when_validation_also_fails() {
+    for received in [0, 1] {
+        let report = json!({"received":received,"complete":false,"refresh_errors":["refresh deadline elapsed"]});
+        let error = delivery_outcome(false, &report, &["old prepared parent".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("incomplete delivery measurement:"));
+        assert!(error.contains("refresh deadline elapsed"));
+        assert!(error.contains("old prepared parent"));
+    }
+    assert!(delivery_outcome(false, &json!({"received":1}), &[]).is_err());
+}
+
+#[test]
+fn complete_receipts_do_not_hide_durable_identity_failure() {
+    let error = delivery_outcome(
+        true,
+        &json!({"received":2}),
+        &["child identity mismatch".into()],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("delivery durability validation failed:"));
+    assert!(error.contains("child identity mismatch"));
+    assert!(delivery_outcome(true, &json!({"received":2}), &[]).is_ok());
+}
+
+/// Preserve the old blocking assertion at the actual authority fence. The
+/// historical advisory baseline remains attributed to its original revision.
+///
+/// The hold is an authority write as the server makes one: the cluster row
+/// `FOR UPDATE` (`lock_cluster_authority`), then a `payout_revision`
+/// `UPDATE`, rolled back after three seconds so the job persists under its
+/// original revision. Before #479 the hold was a `ledger_clock_ms` `UPDATE`,
+/// which job persistence no longer waits for (see
+/// [`clock_hold_does_not_block_persistence`]): the clock is not authority and
+/// no persistence path reads it.
+pub async fn authority_lock(fixture: &Fixture) -> Result<()> {
+    let frontend = &fixture.frontends[0];
+    let worker = frontend.authorize("b275.authority").await?;
+    let job = frontend.build_job(&worker, "11223344", 1.0, 0.0).await?;
+    let mut tx = fixture.direct.begin().await?;
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton")
+        .execute(&mut *tx)
+        .await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await?;
+    let start = Instant::now();
+    let persist = async {
+        frontend
+            .persist_issued_job(&worker, &job, 0, Duration::from_secs(60))
+            .await?;
+        Ok::<_, anyhow::Error>(start.elapsed().as_secs_f64())
+    };
+    let release = async {
+        let observed = fixture.cluster_waiter(blocker).await;
+        tokio::time::sleep_until(start + Duration::from_secs(3)).await;
+        tx.rollback().await?;
+        observed?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (persist, released) = tokio::join!(persist, release);
+    released?;
+    let elapsed = persist?;
+    ensure!(
+        elapsed >= 3.0,
+        "persistence bypassed the held authority fence"
+    );
+    ensure!(
+        frontend.ledger.job(&job.wire.job_id).await?.is_some(),
+        "persist succeeded without durable row"
+    );
+    println!(
+        "B275_AUTHORITY_LOCK {}",
+        json!({"hold_target_seconds":3,"persist_seconds":elapsed,
+        "ordinary_update_wait_observed":true,"scope":"legitimate authority row contention retained"})
+    );
+    Ok(())
+}
+
+/// The converse of [`authority_lock`] (#479): the share append's clock
+/// `UPDATE` holds the cluster row `FOR NO KEY UPDATE` under ORDER_LOCK, and
+/// job persistence's `FOR KEY SHARE` fence does not wait for it, so shares
+/// and job persistence no longer queue behind each other on the clock.
+pub async fn clock_hold_does_not_block_persistence(fixture: &Fixture) -> Result<()> {
+    let frontend = &fixture.frontends[0];
+    let worker = frontend.authorize("b275.clock").await?;
+    let job = frontend.build_job(&worker, "55667788", 1.0, 0.0).await?;
+    let mut tx = fixture.direct.begin().await?;
+    sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=ledger_clock_ms WHERE singleton")
+        .execute(&mut *tx)
+        .await?;
+    let start = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        frontend.persist_issued_job(&worker, &job, 0, Duration::from_secs(60)),
+    )
+    .await
+    .context("job persistence waited behind a held ledger clock UPDATE")??;
+    let elapsed = start.elapsed().as_secs_f64();
+    ensure!(
+        frontend.ledger.job(&job.wire.job_id).await?.is_some(),
+        "persist succeeded without durable row"
+    );
+    tx.rollback().await?;
+    println!(
+        "B275_CLOCK_HOLD {}",
+        json!({"persist_seconds":elapsed,"clock_hold_open":true})
+    );
+    Ok(())
+}
+
+/// Acceptance for persistence only. The old blocking measurement remains in
+/// tests/perf/b275_persistence_measure.md at its recorded historical revision.
+pub async fn settlement_isolation(fixture: &Fixture) -> Result<()> {
+    for (mode, children) in [
+        ("hot-single", 1),
+        ("hot-cohort", 64),
+        ("repair-survivors", 1),
+        ("repair-missing", 1),
+    ] {
+        let mut requests = Vec::new();
+        let mut originals = Vec::new();
+        for (index, frontend) in fixture.frontends.iter().enumerate() {
+            let worker = frontend.authorize(&format!("b275.lock-{index}")).await?;
+            for child in 0..children {
+                let job = frontend
+                    .build_job(&worker, &format!("{child:08x}"), 1.0, 0.0)
+                    .await?;
+                if child == 0 {
+                    let stored = frontend
+                        .ledger
+                        .compact_prepared(&job.context.prepared.storage_key)
+                        .await?
+                        .context("original prepared row missing")?;
+                    originals.push((index, job.context.prepared.storage_key.clone(), stored));
+                }
+                requests.push((index, worker.clone(), job));
+            }
+        }
+        if mode.starts_with("repair") {
+            let keys: Vec<_> = originals.iter().map(|(_, key, _)| key.clone()).collect();
+            sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id=ANY($1)")
+                .bind(&keys)
+                .execute(&fixture.direct)
+                .await?;
+            if mode == "repair-missing" {
+                sqlx::query("DELETE FROM qbit_prism_templates")
+                    .execute(&fixture.direct)
+                    .await?;
+                sqlx::query("DELETE FROM qbit_prism_balance_snapshots")
+                    .execute(&fixture.direct)
+                    .await?;
+            }
+        }
+        let mut stub = fixture.direct.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(SETTLEMENT_LOCK)
+            .execute(&mut *stub)
+            .await?;
+        let stub_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *stub)
+            .await?;
+        let start = Instant::now();
+        let release_at = start + Duration::from_secs(3);
+        let before = fixture.metrics()?;
+        // Nothing can release the stub until return AND durable verification
+        // finish. The timeout catches a regression without manufacturing a
+        // post-unlock success; SQL lock ownership is the synchronization proof.
+        let verified = timeout_at(release_at, async {
+            let results = join_all(requests.iter().map(|(index, worker, job)| async move {
+                fixture.frontends[*index].persist_issued_job(worker, job, 0, Duration::from_secs(60)).await
+            })).await;
+            for result in results { result?; }
+            let ids: HashSet<_> = requests.iter().map(|(_, _, job)| job.wire.job_id.as_str()).collect();
+            ensure!(ids.len() == requests.len(), "runtime cohort reused a child ID");
+            for (index, worker, job) in &requests {
+                let row = sqlx::query("SELECT instance_id,parent_hash,payout_revision,payload,(extract(epoch FROM expires_at)*1000)::bigint AS expiry,expires_at>clock_timestamp() AS live,num_nulls(window_anchor_ms,window_prior_balances_sha256,window_first_share_seq,window_last_share_seq,window_share_count,window_snapshot_sha256,template_sha256)=7 AS child_shape FROM qbit_prism_jobs WHERE job_id=$1")
+                    .bind(&job.wire.job_id).fetch_one(&fixture.direct).await?;
+                let expiry: i64 = row.try_get("expiry")?;
+                let expected = json!({"prepared_key":job.context.prepared.storage_key,"worker":worker,
+                    "extranonce1":job.wire.extranonce1,"extranonce2_size":job.wire.extranonce2_size,
+                    "share_target_hex":job.wire.share_target.to_str_radix(16),"share_difficulty":job.wire.share_difficulty,
+                    "version_mask":0,"expires_at_ms":expiry});
+                // PostgreSQL expands exponent-form JSON numbers to decimal.
+                // Compare every field with exact JSONB equality, the same
+                // comparator as immutable retries, without rounding to f64.
+                let exact: bool = sqlx::query_scalar("SELECT payload=$2 FROM qbit_prism_jobs WHERE job_id=$1")
+                    .bind(&job.wire.job_id).bind(&expected).fetch_one(&fixture.direct).await?;
+                ensure!(exact && row.try_get::<bool,_>("child_shape")?
+                    && row.try_get::<bool,_>("live")?, "durable child identity or expiry differs: mode={mode}, expected={expected}, actual={}, shape={}, live={}",
+                    row.try_get::<Value,_>("payload")?, row.try_get::<bool,_>("child_shape")?, row.try_get::<bool,_>("live")?);
+                ensure!(row.try_get::<String,_>("instance_id")? == fixture.frontends[*index].config.instance_id
+                    && row.try_get::<String,_>("parent_hash")? == job.wire.previousblockhash
+                    && row.try_get::<i64,_>("payout_revision")? == job.context.prepared.snapshot.payout_revision);
+            }
+            for (index, key, original) in &originals {
+                let stored = fixture.frontends[*index].ledger.compact_prepared(key).await?.context("dangling prepared reference")?;
+                ensure!(stored.record == original.record && stored.template == original.template
+                    && stored.prior_balances == original.prior_balances
+                    && stored.original_expires_at_ms == original.original_expires_at_ms);
+            }
+            let (owned, waiters): (bool, i64) = sqlx::query_as("SELECT bool_or(l.pid=$1 AND l.granted),count(*) FILTER (WHERE NOT l.granted AND a.application_name=$4) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND l.classid=$2::bigint::oid AND l.objid=$3::bigint::oid AND l.objsubid=1")
+                .bind(stub_pid).bind(SETTLEMENT_LOCK >> 32).bind(SETTLEMENT_LOCK & 0xffff_ffff).bind(&fixture.schema).fetch_one(&fixture.direct).await?;
+            ensure!(owned && waiters == 0, "stub ownership or settlement independence lost");
+            Ok::<_, anyhow::Error>(start.elapsed().as_secs_f64())
+        }).await.context("persistence and exact durable rows did not precede stub release")?;
+        let elapsed = verified?;
+        tokio::time::sleep_until(release_at).await;
+        stub.rollback().await?;
+        println!(
+            "B275_LOCK {}",
+            json!({"schema":"b275.lock-isolation.v1","mode":mode,
+            "frontends":fixture.frontends.len(),"children_per_frontend":children,"stub_hold_target_seconds":3,
+            "return_and_durable_verification_seconds":elapsed,"release_observed_seconds":start.elapsed().as_secs_f64(),
+            "exact_rows_before_release":true,"stub_owned_at_verification":true,"settlement_waiter_observed":false,
+            "database_metric_deltas":metric_delta(before,fixture.metrics()?)?,"commit_seconds":null,
+            "lock_free_acceptance_met":true,"scope":"prebuilt issuance persistence; no full refresh latency claim"})
+        );
+    }
+    Ok(())
+}
+
+/// A transient issued-row rejection must remain visible after the listener retries.
+/// The constraint exists only in this regression's disposable schema, never in
+/// either measurement topology. Prepared publication and old-parent login work
+/// remain available so the failure occurs inside the delivery bracket.
+pub async fn retry_attribution(fixture: &Fixture, deadline: Instant) -> Result<()> {
+    let parent = "ef".repeat(32);
+    sqlx::query(&format!(
+        "ALTER TABLE qbit_prism_jobs ADD CONSTRAINT b275_reject_new_issued CHECK (parent_hash <> '{parent}' OR NOT (payload ? 'prepared_key')) NOT VALID"
+    )).execute(&fixture.direct).await?;
+    let release = async {
+        timeout(Duration::from_secs(10), async {
+            while fixture.listeners[0].stats.snapshot(0).job_delivery_failures == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("injected delivery failure was not observed")?;
+        sqlx::query("ALTER TABLE qbit_prism_jobs DROP CONSTRAINT b275_reject_new_issued")
+            .execute(&fixture.direct)
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (result, released) = tokio::join!(delivery(fixture, 8, deadline), release);
+    released?;
+    let error = result.expect_err("retried delivery was reported as failure-free");
+    let message = error.to_string();
+    ensure!(
+        message.contains("incomplete delivery measurement"),
+        "{error:#}"
+    );
+    ensure!(
+        message.contains("\"received\":8"),
+        "clients did not recover: {error:#}"
+    );
+    ensure!(
+        message.contains("\"delivery_failure_free\":false"),
+        "failure attribution lost: {error:#}"
+    );
+    Ok(())
+}
+
+pub async fn revision_fence(fixture: &Fixture) -> Result<()> {
+    let frontend = &fixture.frontends[0];
+    let worker = frontend.authorize("b275.fence").await?;
+    let job = frontend.build_job(&worker, "55667788", 1.0, 0.0).await?;
+    let original = job.context.prepared.snapshot.payout_revision;
+    let prepared_key = &job.context.prepared.storage_key;
+    let stored = frontend
+        .ledger
+        .compact_prepared(prepared_key)
+        .await?
+        .context("prepared dependency missing")?;
+    let expires_at_ms: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint+60000")
+            .fetch_one(&fixture.direct)
+            .await?;
+    let mut tx = fixture.direct.begin().await?;
+    // An authority writer as the server makes one: the row FOR UPDATE, then
+    // the UPDATE (a bare non-key UPDATE is forbidden, #479).
+    sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1 WHERE singleton")
+        .execute(&mut *tx)
+        .await?;
+    let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await?;
+    // Drive the actual compact-issued transaction under its own lock wait.
+    // The public coordinator deliberately erases the underlying error cause.
+    let payload = json!({"prepared_key":prepared_key,"expires_at_ms":expires_at_ms});
+    let stale_save = frontend.ledger.save_issued_job_compact(
+        "b275-stale",
+        &payload,
+        original,
+        &job.wire.previousblockhash,
+        expires_at_ms,
+        CompactDependency {
+            key: prepared_key,
+            original_revision: stored.record.payout_revision,
+            parent: &stored.record.parent_hash,
+            original_expires_at_ms: stored.original_expires_at_ms,
+            template_sha256: &stored.record.template_sha256,
+            prior_balances_digest: stored.record.window.prior_balances_digest,
+        },
+        None,
+    );
+    let bump = async {
+        fixture.cluster_waiter(blocker).await?;
+        tx.commit().await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (saved, bumped) = tokio::join!(stale_save, bump);
+    bumped?;
+    let error = saved.expect_err("stale revision persisted");
+    ensure!(
+        error
+            .to_string()
+            .contains("payout revision changed while observing chain state"),
+        "{error:#}"
+    );
+    ensure!(
+        frontend
+            .persist_issued_job(&worker, &job, 0, Duration::from_secs(60))
+            .await
+            .is_err(),
+        "stale runtime job persisted"
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM qbit_prism_jobs WHERE job_id=ANY($1)")
+            .bind(vec!["b275-stale", job.wire.job_id.as_str()])
+            .fetch_one(&fixture.direct)
+            .await?;
+    ensure!(count == 0, "stale job row exists");
+    Ok(())
+}

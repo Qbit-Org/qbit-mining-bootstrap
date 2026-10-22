@@ -1,0 +1,15 @@
+# Fallback Ubuntu mirrors for CI package installs (.github/scripts/apt-install.sh).
+#
+# The runner's own Ubuntu sources are tried first. If an install fails there,
+# the helper points apt at this list instead, and apt tries these mirrors in
+# priority order (without a priority, apt picks mirrors at random). Metadata
+# must be separated from the URI by a tab. Azure's cloud mirror, the kernel.org mirror and Princeton's mirror
+# run on infrastructure separate from Canonical's archive, which comes last.
+#
+# Every mirror here must carry the release, -updates, -backports and
+# -security suites for amd64. apt checks everything against the Ubuntu
+# archive signing key, so a mirror cannot change what gets installed.
+http://azure.archive.ubuntu.com/ubuntu/	priority:1
+https://mirrors.edge.kernel.org/ubuntu/	priority:2
+https://mirror.math.princeton.edu/pub/ubuntu/	priority:3
+http://archive.ubuntu.com/ubuntu/	priority:4

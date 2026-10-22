@@ -1,0 +1,245 @@
+# Integration test gate
+
+Every Rust test whose execution depends on an environment input takes that
+input through one gate, the `qbit-prism-test-gate` crate in
+`crates/qbit-prism-test-gate`. The gate applies one decision table, records
+what it decided in an execution manifest, and prints a skip line with a fixed
+prefix when it lets a test return early. This page is the contract: the
+switch, the manifest, the expected list, and how to add a gated test. Issue
+#286 introduced it after 59 native tests were found to report `passed`
+without running.
+
+## Inputs
+
+| variable | what it carries | tests that need it |
+| --- | --- | --- |
+| `PRISM_TEST_DATABASE_URL` | a disposable PostgreSQL the test may write to (each test creates and drops its own schema; `api_2x`, `ledger_postgres`, `audit_body_normalization`, `ledger_deadline_atomicity`, `candidate_window_migration`, `ledger_single_execution`, `readiness_rpc`, `window_read_oracle` and `window_reference` create and drop a whole database per fixture instead, because PostgreSQL scopes advisory locks to a database, so their role needs `CREATEDB` and the URL must name a non-template database such as `postgres`) | ledger, API, rollups, readiness, authorization, migration, JSONB ceiling, window oracle, candidate lease, the D2 payout rules, the explicit `#[ignore]` runs, and the live suite |
+| `PRISM_TEST_PG_BIN_DIR` | a directory holding `initdb`, `pg_ctl` and `pg_basebackup` | the physical failover and public read replica tests, which run their own clusters |
+| `QBITD_BIN` | a `qbitd` executable | the live regtest suite (`live_regtest`, with its high-difficulty, CTV/CPFP, weighted-recipient and two-node modules) |
+
+An empty or whitespace-only value counts as unset. A value that is not valid
+Unicode is an error, never "absent": treating it as unset would let a
+deliberately configured run skip a test without a word.
+
+## The decision table
+
+| input set and non-empty | switch | result |
+| --- | --- | --- |
+| yes | any | run |
+| no | `PRISM_TEST_REQUIRE_INTEGRATION=1` | fail, naming the missing variable and the test |
+| no | `GITHUB_JOB=prism-native-postgres` | fail, same |
+| no | neither | print one skip line and return |
+
+`PRISM_TEST_REQUIRE_INTEGRATION` accepts `1` (require), `0` or unset (do not
+require); any other value is an error, so a typo cannot pass silently. The
+switch is consulted before the job id, so a run that sets both is reported as
+demanded by the switch.
+
+`GITHUB_JOB` is set by GitHub to the running job's id. Matching it means a
+database outage in the `prism-native-postgres` job surfaces as a failure even
+if the job's own environment were edited. Keying on `CI` would be wrong:
+GitHub sets `CI=true` in every job, including `rust-tests`, which runs the
+whole workspace with no database.
+
+Explicit `#[ignore]` runs are always required. The native job selects ten
+`#[ignore]` gated tests in three targets with `--ignored`: the 10,000-connection
+admission test in `stratum_admission_postgres` (by `--exact` name), both tests
+in `observability_database`, and all seven issued/prepared job dependency
+contracts in `issued_job_dependency` (with `--test-threads=2`). They use the
+gate's `required_*` entry points, which never skip: a missing input fails them
+whatever the switch says, since a vacuous pass is exactly what selecting them
+explicitly tried to avoid. All ten are in the expected list. Measurement runs,
+such as the full-size ratchet and baseline sweep in `jsonb_ceiling_gate`, stay
+`#[ignore]` and opt-in; CI never selects them, so they are not listed. The
+130-recipient nightly case of `live_regtest`'s weighted-recipient module is
+opt-in the same way until a nightly job selects it.
+
+The nightly `live-nightly` job in `prism-load-nightly.yml` runs the
+`live_regtest` `#[ignore]` variants listed in
+[test/prism-nightly-gated-tests.txt](../test/prism-nightly-gated-tests.txt)
+with `--ignored --exact`, and proves each executed with the same checker. Two
+of them need host tools besides the gate's inputs, found on `PATH` and failing
+the test when absent: the disk-exhaustion variant (#575) mounts a small ext4
+image without root, so it needs `fuse2fs`, `mkfs.ext4`, `fusermount3` and
+`/dev/fuse`; the clock-jump variant runs the servers and its own PostgreSQL
+under libfaketime, found next to the `faketime` wrapper (the `faketime` and
+`libfaketime` packages). Its private clusters use `PRISM_TEST_PG_BIN_DIR`.
+
+The table is a pure function, `qbit_prism_test_gate::decide`, over injected
+values, with unit tests for every row in the crate itself.
+
+## The skip line
+
+A skipped test prints exactly one line on the process's real standard error,
+past libtest's capture, so it is visible with or without `--nocapture`:
+
+```text
+[prism-test-gate] skipped <package>::<binary>::<test path>: PRISM_TEST_DATABASE_URL is unset or empty; set PRISM_TEST_DATABASE_URL to run it, or PRISM_TEST_REQUIRE_INTEGRATION=1 to fail instead
+```
+
+The prefix `[prism-test-gate] skipped` is fixed. `scripts/check_gate_manifest.py`
+fails the native job if it appears in the job's log, and also if any of the
+per-file skip messages the gate replaced reappears (`skipping ... set
+PRISM_TEST_DATABASE_URL`, `PRISM_TEST_DATABASE_URL not set`, `set
+PRISM_TEST_DATABASE_URL for ...`, `SKIPPED: jsonb_ceiling_gate`).
+
+## Test identity
+
+A gated test is identified as `<package>::<binary>::<test path>`:
+
+- `<package>` is the Cargo package, for example `qbit-prism-server`;
+- `<binary>` is the test binary, the file stem of an integration test
+  (`ledger_postgres`) or the crate name for `#[cfg(test)]` modules in the
+  library (`qbit_prism_server`);
+- `<test path>` is the test's module path and name inside that binary, as
+  `cargo test` prints it (`two_x::legacy_2x_upgrade_repairs_partial_carry_seed_and_preserves_shared_state`).
+
+The first two come from the `gate::site!()` macro at the call site. The third
+is the name libtest gives the thread it runs each test on, which is why the
+gate must be called from the test's own thread: at the top of the test body,
+or from a fixture helper the test body calls before spawning anything. A
+call from an unnamed or runtime worker thread is an error that names the
+thread.
+
+## The manifest
+
+When `PRISM_TEST_GATE_MANIFEST=<path>` is set, every decision appends one
+line to that file:
+
+```text
+executed qbit-prism-server::ledger_postgres::candidate_renewal_requires_a_live_pending_token
+skipped  qbit-prism-server::live_regtest::real_two_server_mining_failover_audit_and_reorg
+failed   qbit-prism-server::postgres_failover::acknowledged_shares_survive_synchronous_primary_loss_and_pool_reconnect
+```
+
+Each line is one `O_APPEND` write, so parallel test threads and the several
+test binaries of one `cargo test` run share the file safely. A test that
+asks the gate more than once (a fixture opened in a loop) writes more than
+one line; the checker counts it once. An unwritable manifest fails the test.
+
+## The expected list and the proof
+
+[test/prism-gated-tests.txt](../test/prism-gated-tests.txt) lists every gated
+test the `prism-native-postgres` job must execute, one id per line, sorted.
+The number of test ids in that file is the minimum count; see the file for
+the current list and the `check-gate-manifest` success line from
+[scripts/check_gate_manifest.py](../scripts/check_gate_manifest.py) for the
+count verified in a green run.
+
+The job has four shards, each with its own PostgreSQL service and qbitd.
+[scripts/run_rust_test_shard.py](../scripts/run_rust_test_shard.py) discovers
+all workspace targets from Cargo metadata and assigns them longest first,
+each to the shard with the least estimated time so far. The estimates are
+measured durations for the few heavy targets and 20 seconds for the rest; each
+shard's job summary lists its per-command durations for the next re-measure.
+Each test binary stays intact, preserving its fixtures and process-wide locks.
+New workspace targets join automatically.
+The three explicit `--ignored` targets run only on the shards owning them.
+Use `--shard-index 0 --shard-count 4 --dry-run` to inspect a shard's commands.
+
+Each shard's PostgreSQL service keeps its data directory on a tmpfs, so a
+busy disk on the shared runner host cannot stall its commits; `fsync`,
+`full_page_writes` and `synchronous_commit` stay on. The disposable clusters
+some tests start from `PRISM_TEST_PG_BIN_DIR` stay on disk. The service logs
+every statement that runs over a second and every lock wait over a second, and
+the runner prints that log when the job ends. The job sets
+`PRISM_DATABASE_STATEMENT_TIMEOUT_MS=60000` for the ledgers the tests open in
+process: production keeps its 15 s default, but these 2 vCPU runners take 1 to
+4 s for the heaviest statements and, in a slow spell, more than 15 s. The
+servers and operator tools the tests spawn drop inherited `PRISM_` settings and
+keep the production default. `authorization_rpc` re-runs its own test binary in
+a cleared environment and forwards the setting to it. Tests of timeout
+behaviour set their own values.
+
+Each shard uploads its manifest and test log as `prism-gate-shard-<index>`.
+The `prism-integration-proof` job requires every shard to succeed, downloads
+and combines their manifests and logs, then runs
+
+```sh
+python3 scripts/check_gate_manifest.py \
+  --manifest prism-gate-manifest.txt \
+  --expected test/prism-gated-tests.txt \
+  --log prism-native-tests.log
+```
+
+which fails when any expected test has no `executed` line, any `skipped` or
+`failed` line appears, fewer distinct tests executed than the list holds, a
+test executed that is not in the list, or the log shows a skip line. It
+prints the manifest to the log and to the job summary, and the job uploads
+the combined manifest as the `prism-gate-manifest` artifact. Every shard sets
+`PRISM_TEST_REQUIRE_INTEGRATION=1`, so an input that goes missing fails the
+tests themselves before the checker runs.
+
+`rust-tests` runs the same workspace with no inputs, where every gated test
+prints its skip line and passes; nothing there asserts execution, which is
+why both the native matrix and its combined proof are in the required
+`checks` list; `rust-tests` is not the proof.
+
+## Running locally
+
+The public-reader credential tests require PostgreSQL to reject missing or
+incorrect passwords for their temporary reader roles. A supplied
+`PRISM_TEST_DATABASE_URL` must point to a disposable cluster that enforces
+password authentication for those roles; an unrestricted TCP `trust` rule
+invalidates these tests. The runner configures this for clusters it creates,
+while allowing its bootstrap role to connect without a password for setup.
+
+`test/prism-native-tests.sh` provisions a private PostgreSQL cluster (or uses
+`PRISM_TEST_DATABASE_URL`), resolves `PRISM_TEST_PG_BIN_DIR` and `QBITD_BIN`,
+and exports the switch once every input a mode needs is present, so a local
+run is as non-vacuous as CI:
+
+| invocation | what runs | required mode |
+| --- | --- | --- |
+| `make test-prism-postgres` (`test/prism-native-tests.sh`) | the whole workspace, the three explicit `--ignored` targets, then the manifest check | when `qbitd` and the PostgreSQL server tools are found; otherwise the manifest is printed and the run says which input is missing |
+| `make test-prism-regtest` (`... live`) | `live_regtest` | always (the mode refuses to start without `qbitd`) |
+| `make test-prism-public-read-replica` (`... replica`) | `postgres_failover` | always |
+| `test/prism-native-tests.sh cargo-args <args>` | the `cargo test` you name | always |
+
+Without the script, a bare `cargo test --workspace --all-targets` prints one
+skip line per gated test and passes. Set `PRISM_TEST_REQUIRE_INTEGRATION=1`
+to turn those skips into failures, for example to prove that a test really
+depends on its input.
+
+## Adding a gated test
+
+1. Take the input through the gate at the top of the test body, or in the
+   fixture helper the body calls first:
+
+   ```rust
+   use qbit_prism_test_gate as gate;
+
+   #[tokio::test]
+   async fn my_ledger_contract() -> anyhow::Result<()> {
+       let Some(url) = gate::database_url(gate::site!())? else {
+           return Ok(());
+       };
+       // ...
+   }
+   ```
+
+   `gate::pg_bin_dir`, `gate::qbitd_and_database_url` and the general
+   `gate::inputs(site, &[Input::...])` cover the other inputs;
+   `gate::required_database_url` is for explicitly selected `#[ignore]` tests.
+   Tests that return `()` call `.expect("integration gate")` instead of `?`.
+2. Never read the variables directly. `scripts/check_gate_env_reads.py`, run
+   in the lint job, fails on any Rust source line outside the gate crate that
+   holds one of the variable names as a string literal.
+3. Add the test's id to `test/prism-gated-tests.txt`, keeping the file
+   sorted. The id is what the gate writes; the easiest way to get it is to
+   run the test with `PRISM_TEST_GATE_MANIFEST` set and copy the line. A
+   gated test that runs without being listed fails the native job, so the
+   list cannot silently drift.
+4. If the test lives under `crates/qbit-prism`, nothing else changes: the
+   native job runs the whole workspace, and the crate already has the gate
+   as a dev-dependency.
+5. Renaming or removing a gated test means changing the list too.
+
+## Related
+
+- [prism-deleted-test-map.md](prism-deleted-test-map.md): every 2.x.x test
+  file absent on 3.x.x, with its native replacement or the issue that closes
+  the gap.
+- `crates/qbit-prism-test-gate/src/lib.rs`: the gate, its decision table and
+  its unit tests; `crates/qbit-prism-test-gate/tests/process.rs` drives the
+  runtime path through a child process.
