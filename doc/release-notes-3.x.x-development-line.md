@@ -1,13 +1,15 @@
 # qbit-mining-bootstrap 3.x.x development line
 
-Release date: none. This is a development line, not a release.
+Release date: none. This is a development line, not a release. Its first
+release is [3.0.0](release-notes-3.0.0.md), cut on the `3.0.x` branch.
 
 ## Status
 
-The `3.x.x` branch is not production-ready. The production line is `2.x.x`;
-its tip is version 2.0.2 (see `release-notes-2.0.2.md`, whose release date is still pending). Nothing on this
-branch has been through a production release, and no production deployment
-should run it or point a production database at it.
+3.0.0 is the production release of this line, from the `3.0.x` branch, which
+starts at `4c134913`. Deploy 3.0.0 from its tag, not from `3.x.x`: `3.x.x`
+continues as 3.1 (3.1.0-rc.1 onwards), which 3.0.0 doesn't include. The
+previous production line is `2.x.x`, whose tip is version 2.0.2 (see
+`release-notes-2.0.2.md`); the upgrade from it is in the 3.0.0 notes.
 
 This line exists so that three engineers can work in parallel on the native
 Rust PRISM server without sharing one open pull request. Work is split into
@@ -117,8 +119,7 @@ they fixed or configured no longer exists on this line:
 
 ## Not done yet
 
-- There is no production release of the Rust server. The Postgres-backed and
-  live-regtest Rust suites need a PostgreSQL server and a `qbitd` binary; see
+- The Postgres-backed and live-regtest Rust suites need a PostgreSQL server and a `qbitd` binary; see
   `test/prism-native-tests.sh`. They are not part of this note's verification.
 - The tree reads 3.0.0 ([its notes](release-notes-3.0.0.md); the release
   candidates' are [3.0.0-rc.1](release-notes-3.0.0-rc.1.md),
@@ -132,19 +133,19 @@ they fixed or configured no longer exists on this line:
 
 ## Upgrade and rollback
 
-No production cutover is supported yet. Do not point a production database at this line. The Rust
-migrator refuses to start against a live legacy Python writer lease and
-against an undrained legacy block outbox, but that is a guard against
-accidental cutover, not release approval.
+The supported production cutover is to 3.0.0, as its
+[notes](release-notes-3.0.0.md#upgrading) and `docs/prism-rust-migration.md`
+describe. The Rust migrator refuses to start against a live legacy Python
+writer lease and against an undrained legacy block outbox, as a guard against
+an accidental cutover.
 
 Decision D5 in #260 declares one-way native migration with forward repair and
 isolated-restore reconciliation, without down-migrations. #287 supplies the
 numbered procedures and exact queries in `docs/prism-rust-migration.md` and
 `docs/prism-ledger-ops.md`, and enforces audit import through production
-`self-check`. #291 must rehearse the procedure on production-sized history,
-record restore/import timings, and include the following identical data-loss
-boundary already recorded in the [unreleased 3.0.0 notes](release-notes-3.0.0.md)
-when preparing the actual release:
+`self-check`. #291 records the rehearsal on production-sized history and its
+restore and import timings. The [3.0.0 notes](release-notes-3.0.0.md) record
+the same data-loss boundary:
 
 > Before the first native share is acknowledged, restore the complete
 > pre-migration database and artifact backup and restart the pinned old image

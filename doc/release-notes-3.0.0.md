@@ -131,6 +131,13 @@ adds no migration ([Upgrading](#upgrading)).
   - **Operator rule:** keep qbitd's `-rpcservertimeout`, and the idle
     timeout of any proxy between a PRISM process and its node, above 20 s.
     qbitd's default, 30 s, is.
+- TLS dependencies, for the RustSec advisories `cargo deny` reports against
+  rc.6's lockfile: rustls 0.23.45 to 0.23.46 (RUSTSEC-2026-0346, -0347,
+  -0348 and -0349), rustls-webpki 0.103.15 to 0.103.16 (RUSTSEC-2026-0382)
+  and webpki-roots 1.0.9 to 1.0.10 (RUSTSEC-2026-0381), in the root and fuzz
+  lockfiles. They are patch releases within the versions rc.6 already
+  resolved, with no other dependency change. The serving binary's
+  PostgreSQL (sqlx) and HTTPS (reqwest) clients use them.
 
 ## Upgrading
 
@@ -176,8 +183,9 @@ adds no migration ([Upgrading](#upgrading)).
 
 ## Verification
 
-The runtime changes between rc.6 and 3.0.0 are in `import-audits`
-and in how long the node clients keep an idle connection:
+The runtime changes between rc.6 and 3.0.0 are in `import-audits`, in how
+long the node clients keep an idle connection, and in the TLS crates' patch
+releases above:
 - #770, merged as `4c134913`: `import-audits` only, in
   `ledger/migration.rs` (`Ledger::import_legacy_audits_with` and its per-row
   transaction) and `tools.rs` (the command, its two settings, its stop
