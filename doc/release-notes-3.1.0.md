@@ -11,7 +11,7 @@ Against [3.0.0](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/do
 which was cut from the `3.0.x` branch, 3.1.0 adds the 3.1 dual
 writer and three schema migrations, 027, 028 and 031:
 - **The dual writer is off by default.** With `PRISM_DUAL_WRITER` unset, a
-  frontend behaves as 3.0's does. Turned on, it lets two nodes each write
+  frontend serves as 3.0's does, once the migrations below are applied. Turned on, it lets two nodes each write
   their own PostgreSQL and serve miners at once.
 - **Every start requires migrations 027, 028 and 031,** whether or not the
   dual writer is turned on. 031 builds its index online, so `migrate` can run
@@ -107,7 +107,9 @@ No other dependency changes.
   [3.0.0-rc.6 notes](release-notes-3.0.0-rc.6.md#upgrading), with 3.1.0 in
   rc.6's place: its `migrate` applies 027, 028 and 031 with the rest, and the
   cutover's `migrate --offline-indexes` builds 031 offline too. Check
-  #760's node rule (the rc.1 notes' step 4) as well.
+  #760's node rule (the rc.1 notes' step 4) as well. An
+  `import-audits` beside serving frontends needs no #765 guard with 3.1.0
+  (the rc.1 notes' step 5).
 
 Rolling back from 3.1.0 is as the rc.1 notes'
 [Rolling back](release-notes-3.1.0-rc.1.md#rolling-back) describes, with
@@ -125,10 +127,12 @@ Since rc.1, only lockfiles and the version have changed, so the rc.1 notes'
 release:
 - `cargo deny --locked check` passes; on 3.1.0-rc.1's tree with #777 it
   fails on RUSTSEC-2026-0386;
-- CI runs on the version-bump pull request, and is dispatched on the tag;
+- CI runs on the version-bump pull request, including the required
+  `prism-dual-writer` lane, and is dispatched on the tag;
 - the L3 production-window matrix runs on the version-bump pull request,
   which the tag promotes on a tree match (#608);
-- the evidence bundle on the `v3.1.0` GitHub release lists every run.
+- otherwise the evidence set is rc.1's (#557), and the evidence bundle on
+  the `v3.1.0` GitHub release lists every run.
 
 ## Known issues
 

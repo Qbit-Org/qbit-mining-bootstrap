@@ -2258,7 +2258,7 @@ D5 declares a **one-way migration with forward repair and isolated-restore
 reconciliation**. There are no down-migrations for native 002–010, including
 006/007/008, or permission to remove migration guards. The legacy publication
 ordinal revert refuses native schemas and points here. The following boundary
-matches the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md):
+matches the [3.0.0 release notes](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/doc/release-notes-3.0.0.md#migration-and-recovery-d5):
 
 > Before the first native share is acknowledged, restore the complete
 > pre-migration database and artifact backup and restart the pinned old image

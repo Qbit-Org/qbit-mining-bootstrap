@@ -1,7 +1,7 @@
 # qbit-mining-bootstrap 3.x.x development line
 
-Release date: none. This is a development line, not a release. Its
-releases are [3.0.0](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/doc/release-notes-3.0.0.md),
+Release date: none. This note describes the `3.x.x` line as a whole, not
+one release. Its releases are [3.0.0](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/doc/release-notes-3.0.0.md),
 cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md), cut on this
 branch.
 
