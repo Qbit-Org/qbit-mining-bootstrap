@@ -91,15 +91,15 @@ qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
    reconstructed body. Require the exact SHA and matching ETag, as below.
 
 Nothing on the serving path reads a legacy row's canonical bytes. So
-frontends can admit traffic before `import-audits` finishes. From 3.1.0-rc.1
-an import beside them holds `SETTLEMENT_LOCK` only to check the write guard and
-commit each row, except toward a lock holder that needs the very row being
+frontends can admit traffic before `import-audits` finishes. From 3.0.0 and
+3.1.0-rc.1, and so in 3.1.0, an import beside them holds `SETTLEMENT_LOCK`
+only to check the write guard and commit each row, except toward a lock holder that needs the very row being
 imported, which waits for that row's UPDATE
 ([ledger operations](prism-ledger-ops.md)). It sends and stores the row first, within
 `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`; `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS`
 bounds its wait for the lock and its hold. SIGTERM stops it (#765). Through
 3.0.0-rc.6 it held the lock while it sent and stored each body, which stalls
-settlement and template refresh for as long, so run an earlier candidate's
+settlement and template refresh for as long, so run an earlier build's
 import beside serving frontends only under a guard that kills it with
 SIGKILL once a settlement waiter has waited a few seconds: as a container's
 PID 1 it ignores SIGTERM. Until `import-audits` finishes,
@@ -501,10 +501,10 @@ only reschedules reconciliation for a reserved or offered row; it never
 grants another offer. Follow [the offer lifecycle recovery guidance](prism-ledger-ops.md)
 for those rows and retain their evidence.
 
-**A database an earlier 3.x.x build migrated before 006.** `3.x.x` is a
-development line with no supported production upgrade, but a database an
-earlier `3.x.x` build brought to native schema 3, 4 or 5 can still hold a
-pending v2 row: that build's drain check used the v1-only predicate, which
+**A database an earlier 3.x.x build migrated before 006.** The `3.x.x`
+development builds before the 3.0.0 candidates had no supported production
+upgrade, but a database such a build brought to native schema 3, 4 or 5
+can still hold a pending v2 row: that build's drain check used the v1-only predicate, which
 never counted a row whose `candidate` is NULL. `migrate` therefore runs the
 same column-aware drain check on a native schema 3, 4 or 5 before 004, 005
 and 006, and refuses before any DDL when such a row is pending, naming the
