@@ -76,9 +76,13 @@ fn log_lines_since(
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<String> {
     let at = |line: &str| {
-        let plain: String = line
-            .split('\u{1b}')
-            .map(|part| part.split_once('m').map_or(part, |(_, rest)| rest))
+        // Only what follows an escape is a colour code's remainder: a line
+        // logged without colour keeps its leading time.
+        let mut parts = line.split('\u{1b}');
+        let plain: String = parts
+            .next()
+            .into_iter()
+            .chain(parts.map(|part| part.split_once('m').map_or(part, |(_, rest)| rest)))
             .collect();
         plain
             .split_whitespace()

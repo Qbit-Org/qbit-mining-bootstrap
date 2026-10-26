@@ -560,6 +560,12 @@ pub async fn run(
     let seeded = Instant::now();
     seed(&pool, &plan).await?;
     let seed_ms = seeded.elapsed().as_millis() as u64;
+    // The seed's writes are flushed before anything is measured: a
+    // checkpoint still syncing them stalls every commit, the migrate's and
+    // the appender's, on fsync, which is the host's disk, not the migrate.
+    let admin = node.admin_pool(DATABASE).await?;
+    sqlx::query("CHECKPOINT").execute(&admin).await?;
+    admin.close().await;
     let (p0_heap_bytes, p0_rows): (i64, i64) = sqlx::query_as(
         "SELECT pg_relation_size('qbit_share_ledger_p0'), \
                 (SELECT count(*) FROM qbit_share_ledger_p0)",
