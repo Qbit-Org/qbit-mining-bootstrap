@@ -116,16 +116,18 @@ unchanged.
 The coordinator database clock and chain-observation state each record one
 checkout. The latter retains its one-statement revision/epoch/tip snapshot.
 Each block-only duplicate probe and each credit/disposition poll records its
-own checkout, inside the
-original acknowledgement deadline. The two block-only probes are not issued-job
-reads. Credit and disposition still share one SQL statement and MVCC snapshot.
-Connections are released at the statement boundary, before enqueue or poll
-sleep. Missing rows, duplicates and terminal dispositions retain successful
-checkout observations; SQL errors or cancellation after acquisition do too.
-Cancellation while acquiring records a failure. Before enqueue a read failure
-is definite; after enqueue a failed or missing read does not prove whether the
-durable candidate earned credit. Timing changes neither that distinction nor
-the enqueue's existing handling of an unknown outcome.
+own checkout. Each runs in a task the acknowledgement does not own (#574), so
+neither the acknowledgement deadline nor a cancelled submission cancels its
+checkout or SQL: a checkout still waiting then records its own outcome when it
+ends, and a poll that answers after the deadline is discarded. The two
+block-only probes are not issued-job reads. Credit and disposition still share
+one SQL statement and MVCC snapshot. Connections are released at the statement
+boundary, before enqueue or poll sleep. Missing rows, duplicates and terminal
+dispositions retain successful checkout observations; SQL errors do too.
+Before enqueue a read failure is definite; after enqueue a failed or missing
+read does not prove whether the durable candidate earned credit. Timing changes
+neither that distinction nor the enqueue's existing handling of an unknown
+outcome.
 
 The server passes its existing metrics handle to the rollup loop. Each valid
 rollup attempt records one checkout before `BEGIN`; `SET LOCAL`, the single
