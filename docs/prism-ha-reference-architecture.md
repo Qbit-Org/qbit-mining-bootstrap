@@ -558,9 +558,15 @@ needed for these probes:
   `status` and `snapshot_age_seconds`.
 - Local equivalent: `qbit-prism-server healthcheck` exits 0 only for success.
   `--url http://.../healthz` selects a remote HTTP target; its internal HTTP timeout
-  is 3 seconds. Do not pass `--public-api` for mining routing.
+  is 3 seconds. Do not pass `--public-api` for mining routing. A 3.1
+  dual-writer frontend's healthcheck is liveness instead, which also passes
+  while the frontend catches up on its own log or rides out a dip inside its
+  admission grace: route a dual-writer pair on its readiness endpoint, never on
+  this ([the container healthcheck](prism-dual-writer-readiness.md#the-container-healthcheck-dual-mode)).
 - When the audit listener is disabled (`PRISM_AUDIT_PORT=0`), the subcommand uses
-  Stratum instead: send `{"id":1,"method":"mining.get_health","params":[]}\n` to
+  Stratum instead (a single writer only; in dual-writer mode it fails, since
+  gated listeners refuse connections while the frontend does not admit miners):
+  send `{"id":1,"method":"mining.get_health","params":[]}\n` to
   that frontend's enabled listener, without subscribe/authorize. Require one
   newline-terminated JSON frame at most 4096 bytes, matching `id=1`, null `error`
   and `result.ready=true`, within 3 seconds. HTTP is preferred for the shipped
@@ -613,6 +619,16 @@ Qualification: generate new tips and payout-revision changes under load, record
 readiness transitions and routing decisions, confirm ordinary rebuilds stay
 within budget, then hold work unavailable and confirm ejection by the stated
 bound and re-entry after two successes. This is the #186 carry-over to #291.
+
+### PRISM 3.1: readiness endpoint and admission grace
+
+PRISM 3.1 adds a readiness-only, token-protected endpoint for balancers that
+check each frontend on an address they can reach from outside, and a grace
+that keeps an ordinary rebuild from withdrawing a frontend; in dual-writer
+mode the Stratum listeners refuse connections while it does not admit miners
+(before its first admission, after a withdrawal, or when its decision is
+stale). See
+[dual-writer readiness](prism-dual-writer-readiness.md).
 
 ## Self-check live instances
 

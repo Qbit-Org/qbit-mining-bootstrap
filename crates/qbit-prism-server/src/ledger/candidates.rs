@@ -385,10 +385,15 @@ pub fn build_claim_parts(
         _ => bail!("candidate bootstrap share disagrees with its window reference"),
     };
     let witnesses = crate::codec::witness_merkle_leaves_from_block(&candidate.block_bytes)?;
+    // The cut the coinbase committed: the reference's for a dual-writer
+    // window, none for a single writer's or the bootstrap window's, whose one
+    // share is synthetic (`coordinator/bundle_build.rs` builds the same).
+    let window_cut = candidate.window.shares.and(candidate.window.cut);
     let body = if let Some(ctv) = &candidate.ctv {
-        qbit_prism::build_audit_bundle_body_with_ctv_settlement_options(
+        qbit_prism::build_audit_bundle_body_with_ctv_settlement_options_parallel(
             &shares,
             candidate.found_block.clone(),
+            window_cut,
             prior_balances,
             candidate.payout_policy.clone(),
             ctv.direct_floor_sats,
@@ -398,17 +403,20 @@ pub fn build_claim_parts(
             witnesses,
             manifest_key,
             ledger_key,
+            qbit_prism::Parallelism::serial(),
         )?
     } else {
-        qbit_prism::build_audit_bundle_body_with_coinbase_options(
+        qbit_prism::build_audit_bundle_body_with_coinbase_options_parallel(
             &shares,
             candidate.found_block.clone(),
+            window_cut,
             prior_balances,
             candidate.payout_policy.clone(),
             Some(candidate.coinbase_suffix_hex.clone()),
             witnesses,
             manifest_key,
             ledger_key,
+            qbit_prism::Parallelism::serial(),
         )?
     };
     Ok(ClaimParts {
@@ -1182,12 +1190,30 @@ impl Ledger {
     /// that screen, as every leased candidate is (#350).
     ///
     /// One transaction, fenced on the live token and on a reservation that
-    /// recorded no call. Nothing else ever returns a reservation: a crash or
-    /// a lost claim between that answer and this commit leaves
+    /// recorded no call. Nothing else returns a reservation but
+    /// [`Ledger::release_unmade_offer`], whose call was never made: a crash
+    /// or a lost claim between that answer and this commit leaves
     /// `offer_reserved`, which recovery treats as delivery unknown and never
     /// offers again, because nothing durable proves that the call was not
     /// made.
     pub async fn release_unsent_offer(&self, claim: &CandidateClaim, reason: &str) -> Result<()> {
+        self.release_unsent(claim, reason, true).await
+    }
+
+    /// 3.1 dual writer: [`Ledger::release_unsent_offer`] for an offer this
+    /// frontend did not make, because the carry gate moved after its
+    /// reservation. The row is due again at once, not after a backoff:
+    /// nothing transient held it back, and a found block cannot wait.
+    pub async fn release_unmade_offer(&self, claim: &CandidateClaim, reason: &str) -> Result<()> {
+        self.release_unsent(claim, reason, false).await
+    }
+
+    async fn release_unsent(
+        &self,
+        claim: &CandidateClaim,
+        reason: &str,
+        backoff: bool,
+    ) -> Result<()> {
         ensure!(
             reason.starts_with(OFFER_NOT_SENT_REASON_PREFIX),
             "an unsent offer's reason must start with {OFFER_NOT_SENT_REASON_PREFIX:?}"
@@ -1195,8 +1221,8 @@ impl Ledger {
         let mut tx = self.begin().await?;
         writable(&mut tx).await?;
         lock_candidate_row(&mut tx, claim).await?;
-        let released = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='pending',offer_reserved_at=NULL,offer_reserved_by=NULL,last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,next_attempt_at=clock_timestamp()+LEAST(60,attempt_count)*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL")
-            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).execute(&mut *tx).await?.rows_affected();
+        let released = sqlx::query("UPDATE qbit_block_candidate_outbox SET state='pending',offer_reserved_at=NULL,offer_reserved_by=NULL,last_error=$3,claim_token=NULL,claim_instance_id=NULL,claim_expires_at=NULL,claim_lease_seconds=NULL,claim_renewals=0,next_attempt_at=clock_timestamp()+CASE WHEN $4 THEN LEAST(60,attempt_count) ELSE 0 END*interval '1 second',updated_at=clock_timestamp() WHERE block_hash=$1 AND claim_token=$2 AND state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL")
+            .bind(&claim.candidate.block_hash).bind(&claim.claim_token).bind(reason).bind(backoff).execute(&mut *tx).await?.rows_affected();
         ensure!(
             released == 1,
             "candidate claim was lost or expired before the unsent offer was returned to pending; the reservation stays and recovers as delivery unknown"

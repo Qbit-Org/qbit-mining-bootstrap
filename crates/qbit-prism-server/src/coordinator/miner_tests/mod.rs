@@ -55,6 +55,11 @@ pub(crate) struct MemoryLedger {
     pub compact: work_store::CompactStore,
     pub clock_offset_ms: AtomicI64,
     pub snapshot: StdMutex<Option<Snapshot>>,
+    /// The dual-writer peer sync's mark the refresh probe and snapshots
+    /// report (3.1); `None`, as for a single writer, unless a test sets it.
+    pub peer_mark: StdMutex<Option<i64>>,
+    /// Whether the snapshots report a peer row pending a later anchor (3.1).
+    pub peer_pending: StdMutex<bool>,
     /// Full originals belong to the fixture, never to runtime Prepared views.
     originals: StdMutex<HashMap<String, Arc<StoredPrepared>>>,
     pub snapshots: StdMutex<Vec<Snapshot>>,
@@ -547,6 +552,10 @@ impl Fixture {
             offer_sections: Default::default(),
             landing_trim: Default::default(),
             submission_hold: Default::default(),
+            peer_sync: Default::default(),
+            peer_ingest: None,
+            finder_liveness: Default::default(),
+            dual_writer: None,
         });
         let fixture = Self {
             coordinator,
@@ -624,6 +633,7 @@ impl Fixture {
             payout_revision: revision,
             shares: vec![share.clone()],
             prior_balances: vec![],
+            cut: None,
         });
         let bundle = Arc::new(
             qbit_prism::build_audit_bundle_with_coinbase_options(
@@ -786,6 +796,7 @@ impl Fixture {
                     payout_revision: prepared.snapshot.payout_revision,
                     shares: vec![],
                     prior_balances: (*prepared.reservation.balances).clone(),
+                    cut: None,
                 }
             });
         snapshot.prior_balances = (*prepared.reservation.balances).clone();

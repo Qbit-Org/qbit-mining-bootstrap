@@ -431,6 +431,7 @@ fn direct_coordinator_config(fixture: &Fixture) -> Result<qbit_prism_server::con
         version_mask: qbit_prism_server::codec::VERSION_ROLLING_MASK,
         audit_bind: "127.0.0.1".into(),
         audit_port: free_port()?,
+        dual_writer: None,
     })
 }
 

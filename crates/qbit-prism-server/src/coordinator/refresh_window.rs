@@ -19,6 +19,34 @@ pub(in crate::coordinator) fn refresh_parallelism() -> qbit_prism::Parallelism {
     *DETECTED.get_or_init(qbit_prism::Parallelism::detect)
 }
 
+/// At most one alert a minute, for a refusal every refresh repeats until an
+/// operator acts: a dual-writer ledger without migration 031's index
+/// refuses each snapshot, on every tick and wake.
+#[derive(Default)]
+pub(super) struct AlertEveryMinute {
+    last: Option<Instant>,
+}
+
+impl AlertEveryMinute {
+    const INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Whether to alert at `now`; when it is, the minute starts again.
+    pub(super) fn due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= Self::INTERVAL);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+
+    /// The cause cleared, so its next occurrence alerts at once.
+    pub(super) fn clear(&mut self) {
+        self.last = None;
+    }
+}
+
 pub(super) type CachedWindow = Arc<RefreshWindow>;
 type CapturedWindow = CompactOwner<(
     CachedWindow,
@@ -36,6 +64,12 @@ pub(super) struct RefreshWindow {
     leaf: Option<crate::ledger::LeafWitness>,
     /// The writer timeline the window's rows were read on (#619).
     pub timeline: crate::ledger::WriterTimeline,
+    /// The dual-writer peer mark the window's cut was taken at; `None` for a
+    /// single writer.
+    peer_mark: Option<i64>,
+    /// Whether an accepted peer row at or below that mark waits for a later
+    /// anchor (a peer clock running ahead); `false` for a single writer.
+    peer_pending: bool,
     anchored: Instant,
 }
 
@@ -45,6 +79,7 @@ impl RefreshWindow {
             network: self.network,
             anchor_ms: self.snapshot.anchor_ms,
             cutoff: self.snapshot.share_seq,
+            cut: self.snapshot.cut,
             shares: self.snapshot.shares,
             leaf: self.leaf,
         }
@@ -54,21 +89,35 @@ impl RefreshWindow {
         self.anchored.elapsed() < interval
     }
 
+    /// The dual-writer peer mark this window's cut was taken at; `None` for
+    /// a single writer.
+    pub(super) fn peer_mark(&self) -> Option<i64> {
+        self.peer_mark
+    }
+
     /// Whether a new template may reuse this window. A window read on
     /// another writer timeline never is: a promotion can lose its rows and
     /// hand their numbers to other shares, so an equal cutoff proves nothing
-    /// (#619).
+    /// (#619). Nor is a dual-writer window once the peer sync's mark has
+    /// moved: the peer's newer rows can all lie below this node's cutoff, so
+    /// an equal cutoff does not prove that nothing arrived (CONTRACT D-13).
+    /// Nor is one with a peer row pending: stamped after its anchor by a peer
+    /// clock running ahead, the row joins a later anchor's window with no new
+    /// row and no move of the mark.
     pub fn reusable(
         &self,
         network: u128,
         share_seq: u64,
         state: crate::ledger::PayoutState,
         timeline: crate::ledger::WriterTimeline,
+        peer_mark: Option<i64>,
         interval: Duration,
     ) -> bool {
         self.network == network
             && self.timeline == timeline
             && self.snapshot.share_seq == share_seq
+            && self.peer_mark == peer_mark
+            && !self.peer_pending
             && self.snapshot.payout_revision == state.payout_revision
             && self.reference.prior_balances_digest == state.prior_balances_digest
             && self.within_reanchor_interval(interval)
@@ -145,6 +194,8 @@ impl Coordinator {
                     leaf,
                     acquisition,
                     timeline,
+                    peer_mark,
+                    peer_pending,
                 } = Arc::try_unwrap(capture)
                     .ok()
                     .expect("both borrowed computations have finished");
@@ -156,6 +207,8 @@ impl Coordinator {
                     network,
                     leaf,
                     timeline,
+                    peer_mark,
+                    peer_pending,
                     anchored,
                 });
                 // Keep the original cache behavior even when body preparation failed.
@@ -163,5 +216,80 @@ impl Coordinator {
                 Ok(CompactOwner::new((window, body, admission)))
             })
             .await?
+    }
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_refusal_alerts_once_a_minute_and_again_once_cleared() {
+        let start = Instant::now();
+        let mut alert = AlertEveryMinute::default();
+        assert!(alert.due(start));
+        assert!(!alert.due(start + Duration::from_secs(1)));
+        assert!(!alert.due(start + Duration::from_millis(59_999)));
+        assert!(alert.due(start + Duration::from_secs(60)));
+        assert!(!alert.due(start + Duration::from_secs(61)));
+        alert.clear();
+        assert!(alert.due(start + Duration::from_secs(62)));
+    }
+}
+
+#[cfg(test)]
+mod peer_mark_tests {
+    use super::*;
+
+    fn window(peer_mark: Option<i64>) -> RefreshWindow {
+        pending_window(peer_mark, false)
+    }
+
+    fn pending_window(peer_mark: Option<i64>, peer_pending: bool) -> RefreshWindow {
+        let snapshot = Snapshot {
+            anchor_ms: 10,
+            share_seq: 40,
+            payout_revision: 3,
+            shares: Vec::new(),
+            prior_balances: Vec::new(),
+            cut: peer_mark.map(|_| qbit_prism::WindowCut::new(Some(40), Some(21)).unwrap()),
+        };
+        RefreshWindow {
+            reference: WindowRef::from_snapshot(&snapshot).unwrap(),
+            snapshot,
+            acquisition: crate::ledger::AcquisitionReport::full(
+                crate::metrics::WindowAcquisition::NoPrior,
+            ),
+            network: 7,
+            leaf: None,
+            timeline: crate::ledger::WriterTimeline::new(1),
+            peer_mark,
+            peer_pending,
+            anchored: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_window_is_not_reused_once_the_peer_mark_moves() {
+        let interval = Duration::from_secs(60);
+        let state = |window: &RefreshWindow| crate::ledger::PayoutState {
+            payout_revision: window.snapshot.payout_revision,
+            prior_balances_digest: window.reference.prior_balances_digest,
+        };
+        let timeline = crate::ledger::WriterTimeline::new(1);
+        // A single writer's window carries no mark, and its reuse is 3.0's.
+        let single = window(None);
+        assert!(single.reusable(7, 40, state(&single), timeline, None, interval));
+        assert!(!single.reusable(7, 41, state(&single), timeline, None, interval));
+        // A dual-writer window is reused only at the mark it was taken at:
+        // the peer's newer rows can all lie under the unchanged cutoff.
+        let dual = window(Some(21));
+        assert!(dual.reusable(7, 40, state(&dual), timeline, Some(21), interval));
+        assert!(!dual.reusable(7, 40, state(&dual), timeline, Some(23), interval));
+        assert!(!dual.reusable(7, 40, state(&dual), timeline, None, interval));
+        // Nor while a peer row below the mark waits for a later anchor: it
+        // joins the next window with nothing else changed.
+        let pending = pending_window(Some(21), true);
+        assert!(!pending.reusable(7, 40, state(&pending), timeline, Some(21), interval));
     }
 }

@@ -63,6 +63,21 @@ macro_rules! labels {
 }
 
 labels!(AckResult { Accepted => "accepted", Rejected => "rejected" });
+// 3.1 admission and dual-writer readiness (D4).
+labels!(AdmissionStateLabel {
+    Starting => "starting", Admitting => "admitting", Grace => "grace", Withdrawn => "withdrawn"
+});
+labels!(WithdrawalReason {
+    OwnLogBehind => "own-log-behind", WriterNotLocal => "writer-not-local", NotReady => "not-ready"
+});
+labels!(StratumListenerName { Default => "default", Highdiff => "highdiff" });
+labels!(WriterPathLabel {
+    Local => "local", Remote => "remote", Unidentified => "unidentified",
+    ReadOnly => "read_only", Unanswered => "unanswered"
+});
+labels!(ReadinessAnswer {
+    Ready => "ready", NotReady => "not_ready", Unauthorized => "unauthorized", NotFound => "not_found"
+});
 labels!(Outcome { Success => "success", Failure => "failure" });
 labels!(RevisionWorkResult {
     Published => "published", Degraded => "degraded", Superseded => "superseded"
@@ -125,6 +140,20 @@ labels!(JobDeferral {
     NewTipPending => "new_tip_pending", WorkRetired => "work_retired",
     FeeFloor => "fee_floor", Other => "other"
 });
+// PRISM 3.1 dual writer: the carry owner guard's state, paying or the reason
+// its work is carry-free (`carry_owner::CarryFreeReason`).
+labels!(CarryOwnerState {
+    Paying => "paying", NotOwner => "not_owner", NodeUnidentified => "node_unidentified",
+    NoJournalRow => "no_journal_row", ConfigMismatch => "config_mismatch",
+    SettingPending => "setting_pending",
+    OwnJournalBehindPeer => "own_journal_behind_peer",
+    OwnJournalRolledBack => "own_journal_rolled_back", ClaimNotVetted => "claim_not_vetted",
+    PeerClaimsOwnership => "peer_claims_ownership", PeerJournalBehind => "peer_journal_behind",
+    PeerNotSeeded => "peer_not_seeded",
+    PeerUnconfirmed => "peer_unconfirmed", LayoutMismatch => "layout_mismatch"
+});
+// Whether the carry owner guard's live read of the peer's journal answered.
+labels!(PeerCheckResult { Answered => "answered", Failed => "failed" });
 // #478: what the offer did with a pending block on the current tip whose
 // payout revision was superseded.
 labels!(CaptureDecision {
@@ -145,14 +174,39 @@ labels!(BlockAckPath { Share => "share", BlockOnly => "block_only" });
 // settlement (first_confirmation when that transaction confirmed the block
 // for the first time, settlement otherwise, including an abandon), the reorg
 // reconciler, the orphan disposition, the refresh's window snapshot that
-// prepared work is built from, blob cleanup, fatal-state recovery, and the
+// prepared work is built from, blob cleanup, fatal-state recovery, the
 // operator commands (policy and signing transitions, archive verify and
-// restore). The schema cutover's hold is not observed.
+// restore), and the 3.1 dual writer's identity upkeep (a node's
+// personalisation, and the peer sync raising the share sequence above the
+// peer's rows). The schema cutover's hold is not observed.
 labels!(OrderLockHolder {
     Append => "append", CandidateInsert => "candidate_insert",
     FirstConfirmation => "first_confirmation", Settlement => "settlement",
     Reconcile => "reconcile", Orphan => "orphan", Prepared => "prepared",
-    Cleanup => "cleanup", FatalState => "fatal_state", Operator => "operator"
+    Cleanup => "cleanup", FatalState => "fatal_state", Operator => "operator",
+    PeerSync => "peer_sync"
+});
+// 3.1 dual writer (D1): the peer sync's streams, the path a pass took to the
+// peer's database, why it refused the peer, and the tables it copies.
+labels!(PeerSyncStream {
+    Shares => "shares", Blocks => "blocks", Prepared => "prepared", Roles => "roles"
+});
+labels!(PeerSyncPath { Primary => "primary", Fallback => "fallback" });
+labels!(PeerIngestOutcome {
+    Confirmed => "confirmed", TimedOut => "timed_out", Unreachable => "unreachable"
+});
+labels!(PeerSyncRefusal {
+    LocalIdentity => "local_identity", PeerIdentity => "peer_identity",
+    Fingerprint => "fingerprint", Schema => "schema"
+});
+labels!(PeerSyncTable {
+    ShareLedger => "qbit_share_ledger", ShareHashes => "qbit_prism_share_hashes",
+    PoolBlocks => "qbit_pool_blocks", AuditSnapshots => "qbit_prism_audit_snapshots",
+    AuditBundles => "qbit_pool_audit_bundles", PayoutEntries => "qbit_pool_payout_entries",
+    CarryForward => "qbit_payout_carry_forward", FanoutSets => "qbit_ctv_fanout_sets",
+    FanoutArtifacts => "qbit_ctv_fanout_artifacts", Templates => "qbit_prism_templates",
+    BalanceSnapshots => "qbit_prism_balance_snapshots", Jobs => "qbit_prism_jobs",
+    NodeRoles => "qbit_prism_node_roles"
 });
 // #602: the share acknowledgement p99 bound, in seconds, a landing window is
 // judged against: 2 s tickets after three windows in a row, 10 s warns.

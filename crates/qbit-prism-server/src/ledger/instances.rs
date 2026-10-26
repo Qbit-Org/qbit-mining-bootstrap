@@ -129,6 +129,81 @@ impl Ledger {
             .bind(&self.instance_id).bind(status).execute(&mut *self.acquire().await?).await?;
         Ok(())
     }
+
+    /// A dual-writer frontend's stopped marker (3.1), written as
+    /// [`Self::heartbeat`] writes [`HeartbeatStatus::Stopped`], but only over
+    /// this incarnation's own row, or where there is none. A replacement with
+    /// this instance id may register while this one shuts down (its listener
+    /// already released): an unconditional marker would overwrite the
+    /// replacement's row, which its guarded heartbeats would then leave
+    /// standing until they may take it over, the running replacement reading
+    /// as stopped meanwhile. Returns whether it wrote the marker.
+    pub async fn stopped_unless_replaced(&self) -> Result<bool> {
+        self.session_owner.stop()?;
+        let mut status = serde_json::to_value(HeartbeatStatus::Stopped)?;
+        status
+            .as_object_mut()
+            .expect("typed heartbeat is an object")
+            .insert(
+                "session_owner_token".into(),
+                self.session_owner.token.clone().into(),
+            );
+        let written = sqlx::query(
+            "INSERT INTO qbit_prism_instances(instance_id,status) VALUES($1,$2) \
+             ON CONFLICT(instance_id) DO UPDATE SET heartbeat_at=clock_timestamp(),status=EXCLUDED.status \
+             WHERE (qbit_prism_instances.status->>'session_owner_token') = \
+             (EXCLUDED.status->>'session_owner_token')",
+        )
+        .bind(&self.instance_id)
+        .bind(status)
+        .execute(&mut *self.acquire().await?)
+        .await?
+        .rows_affected();
+        Ok(written == 1)
+    }
+
+    /// A dual-writer frontend's health heartbeat (3.1). It runs off the
+    /// health publisher's path, so at shutdown it can be abandoned with its
+    /// statement already sent, and the database may apply it after the
+    /// stopped marker, or after a replacement with this instance id has
+    /// registered. So it updates this incarnation's own row (its
+    /// `session_owner_token`, which the starting heartbeat installed at
+    /// connect) unless that row is stopped, and a row another incarnation
+    /// wrote only once that row has gone `take_over_after` without a
+    /// heartbeat. A live incarnation heartbeats far more often (the caller
+    /// passes half the freshness budget), so a late heartbeat never replaces a
+    /// live replacement's row, while a live frontend whose row a duplicate
+    /// overwrote (one instance id, two processes) takes it back before any
+    /// reader finds it stale. It never inserts a row. Returns whether it
+    /// wrote one.
+    pub async fn health_heartbeat_unless_stopped(
+        &self,
+        health: HeartbeatHealth,
+        take_over_after: std::time::Duration,
+    ) -> Result<bool> {
+        let mut status = serde_json::to_value(HeartbeatStatus::Health(health))?;
+        status
+            .as_object_mut()
+            .expect("typed heartbeat is an object")
+            .insert(
+                "session_owner_token".into(),
+                self.session_owner.token.clone().into(),
+            );
+        let written = sqlx::query(
+            "UPDATE qbit_prism_instances SET heartbeat_at=clock_timestamp(),status=$2 \
+             WHERE instance_id=$1 AND CASE \
+             WHEN (status->>'session_owner_token') = ($2->>'session_owner_token') \
+             THEN (status->>'state') IS DISTINCT FROM 'stopped' \
+             ELSE heartbeat_at < clock_timestamp() - make_interval(secs => $3) END",
+        )
+        .bind(&self.instance_id)
+        .bind(status)
+        .bind(take_over_after.as_secs_f64())
+        .execute(&mut *self.acquire().await?)
+        .await?
+        .rows_affected();
+        Ok(written == 1)
+    }
 }
 
 // Sample with the configured database's clock. The reader supplies the same
@@ -554,6 +629,122 @@ mod live_instance_tests {
             );
             assert_eq!(report.stale_instances.unwrap().len(), 1);
         }
+        // 3.1: a dual-writer frontend's health heartbeat, applied however
+        // late, updates this incarnation's own row unless it is stopped, never
+        // a row another incarnation refreshed within `take_over_after`, and it
+        // never inserts one; a row another incarnation left that long without
+        // a heartbeat is taken over.
+        let take_over_after = std::time::Duration::from_secs(60);
+        let guarded = Ledger::offline_for_tests(pool.clone(), "guarded-writer".into());
+        let read = async || -> Result<Option<Value>> {
+            Ok(sqlx::query_scalar(
+                "SELECT status FROM qbit_prism_instances WHERE instance_id='guarded-writer'",
+            )
+            .fetch_optional(&pool)
+            .await?)
+        };
+        let health = || HeartbeatHealth::new(true, Map::new());
+        let beat = async |ledger: &Ledger| -> Result<bool> {
+            ledger
+                .health_heartbeat_unless_stopped(health(), take_over_after)
+                .await
+        };
+        let owner = async || -> Result<(Value, Value)> {
+            let stored = read().await?.expect("the row exists");
+            Ok((
+                stored["state"].clone(),
+                stored["session_owner_token"].clone(),
+            ))
+        };
+        assert!(!beat(&guarded).await?);
+        assert_eq!(read().await?, None, "a heartbeat inserted a row");
+        // Connect's starting heartbeat installs the row and its token.
+        guarded.heartbeat(HeartbeatStatus::Starting).await?;
+        assert!(beat(&guarded).await?);
+        assert!(beat(&guarded).await?);
+        let stored = read().await?.unwrap();
+        assert_eq!(stored["schema"], "qbit.prism.audit-health.v1", "{stored}");
+        assert_eq!(stored["session_owner_token"], guarded.session_owner.token);
+        guarded.heartbeat(HeartbeatStatus::Stopped).await?;
+        assert!(
+            !beat(&guarded).await?,
+            "a late heartbeat replaced its own stopped marker"
+        );
+        assert_eq!(
+            owner().await?,
+            (json!("stopped"), json!(guarded.session_owner.token))
+        );
+        // A replacement with this instance id: its rows, starting, live or
+        // stopped, are not the old incarnation's to overwrite while fresh.
+        let replacement = Ledger::offline_for_tests(pool.clone(), "guarded-writer".into());
+        replacement.heartbeat(HeartbeatStatus::Starting).await?;
+        assert!(!beat(&guarded).await?);
+        assert_eq!(
+            owner().await?,
+            (json!("starting"), json!(replacement.session_owner.token))
+        );
+        assert!(beat(&replacement).await?);
+        assert!(!beat(&guarded).await?);
+        let stored = read().await?.unwrap();
+        assert_eq!(
+            (&stored["schema"], &stored["session_owner_token"]),
+            (
+                &json!("qbit.prism.audit-health.v1"),
+                &json!(replacement.session_owner.token)
+            ),
+            "{stored}"
+        );
+        replacement.heartbeat(HeartbeatStatus::Stopped).await?;
+        assert!(!beat(&guarded).await?);
+        assert_eq!(
+            owner().await?,
+            (json!("stopped"), json!(replacement.session_owner.token))
+        );
+        // Once another incarnation's row has gone take_over_after without a
+        // heartbeat, a live incarnation takes it over: a duplicate that wrote
+        // over a serving frontend's row does not silence it for good.
+        let serving = Ledger::offline_for_tests(pool.clone(), "guarded-writer".into());
+        let age = async |seconds: i32| -> Result<()> {
+            sqlx::query(
+                "UPDATE qbit_prism_instances SET heartbeat_at=clock_timestamp()-make_interval(secs => $1) \
+                 WHERE instance_id='guarded-writer'",
+            )
+            .bind(f64::from(seconds))
+            .execute(&pool)
+            .await?;
+            Ok(())
+        };
+        age(59).await?;
+        assert!(!beat(&serving).await?, "taken over before take_over_after");
+        age(61).await?;
+        assert!(beat(&serving).await?);
+        let stored = read().await?.unwrap();
+        assert_eq!(
+            (&stored["schema"], &stored["session_owner_token"]),
+            (
+                &json!("qbit.prism.audit-health.v1"),
+                &json!(serving.session_owner.token)
+            ),
+            "{stored}"
+        );
+        // A dual-writer stopped marker goes only over this incarnation's own
+        // row: a replacement that registered while it shut down keeps its row,
+        // and its heartbeats keep writing. Over its own row, or none, it is
+        // written.
+        let leaving = Ledger::offline_for_tests(pool.clone(), "guarded-writer".into());
+        assert!(!leaving.stopped_unless_replaced().await?);
+        assert_eq!(
+            read().await?.unwrap()["session_owner_token"],
+            serving.session_owner.token
+        );
+        assert!(beat(&serving).await?);
+        assert!(serving.stopped_unless_replaced().await?);
+        assert_eq!(
+            owner().await?,
+            (json!("stopped"), json!(serving.session_owner.token))
+        );
+        let unregistered = Ledger::offline_for_tests(pool.clone(), "unregistered-writer".into());
+        assert!(unregistered.stopped_unless_replaced().await?);
         let mut connection = pool.acquire().await?;
         sqlx::query("DROP TABLE qbit_prism_instances")
             .execute(&mut *connection)

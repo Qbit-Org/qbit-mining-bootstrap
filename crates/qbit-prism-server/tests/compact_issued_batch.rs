@@ -143,6 +143,7 @@ async fn seed(db: &Database) -> Result<Original> {
             anchor_ms: 1_700_000_000_000,
             prior_balances_digest: qbit_prism::prior_balances_digest(&[]),
             shares: None,
+            cut: None,
         },
         share_seq: 0,
         payout_revision: 0,

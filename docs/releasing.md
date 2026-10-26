@@ -1,7 +1,7 @@
 # Publishing a release
 
 `main` is the release promotion branch. `3.x.x` is the development branch for
-the 3.x series, now carrying 3.1; `2.x.x` is the maintenance branch of the
+the 3.x series, which released 3.1.0; `2.x.x` is the maintenance branch of the
 2.x series. A release cut from an earlier point of a development branch gets
 its own branch at that cutoff, as `3.0.x` does for 3.0.0. A version is
 published only when its tag and GitHub release exist. A version bump or
@@ -35,6 +35,14 @@ tag. The 3.0.0-rc.N pre-releases were tagged on `3.x.x`. 3.0.0-rc.7 was
 prepared (#772) but never tagged, and its changes ship in 3.0.0. The L3
 matrix for the release is recorded in #779.
 
+3.1.0 needed no release branch: `v3.1.0` was tagged and published on `3.x.x`
+itself, at the squash of its version bump and notes (#782, `59194d03`), as
+`v3.1.0-rc.1` was. The promotion into `main` gives `main` that tagged tree,
+plus this guide, a README banner that doesn't name a branch, the released
+3.0.0 notes in place of `3.x.x`'s pre-release copy, and the
+disposition-poll fix that `main` took in #781 after 3.1.0's cutoff. It adds
+no tag. The 400k two-frontend L3 failures are tracked in #779, as for 3.0.0.
+
 Merge the intended development cutoff into the promotion branch and retain
 fixes already made during promotion review. The repository allows only squash
 and rebase merges, so the promotion lands on `main` as one squashed commit. Check package versions together,
@@ -45,7 +53,7 @@ set the actual release date in a reviewed commit before the final merge.
 ## Publish the reviewed main commit
 
 Tag the promoted `main` commit unless the release was already tagged on its
-release branch, as 3.0.0 was. After the promotion PR passes required checks
+release or development branch, as 3.0.0 and 3.1.0 were. After the promotion PR passes required checks
 and is merged, identify the exact resulting commit on `main`. A squash or rebase merge produces a different
 commit from the promotion branch head. Verify the resulting commit's checks,
 version metadata and dated release notes before tagging it.

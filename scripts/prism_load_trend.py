@@ -106,6 +106,8 @@ JOB_LANES = {
     "live-weekly": "L4",
     "stratum-fuzz": "fuzz",
     "shipped-images": "L6",
+    # The 3.1 dual-writer scenario matrix (crates/qbit-prism-dual-sim).
+    "dual-writer-nightly": "L4",
 }
 PROMOTE_ALWAYS = ("L3", "L5", "weekly")
 BOT_NAME = "github-actions[bot]"

@@ -134,13 +134,15 @@ async fn refuse_reserved_names(connection: &mut PgConnection, version: i32) -> R
     Ok(())
 }
 
-/// Run one statement that needs a table lock, retrying on `lock_timeout`
-/// within the budget. The session's `lock_timeout` is set for the
-/// statement and reset afterwards.
-async fn with_lock_retries(
+/// Run one statement that needs a lock on `table`, retrying on
+/// `lock_timeout` within the budget. The session's `lock_timeout` is set
+/// for the statement and reset afterwards. 031's partitioned index build
+/// takes its catalog locks the same way (`online.rs`).
+pub(super) async fn with_lock_retries(
     connection: &mut PgConnection,
     version: i32,
     what: &str,
+    table: &str,
     statement: &str,
 ) -> Result<()> {
     sqlx::query("SELECT set_config('lock_timeout',$1,false)")
@@ -154,7 +156,7 @@ async fn with_lock_retries(
             Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
                 if started.elapsed() >= LOCK_RETRY_BUDGET {
                     break Err(anyhow::anyhow!(
-                        "migration {version}: {what} could not take its lock on qbit_share_ledger within {} s; a transaction has held the table throughout (a long read, an open writer). Let it finish, or stop the frontends, and migrate again",
+                        "migration {version}: {what} could not take its lock on {table} within {} s; a transaction has held the table throughout (a long read, an open writer). Let it finish, or stop the frontends, and migrate again",
                         LOCK_RETRY_BUDGET.as_secs()
                     ));
                 }
@@ -205,6 +207,7 @@ pub(super) async fn apply(
                     connection,
                     version,
                     "preparing the partition bound",
+                    "qbit_share_ledger",
                     "SELECT qbit_prism_share_ledger_convert_prepare()",
                 )
                 .await?;
@@ -218,6 +221,7 @@ pub(super) async fn apply(
                     connection,
                     version,
                     "checking the partition bound",
+                    "qbit_share_ledger",
                     "SELECT qbit_prism_share_ledger_convert_prepare()",
                 )
                 .await?;
@@ -248,6 +252,7 @@ pub(super) async fn apply(
                     connection,
                     version,
                     "checking the partition bound",
+                    "qbit_share_ledger",
                     "SELECT qbit_prism_share_ledger_convert_prepare()",
                 )
                 .await?;
@@ -264,6 +269,7 @@ pub(super) async fn apply(
                     connection,
                     version,
                     "swapping the share ledger",
+                    "qbit_share_ledger",
                     "SELECT qbit_prism_share_ledger_convert_swap()",
                 )
                 .await?;

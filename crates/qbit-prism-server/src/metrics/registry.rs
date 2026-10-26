@@ -1,5 +1,8 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
-use super::{Labels, LockKind, OrderLockHolder, Outcome, RefreshAcquisition, RefreshTrigger};
+use super::{
+    CarryOwnerState, Labels, LockKind, OrderLockHolder, Outcome, PeerCheckResult,
+    RefreshAcquisition, RefreshTrigger,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -105,6 +108,9 @@ families! {
     OfferStandbyWaits: Counter, "block_offer_standby_wait_total", "Found-block offers that waited for the failover standby's WAL flush first (#529, PRISM_OFFER_STANDBY_APPLICATION_NAME), by how the wait ended; every one was offered.";
     DivergentLandings: Counter, "divergent_landings_total", "Confirmations this instance committed whose landed rows started to count on canonical balances other than their as-issued prior balances.";
     DivergentOverpay: Counter, "divergent_landing_overpay_sats_total", "Carry-forward debt, in sats, created by the divergent confirmations this instance committed.";
+    CarryOwnerState: Gauge, "carry_owner_state", "Dual writer: one sample per carry owner guard state, 1 for the state this frontend builds work in and 0 for the others: paying, or why its work is carry-free; no samples in single-writer mode.";
+    CarryOwnerAlert: Gauge, "carry_owner_alert", "Dual writer: 1 while the carry owner guard needs an operator, a carry-free state other than not_owner or peer_unconfirmed, else 0; no sample in single-writer mode.";
+    CarryOwnerPeerChecks: Counter, "carry_owner_peer_checks_total", "Dual writer: live reads of the peer's node-role journal by this frontend's carry owner guard, by result; no samples in single-writer mode.";
     CarryForwardDebt: Gauge, "carry_forward_debt_sats", "Sum of negative carry-forward balances, in sats, read from the canonical balances at this instance's latest balance change or full refresh, or -1 before one.";
     NodePeers: Gauge, "node_peers", "Node peer connections from the latest node observation, or -1 when unknown.";
     NodeIbd: Gauge, "node_initial_block_download", "Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown.";
@@ -121,6 +127,26 @@ families! {
     LandingTrimResident: Gauge, "landing_malloc_trim_resident_bytes", "Process resident bytes right after this frontend's latest post-landing trim, its resident floor after the landing, or -1 before the first trim or when procfs could not be read.";
     RequestDeliveryWait: Histogram, "stratum_request_delivery_wait_seconds", "Complete Stratum request frame to the end of its session's own job delivery, for a request that waited for that delivery (#621): every JSON object frame but mining.submit and mining.get_health, that is mining.subscribe, mining.authorize, mining.configure, mining.suggest_difficulty, mining.extranonce.subscribe, any other method, or a missing or non-string method; the session reads nothing after it meanwhile, so a submit sent behind it waits as long. Submits and health probes are answered during a delivery and never wait.";
     DeliveryCancelled: Counter, "job_delivery_cancellations_total", "Local job deliveries abandoned before their announcement because their session ended: the miner disconnected or broke the protocol, or the listener shut down (#621); counted neither as successes nor as failures.";
+    PeerSyncReachable: Gauge, "peer_sync_peer_reachable", "3.1 dual writer: whether the peer sync's latest pass reached the peer's database on one of its paths (1) or on neither (0); reported, never a readiness input. No sample on a single writer.";
+    PeerSyncOwnLogCaughtUp: Gauge, "peer_sync_own_log_caught_up", "3.1 dual writer: the own-log latch, the peer sync's one readiness input: 1 once every row this node originated that the peer holds is in its own database, 0 before and after a detected local rollback. Losing the peer later never clears it. No sample on a single writer.";
+    PeerSyncRollbackEvidence: Gauge, "peer_sync_rollback_evidence", "3.1 dual writer: 1 while the own log is not caught up and this database's system identifier or WAL timeline differs from its last own-log verification, or it has none, so the node waits for the peer; 0 otherwise. No sample on a single writer.";
+    PeerSyncRefused: Gauge, "peer_sync_refused", "3.1 dual writer: 1 for the reason the peer sync's latest pass refused to sync, 0 for the others: this database is not personalised as this node or drifted, the peer's is not the other node, the peer runs another cluster fingerprint, or its copied tables carry other columns (`schema`, also when either database lacks a valid (origin_node, share_seq) index of migration 031). No sample on a single writer.";
+    PeerSyncPath: Gauge, "peer_sync_path", "3.1 dual writer: 1 for the path to the peer's database the peer sync uses now (PRISM_PEER_DATABASE_URL, or its _FALLBACK), 0 for the other. No sample on a single writer.";
+    PeerSyncLagRows: Gauge, "peer_sync_lag_rows", "3.1 dual writer: peer rows of each stream the latest pass saw on the peer and this node does not hold yet, in the stream's root rows (shares, landed blocks, prepared jobs, journal rows), counted up to a million. No sample on a single writer.";
+    PeerSyncLagSeconds: Gauge, "peer_sync_lag_seconds", "3.1 dual writer: seconds since each stream was last fully caught up with the peer, or since start before it first was. No sample on a single writer.";
+    PeerSyncRows: Counter, "peer_sync_rows_total", "3.1 dual writer: rows the peer sync inserted, by copied table, the peer's rows and this node's own rows pulled back after a restore alike.";
+    PeerSyncConflicts: Counter, "peer_sync_conflicts_total", "3.1 dual writer: rows the peer sync found under an identity this node holds with other content, or could not insert, by copied table; each is kept out, recorded in qbit_prism_peer_sync_conflicts and alerted.";
+    PeerSyncFailures: Counter, "peer_sync_failures_total", "3.1 dual writer: peer sync passes that failed, by the path they used; the next pass tries the other path.";
+    PeerSyncOfferWaits: Counter, "peer_sync_offer_waits_total", "3.1 dual writer (D-19): found-block offers that first waited, up to PRISM_PEER_INGEST_WAIT_MS, for the peer to hold this node's shares through the block's window and its prepared record, by how the wait ended (unreachable: neither path to the peer answered, or this node could not read the record); every one was offered.";
+    DualWriterOriginIndexMissing: Gauge, "dual_writer_origin_index_missing", "3.1 dual writer: 1 while this frontend refuses to take window snapshots because qbit_share_ledger has no valid (origin_node, share_seq) index (migration 031), so it publishes no new work; 0 once a snapshot found one. No sample on a single writer.";
+    AdmissionAdmitting: Gauge, "admission_admitting", "Whether this frontend admits miners (3.1): 1 while its readiness endpoint answers ready and, in dual-writer mode, its Stratum listeners accept connections; 0 before its first admission, after a withdrawal and in a stale snapshot; no sample unless dual-writer mode or the readiness endpoint is on.";
+    AdmissionState: Gauge, "admission_state", "This frontend's admission state (3.1), 1 on the current state's series and 0 on the others: starting (never admitted), admitting, grace (still admitting through a readiness dip shorter than PRISM_READINESS_GRACE_SECONDS) or withdrawn; the last decision, also in a stale snapshot, where qbit_prism_admission_admitting reads 0; no samples unless dual-writer mode or the readiness endpoint is on.";
+    AdmissionWithdrawals: Counter, "admission_withdrawals_total", "Times this frontend stopped admitting miners since process start (3.1), by what withdrew it: own-log-behind or writer-not-local without waiting for the grace, not-ready once readiness stayed false for the whole grace; no samples unless dual-writer mode or the readiness endpoint is on.";
+    StratumListenerAccepting: Gauge, "stratum_listener_accepting", "Dual-writer mode (3.1): whether a Stratum listener accepts connections (1) or refuses every connection (0) because the frontend does not admit miners, by listener; no samples in single-writer mode, whose listeners always accept.";
+    DualWriterWriterPath: Gauge, "dual_writer_writer_path", "Dual-writer mode (3.1): where this frontend's writes go as its database last answered, 1 on the current path's series and 0 on the others: local (this node's writable primary), remote (a database that identifies as the peer), unidentified (no node identity recorded), read_only (a standby, or read-only sessions) or unanswered (the probe failed or timed out); all 0 before the first probe. The frontend admits no miner unless it is local.";
+    DualWriterNodeIndex: Gauge, "dual_writer_node_index", "Dual-writer mode (3.1): this node's configured PRISM_NODE_INDEX, 0 for A and 1 for B.";
+    DualWriterCarryOwner: Gauge, "dual_writer_carry_owner", "Dual-writer mode (3.1): this node's PRISM_CARRY_OWNER as configured, 1 on the node configured to pay down carried balances.";
+    ReadinessRequests: Counter, "readiness_requests_total", "Requests to the readiness endpoint (PRISM_READINESS_PORT, 3.1) by answer: ready (200), not_ready (503), unauthorized (401, a missing, repeated or wrong token) or not_found (404, another path or method); no samples while the endpoint is off.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -261,6 +287,26 @@ impl Registry {
                             Sample::Pending,
                         );
                     }
+                }
+            }
+            Family::CarryOwnerState => {
+                for state in CarryOwnerState::ALL {
+                    self.samples.insert(
+                        (family, Labels::One(("state", state.as_str()))),
+                        Sample::Pending,
+                    );
+                }
+            }
+            Family::CarryOwnerAlert => {
+                self.samples
+                    .insert((family, Labels::Empty), Sample::Pending);
+            }
+            Family::CarryOwnerPeerChecks => {
+                for result in PeerCheckResult::ALL {
+                    self.samples.insert(
+                        (family, Labels::One(("result", result.as_str()))),
+                        Sample::Pending,
+                    );
                 }
             }
             Family::OrderLockHold => {

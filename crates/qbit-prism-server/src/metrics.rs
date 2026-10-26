@@ -1,4 +1,5 @@
 //! Bounded native telemetry. Event producers share one registry per instance.
+mod admission;
 pub mod collectors;
 mod events;
 mod labels;
@@ -222,13 +223,41 @@ impl Metrics {
         // Owner-dependent hooks are declared without inventing observations.
         // The rollup lag joins them: a disabled rollup publishes no pass, and an
         // absent sample is not the same claim as a lag of -1.
+        // 3.1 dual writer (D1): only a dual-writer frontend's peer sync
+        // publishes these, so a single writer declares them without samples;
+        // likewise its window snapshots' origin-index check (D2).
         for family in [
             Family::FirstOffer,
+            Family::CarryOwnerState,
+            Family::CarryOwnerAlert,
+            Family::CarryOwnerPeerChecks,
             Family::LockWait,
             Family::OrderLockHold,
             Family::RefreshSeconds,
             Family::RollupLag,
             Family::LandingTrimSeconds,
+            Family::PeerSyncReachable,
+            Family::PeerSyncOwnLogCaughtUp,
+            Family::PeerSyncRollbackEvidence,
+            Family::PeerSyncRefused,
+            Family::PeerSyncPath,
+            Family::PeerSyncLagRows,
+            Family::PeerSyncLagSeconds,
+            Family::PeerSyncRows,
+            Family::PeerSyncConflicts,
+            Family::PeerSyncFailures,
+            Family::PeerSyncOfferWaits,
+            Family::DualWriterOriginIndexMissing,
+            // 3.1: sampled only once dual-writer mode or the readiness
+            // endpoint exposes admission (`Metrics::enable_admission`).
+            Family::AdmissionAdmitting,
+            Family::AdmissionState,
+            Family::AdmissionWithdrawals,
+            Family::StratumListenerAccepting,
+            Family::DualWriterWriterPath,
+            Family::DualWriterNodeIndex,
+            Family::DualWriterCarryOwner,
+            Family::ReadinessRequests,
         ] {
             registry.declare(family);
         }

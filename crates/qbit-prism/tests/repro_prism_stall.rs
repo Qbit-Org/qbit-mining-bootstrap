@@ -59,6 +59,7 @@ fn reward_manifest() -> PrismRewardManifest {
         anchor_share_seq: 1,
         newest_share_seq: 1,
         oldest_share_seq: 1,
+        cut: None,
         included_share_count: entitlements.len(),
         share_slice_digest_hex: "00".repeat(32),
         shares: Vec::new(),

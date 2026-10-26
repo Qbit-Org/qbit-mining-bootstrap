@@ -91,13 +91,15 @@ qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
    reconstructed body. Require the exact SHA and matching ETag, as below.
 
 Nothing on the serving path reads a legacy row's canonical bytes. So
-frontends can admit traffic before `import-audits` finishes. From 3.0.0 an
-import beside them holds `SETTLEMENT_LOCK` only to check the write guard and
-commit each row. It sends and stores the row first, within
+frontends can admit traffic before `import-audits` finishes. From 3.0.0 and
+3.1.0-rc.1, and so in 3.1.0, an import beside them holds `SETTLEMENT_LOCK`
+only to check the write guard and commit each row, except toward a lock holder that needs the very row being
+imported, which waits for that row's UPDATE
+([ledger operations](prism-ledger-ops.md)). It sends and stores the row first, within
 `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`; `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS`
 bounds its wait for the lock and its hold. SIGTERM stops it (#765). Through
-rc.6 it held the lock while it sent and stored each body, which stalls
-settlement and template refresh for as long, so run an earlier candidate's
+3.0.0-rc.6 it held the lock while it sent and stored each body, which stalls
+settlement and template refresh for as long, so run an earlier build's
 import beside serving frontends only under a guard that kills it with
 SIGKILL once a settlement waiter has waited a few seconds: as a container's
 PID 1 it ignores SIGTERM. Until `import-audits` finishes,
@@ -145,7 +147,7 @@ hashrate rollups, and their watermark. Migration 6 pins the accepted `2.x.x`
 source schema, records what was migrated, and declares the schema capability
 every later start checks. The base schema and native migrations apply in one
 transaction, including carry-forward summary repair, except 002's share-hash
-backfill and migrations 013, 017 and 024. On a ledger with rows, 002 maps the
+backfill and migrations 013, 017, 024 and 031. On a ledger with rows, 002 maps the
 legacy shares' headers after the commit, in bounded batches, and records 2
 once every one is mapped
 ([below](#migration-002s-share-hash-backfill-applied-online)). With
@@ -499,11 +501,10 @@ only reschedules reconciliation for a reserved or offered row; it never
 grants another offer. Follow [the offer lifecycle recovery guidance](prism-ledger-ops.md)
 for those rows and retain their evidence.
 
-**A database an earlier 3.x.x build migrated before 006.** `3.x.x` is a
-development line with no supported production upgrade, but a database an
-earlier `3.x.x` build brought to native schema 3, 4 or 5 can still hold a
-pending v2 row: that build's drain check used the v1-only predicate, which
-never counted a row whose `candidate` is NULL. `migrate` therefore runs the
+**A database an earlier 3.x.x build migrated before 006.** A database
+that an early `3.x.x` development build, from before the 3.0.0 candidates,
+brought to native schema 3, 4 or 5 can still hold a pending v2 row: that
+build's drain check used the v1-only predicate, which never counted a row whose `candidate` is NULL. `migrate` therefore runs the
 same column-aware drain check on a native schema 3, 4 or 5 before 004, 005
 and 006, and refuses before any DDL when such a row is pending, naming the
 rows as above:
@@ -682,6 +683,32 @@ leave them, as in 001, whose own order for them is not fixed either.
 011. Like 025, it changes no stored row and is applied in the migration
 transaction, with no capability and no shutdown proof: an earlier binary
 accepts the unknown migration with a warning and reads the same report.
+Migration 027 adds what the 3.1 dual writer needs: `origin_node smallint
+NOT NULL DEFAULT 0` on every table the peer sync copies, the share ledger and
+its partitions included, a `sync_seq` pull order on `qbit_pool_blocks` and
+`qbit_prism_jobs`, the carry-owner journal (`qbit_prism_node_roles`), the
+node identity and lineage, and the peer sync's cursor and conflict tables.
+Every new column has a constant default or none, so no table is rewritten and
+no constraint is validated by a scan; each `ALTER` holds its table's lock only
+for the catalog change, until the migration commits. Its three indexes are
+small: two are partial, over rows written after 027 only, and the third is
+`qbit_prism_jobs (origin_node, expires_at)` for the dual-mode expiry prune,
+built in the transaction over a table the expiry prune keeps to its unexpired
+jobs. The
+share ledger's index by origin is 031's, built online. It is additive and
+applied in the migration transaction, with no capability and no shutdown
+proof: an earlier binary accepts the unknown migration with a warning, and
+its inserts take the defaults. See
+[dual-writer node identity](prism-ledger-ops.md#dual-writer-node-identity-027).
+Migration 028 adds a dual-writer window's per-node cut to the audit share
+snapshot: `cut_seq_0` and `cut_seq_1` on `qbit_prism_audit_snapshots`, both
+`NULL` (no cut, 3.0's meaning) or both set, with a `CHECK` validated against
+the existing rows, all `NULL`. Window references carry the cut inside the
+digest-checked documents that hold them, so no other table changes. It is
+additive and applied in the migration transaction, with no capability and no
+shutdown proof: an earlier binary never names the columns, and every row it
+writes has no cut. See
+[dual-writer window cuts](prism-ledger-ops.md#dual-writer-window-cuts-028).
 While a share-hash backfill that this release started is pending on a
 populated `2.x.x` source, the database declares
 `share_hash_backfill_pending = 1` (#669), raised to 2 once
@@ -902,7 +929,7 @@ holds:
 | `end_seq` | the ledger held no row at or above it when the transaction committed |
 | `started_at`, `updated_at` | when the cursor was created and last advanced |
 
-After the commit, and before 013, 017 and 024, `migrate` maps the legacy shares in
+After the commit, and before 013, 017, 024 and 031, `migrate` maps the legacy shares in
 batches of consecutive `share_seq`. Each batch is 002's statement restricted to
 its range: one statement, in a transaction that also advances the cursor. The
 first batch covers 10,000 `share_seq`; later ones double or halve toward half a
@@ -1035,7 +1062,7 @@ interrupted `migrate` loses only the batch in flight. That holds for a killed
 process, a lost connection, and a cancelled or timed-out statement. Run
 `migrate` again. The migration transaction finds 3 recorded without 2 and the
 cursor table present, so it applies nothing, and the backfill resumes at
-`next_seq`; 013, 017 and 024 follow. A record with 3 and not 2 but no cursor table
+`next_seq`; 013, 017, 024 and 031 follow. A record with 3 and not 2 but no cursor table
 is still refused as an edited record.
 
 Resuming only goes forward. The migration transaction has committed, so the
@@ -1127,9 +1154,9 @@ same migration at their start. Plain `migrate` behaves exactly as above.
      it uncalled. A sequence that does not lag is not written to, so its
      `last_value` and `is_called` stay exactly as the source had them. A
      promoted physical copy is ahead already.
-4. 013, 017 and 024 follow as usual, with the cursor present. With
+4. 013, 017, 024 and 031 follow as usual, with the cursor present. With
    `--offline-indexes` beside the flag, as a cutover's migrate step can run
-   them, 013 and 024 build offline
+   them, 013, 024 and 031 build offline
    ([migration 013](#migration-013-the-share-ledger-index-trim-applied-online)).
 5. `migrate` returns and says that 2 is deferred, naming `next_seq` and
    `end_seq`. The cursor has not moved, and 2 is not recorded.
@@ -1521,7 +1548,9 @@ inventory lists before scheduling #144.
 
 When nothing else runs against the database, as in the cutover's migrate step
 or on an isolated restore, `qbit-prism-server migrate --offline-indexes` builds
-013's indexes, and 024's, with a plain `CREATE INDEX` instead. It runs the same
+013's indexes, and 024's and 031's
+([below](#migration-031-the-share-ledgers-origin-index-applied-online)), with
+a plain `CREATE INDEX` instead. It runs the same
 plan in one transaction per migration. Before any DDL it takes the migration
 lock and then, waiting at most 5 s for any other lock, refuses any instance
 that has not reported `drained` or `stopped` and a live legacy writer lease,
@@ -1780,9 +1809,82 @@ duplicate `share_id` accepted across two leaves. Recovery is the
 [isolated-restore reconciliation](prism-ledger-ops.md#one-way-migration-and-isolated-restore-reconciliation)
 of #287, as for every other native migration.
 
+### Migration 031: the share ledger's origin index, applied online
+
+Migration 031 adds `qbit_share_ledger_origin_seq_idx` on
+`qbit_share_ledger (origin_node, share_seq)` for the 3.1 dual writer: the peer
+sync pulls the other node's shares in `share_seq` order, and a window cut
+reads this node's newest share, each through it. Without it either is a walk
+of the primary key until it meets a row of the node it wants, and on a node
+that has written nothing lately the cut walks the whole ledger under
+`ORDER_LOCK`. It is an index only, additive like 024: no capability and no
+shutdown proof, and a binary that does not know it never reads it. 028 is
+the window cuts, and 029 and 030 belong to the rest of the 3.1 dual writer;
+each version is checked on its own, so 031 needs none of them. The
+[index inventory](prism-ledger-ops.md#share-ledger-indexes) lists it with its
+readers.
+
+A fresh deployment or an empty 2.x.x source applies it inside the migration
+transaction. Everywhere else it is applied online, as 013 and 024 are, but
+PostgreSQL cannot build an index of a partitioned table `CONCURRENTLY`, and a
+plain build of one holds every partition for the whole build. So, after the
+migration transaction and on the online runner's connection, `migrate` (or a
+start with `PRISM_POSTGRES_INIT_SCHEMA=1`) builds it the way PostgreSQL
+documents for partitioned tables:
+
+1. one leaf per partition, oldest first, with `CREATE INDEX CONCURRENTLY`,
+   named `<partition>_origin_seq_idx` as every partition created afterwards
+   names its own. Appends and reads continue: each build waits for the
+   transactions already using its partition, as 013's builds wait;
+2. the index itself `ON ONLY` the parent, catalog work under a SHARE lock on
+   `qbit_share_ledger`, which waits for every open append;
+3. each leaf attached to it, catalog work under an ACCESS EXCLUSIVE lock on
+   that leaf index alone, which waits for every open read of its partition.
+
+The locks of steps 2 and 3 are taken with a 2 s lock timeout and retried for
+up to ten minutes, as 017's swap takes its own, so no append or read queues
+for longer behind a request that waits on a long transaction. PostgreSQL marks
+the index valid when the last partition's leaf is attached, and 31 is
+recorded then. A partition attached during step 1, by a frontend keeping its
+lead partitions, gets its leaf in the next pass; one attached after step 2
+gets its leaf from the index's definition as it is attached. A partition
+that left the ledger while the index waited for its leaf would leave the
+index invalid for good, so the runner holds the share archive's lifecycle
+lock for the whole build: a `share-archive` command already running finishes
+first, and none starts until 31 is recorded.
+
+Until 31 is recorded every start refuses the database, naming it. An
+interrupted build resumes from what it finds: a leaf already built with the
+declared definition is kept, attached or not, an invalid one an interrupted
+build left is dropped and built again, and the index itself is kept, valid or
+not. Before any DDL, the run refuses an index of another definition, or a
+relation of another kind, under a leaf's name, naming it; a partition still
+detaching after an interrupted `share-archive detach` (finish it with
+`share-archive detach <partition>`); and a leaf attached to the index but not
+valid. If every partition's leaf is attached and PostgreSQL still has not
+marked the index valid, because a partition left the ledger without its leaf
+outside `share-archive`, the run refuses to record 31 and says so: drop the
+index with `DROP INDEX qbit_share_ledger_origin_seq_idx`, which drops every
+leaf with it, and migrate again.
+
+`migrate --offline-indexes` builds the same leaves with a plain
+`CREATE INDEX` each, then the index `ON ONLY` the parent, and attaches them,
+in the one transaction that records 31, under the same refusals and locks as
+013's offline build ([above](#migration-013-the-share-ledger-index-trim-applied-online)).
+
+**Plan for the build on a large ledger.** Each leaf build reads its partition
+twice and sorts its rows' `(origin_node, share_seq)`, so the whole build
+takes about two scans of the ledger plus one sort of a 16-byte key per row,
+leaf by leaf; the index adds about 30 bytes per row. Run `migrate` from a
+shell where a long command is acceptable, rather than relying on a starting
+frontend, whose readiness stays down until the build completes.
+
 ## Bring up native instances
 
-Start one instance first and verify readiness before admitting controlled miners:
+Start one instance first and verify readiness before admitting controlled miners
+(for a 3.1 dual-writer frontend, `healthcheck` reports liveness and `self-check`
+still requires readiness; see
+[the container healthcheck](prism-dual-writer-readiness.md#the-container-healthcheck-dual-mode)):
 
 ```sh
 qbit-prism-server run
@@ -2155,7 +2257,7 @@ D5 declares a **one-way migration with forward repair and isolated-restore
 reconciliation**. There are no down-migrations for native 002–010, including
 006/007/008, or permission to remove migration guards. The legacy publication
 ordinal revert refuses native schemas and points here. The following boundary
-matches the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md):
+matches the [3.0.0 release notes](../doc/release-notes-3.0.0.md#migration-and-recovery-d5):
 
 > Before the first native share is acknowledged, restore the complete
 > pre-migration database and artifact backup and restart the pinned old image
@@ -2438,8 +2540,9 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`, `025` and `026`), 002's share-hash backfill, 013's and 024's
-concurrent index builds, and 017's prepare, validate and swap. The transaction holds the
+(`001` and native `002` to `023`, and `025` to `028`), 002's share-hash backfill, 013's, 024's
+and 031's concurrent index builds, 031's parent index and leaf attachments, and 017's prepare,
+validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
 whole length; the backfill's batches hold only ACCESS SHARE on it. The report
 also lists the statements `migrate` spent the most sampled time in.
