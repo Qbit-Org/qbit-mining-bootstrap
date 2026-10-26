@@ -2778,7 +2778,7 @@ Decision D5 in #260 chooses one-way native migration with forward repair. No
 down-migrations are provided for native 002–010, including 006/007/008. Never
 remove native guards to run a legacy writer. The publication-ordinal revert
 refuses native schemas and names this recovery path. The data-loss boundary,
-matching the [unreleased 3.0.0 release notes](../doc/release-notes-3.0.0.md), is:
+matching the [3.0.0 release notes](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/doc/release-notes-3.0.0.md#migration-and-recovery-d5), is:
 
 > Before the first native share is acknowledged, restore the complete
 > pre-migration database and artifact backup and restart the pinned old image
