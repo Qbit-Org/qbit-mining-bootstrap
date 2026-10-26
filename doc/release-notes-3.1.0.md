@@ -11,8 +11,9 @@ Against [3.0.0](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/do
 which was cut from the `3.0.x` branch, 3.1.0 adds the 3.1 dual
 writer and three schema migrations, 027, 028 and 031:
 - **The dual writer is off by default.** With `PRISM_DUAL_WRITER` unset, a
-  frontend serves as 3.0's does, once the migrations below are applied. Turned on, it lets two nodes each write
-  their own PostgreSQL and serve miners at once.
+  frontend serves as 3.0's does, once the migrations below are applied.
+  Turned on, it lets two nodes each write their own PostgreSQL and serve
+  miners at once.
 - **Every start requires migrations 027, 028 and 031,** whether or not the
   dual writer is turned on. 031 builds its index online, so `migrate` can run
   while 3.0.0 or 3.0.0-rc.6 serves ([Upgrading](#upgrading)).
@@ -124,8 +125,8 @@ personalised database.**
 
 ## Verification
 
-Since rc.1, only the lockfiles, the version and docs have changed, so the rc.1 notes'
-[verification](release-notes-3.1.0-rc.1.md#verification) applies. For this
+Since rc.1, only the lockfiles, the version and docs have changed, so the
+rc.1 notes' [verification](release-notes-3.1.0-rc.1.md#verification) applies. For this
 release:
 - `cargo deny --locked check` passes; on 3.1.0-rc.1's tree with #777 it
   fails on RUSTSEC-2026-0386;
