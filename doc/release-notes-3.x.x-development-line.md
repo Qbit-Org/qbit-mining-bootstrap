@@ -133,8 +133,9 @@ they fixed or configured no longer exists on this line:
   [3.0.0-rc.3](release-notes-3.0.0-rc.3.md),
   [3.0.0-rc.4](release-notes-3.0.0-rc.4.md),
   [3.0.0-rc.5](release-notes-3.0.0-rc.5.md) and
-  [3.0.0-rc.6](release-notes-3.0.0-rc.6.md)) and 3.0.0. 3.0.0's notes are
-  on the `3.0.x` branch; this branch's `doc/release-notes-3.0.0.md` still
+  [3.0.0-rc.6](release-notes-3.0.0-rc.6.md)). 3.0.0 was cut from the
+  `3.0.x` branch, which isn't an ancestor of 3.1.0, and its notes are
+  there; this branch's `doc/release-notes-3.0.0.md` still
   records only the D5 recovery contract. #291 keeps the rollout record: the
   cutover qualification and the go/no-go.
 - Native candidate recovery (#268) landed with #439.

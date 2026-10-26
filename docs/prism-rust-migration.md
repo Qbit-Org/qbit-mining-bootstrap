@@ -501,11 +501,10 @@ only reschedules reconciliation for a reserved or offered row; it never
 grants another offer. Follow [the offer lifecycle recovery guidance](prism-ledger-ops.md)
 for those rows and retain their evidence.
 
-**A database an earlier 3.x.x build migrated before 006.** The `3.x.x`
-development builds before the 3.0.0 candidates had no supported production
-upgrade, but a database such a build brought to native schema 3, 4 or 5
-can still hold a pending v2 row: that build's drain check used the v1-only predicate, which
-never counted a row whose `candidate` is NULL. `migrate` therefore runs the
+**A database an earlier 3.x.x build migrated before 006.** A database
+that an early `3.x.x` development build, from before the 3.0.0 candidates,
+brought to native schema 3, 4 or 5 can still hold a pending v2 row: that
+build's drain check used the v1-only predicate, which never counted a row whose `candidate` is NULL. `migrate` therefore runs the
 same column-aware drain check on a native schema 3, 4 or 5 before 004, 005
 and 006, and refuses before any DDL when such a row is pending, naming the
 rows as above:

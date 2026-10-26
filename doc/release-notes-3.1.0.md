@@ -96,9 +96,11 @@ No other dependency changes.
      [the carry owner and peer settlement](../docs/prism-ledger-ops.md#dual-writer-carry-owner-and-peer-settlement-31),
      and the balancer routes on `/readyz`
      ([dual-writer readiness](../docs/prism-dual-writer-readiness.md#the-balancer)).
-     The rc.1 notes'
-     [upgrading section](release-notes-3.1.0-rc.1.md#upgrading) lists the
-     same steps.
+     A node rebuilt from a physical copy of its peer is re-personalised
+     with `node-identity repersonalise --index N`
+     ([rebuilding a node](../docs/prism-ledger-ops.md#rebuilding-a-node-from-its-peer)).
+     The cutover itself is the pair's runbook, as the rc.1 notes'
+     [upgrading section](release-notes-3.1.0-rc.1.md#upgrading) says.
 
   Don't overlap the pre-migrate with heavy disk jobs on the database host:
   fsync starvation can push the serving frontends past their 5 s lock
@@ -122,7 +124,7 @@ personalised database.**
 
 ## Verification
 
-Since rc.1, only lockfiles and the version have changed, so the rc.1 notes'
+Since rc.1, only the lockfiles, the version and docs have changed, so the rc.1 notes'
 [verification](release-notes-3.1.0-rc.1.md#verification) applies. For this
 release:
 - `cargo deny --locked check` passes; on 3.1.0-rc.1's tree with #777 it
@@ -143,11 +145,12 @@ issue listed there has been fixed since. That covers #771, #762, #757 and
 #716's open part, #711 and #712. In addition:
 
 - **#716 in the L3 matrix (#779):** on 3.0.0's tree, the
-  `throughput-400k-window-2fe-async-3-blocks` preset failed its gate with
-  one valid share refused per run, #716's commit-gate class. 3.1.0 doesn't
-  fix #716, so the preset can fail the same way. #779 also records a
-  steady-state shortfall in `throughput-400k-window-2fe-sync-r3`, not yet
-  traced to the code or the runner.
+  `throughput-400k-window-2fe-async-3-blocks` preset failed its gate in
+  four of six repeats, each with one valid share refused, #716's
+  commit-gate class. 3.1.0 doesn't fix #716, so the preset can fail the
+  same way. #779 also records a steady-state shortfall in one repeat of
+  `throughput-400k-window-2fe-sync`, not yet traced to the code or the
+  runner.
 - **The block-proof acknowledgement bound can drop a pooled connection.**
   A block-bearing submission's disposition poll runs under that bound. When
   the bound expires while the poll is still checking out its connection
