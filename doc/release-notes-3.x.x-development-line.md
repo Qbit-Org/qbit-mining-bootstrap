@@ -2,13 +2,13 @@
 
 Release date: none. This note describes the `3.x.x` line as a whole, not
 one release. Its releases are [3.0.0](release-notes-3.0.0.md),
-cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md), cut on this
-branch.
+cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md), cut on
+`3.x.x`.
 
 ## Status
 
 `3.x.x` is the production line, and 3.1.0 is its current release. Deploy
-3.1.0 from the `v3.1.0` tag, not from the branch head, which moves on after
+3.1.0 from the `v3.1.0` tag, not from the `3.x.x` head, which moves on after
 the release. 3.0.0 is on the `3.0.x` branch, which starts at `4c134913`; 3.1.0
 contains everything it adds to 3.0.0-rc.6. The previous production line is
 `2.x.x`, whose tip is version 2.0.2 (see `release-notes-2.0.2.md`); the

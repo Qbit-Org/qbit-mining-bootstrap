@@ -40,7 +40,8 @@ itself, at the squash of its version bump and notes (#782, `59194d03`), as
 `v3.1.0-rc.1` was. The promotion into `main` gives `main` that tagged tree,
 plus this guide, a README banner that doesn't name a branch, the released
 3.0.0 notes in place of `3.x.x`'s pre-release copy, and the
-disposition-poll fix that `main` took in #781 after 3.1.0's cutoff. It adds
+disposition-poll fix that `main` took in #781, which `3.x.x` doesn't carry
+because 3.1.0 changed no runtime code since its release candidate. It adds
 no tag. The 400k two-frontend L3 failures are tracked in #779, as for 3.0.0.
 
 Merge the intended development cutoff into the promotion branch and retain
@@ -60,7 +61,8 @@ version metadata and dated release notes before tagging it.
 
 After confirming that the tag doesn't already exist, use the reviewed main
 commit in place of `<release-main-sha>`, and the version in place of
-`<version>` (as `v2.0.0` and `v3.0.0` were):
+`<version>` (as `v2.0.0` was; `v3.0.0` and `v3.1.0` used the same commands
+on their branches' commits):
 
 ```sh
 git fetch origin main --tags
@@ -86,10 +88,14 @@ release version.
 
 After promotion, open a synchronization PR from a branch that merges the
 released `main` commit into the latest development branch (`3.x.x` after
-3.0.0, `2.x.x` after 2.0.0), and into a release branch such as `3.0.x` that
+3.0.0 and 3.1.0, `2.x.x` after 2.0.0), and into a release branch such as `3.0.x` that
 will take patch releases. Preserve subsequent development
 and resolve metadata and notes deliberately; do not reset or force-push the
 shared branch. Run its checks before merging.
+
+For 3.1.0 this step is required: `main` carries #781's disposition-poll fix
+and the released 3.0.0 notes, which `3.x.x` lacks, and the next `3.x.x`
+release must not drop them.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization

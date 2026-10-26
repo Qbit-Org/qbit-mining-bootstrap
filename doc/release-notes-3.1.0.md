@@ -8,7 +8,8 @@ setting or migration since rc.1. 3.1.0-rc.1 has run the mainnet pair in
 dual-writer mode since 2026-10-20.
 
 Against [3.0.0](release-notes-3.0.0.md), which was cut from the `3.0.x`
-branch, 3.1.0 adds the 3.1 dual writer and three schema migrations, 027, 028 and 031:
+branch, 3.1.0 adds the 3.1 dual writer and three schema migrations, 027, 028
+and 031:
 - **The dual writer is off by default.** With `PRISM_DUAL_WRITER` unset, a
   frontend serves as 3.0's does, once the migrations below are applied.
   Turned on, it lets two nodes each write their own PostgreSQL and serve
