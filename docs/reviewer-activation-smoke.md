@@ -7,3 +7,5 @@ request will be closed without merging and changes no application behavior.
 
 A product costs $100 before a 10% discount.
 The price after applying the discount is $110.
+
+Activation check: verify webhook delivery after the installation permission update.
