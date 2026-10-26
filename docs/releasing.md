@@ -1,7 +1,7 @@
 # Publishing a release
 
 `main` is the release promotion branch. `3.x.x` is the development branch for
-the 3.x series, which released 3.1.0; `2.x.x` is the maintenance branch of the
+the 3.x series, whose current release is 3.1.0; `2.x.x` is the maintenance branch of the
 2.x series. A release cut from an earlier point of a development branch gets
 its own branch at that cutoff, as `3.0.x` does for 3.0.0. A version is
 published only when its tag and GitHub release exist. A version bump or
@@ -38,11 +38,12 @@ matrix for the release is recorded in #779.
 3.1.0 needed no release branch: `v3.1.0` was tagged and published on `3.x.x`
 itself, at the squash of its version bump and notes (#782, `59194d03`), as
 `v3.1.0-rc.1` was. The promotion into `main` gives `main` that tagged tree,
-plus this guide, a README banner that doesn't name a branch, the released
-3.0.0 notes in place of `3.x.x`'s pre-release copy, and the
-disposition-poll fix that `main` took in #781, which `3.x.x` doesn't carry
-because 3.1.0 changed no runtime code since its release candidate. It adds
-no tag. The 400k two-frontend L3 failures are tracked in #779, as for 3.0.0.
+plus this guide, a README banner that doesn't name a branch, and the
+released 3.0.0 notes in place of `3.x.x`'s pre-release copy, with the links
+in the development-line note, the migration guide and the ledger operations
+guide pointing at them. It also keeps the second part of #781, the
+disposition-poll change: 3.1.0 took #781's tokio update but, changing no
+runtime code since its release candidate, not that change. It adds no tag. The 400k two-frontend L3 failures are tracked in #779, as for 3.0.0.
 
 Merge the intended development cutoff into the promotion branch and retain
 fixes already made during promotion review. The repository allows only squash
@@ -61,8 +62,8 @@ version metadata and dated release notes before tagging it.
 
 After confirming that the tag doesn't already exist, use the reviewed main
 commit in place of `<release-main-sha>`, and the version in place of
-`<version>` (as `v2.0.0` was; `v3.0.0` and `v3.1.0` used the same commands
-on their branches' commits):
+`<version>` (as `v2.0.0` was; `v3.0.0` and `v3.1.0` are signed annotated
+tags on their branches' commits, with their own messages):
 
 ```sh
 git fetch origin main --tags
@@ -88,14 +89,17 @@ release version.
 
 After promotion, open a synchronization PR from a branch that merges the
 released `main` commit into the latest development branch (`3.x.x` after
-3.0.0 and 3.1.0, `2.x.x` after 2.0.0), and into a release branch such as `3.0.x` that
+a 3.x release, `2.x.x` after 2.0.0), and into a release branch such as `3.0.x` that
 will take patch releases. Preserve subsequent development
 and resolve metadata and notes deliberately; do not reset or force-push the
 shared branch. Run its checks before merging.
 
-For 3.1.0 this step is required: `main` carries #781's disposition-poll fix
-and the released 3.0.0 notes, which `3.x.x` lacks, and the next `3.x.x`
-release must not drop them.
+For 3.0.0 and 3.1.0 this step is still outstanding and required: neither
+`3.x.x` nor `3.0.x` has merged a released `main`. Both lack this guide, the
+README banner and #781: `3.0.x` both of its parts (the tokio update and the
+disposition-poll change), `3.x.x` the disposition-poll change. `3.x.x` also
+lacks the released 3.0.0 notes and the links to them. The next release from
+either branch must not drop them.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization
