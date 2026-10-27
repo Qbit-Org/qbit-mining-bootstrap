@@ -45,8 +45,10 @@
 //! scenario puts `support/ledger_execution_proxy.rs` on the child's wire and
 //! attributes executions by statement identity rather than by wall clock, and
 //! proves the attribution by requiring its classifier to select nothing at
-//! all from an idle window. The parent's own ledger always stays on the
-//! direct URL, so nothing the test itself reads is ever observed.
+//! all from an idle window. That window follows one landing by the same
+//! process, so background work that only an accepted block switches on is
+//! idle work too. The parent's own ledger always stays on the direct URL, so
+//! nothing the test itself reads is ever observed.
 //!
 //! The fixture takes its own PostgreSQL database through
 //! `support/ledger_database.rs` (#410): the drain holds database-scoped
@@ -301,7 +303,10 @@ impl FakeNode {
     }
 
     /// The `submitblock` calls this node has answered or withheld, per block
-    /// hash. Taken once both children are reaped, so nothing moves under it.
+    /// hash, as of the call. Most callers read it once both children are
+    /// reaped, so nothing moves under it; `observe_recovery` also reads it
+    /// while its child serves, once the landed sibling is terminal and
+    /// nothing else is claimable.
     async fn per_hash(&self) -> BTreeMap<String, u64> {
         self.shared.state.lock().await.per_hash.clone()
     }
@@ -1778,13 +1783,15 @@ const IDLE_REPEATS: usize = 2;
 /// One periodic path is longer than any window of this length: the vardiff
 /// hint prune, at five minutes. It is not covered by the idle windows, and it
 /// is caught the other way -- by the pinned statement count, which one stray
-/// selected statement would break.
+/// selected statement would break. The share-partition maintenance's default
+/// minute is longer than this floor too, but it ticks as the child starts, and
+/// the first idle window covers the startup.
 const IDLE_FLOOR: Duration = Duration::from_secs(25);
 
 /// A bound on how long an idle observation waits for the settling rule on top
 /// of that floor. Also a bound on a *wait*: a window that hits this cap is not
-/// a failure, because the second window's empty-selection assertion is what
-/// proves the first window saw every background statement.
+/// a failure, because the last window's empty-selection assertion is what
+/// proves the windows before it saw every background statement.
 const IDLE_WINDOW_CAP: Duration = Duration::from_secs(60);
 
 /// Statements the recovery of one dead claimant's row costs a relaunched
@@ -1920,6 +1927,31 @@ fn runs(executions: &[Execution]) -> Vec<Vec<Execution>> {
     closed
 }
 
+/// Whether an execution only delimits a transaction: `BEGIN`, `COMMIT`,
+/// `ROLLBACK`, `SAVEPOINT` or `RELEASE`. Read from the server's completion
+/// tags when the proxy paired them with the execution, as [`runs`] reads its
+/// boundaries, so a batch such as `BEGIN; SET LOCAL …` is not one. Otherwise
+/// from the text, as `Execution::begins_transaction` does, and then only a
+/// single statement counts. The proxy cannot pair the reply to a frame the
+/// client pipelined behind an earlier `Sync`: a `ROLLBACK` SQLx sends while
+/// the `COMMIT` before it is still unanswered stays without tags.
+fn transaction_control(execution: &Execution) -> bool {
+    const CONTROL: [&str; 5] = ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"];
+    if !execution.tags.is_empty() {
+        return execution
+            .tags
+            .iter()
+            .all(|tag| CONTROL.contains(&tag.as_str()));
+    }
+    let sql = execution.sql.trim().trim_end_matches(';');
+    !sql.contains(';')
+        && sql.split_whitespace().next().is_some_and(|word| {
+            CONTROL
+                .iter()
+                .any(|control| word.eq_ignore_ascii_case(control))
+        })
+}
+
 /// The statements a set of executions spent on foreground work, in order.
 ///
 /// A run is foreground when it contains at least one statement text the child
@@ -1931,13 +1963,38 @@ fn runs(executions: &[Execution]) -> Vec<Vec<Execution>> {
 /// statements a marker can never see: triggers exist for `INSERT`, `UPDATE`
 /// and `DELETE` only.
 ///
+/// That rests on the idle windows running in the state the measurement runs
+/// in. A background transaction can contain a statement only some state
+/// switches on: the metrics collector's orphan-evidence lookup runs once this
+/// process has registered an accepted block, which the recovered row's own
+/// active observation (`Metrics::accepted_block`) does inside its span. Idle
+/// windows that never saw an acceptance would never learn that statement, and
+/// a collector tick inside the span would be charged to the recovery (#729).
+/// So the child lands one sibling before the idle window the background set
+/// settles in and the one that verifies it.
+///
+/// Transaction control never makes a run foreground on its own
+/// ([`transaction_control`]). How a background transaction ends can depend
+/// on the host rather than on any state an idle window can reach: when a
+/// stalled WAL flush holds the blob pruner's `COMMIT` past its five-second
+/// budget, the dropped transaction makes SQLx send a `ROLLBACK` after that
+/// `COMMIT` has completed, a run of one no idle window need ever see (#729).
+/// It costs the recovery nothing: `BEGIN` and `COMMIT` are in every background
+/// set, since every idle claim poll runs both, so each of the recovery's
+/// transactions was already foreground through a statement of its own, and a
+/// run that is taken still counts every statement it has, transaction control
+/// included.
+///
 /// With a `span`, only runs that reach into it are taken. The span is the
 /// execution order between the first and last statement marked for the
 /// recovered row, and `Coordinator::submit_loop` awaits each row's processing
 /// inline before it claims the next, so no other row's work can be in flight
 /// inside it. That is the whole of the attribution: background statements are
 /// excluded because their texts are the idle ones, and sibling drains are
-/// excluded because they are not in the span.
+/// excluded because they are not in the span. The executions must start
+/// before any run that reaches the span does, because a run is rebuilt from
+/// its `BEGIN`: the poll that takes the recovered row over can send its
+/// `BEGIN` before the measured window opens.
 fn foreground(
     executions: &[Execution],
     idle: &std::collections::BTreeSet<String>,
@@ -1945,7 +2002,10 @@ fn foreground(
 ) -> Vec<String> {
     let mut selected = Vec::new();
     for run in runs(executions) {
-        if !run.iter().any(|execution| !idle.contains(&execution.sql)) {
+        if !run
+            .iter()
+            .any(|execution| !transaction_control(execution) && !idle.contains(&execution.sql))
+        {
             continue;
         }
         if let Some((first, last)) = span {
@@ -2005,8 +2065,8 @@ async fn observe_idle(
     }
 }
 
-/// Hold **every** row out of the due set, and release them all again in the
-/// order they were enqueued.
+/// Hold **every** row out of the due set; release one sibling alone; and
+/// release every row still unfinished in the order they were enqueued.
 ///
 /// The measured scenario needs a relaunched child with nothing whatever to
 /// claim, for as long as its idle windows take. Holding the recovered row out
@@ -2014,12 +2074,14 @@ async fn observe_idle(
 /// protected only by its dead owner's claim, would make the windows race
 /// `CANDIDATE_LEASE`'s compile-time 120 seconds, and a window that outlasted it
 /// would find the recovery running inside the very window that is supposed to
-/// prove nothing happens there.
+/// prove nothing happens there. A held row is also never taken over, so the
+/// one sibling released for the landing is the only row the child can claim
+/// then.
 ///
-/// The release sets `next_attempt_at` to each row's own `created_at`, so the
-/// whole population becomes claimable in one statement and the oldest-due lane
-/// sees the recovered row -- enqueued first -- as the oldest. A release to one
-/// wall-clock instant would leave that order to microseconds.
+/// The releases set `next_attempt_at` to each row's own `created_at`, so the
+/// rest of the population becomes claimable in one statement and in the order
+/// it was enqueued, where a release to one wall-clock instant would leave that
+/// order to microseconds.
 async fn hold_all(ledger: &Ledger) -> Result<u64> {
     Ok(
         sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at='infinity'")
@@ -2029,13 +2091,24 @@ async fn hold_all(ledger: &Ledger) -> Result<u64> {
     )
 }
 
-async fn release_all_in_enqueue_order(ledger: &Ledger) -> Result<u64> {
-    Ok(
-        sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=created_at")
-            .execute(&ledger.pool)
-            .await?
-            .rows_affected(),
+async fn release_one(ledger: &Ledger, block_hash: &str) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE qbit_block_candidate_outbox SET next_attempt_at=created_at WHERE block_hash=$1",
     )
+    .bind(block_hash)
+    .execute(&ledger.pool)
+    .await?
+    .rows_affected())
+}
+
+async fn release_all_in_enqueue_order(ledger: &Ledger) -> Result<u64> {
+    Ok(sqlx::query(&format!(
+        "UPDATE qbit_block_candidate_outbox SET next_attempt_at=created_at WHERE state IN {}",
+        CandidateState::UNFINISHED_SQL
+    ))
+    .execute(&ledger.pool)
+    .await?
+    .rows_affected())
 }
 
 /// What one measured recovery observed.
@@ -2082,30 +2155,55 @@ struct RecoveryCost {
 /// and **every** row is held out of the due set. A second child is then
 /// launched **through the execution proxy** — the parent's own ledger stays on
 /// the direct URL, so none of its reads are ever observed — and comes up with
-/// nothing claimable at all. That is what makes the two idle windows genuinely
-/// idle, and it is why the recovered row is parked rather than left under its
-/// dead owner's claim: windows long enough to cover the slowest background
-/// path would otherwise race `CANDIDATE_LEASE`'s compile-time 120 seconds, and
-/// the recovery would run inside the window that exists to show nothing does.
+/// nothing claimable at all. A first idle window then covers its startup,
+/// whose one-off statements no later window is sure to see.
 ///
-/// The whole population is then made claimable in one statement, in the order
-/// it was enqueued. The recovered row is not `pending` and its attempt count
-/// is not zero, so the fresh claim lane can never select it; it is claimed by
-/// the oldest-due lane, behind a handful of sibling claims, with the rest of
-/// the population still unfinished and due underneath it. That is the shape a
-/// per-sibling loop in `Ledger::claim_candidate` would be measured against.
+/// One sibling is then released alone, and the child offers it, the node
+/// accepts it, and it lands and is confirmed. That puts the idle windows
+/// after it in the state the measurement runs in.
+/// Once this process has registered an accepted block, which the recovered
+/// row's own active observation also does, the metrics collector looks up
+/// orphan evidence on every ten-second tick, because no miner ever connects
+/// to close the block's landing wait. Idle windows that saw no acceptance
+/// never learned that lookup, so a tick inside the recovery's span was
+/// charged to it as one extra seven-statement transaction (#729). Nothing the
+/// child runs while landing that sibling joins the background set, and the
+/// node must have been offered that sibling once and the recovered block no
+/// more than before.
+///
+/// With that sibling terminal, the child again has nothing claimable at all.
+/// That is what makes the idle windows genuinely idle, and it is why the
+/// recovered row is parked rather than left under its dead owner's claim:
+/// windows long enough to cover the slowest background path would otherwise
+/// race `CANDIDATE_LEASE`'s compile-time 120 seconds, and the recovery would
+/// run inside the window that exists to show nothing does.
+///
+/// Every unfinished row is then made claimable in one statement, in the order
+/// it was enqueued. The first claim poll after that takes the recovered row
+/// over: its dead owner's claim was revoked to a zero lease, and a takeover
+/// runs before, and instead of, the due-work probe and the claim lanes
+/// (#581). So it is recovered ahead of every sibling, with the rest of the
+/// population still unfinished and due underneath it. That poll can send its
+/// `BEGIN` before the release and its claim survey after it, so the measured
+/// executions start at the last idle window rather than at the release:
+/// cut at the release, that transaction once lost four of its five
+/// statements and the recovery read 61 (#729).
 ///
 /// # Honest scope
 ///
 /// No statement on this recovery path has an execution count that depends on
 /// the number of unfinished siblings **today**: every one of them is once per
-/// transaction, `WHERE block_hash=$1`, a `LIMIT 1` selection over the
+/// transaction, `WHERE block_hash=$1`, one set-based statement over the
 /// unfinished set, or a page loop bounded by the window's share count. The
 /// equality this test asserts therefore guards against a *future* per-sibling
-/// loop. The most realistic site is `Ledger::claim_candidate`, where the
-/// `LIMIT 1` due-work probe and the single claiming lane statement would
-/// become a `LIMIT k` selection and one `UPDATE` per due row; that claim is
-/// inside the measured span, so such a change fails this test at once.
+/// loop. The most realistic site is the opening every claim poll shares with
+/// a takeover in `Ledger::claim_candidate`: the claim survey, one statement
+/// that reads every claimed row and reschedules every row a clock step
+/// stranded, would become one statement per unfinished row. That claim is
+/// inside the measured span, so such a change fails this test at once. The
+/// due-work probe and the claim lanes are not on this path, because the
+/// takeover runs instead of them; a per-sibling loop there would cost the
+/// siblings' claims, which this test does not measure.
 ///
 /// It proves nothing about plan cost, rows scanned, contention, latency or
 /// anything outside the selected transactions — including every startup gate,
@@ -2244,8 +2342,9 @@ async fn recover_one_row(
 
     // ---- The population, published while nothing is draining. Every row,
     // the recovered one included, is then held out of the due set, so the
-    // relaunched child comes up with nothing to claim and stays that way for
-    // as long as its idle windows take. The dead owner's claim is expired here
+    // relaunched child comes up with nothing to claim, and stays that way
+    // through its idle windows but for the one sibling `observe_recovery`
+    // releases and lands between them. The dead owner's claim is expired here
     // rather than later, while it is certainly still live, so the fence below
     // can only ever hit that claim. ----
     for row in &planned[1..] {
@@ -2303,6 +2402,7 @@ async fn observe_recovery(
 ) -> Result<RecoveryCost> {
     let count = planned.len();
     let victim_hash = planned[0].block_hash.clone();
+    let landed_first = &planned[1].block_hash;
     // Before the child exists, so the background set below covers its startup
     // as well as its steady state. That matters for one statement group in
     // particular: the session settings a pooled connection runs when it opens.
@@ -2320,22 +2420,52 @@ async fn observe_recovery(
     )
     .await?;
 
-    // ---- Two idle windows. The first settles: it ends once every periodic
-    // path has been seen from one of its ticks to the next, and everything the
-    // child has run since it was launched then becomes the background set. The
-    // second proves that set was complete, by requiring the classifier to
-    // select nothing at all from a window of the same shape. Coinciding totals
-    // would not say this; an empty selection does, and the window it is taken
-    // over contributed nothing to the set it is checked against. ----
-    let settled = observe_idle(proxy, proxy.mark()).await?;
+    // ---- A first idle window, before anything is claimable. With the launch
+    // before it, it covers the child's startup, whose one-off statements --
+    // the first tick of the share-partition maintenance's one-minute interval,
+    // the session settings of the connections the pool opens -- that no
+    // window after the landing is sure to see. ----
+    let launched = observe_idle(proxy, proxy.mark()).await?;
     ensure!(
-        !settled.is_empty(),
+        !launched.is_empty(),
         "the first idle window observed nothing at all; the proxy is not on the child's wire"
     );
+
+    // ---- One sibling, offered, accepted, landed and confirmed, so the idle
+    // windows after it run in the state the measurement runs in: with a block
+    // this process has registered as accepted, which switches on the metrics
+    // collector's orphan-evidence lookup. Everything the child runs from this
+    // release until the sibling is terminal is its own foreground work, and
+    // none of it joins the background set. ----
+    let landing_mark = proxy.mark();
+    let released = release_one(ledger, landed_first).await?;
+    ensure!(
+        released == 1,
+        "{released} rows were released for the landing, not one sibling"
+    );
+    wait_for_row_state(ledger, &child, count, landed_first, "submitted").await?;
+    let landed_mark = proxy.mark();
+    let offered = node.per_hash().await;
+    ensure!(
+        offered.get(landed_first) == Some(&1) && offered.get(&victim_hash) == Some(&1),
+        "landing one sibling, the relaunched frontend was to offer it once and never offer the recovered block again; the node saw {offered:?}"
+    );
+
+    // ---- Two more idle windows. The first settles: it ends once every
+    // periodic path has been seen from one of its ticks to the next, and
+    // everything the child ran outside the landing then becomes the
+    // background set. The second proves that set was complete, by requiring
+    // the classifier to select nothing at all from a window of the same shape.
+    // Coinciding totals would not say this; an empty selection does, and the
+    // window it is taken over contributed nothing to the set it is checked
+    // against. ----
+    observe_idle(proxy, landed_mark).await?;
     let verify_mark = proxy.mark();
+    let landing = landing_mark + 1..=landed_mark;
     let background: std::collections::BTreeSet<String> = proxy
         .executions_since(startup_mark)?
         .into_iter()
+        .filter(|execution| execution.seq <= verify_mark && !landing.contains(&execution.seq))
         .map(|execution| execution.sql)
         .collect();
     observe_idle(proxy, verify_mark).await?;
@@ -2346,15 +2476,19 @@ async fn observe_recovery(
         stray.len()
     );
 
-    // ---- The measured window. ----
-    let mark = proxy.mark();
+    // ---- The measured window. Its executions are taken from the start of
+    // the last idle window, not from the release: the poll that takes the
+    // recovered row over can send its `BEGIN` before the release and its claim
+    // survey after it, and a run is rebuilt from its `BEGIN`. The span alone
+    // decides what is counted. ----
     let released = release_all_in_enqueue_order(ledger).await?;
     ensure!(
-        released == count as u64,
-        "{released} rows were released for {count} planned blocks"
+        released == count as u64 - 1,
+        "{released} rows were released for the {} planned blocks still unfinished",
+        count - 1
     );
     wait_for_row_state(ledger, &child, count, &victim_hash, "submitted").await?;
-    let executions = proxy.executions_since(mark)?;
+    let executions = proxy.executions_since(verify_mark)?;
     let unfinished: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM qbit_block_candidate_outbox WHERE state IN {}",
         CandidateState::UNFINISHED_SQL
