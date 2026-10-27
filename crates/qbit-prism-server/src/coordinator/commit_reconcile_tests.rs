@@ -785,11 +785,14 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
         // The production adapter must preserve the private gate's actual
         // winning cause through a real SQL rollback. The public bool hook
         // and CommitGateClosed error intentionally carry no inferred cause.
-        use super::submit_ledger::{CommitGate, GateClosure, SubmitLedger};
+        // A contended hook wins nothing (#716): it rolls back and leaves the
+        // gate contended, and once the authority is readable the same gate
+        // reopens and commits the same share.
+        use super::submit_ledger::{CommitGate, GateClosure, GateState, SubmitLedger};
         for (index, expected) in [
-            GateClosure::StaleAuthority,
-            GateClosure::AuthorityUnavailable,
-            GateClosure::DeadlineOrCancelled,
+            Some(GateClosure::StaleAuthority),
+            None,
+            Some(GateClosure::DeadlineOrCancelled),
         ]
         .into_iter()
         .enumerate()
@@ -808,13 +811,13 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
             let gate = Arc::new(CommitGate::with_lease(Some(
                 fixture.coordinator.lease_commit_fence(lease, None),
             )));
-            if expected == GateClosure::DeadlineOrCancelled {
+            if expected == Some(GateClosure::DeadlineOrCancelled) {
                 ensure!(gate.close(), "the original deadline must win");
             }
             // Publish a new generation after admission, before the SQL hook.
-            // The unavailable case holds the publication lock instead: a
+            // The contended case holds the publication lock instead: a
             // failed try_read cannot prove whether any work became stale.
-            let contended = if expected == GateClosure::AuthorityUnavailable {
+            let contended = if expected.is_none() {
                 Some(fixture.coordinator.prepared.write().await)
             } else {
                 let mut tip = fixture.coordinator.observed_tip.write().await;
@@ -833,7 +836,7 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
                 gate.clone(),
             )
             .await
-            .expect_err("a closed gate must roll back the new share");
+            .expect_err("a refusing gate must roll back the new share");
             ensure!(
                 error
                     .downcast_ref::<crate::ledger::CommitGateClosed>()
@@ -841,37 +844,60 @@ async fn commit_reconcile_ledger_hook_refusal_sends_no_commit() -> Result<()> {
                 "expected a typed gate refusal: {error:#}"
             );
             ensure!(
-                gate.closure() == Some(expected),
+                gate.closure() == expected,
                 "wrong closure: {:?}",
                 gate.closure()
+            );
+            ensure!(
+                (gate.state() == GateState::Contended) == expected.is_none(),
+                "only contention may leave the gate contended: {:?}",
+                gate.state()
             );
             ensure!(
                 fixture.rows(&refused.share_id).await? == 0,
                 "refused share committed"
             );
-            // A closed stale gate cannot erase a credit already confirmed by
-            // the immutable-row match, nor turn that duplicate into stale.
+            // A refusing gate cannot erase a credit already confirmed by the
+            // immutable-row match, nor turn that duplicate into stale.
             let duplicate = SubmitLedger::append_at_revision(
                 ledger.as_ref(),
                 share.clone(),
                 None,
                 revision,
-                gate,
+                gate.clone(),
             )
             .await?;
             ensure!(
                 duplicate == submit_ledger::Appended::Recorded,
-                "closed gate changed a confirmed duplicate"
+                "refusing gate changed a confirmed duplicate"
             );
             drop(contended);
-            // Rollback also released ORDER_LOCK for a subsequent valid append.
+            // Rollback also released ORDER_LOCK for a subsequent valid append:
+            // under the same gate once a contended authority is readable, and
+            // without a gate after a closure, which allows no retry.
+            let retried = gate.retry_after_contention().await;
             ensure!(
+                retried == expected.is_none(),
+                "only a contended gate may run its append again"
+            );
+            let inserted = if retried {
+                SubmitLedger::append_at_revision(
+                    ledger.as_ref(),
+                    refused.clone(),
+                    None,
+                    revision,
+                    gate.clone(),
+                )
+                .await?
+                    == submit_ledger::Appended::Inserted
+                    && gate.state() == GateState::Committing
+            } else {
                 ledger
                     .append_at_revision(refused.clone(), None, revision)
                     .await?
-                    .inserted,
-                "a refused transaction retained its lock or row"
-            );
+                    .inserted
+            };
+            ensure!(inserted, "a refused transaction retained its lock or row");
             ensure!(
                 fixture.rows(&refused.share_id).await? == 1,
                 "expected one later credit"

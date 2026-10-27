@@ -30,9 +30,12 @@ pub(super) enum SaveOutcome {
     Duplicate,
     /// The original lease expired or was replaced before COMMIT: `stale-job`.
     Stale,
-    /// The lease's commit gate could not read or prove its chain authority
-    /// before COMMIT (#716): nothing was written, and neither a stale race
-    /// nor a ledger failure is proven. Answered as admission answers
+    /// The lease's commit gate could not prove its chain authority before
+    /// COMMIT (#716): readiness or the tip authority lapsed, or contention for
+    /// the authority's locks outlasted the acknowledgement deadline (shorter
+    /// contention is waited out and the append runs again). Nothing was
+    /// written, and neither a stale race nor a ledger failure is proven.
+    /// Answered as admission answers
     /// readiness it cannot prove: `backend-rpc-unavailable`, or
     /// `backend-database-unavailable` when the refresh failed on the ledger
     /// database.
@@ -153,33 +156,36 @@ fn sync_rep_unknown(
 /// The outcome of a share whose commit gate closed before COMMIT, decided by
 /// the closure that won the gate; `error` is the refusal the append reported.
 /// - A proven stale lease is a stale race.
-/// - #716: a lease fence that could not read or prove its chain authority
-///   (a tip poll, a fee or readiness write, or the publication held or
-///   awaited a lock; or readiness or the tip authority lapsed) proves neither
-///   stale work nor a ledger failure. It is answered as admission answers
-///   readiness it cannot prove, not as `ledger-confirmation-failed`, which
-///   feeds the share-append failure warning.
+/// - #716: a lease fence that could not prove its chain authority (readiness
+///   or the tip authority lapsed, at the hook or after it waited out a tip
+///   poll, a fee or readiness write, or the publication holding or awaiting
+///   one of the authority's locks) proves neither stale work nor a ledger
+///   failure. Nor does a deadline that closed the gate while the append was
+///   still waiting out that contention. Both are answered as admission
+///   answers readiness it cannot prove, not as `ledger-confirmation-failed`,
+///   which feeds the share-append failure warning.
 /// - A deadline closure, or a refusal that recorded none, stays strict.
 fn closed_gate_outcome(closure: Option<GateClosure>, error: anyhow::Error) -> SaveOutcome {
+    if closure != Some(GateClosure::StaleAuthority) {
+        tracing::info!(
+            %error,
+            closure = closure.map_or("unspecified", GateClosure::label),
+            "share commit gate refused before COMMIT"
+        );
+    }
     match closure {
         Some(GateClosure::StaleAuthority) => SaveOutcome::Stale,
-        Some(GateClosure::AuthorityUnavailable) => {
-            tracing::info!(
-                %error,
-                closure = "authority-unavailable",
-                "share commit gate refused before COMMIT"
-            );
+        Some(GateClosure::AuthorityUnavailable | GateClosure::AuthorityContended) => {
             SaveOutcome::AuthorityUnavailable
         }
-        Some(GateClosure::DeadlineOrCancelled) | None => {
-            tracing::info!(
-                %error,
-                closure = if closure.is_some() { "deadline-or-cancelled" } else { "unspecified" },
-                "share commit gate refused before COMMIT"
-            );
-            SaveOutcome::Failed(error)
-        }
+        Some(GateClosure::DeadlineOrCancelled) | None => SaveOutcome::Failed(error),
     }
+}
+
+/// A refusal at the append's pre-COMMIT hook: COMMIT was never sent and the
+/// attempt rolled back, so nothing was written.
+fn refused_at_hook(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CommitGateClosed>().is_some()
 }
 
 fn sqlx_error(error: &anyhow::Error) -> Option<&sqlx::Error> {
@@ -626,8 +632,8 @@ impl Coordinator {
                 // same readiness read: the ledger database when the latest
                 // refresh failed on it or the refresh in flight is still
                 // blocked on it (#581, #655), the node otherwise. The
-                // readiness lock is not read again: its contention may be
-                // what closed the gate.
+                // readiness lock is not read again, so a refusal never waits
+                // behind a writer for its answer.
                 Err(protocol_error(
                     self.stale_readiness_reason(refresh_failed_on_database),
                     "current chain state is unavailable",
@@ -654,7 +660,7 @@ impl Coordinator {
             }
             SaveOutcome::Failed(error) => {
                 self.rejected.fetch_add(1, Ordering::Relaxed);
-                if error.downcast_ref::<CommitGateClosed>().is_some() {
+                if refused_at_hook(&error) {
                     // A refused local gate proves COMMIT was never sent, and
                     // `persist_share_pass` logged its closure. A deadline
                     // closure or an unspecified refusal has no proven cause:
@@ -733,16 +739,40 @@ impl Coordinator {
         let task_gate = gate.clone();
         let mut task = AppendTask {
             handle: Some(tokio::spawn(async move {
-                let result = ledger
-                    .append_at_revision_observed(
-                        share,
-                        candidate,
-                        proof_observed_at_ms,
-                        revision,
-                        moved,
-                        task_gate.clone(),
-                    )
-                    .await;
+                let mut attempt = (share, candidate);
+                let result = loop {
+                    // Only a lease fence sends a refused append round again
+                    // (#716), and a fenced append carries no candidate, so the
+                    // copy is a share's few strings.
+                    let again = task_gate.fenced().then(|| attempt.clone());
+                    let (share, candidate) = attempt;
+                    let result = ledger
+                        .append_at_revision_observed(
+                            share,
+                            candidate,
+                            proof_observed_at_ms,
+                            revision,
+                            moved,
+                            task_gate.clone(),
+                        )
+                        .await;
+                    let refused = matches!(&result, Err(error) if refused_at_hook(error));
+                    let Some(again) = again.filter(|_| refused) else {
+                        break result;
+                    };
+                    // Nothing was written: the hook refused before COMMIT and
+                    // the attempt rolled back, releasing ORDER_LOCK.
+                    let waited = tokio::time::Instant::now();
+                    if !task_gate.retry_after_contention().await {
+                        break result;
+                    }
+                    tracing::info!(
+                        share_id = %again.0.share_id,
+                        waited_ms = waited.elapsed().as_millis() as u64,
+                        "share commit gate waited out contention for its authority; appending again"
+                    );
+                    attempt = again;
+                };
                 // Measured here, not at the join: a coordinator task that is
                 // scheduled late must not turn a durable commit into unknown.
                 let commit_elapsed = task_gate.committing_since().map(|since| since.elapsed());
@@ -757,13 +787,17 @@ impl Coordinator {
             None if refusable && gate.close() => {
                 task.abort();
                 // `close` also reports a gate that a lease fence closed first,
-                // at the pre-COMMIT hook, while the append's ROLLBACK was still
-                // in flight. The deadline did not win that gate, so the
+                // at the pre-COMMIT hook while the append's ROLLBACK was still
+                // in flight, or once it had waited out contention for its
+                // authority. The deadline did not win that gate, so the
                 // fence's closure decides the answer, as it does once the
-                // append returns (#716).
+                // append returns (#716). A gate whose append was still
+                // waiting out that contention closes for the contention.
                 return match gate.closure() {
                     closure @ Some(
-                        GateClosure::StaleAuthority | GateClosure::AuthorityUnavailable,
+                        GateClosure::StaleAuthority
+                        | GateClosure::AuthorityUnavailable
+                        | GateClosure::AuthorityContended,
                     ) => closed_gate_outcome(closure, CommitGateClosed.into()),
                     Some(GateClosure::DeadlineOrCancelled) | None => SaveOutcome::Failed(
                         anyhow::anyhow!("share commit deadline passed before COMMIT was sent"),
@@ -820,7 +854,7 @@ impl Coordinator {
         let outcome = match outcome {
             // A refused local gate proves COMMIT was never sent; the closure
             // that won it decides the answer.
-            SaveOutcome::Failed(error) if error.downcast_ref::<CommitGateClosed>().is_some() => {
+            SaveOutcome::Failed(error) if refused_at_hook(&error) => {
                 closed_gate_outcome(gate.closure(), error)
             }
             // The append's payout-revision fence refused the share before any

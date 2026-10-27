@@ -141,8 +141,13 @@ pub(super) struct LeaseCommitFence {
 pub(super) enum LeaseCommitRefusal {
     /// The original publication/expiry no longer authorizes this append.
     Stale,
-    /// Unavailable locks, readiness or tip observations prove no staleness.
+    /// Unavailable readiness or tip observations prove no staleness.
     Unavailable,
+    /// #716: a tip poll, a fee or readiness write, or the publication held or
+    /// awaited an authority lock, so the hook could not read it without
+    /// waiting. That proves nothing about the lease: the append waits for the
+    /// authority outside `ORDER_LOCK` and runs again.
+    Contended,
 }
 
 impl LeaseCommitFence {
@@ -154,23 +159,34 @@ impl LeaseCommitFence {
         commit: impl FnOnce() -> bool,
     ) -> std::result::Result<bool, LeaseCommitRefusal> {
         let Some(view) = AuthorityView::try_read(&self.prepared, &self.readiness, &self.tip) else {
-            return Err(LeaseCommitRefusal::Unavailable);
+            return Err(LeaseCommitRefusal::Contended);
         };
+        self.authorize(&view)?;
+        let won = commit();
+        drop(view);
+        Ok(won)
+    }
+
+    /// After a contended hook (#716): wait for the authority, outside
+    /// `ORDER_LOCK` and any transaction, and check the lease against it as
+    /// the hook does. The guards are released before this returns, so the
+    /// append's next attempt still decides at its own hook.
+    pub(super) async fn await_authority(&self) -> std::result::Result<(), LeaseCommitRefusal> {
+        let view = AuthorityView::read(&self.prepared, &self.readiness, &self.tip).await;
+        self.authorize(&view)
+    }
+
+    fn authorize(&self, view: &AuthorityView<'_>) -> std::result::Result<(), LeaseCommitRefusal> {
         if self
             .expires_at
             .is_some_and(|at| MonotonicInstant::now().into_std() >= at)
         {
             return Err(LeaseCommitRefusal::Stale);
         }
-        match self.lease.select_with_cause(&view, &self.config) {
-            Ok(LeaseSelection::Selected(..)) => {}
-            Ok(LeaseSelection::Stale) => return Err(LeaseCommitRefusal::Stale),
-            Ok(LeaseSelection::Unavailable) | Err(_) => {
-                return Err(LeaseCommitRefusal::Unavailable)
-            }
+        match self.lease.select_with_cause(view, &self.config) {
+            Ok(LeaseSelection::Selected(..)) => Ok(()),
+            Ok(LeaseSelection::Stale) => Err(LeaseCommitRefusal::Stale),
+            Ok(LeaseSelection::Unavailable) | Err(_) => Err(LeaseCommitRefusal::Unavailable),
         }
-        let won = commit();
-        drop(view);
-        Ok(won)
     }
 }

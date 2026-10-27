@@ -10,6 +10,10 @@ use std::sync::{atomic::AtomicU8, OnceLock};
 
 const OPEN: u8 = 0;
 const COMMITTING: u8 = 1;
+/// #716: the hook refused only because its lease's authority was contended.
+/// Nothing was written and nothing is decided: the append waits for the
+/// authority and runs again, and the deadline can still close the gate.
+const CONTENDED: u8 = 6;
 
 /// Stored atomically with closure: later observations cannot change why the
 /// first refusal won, or replace an already-started COMMIT with staleness.
@@ -19,11 +23,39 @@ pub(super) enum GateClosure {
     DeadlineOrCancelled = 2,
     AuthorityUnavailable = 3,
     StaleAuthority = 4,
+    /// #716: the deadline closed the gate while the append was waiting out
+    /// contention for its lease's authority. The authority held the share
+    /// back, not the ledger.
+    AuthorityContended = 5,
+}
+
+impl GateClosure {
+    /// The `closure` field of a refusal's log line, which operators read.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::DeadlineOrCancelled => "deadline-or-cancelled",
+            Self::AuthorityUnavailable => "authority-unavailable",
+            Self::StaleAuthority => "stale-authority",
+            Self::AuthorityContended => "authority-contended",
+        }
+    }
+}
+
+impl From<LeaseCommitRefusal> for GateClosure {
+    fn from(refusal: LeaseCommitRefusal) -> Self {
+        match refusal {
+            LeaseCommitRefusal::Stale => Self::StaleAuthority,
+            LeaseCommitRefusal::Unavailable => Self::AuthorityUnavailable,
+            LeaseCommitRefusal::Contended => Self::AuthorityContended,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GateState {
     Open,
+    /// #716: refused for contention; the append waits for the authority.
+    Contended,
     Committing,
     Closed,
 }
@@ -31,7 +63,11 @@ pub(super) enum GateState {
 /// One-shot arbiter between an append's COMMIT and its acknowledgement
 /// deadline. Both transitions leave `Open` by compare-and-swap, so exactly one
 /// of them wins: an append sends COMMIT only after `begin_commit` succeeds,
-/// and once `close` succeeds it never will.
+/// and once `close` succeeds it never will. A lease fence that finds its
+/// authority contended moves the gate to `Contended` instead (#716), which
+/// decides nothing: `retry_after_contention` reopens it for the append's next
+/// attempt, under the same deadline, or closes it, and the deadline can close
+/// it meanwhile.
 #[derive(Default)]
 pub(super) struct CommitGate {
     state: AtomicU8,
@@ -46,22 +82,74 @@ impl CommitGate {
             ..Self::default()
         }
     }
+
+    /// Whether a lease fence guards this gate, the only kind under which a
+    /// refused append may run again (#716).
+    pub(super) fn fenced(&self) -> bool {
+        self.lease.is_some()
+    }
+
     /// The append's pre-commit hook. `true` lets COMMIT be sent, and records
     /// when it started.
     pub(super) fn begin_commit(&self) -> bool {
         if let Some(lease) = &self.lease {
             return match lease.with_authority(|| self.begin_authorized_commit()) {
                 Ok(won) => won,
+                // #716: contention proves nothing, so it closes nothing. The
+                // append rolls back and waits in `retry_after_contention`,
+                // outside ORDER_LOCK, before it runs again. A gate the
+                // deadline already closed stays closed, and the retry finds
+                // it so.
+                Err(LeaseCommitRefusal::Contended) => {
+                    self.contend();
+                    false
+                }
                 Err(refusal) => {
-                    self.close_for(match refusal {
-                        LeaseCommitRefusal::Stale => GateClosure::StaleAuthority,
-                        LeaseCommitRefusal::Unavailable => GateClosure::AuthorityUnavailable,
-                    });
+                    self.close_for(refusal.into());
                     false
                 }
             };
         }
         self.begin_authorized_commit()
+    }
+
+    /// After an append refused at its hook: whether it may run again under
+    /// this gate (#716). Only a `Contended` gate allows that. This waits for
+    /// the authority, outside `ORDER_LOCK` and any transaction, and checks the
+    /// lease against it: `true` when the lease still authorizes the share and
+    /// the gate reopened, so the next attempt decides at its own hook.
+    /// Otherwise `false`, with the gate closed by the lease's own refusal or
+    /// already by the deadline.
+    pub(super) async fn retry_after_contention(&self) -> bool {
+        let Some(lease) = &self.lease else {
+            return false;
+        };
+        if self.state() != GateState::Contended {
+            return false;
+        }
+        match lease.await_authority().await {
+            Ok(()) => self.reopen(),
+            Err(refusal) => {
+                self.close_for(refusal.into());
+                false
+            }
+        }
+    }
+
+    /// The hook found its lease's authority contended. A gate the deadline
+    /// already closed stays closed.
+    fn contend(&self) -> bool {
+        self.state
+            .compare_exchange(OPEN, CONTENDED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Reopen a contended gate for the append's next attempt, unless the
+    /// deadline closed it first.
+    fn reopen(&self) -> bool {
+        self.state
+            .compare_exchange(CONTENDED, OPEN, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn begin_authorized_commit(&self) -> bool {
@@ -88,13 +176,27 @@ impl CommitGate {
         self.close_for(reason)
     }
 
+    /// Close an open or contended gate. The deadline, or a cancellation, that
+    /// finds the append waiting out contention closes the gate for that
+    /// contention, not for ledger latency (#716); a lease's own refusal after
+    /// the wait closes it for that refusal.
     fn close_for(&self, reason: GateClosure) -> bool {
-        match self
-            .state
-            .compare_exchange(OPEN, reason as u8, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => true,
-            Err(current) => current != COMMITTING,
+        let mut current = OPEN;
+        loop {
+            let closure = match (current, reason) {
+                (CONTENDED, GateClosure::DeadlineOrCancelled) => GateClosure::AuthorityContended,
+                _ => reason,
+            };
+            match self.state.compare_exchange(
+                current,
+                closure as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual @ (OPEN | CONTENDED)) => current = actual,
+                Err(actual) => return actual != COMMITTING,
+            }
         }
     }
 
@@ -103,6 +205,7 @@ impl CommitGate {
             2 => Some(GateClosure::DeadlineOrCancelled),
             3 => Some(GateClosure::AuthorityUnavailable),
             4 => Some(GateClosure::StaleAuthority),
+            5 => Some(GateClosure::AuthorityContended),
             _ => None,
         }
     }
@@ -110,6 +213,7 @@ impl CommitGate {
     pub(super) fn state(&self) -> GateState {
         match self.state.load(Ordering::Acquire) {
             OPEN => GateState::Open,
+            CONTENDED => GateState::Contended,
             COMMITTING => GateState::Committing,
             _ => GateState::Closed,
         }
@@ -227,6 +331,7 @@ mod tests {
             GateClosure::DeadlineOrCancelled,
             GateClosure::AuthorityUnavailable,
             GateClosure::StaleAuthority,
+            GateClosure::AuthorityContended,
         ];
         for first in causes {
             for later in causes {
@@ -234,6 +339,8 @@ mod tests {
                 assert!(gate.close_for(first));
                 assert!(gate.close_for(later));
                 assert!(gate.close());
+                assert!(!gate.contend());
+                assert!(!gate.reopen());
                 assert!(!gate.begin_commit());
                 assert_eq!(gate.closure(), Some(first));
                 assert_eq!(gate.state(), GateState::Closed);
@@ -242,8 +349,49 @@ mod tests {
             let gate = CommitGate::default();
             assert!(gate.begin_commit());
             assert!(!gate.close_for(first));
+            assert!(!gate.contend());
             assert_eq!(gate.closure(), None);
             assert_eq!(gate.state(), GateState::Committing);
+        }
+    }
+
+    /// #716: contention decides nothing. A contended gate is neither
+    /// committing nor closed; it reopens for the append's next attempt, or
+    /// closes, and the deadline closes it for the contention, never for
+    /// ledger latency.
+    #[test]
+    fn a_contended_gate_reopens_or_closes_for_its_contention() {
+        let gate = CommitGate::default();
+        assert!(gate.contend());
+        assert_eq!(gate.state(), GateState::Contended);
+        assert_eq!(gate.closure(), None);
+        assert!(!gate.begin_commit(), "a contended gate admits no COMMIT");
+        assert!(gate.reopen());
+        assert_eq!(gate.state(), GateState::Open);
+        assert!(!gate.reopen());
+        assert!(gate.begin_commit(), "the reopened gate admits the retry");
+        assert!(!gate.close(), "the retry's COMMIT is in flight");
+        assert_eq!(gate.state(), GateState::Committing);
+
+        let gate = CommitGate::default();
+        assert!(gate.contend());
+        assert!(gate.close(), "the deadline closes a contended gate");
+        assert_eq!(gate.closure(), Some(GateClosure::AuthorityContended));
+        assert!(
+            !gate.reopen(),
+            "an attempt after the deadline cannot reopen it"
+        );
+        assert!(!gate.begin_commit());
+        assert!(gate.committing_since().is_none());
+
+        for refusal in [LeaseCommitRefusal::Stale, LeaseCommitRefusal::Unavailable] {
+            let gate = CommitGate::default();
+            assert!(gate.contend());
+            assert!(gate.close_for(refusal.into()));
+            assert_eq!(gate.closure(), Some(refusal.into()));
+            assert!(gate.close(), "the deadline cannot replace the refusal");
+            assert_eq!(gate.closure(), Some(refusal.into()));
+            assert!(!gate.reopen());
         }
     }
 }
