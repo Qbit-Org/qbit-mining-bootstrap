@@ -13,6 +13,7 @@ mod block_solvers;
 mod online;
 mod partition;
 mod share_hashes;
+mod table_locks;
 pub use online::IndexBuildMode;
 pub(super) use online::{apply_online_migration, OnlineMigration};
 pub use share_hashes::ShareHashBackfill;
@@ -21,6 +22,7 @@ pub use share_hashes::{
     Finished as ShareHashBackfillFinished, Pending as ShareHashBackfillPending,
     Throttle as ShareHashThrottle,
 };
+pub(super) use table_locks::migrate_schema_committed;
 
 /// The schema migrations every native start requires, each checked on its
 /// own. Add every new migration file here and to the `required_versions`
@@ -2169,6 +2171,15 @@ fn named_objects(objects: &[String]) -> String {
     }
 }
 
+/// Whether a statement was cancelled by the statement timeout. An
+/// operator's cancel request carries the same SQLSTATE and another message,
+/// and still stops the run. The share-hash backfill's batches and record
+/// (`share_hashes.rs`) and the up-front table locks (`table_locks.rs`) read
+/// it.
+fn statement_timed_out(error: &dyn sqlx::error::DatabaseError) -> bool {
+    error.code().as_deref() == Some("57014") && error.message().contains("statement timeout")
+}
+
 /// The native migrations in the order `migrate_schema` applies them, each
 /// with the version it records. The scratch apply of `release_fingerprint`
 /// runs the same files in the same order, so the reserved set is derived
@@ -2901,8 +2912,12 @@ async fn require_migration_history(connection: &mut sqlx::PgConnection) -> Resul
 /// Apply the base schema and every native migration inside the caller's
 /// transaction, which holds the migration lock throughout. Refusals happen
 /// before any DDL or roll the transaction back, so a refused database is
-/// unchanged. The online migrations (`ONLINE_MIGRATIONS`) are applied here
-/// only for fresh or empty 2.x.x sources under the cutover locks; existing
+/// unchanged. The caller is `migrate_schema_committed`, which commits the
+/// transaction, and rolls it back and runs this again from the start when
+/// it could not lock the migration history or the tables 027 and 028 alter
+/// within 100 ms (`table_locks.rs`). The
+/// online migrations (`ONLINE_MIGRATIONS`) are applied here only for fresh
+/// or empty 2.x.x sources under the cutover locks; existing
 /// native ledgers always return their changes for the caller to apply with
 /// `apply_online_migration` after the commit, and they are recorded then.
 /// `backfill_mode` is what a pending share-hash backfill gets: the caller's
@@ -2920,10 +2935,11 @@ pub(super) async fn migrate_schema(
             .fetch_one(&mut **tx)
             .await?;
     if history_exists {
-        sqlx::query("LOCK TABLE ONLY qbit_prism_schema_migrations IN ACCESS EXCLUSIVE MODE")
-            .execute(&mut **tx)
-            .await
-            .context("refusing qbit_prism_schema_migrations before any DDL: cannot lock the migration-history table for validation")?;
+        // Within 100 ms, or this attempt gives up and is run again, as for
+        // 027's and 028's tables below: a starting frontend reads the
+        // history, and must not queue behind the request for longer
+        // (`table_locks.rs`, #789).
+        table_locks::lock_history(tx).await?;
         require_migration_history(&mut *tx).await?;
     } else {
         sqlx::raw_sql("CREATE TABLE qbit_prism_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())").execute(&mut **tx).await?;
@@ -3470,6 +3486,16 @@ pub(super) async fn migrate_schema(
                 .await?;
         }
     }
+    // 027 and 028 run while earlier frontends may serve the database, as
+    // they do during the 3.1 pre-migrate: every table the pending migrations
+    // of `table_locks::ALTERED` alter is locked first, in one `LOCK TABLE`,
+    // or this attempt gives up and is run again. That statement takes the
+    // tables in list order and keeps the ones it has while it waits for the
+    // next, but for 100 ms at most in all; the files then wait for no other
+    // lock. Why that suffices, as long as the bound stays well under
+    // `deadlock_timeout` and every frontend lock timeout, is in
+    // `table_locks.rs`'s docs (#789).
+    table_locks::lock_altered_tables(tx, &versions).await?;
     if !versions.contains(&27) {
         // 3.1 dual writer (D1): origin_node on every copied table, the
         // non-share streams' pull order, the node-role row and the peer

@@ -392,15 +392,13 @@ impl Ledger {
             .connect(url)
             .await?;
         if initialize {
-            let mut tx = begin(&pool, metrics.as_deref()).await?;
-            let online = migration::migrate_schema(
-                &mut tx,
+            let online = migration::migrate_schema_committed(
+                &pool,
                 &instance_id,
                 options.share_hashes,
                 metrics.as_deref(),
             )
             .await?;
-            tx.commit().await?;
             // 002's share-hash backfill on a populated 2.x.x source, then the
             // index rebuilds and the partition conversion, run after the
             // commit, outside the migration transaction: the backfill in
@@ -800,7 +798,7 @@ async fn lock_with_scope(
 /// `pool/mod.rs`), so it is a drop-in replacement down to the error type. Only
 /// `acquire` is timed: the `BEGIN` round trip stays outside the timer, so these
 /// observations keep the same meaning as the metrics collector's own.
-async fn begin(
+pub(super) async fn begin(
     pool: &PgPool,
     metrics: Option<&Metrics>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
