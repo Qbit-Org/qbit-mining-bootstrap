@@ -239,7 +239,7 @@ fn native_rules_reference_only_inventory_families_for_their_role() {
                     matches!(
                         rule["uid"].as_str().unwrap(),
                         "qbit-prism-database-advisory-lock-wait"
-                            | "qbit-prism-database-advisory-lock-failures-critical"
+                            | "qbit-prism-advisory-lock-failures-crit"
                     ),
                     "rule {} may not read {name}",
                     rule["title"]

@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 9436a7246611e8a13adcdd2c242ea6d4bf2c6aae82db55913745395eefd11d3d
++   Specification SHA-256: 46185c4e8a013a93a9368f08b570e7f6a78b251e681a5435671ef405f68bb652
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -400,7 +400,7 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
-+    "uid": "qbit-prism-pool-resubmission-reject-ratio",
++    "uid": "qbit-prism-pool-resubmit-reject-ratio",
 +    "title": "PrismPoolResubmissionRejectRatioHigh",
 +    "expr": "((sum by (network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",reason_id=~\"duplicate-share|unknown-job|stale-job\"}[5m]) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))) / sum by (network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]))) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)))) > bool 0.05) and on(network) (sum by (network) ((sum by (job, instance, network) (increase(qbit_prism_accepted_shares_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) + sum by (job, instance, network) (increase(qbit_prism_rejections_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]))) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))) >= 500)",
 +    "condition_type": "threshold",
@@ -655,7 +655,7 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
-+    "uid": "qbit-prism-candidate-landing-failed-critical",
++    "uid": "qbit-prism-candidate-landing-failed-crit",
 +    "title": "PrismBlockCandidateLandingFailedCritical",
 +    "expr": "(qbit_prism_block_candidate_oldest_landing_failed_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool 307) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0)) and on(job, instance, network) (qbit_prism_collector_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",collector=\"database\"} == 1)",
 +    "condition_type": "threshold",
@@ -730,7 +730,7 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
-+    "uid": "qbit-prism-block-offer-standby-unconfirmed",
++    "uid": "qbit-prism-offer-standby-unconfirmed",
 +    "title": "PrismBlockOfferStandbyUnconfirmed",
 +    "expr": "(sum by (job, instance, network) (increase(qbit_prism_block_offer_standby_wait_total{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",outcome=~\"absent|lagging|failed\"}[30m])) > bool 0) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
 +    "condition_type": "threshold",
@@ -784,7 +784,7 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
-+    "uid": "qbit-prism-database-advisory-lock-failures-critical",
++    "uid": "qbit-prism-advisory-lock-failures-crit",
 +    "title": "PrismDatabaseAdvisoryLockFailuresCritical",
 +    "expr": "((sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\",result=\"failure\"}[5m])) / sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\"}[5m])) > bool 0.05) and on(job, instance, network, lock) (sum by (job, instance, network, lock) (increase(qbit_prism_database_advisory_lock_wait_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",lock=~\"order|settlement\"}[5m])) >= 10)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
 +    "condition_type": "threshold",
@@ -893,7 +893,7 @@
 +    "exec_err_state": "Alerting"
 +  },
 +  {
-+    "uid": "qbit-prism-revision-work-pending-critical",
++    "uid": "qbit-prism-revision-work-pending-crit",
 +    "title": "PrismAcceptedRevisionWorkPendingCritical",
 +    "expr": "((qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= bool 307) and on(job, instance, network) (qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} >= 0)) and on(job, instance, network) (qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} > 0) and on(job, instance, network) (up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1)",
 +    "condition_type": "threshold",
