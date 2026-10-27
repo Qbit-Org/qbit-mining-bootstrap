@@ -1010,6 +1010,12 @@ impl Coordinator {
         (capped, log_path): (BlockAckPath, &'static str),
     ) -> SaveOutcome {
         loop {
+            // A bound already past, as for a capture whose append committed
+            // in the share grace (#657), starts no poll: its answer would
+            // arrive too late to use.
+            if tokio::time::Instant::now() >= bound {
+                break;
+            }
             // Observe credit and disposition in one MVCC snapshot so
             // finalization cannot fall between two separate reads. The credit
             // this polls for is written by the reconciliation of the block
@@ -1017,16 +1023,30 @@ impl Coordinator {
             // leaves and carries the same probe floor as the probe above:
             // without it, every poll of this loop would descend one per-leaf
             // `share_id` index per attached partition.
-            let poll = tokio::time::timeout_at(bound, async {
-                sqlx::query_as::<_, (bool, Option<String>, Option<String>, Option<String>)>(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
-                )
-                .bind(share_id)
-                .bind(block_hash)
-                .fetch_one(&mut *self.ledger.acquire().await?)
+            //
+            // Each poll runs in its own task, as the probe and enqueue do, and
+            // only the wait for it is bounded. A bound that fell inside the
+            // poll's checkout, during the pool's probe of an idle connection
+            // or a new connection's setup, would drop that connection with
+            // its reply unread: the server sees a reset and the pool loses a
+            // healthy connection. Past the bound the poll finishes on its own
+            // and returns its connection.
+            let poll = tokio::spawn({
+                let ledger = self.ledger.clone();
+                let (share_id, block_hash) = (share_id.to_owned(), block_hash.to_owned());
+                async move {
+                    sqlx::query_as::<_, (bool, Option<String>, Option<String>, Option<String>)>(
+                        "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor()), (SELECT state FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT offer_outcome FROM qbit_block_candidate_outbox WHERE block_hash=$2), (SELECT last_error FROM qbit_block_candidate_outbox WHERE block_hash=$2)",
+                    )
+                    .bind(share_id)
+                    .bind(block_hash)
+                    .fetch_one(&mut *ledger.acquire().await?)
+                    .await
+                }
+            });
+            let poll = tokio::time::timeout_at(bound, poll)
                 .await
-            })
-            .await;
+                .map(|joined| anyhow::Ok(joined??));
             match poll {
                 Err(_) => break,
                 Ok(Ok((true, _, _, _))) => return SaveOutcome::Accepted,

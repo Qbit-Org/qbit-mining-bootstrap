@@ -535,7 +535,6 @@ async fn block_only_poll_checkout_cancel_and_deadline_stay_unknown() -> Result<(
             let mut persist = Box::pin(h.persist(start));
             let held = first_poll(h, &mut persist).await?;
             let before = counts(h.metrics());
-            let sum = sample(h.metrics(), "failure", "sum");
             tokio::time::pause();
             let resume = ResumeClock;
             tokio::time::advance(Duration::from_millis(50)).await;
@@ -543,10 +542,13 @@ async fn block_only_poll_checkout_cancel_and_deadline_stay_unknown() -> Result<(
             assert_eq!(counts(h.metrics()), before);
             tokio::time::advance(Duration::from_millis(75)).await;
             drop(persist);
-            assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
-            assert!((sample(h.metrics(), "failure", "sum") - sum - 0.075).abs() < 0.000001);
+            // The poll runs in a task the submission does not own, so a
+            // cancelled submission leaves its checkout waiting, not failed,
+            // and the poll still completes.
+            assert_eq!(counts(h.metrics()), before);
             drop(resume);
             drop(held);
+            wait_counts(h.metrics(), (before.0 + 1., before.1)).await?;
             let deferred: Value = sqlx::query_scalar(
                 "SELECT share FROM qbit_prism_deferred_shares WHERE block_hash=$1",
             )
@@ -584,9 +586,12 @@ async fn block_only_poll_checkout_cancel_and_deadline_stay_unknown() -> Result<(
                     ..
                 }
             ));
-            assert_eq!(counts(h.metrics()), (before.0, before.1 + 1.));
+            // The bound ends only the wait: the poll's checkout is not
+            // cancelled with it, and completes once the slot is free.
+            assert_eq!(counts(h.metrics()), before);
             drop(resume);
             drop(held);
+            wait_counts(h.metrics(), (before.0 + 1., before.1)).await?;
             Ok(())
         })
     })
@@ -721,9 +726,12 @@ async fn block_only_poll_missing_and_sql_error_stay_unknown() -> Result<()> {
                     panic!("nonterminal: {answer:?}")
                 };
                 assert_eq!(phase, expected_phase);
-                assert_eq!(counts(h.metrics()), (before.0 + 1., before.1 + 1.));
+                // The poll still waiting for the slot at the bound is not
+                // cancelled with the answer; it checks out once released.
+                assert_eq!(counts(h.metrics()), (before.0 + 1., before.1));
                 drop(resume);
                 drop(held);
+                wait_counts(h.metrics(), (before.0 + 2., before.1)).await?;
                 drop(tokio::time::timeout(WAIT, h.ledger().pool.acquire()).await??);
                 Ok(())
             })
