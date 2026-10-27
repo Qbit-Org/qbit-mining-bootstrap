@@ -1,14 +1,14 @@
 # qbit-mining-bootstrap 3.x.x development line
 
 Release date: none. This note describes the `3.x.x` line as a whole, not
-one release. Its releases are [3.0.0](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/doc/release-notes-3.0.0.md),
-cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md), cut on this
-branch.
+one release. Its releases are [3.0.0](release-notes-3.0.0.md),
+cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md), cut on
+`3.x.x`.
 
 ## Status
 
 `3.x.x` is the production line, and 3.1.0 is its current release. Deploy
-3.1.0 from the `v3.1.0` tag, not from the branch head, which moves on after
+3.1.0 from the `v3.1.0` tag, not from the `3.x.x` head, which moves on after
 the release. 3.0.0 is on the `3.0.x` branch, which starts at `4c134913`; 3.1.0
 contains everything it adds to 3.0.0-rc.6. The previous production line is
 `2.x.x`, whose tip is version 2.0.2 (see `release-notes-2.0.2.md`); the
@@ -134,9 +134,8 @@ they fixed or configured no longer exists on this line:
   [3.0.0-rc.4](release-notes-3.0.0-rc.4.md),
   [3.0.0-rc.5](release-notes-3.0.0-rc.5.md) and
   [3.0.0-rc.6](release-notes-3.0.0-rc.6.md)). 3.0.0 was cut from the
-  `3.0.x` branch, which isn't an ancestor of 3.1.0, and its notes are
-  there; this branch's `doc/release-notes-3.0.0.md` still
-  records only the D5 recovery contract. #291 keeps the rollout record: the
+  `3.0.x` branch, which isn't an ancestor of 3.1.0
+  ([its notes](release-notes-3.0.0.md)). #291 keeps the rollout record: the
   cutover qualification and the go/no-go.
 - Native candidate recovery (#268) landed with #439.
 
@@ -154,7 +153,7 @@ numbered procedures and exact queries in `docs/prism-rust-migration.md` and
 `docs/prism-ledger-ops.md`, and enforces audit import through production
 `self-check`. #291 tracks the rehearsal on production-sized history and its
 restore and import timings. The
-[3.0.0 notes](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v3.0.0/doc/release-notes-3.0.0.md#migration-and-recovery-d5)
+[3.0.0 notes](release-notes-3.0.0.md#migration-and-recovery-d5)
 record the same data-loss boundary:
 
 > Before the first native share is acknowledged, restore the complete
