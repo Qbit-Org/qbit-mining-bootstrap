@@ -421,7 +421,16 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
-          $ref: "#/components/responses/NotFound"
+          description: >
+            No public artifact has this SHA-256, or it is a legacy audit bundle
+            whose body is not on the serving host yet (message `audit bundle
+            body is not retrievable`) until the migration stores its canonical
+            bytes. Sent with `Cache-Control: no-store` and never cached, so a
+            later request can succeed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           $ref: "#/components/responses/UpstreamUnavailable"
   /mining-configuration:

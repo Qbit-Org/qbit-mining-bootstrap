@@ -107,9 +107,11 @@ production `self-check` fails at audit completeness and skips its other checks
 (#734). `scripts/prism_legacy_import_admission_gate.sh` checks every other fact
 `self-check` checks, against the frontend's own environment on each host. It
 reports legacy completeness as pending, and fails on any incomplete native
-audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
-for an audit whose 2.x body can't be read on that host (#735), and the block's
-audit view answers 404.
+audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers a
+`no-store` 404 for an audit whose 2.x body file isn't on that host, as the
+block's audit view does (#735). A body file that is there but can't be read or
+verified still answers 500, and so does a 2.x audit-bundle.v2 body until 3.x
+can verify it (#731): expect those 500s on a host that holds the 2.x bodies.
 
 The gate's carry-forward integrity check runs the same report `self-check`
 runs. At production size it took about a minute before migration 026 (#737).

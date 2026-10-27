@@ -152,6 +152,72 @@ pub(super) async fn audit_payouts(state: &ApiState, hash: &str) -> ApiResult<Val
     )
 }
 pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiResult<Value> {
+    bundle_with(state, id, commitment, LegacyBodyError::for_audit).await
+}
+/// The message of a legacy body that is not at its recorded location.
+const BODY_NOT_RETRIEVABLE: &str = "audit bundle body is not retrievable";
+/// Why a legacy body could not be served from its recorded `body_uri`.
+enum LegacyBodyError {
+    /// The body, or a share segment it names, is not at its recorded location.
+    Absent,
+    /// A body is there but could not be read, parsed or proven.
+    Fault {
+        message: &'static str,
+        error: String,
+    },
+    Internal,
+}
+impl LegacyBodyError {
+    fn io(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Self::Absent
+        } else {
+            Self::fault(BODY_NOT_RETRIEVABLE, error)
+        }
+    }
+    /// A share segment named by a v2 or body-ref envelope is absent the same
+    /// way; every other envelope failure is a fault.
+    fn parse(error: qbit_prism::AuditBodyRefError) -> Self {
+        match error {
+            qbit_prism::AuditBodyRefError::Io(error) => Self::io(error),
+            error => Self::fault(BODY_NOT_RETRIEVABLE, error),
+        }
+    }
+    fn fault(message: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Fault {
+            message,
+            error: error.to_string(),
+        }
+    }
+    /// The audit routes answer 404 for any legacy body they cannot serve.
+    fn for_audit(self) -> ApiError {
+        match self {
+            Self::Absent => ApiError::missing(BODY_NOT_RETRIEVABLE),
+            Self::Fault { message, .. } => ApiError::missing(message),
+            Self::Internal => ApiError::internal(),
+        }
+    }
+    /// A public artifact answers 404 only for a body that is not there, as
+    /// before `import-audits` stores the row (#735). A body that is there but
+    /// cannot be read or proven is a server fault, and so is a 2.x v2 body
+    /// this build cannot verify yet (#731).
+    fn for_artifact(self) -> ApiError {
+        match self {
+            Self::Absent => ApiError::missing(BODY_NOT_RETRIEVABLE),
+            Self::Fault { message, error } => {
+                tracing::warn!(%error, reason = message, "legacy audit body cannot be served");
+                ApiError::internal()
+            }
+            Self::Internal => ApiError::internal(),
+        }
+    }
+}
+async fn bundle_with(
+    state: &ApiState,
+    id: &str,
+    commitment: bool,
+    body_error: fn(LegacyBodyError) -> ApiError,
+) -> ApiResult<Value> {
     let sql = if commitment {
         include_str!("queries/audit_bundle_by_commitment.sql")
     } else {
@@ -251,33 +317,40 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
             .as_str()
             .ok_or_else(ApiError::internal)?
             .to_string();
-        value["audit_bundle"] = tokio::task::spawn_blocking(move || -> ApiResult<Value> {
+        let read = tokio::task::spawn_blocking(move || {
             let path = std::path::Path::new(uri.strip_prefix("file://").unwrap_or(&uri));
-            let bytes = std::fs::read(path)
-                .map_err(|_| ApiError::missing("audit bundle body is not retrievable"))?;
-            let body: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| ApiError::missing("audit bundle body is not valid JSON"))?;
+            let bytes = std::fs::read(path).map_err(LegacyBodyError::io)?;
+            let body: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                LegacyBodyError::fault("audit bundle body is not valid JSON", error)
+            })?;
             if matches!(
                 body["schema"].as_str(),
                 Some(qbit_prism::AUDIT_BODY_REF_SCHEMA | qbit_prism::AUDIT_BUNDLE_V2_SCHEMA)
             ) {
                 let parsed = qbit_prism::parse_audit_bundle_value(body, path.parent())
-                    .map_err(|_| ApiError::missing("audit bundle body is not retrievable"))?;
+                    .map_err(LegacyBodyError::parse)?;
                 let canonical = qbit_prism::canonical_audit_bundle_bytes(&parsed)
-                    .map_err(|_| ApiError::internal())?;
+                    .map_err(|_| LegacyBodyError::Internal)?;
                 if hex::encode(Sha256::digest(&canonical)) != expected {
-                    return Err(ApiError::missing("audit bundle body hash mismatch"));
+                    return Err(LegacyBodyError::fault(
+                        "audit bundle body hash mismatch",
+                        "canonical bytes differ from audit_bundle_sha256",
+                    ));
                 }
-                serde_json::to_value(parsed).map_err(|_| ApiError::internal())
+                serde_json::to_value(parsed).map_err(|_| LegacyBodyError::Internal)
             } else {
                 if hex::encode(Sha256::digest(&bytes)) != expected {
-                    return Err(ApiError::missing("audit bundle body hash mismatch"));
+                    return Err(LegacyBodyError::fault(
+                        "audit bundle body hash mismatch",
+                        "body bytes differ from audit_bundle_sha256",
+                    ));
                 }
                 Ok(body)
             }
         })
         .await
-        .map_err(|_| ApiError::internal())??;
+        .map_err(|_| ApiError::internal())?;
+        value["audit_bundle"] = read.map_err(body_error)?;
     }
     let object = value.as_object_mut().unwrap();
     for internal in [
@@ -380,7 +453,7 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
         return Ok(Payload::addressed(canonical, hash));
     }
     let mut payload = Payload::json(
-        bundle(state, &block_hash, false)
+        bundle_with(state, &block_hash, false, LegacyBodyError::for_artifact)
             .await
             .map_err(artifact_fallback_error)?["audit_bundle"]
             .take(),
@@ -401,10 +474,12 @@ pub(super) async fn artifact(state: &ApiState, hash: &str) -> ApiResult<Value> {
     .fetch_optional(&state.pool)
     .await?;
     if let Some(hash) = hash {
-        return Ok(bundle(state, &hash, false)
-            .await
-            .map_err(artifact_fallback_error)?["audit_bundle"]
-            .take());
+        return Ok(
+            bundle_with(state, &hash, false, LegacyBodyError::for_artifact)
+                .await
+                .map_err(artifact_fallback_error)?["audit_bundle"]
+                .take(),
+        );
     }
     Err(ApiError::missing("unknown public PRISM artifact"))
 }
@@ -414,8 +489,11 @@ fn audit_read_error(error: anyhow::Error) -> ApiError {
         Err(_) => ApiError::internal(),
     }
 }
+/// A not_found reaching here is proven absence: the row went away after it
+/// was found, or its legacy body is not at its recorded location. Every other
+/// legacy body failure was made internal by `LegacyBodyError::for_artifact`.
 fn artifact_fallback_error(error: ApiError) -> ApiError {
-    if error.code == "read_timeout" {
+    if matches!(error.code, "read_timeout" | "not_found") {
         error
     } else {
         ApiError::internal()

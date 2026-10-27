@@ -19,6 +19,7 @@ qbit-prism-server::api_2x::chart_rollups_match_raw_for_every_range_bucket_and_wa
 qbit-prism-server::api_2x::chart_rollups_read_only_the_partial_buckets_under_any_plan
 qbit-prism-server::api_2x::content_addressed_bytes_and_legacy_fallback_headers_are_exact
 qbit-prism-server::api_2x::fixture_migrations_do_not_share_advisory_locks
+qbit-prism-server::api_2x::legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_500
 qbit-prism-server::api_2x::public_service_is_read_only_and_bounds_http_database_work
 qbit-prism-server::api_database::accepted_public_blocks_and_earnings_follow_confirmed_chain_state
 qbit-prism-server::api_database::shared_database_serves_all_contracts_and_global_reward_ranks

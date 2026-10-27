@@ -499,6 +499,113 @@ async fn content_addressed_bytes_and_legacy_fallback_headers_are_exact() -> Resu
     f.close(result).await
 }
 
+/// #735: a legacy artifact whose body is not at its recorded location yet
+/// answers a 404 that no cache keeps and no 5xx count sees; a body that is
+/// there but cannot be read or proven still answers 500. The block's audit
+/// view keeps answering 404 with its own messages.
+#[tokio::test]
+async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_500() -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result=async {
+        let at=chrono::Utc::now().timestamp()-10;
+        let(app,service)=public_service::router(f.state(true),ServiceConfig::default());
+        service.probe_once().await;
+        let audit=api::router(f.state(false));
+        let immutable=|status:StatusCode,headers:&HeaderMap,hash:&str|->Result<()>{
+            ensure!(status==StatusCode::OK&&headers["etag"]==format!("\"{hash}\""),"{status}: {headers:?}");
+            ensure!(headers["cache-control"]=="public, max-age=0, must-revalidate","{headers:?}");
+            for header in ["cdn-cache-control","vercel-cdn-cache-control"] {
+                ensure!(headers[header]=="public, max-age=86400, stale-while-revalidate=86400, immutable","{header}: {headers:?}");
+            }
+            ensure!(headers["x-prism-staleness-budget-seconds"]=="unbounded"&&!headers.contains_key("x-prism-artifact-canonical-state"),"{headers:?}");
+            Ok(())
+        };
+        let absent=|(status,headers,body):(StatusCode,HeaderMap,Value)|->Result<()>{
+            ensure!(status==StatusCode::NOT_FOUND&&body==json!({"schema":"prism.dashboard.error.v1","error":{"code":"not_found","message":"audit bundle body is not retrievable","request_id":null}}),"{status}: {body}");
+            ensure!(headers["cache-control"]=="no-store","{headers:?}");
+            for header in ["cdn-cache-control","vercel-cdn-cache-control","etag"] {
+                ensure!(!headers.contains_key(header),"a 404 carries {header}: {headers:?}");
+            }
+            ensure!(!headers.values().any(|value|value.to_str().is_ok_and(|value|value.contains("immutable"))),"{headers:?}");
+            Ok(())
+        };
+        let fault=|(status,headers,body):(StatusCode,HeaderMap,Value)|->Result<()>{
+            ensure!(status==StatusCode::INTERNAL_SERVER_ERROR&&body["error"]["code"]=="internal_error","{status}: {body}");
+            ensure!(headers["cache-control"]=="no-store"&&!headers.contains_key("cdn-cache-control"),"{headers:?}");
+            Ok(())
+        };
+        // A stored artifact keeps today's immutable answer.
+        let stored=f.block(1,101,"confirmed",at).await?;
+        let canonical=b"{\"z\":3,\"a\":1,\"schema\":\"historical\"}";
+        let stored_hash=hex::encode(Sha256::digest(canonical));
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,canonical_audit_bytes,coinbase_tx_hex) VALUES($1,$2,$3,$4,'00')")
+            .bind(&stored).bind(json!({"z":3,"a":1,"schema":"historical"})).bind(&stored_hash).bind(canonical.as_slice()).execute(&f.pool).await?;
+        let(status,headers,body)=raw_get(&app,&format!("/public/v1/artifacts/{stored_hash}")).await;
+        ensure!(body==canonical);immutable(status,&headers,&stored_hash)?;
+        // Corrupt stored canonical bytes are a server fault.
+        let corrupt=f.block(3,103,"confirmed",at).await?;
+        let corrupt_hash=hex::encode(Sha256::digest(b"never stored"));
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,canonical_audit_bytes,coinbase_tx_hex) VALUES($1,'{}',$2,'{}'::bytea,'00')")
+            .bind(&corrupt).bind(&corrupt_hash).execute(&f.pool).await?;
+        fault(get(&app,&format!("/public/v1/artifacts/{corrupt_hash}")).await)?;
+        // A legacy row that `import-audits` has not stored, whose body is not
+        // on this host yet.
+        let legacy=f.block(2,102,"confirmed",at).await?;
+        let body=b"{\"schema\":\"historical\",\"legacy\":true}";
+        let hash=hex::encode(Sha256::digest(body));
+        let dir=tempfile::tempdir()?;
+        let file=dir.path().join("legacy-audit.json");
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle_sha256,body_uri,coinbase_tx_hex) VALUES($1,$2,$3,'00')")
+            .bind(&legacy).bind(&hash).bind(format!("file://{}",file.display())).execute(&f.pool).await?;
+        let path=format!("/public/v1/artifacts/{hash}");
+        let view=format!("/audit/blocks/{legacy}/bundle");
+        let audit_view=|message:&'static str|{let audit=audit.clone();let view=view.clone();async move{
+            let(status,_,body)=get(&audit,&view).await;
+            ensure!(status==StatusCode::NOT_FOUND&&body["error"]==message,"{status}: {body}");
+            Ok::<_,anyhow::Error>(())
+        }};
+        // Asked twice: the first 404 is not kept by the origin cache.
+        absent(get(&app,&path).await)?;absent(get(&app,&path).await)?;
+        audit_view("audit bundle body is not retrievable").await?;
+        // A body-ref envelope whose share segment is not there is absent too.
+        std::fs::write(&file,serde_json::to_vec(&json!({"schema":"qbit.prism.audit-body-ref.v1","audit_bundle_sha256":hash,"share_count":1,"bundle_without_shares":{},"share_parts":[{"kind":"segment","first_share_seq":1,"last_share_seq":1,"share_count":1,"sha256":"0".repeat(64),"body_uri":"segment.json"}]}))?)?;
+        absent(get(&app,&path).await)?;
+        audit_view("audit bundle body is not retrievable").await?;
+        // A segment that is there but does not prove is a fault.
+        std::fs::write(dir.path().join("segment.json"),b"{}")?;
+        fault(get(&app,&path).await)?;
+        audit_view("audit bundle body is not retrievable").await?;
+        // So are a body that is not JSON, one that is not the advertised
+        // body, and one that cannot be read.
+        std::fs::write(&file,b"not json")?;
+        fault(get(&app,&path).await)?;
+        audit_view("audit bundle body is not valid JSON").await?;
+        std::fs::write(&file,b"{\"schema\":\"historical\",\"legacy\":false}")?;
+        fault(get(&app,&path).await)?;
+        audit_view("audit bundle body hash mismatch").await?;
+        std::fs::remove_file(&file)?;std::fs::create_dir(&file)?;
+        fault(get(&app,&path).await)?;
+        audit_view("audit bundle body is not retrievable").await?;
+        std::fs::remove_dir(&file)?;
+        // Once the body arrives, the same address serves it at once.
+        std::fs::write(&file,body)?;
+        let(status,headers,served)=raw_get(&app,&path).await;
+        ensure!(status==StatusCode::OK&&serde_json::from_slice::<Value>(&served)?==serde_json::from_slice::<Value>(body)?&&headers["cache-control"]=="no-store"&&headers["x-prism-artifact-canonical-state"]=="missing","{status}: {headers:?}");
+        // And once `import-audits` stores it, as immutably as any artifact.
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=$2 WHERE block_hash=$1").bind(&legacy).bind(body.as_slice()).execute(&f.pool).await?;
+        let(status,headers,served)=raw_get(&app,&path).await;
+        ensure!(served==body);immutable(status,&headers,&hash)?;
+        // Only the faults count toward the 5xx alert.
+        let(_,_,metrics)=raw_get(&app,"/metrics").await;
+        let metrics=String::from_utf8(metrics)?;
+        ensure!(metrics.contains("qbit_prism_public_responses_total{status=\"404\"} 3\n")&&metrics.contains("qbit_prism_public_responses_total{status=\"500\"} 5\n"),"{metrics}");
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    f.close(result).await
+}
+
 /// Holding a fixture's migration key must not block another fixture's setup.
 #[tokio::test]
 async fn fixture_migrations_do_not_share_advisory_locks() -> Result<()> {
