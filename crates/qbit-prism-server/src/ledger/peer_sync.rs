@@ -1410,6 +1410,20 @@ impl Ledger {
     ) -> Result<Applied> {
         let mut applied = Applied::default();
         let mut tx = self.begin().await?;
+        if batch.count > 0 || array_len(&batch.templates) > 0 || array_len(&batch.balances) > 0 {
+            // Fence blob GC as `save_compact_prepared` does, before any blob
+            // is inserted or found held, through the commit: the collector
+            // deletes, under the cluster row FOR UPDATE, every blob no
+            // committed job names, and `ON CONFLICT DO NOTHING` locks no held
+            // blob. It then either commits first, and the inserts below put
+            // the blobs back, or scans after these jobs are visible. No
+            // advisory lock may follow this fence (the collector takes
+            // SETTLEMENT and ORDER before it), and none does: the job insert
+            // names `sync_seq`, so its barrier-taking default never runs.
+            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE")
+                .fetch_one(&mut *tx)
+                .await?;
+        }
         for (table, key, documents, compared) in [
             (
                 "qbit_prism_templates",
