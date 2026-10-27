@@ -97,12 +97,13 @@ will take patch releases. Preserve subsequent development and resolve metadata
 and notes deliberately; do not reset or force-push the shared branch. Run its
 checks before merging.
 
-For 3.0.0 and 3.1.0 this step is still outstanding and required: neither
-`3.x.x` nor `3.0.x` has merged a released `main`. Both lack this guide, the
-README banner and #781's disposition-poll change; `3.0.x` also lacks its
-tokio update. `3.x.x` also
-lacks the local copy of the released 3.0.0 notes. The next release from
-either branch must not drop them.
+For 3.1.0 and 3.0.0 this step merges the released `main` (`b9187551`, #783)
+into `3.x.x`, and `main` at `b9579c67` into `3.0.x`. That commit is 3.0.0's
+promotion (#778) plus #781, before 3.1.0's, because a 3.0 patch branch must
+not take the 3.1 dual writer. Both branches gain this guide, the README banner
+and #781's disposition-poll change. `3.0.x` also gains #781's tokio update,
+and `3.x.x` the released 3.0.0 notes in place of its pre-release copy. The
+next release from either branch must not drop them.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization
