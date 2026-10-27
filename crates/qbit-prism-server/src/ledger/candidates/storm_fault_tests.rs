@@ -905,6 +905,7 @@ fn fixture_config(database_url: &str, rpc_url: &str) -> Config {
         version_mask: codec::VERSION_ROLLING_MASK,
         audit_bind: "127.0.0.1".into(),
         audit_port: 0,
+        dual_writer: None,
     }
 }
 

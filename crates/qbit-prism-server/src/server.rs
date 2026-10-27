@@ -3,16 +3,26 @@ use crate::{
     config::{self, Config},
     coordinator::Coordinator,
     ledger::{HeartbeatHealth, HeartbeatStatus},
-    listen::{bind_listener, HTTP_LISTEN_BACKLOG},
+    listen::{bind_listener, reserve_address, ReservedAddress, HTTP_LISTEN_BACKLOG},
     metrics::{self, TaskKind},
-    stratum::{run_listener, StratumConfig, StratumStats},
+    readiness::{
+        admission::{Admission, AdmissionChange, AdmissionSignal},
+        dual_writer::{DualWriterReport, WriterPath},
+        endpoint,
+    },
+    stratum::{run_gated_listener, run_listener, StratumConfig, StratumStats},
 };
 use anyhow::{Context, Result};
 use std::{
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    net::{TcpListener, ToSocketAddrs},
+    sync::watch,
+    task::JoinSet,
+};
 
 const BLOB_PRUNE_BUDGET: Duration = Duration::from_secs(5);
 
@@ -30,19 +40,27 @@ pub async fn run(config: Config) -> Result<()> {
     // because it serves the coordinator's ledger.
     let highdiff = stratum_config.highdiff_config()?;
     let mut api_config = ApiConfig::from_env()?;
-    let primary = bind_listener(
+    // 3.1: the readiness endpoint (decision D-7) and the grace that it and
+    // the dual-writer Stratum gate decide admission with.
+    let readiness_endpoint = endpoint::EndpointConfig::from_env()?;
+    let admission_grace = crate::readiness::admission::grace_from_env()?;
+    // 3.1: a dual-writer frontend binds its Stratum addresses without
+    // listening; they accept connections only while it admits miners.
+    let gated = config.dual_writer.is_some();
+    let primary = StratumAddress::bind(
         (
             config::value("PRISM_STRATUM_BIND", "127.0.0.1"),
             config::number("PRISM_STRATUM_PORT", 3340u16)?,
         ),
         stratum_config.listen_backlog,
+        gated,
     )
     .await
     .context("bind primary Stratum listener")?;
     // The kernel caps every listen backlog at the namespace's somaxconn
     // without an error, so say what the Stratum listeners actually got.
     let somaxconn = crate::listen::somaxconn();
-    tracing::info!(address=%primary.local_addr()?,instance=%config.instance_id,workers=config.runtime_workers,listen_backlog=stratum_config.listen_backlog,somaxconn=?somaxconn,"PRISM listening");
+    tracing::info!(address=%primary.local_addr()?,instance=%config.instance_id,workers=config.runtime_workers,listen_backlog=stratum_config.listen_backlog,somaxconn=?somaxconn,gated,"PRISM listening");
     if let Some(cap) = somaxconn.filter(|cap| *cap < stratum_config.listen_backlog) {
         tracing::warn!(
             requested = stratum_config.listen_backlog,
@@ -52,13 +70,14 @@ pub async fn run(config: Config) -> Result<()> {
     }
     let high_listener = if highdiff.is_some() {
         Some(
-            bind_listener(
+            StratumAddress::bind(
                 (
                     config::optional("PRISM_STRATUM_HIGHDIFF_BIND")
                         .unwrap_or_else(|| config::value("PRISM_STRATUM_BIND", "127.0.0.1")),
                     config::number("PRISM_STRATUM_HIGHDIFF_PORT", 4334u16)?,
                 ),
                 stratum_config.listen_backlog,
+                gated,
             )
             .await
             .context("bind high difficulty Stratum listener")?,
@@ -66,6 +85,32 @@ pub async fn run(config: Config) -> Result<()> {
     } else {
         None
     };
+    let readiness_listener = match &readiness_endpoint {
+        Some(endpoint) => Some(
+            bind_listener((endpoint.bind.as_str(), endpoint.port), HTTP_LISTEN_BACKLOG)
+                .await
+                .context("bind readiness endpoint listener")?,
+        ),
+        None => None,
+    };
+    // Gated, an address that could never listen beside another still binds
+    // beside it (SO_REUSEADDR, not listening yet), and its listen would fail
+    // only once admitted, taking the frontend down. Refuse such pairs here,
+    // before the coordinator writes cluster state, as 3.0's eager listen does;
+    // the audit listener, bound after the coordinator as in 3.0, is checked
+    // where it binds.
+    let mut gated_addresses = Vec::new();
+    if gated {
+        gated_addresses.push(("primary Stratum", primary.local_addr()?));
+        if let Some(high) = &high_listener {
+            gated_addresses.push(("high difficulty Stratum", high.local_addr()?));
+        }
+    }
+    let readiness_address = match &readiness_listener {
+        Some(listener) => vec![("readiness endpoint", listener.local_addr()?)],
+        None => Vec::new(),
+    };
+    refuse_listen_conflicts(&gated_addresses, &readiness_address)?;
     let registry = Arc::new(metrics::Metrics::default());
     // #291: 0 from the start with the switch off. With it on, unknown until
     // the first health publication has read the cluster's hold (#664).
@@ -78,6 +123,62 @@ pub async fn run(config: Config) -> Result<()> {
         move || stats.accepted_submissions()
     });
     let coordinator = Coordinator::new(config, registry.clone()).await?;
+    // 3.1 dual writer. A frontend never personalises its database
+    // (`node-identity set` does, CONTRACT D-9): it checks it. A database
+    // personalised as this node whose defaults or key sequences have been
+    // changed since would write rows under the wrong identity, so it is
+    // refused. One not personalised, or personalised as the other node, is
+    // reported: the frontend runs, but the peer sync refuses to start and the
+    // frontend never becomes ready. A single writer refuses a database that
+    // has run as a dual-writer node, unless the rollback says so (D-12).
+    // A dual writer, or a single writer on a personalised database, sweeps
+    // the rollups as a dual writer does.
+    let dual_writer_sweep = match &coordinator.config.dual_writer {
+        Some(dual) => {
+            let node = dual.identity.node;
+            match coordinator.ledger.check_node_identity(node).await? {
+                crate::ledger::IdentityCheck::Ready(record) => tracing::info!(
+                    node = %record.node,
+                    carry_owner = dual.identity.carry_owner,
+                    recorded_at = %record.recorded_at,
+                    "dual-writer node identity"
+                ),
+                crate::ledger::IdentityCheck::Drifted(record, drift) => anyhow::bail!(
+                    "this database is dual-writer node {}, but {} changed since it was \
+                     personalised; run `qbit-prism-server node-identity set --index {}` again \
+                     before starting",
+                    record.node,
+                    drift.join(", "),
+                    node.index()
+                ),
+                crate::ledger::IdentityCheck::Unidentified => tracing::error!(
+                    node = %node,
+                    "ALERT: this database has no dual-writer node identity: run \
+                     `qbit-prism-server node-identity set --index {}` on it; until then the peer \
+                     sync does not run and this frontend admits no miners",
+                    node.index()
+                ),
+                crate::ledger::IdentityCheck::OtherNode(record) => tracing::error!(
+                    node = %node,
+                    database_node = %record.node,
+                    "ALERT: PRISM_DATABASE_URL names dual-writer node {}'s database, not this \
+                     node's; the peer sync does not run and this frontend admits no miners. If \
+                     it is a physical copy of that database rebuilt for this node, stop this \
+                     frontend and run `qbit-prism-server node-identity repersonalise --index {}`",
+                    record.node,
+                    node.index()
+                ),
+            }
+            true
+        }
+        None => {
+            coordinator
+                .ledger
+                .refuse_single_writer_on_dual_ledger(config::dual_writer_downgrade()?)
+                .await?;
+            coordinator.ledger.recorded_node_identity().await?.is_some()
+        }
+    };
     coordinator.landing_trim.set_enabled(landing_trim);
     tracing::info!(
         enabled = landing_trim,
@@ -117,6 +218,14 @@ pub async fn run(config: Config) -> Result<()> {
     );
     let metrics = api_state.metrics();
     let runtime = metrics.runtime();
+    // 3.1: admission is decided only where something reads it, so a single
+    // writer without the readiness endpoint runs as 3.0 did.
+    let admission_exposed = gated || readiness_endpoint.is_some();
+    if admission_exposed {
+        registry.enable_admission();
+    }
+    let stale_after = api_state.config.health_stale_after();
+    let (admission_decisions, admission) = watch::channel(AdmissionSignal::UNDECIDED);
     let api_listener = if config.audit_port > 0 {
         Some(
             bind_listener(
@@ -129,36 +238,73 @@ pub async fn run(config: Config) -> Result<()> {
     } else {
         None
     };
+    if let Some(listener) = &api_listener {
+        refuse_listen_conflicts(&gated_addresses, &[("audit API", listener.local_addr()?)])?;
+    }
     let mut tasks = JoinSet::new();
+    // 3.1 dual writer: the peer sync, and the own-log latch (D-8) that the
+    // tasks writing this node's own rows wait for: the refresh (prepared
+    // work, reconciliation), the submit loop (landings) and, inside its own
+    // loop, adoption (adopted landings, below). A node restored from an old
+    // backup pulls its own rows back from the peer first, so none of them
+    // reuses a key the peer already holds. The Stratum listeners (share
+    // appends) wait through admission, which needs the latch too. A single
+    // writer waits for nothing.
+    let own_log = match &config.dual_writer {
+        Some(dual) => {
+            let (sync, status) = crate::peer_sync::PeerSync::new(
+                (*coordinator.ledger).clone(),
+                dual,
+                Some(registry.clone()),
+            );
+            let _ = coordinator.peer_sync.set(status.clone());
+            tasks.spawn(sync.run(shutdown_rx.clone()));
+            Some(status)
+        }
+        None => None,
+    };
     tasks.spawn(runtime.track(
         TaskKind::StratumListener,
-        run_listener(
-            primary,
+        primary.serve(
             stratum_config,
             coordinator.clone(),
             coordinator.refresh.subscribe(),
             shutdown_rx.clone(),
             registry.clone(),
+            admission.clone(),
+            stale_after,
         ),
     ));
     if let (Some(listener), Some(highdiff)) = (high_listener, highdiff) {
         tasks.spawn(runtime.track(
             TaskKind::StratumListener,
-            run_listener(
-                listener,
+            listener.serve(
                 highdiff,
                 coordinator.clone(),
                 coordinator.refresh.subscribe(),
                 shutdown_rx.clone(),
                 registry.clone(),
+                admission.clone(),
+                stale_after,
             ),
+        ));
+    }
+    if let (Some(listener), Some(config)) = (readiness_listener, &readiness_endpoint) {
+        tracing::info!(address=%listener.local_addr()?, "PRISM readiness endpoint listening");
+        tasks.spawn(endpoint::serve(
+            listener,
+            endpoint::Endpoint::new(config, admission.clone(), stale_after, registry.clone()),
+            shutdown_rx.clone(),
         ));
     }
     tasks.spawn(runtime.track(TaskKind::Refresh, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
         async move {
-            coordinator.refresh_loop(rx).await;
+            if caught_up.await {
+                coordinator.refresh_loop(rx).await;
+            }
             Ok(())
         }
     }));
@@ -167,8 +313,11 @@ pub async fn run(config: Config) -> Result<()> {
     tasks.spawn(runtime.track(TaskKind::Submit, {
         let coordinator = coordinator.clone();
         let rx = shutdown_rx.clone();
+        let caught_up = wait_for_own_log(own_log.clone(), shutdown_rx.clone());
         async move {
-            coordinator.submit_loop(rx).await;
+            if caught_up.await {
+                coordinator.submit_loop(rx).await;
+            }
             Ok(())
         }
     }));
@@ -182,6 +331,26 @@ pub async fn run(config: Config) -> Result<()> {
             }
         }));
     }
+    // PRISM 3.1 dual writer: the carry owner guard, and adoption of pool
+    // blocks whose finder died before their rows arrived (S8).
+    if config.dual_writer.is_some() {
+        let settings = crate::carry_owner::CarryOwnerSettings::from_config(config)?;
+        tasks.spawn(crate::carry_owner::run(
+            coordinator.ledger.clone(),
+            settings,
+            own_log.clone(),
+            Some(registry.clone()),
+            shutdown_rx.clone(),
+        ));
+        tasks.spawn({
+            let coordinator = coordinator.clone();
+            let rx = shutdown_rx.clone();
+            async move {
+                coordinator.adoption_loop(rx).await;
+                Ok(())
+            }
+        });
+    }
     match config.block_submission().ctv_broadcaster {
         config::CtvBroadcaster::On => {
             tasks.spawn(runtime.track(
@@ -193,6 +362,15 @@ pub async fn run(config: Config) -> Result<()> {
         config::CtvBroadcaster::Off => {}
     }
     if let Some(settings) = rollup_settings {
+        // On a personalised database a peer sync may insert late shares, its
+        // own frontend's or another one's (a rollback in progress, or a
+        // frontend started without PRISM_DUAL_WRITER beside a dual writer),
+        // so the sweep takes the progress row first, as a dual writer's does.
+        let settings = if dual_writer_sweep {
+            settings.for_dual_writer()
+        } else {
+            settings
+        };
         tasks.spawn(runtime.track(
             TaskKind::Rollup,
             crate::rollups::run_with_metrics(
@@ -235,7 +413,17 @@ pub async fn run(config: Config) -> Result<()> {
     ));
     tasks.spawn(runtime.track(
         TaskKind::HealthPublisher,
-        publish_health(coordinator.clone(), api_state, stats, shutdown_rx.clone()),
+        publish_health(
+            coordinator.clone(),
+            api_state,
+            stats,
+            shutdown_rx.clone(),
+            AdmissionPublisher {
+                admission: Admission::new(admission_grace),
+                decisions: admission_decisions,
+                exposed: admission_exposed,
+            },
+        ),
     ));
     tasks.spawn({
         let ledger = coordinator.ledger.clone();
@@ -274,6 +462,18 @@ pub async fn run(config: Config) -> Result<()> {
         result=tasks.join_next()=>{Some(match result {Some(Ok(Err(error)))=>error,Some(Err(error))=>error.into(),_=>anyhow::anyhow!("critical PRISM task exited")})}
     };
     shutdown.send_replace(true);
+    // A database restored, promoted or re-identified under the running
+    // frontend (D-8, D-9): nothing drains. Every task is cancelled at once,
+    // and its open transaction rolls back, so none commits another own row
+    // unless its COMMIT was already sent. The restart runs every startup
+    // check again.
+    if failure.as_ref().is_some_and(|failure| {
+        failure
+            .downcast_ref::<crate::peer_sync::FrontendStop>()
+            .is_some()
+    }) {
+        tasks.abort_all();
+    }
     // Connections drain before pooled DB handles close; queued block intents
     // remain durable and can be claimed immediately after their lease expires.
     if tokio::time::timeout(Duration::from_secs(30), async {
@@ -292,8 +492,21 @@ pub async fn run(config: Config) -> Result<()> {
     // SessionOwner::stop() verifies that no active or pending guard remains.
     // Publish stopped first; only then is it safe to release this token's
     // reservations. On failure, retain reservations and close without a
-    // stopped marker so a replacement cannot reclaim live IDs.
-    if let Err(error) = coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await {
+    // stopped marker so a replacement cannot reclaim live IDs. A dual-writer
+    // frontend (3.1) writes it only over its own row: a replacement may have
+    // registered while it shut down, and its own reservations are released
+    // below either way.
+    let stopped = if coordinator.config.dual_writer.is_some() {
+        coordinator.ledger.stopped_unless_replaced().await.map(|written| {
+            if !written {
+                tracing::info!("stopped marker not written: the instance row is no longer this incarnation's (another with this PRISM_INSTANCE_ID, a replacement or a duplicate, wrote it)");
+            }
+        })
+    } else {
+        coordinator.ledger.heartbeat(HeartbeatStatus::Stopped).await
+    };
+    if let Err(error) = stopped {
+        coordinator.close_health_pool().await;
         coordinator.ledger.pool.close().await;
         if let Some(failure) = failure {
             return Err(anyhow::anyhow!(
@@ -307,6 +520,7 @@ pub async fn run(config: Config) -> Result<()> {
         .release_session_owner_reservations()
         .await
         .err();
+    coordinator.close_health_pool().await;
     coordinator.ledger.pool.close().await;
     if let Some(error) = cleanup_error {
         return Err(anyhow::anyhow!(
@@ -317,6 +531,22 @@ pub async fn run(config: Config) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// 3.1 dual writer (D-8): true once the own log is caught up, false if the
+/// shutdown comes first. A single writer (`None`) never waits.
+async fn wait_for_own_log(
+    status: Option<watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> bool {
+    let Some(mut status) = status else {
+        return true;
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => false,
+        caught_up = status.wait_for(|status| status.own_log_caught_up) => caught_up.is_ok(),
+    }
 }
 
 // One operation ends at publication; subsequent database maintenance is not
@@ -369,66 +599,316 @@ async fn prune_jobs<T, F: std::future::Future<Output = Result<T>>>(
     Ok(())
 }
 
+/// Refuse any two addresses, at least one of them a gated Stratum address
+/// (`gated`), that could never both listen ([`crate::listen::listen_conflict`]).
+fn refuse_listen_conflicts(
+    gated: &[(&str, SocketAddr)],
+    others: &[(&str, SocketAddr)],
+) -> Result<()> {
+    for (index, (name, addr)) in gated.iter().enumerate() {
+        for (other, other_addr) in gated[index + 1..].iter().chain(others) {
+            anyhow::ensure!(
+                !crate::listen::listen_conflict(*addr, *other_addr),
+                "the {other} address {other_addr} overlaps the {name} address {addr}: in dual-writer mode both bind at startup, but only one could listen once the frontend admits miners; give each its own port"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A Stratum address as the frontend serves it: listening from startup as
+/// in 3.0, or, in dual-writer mode (3.1), bound and listening only while the
+/// frontend admits miners.
+enum StratumAddress {
+    Listening(TcpListener),
+    Gated(ReservedAddress),
+}
+
+impl StratumAddress {
+    async fn bind(addr: impl ToSocketAddrs, backlog: u32, gated: bool) -> std::io::Result<Self> {
+        Ok(if gated {
+            Self::Gated(reserve_address(addr).await?)
+        } else {
+            Self::Listening(bind_listener(addr, backlog).await?)
+        })
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Listening(listener) => listener.local_addr(),
+            Self::Gated(address) => Ok(address.local_addr()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve(
+        self,
+        config: StratumConfig,
+        coordinator: Arc<Coordinator>,
+        refresh: watch::Receiver<u64>,
+        shutdown: watch::Receiver<bool>,
+        registry: Arc<metrics::Metrics>,
+        admission: watch::Receiver<AdmissionSignal>,
+        stale_after: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Listening(listener) => {
+                run_listener(listener, config, coordinator, refresh, shutdown, registry).await
+            }
+            Self::Gated(address) => {
+                run_gated_listener(
+                    address,
+                    config,
+                    coordinator,
+                    refresh,
+                    shutdown,
+                    registry,
+                    admission,
+                    stale_after,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// 3.1: folds each health publication into the admission decision that the
+/// dual-writer Stratum gate and the readiness endpoint read, and reports it
+/// in the health payload and the metrics.
+struct AdmissionPublisher {
+    admission: Admission,
+    decisions: watch::Sender<AdmissionSignal>,
+    /// Dual-writer mode or the readiness endpoint; otherwise nothing reads
+    /// admission and nothing is decided or reported.
+    exposed: bool,
+}
+
+impl AdmissionPublisher {
+    fn publish(
+        &mut self,
+        health: &mut serde_json::Value,
+        dual: Option<&DualWriterReport>,
+        runtime_stalled: bool,
+        registry: &metrics::Metrics,
+    ) {
+        if !self.exposed {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        // The readiness this publication reports, as /healthz will serve it
+        // short of staleness, which the readers age themselves.
+        let ready = health["ready"] == true && !runtime_stalled;
+        let change =
+            self.admission
+                .observe(now.into_std(), ready, dual.and_then(|dual| dual.withdrawal));
+        let state = self.admission.state();
+        let close_sessions = dual.is_some_and(DualWriterReport::forbids_sessions);
+        self.decisions
+            .send_replace(AdmissionSignal::of(state, close_sessions, now));
+        match change {
+            Some(AdmissionChange::Admitted) => {
+                tracing::info!("PRISM admits miners: readiness endpoint ready, dual-writer Stratum listeners accepting")
+            }
+            Some(AdmissionChange::Withdrawn(reason)) => {
+                registry.record_admission_withdrawal(reason.label());
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "PRISM withdrew: readiness endpoint not ready, dual-writer Stratum listeners refusing new connections"
+                );
+            }
+            None => {}
+        }
+        registry.publish_admission(state.label());
+        if let Some(dual) = dual {
+            registry.publish_dual_writer(
+                dual.identity.node.index(),
+                dual.identity.carry_owner,
+                dual.writer_path.map(WriterPath::label),
+            );
+        }
+        health["admission"] = serde_json::json!({
+            "admitting": state.admits(),
+            "state": state.as_str(),
+            "reason": state.reason().map(|reason| reason.as_str()),
+            "grace_seconds": self.admission.grace().as_secs(),
+        });
+    }
+}
+
+/// A dual-writer frontend's cluster heartbeat in flight (3.1): its own
+/// task, so a slow or hung database never holds the next publication, which
+/// is what withdraws the node. It is never cancelled while the publisher
+/// runs, so a slow heartbeat still lands. When the publisher returns it
+/// waits for it at most [`HEARTBEAT_SHUTDOWN_WAIT`], so it does not take the
+/// shutdown's budget, then aborts it, as it does if the publisher is aborted
+/// itself. An abandoned heartbeat's statement may already be sent, and the
+/// database may apply it after the stopped marker, or after a replacement
+/// registered; it is written so that it never replaces this incarnation's
+/// stopped marker, nor a row another incarnation keeps fresh
+/// (`Ledger::health_heartbeat_unless_stopped`).
+struct HeartbeatTask {
+    handle: tokio::task::JoinHandle<()>,
+    started: Instant,
+}
+
+impl Drop for HeartbeatTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// How long the publisher, returning, waits for its heartbeat in flight.
+const HEARTBEAT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// A heartbeat running this long has a stuck instance row behind it.
+const HEARTBEAT_STUCK: Duration = Duration::from_secs(10);
+/// At most one warning about a stuck heartbeat this often.
+const HEARTBEAT_STUCK_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a publication that skips its heartbeat, because one that started
+/// `running` ago is still in flight, warns about it: only once that one has
+/// been running for [`HEARTBEAT_STUCK`], and at most once per
+/// [`HEARTBEAT_STUCK_WARNING_INTERVAL`].
+fn heartbeat_stuck_warning_due(running: Duration, warned: Option<Instant>, now: Instant) -> bool {
+    running >= HEARTBEAT_STUCK
+        && warned
+            .is_none_or(|at| now.saturating_duration_since(at) >= HEARTBEAT_STUCK_WARNING_INTERVAL)
+}
+
 async fn publish_health(
     coordinator: Arc<Coordinator>,
     state: ApiState,
     stats: Arc<StratumStats>,
     mut shutdown: watch::Receiver<bool>,
+    mut admission: AdmissionPublisher,
 ) -> Result<()> {
     let mut tick = publication_ticks(&state);
     let mut missing_since = None::<Instant>;
-    loop {
-        tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
-        let health = with_health_publication_progress(&state, async {
-            let mut health = coordinator.health().await;
-            let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
-            if snapshot.authorized_missing_current_work == 0 {
-                missing_since = None;
+    let dual_writer = coordinator.config.dual_writer.is_some();
+    let mut heartbeat = None::<HeartbeatTask>;
+    let mut stuck_warned = None::<Instant>;
+    // A dual-writer heartbeat takes over a row another incarnation with this
+    // instance id wrote once that row has gone half the freshness budget
+    // without a heartbeat: a live one heartbeats every publication.
+    let take_over_after = state.config.health_stale_after() / 2;
+    let row_held_elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let published = async {
+        loop {
+            tokio::select! {_=shutdown.changed()=>break,_=tick.tick()=>{}}
+            let health = with_health_publication_progress(&state, async {
+                let (mut health, dual) = coordinator.health_report().await;
+                let snapshot = stats.snapshot(health["template_generation"].as_u64().unwrap_or(0));
+                if snapshot.authorized_missing_current_work == 0 {
+                    missing_since = None;
+                } else {
+                    missing_since.get_or_insert_with(Instant::now);
+                }
+                let delivery_stalled = missing_since
+                    .is_some_and(|at| at.elapsed() > coordinator.config.health_timeout)
+                    && snapshot
+                        .last_delivery_progress_age_seconds
+                        .is_none_or(|age| age > coordinator.config.health_timeout.as_secs_f64());
+                if delivery_stalled {
+                    health["ok"] = false.into();
+                    health["ready"] = false.into();
+                    health["status"] = "job-delivery-stalled".into();
+                }
+                health["stratum"] = serde_json::to_value(&snapshot)?;
+                metrics::add_known_health_fields(&mut health);
+                let registry = state.metrics();
+                admission.publish(
+                    &mut health,
+                    dual.as_ref(),
+                    registry.runtime().snapshot().stalled(),
+                    &registry,
+                );
+                state.publish_health(health.clone());
+                registry.publish_stratum(
+                    &snapshot,
+                    health["ok"] == true,
+                    coordinator.config.runtime_workers,
+                    coordinator.blocks.load(Ordering::Relaxed),
+                );
+                registry.publish_delivery(stats.delivery_metrics());
+                // #664: the switch, and the cluster hold as this publication read it.
+                registry.publish_block_submission(
+                    coordinator.config.block_submit_enabled,
+                    health["block_submission_hold"]["held"].as_bool(),
+                );
+                registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
+                registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
+                state.publish_metrics(registry.render())?;
+                Ok(health)
+            })
+            .await?;
+            let health: HeartbeatHealth = serde_json::from_value(health)?;
+            if !dual_writer {
+                // A single writer's heartbeat, as in 3.0: in line.
+                if let Err(error) = coordinator
+                    .ledger
+                    .heartbeat(HeartbeatStatus::Health(health))
+                    .await
+                {
+                    tracing::warn!(%error,"cluster heartbeat failed");
+                }
+            } else if let Some(task) = heartbeat.as_ref().filter(|task| !task.handle.is_finished()) {
+                let running = task.started.elapsed();
+                let now = Instant::now();
+                if heartbeat_stuck_warning_due(running, stuck_warned, now) {
+                    stuck_warned = Some(now);
+                    tracing::warn!(
+                        running_seconds = running.as_secs(),
+                        "cluster heartbeat stuck: the previous one is still running, so this instance's heartbeat_at is not advancing"
+                    );
+                } else {
+                    tracing::debug!("cluster heartbeat skipped: the previous one is still running");
+                }
             } else {
-                missing_since.get_or_insert_with(Instant::now);
+                // The previous one has finished: a new one that gets stuck
+                // warns at once.
+                stuck_warned = None;
+                let ledger = coordinator.ledger.clone();
+                let row_held_elsewhere = row_held_elsewhere.clone();
+                heartbeat = Some(HeartbeatTask {
+                    handle: tokio::spawn(async move {
+                        match ledger
+                            .health_heartbeat_unless_stopped(health, take_over_after)
+                            .await
+                        {
+                            Ok(true) => {
+                                if row_held_elsewhere.swap(false, Ordering::Relaxed) {
+                                    tracing::info!("cluster heartbeat written again: this incarnation holds its instance row");
+                                }
+                            }
+                            Ok(false) => {
+                                if !row_held_elsewhere.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        take_over_seconds = take_over_after.as_secs_f64(),
+                                        "cluster heartbeat not written: another incarnation with this PRISM_INSTANCE_ID holds the instance row and heartbeated it within the take-over time; it is taken over once that row goes that long without one"
+                                    );
+                                }
+                            }
+                            Err(error) => tracing::warn!(%error,"cluster heartbeat failed"),
+                        }
+                    }),
+                    started: Instant::now(),
+                });
             }
-            let delivery_stalled = missing_since
-                .is_some_and(|at| at.elapsed() > coordinator.config.health_timeout)
-                && snapshot
-                    .last_delivery_progress_age_seconds
-                    .is_none_or(|age| age > coordinator.config.health_timeout.as_secs_f64());
-            if delivery_stalled {
-                health["ok"] = false.into();
-                health["ready"] = false.into();
-                health["status"] = "job-delivery-stalled".into();
-            }
-            health["stratum"] = serde_json::to_value(&snapshot)?;
-            metrics::add_known_health_fields(&mut health);
-            state.publish_health(health.clone());
-            let registry = state.metrics();
-            registry.publish_stratum(
-                &snapshot,
-                health["ok"] == true,
-                coordinator.config.runtime_workers,
-                coordinator.blocks.load(Ordering::Relaxed),
-            );
-            registry.publish_delivery(stats.delivery_metrics());
-            // #664: the switch, and the cluster hold as this publication read it.
-            registry.publish_block_submission(
-                coordinator.config.block_submit_enabled,
-                health["block_submission_hold"]["held"].as_bool(),
-            );
-            registry.publish_work_refresh_stalled(coordinator.work_refresh_age());
-            registry.publish_tip_poll_age(coordinator.tip_poll_age().await);
-            state.publish_metrics(registry.render())?;
-            Ok(health)
-        })
-        .await?;
-        let health: HeartbeatHealth = serde_json::from_value(health)?;
-        if let Err(error) = coordinator
-            .ledger
-            .heartbeat(HeartbeatStatus::Health(health))
+        }
+        Ok(())
+    }
+    .await;
+    if let Some(mut task) = heartbeat.take() {
+        if tokio::time::timeout(HEARTBEAT_SHUTDOWN_WAIT, &mut task.handle)
             .await
+            .is_err()
         {
-            tracing::warn!(%error,"cluster heartbeat failed");
+            tracing::warn!(
+                wait_seconds = HEARTBEAT_SHUTDOWN_WAIT.as_secs(),
+                "cluster heartbeat abandoned at shutdown: it did not finish in time"
+            );
         }
     }
-    Ok(())
+    published
 }
 
 pub(crate) async fn signal() -> Result<()> {
@@ -449,6 +929,41 @@ mod tests {
     use axum::{body::Body, http::Request};
     use serde_json::json;
     use tower::ServiceExt;
+
+    /// The gated Stratum addresses are checked against each other and against
+    /// every other listener, the audit API's included, and only pairs with a
+    /// gated address are refused: two eager listeners refuse each other at
+    /// their own bind.
+    #[test]
+    fn listen_conflicts_are_refused_only_against_a_gated_address() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let gated = [
+            ("primary Stratum", addr("0.0.0.0:3340")),
+            ("high difficulty Stratum", addr("0.0.0.0:4334")),
+        ];
+        refuse_listen_conflicts(&gated, &[("audit API", addr("127.0.0.1:3341"))]).unwrap();
+        let error = refuse_listen_conflicts(&gated, &[("audit API", addr("127.0.0.1:4334"))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the audit API address 127.0.0.1:4334 overlaps the high difficulty Stratum address 0.0.0.0:4334"),
+            "{error}"
+        );
+        let both = [
+            gated[0],
+            ("high difficulty Stratum", addr("127.0.0.1:3340")),
+        ];
+        assert!(refuse_listen_conflicts(&both, &[]).is_err());
+        // Without a gated address, nothing is compared.
+        refuse_listen_conflicts(
+            &[],
+            &[
+                ("readiness endpoint", addr("0.0.0.0:3340")),
+                ("audit API", addr("0.0.0.0:3340")),
+            ],
+        )
+        .unwrap();
+    }
 
     fn state() -> ApiState {
         state_with(ApiConfig::default())
@@ -472,6 +987,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    #[test]
+    fn a_stuck_heartbeat_warns_after_ten_seconds_at_most_once_a_minute() {
+        let now = Instant::now();
+        assert!(!heartbeat_stuck_warning_due(
+            Duration::from_secs(9),
+            None,
+            now
+        ));
+        assert!(heartbeat_stuck_warning_due(HEARTBEAT_STUCK, None, now));
+        let warned = now - Duration::from_secs(59);
+        assert!(!heartbeat_stuck_warning_due(
+            Duration::from_secs(70),
+            Some(warned),
+            now
+        ));
+        let warned = now - HEARTBEAT_STUCK_WARNING_INTERVAL;
+        assert!(heartbeat_stuck_warning_due(
+            Duration::from_secs(70),
+            Some(warned),
+            now
+        ));
     }
 
     #[tokio::test]

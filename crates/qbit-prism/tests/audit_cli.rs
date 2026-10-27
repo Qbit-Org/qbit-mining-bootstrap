@@ -1302,8 +1302,9 @@ fn build_audit_bundle_serve_mode_caches_parsed_windows() {
     stdout.read_line(&mut line).unwrap();
     let handshake: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(handshake["event"], "handshake");
-    // Protocol 2: prepare_window plus the append-invalidation epoch tag.
-    assert_eq!(handshake["protocol"], 2);
+    // Protocol 3: prepare_window, the append-invalidation epoch tag, and a
+    // build request's window_cut.
+    assert_eq!(handshake["protocol"], 3);
     assert_eq!(handshake["tool"], "qbit-prism-build-audit-bundle");
 
     let mut request_with_window = build_fields.clone();

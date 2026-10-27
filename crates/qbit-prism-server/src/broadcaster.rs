@@ -1,9 +1,10 @@
 //! Recoverable, non-custodial CTV submission. A database claim coordinates
 //! frontends; every attempt verifies the covenant and live parent maturity.
 use crate::{
+    carry_owner::{CarryOwnerSettings, PeerJournal},
     codec, config,
     coordinator::Coordinator,
-    ledger::{FanoutClaim, SubmissionHeld},
+    ledger::{FanoutClaim, FanoutSponsor, SubmissionHeld, SPONSOR_TAKEOVER_AFTER},
 };
 use anyhow::{bail, ensure, Context, Result};
 use qbit_prism::{CpfpChildRequest, CtvFanoutManifest};
@@ -403,6 +404,18 @@ async fn process_view(
         rpc.call("sendrawtransaction", json!([manifest.fanout_tx_hex]))
             .await?
     } else {
+        // Dual writer: each node funds a child from its own wallet and
+        // reserves the coin in its own ledger, so two sponsors' children
+        // would conflict and leave one coin locked. The node whose work found
+        // the block sponsors; the other only watches until the fanout is
+        // overdue and its finder silent (`Ledger::fanout_sponsor`).
+        if !sponsors_fanout(coordinator, &claim.fanout_txid).await? {
+            return Ok(observation(
+                "broadcastable",
+                json!({"sponsor":"finder_node"}),
+                60,
+            ));
+        }
         ensure!(fee > 0, "zero-fee fanout requires CPFP fee sponsorship");
         let child = build_child(coordinator, claim, &manifest, fee).await?;
         coordinator.ledger.renew_fanout_claim(claim, LEASE).await?;
@@ -486,6 +499,233 @@ async fn scan_spender(
         json!({"spend_scan_pending":true,"next_height":end.saturating_add(1)}),
         if next > tip { 10 } else { 1 },
     ))
+}
+
+/// Dual writer: the broadcaster's view of whether the peer's node, the
+/// finder of the fanouts it may take over, is silent ([`finder_silent`]),
+/// kept by the coordinator. One check runs at a time, and its verdict serves
+/// every fanout for [`VERDICT_TTL`].
+#[derive(Default)]
+pub struct FinderLiveness {
+    /// The peer's database: unopened, opened, or unusable (logged once).
+    journal: std::sync::Mutex<Option<Option<Arc<PeerJournal>>>>,
+    state: tokio::sync::Mutex<LivenessState>,
+}
+
+#[derive(Debug, Default)]
+struct LivenessState {
+    /// The last check: when, and its verdict.
+    verdict: Option<(std::time::Instant, bool)>,
+    /// The outage the last check found, if it found one.
+    outage: Option<Outage>,
+    /// Since when the checks have found the peer's database answering with
+    /// no work of its node at all, with none between them that found work.
+    no_work_since: Option<std::time::Instant>,
+}
+
+/// Checks that each found the peer's database out of reach, with no check
+/// between them that reached it and no gap longer than [`OUTAGE_GAP`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Outage {
+    since: std::time::Instant,
+    failed_checks: u32,
+}
+
+impl FinderLiveness {
+    fn journal(&self, settings: &CarryOwnerSettings) -> Option<Arc<PeerJournal>> {
+        let mut journal = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        journal
+            .get_or_insert_with(|| {
+                match PeerJournal::new(&settings.peer_urls, settings.peer_timeout) {
+                    Ok(opened) => Some(Arc::new(opened)),
+                    Err(error) => {
+                        tracing::error!(
+                            error = %format!("{error:#}"),
+                            "CTV broadcaster: the peer's database URL is unusable, so no zero-fee fanout found on the peer's work is taken over"
+                        );
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
+
+    /// For tests: read the peer's database through `journal`, forgetting
+    /// every earlier check.
+    #[doc(hidden)]
+    pub async fn use_journal(&self, journal: PeerJournal) {
+        *self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Some(Arc::new(journal)));
+        *self.state.lock().await = LivenessState::default();
+    }
+
+    /// For tests: checks have found the peer's database out of reach since
+    /// `since`, as often as an outage needs, the last one long enough ago
+    /// for the next to run.
+    #[doc(hidden)]
+    pub async fn assume_unreachable_since(&self, since: std::time::Instant) {
+        let mut state = self.state.lock().await;
+        state.outage = Some(Outage {
+            since,
+            failed_checks: OUTAGE_CHECKS - 1,
+        });
+        state.verdict = Some((std::time::Instant::now() - VERDICT_TTL, false));
+    }
+
+    /// For tests: checks have found the peer's database answering with no
+    /// work of its node since `since`, the last one long enough ago for the
+    /// next to run.
+    #[doc(hidden)]
+    pub async fn assume_no_work_since(&self, since: std::time::Instant) {
+        let mut state = self.state.lock().await;
+        state.no_work_since = Some(since);
+        state.verdict = Some((std::time::Instant::now() - VERDICT_TTL, false));
+    }
+}
+
+/// How long one check's verdict serves.
+const VERDICT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long, and over how many checks, the peer's database must keep failing
+/// before its node counts as silent: a blip, or two, only waits.
+const OUT_OF_REACH_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+const OUTAGE_CHECKS: u32 = 3;
+/// The longest gap between two failed checks of one outage: an older
+/// failure belongs to an outage that may have ended unobserved.
+const OUTAGE_GAP: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The outage a failed check at `now` belongs to: the one the previous
+/// check, at `last_check`, found, if that was at most [`OUTAGE_GAP`] ago, or
+/// a new one.
+fn continue_outage(
+    outage: Option<Outage>,
+    last_check: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Outage {
+    match (outage, last_check) {
+        (Some(outage), Some(last)) if now.saturating_duration_since(last) <= OUTAGE_GAP => Outage {
+            failed_checks: outage.failed_checks + 1,
+            ..outage
+        },
+        _ => Outage {
+            since: now,
+            failed_checks: 1,
+        },
+    }
+}
+
+impl Outage {
+    /// Whether it has lasted `after`, over enough checks, for the peer's
+    /// node to count as silent.
+    fn long_enough(&self, now: std::time::Instant, after: std::time::Duration) -> bool {
+        self.failed_checks >= OUTAGE_CHECKS && now.saturating_duration_since(self.since) >= after
+    }
+}
+
+/// Dual writer: whether this node funds the zero-fee fanout `fanout_txid`'s
+/// CPFP child: as the node its block was found on, to finish a package it
+/// holds, or to take it over once it is overdue (the ledger's fence,
+/// `Ledger::fanout_sponsor`) and its finder silent. Always on a single
+/// writer.
+pub async fn sponsors_fanout(coordinator: &Coordinator, fanout_txid: &str) -> Result<bool> {
+    match coordinator.ledger.fanout_sponsor(fanout_txid).await? {
+        Some(FanoutSponsor::Finder | FanoutSponsor::Held) => Ok(true),
+        Some(sponsor @ (FanoutSponsor::Overdue | FanoutSponsor::Unwitnessed)) => {
+            // Without the finder's work held here, an outage must itself
+            // last the takeover delay.
+            let out_of_reach_after = if sponsor == FanoutSponsor::Overdue {
+                OUT_OF_REACH_AFTER
+            } else {
+                SPONSOR_TAKEOVER_AFTER
+            };
+            let silent = finder_silent(coordinator, out_of_reach_after).await?;
+            if silent {
+                tracing::warn!(
+                    fanout_txid,
+                    takeover_minutes = SPONSOR_TAKEOVER_AFTER.as_secs() / 60,
+                    "CTV broadcaster: taking over CPFP sponsorship of a zero-fee fanout found on the peer's work: its block matured here, and the peer's node has published no work, for longer than the takeover delay"
+                );
+            }
+            Ok(silent)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Whether the finder of an overdue fanout, the peer's node, is silent.
+///
+/// - **Its database answers** (through any of its URLs): silent if the
+///   youngest newest work it shows of its own node, aged by its own clock, is
+///   [`SPONSOR_TAKEOVER_AFTER`] old. A frontend that is alive publishes work
+///   every few minutes (the reanchor and the template's maximum age).
+/// - **It answers with no work of its node at all**, through any URL that
+///   answers, and no URL shows work younger than the takeover delay (a
+///   frontend just started, or its expired work pruned; another URL's stale
+///   copy does not override it): unknown, and silent only once the
+///   checks have found none for [`SPONSOR_TAKEOVER_AFTER`].
+/// - **Only a fallback answers**, with work no younger than the takeover
+///   delay or none: a fallback may lag behind the primary, so this counts
+///   as a failed check, as below (`PeerJournal::work_age`).
+/// - **It has failed [`OUTAGE_CHECKS`] checks in a row, over
+///   `out_of_reach_after` at least:** silent. That is [`OUT_OF_REACH_AFTER`]
+///   for an [`FanoutSponsor::Overdue`] fanout, whose fence has already found
+///   the finder's work this node holds as old as the takeover delay, and
+///   [`SPONSOR_TAKEOVER_AFTER`] for an [`FanoutSponsor::Unwitnessed`] one,
+///   with no such work here to date the silence. A finder that is alive but
+///   cut off from this node that long looks silent, and both nodes may then
+///   fund a child (docs/prism-ledger-ops.md).
+/// - **A shorter outage:** not silent yet.
+async fn finder_silent(
+    coordinator: &Coordinator,
+    out_of_reach_after: std::time::Duration,
+) -> Result<bool> {
+    let settings = match CarryOwnerSettings::from_config(&coordinator.config) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "CTV broadcaster: no dual-writer settings, so the fanout is not taken over");
+            return Ok(false);
+        }
+    };
+    let liveness = &coordinator.finder_liveness;
+    let Some(journal) = liveness.journal(&settings) else {
+        return Ok(false);
+    };
+    let mut state = liveness.state.lock().await;
+    if let Some((at, silent)) = state.verdict {
+        if at.elapsed() < VERDICT_TTL {
+            // An outage's verdict depends on how long the caller needs it.
+            return Ok(match state.outage {
+                Some(outage) => outage.long_enough(at, out_of_reach_after),
+                None => silent,
+            });
+        }
+    }
+    let peer = crate::carry_owner::peer_index(settings.node_index);
+    let answer = journal.work_age(peer).await;
+    let now = std::time::Instant::now();
+    let silent = match answer {
+        Some(Some(age)) => {
+            state.outage = None;
+            state.no_work_since = None;
+            age >= SPONSOR_TAKEOVER_AFTER
+        }
+        Some(None) => {
+            state.outage = None;
+            let since = *state.no_work_since.get_or_insert(now);
+            now.saturating_duration_since(since) >= SPONSOR_TAKEOVER_AFTER
+        }
+        None => {
+            let outage = continue_outage(state.outage, state.verdict.map(|(at, _)| at), now);
+            state.outage = Some(outage);
+            outage.long_enough(now, out_of_reach_after)
+        }
+    };
+    state.verdict = Some((now, silent));
+    Ok(silent)
 }
 
 async fn build_child(
@@ -1133,6 +1373,67 @@ mod tests {
                 .is_err()
         );
         server.abort();
+    }
+
+    #[test]
+    fn an_outage_needs_three_failed_checks_in_a_row_over_a_minute() {
+        use std::time::{Duration, Instant};
+        // Offsets back from a `now` five hours ahead never underflow.
+        let now = Instant::now() + Duration::from_secs(5 * 3600);
+        let ago = |seconds| now - Duration::from_secs(seconds);
+        let first = continue_outage(None, None, now);
+        assert_eq!(
+            first,
+            Outage {
+                since: now,
+                failed_checks: 1
+            }
+        );
+        assert!(!first.long_enough(now, OUT_OF_REACH_AFTER));
+        // Failed checks a minute apart continue it; two blips are not enough.
+        let earlier = Outage {
+            since: ago(60),
+            failed_checks: 1,
+        };
+        let second = continue_outage(Some(earlier), Some(ago(60)), now);
+        assert_eq!(second.failed_checks, 2);
+        assert!(!second.long_enough(now, OUT_OF_REACH_AFTER));
+        // A third, over a minute after the first: the peer's node is silent.
+        let third = continue_outage(Some(second), Some(ago(30)), now + Duration::from_secs(30));
+        assert!(
+            third.failed_checks == 3
+                && third.long_enough(now + Duration::from_secs(30), OUT_OF_REACH_AFTER)
+        );
+        // Without the finder's work held here, a minute is not enough: the
+        // outage itself must last the takeover delay.
+        assert!(!third.long_enough(now + Duration::from_secs(30), SPONSOR_TAKEOVER_AFTER));
+        let long = Outage {
+            since: ago(SPONSOR_TAKEOVER_AFTER.as_secs()),
+            failed_checks: 3,
+        };
+        assert!(long.long_enough(now, SPONSOR_TAKEOVER_AFTER));
+        // Three quick failures within a minute are not enough either.
+        let quick = Outage {
+            since: ago(20),
+            failed_checks: 3,
+        };
+        assert!(!quick.long_enough(now, OUT_OF_REACH_AFTER));
+        // A failure long after the last check begins a new outage: the old
+        // one may have ended unobserved.
+        assert_eq!(
+            continue_outage(
+                Some(Outage {
+                    since: ago(4 * 3600),
+                    failed_checks: 9
+                }),
+                Some(ago(3 * 3600)),
+                now
+            ),
+            Outage {
+                since: now,
+                failed_checks: 1
+            }
+        );
     }
 
     #[test]

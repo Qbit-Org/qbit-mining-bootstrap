@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-pool-builder"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "hex",
  "qbit-pool-builder",
@@ -1400,8 +1400,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "qbit-prism-dual-sim"
+version = "3.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "hex",
+ "libc",
+ "qbit-pool-builder",
+ "qbit-prism",
+ "qbit-prism-load",
+ "qbit-prism-server",
+ "qbit-prism-test-gate",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "qbit-prism-load"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1428,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism-server"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1439,6 +1465,8 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "num-bigint",
  "num-traits",
@@ -1466,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "qbit-prism-test-gate"
-version = "3.0.0"
+version = "3.1.0"
 
 [[package]]
 name = "quinn"

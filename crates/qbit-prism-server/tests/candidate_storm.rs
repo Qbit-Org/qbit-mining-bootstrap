@@ -669,6 +669,7 @@ fn config(database_url: String, rpc_url: String, instance: &str) -> Result<Confi
         version_mask: codec::VERSION_ROLLING_MASK,
         audit_bind: "127.0.0.1".into(),
         audit_port: 0,
+        dual_writer: None,
     })
 }
 

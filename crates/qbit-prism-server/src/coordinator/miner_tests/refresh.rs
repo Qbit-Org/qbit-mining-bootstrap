@@ -399,3 +399,88 @@ fn refresh_trigger_precedence_is_tip_revision_balances_reanchor_shares_fee_templ
         RefreshTrigger::WriterTimeline
     );
 }
+
+/// 3.1 dual writer: the peer sync's mark can move while the accepted cutoff
+/// does not, the peer's newly eligible rows all below it. Empty-window
+/// (bootstrap) work is then replaced at once, as a first share replaces it,
+/// and labelled `shares`; published work with a window keeps 3.0's
+/// same-template cadence.
+#[tokio::test]
+async fn an_empty_window_is_replaced_once_the_peer_mark_moves_and_a_full_one_keeps_its_cadence() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    let original = {
+        let mut slot = f.store.snapshot.lock().unwrap();
+        let snapshot = slot.as_mut().unwrap();
+        let original = snapshot.clone();
+        snapshot.shares.clear();
+        snapshot.share_seq = 0;
+        snapshot.cut = Some(qbit_prism::WindowCut::default());
+        original
+    };
+    f.coordinator.refresh_once().await.unwrap();
+    let empty = f.coordinator.prepared.read().await.clone().unwrap();
+    assert!(
+        empty.bundle.is_none(),
+        "the empty window's work has a bundle"
+    );
+    let reads = f.store.snapshots.lock().unwrap().len();
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads);
+    *f.store.peer_mark.lock().unwrap() = Some(7);
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads + 1);
+    assert_refresh_observations(&f.coordinator, "shares", 1.0);
+    // At the same mark the new window is reused.
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads + 1);
+
+    // Work with a window keeps 3.0's cadence when only the mark moves.
+    *f.store.snapshot.lock().unwrap() = Some(Snapshot {
+        cut: Some(qbit_prism::WindowCut::new(Some(original.share_seq), None).unwrap()),
+        ..original
+    });
+    f.coordinator.refresh_once().await.unwrap();
+    let full = f.coordinator.prepared.read().await.clone().unwrap();
+    assert!(full.bundle.is_some(), "the window's work has no bundle");
+    let reads = f.store.snapshots.lock().unwrap().len();
+    *f.store.peer_mark.lock().unwrap() = Some(9);
+    f.coordinator.refresh_once().await.unwrap();
+    assert_eq!(f.store.snapshots.lock().unwrap().len(), reads);
+    assert!(Arc::ptr_eq(
+        f.coordinator.prepared.read().await.as_ref().unwrap(),
+        &full
+    ));
+}
+
+/// 3.1 dual writer: a peer row stamped after a window's anchor, by a peer
+/// clock running ahead, joins a later anchor's window with no new row and no
+/// move of the mark. A new template does not reuse a window while such a row
+/// is pending, and reuses one taken once none is.
+#[tokio::test]
+async fn a_new_template_does_not_reuse_a_window_with_a_peer_row_pending() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    *f.store.peer_mark.lock().unwrap() = Some(9);
+    *f.store.peer_pending.lock().unwrap() = true;
+    {
+        let mut slot = f.store.snapshot.lock().unwrap();
+        let snapshot = slot.as_mut().unwrap();
+        snapshot.cut = Some(qbit_prism::WindowCut::new(Some(snapshot.share_seq), None).unwrap());
+    }
+    f.coordinator.refresh_once().await.unwrap();
+    f.node.lock().unwrap().parents.insert(hash(4), hash(3));
+    let snapshots = || f.store.snapshots.lock().unwrap().len();
+    // Each tip is one a peer already recorded, so the revision stays and the
+    // window's reuse alone decides whether a snapshot is read. The window
+    // taken at tip 2 still had the row pending; the one taken at tip 3 did
+    // not, and tip 4 reuses it.
+    for (tip, pending, reads) in [(2, true, 1), (3, false, 1), (4, false, 0)] {
+        *f.store.peer_pending.lock().unwrap() = pending;
+        *f.store.tip.lock().unwrap() = Some(hash(tip));
+        let taken = snapshots();
+        f.detect(tip).await;
+        f.coordinator.refresh_once().await.unwrap();
+        assert_eq!(snapshots(), taken + reads, "tip {tip}");
+        let published = f.coordinator.prepared.read().await.clone().unwrap();
+        assert_eq!(published.template["previousblockhash"], hash(tip));
+    }
+}

@@ -175,6 +175,7 @@ pub(super) fn test_config(
         version_mask: codec::VERSION_ROLLING_MASK,
         audit_bind: "127.0.0.1".into(),
         audit_port: 0,
+        dual_writer: None,
     })
 }
 
@@ -198,6 +199,7 @@ pub(super) async fn original_snapshot(
         payout_revision: prepared.snapshot.payout_revision,
         shares: window.shares,
         prior_balances: window.prior_balances,
+        cut: prepared.window.cut,
     })
 }
 

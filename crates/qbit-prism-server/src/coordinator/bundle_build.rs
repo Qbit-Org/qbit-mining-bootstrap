@@ -89,6 +89,15 @@ pub(super) fn build_body_with(
         Some(share) => std::slice::from_ref(share),
         None => &snapshot.shares,
     };
+    // A dual-writer window's cut is committed in the reward manifest. The
+    // bootstrap window's one share is synthetic, never a ledger row, so its
+    // bundle carries no cut; the landing still proves the empty window
+    // against the reference's cut (`ledger/audit.rs`).
+    let window_cut = if bootstrap_share.is_some() {
+        None
+    } else {
+        snapshot.cut
+    };
     let witnesses = codec::witness_merkle_leaves_hex(&codec::transactions_from_template(template)?);
     let manifest_key = ManifestSigningKey::from_seed_hex(&config.manifest_seed)?;
     let ledger_key = ManifestSigningKey::from_seed_hex(&config.ledger_seed)?;
@@ -102,6 +111,7 @@ pub(super) fn build_body_with(
         qbit_prism::build_audit_bundle_body_with_ctv_settlement_options_parallel(
             shares,
             found,
+            window_cut,
             snapshot.prior_balances.clone(),
             inputs.payout_policy,
             ctv.direct_floor_sats,
@@ -117,6 +127,7 @@ pub(super) fn build_body_with(
         qbit_prism::build_audit_bundle_body_with_coinbase_options_parallel(
             shares,
             found,
+            window_cut,
             snapshot.prior_balances.clone(),
             inputs.payout_policy,
             Some(suffix),

@@ -94,6 +94,7 @@ fn dummy_manifest(coinbase: u64, ents: Vec<WeightedEntitlement>) -> PrismRewardM
         anchor_share_seq: 1,
         newest_share_seq: 1,
         oldest_share_seq: 1,
+        cut: None,
         included_share_count: ents.len(),
         share_slice_digest_hex: "00".repeat(32),
         shares: Vec::new(),

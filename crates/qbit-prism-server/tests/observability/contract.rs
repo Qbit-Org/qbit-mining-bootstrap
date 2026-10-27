@@ -102,6 +102,11 @@ pub fn expected(populated: bool) -> Census {
         series: BTreeSet::new(),
     };
     let unlabelled = [String::new()];
+    let carry_owner_states = labels(
+        "state",
+        "paying,not_owner,node_unidentified,no_journal_row,config_mismatch,setting_pending,own_journal_behind_peer,own_journal_rolled_back,claim_not_vetted,peer_claims_ownership,peer_journal_behind,peer_not_seeded,peer_unconfirmed,layout_mismatch",
+    );
+    let peer_checks = labels("result", "answered,failed");
     for name in [
         "ctv_fanout_broadcaster_tip_refresh_yields_total",
         "accepted_shares_total",
@@ -312,7 +317,7 @@ pub fn expected(populated: bool) -> Census {
     );
     let holders = labels(
         "holder",
-        "append,candidate_insert,first_confirmation,settlement,reconcile,orphan,prepared,cleanup,fatal_state,operator",
+        "append,candidate_insert,first_confirmation,settlement,reconcile,orphan,prepared,cleanup,fatal_state,operator,peer_sync",
     );
     result.family(
         "database_order_lock_hold_seconds",
@@ -343,6 +348,25 @@ pub fn expected(populated: bool) -> Census {
         if populated { &refreshes } else { &[] },
         SECONDS,
     );
+    // 3.1 dual writer (D1): only a dual-writer frontend's peer sync publishes
+    // these, so a single writer declares them without samples; likewise its
+    // window snapshots' origin-index check (D2).
+    for (name, kind) in [
+        ("peer_sync_peer_reachable", "gauge"),
+        ("peer_sync_own_log_caught_up", "gauge"),
+        ("peer_sync_rollback_evidence", "gauge"),
+        ("peer_sync_refused", "gauge"),
+        ("peer_sync_path", "gauge"),
+        ("peer_sync_lag_rows", "gauge"),
+        ("peer_sync_lag_seconds", "gauge"),
+        ("peer_sync_rows_total", "counter"),
+        ("peer_sync_conflicts_total", "counter"),
+        ("peer_sync_failures_total", "counter"),
+        ("peer_sync_offer_waits_total", "counter"),
+        ("dual_writer_origin_index_missing", "gauge"),
+    ] {
+        result.family(name, kind, &[], &[]);
+    }
     // A disabled rollup publishes no lag at all, so the family is declared and
     // unsampled exactly as it is before the loop starts.
     result.family(
@@ -351,6 +375,39 @@ pub fn expected(populated: bool) -> Census {
         if populated { &unlabelled } else { &[] },
         &[],
     );
+    // PRISM 3.1: only a dual-writer frontend's carry owner guard samples these.
+    result.family(
+        "carry_owner_state",
+        "gauge",
+        if populated { &carry_owner_states } else { &[] },
+        &[],
+    );
+    result.family(
+        "carry_owner_alert",
+        "gauge",
+        if populated { &unlabelled } else { &[] },
+        &[],
+    );
+    result.family(
+        "carry_owner_peer_checks_total",
+        "counter",
+        if populated { &peer_checks } else { &[] },
+        &[],
+    );
+    // 3.1 admission and dual-writer readiness: declared, and sampled only
+    // once dual-writer mode or the readiness endpoint exposes admission.
+    for (name, kind) in [
+        ("admission_admitting", "gauge"),
+        ("admission_state", "gauge"),
+        ("admission_withdrawals_total", "counter"),
+        ("stratum_listener_accepting", "gauge"),
+        ("dual_writer_writer_path", "gauge"),
+        ("dual_writer_node_index", "gauge"),
+        ("dual_writer_carry_owner", "gauge"),
+        ("readiness_requests_total", "counter"),
+    ] {
+        result.family(name, kind, &[], &[]);
+    }
     result
 }
 

@@ -2,6 +2,7 @@
 //! frontend owns only its connections and immutable, bounded work cache.
 pub mod api;
 pub mod broadcaster;
+pub mod carry_owner;
 pub mod codec;
 pub mod config;
 pub mod coordinator;
@@ -9,7 +10,9 @@ pub mod ledger;
 pub mod listen;
 pub mod memory;
 pub mod metrics;
+pub mod node_identity;
 pub mod partitions;
+pub mod peer_sync;
 pub mod readiness;
 pub mod rollups;
 pub mod rpc;

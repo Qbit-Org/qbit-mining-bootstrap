@@ -32,6 +32,7 @@ use std::{
 };
 use tokio::sync::{watch, Mutex, Notify, RwLock, Semaphore};
 
+pub mod adoption;
 mod bundle_build;
 mod chain_observation;
 mod claim_release;
@@ -339,6 +340,20 @@ pub struct Coordinator {
     pub landing_trim: Arc<crate::memory::LandingTrim>,
     /// The cluster's block submission hold (#664) as `health` last read it.
     submission_hold: SubmissionHoldView,
+    /// 3.1 dual writer (D-9): the peer sync's status, attached once at
+    /// startup by a dual-writer frontend; never set on a single writer.
+    /// `own_log_caught_up` is the readiness input (D-8).
+    pub peer_sync:
+        std::sync::OnceLock<tokio::sync::watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    /// 3.1 dual writer (D-19): the wait before a found block's offer for the
+    /// peer to hold what adopting it needs; `None` on a single writer or
+    /// with `PRISM_PEER_INGEST_WAIT_MS=0`.
+    peer_ingest: Option<crate::peer_sync::PeerIngestWait>,
+    /// 3.1 dual writer: the CTV broadcaster's view of the peer's node, the
+    /// finder of the zero-fee fanouts it may take over.
+    pub finder_liveness: crate::broadcaster::FinderLiveness,
+    /// 3.1: the dual-writer readiness inputs, `None` for a single writer.
+    dual_writer: Option<crate::readiness::dual_writer::DualWriterReadiness>,
 }
 
 /// See `Coordinator::offer_probe`.
@@ -889,22 +904,13 @@ impl Coordinator {
             rpc.without_relay()
         };
         if let Some(address) = &config.fee_address {
-            let validation = rpc.call("validateaddress", json!([address])).await?;
-            let script = validation["scriptPubKey"]
-                .as_str()
-                .context("pool fee address has no script")?;
-            ensure!(
-                validation["isvalid"] == true
-                    && script.starts_with("5220")
-                    && hex::decode(script)?.len() == 34,
-                "pool fee address must be P2MR"
-            );
+            let program = pool_fee_address_program(&rpc, address).await?;
             config
                 .payout_policy
                 .pool_fee_policy
                 .as_mut()
                 .context("missing fee policy")?
-                .p2mr_program_hex = script[4..].into();
+                .p2mr_program_hex = program;
         }
         let genesis = rpc.call("getblockhash", json!([0])).await?;
         config.verify_genesis(genesis.as_str().context("qbit genesis hash missing")?)?;
@@ -953,6 +959,10 @@ impl Coordinator {
                 "Prism schema migrations 007 and 009 are required for mining startup"
             );
         }
+        if let Some(dual) = &config.dual_writer {
+            ledger.set_dual_writer_identity(dual.identity)?;
+            ledger.set_coinbase_layout(config.coinbase_tag.as_bytes(), config.extranonce2_size)?;
+        }
         // Keep a frontend's initial heartbeat non-quiescent if configuration
         // fails. Another live incarnation may share this instance ID, so this
         // rejected startup cannot safely publish `stopped` for the shared row.
@@ -976,6 +986,14 @@ impl Coordinator {
             .filter(|millis| *millis > 0)
             .map(Duration::from_millis);
         let (refresh, _) = watch::channel(0);
+        let peer_ingest = match &config.dual_writer {
+            Some(dual) => crate::peer_sync::PeerIngestWait::new(dual)?,
+            None => None,
+        };
+        let dual_writer = config
+            .dual_writer
+            .as_ref()
+            .map(|dual| crate::readiness::dual_writer::DualWriterReadiness::new(dual.identity));
         Ok(Arc::new(Self {
             metrics,
             build_slots: Arc::new(Semaphore::new(config.build_workers)),
@@ -1015,6 +1033,10 @@ impl Coordinator {
             offer_sections: Default::default(),
             landing_trim: Default::default(),
             submission_hold: Default::default(),
+            peer_sync: Default::default(),
+            peer_ingest,
+            finder_liveness: Default::default(),
+            dual_writer,
         }))
     }
 
@@ -1580,6 +1602,9 @@ impl Coordinator {
                 probe.payout_state.payout_revision,
                 probe.payout_state.prior_balances_digest,
                 probe.accepted_share_seq,
+                cached_window
+                    .as_ref()
+                    .is_some_and(|window| window.peer_mark() != probe.peer_mark),
                 cached_within_reanchor,
                 &fee,
             )
@@ -1590,7 +1615,10 @@ impl Coordinator {
             // A new share invalidates build inputs, but does not itself replace
             // usable published work. Preserve the existing same-template
             // cadence; the next template/economic change or original reanchor
-            // reads the latest shares. Empty-to-first-share remains immediate.
+            // reads the latest shares. Empty-to-first-share remains immediate,
+            // and in dual-writer mode so does empty-to-first-peer-share: the
+            // peer sync's mark can move while the accepted cutoff does not,
+            // with the peer's newly eligible rows all below it.
             // A new writer timeline does replace it: a promotion can lose the
             // window's rows while revision, balances and template stay equal
             // (#619). Issuance re-checks the timeline at every admission, so a
@@ -1598,6 +1626,7 @@ impl Coordinator {
             if cached_window.as_ref().is_some_and(|window| {
                 window.reference == current.window
                     && window.within_reanchor_interval(self.config.snapshot_interval)
+                    && (current.bundle.is_some() || window.peer_mark() == probe.peer_mark)
             }) && current.timeline == Some(probe.timeline)
                 && current.fee == fee
                 && current.fingerprint == fingerprint
@@ -1680,6 +1709,7 @@ impl Coordinator {
                 probe.accepted_share_seq,
                 probe.payout_state,
                 probe.timeline,
+                probe.peer_mark,
                 self.config.snapshot_interval,
             )
         } else {
@@ -1752,14 +1782,21 @@ impl Coordinator {
                 admitted.0.snapshot.payout_revision,
                 admitted.0.reference.prior_balances_digest,
                 admitted.0.snapshot.share_seq,
+                current
+                    .as_ref()
+                    .is_some_and(|current| current.window.cut != admitted.0.reference.cut),
                 cached_within_reanchor,
                 &fee,
             )
         });
+        // A dual-writer window's rows are its cutoff's and its cut's: the
+        // peer's rows can change it under an equal cutoff. A single writer's
+        // cut is always None.
         let equivalent = current.as_ref().is_some_and(|current| {
             current.fingerprint == fingerprint
                 && current.timeline == Some(admitted.0.timeline)
                 && current.snapshot.share_seq == admitted.0.snapshot.share_seq
+                && current.window.cut == admitted.0.reference.cut
                 && current.snapshot.payout_revision == admitted.0.snapshot.payout_revision
                 && current.window.prior_balances_digest
                     == admitted.0.reference.prior_balances_digest
@@ -1903,6 +1940,7 @@ impl Coordinator {
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_hint_prune = Instant::now();
+        let mut origin_index_alert = refresh_window::AlertEveryMinute::default();
         loop {
             tokio::select! { _=tick.tick()=>{},_=self.wake.notified()=>{},_=shutdown.changed()=>break }
             // One definite accounting-only refusal may retry immediately with
@@ -1916,11 +1954,24 @@ impl Coordinator {
                 match self.refresh_once().await {
                     Ok(()) => {
                         *self.last_error.write().await = None;
+                        origin_index_alert.clear();
                         break;
                     }
                     Err(error) => {
                         let retry = error.is::<crate::ledger::ChainObservationRetry>();
-                        tracing::warn!(%error,"template refresh deferred");
+                        if error.is::<crate::ledger::OriginIndexMissing>() {
+                            // Every tick and wake repeats it until the index
+                            // is valid: alert once a minute, while the
+                            // dual_writer_origin_index_missing gauge holds 1.
+                            if origin_index_alert.due(Instant::now()) {
+                                tracing::error!(
+                                    %error,
+                                    "ALERT: template refresh deferred: this dual-writer frontend publishes no new work until migration 031's index is valid"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(%error,"template refresh deferred");
+                        }
                         *self.last_error.write().await = Some(error.to_string());
                         if !retry {
                             break;
@@ -2776,12 +2827,15 @@ impl Coordinator {
         // overpay ceiling in the same transaction (#478). An unknown bound
         // is an error like any other here: nothing is reserved, nothing is
         // abandoned, and the claim is retried.
+        let mut reserved_current = false;
+        // The gate as the reservation finds it, at the latest.
+        let carry_generation = self.ledger.carry_gate_generation();
         match self
             .ledger
             .reserve_offer_within(claim, Some(self.config.capture_overpay_ceiling_bps))
             .await?
         {
-            OfferReservation::Reserved { bound: None } => {}
+            OfferReservation::Reserved { bound: None } => reserved_current = true,
             OfferReservation::Reserved { bound: Some(bound) } => {
                 self.metrics
                     .record_capture_decision(crate::metrics::CaptureDecision::Offered);
@@ -2845,11 +2899,52 @@ impl Coordinator {
         if let Some(wait) = &self.config.offer_standby {
             self.await_offer_standby(wait, &candidate.block_hash).await;
         }
+        // CONTRACT D-19: a dual-writer node has no failover standby. Its peer
+        // adopts a block this node found if this node dies (S8), so the peer
+        // should hold what adoption needs before the block leaves. Bounded,
+        // and the block is offered whatever the wait finds.
+        if let Some(wait) = &self.peer_ingest {
+            self.await_peer_ingest(wait, candidate).await;
+        }
         #[cfg(test)]
         self.offer_probe().await;
         // Renewal failure cancels the attempt even between periodic ticks.
         // Recheck the strictly-live token at the external mutation boundary.
         self.renew_candidate(claim, lease).await?;
+        // 3.1 dual writer: the carry gate may have moved since the
+        // reservation took this carry-paying block for current work. Then
+        // nothing is sent: the reservation goes back to `pending`, due at
+        // once, and the next attempt's reservation takes the capture path
+        // (the bound, or abandonment with capture off). A leased candidate
+        // was reserved without a revision check, as before.
+        // The gate is this process's; a `carry-owner release` another
+        // process committed reaches it only at the guard's next check, so
+        // the journal is read here too. A read that fails is taken as
+        // withdrawn: the reservation goes back to `pending` below, whereas
+        // an error here would leave it reserved, a call that never ran.
+        if reserved_current
+            && !candidate.leased
+            && (self
+                .ledger
+                .carry_paying_unsendable(&candidate.window.prior_balances_digest, carry_generation)
+                || self
+                    .ledger
+                    .carry_claim_withdrawn(&candidate.window.prior_balances_digest)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(block = %candidate.block_hash, error = %format!("{error:#}"), "could not read this node's journal before the offer; not sending this carry-paying block now");
+                        true
+                    }))
+        {
+            let reason = format!(
+                "{}: the carry gate moved, or this node's journal stopped claiming ownership, after this carry-paying block was reserved as current work; the reservation taken by {} was returned to pending for another attempt",
+                crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
+                self.config.instance_id
+            );
+            self.ledger.release_unmade_offer(claim, &reason).await?;
+            tracing::warn!(block = %candidate.block_hash, %reason, "the carry gate moved before the offer; the next attempt decides it again, through the capture path");
+            return Ok(());
+        }
         let (result, offered_at_ms) = self.submit_block(params).await?;
         // #522, #526: a call whose connection was never established, or
         // that the node answered from its warmup, provably did not run, so
@@ -2915,6 +3010,64 @@ impl Coordinator {
             );
         }
         self.metrics.record_offer_standby_wait(outcome);
+    }
+
+    /// D-19: wait for the peer to hold this node's shares through the block's
+    /// window and the prepared record it was built on, then count and log how
+    /// the wait ended.
+    async fn await_peer_ingest(
+        &self,
+        wait: &crate::peer_sync::PeerIngestWait,
+        candidate: &crate::ledger::Candidate,
+    ) {
+        // This node's own read is inside the wait's bound too. If it fails,
+        // or the job or its record is gone (pruned while the block waited),
+        // nothing proves the peer holds it, and the offer goes unconfirmed at
+        // once. The record is the one the block's issued job names, not any
+        // other prepared over the same window.
+        let needs = async {
+            let prepared = match self.ledger.dual_writer_identity() {
+                Some(identity) => {
+                    self.ledger
+                        .own_prepared_sync_seq(identity.node, &candidate.job_id)
+                        .await?
+                }
+                None => None,
+            };
+            Ok(crate::peer_sync::AdoptionNeeds {
+                share_seq: candidate
+                    .window
+                    .shares
+                    .and_then(|range| i64::try_from(range.last_share_seq).ok()),
+                first_share_seq: candidate
+                    .window
+                    .shares
+                    .and_then(|range| i64::try_from(range.first_share_seq).ok()),
+                prepared_sync_seq: prepared,
+            })
+        };
+        let (waited, outcome, needs) = wait.wait(needs).await;
+        let waited_us = waited.as_micros() as u64;
+        match &outcome {
+            crate::peer_sync::PeerIngest::Confirmed => tracing::info!(
+                block = %candidate.block_hash,
+                waited_us,
+                "block offer peer ingest wait confirmed: the peer holds what adopting the block needs"
+            ),
+            unconfirmed => tracing::warn!(
+                block = %candidate.block_hash,
+                outcome = unconfirmed.outcome(),
+                // The peer's, or this node's own read of the needs.
+                detail = match unconfirmed {
+                    crate::peer_sync::PeerIngest::Unreachable(detail) => detail.as_str(),
+                    _ => "",
+                },
+                waited_us,
+                needs = ?needs,
+                "block offer peer ingest wait unconfirmed: offering before the peer holds what adopting the block needs"
+            ),
+        }
+        self.metrics.record_peer_ingest_wait(outcome.outcome());
     }
 
     /// A pending block the chain already holds, found by the pre-offer
@@ -3250,6 +3403,35 @@ impl Coordinator {
     }
 
     pub async fn health(&self) -> Value {
+        self.health_report().await.0
+    }
+
+    /// Close the dual-writer health pool, if any: at shutdown, beside the
+    /// ledger's pool.
+    pub async fn close_health_pool(&self) {
+        if let Some(dual) = &self.dual_writer {
+            dual.close().await;
+        }
+    }
+
+    /// How many dual-writer health refreshes (the writer probe and the health
+    /// reads) this frontend has run; `None` for a single writer.
+    pub fn dual_writer_health_refreshes(&self) -> Option<u64> {
+        self.dual_writer
+            .as_ref()
+            .map(crate::readiness::dual_writer::DualWriterReadiness::refreshes)
+    }
+
+    /// `health`, and in dual-writer mode (3.1) the report it was read with,
+    /// for admission and the metrics. A dual-writer frontend is ready only
+    /// while its own log is caught up and its writer is local; a single
+    /// writer's health is exactly 3.0's.
+    pub(crate) async fn health_report(
+        &self,
+    ) -> (
+        Value,
+        Option<crate::readiness::dual_writer::DualWriterReport>,
+    ) {
         let (poll_age, fee_floor) = {
             let readiness = self.readiness.read().await;
             (
@@ -3260,7 +3442,26 @@ impl Coordinator {
         let prepared = self.prepared.read().await.clone();
         let observed = self.observed_tip.read().await.as_deref().map(str::to_owned);
         // #664: the cluster's hold in the same statement, as last read.
-        let (revision, hold) = match self.ledger.health_reads().await {
+        // 3.1: a dual-writer frontend reads it in its health refresh, on its
+        // own health pool beside its writer probe and within the probe's
+        // budget, at most one refresh at a time and one per reuse window
+        // however many callers ask: a saturated ledger pool never delays it,
+        // a flood of Stratum health probes cannot starve it, and a dead or
+        // hung database makes this publication within seconds (and withdraws
+        // the node) instead of holding it for the ledger pool's whole acquire
+        // timeout. Reads that fail or run out of time are a failed read. A
+        // single writer reads as in 3.0.
+        let (reads, dual) = match &self.dual_writer {
+            Some(dual) => {
+                let (report, reads) = dual.report(&self.ledger.pool, self.peer_sync.get()).await;
+                (
+                    reads.context("the health reads failed or ran out of time"),
+                    Some(report),
+                )
+            }
+            None => (self.ledger.health_reads().await, None),
+        };
+        let (revision, hold) = match reads {
             Ok((revision, hold)) => (revision, Some(hold)),
             Err(_) => (None, None),
         };
@@ -3275,11 +3476,25 @@ impl Coordinator {
                         .is_some_and(|(fee, floor)| validate_fee_floor(fee, floor).is_ok()))
         }) && poll_age
             .is_some_and(|age| age < self.config.health_timeout.as_secs_f64());
-        let Value::Object(fields) = json!({"ok":ready,"status":if ready {"ok"} else {"unavailable"},"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"block_submission_hold":submission_hold_report(hold.as_ref()),"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
+        let ready = ready
+            && dual
+                .as_ref()
+                .is_none_or(crate::readiness::dual_writer::DualWriterReport::serving);
+        let status = if ready {
+            "ok"
+        } else {
+            dual.as_ref()
+                .and_then(crate::readiness::dual_writer::DualWriterReport::status)
+                .unwrap_or("unavailable")
+        };
+        let Value::Object(mut fields) = json!({"ok":ready,"status":status,"backend":"postgres","instance_id":self.config.instance_id,"runtime_workers":self.config.runtime_workers,"block_submission_enabled":self.config.block_submit_enabled,"block_submission_hold":submission_hold_report(hold.as_ref()),"tip_poll_age_seconds":poll_age,"accepted_share_count":self.accepted.load(Ordering::Relaxed),"found_block_count":self.blocks.load(Ordering::Relaxed),"template_generation":prepared.as_ref().map(|p|p.generation),"template_age_seconds":prepared.as_ref().map(|p|p.created.elapsed().as_secs_f64()),"observed_tip":observed,"payout_state_generation":prepared.as_ref().map(|p|p.snapshot.payout_revision)})
         else {
             unreachable!("coordinator health fields are an object");
         };
-        HeartbeatHealth::new(ready, fields).into_value()
+        if let Some(dual) = &dual {
+            fields.insert("dual_writer".into(), dual.value.clone());
+        }
+        (HeartbeatHealth::new(ready, fields).into_value(), dual)
     }
 }
 
@@ -3370,6 +3585,22 @@ fn job_deferral(error: &anyhow::Error) -> crate::metrics::JobDeferral {
         None if error.is::<JobFeeRefused>() => JobDeferral::FeeFloor,
         None => JobDeferral::Other,
     }
+}
+
+/// The 32-byte P2MR program, as hex, that a pool-fee address pays, checked
+/// through the node; shared by the frontend and the `carry-owner` scan.
+pub(crate) async fn pool_fee_address_program(rpc: &Rpc, address: &str) -> Result<String> {
+    let validation = rpc.call("validateaddress", json!([address])).await?;
+    let script = validation["scriptPubKey"]
+        .as_str()
+        .context("pool fee address has no script")?;
+    ensure!(
+        validation["isvalid"] == true
+            && script.starts_with("5220")
+            && hex::decode(script)?.len() == 34,
+        "pool fee address must be P2MR"
+    );
+    Ok(script[4..].into())
 }
 
 fn header_parent(block: &[u8]) -> Result<String> {
@@ -4003,7 +4234,10 @@ mod offer_not_executed_tests;
 /// (tip, revision, balances, reanchor, shares, fee, then template) when
 /// several changed on one poll; the reuse test checks them in another order.
 /// The revision, balances digest and share sequence are the ledger probe's
-/// on a same-template poll and the admitted window's on a new template. A
+/// on a same-template poll and the admitted window's on a new template.
+/// `peer_rows` says whether a dual-writer window's peer rows may have moved
+/// without the share sequence: the probe's peer mark against the cached
+/// window's, or the admitted window's cut against the published one's. A
 /// missing cached window with published work is labelled `reanchor`. A
 /// label for the refresh metric and log, never a decision input.
 #[allow(clippy::too_many_arguments)]
@@ -4014,6 +4248,7 @@ fn refresh_trigger(
     payout_revision: i64,
     prior_balances_digest: [u8; 32],
     share_seq: u64,
+    peer_rows: bool,
     window_within_reanchor: bool,
     fee: &Option<FanoutFeeRatePolicy>,
 ) -> RefreshTrigger {
@@ -4026,7 +4261,7 @@ fn refresh_trigger(
         revision: current.snapshot.payout_revision != payout_revision,
         balances: current.window.prior_balances_digest != prior_balances_digest,
         window_within_reanchor,
-        shares: current.bundle.is_none() && current.snapshot.share_seq != share_seq,
+        shares: current.bundle.is_none() && (current.snapshot.share_seq != share_seq || peer_rows),
         fee: current.fee != *fee,
     })
 }

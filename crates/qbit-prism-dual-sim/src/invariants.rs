@@ -1,0 +1,2538 @@
+//! The payout-invariant checker: CONTRACT.md §4, read from both databases,
+//! the chain and the share records, after a scenario has settled.
+//!
+//! **The census comes from the chain, not from a database.** Every block of
+//! the active chain since the scenario started is read from C (the rest of
+//! the network), and a block whose coinbase carries the pool's tag
+//! (`/PRISM/`) is a pool block. A database's `chain_state` never decides
+//! what is on the chain, so a pool block on chain that no database knows is
+//! found too (it has no landing rows anywhere: invariant 3). Each block's
+//! origin is the node whose frontend issued the job it was solved on: the
+//! job id names its frontend (`<instance>-<uuid>`).
+//!
+//! **Checks**, each a [`Check`] with its own verdict:
+//!
+//! 1. `inv1-no-overpay`: per account (P2MR program), the balance is the sum
+//!    of `gross - onchain` of the as-issued carry rows of every census block,
+//!    in height order (PRISM's own definition, `ledger/divergence.rs`). Debt
+//!    is `max(0, -balance)`. A block that raises an account's debt fails,
+//!    unless the owner (in the 3.0 pair, the one database) recorded that
+//!    block and account as a #478 divergence whose `overpay_sats` covers the
+//!    increase. `owner-balances-match-chain` then holds the owner's own
+//!    balance view to the same sums.
+//! 2. `inv2-non-owner-carry-free`: every block the non-owner issued has an
+//!    empty prior set, the empty prior digest, and `onchain <= gross` for
+//!    every miner, in its audit and in its carry rows.
+//! 3. `inv3-landing-rows`: every census block has its landing rows in every
+//!    checked database (block, audit bundle and snapshot, one payout entry
+//!    per manifest account, one carry row per miner account, its CTV fanout
+//!    set and artifacts) at the chain's height and coinbase txid, its child
+//!    rows at the block's height, the same in every database in every
+//!    column the peer sync carries (provenance included; a snapshot by its content).
+//!    `inv3-audits-verify`: each node's frontend serves the block's bundle,
+//!    `qbit-prism-audit-verify` accepts it against the coinbase from the
+//!    chain with the pinned ledger key, its manifest key is the pinned one,
+//!    and both nodes serve the same bundle. `inv3-fanouts-identical`: each
+//!    database holds the bundle's fanout transactions byte for byte.
+//! 4. `inv4-acked-shares-present`: every share a miner saw accepted is in
+//!    every checked database, except shares a scenario excuses as a dead
+//!    node's documented tail (reported with the reason).
+//!    `inv4-no-double-credit`: one ledger row per share id and per header in
+//!    each database, every row mapped to its own header, and a header present
+//!    in both databases has the same row in both, in every column.
+//!    `inv4-windows-unchanged`: every
+//!    window a landing recorded still has exactly its shares, with no newer
+//!    eligible share. `inv4-windows-reproducible`: each recorded window,
+//!    recomputed from every database, gives the recorded digest.
+//!
+//! Plus `ledger-integrity` (`qbit_carry_forward_integrity_report()` clean),
+//! `candidates-settled` (no candidate left unfinished), `d2-local-state-not-
+//! copied` and `copied-state-identical` (the copied tables beyond shares and
+//! landings: prepared records with their blobs, and the carry-owner journal).
+
+use crate::{
+    frontend::Node,
+    load::ShareRecord,
+    sim::{Sim, Topology},
+};
+use anyhow::{bail, Context, Result};
+use qbit_prism_server::ledger::peer_sync::CarriedColumns;
+use serde::Serialize;
+use serde_json::{json, Value};
+use sqlx::{PgPool, Row};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+/// `hex("/PRISM/")`, the default `PRISM_COINBASE_TAG`.
+pub const POOL_TAG_HEX: &str = "2f505249534d2f";
+/// The empty prior set's digest (`qbit_prism::prior_balances_digest` of []).
+pub const EMPTY_PRIOR_DIGEST: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/// At most this many problems are listed per check; the count is exact.
+const PROBLEM_LIMIT: usize = 40;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Pass,
+    Fail,
+    /// Not applicable to this topology, with the reason in `summary`.
+    Skip,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Check {
+    pub id: String,
+    pub status: Status,
+    pub summary: String,
+    pub problem_count: usize,
+    pub problems: Vec<String>,
+    pub data: Value,
+}
+
+impl Check {
+    fn skip(id: &str, reason: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            status: Status::Skip,
+            summary: reason.to_owned(),
+            problem_count: 0,
+            problems: Vec::new(),
+            data: Value::Null,
+        }
+    }
+}
+
+struct CheckBuilder {
+    id: String,
+    problems: Vec<String>,
+    data: Value,
+}
+
+impl CheckBuilder {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            problems: Vec::new(),
+            data: json!({}),
+        }
+    }
+
+    fn problem(&mut self, problem: String) {
+        self.problems.push(problem);
+    }
+
+    fn data(&mut self, key: &str, value: Value) {
+        self.data[key] = value;
+    }
+
+    fn finish(self, summary: String) -> Check {
+        let count = self.problems.len();
+        Check {
+            status: if count == 0 {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            summary,
+            problem_count: count,
+            problems: self.problems.into_iter().take(PROBLEM_LIMIT).collect(),
+            id: self.id,
+            data: self.data,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InvariantReport {
+    pub checks: Vec<Check>,
+    pub census: Vec<CensusBlock>,
+}
+
+impl InvariantReport {
+    pub fn failures(&self) -> Vec<&Check> {
+        self.checks
+            .iter()
+            .filter(|check| check.status == Status::Fail)
+            .collect()
+    }
+
+    pub fn passed(&self) -> bool {
+        self.failures().is_empty()
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Check> {
+        self.checks.iter().find(|check| check.id == id)
+    }
+}
+
+/// What a scenario tells the checker beyond the run itself.
+#[derive(Clone, Debug, Default)]
+pub struct CheckOptions {
+    /// Accepted shares that may be missing, by share id, with why: a dead
+    /// node's documented unsynced tail.
+    pub excused_missing: BTreeMap<String, String>,
+    /// Databases whose landing rows are not expected yet (a node still
+    /// down), with why. Its other checks still run where they can.
+    pub absent_ledgers: BTreeMap<Node, String>,
+    /// Candidates that may stay in `reconciliation` with their block never
+    /// confirmed (no `qbit_pool_blocks` row, or only the `prepared` one the
+    /// offer writes), by block hash, with why: a block lost with its node,
+    /// whose offer outcome was never recorded, which PRISM keeps for
+    /// reconciliation and never offers again (S8).
+    pub unresolved_candidates: BTreeMap<String, String>,
+    /// Who owned the carry from which height, oldest first, when it is not
+    /// the dual-writer pair's A from the start: the 3.0 epoch before a
+    /// cutover has no owner (S9), and a transfer moves it (S11). Empty means
+    /// the topology's default.
+    pub ownership: Vec<(u64, Option<Node>)>,
+}
+
+impl CheckOptions {
+    /// The carry owner when a block at `height` was built: `None` in a
+    /// single-writer epoch.
+    pub fn owner_at(&self, topology: Topology, height: u64) -> Option<Node> {
+        if self.ownership.is_empty() {
+            return (topology == Topology::DualWriter).then_some(Node::A);
+        }
+        self.ownership
+            .iter()
+            .take_while(|(from, _)| *from <= height)
+            .last()
+            .and_then(|(_, owner)| *owner)
+    }
+}
+
+/// One pool block of the active chain.
+#[derive(Clone, Debug, Serialize)]
+pub struct CensusBlock {
+    pub hash: String,
+    pub height: u64,
+    pub origin: Option<Node>,
+    pub coinbase_txid: String,
+    /// Which checked databases hold its `qbit_pool_blocks` row.
+    pub landed_in: Vec<Node>,
+    #[serde(skip)]
+    pub coinbase_hex: String,
+}
+
+/// The databases the checker holds to the invariants: in the 3.0 pair the
+/// one writer, otherwise both.
+pub fn ledger_nodes(sim: &Sim) -> Vec<Node> {
+    match sim.config.topology {
+        Topology::SingleWriter => vec![Node::A],
+        Topology::DualWriter | Topology::Unsynced => Node::BOTH.to_vec(),
+    }
+}
+
+/// The owner at the census's newest block, whose balance view the checker
+/// holds to the chain: the dual-writer owner, or in the 3.0 pair the one
+/// database (A's).
+fn current_owner(sim: &Sim, options: &CheckOptions, census: &[CensusBlock]) -> Node {
+    let tip = census.last().map_or(sim.start_height, |block| block.height);
+    options
+        .owner_at(sim.config.topology, tip)
+        .unwrap_or(Node::A)
+}
+
+/// Run every check.
+pub async fn check(
+    sim: &Sim,
+    shares: &[ShareRecord],
+    options: &CheckOptions,
+) -> Result<InvariantReport> {
+    let mut pools = BTreeMap::new();
+    for node in ledger_nodes(sim) {
+        if options.absent_ledgers.contains_key(&node) {
+            continue;
+        }
+        pools.insert(node, sim.pool(node).await?);
+    }
+    let census = census(sim, &pools, shares).await?;
+    let mut checks = Vec::new();
+    checks.push(no_overpay(sim, &pools, &census, options).await?);
+    checks.push(owner_balances_match_chain(sim, &pools, &census, options).await?);
+    checks.push(non_owner_carry_free(sim, &pools, &census, options).await?);
+    checks.push(landing_rows(&pools, &census, options).await?);
+    checks.push(audits_verify(sim, &census, options).await?);
+    checks.push(fanouts_identical(&pools, &census).await?);
+    checks.push(acked_shares_present(&pools, shares, options).await?);
+    checks.push(no_double_credit(&pools).await?);
+    checks.push(windows_unchanged(&pools).await?);
+    checks.push(windows_reproducible(&pools).await?);
+    checks.push(ledger_integrity(&pools).await?);
+    checks.push(candidates_settled(&pools, options).await?);
+    checks.push(local_state_not_copied(sim, &pools).await?);
+    checks.push(copied_state_identical(sim, &pools).await?);
+    for pool in pools.values() {
+        pool.close().await;
+    }
+    Ok(InvariantReport { checks, census })
+}
+
+// --- census ----------------------------------------------------------------
+
+async fn census(
+    sim: &Sim,
+    pools: &BTreeMap<Node, PgPool>,
+    shares: &[ShareRecord],
+) -> Result<Vec<CensusBlock>> {
+    let network = &sim.chain.c;
+    let (tip, _, _) = network.tip().await?;
+    let mut landed: BTreeMap<String, Vec<Node>> = BTreeMap::new();
+    for (node, pool) in pools {
+        let hashes: Vec<String> = sqlx::query_scalar("SELECT block_hash FROM qbit_pool_blocks")
+            .fetch_all(pool)
+            .await?;
+        for hash in hashes {
+            landed.entry(hash).or_default().push(*node);
+        }
+    }
+    let issued_by: BTreeMap<String, Node> = shares
+        .iter()
+        .filter(|record| record.scheduled_block && record.accepted())
+        .filter_map(|record| Some((record.header_hash().to_owned(), record.issuer?)))
+        .collect();
+    let mut blocks = Vec::new();
+    for height in (sim.start_height + 1)..=tip {
+        let hash = network
+            .rpc("getblockhash", json!([height]))
+            .await?
+            .as_str()
+            .context("block hash")?
+            .to_owned();
+        let block = network.rpc("getblock", json!([hash, 2])).await?;
+        let coinbase = &block["tx"][0];
+        let script_sig = coinbase["vin"][0]["coinbase"].as_str().unwrap_or_default();
+        if !script_sig.contains(POOL_TAG_HEX) {
+            continue;
+        }
+        let mut origin = issued_by.get(&hash).copied();
+        if origin.is_none() {
+            for pool in pools.values() {
+                if let Some(job) = solver_job(pool, &hash).await? {
+                    origin = crate::load::issuer_of(&job);
+                    if origin.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+        blocks.push(CensusBlock {
+            landed_in: landed.remove(&hash).unwrap_or_default(),
+            hash,
+            height,
+            origin,
+            coinbase_txid: coinbase["txid"].as_str().unwrap_or_default().to_owned(),
+            coinbase_hex: coinbase["hex"].as_str().unwrap_or_default().to_owned(),
+        });
+    }
+    Ok(blocks)
+}
+
+/// The job id of the share that solved `hash`, credited or deferred.
+async fn solver_job(pool: &PgPool, hash: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT job_id FROM qbit_share_ledger WHERE lower(right(share_id, 64)) = $1 \
+         UNION ALL SELECT share->>'job_id' FROM qbit_prism_deferred_shares WHERE block_hash = $1 \
+         LIMIT 1",
+    )
+    .bind(hash)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// One block's as-issued carry rows, per program: `(gross, onchain, prior)`.
+async fn carry_rows(pool: &PgPool, hash: &str) -> Result<BTreeMap<String, (i128, i128, i128)>> {
+    let rows = sqlx::query(
+        "SELECT encode(p2mr_program, 'hex') AS program, \
+                sum(gross_amount_sats)::text AS gross, sum(onchain_amount_sats)::text AS onchain, \
+                sum(prior_balance_sats)::text AS prior \
+         FROM qbit_payout_carry_forward \
+         WHERE block_hash = $1 AND maturity_state <> 'reversed' GROUP BY p2mr_program",
+    )
+    .bind(hash)
+    .fetch_all(pool)
+    .await?;
+    let mut carry = BTreeMap::new();
+    for row in rows {
+        carry.insert(
+            row.try_get::<String, _>("program")?,
+            (
+                parse_i128(&row.try_get::<String, _>("gross")?)?,
+                parse_i128(&row.try_get::<String, _>("onchain")?)?,
+                parse_i128(&row.try_get::<String, _>("prior")?)?,
+            ),
+        );
+    }
+    Ok(carry)
+}
+
+fn parse_i128(text: &str) -> Result<i128> {
+    text.parse()
+        .with_context(|| format!("{text:?} is not an integer"))
+}
+
+/// The database a block's landing rows are read from: its origin's when
+/// that database has them, else any that does.
+fn source_of<'a>(
+    block: &CensusBlock,
+    pools: &'a BTreeMap<Node, PgPool>,
+) -> Option<(Node, &'a PgPool)> {
+    block
+        .origin
+        .and_then(|origin| {
+            block
+                .landed_in
+                .contains(&origin)
+                .then(|| pools.get(&origin).map(|pool| (origin, pool)))
+                .flatten()
+        })
+        .or_else(|| {
+            block
+                .landed_in
+                .iter()
+                .find_map(|node| pools.get(node).map(|pool| (*node, pool)))
+        })
+}
+
+// --- invariant 1 -------------------------------------------------------------
+
+/// One census block's as-issued carry rows, per program: `(gross, onchain,
+/// prior)`, and the #478 overpay its confirming database recorded per
+/// program, when it may carry one.
+#[derive(Clone, Debug)]
+pub struct BlockRows {
+    pub hash: String,
+    pub height: u64,
+    pub origin: Option<Node>,
+    pub carry: BTreeMap<String, (i128, i128, i128)>,
+    pub recorded_overpay: BTreeMap<String, i128>,
+}
+
+/// A block that raised an account's debt with no record to cover it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebtIncrease {
+    pub block: String,
+    pub program: String,
+    pub increase: i128,
+    pub debt_after: i128,
+    pub recorded: Option<i128>,
+}
+
+/// Walk `blocks` in order: per program, `balance += gross - onchain`, and
+/// every increase of `max(0, -balance)` not covered by a recorded #478
+/// overpay is returned. Also returns the final balances and how many
+/// increases records covered.
+pub fn debt_walk(blocks: &[BlockRows]) -> (Vec<DebtIncrease>, BTreeMap<String, i128>, usize) {
+    let mut balances: BTreeMap<String, i128> = BTreeMap::new();
+    let mut increases = Vec::new();
+    let mut excused = 0;
+    for block in blocks {
+        for (program, (gross, onchain, _)) in &block.carry {
+            let before = *balances.get(program).unwrap_or(&0);
+            let after = before + gross - onchain;
+            balances.insert(program.clone(), after);
+            let increase = (-after).max(0) - (-before).max(0);
+            if increase <= 0 {
+                continue;
+            }
+            let recorded = block.recorded_overpay.get(program).copied();
+            if recorded.is_some_and(|recorded| recorded >= increase) {
+                excused += 1;
+                continue;
+            }
+            increases.push(DebtIncrease {
+                block: block.hash.clone(),
+                program: program.clone(),
+                increase,
+                debt_after: (-after).max(0),
+                recorded,
+            });
+        }
+    }
+    (increases, balances, excused)
+}
+
+async fn no_overpay(
+    sim: &Sim,
+    pools: &BTreeMap<Node, PgPool>,
+    census: &[CensusBlock],
+    options: &CheckOptions,
+) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv1-no-overpay");
+    let mut blocks = Vec::new();
+    for block in census {
+        let Some((_, pool)) = source_of(block, pools) else {
+            check.problem(format!(
+                "pool block {} at {} has no carry rows in any database, so its payouts cannot be \
+                 accounted",
+                block.hash, block.height
+            ));
+            continue;
+        };
+        let carry = carry_rows(pool, &block.hash).await?;
+        // The #478 race is recorded by the database that confirmed the
+        // block; in a dual-writer epoch only the owner's own blocks may
+        // carry it.
+        let recorder = match options.owner_at(sim.config.topology, block.height) {
+            Some(owner) => (block.origin == Some(owner))
+                .then(|| pools.get(&owner))
+                .flatten(),
+            None => Some(pool),
+        };
+        let mut recorded_overpay = BTreeMap::new();
+        if let Some(recorder) = recorder {
+            for program in carry.keys() {
+                if let Some(recorded) = recorded_overpay_of(recorder, &block.hash, program).await? {
+                    recorded_overpay.insert(program.clone(), recorded);
+                }
+            }
+        }
+        blocks.push(BlockRows {
+            hash: block.hash.clone(),
+            height: block.height,
+            origin: block.origin,
+            carry,
+            recorded_overpay,
+        });
+    }
+    let (increases, balances, excused) = debt_walk(&blocks);
+    for increase in &increases {
+        let block = blocks.iter().find(|b| b.hash == increase.block);
+        check.problem(format!(
+            "pool block {} at {} (origin {:?}) raised the debt of {} by {} sats to {} (recorded \
+             #478 overpay: {})",
+            increase.block,
+            block.map_or(0, |b| b.height),
+            block.and_then(|b| b.origin),
+            short(&increase.program),
+            increase.increase,
+            increase.debt_after,
+            increase
+                .recorded
+                .map_or_else(|| "none".into(), |recorded| recorded.to_string())
+        ));
+    }
+    let debt: i128 = balances.values().map(|balance| (-balance).max(0)).sum();
+    check.data(
+        "blocks",
+        json!(blocks
+            .iter()
+            .map(|block| json!({
+                "block": block.hash, "height": block.height, "origin": block.origin,
+                "accounts": block.carry.iter().map(|(program, (gross, onchain, prior))| json!({
+                    "program": short(program), "prior": prior.to_string(),
+                    "gross": gross.to_string(), "onchain": onchain.to_string(),
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>()),
+    );
+    check.data(
+        "final_balances",
+        json!(balances
+            .iter()
+            .map(|(p, b)| (short(p), b.to_string()))
+            .collect::<BTreeMap<_, _>>()),
+    );
+    check.data("final_pool_debt_sats", json!(debt.to_string()));
+    check.data("excused_478_increases", json!(excused));
+    Ok(check.finish(format!(
+        "{} pool blocks walked over {} accounts; final pool debt {debt} sats; {excused} recorded \
+         #478 increases",
+        census.len(),
+        balances.len()
+    )))
+}
+
+async fn recorded_overpay_of(pool: &PgPool, block: &str, program: &str) -> Result<Option<i128>> {
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT a.overpay_sats::text FROM qbit_prism_payout_divergence_accounts a \
+         JOIN qbit_prism_payout_divergences d ON d.block_hash = a.block_hash \
+         WHERE a.block_hash = $1 AND a.p2mr_program = decode($2, 'hex') \
+           AND d.confirmed_at IS NOT NULL AND d.divergent_accounts > 0",
+    )
+    .bind(block)
+    .bind(program)
+    .fetch_optional(pool)
+    .await?;
+    recorded.as_deref().map(parse_i128).transpose()
+}
+
+async fn owner_balances_match_chain(
+    sim: &Sim,
+    pools: &BTreeMap<Node, PgPool>,
+    census: &[CensusBlock],
+    options: &CheckOptions,
+) -> Result<Check> {
+    let mut check = CheckBuilder::new("owner-balances-match-chain");
+    let owner = current_owner(sim, options, census);
+    let Some(pool) = pools.get(&owner) else {
+        return Ok(Check::skip(
+            "owner-balances-match-chain",
+            "the owner's database is not checked in this run",
+        ));
+    };
+    let mut truth: BTreeMap<String, i128> = BTreeMap::new();
+    for block in census {
+        let Some((_, source)) = source_of(block, pools) else {
+            continue;
+        };
+        for (program, (gross, onchain, _)) in carry_rows(source, &block.hash).await? {
+            *truth.entry(program).or_default() += gross - onchain;
+        }
+    }
+    truth.retain(|_, balance| *balance != 0);
+    let rows = sqlx::query(
+        "SELECT encode(p2mr_program, 'hex') AS program, balance_sats::text AS balance \
+         FROM qbit_current_carry_forward_balances()",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut view = BTreeMap::new();
+    for row in rows {
+        view.insert(
+            row.try_get::<String, _>("program")?,
+            parse_i128(&row.try_get::<String, _>("balance")?)?,
+        );
+    }
+    for program in truth.keys().chain(view.keys()).collect::<BTreeSet<_>>() {
+        let (want, have) = (truth.get(program), view.get(program));
+        if want != have {
+            check.problem(format!(
+                "{}: the chain's as-issued rows sum to {}, the owner's balances say {}",
+                short(program),
+                want.map_or_else(|| "0".into(), i128::to_string),
+                have.map_or_else(|| "0".into(), i128::to_string)
+            ));
+        }
+    }
+    check.data("accounts", json!(truth.len()));
+    Ok(check.finish(format!(
+        "node {owner:?}'s current balances against the sums over {} pool blocks",
+        census.len()
+    )))
+}
+
+// --- invariant 2 -------------------------------------------------------------
+
+async fn non_owner_carry_free(
+    sim: &Sim,
+    pools: &BTreeMap<Node, PgPool>,
+    census: &[CensusBlock],
+    options: &CheckOptions,
+) -> Result<Check> {
+    // A block is the non-owner's when its origin is not the owner of its
+    // height's epoch; a single-writer epoch has none.
+    let blocks: Vec<&CensusBlock> = census
+        .iter()
+        .filter(|block| {
+            options
+                .owner_at(sim.config.topology, block.height)
+                .is_some_and(|owner| block.origin.is_some_and(|origin| origin != owner))
+        })
+        .collect();
+    if sim.config.topology != Topology::DualWriter && options.ownership.is_empty() {
+        return Ok(Check::skip(
+            "inv2-non-owner-carry-free",
+            "single-writer topology: there is no non-owner",
+        ));
+    }
+    let mut check = CheckBuilder::new("inv2-non-owner-carry-free");
+    for block in &blocks {
+        for node in &block.landed_in {
+            let Some(pool) = pools.get(node) else {
+                continue;
+            };
+            let row = sqlx::query(
+                "SELECT jsonb_array_length(COALESCE(a.audit_bundle->'prior_balances', '[]'::jsonb)) AS prior_entries, \
+                        a.audit_bundle #>> '{ledger_window_attestation,prior_balances_digest_hex}' AS prior_digest, \
+                        (SELECT count(*) FROM jsonb_array_elements(a.audit_bundle #> '{payout_policy_manifest,accounts}') acc \
+                          WHERE COALESCE(acc->>'account_type', 'miner') = 'miner' \
+                            AND ((acc->>'prior_balance_sats')::numeric <> 0 \
+                                 OR (acc->>'gross_amount_sats')::numeric < (acc->>'onchain_amount_sats')::numeric)) AS bad_accounts, \
+                        (SELECT count(*) FROM qbit_payout_carry_forward c \
+                          WHERE c.block_hash = a.block_hash \
+                            AND (c.prior_balance_sats <> 0 OR c.gross_amount_sats < c.onchain_amount_sats)) AS bad_rows \
+                 FROM qbit_pool_audit_bundles a WHERE a.block_hash = $1",
+            )
+            .bind(&block.hash)
+            .fetch_optional(pool)
+            .await?;
+            let Some(row) = row else {
+                check.problem(format!(
+                    "{} has no audit bundle on node {node:?}",
+                    block.hash
+                ));
+                continue;
+            };
+            let prior_entries: i32 = row.try_get("prior_entries")?;
+            let digest: Option<String> = row.try_get("prior_digest")?;
+            let bad_accounts: i64 = row.try_get("bad_accounts")?;
+            let bad_rows: i64 = row.try_get("bad_rows")?;
+            if prior_entries != 0
+                || digest.as_deref() != Some(EMPTY_PRIOR_DIGEST)
+                || bad_accounts != 0
+                || bad_rows != 0
+            {
+                check.problem(format!(
+                    "non-owner block {} on node {node:?}: {prior_entries} prior entries, prior \
+                     digest {digest:?}, {bad_accounts} manifest accounts and {bad_rows} carry rows \
+                     with a prior or onchain above gross",
+                    block.hash
+                ));
+            }
+        }
+    }
+    Ok(check.finish(format!(
+        "{} blocks issued by a non-owner of their epoch",
+        blocks.len()
+    )))
+}
+
+// --- invariant 3 -------------------------------------------------------------
+
+async fn landing_rows(
+    pools: &BTreeMap<Node, PgPool>,
+    census: &[CensusBlock],
+    options: &CheckOptions,
+) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv3-landing-rows");
+    let hashes: Vec<String> = census.iter().map(|block| block.hash.clone()).collect();
+    let mut landings: BTreeMap<Node, BTreeMap<String, Value>> = BTreeMap::new();
+    for (node, pool) in pools {
+        let rows = sqlx::query(
+            "SELECT h.block_hash, b.block_hash IS NOT NULL AS has_block, b.chain_state, \
+                    a.block_hash IS NOT NULL AS has_bundle, \
+                    COALESCE(b.as_issued_audit_sha256 = a.audit_bundle_sha256, false) AS marker_matches, \
+                    s.snapshot_sha256 IS NOT NULL AS has_snapshot, \
+                    (SELECT count(*) FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash) AS payout_rows, \
+                    COALESCE(jsonb_array_length(a.audit_bundle #> '{payout_policy_manifest,accounts}'), -1) AS manifest_accounts, \
+                    (SELECT count(*) FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash) AS carry_rows, \
+                    (SELECT count(*) FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                      WHERE COALESCE(acc->>'account_type', 'miner') = 'miner') AS manifest_miners, \
+                    COALESCE(jsonb_array_length(a.audit_bundle #> '{ctv_fanout_manifest_set,manifests}'), 0) AS expected_fanouts, \
+                    f.block_hash IS NOT NULL AS has_fanout_set, \
+                    (SELECT count(*) FROM qbit_ctv_fanout_artifacts fa WHERE fa.block_hash = h.block_hash) AS fanout_artifacts, \
+                    b.coinbase_txid, b.block_height, \
+                    (SELECT count(*) FROM qbit_pool_payout_entries p \
+                      WHERE p.block_hash = h.block_hash AND p.block_height IS DISTINCT FROM b.block_height) AS payout_height_mismatches, \
+                    (SELECT count(*) FROM qbit_payout_carry_forward c \
+                      WHERE c.block_hash = h.block_hash AND c.block_height IS DISTINCT FROM b.block_height) AS carry_height_mismatches, \
+                    (SELECT count(*) FROM ( \
+                       (SELECT p.miner_id, p.payout_order_key, p.p2mr_program, \
+                               p.onchain_amount_sats::numeric, p.carry_forward_balance_sats::numeric, p.action \
+                          FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash \
+                        EXCEPT ALL \
+                        SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'onchain_amount_sats')::numeric, (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc) \
+                       UNION ALL \
+                       (SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'onchain_amount_sats')::numeric, (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                        EXCEPT ALL \
+                        SELECT p.miner_id, p.payout_order_key, p.p2mr_program, \
+                               p.onchain_amount_sats::numeric, p.carry_forward_balance_sats::numeric, p.action \
+                          FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash)) x) AS payout_mismatches, \
+                    (SELECT count(*) FROM ( \
+                       (SELECT c.miner_id, c.payout_order_key, c.p2mr_program, c.gross_amount_sats::numeric, \
+                               c.prior_balance_sats::numeric, c.candidate_balance_sats::numeric, c.onchain_amount_sats::numeric, \
+                               c.settlement_fee_sats::numeric, c.carry_forward_balance_sats::numeric, c.action \
+                          FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash \
+                        EXCEPT ALL \
+                        SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'gross_amount_sats')::numeric, (acc->>'prior_balance_sats')::numeric, \
+                               (acc->>'candidate_balance_sats')::numeric, (acc->>'onchain_amount_sats')::numeric, \
+                               COALESCE((acc->>'settlement_fee_sats')::numeric, 0), (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                         WHERE COALESCE(acc->>'account_type', 'miner') = 'miner') \
+                       UNION ALL \
+                       (SELECT acc->>'recipient_id', acc->>'order_key', decode(acc->>'p2mr_program_hex', 'hex'), \
+                               (acc->>'gross_amount_sats')::numeric, (acc->>'prior_balance_sats')::numeric, \
+                               (acc->>'candidate_balance_sats')::numeric, (acc->>'onchain_amount_sats')::numeric, \
+                               COALESCE((acc->>'settlement_fee_sats')::numeric, 0), (acc->>'carry_forward_balance_sats')::numeric, acc->>'action' \
+                          FROM jsonb_array_elements(COALESCE(a.audit_bundle #> '{payout_policy_manifest,accounts}', '[]'::jsonb)) acc \
+                         WHERE COALESCE(acc->>'account_type', 'miner') = 'miner' \
+                        EXCEPT ALL \
+                        SELECT c.miner_id, c.payout_order_key, c.p2mr_program, c.gross_amount_sats::numeric, \
+                               c.prior_balance_sats::numeric, c.candidate_balance_sats::numeric, c.onchain_amount_sats::numeric, \
+                               c.settlement_fee_sats::numeric, c.carry_forward_balance_sats::numeric, c.action \
+                          FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash)) y) AS carry_mismatches \
+             FROM unnest($1::text[]) AS h(block_hash) \
+             LEFT JOIN qbit_pool_blocks b ON b.block_hash = h.block_hash \
+             LEFT JOIN qbit_pool_audit_bundles a ON a.block_hash = h.block_hash \
+             LEFT JOIN qbit_prism_audit_snapshots s ON s.snapshot_sha256 = a.share_snapshot_sha256 \
+             LEFT JOIN qbit_ctv_fanout_sets f ON f.block_hash = h.block_hash",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            let hash: String = row.try_get("block_hash")?;
+            if !row.try_get::<bool, _>("has_block")? {
+                if !options.absent_ledgers.contains_key(node) {
+                    check.problem(format!(
+                        "pool block {hash} has no landing rows on node {node:?}"
+                    ));
+                }
+                continue;
+            }
+            let state: Option<String> = row.try_get("chain_state")?;
+            let mut faults = Vec::new();
+            if state.as_deref() != Some("confirmed") {
+                faults.push(format!("chain_state {state:?}, not confirmed"));
+            }
+            if !row.try_get::<bool, _>("has_bundle")? {
+                faults.push("no audit bundle".into());
+            }
+            if !row.try_get::<bool, _>("marker_matches")? {
+                faults.push("as-issued audit marker differs from the bundle".into());
+            }
+            if !row.try_get::<bool, _>("has_snapshot")? {
+                faults.push("no audit snapshot".into());
+            }
+            let payout_rows: i64 = row.try_get("payout_rows")?;
+            let manifest_accounts: i32 = row.try_get("manifest_accounts")?;
+            if payout_rows != i64::from(manifest_accounts) {
+                faults.push(format!(
+                    "{payout_rows} payout entries for {manifest_accounts} manifest accounts"
+                ));
+            }
+            let carry: i64 = row.try_get("carry_rows")?;
+            let miners: i64 = row.try_get("manifest_miners")?;
+            if carry != miners {
+                faults.push(format!("{carry} carry rows for {miners} miner accounts"));
+            }
+            // Not just as many rows as the signed manifest's accounts: the
+            // same rows, field for field, as the landing writes them from it.
+            for (column, what) in [
+                ("payout_mismatches", "payout entries"),
+                ("carry_mismatches", "carry rows"),
+            ] {
+                let mismatches: i64 = row.try_get(column)?;
+                if mismatches != 0 {
+                    faults.push(format!(
+                        "{mismatches} {what} and manifest accounts differ (recipient, order key, \
+                         program, amounts or action)"
+                    ));
+                }
+            }
+            let expected: i32 = row.try_get("expected_fanouts")?;
+            let artifacts: i64 = row.try_get("fanout_artifacts")?;
+            if row.try_get::<bool, _>("has_fanout_set")? != (expected > 0)
+                || artifacts != i64::from(expected)
+            {
+                faults.push(format!(
+                    "{artifacts} fanout artifacts for {expected} manifests"
+                ));
+            }
+            // The landed coinbase and height must be the chain's: the census
+            // read them from C, never from a database. The child rows carry
+            // the block's height too.
+            let coinbase_txid: Option<String> = row.try_get("coinbase_txid")?;
+            let height: Option<i64> = row.try_get("block_height")?;
+            if let Some(block) = census.iter().find(|block| block.hash == hash) {
+                if coinbase_txid.as_deref() != Some(block.coinbase_txid.as_str()) {
+                    faults.push(format!(
+                        "coinbase txid {coinbase_txid:?}, the chain's is {}",
+                        block.coinbase_txid
+                    ));
+                }
+                if height.and_then(|h| u64::try_from(h).ok()) != Some(block.height) {
+                    faults.push(format!(
+                        "block height {height:?}, the chain's is {}",
+                        block.height
+                    ));
+                }
+            }
+            for (column, what) in [
+                ("payout_height_mismatches", "payout entries"),
+                ("carry_height_mismatches", "carry rows"),
+            ] {
+                let mismatches: i64 = row.try_get(column)?;
+                if mismatches != 0 {
+                    faults.push(format!(
+                        "{mismatches} {what} at another height than the block"
+                    ));
+                }
+            }
+            if !faults.is_empty() {
+                check.problem(format!(
+                    "pool block {hash} on node {node:?}: {}",
+                    faults.join("; ")
+                ));
+            }
+        }
+        // A row confirmed for a block the chain's census does not hold is a
+        // phantom landing, which no check above would visit. Rows of other
+        // states (a lost block's prepared row, a reorged one) may stay.
+        let phantoms: Vec<String> = sqlx::query_scalar(
+            "SELECT block_hash FROM qbit_pool_blocks \
+             WHERE chain_state = 'confirmed' AND NOT (block_hash = ANY($1)) ORDER BY block_hash",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        for hash in phantoms {
+            check.problem(format!(
+                "node {node:?} holds pool block {hash} as confirmed, but it is no pool block of \
+                 the active chain since the scenario began"
+            ));
+        }
+        if pools.len() > 1 {
+            landings.insert(*node, carried_landings(pool, &hashes).await?);
+        }
+    }
+    // CONTRACT.md D-1 and D-10: the peer sync copies a landing whole, so a
+    // block both nodes hold has the same rows on both in every column the
+    // sync carries, its provenance (`origin_node`, `sync_seq`, `found_at`,
+    // the solver) as much as its facts. Only the columns the sync leaves to
+    // each node (chain and maturity state, publication order, claims) may
+    // differ.
+    let mut compared = 0;
+    if let (Some(a), Some(b)) = (landings.get(&Node::A), landings.get(&Node::B)) {
+        for (hash, landing) in a {
+            if let Some(other) = b.get(hash) {
+                compared += 1;
+                if other != landing {
+                    check.problem(format!(
+                        "pool block {hash}'s landing rows differ between nodes: {}",
+                        json_differences(landing, other).join("; ")
+                    ));
+                }
+            }
+        }
+    }
+    check.data("landings_on_both_nodes", json!(compared));
+    Ok(check.finish(format!(
+        "{} pool blocks in {} databases; {compared} held by both compared in every carried column",
+        census.len(),
+        pools.len()
+    )))
+}
+
+/// An SQL condition: the landing of the block `block_hash` names is whole,
+/// with its audit bundle joined as `a` and the bundle's window snapshot as
+/// `s`. That is the bundle, the snapshot, one payout entry per manifest
+/// account, one carry row per miner account, and the CTV fanout set and one
+/// artifact per manifest when the bundle names any: what
+/// `inv3-landing-rows` requires of a landed block. A landing writes all of
+/// them in one transaction, and so does the peer sync's apply of a peer's
+/// block (D-10), so no statement may see part of one.
+pub fn landing_whole(block_hash: &str) -> String {
+    format!(
+        "(a.block_hash IS NOT NULL AND s.snapshot_sha256 IS NOT NULL \
+          AND (SELECT count(*) FROM qbit_pool_payout_entries p WHERE p.block_hash = {block_hash}) \
+              = COALESCE(jsonb_array_length(a.audit_bundle #> '{{payout_policy_manifest,accounts}}'), -1) \
+          AND (SELECT count(*) FROM qbit_payout_carry_forward c WHERE c.block_hash = {block_hash}) \
+              = (SELECT count(*) FROM jsonb_array_elements(COALESCE( \
+                     a.audit_bundle #> '{{payout_policy_manifest,accounts}}', '[]'::jsonb)) acc \
+                 WHERE COALESCE(acc->>'account_type', 'miner') = 'miner') \
+          AND EXISTS (SELECT 1 FROM qbit_ctv_fanout_sets f WHERE f.block_hash = {block_hash}) \
+              = (COALESCE(jsonb_array_length(a.audit_bundle #> '{{ctv_fanout_manifest_set,manifests}}'), 0) > 0) \
+          AND (SELECT count(*) FROM qbit_ctv_fanout_artifacts r WHERE r.block_hash = {block_hash}) \
+              = COALESCE(jsonb_array_length(a.audit_bundle #> '{{ctv_fanout_manifest_set,manifests}}'), 0))"
+    )
+}
+
+/// The content-determined columns of an audit snapshot (D-15, D1's
+/// `SNAPSHOT_FACTS`): windows with one share array share one row, and its
+/// anchor, cut, origin and creation time are whichever node wrote it first.
+pub const SNAPSHOT_FACTS: &[&str] = &[
+    "snapshot_sha256",
+    "first_share_seq",
+    "last_share_seq",
+    "share_count",
+    "inline_shares",
+];
+
+/// The landing of each of `hashes` this database holds, as one document per
+/// block: every row of the landing with exactly the columns D1's peer sync
+/// carries of its table, as this database's catalog has them
+/// ([`CarriedColumns`]), and the snapshot by its [`SNAPSHOT_FACTS`].
+/// Timestamps are read in UTC, so both databases render them alike.
+async fn carried_landings(pool: &PgPool, hashes: &[String]) -> Result<BTreeMap<String, Value>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let carried = CarriedColumns::read(&mut tx).await?;
+    let columns = |table: &str| carried.of(table).to_vec();
+    let facts: Vec<String> = SNAPSHOT_FACTS
+        .iter()
+        .map(|fact| (*fact).to_owned())
+        .collect();
+    let rows: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT h.block_hash, jsonb_build_object( \
+             'qbit_pool_blocks', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(b)) e WHERE e.key = ANY($2)), \
+             'qbit_pool_audit_bundles', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(a)) e WHERE e.key = ANY($3)), \
+             'qbit_prism_audit_snapshots', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(s)) e WHERE e.key = ANY($4)), \
+             'qbit_pool_payout_entries', (SELECT jsonb_agg((SELECT jsonb_object_agg(e.key, e.value) \
+                     FROM jsonb_each(to_jsonb(p)) e WHERE e.key = ANY($5)) \
+                   ORDER BY p.payout_order_key, p.miner_id, p.p2mr_program) \
+                 FROM qbit_pool_payout_entries p WHERE p.block_hash = h.block_hash), \
+             'qbit_payout_carry_forward', (SELECT jsonb_agg((SELECT jsonb_object_agg(e.key, e.value) \
+                     FROM jsonb_each(to_jsonb(c)) e WHERE e.key = ANY($6)) \
+                   ORDER BY c.payout_order_key, c.miner_id, c.p2mr_program) \
+                 FROM qbit_payout_carry_forward c WHERE c.block_hash = h.block_hash), \
+             'qbit_ctv_fanout_sets', (SELECT jsonb_object_agg(e.key, e.value) \
+                 FROM jsonb_each(to_jsonb(f)) e WHERE e.key = ANY($7)), \
+             'qbit_ctv_fanout_artifacts', (SELECT jsonb_agg((SELECT jsonb_object_agg(e.key, e.value) \
+                     FROM jsonb_each(to_jsonb(r)) e WHERE e.key = ANY($8)) \
+                   ORDER BY r.chunk_index, r.fanout_txid) \
+                 FROM qbit_ctv_fanout_artifacts r WHERE r.block_hash = h.block_hash)) \
+         FROM unnest($1::text[]) AS h(block_hash) \
+         JOIN qbit_pool_blocks b ON b.block_hash = h.block_hash \
+         LEFT JOIN qbit_pool_audit_bundles a ON a.block_hash = h.block_hash \
+         LEFT JOIN qbit_prism_audit_snapshots s ON s.snapshot_sha256 = a.share_snapshot_sha256 \
+         LEFT JOIN qbit_ctv_fanout_sets f ON f.block_hash = h.block_hash",
+    )
+    .bind(hashes)
+    .bind(columns("qbit_pool_blocks"))
+    .bind(columns("qbit_pool_audit_bundles"))
+    .bind(facts)
+    .bind(columns("qbit_pool_payout_entries"))
+    .bind(columns("qbit_payout_carry_forward"))
+    .bind(columns("qbit_ctv_fanout_sets"))
+    .bind(columns("qbit_ctv_fanout_artifacts"))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// The keys the test signing seeds give (`PRISM_ALLOW_TEST_SIGNING_SEEDS`):
+/// `(ledger writer, coinbase manifest)`.
+pub fn pinned_keys() -> Result<(String, String)> {
+    let key = |seed: &str| -> Result<String> {
+        Ok(
+            qbit_pool_builder::ManifestSigningKey::from_seed_hex(&seed.repeat(32))
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?
+                .public_key_hex(),
+        )
+    };
+    Ok((key("22")?, key("11")?))
+}
+
+async fn audits_verify(sim: &Sim, census: &[CensusBlock], options: &CheckOptions) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv3-audits-verify");
+    let (ledger_key, manifest_key) = pinned_keys()?;
+    let verifier = sim.inputs.verifier_dir.join("qbit-prism-audit-verify");
+    let dir = sim.report_dir.join("audits");
+    std::fs::create_dir_all(&dir)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let mut verified = 0;
+    for block in census {
+        let mut digests = BTreeMap::new();
+        for node in Node::BOTH {
+            if options.absent_ledgers.contains_key(&node) {
+                continue;
+            }
+            // A frontend down at the end is not one that serves its node's
+            // audits: unless the scenario says the node is away, it fails.
+            if !sim.frontend(node).running() {
+                check.problem(format!(
+                    "node {node:?}'s frontend is not running, so it serves no audit of {}",
+                    block.hash
+                ));
+                continue;
+            }
+            if sim.config.topology == Topology::Unsynced && !block.landed_in.contains(&node) {
+                // The negative control: the other node cannot know it.
+                continue;
+            }
+            let url = format!(
+                "http://127.0.0.1:{}/audit/blocks/{}/bundle",
+                sim.frontend(node).spec.api_port,
+                block.hash
+            );
+            let response = client.get(&url).send().await?;
+            if !response.status().is_success() {
+                check.problem(format!(
+                    "node {node:?} does not serve {}'s audit bundle: HTTP {}",
+                    block.hash,
+                    response.status()
+                ));
+                continue;
+            }
+            let body: Value = response.json().await?;
+            let bundle = &body["audit_bundle"];
+            let file = dir.join(format!("{}-{}.json", block.hash, node.label()));
+            std::fs::write(&file, serde_json::to_vec(bundle)?)?;
+            match run_verifier(&verifier, &file, &block.coinbase_hex, &ledger_key) {
+                Ok(report) => {
+                    let mut faults = Vec::new();
+                    if report["coinbase_txid"] != block.coinbase_txid.as_str() {
+                        faults.push(format!("coinbase txid {}", report["coinbase_txid"]));
+                    }
+                    if report["block_height"].as_u64() != Some(block.height)
+                        && report["block_height"] != Value::Null
+                    {
+                        faults.push(format!("height {}", report["block_height"]));
+                    }
+                    let signer = &bundle["signed_coinbase_manifest"]["signature"]["public_key_hex"];
+                    if signer != manifest_key.as_str() {
+                        faults.push(format!("manifest signed by {signer}, not the pinned key"));
+                    }
+                    if faults.is_empty() {
+                        verified += 1;
+                    } else {
+                        check.problem(format!(
+                            "{}'s audit from node {node:?} verified but disagrees: {}",
+                            block.hash,
+                            faults.join("; ")
+                        ));
+                    }
+                    digests.insert(node, report["audit_bundle_sha256_hex"].clone());
+                }
+                Err(error) => check.problem(format!(
+                    "qbit-prism-audit-verify refused {}'s audit from node {node:?}: {error:#}",
+                    block.hash
+                )),
+            }
+        }
+        let mut values = digests.values();
+        if let Some(first) = values.next() {
+            if values.any(|other| other != first) {
+                check.problem(format!(
+                    "the nodes serve different audits for {}: {}",
+                    block.hash,
+                    json!(digests)
+                ));
+            }
+        }
+    }
+    check.data("verified", json!(verified));
+    Ok(check.finish(format!(
+        "{verified} audit bundles verified by the binary against the chain's coinbases"
+    )))
+}
+
+fn run_verifier(verifier: &Path, bundle: &Path, coinbase_hex: &str, key: &str) -> Result<Value> {
+    let output = std::process::Command::new(verifier)
+        .arg(bundle)
+        .args(["--coinbase-tx-hex", coinbase_hex])
+        .args(["--ledger-writer-public-key-hex", key])
+        .output()
+        .with_context(|| format!("running {}", verifier.display()))?;
+    if !output.status.success() {
+        bail!(
+            "exit {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("the verifier's report is not JSON")
+}
+
+async fn fanouts_identical(
+    pools: &BTreeMap<Node, PgPool>,
+    census: &[CensusBlock],
+) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv3-fanouts-identical");
+    let hashes: Vec<String> = census.iter().map(|block| block.hash.clone()).collect();
+    let mut by_node = BTreeMap::new();
+    for (node, pool) in pools {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT block_hash, fanout_txid, fanout_tx_hex, manifest_sha256 \
+             FROM qbit_ctv_fanout_artifacts WHERE block_hash = ANY($1) ORDER BY fanout_txid",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        // Each artifact must be one of the bundle's own signed manifests in
+        // every immutable field the landing copies from it (ledger/blocks.rs,
+        // persist_fanouts), its digests recomputing, not just its transaction.
+        let mismatched: Vec<String> = sqlx::query_scalar(
+            "SELECT fa.fanout_txid FROM qbit_ctv_fanout_artifacts fa \
+             JOIN qbit_pool_audit_bundles a ON a.block_hash = fa.block_hash \
+             LEFT JOIN qbit_ctv_fanout_sets f ON f.block_hash = fa.block_hash \
+             WHERE fa.block_hash = ANY($1) AND NOT EXISTS ( \
+               SELECT 1 FROM jsonb_array_elements(a.audit_bundle #> '{ctv_fanout_manifest_set,manifests}') m \
+               WHERE fa.manifest = m AND fa.manifest_json::jsonb = m \
+                 AND fa.manifest_sha256 = encode(sha256(convert_to(fa.manifest_json, 'UTF8')), 'hex') \
+                 AND fa.manifest_set_sha256 IS NOT DISTINCT FROM f.manifest_set_sha256 \
+                 AND fa.fanout_txid = m->>'fanout_txid' \
+                 AND fa.precommitment_sha256 = m->>'precommitment_sha256_hex' \
+                 AND fa.ctv_hash = m #>> '{precommitment,ctv_hash_hex}' \
+                 AND fa.commitment_witness_leaf_hex = m->>'commitment_witness_leaf_hex' \
+                 AND fa.chunk_index = (m #>> '{precommitment,chunk_index}')::int \
+                 AND fa.chunk_count = (m #>> '{precommitment,chunk_count}')::int \
+                 AND fa.parent_coinbase_txid = m->>'parent_coinbase_txid' \
+                 AND fa.parent_coinbase_vout = (m->>'parent_coinbase_vout')::int \
+                 AND fa.fanout_tx_template_hex = m #>> '{precommitment,fanout_tx_template_hex}' \
+                 AND fa.fanout_tx_hex = m->>'fanout_tx_hex' \
+                 AND fa.anchor_vout IS NOT DISTINCT FROM (m #>> '{precommitment,anchor_vout}')::int \
+                 AND fa.covenant_output_value_sats = (m->>'covenant_output_value_sats')::bigint \
+                 AND fa.fanout_output_sum_sats = (m #>> '{precommitment,fanout_output_sum_sats}')::bigint)",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        for txid in mismatched {
+            check.problem(format!(
+                "fanout {txid} on node {node:?} is not one of its bundle's signed manifests in \
+                 every field"
+            ));
+        }
+        // And the set row is the bundle's signed manifest set.
+        let sets: Vec<String> = sqlx::query_scalar(
+            "SELECT f.block_hash FROM qbit_ctv_fanout_sets f \
+             JOIN qbit_pool_audit_bundles a ON a.block_hash = f.block_hash \
+             WHERE f.block_hash = ANY($1) AND NOT ( \
+               f.manifest_set = a.audit_bundle->'ctv_fanout_manifest_set' \
+               AND f.manifest_set_json::jsonb = f.manifest_set \
+               AND f.manifest_set_sha256 = encode(sha256(convert_to(f.manifest_set_json, 'UTF8')), 'hex') \
+               AND f.settlement_mode = f.manifest_set->>'settlement_mode' \
+               AND f.parent_coinbase_txid = f.manifest_set->>'parent_coinbase_txid' \
+               AND f.parent_coinbase_tx_hex = f.manifest_set #>> '{manifests,0,parent_coinbase_tx_hex}' \
+               AND f.fanout_count = (f.manifest_set->>'fanout_count')::int \
+               AND f.fanout_output_sum_sats = (f.manifest_set->>'fanout_output_sum_sats')::bigint \
+               AND f.covenant_output_value_sats = (f.manifest_set->>'covenant_output_value_sats')::bigint)",
+        )
+        .bind(&hashes)
+        .fetch_all(pool)
+        .await?;
+        for block in sets {
+            check.problem(format!(
+                "the fanout set of {block} on node {node:?} is not its bundle's signed manifest \
+                 set in every field"
+            ));
+        }
+        by_node.insert(*node, rows);
+    }
+    let mut views = by_node.iter();
+    if let Some((first_node, first)) = views.next() {
+        for (node, rows) in views {
+            let a: BTreeSet<_> = first.iter().collect();
+            let b: BTreeSet<_> = rows.iter().collect();
+            for only in a.difference(&b) {
+                check.problem(format!(
+                    "fanout {} of {} is on node {first_node:?} only, or differs on node {node:?}",
+                    only.1, only.0
+                ));
+            }
+            for only in b.difference(&a) {
+                check.problem(format!(
+                    "fanout {} of {} is on node {node:?} only, or differs on node {first_node:?}",
+                    only.1, only.0
+                ));
+            }
+        }
+    }
+    let count = by_node.values().map(Vec::len).max().unwrap_or(0);
+    check.data("artifacts", json!(count));
+    Ok(check.finish(format!("{count} CTV fanout transactions compared")))
+}
+
+// --- invariant 4 -------------------------------------------------------------
+
+async fn acked_shares_present(
+    pools: &BTreeMap<Node, PgPool>,
+    shares: &[ShareRecord],
+    options: &CheckOptions,
+) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv4-acked-shares-present");
+    let acked: Vec<&ShareRecord> = shares.iter().filter(|record| record.accepted()).collect();
+    // By the full share id the miner was answered for, worker and all: a row
+    // under the same header but another id is not this share.
+    let ids: Vec<String> = acked.iter().map(|record| record.share_id.clone()).collect();
+    let mut missing_by_node = BTreeMap::new();
+    for (node, pool) in pools {
+        if options.absent_ledgers.contains_key(node) {
+            continue;
+        }
+        let missing: Vec<String> = sqlx::query_scalar(
+            "SELECT s.share_id FROM unnest($1::text[]) AS s(share_id) \
+             WHERE NOT EXISTS (SELECT 1 FROM qbit_share_ledger l \
+                 JOIN qbit_prism_share_hashes m ON m.share_id = l.share_id \
+                 WHERE l.share_id = s.share_id AND l.accepted)",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+        missing_by_node.insert(*node, missing.into_iter().collect());
+    }
+    let tally = tally_missing(&missing_by_node, &options.excused_missing);
+    // One problem per lost share, however many databases lack it: the
+    // report counts the problems as shares lost.
+    for record in &acked {
+        if let Some(nodes) = tally.lost.get(&record.share_id) {
+            check.problem(format!(
+                "acknowledged share {} (issued by {:?}, answered at {:?} ms) is missing on \
+                 {nodes:?}",
+                record.share_id, record.issuer, record.answered_ms
+            ));
+        }
+    }
+    let excused: BTreeMap<&String, usize> = tally
+        .excused
+        .iter()
+        .map(|(reason, shares)| (reason, shares.len()))
+        .collect();
+    check.data("acknowledged", json!(acked.len()));
+    check.data("excused_missing", json!(excused));
+    Ok(check.finish(format!(
+        "{} acknowledged shares checked in {} databases",
+        acked.len(),
+        pools.len()
+    )))
+}
+
+/// The acknowledged shares missing from the checked databases, each counted
+/// once however many databases lack it: an excused one under its reason, any
+/// other with the databases that lack it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MissingShares {
+    excused: BTreeMap<String, BTreeSet<String>>,
+    lost: BTreeMap<String, Vec<Node>>,
+}
+
+/// Sort the share ids each database lacks into excused and lost shares
+/// (`excused` maps a share id to why it may be missing). A share neither
+/// node holds, such as a node's unsynced tail after its disk was rebuilt
+/// from the other (S7), is one share, not one per database.
+fn tally_missing(
+    missing_by_node: &BTreeMap<Node, BTreeSet<String>>,
+    excused: &BTreeMap<String, String>,
+) -> MissingShares {
+    let mut tally = MissingShares::default();
+    for (node, missing) in missing_by_node {
+        for share in missing {
+            match excused.get(share) {
+                Some(reason) => {
+                    tally
+                        .excused
+                        .entry(reason.clone())
+                        .or_default()
+                        .insert(share.clone());
+                }
+                None => tally.lost.entry(share.clone()).or_default().push(*node),
+            }
+        }
+    }
+    tally
+}
+
+/// How many of two documents' differences [`json_differences`] names.
+const DIFFERENCES_SHOWN: usize = 12;
+/// How much of each value a named difference shows.
+const DIFFERENCE_VALUE_CHARS: usize = 160;
+
+/// Where two renderings of one row (or of one landing's rows) disagree, each
+/// place by its path with both values, node A's first: depth first, the
+/// first [`DIFFERENCES_SHOWN`], each value cut to [`DIFFERENCE_VALUE_CHARS`].
+pub(crate) fn json_differences(a: &Value, b: &Value) -> Vec<String> {
+    let mut differences = Vec::new();
+    walk_differences("", Some(a), Some(b), &mut differences);
+    if differences.len() > DIFFERENCES_SHOWN {
+        let more = differences.len() - DIFFERENCES_SHOWN;
+        differences.truncate(DIFFERENCES_SHOWN);
+        differences.push(format!("and {more} more"));
+    }
+    differences
+}
+
+fn walk_differences(path: &str, a: Option<&Value>, b: Option<&Value>, out: &mut Vec<String>) {
+    if a == b {
+        return;
+    }
+    let place = if path.is_empty() {
+        "the whole row"
+    } else {
+        path
+    };
+    match (a, b) {
+        (Some(Value::Object(x)), Some(Value::Object(y))) => {
+            let keys: BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+            for key in keys {
+                let inner = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                walk_differences(&inner, x.get(key), y.get(key), out);
+            }
+        }
+        (Some(Value::Array(x)), Some(Value::Array(y))) if x.len() == y.len() => {
+            for (index, (u, v)) in x.iter().zip(y).enumerate() {
+                walk_differences(&format!("{path}[{index}]"), Some(u), Some(v), out);
+            }
+        }
+        (Some(Value::Array(x)), Some(Value::Array(y))) => out.push(format!(
+            "{place}: node A {} entries, node B {} entries",
+            x.len(),
+            y.len()
+        )),
+        _ => out.push(format!("{place}: node A {}, node B {}", shown(a), shown(b))),
+    }
+}
+
+/// One side of a named difference, cut to [`DIFFERENCE_VALUE_CHARS`].
+fn shown(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "absent".to_owned();
+    };
+    let text = value.to_string();
+    if text.chars().count() <= DIFFERENCE_VALUE_CHARS {
+        return text;
+    }
+    let cut: String = text.chars().take(DIFFERENCE_VALUE_CHARS).collect();
+    format!("{cut}…")
+}
+
+async fn no_double_credit(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv4-no-double-credit");
+    let mut rows_by_node: BTreeMap<Node, BTreeMap<String, Value>> = BTreeMap::new();
+    for (node, pool) in pools {
+        let problems: Vec<(String, String)> = sqlx::query_as(
+            "SELECT 'duplicate share id', share_id FROM qbit_share_ledger GROUP BY share_id HAVING count(*) > 1 \
+             UNION ALL \
+             SELECT 'header credited twice', h FROM ( \
+                 SELECT CASE WHEN share_id ~ '[0-9A-Fa-f]{64}$' THEN lower(right(share_id, 64)) \
+                             ELSE encode(sha256(convert_to(share_id, 'UTF8')), 'hex') END AS h \
+                 FROM qbit_share_ledger WHERE accepted) x GROUP BY h HAVING count(*) > 1 \
+             UNION ALL \
+             SELECT 'ledger row without its header', l.share_id FROM qbit_share_ledger l \
+              WHERE l.accepted AND NOT EXISTS (SELECT 1 FROM qbit_prism_share_hashes h \
+                WHERE h.share_id = l.share_id) \
+             UNION ALL \
+             SELECT 'header without its ledger row', h.header_hash FROM qbit_prism_share_hashes h \
+              WHERE NOT EXISTS (SELECT 1 FROM qbit_share_ledger l WHERE l.share_id = h.share_id AND l.accepted) \
+             UNION ALL \
+             SELECT 'header mapped to another share', h.header_hash || ' -> ' || h.share_id \
+              FROM qbit_prism_share_hashes h \
+              WHERE h.share_id ~ '[0-9A-Fa-f]{64}$' AND h.header_hash <> lower(right(h.share_id, 64)) \
+             UNION ALL \
+             SELECT 'job issued after acceptance', share_seq::text FROM qbit_share_ledger \
+              WHERE accepted AND job_issued_at > accepted_at",
+        )
+        .fetch_all(pool)
+        .await?;
+        for (kind, key) in problems {
+            check.problem(format!("node {node:?}: {kind}: {key}"));
+        }
+        // Every column of a header's row, for the cross-node comparison. The
+        // ledger is append-only and copied whole (D1's table inventory copies
+        // `qbit_share_ledger` with no column left out), so a copy must equal
+        // its origin in every column: provenance (`origin_node`), payout order
+        // and credit policy included. Timestamps are read in UTC, so both
+        // databases render them alike whatever their own time zone.
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+            .execute(&mut *tx)
+            .await?;
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT lower(right(share_id, 64)), to_jsonb(l) \
+             FROM qbit_share_ledger l WHERE accepted AND share_id ~ '[0-9A-Fa-f]{64}$'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows_by_node.insert(*node, rows.into_iter().collect());
+    }
+    let mut shared = 0;
+    if let (Some(a), Some(b)) = (rows_by_node.get(&Node::A), rows_by_node.get(&Node::B)) {
+        for (header, row) in a {
+            if let Some(other) = b.get(header) {
+                shared += 1;
+                if other != row {
+                    check.problem(format!(
+                        "header {header} has different rows on the two nodes: {}",
+                        json_differences(row, other).join("; ")
+                    ));
+                }
+            }
+        }
+    }
+    check.data("headers_on_both_nodes", json!(shared));
+    Ok(check.finish(format!(
+        "{} databases; {shared} headers held by both compared",
+        pools.len()
+    )))
+}
+
+/// Which shape of window a database records: 3.0's anchored range, or the
+/// 3.1 range with a per-node cut (CONTRACT.md D-13, migration 028).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowShape {
+    Anchored,
+    Cut,
+}
+
+/// Whether the database's audit snapshots carry D-13's cut columns.
+pub async fn window_shape(pool: &PgPool) -> Result<WindowShape> {
+    let cut: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'qbit_prism_audit_snapshots' \
+           AND column_name = 'cut_seq_0')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(if cut {
+        WindowShape::Cut
+    } else {
+        WindowShape::Anchored
+    })
+}
+
+/// One recorded window: its range, anchor and cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedWindow {
+    pub snapshot: String,
+    pub first: i64,
+    pub last: i64,
+    pub anchor_ms: i64,
+    pub count: i64,
+    /// `(cut[0], cut[1])`, `None` when the window has no cut.
+    pub cut: Option<(Option<i64>, Option<i64>)>,
+}
+
+/// One `qbit_prism_audit_snapshots` row as `recorded_windows` reads it:
+/// digest, first and last share_seq, anchor, count, and the cut.
+type SnapshotRow = (String, i64, i64, i64, i64, Option<i64>, Option<i64>);
+
+/// Every non-bootstrap window a database recorded.
+pub async fn recorded_windows(pool: &PgPool) -> Result<Vec<RecordedWindow>> {
+    let shape = window_shape(pool).await?;
+    let cuts = match shape {
+        WindowShape::Cut => "cut_seq_0, cut_seq_1",
+        WindowShape::Anchored => "NULL::bigint, NULL::bigint",
+    };
+    let rows: Vec<SnapshotRow> = sqlx::query_as(&format!(
+        "SELECT snapshot_sha256, first_share_seq, last_share_seq, anchor_ms, \
+                    share_count::bigint, {cuts} \
+             FROM qbit_prism_audit_snapshots WHERE inline_shares IS NULL"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(snapshot, first, last, anchor_ms, count, cut0, cut1)| RecordedWindow {
+                snapshot,
+                first,
+                last,
+                anchor_ms,
+                count,
+                cut: (cut0.is_some() || cut1.is_some()).then_some((cut0, cut1)),
+            },
+        )
+        .collect())
+}
+
+/// D-13's eligibility predicate over ledger rows `l`, from SQL expressions:
+/// accepted, and accepted and issued no later than `anchor_ms` (in
+/// milliseconds); with `cut`, also each node's rows up to that node's cut.
+/// A cut whose entries are both NULL is no cut (a window recorded before
+/// D-13); a single NULL entry admits none of that node's rows. Without
+/// `cut` the predicate never names `origin_node`, so it reads a 3.0 schema.
+pub(crate) fn eligibility(anchor_ms: &str, cut: Option<(&str, &str)>) -> String {
+    let mut sql = format!(
+        "l.accepted \
+         AND l.accepted_at <= to_timestamp(({anchor_ms})::double precision / 1000) \
+         AND l.job_issued_at <= to_timestamp(({anchor_ms})::double precision / 1000)"
+    );
+    if let Some((cut0, cut1)) = cut {
+        sql.push_str(&format!(
+            " AND ((({cut0}) IS NULL AND ({cut1}) IS NULL) \
+                   OR (l.origin_node = 0 AND l.share_seq <= ({cut0})) \
+                   OR (l.origin_node = 1 AND l.share_seq <= ({cut1})))"
+        ));
+    }
+    sql
+}
+
+/// The predicate for one recorded window, with `$1` the anchor and `$2`,
+/// `$3` the cut (bound as NULL for a window without one; naming them with
+/// their type keeps PostgreSQL from refusing parameters it cannot type).
+fn eligible_sql(window: &RecordedWindow) -> String {
+    match window.cut {
+        None => eligibility("$1", None) + " AND $2::bigint IS NULL AND $3::bigint IS NULL",
+        Some(_) => eligibility("$1", Some(("$2::bigint", "$3::bigint"))),
+    }
+}
+
+/// How a recorded window reads in a ledger now: the eligible rows in its
+/// range, and the lowest eligible row above it, if any.
+pub async fn window_now(pool: &PgPool, window: &RecordedWindow) -> Result<(i64, Option<i64>)> {
+    let eligible = eligible_sql(window);
+    let (cut0, cut1) = window.cut.unwrap_or((None, None));
+    Ok(sqlx::query_as(&format!(
+        "SELECT (SELECT count(*) FROM qbit_share_ledger l \
+                  WHERE {eligible} AND l.share_seq BETWEEN $4 AND $5), \
+                (SELECT min(l.share_seq) FROM qbit_share_ledger l \
+                  WHERE {eligible} AND l.share_seq > $5)"
+    ))
+    .bind(window.anchor_ms)
+    .bind(cut0)
+    .bind(cut1)
+    .bind(window.first)
+    .bind(window.last)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// CONTRACT.md §4.4: a window, once built, never changes. Every recorded
+/// window must still hold exactly its shares, and no row above it may be
+/// eligible for it (a late row that would have joined it).
+pub async fn windows_unchanged(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv4-windows-unchanged");
+    let mut windows = 0;
+    for (node, pool) in pools {
+        for window in recorded_windows(pool).await? {
+            windows += 1;
+            let (durable, newer) = window_now(pool, &window).await?;
+            if durable != window.count || newer.is_some() {
+                check.problem(format!(
+                    "window {} on node {node:?} recorded {} shares; the ledger now holds \
+                     {durable} in its range, and a newer eligible share at {newer:?}",
+                    window.snapshot, window.count
+                ));
+            }
+        }
+    }
+    Ok(check.finish(format!("{windows} recorded windows re-read")))
+}
+
+/// Every recorded window recomputes to its digest on the database that
+/// built it (an in-place edit of a share keeps the count `windows_unchanged`
+/// reads), and in a pair on the other database too.
+async fn windows_reproducible(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    let mut check = CheckBuilder::new("inv4-windows-reproducible");
+    let mut compared = 0;
+    for (node, pool) in pools {
+        for window in recorded_windows(pool).await? {
+            for (other, other_pool) in pools {
+                compared += 1;
+                let digest = window_digest(other_pool, &window).await?;
+                if digest.as_deref() != Some(window.snapshot.as_str()) {
+                    check.problem(format!(
+                        "window {} built on node {node:?} recomputes on node {other:?} as \
+                         {digest:?}",
+                        window.snapshot
+                    ));
+                }
+            }
+        }
+    }
+    Ok(check.finish(format!(
+        "{compared} window recomputations on the building and the other databases"
+    )))
+}
+
+/// The snapshot digest of a recorded window, recomputed from a ledger
+/// (`window.rs`'s `snapshot_sha256`: sha256 of the serde_json share array).
+pub async fn window_digest(pool: &PgPool, window: &RecordedWindow) -> Result<Option<String>> {
+    let eligible = eligible_sql(window);
+    let (cut0, cut1) = window.cut.unwrap_or((None, None));
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT encode(sha256(convert_to('[' || string_agg( \
+             '{{\"share_seq\":' || l.share_seq \
+             || ',\"share_id\":' || to_json(l.share_id)::text \
+             || ',\"miner_id\":' || to_json(l.miner_id)::text \
+             || ',\"order_key\":' || to_json(l.payout_order_key)::text \
+             || ',\"p2mr_program_hex\":\"' || encode(l.p2mr_program, 'hex') || '\"' \
+             || ',\"share_difficulty\":' || l.share_difficulty::text \
+             || ',\"network_difficulty\":' || l.network_difficulty::text \
+             || ',\"template_height\":' || l.template_height \
+             || ',\"job_id\":' || to_json(l.job_id)::text \
+             || ',\"job_issued_at_ms\":' || floor(extract(epoch FROM l.job_issued_at) * 1000)::bigint \
+             || ',\"accepted_at_ms\":' || floor(extract(epoch FROM l.accepted_at) * 1000)::bigint \
+             || ',\"ntime\":' || l.ntime \
+             || COALESCE(',\"credit_policy\":' || to_json(l.credit_policy)::text, '') \
+             || '}}', ',' ORDER BY l.share_seq) || ']', 'UTF8')), 'hex') \
+         FROM qbit_share_ledger l \
+         WHERE {eligible} AND l.share_seq BETWEEN $4 AND $5"
+    ))
+    .bind(window.anchor_ms)
+    .bind(cut0)
+    .bind(cut1)
+    .bind(window.first)
+    .bind(window.last)
+    .fetch_one(pool)
+    .await?)
+}
+
+// --- integrity and settlement ----------------------------------------------
+
+async fn ledger_integrity(pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    let mut check = CheckBuilder::new("ledger-integrity");
+    let mut reports = BTreeMap::new();
+    for (node, pool) in pools {
+        let report: Value = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
+            .fetch_one(pool)
+            .await?;
+        if report["mismatch_count"] != 0 || report["current_drift_count"] != 0 {
+            check.problem(format!("node {node:?}'s carry integrity report: {report}"));
+        }
+        let divergence: Value = sqlx::query_scalar("SELECT qbit_prism_payout_divergence_report()")
+            .fetch_one(pool)
+            .await?;
+        reports.insert(
+            node.label(),
+            json!({"integrity": report, "divergence": divergence}),
+        );
+    }
+    check.data("reports", json!(reports));
+    Ok(check.finish(format!("{} databases' integrity reports", pools.len())))
+}
+
+/// No block candidate is still on its way, and none waits for a landing
+/// that never came. A `reconciliation` row whose block is landed and
+/// confirmed is bookkeeping its next attempt finishes (a post-offer step
+/// that lost a race with a payout-revision bump retries with a backoff): it
+/// is listed, not failed. So is one whose block never confirmed that the
+/// scenario names in [`CheckOptions::unresolved_candidates`]. Invariant 3
+/// separately holds every pool block on the chain to its landing rows.
+async fn candidates_settled(
+    pools: &BTreeMap<Node, PgPool>,
+    options: &CheckOptions,
+) -> Result<Check> {
+    let mut check = CheckBuilder::new("candidates-settled");
+    let mut pending_bookkeeping = Vec::new();
+    let mut unresolved = Vec::new();
+    for (node, pool) in pools {
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT o.block_hash, o.state, o.last_error, b.chain_state \
+             FROM qbit_block_candidate_outbox o \
+             LEFT JOIN qbit_pool_blocks b ON b.block_hash = o.block_hash \
+             WHERE o.state IN ('pending', 'offer_reserved', 'offered', 'reconciliation')",
+        )
+        .fetch_all(pool)
+        .await?;
+        for (hash, state, error, landed) in rows {
+            if state == "reconciliation" && landed.as_deref() == Some("confirmed") {
+                pending_bookkeeping.push(json!({
+                    "node": node, "block": hash, "last_error": error,
+                }));
+                continue;
+            }
+            if state == "reconciliation" {
+                if let Some(why) = options.unresolved_candidates.get(&hash) {
+                    unresolved.push(json!({
+                        "node": node, "block": hash, "chain_state": landed,
+                        "last_error": error, "why": why,
+                    }));
+                    continue;
+                }
+            }
+            check.problem(format!(
+                "candidate {hash} on node {node:?} is still {state}, its block {} ({error:?})",
+                landed.unwrap_or_else(|| "not landed".to_owned())
+            ));
+        }
+    }
+    let note = pending_bookkeeping.len();
+    let excused = unresolved.len();
+    check.data("landed_awaiting_bookkeeping", json!(pending_bookkeeping));
+    check.data("excused_unresolved", json!(unresolved));
+    Ok(check.finish(format!(
+        "no candidate in flight or unlanded; {note} landed blocks await their candidate's next \
+         attempt; {excused} never confirmed, kept for reconciliation as the scenario expects"
+    )))
+}
+
+/// CONTRACT.md D-2 and D-9: what is never copied holds only each node's own
+/// rows. In dual-writer mode, for rows written since the pair began writing
+/// as two primaries (`Sim::dual_since`; older rows are the history both
+/// databases share after a 3.0 cutover):
+///
+/// - **Candidates.** No node holds one its peer's frontend claimed or
+///   reserved, and no candidate is in both outboxes as the same row (the same
+///   `created_at`, which its insert stamps). Each node finds its own blocks
+///   (disjoint extranonce ranges), so a block in both outboxes is a copy,
+///   unless the second row was made on its own, as S8's adoption may.
+///   Copying the outbox or its deferred shares would credit twice.
+/// - **Deferred shares.** A candidate's deferred solving share is its
+///   node's to credit (D1's table inventory clears the peer's on
+///   re-personalise), and its foreign key ties it to a candidate in the
+///   same node's outbox. So no deferred share since the epoch is on both
+///   nodes: a copy of one is caught here even when the copied candidate
+///   carries no claim and fresh timestamps.
+/// - **Issued jobs.** Only prepared records are copied (D-3, D-11). An
+///   issued job of the peer's, by origin or by its frontend's instance,
+///   could be resumed here (`resume_job` reads any stored job) with the
+///   peer's extranonce1 and credit a share the peer credited.
+/// - **Offer decisions.** Only the offering frontend records one, in its own
+///   database (`ledger/divergence.rs`). So a divergence row with a decision
+///   is copied when its node never had the block as a candidate, or when
+///   both nodes hold the same decision (the same `offer_decided_at`). A row
+///   without one is the local reconciler's, which records divergences for
+///   every block it confirms, the peer's included.
+/// - **The cutover's history.** No candidate from before the cutover was
+///   reserved after it: the drain must leave none unfinished, or both nodes
+///   could offer it.
+/// - **Identity.** Each database identifies as its own node.
+///
+/// A disk rebuilt from the peer (S7) holds the peer's local rows until D-16's
+/// re-personalise resets them, so there this also checks that reset.
+async fn local_state_not_copied(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    match (sim.config.topology, sim.dual_since) {
+        (Topology::DualWriter, Some(since)) => local_state_check(pools, since).await,
+        _ => Ok(Check::skip(
+            "d2-local-state-not-copied",
+            "no dual-writer pair: nothing is copied",
+        )),
+    }
+}
+
+/// [`local_state_not_copied`]'s check over `pools` for rows since `since`:
+/// the checker control runs it on one database in both slots, where every
+/// local row is a copy, to show it fails.
+pub async fn local_state_check(
+    pools: &BTreeMap<Node, PgPool>,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<Check> {
+    let copied = "copied (D-2), or left by a rebuild that re-personalise did not reset (D-16)";
+    let mut check = CheckBuilder::new("d2-local-state-not-copied");
+    // Per node: (block, created_at in microseconds) of each candidate since
+    // the epoch, and (block, offer_decided_at) of each offer decision.
+    let mut outboxes: BTreeMap<Node, BTreeSet<(String, i64)>> = BTreeMap::new();
+    let mut decisions: BTreeMap<Node, BTreeSet<(String, i64)>> = BTreeMap::new();
+    // Per node: (block, share digest) of each deferred share whose candidate
+    // is from the epoch on.
+    let mut deferred: BTreeMap<Node, BTreeSet<(String, String)>> = BTreeMap::new();
+    for (node, pool) in pools {
+        let peer = node.peer();
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT block_hash, (extract(epoch FROM created_at) * 1000000)::bigint \
+             FROM qbit_block_candidate_outbox WHERE created_at >= $1",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        outboxes.insert(*node, rows.into_iter().collect());
+        let peers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT block_hash, state FROM qbit_block_candidate_outbox \
+             WHERE created_at >= $2 AND (offer_reserved_by = $1 OR claim_instance_id = $1) \
+             ORDER BY created_at",
+        )
+        .bind(peer.instance_id())
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        for (hash, state) in peers {
+            check.problem(format!(
+                "node {node:?} holds candidate {hash} ({state}), claimed or reserved by node \
+                 {peer:?}'s frontend: {copied}"
+            ));
+        }
+        let reoffered: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT block_hash, offer_reserved_by FROM qbit_block_candidate_outbox \
+             WHERE created_at < $1 AND offer_reserved_at >= $1 ORDER BY offer_reserved_at",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        for (hash, by) in reoffered {
+            check.problem(format!(
+                "node {node:?} reserved candidate {hash} from before the cutover after it (by \
+                 {by:?}): the drain left it unfinished, so both nodes could offer it"
+            ));
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT block_hash, (extract(epoch FROM offer_decided_at) * 1000000)::bigint \
+             FROM qbit_prism_payout_divergences \
+             WHERE offer_decision IS NOT NULL AND offer_decided_at >= $1",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        decisions.insert(*node, rows.into_iter().collect());
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT d.block_hash, d.share_sha256 FROM qbit_prism_deferred_shares d \
+             JOIN qbit_block_candidate_outbox o ON o.block_hash = d.block_hash \
+             WHERE o.created_at >= $1",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        deferred.insert(*node, rows.into_iter().collect());
+        let jobs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT job_id, instance_id FROM qbit_prism_jobs \
+             WHERE job_id NOT LIKE 'prepared:%' AND created_at >= $1 \
+               AND (origin_node = $2 OR instance_id = $3) \
+             ORDER BY created_at",
+        )
+        .bind(since)
+        .bind(peer.index() as i16)
+        .bind(peer.instance_id())
+        .fetch_all(pool)
+        .await?;
+        for (job, instance) in jobs {
+            check.problem(format!(
+                "node {node:?} holds job {job}, issued by node {peer:?}'s frontend ({instance}), \
+                 which resume_job could replay with the peer's extranonce1: {copied}"
+            ));
+        }
+        let orphaned: Vec<(String, String)> = sqlx::query_as(
+            "SELECT d.block_hash, d.offer_decision FROM qbit_prism_payout_divergences d \
+             WHERE d.offer_decision IS NOT NULL AND d.offer_decided_at >= $1 \
+               AND NOT EXISTS (SELECT 1 FROM qbit_block_candidate_outbox o \
+                               WHERE o.block_hash = d.block_hash) \
+             ORDER BY d.offer_decided_at",
+        )
+        .bind(since)
+        .fetch_all(pool)
+        .await?;
+        for (hash, decision) in orphaned {
+            check.problem(format!(
+                "node {node:?} records an offer decision ({decision}) for block {hash}, which it \
+                 never had as a candidate: {copied}"
+            ));
+        }
+        let identity: Option<i16> =
+            sqlx::query_scalar("SELECT node_index FROM qbit_prism_node_identity")
+                .fetch_optional(pool)
+                .await?;
+        if identity != Some(node.index() as i16) {
+            check.problem(format!(
+                "node {node:?}'s database identifies as {identity:?} (D-9)"
+            ));
+        }
+    }
+    // The cross-node findings, counted too: the problem list is capped, and
+    // they come after every node's own.
+    let mut on_both = BTreeMap::new();
+    if let (Some(a), Some(b)) = (outboxes.get(&Node::A), outboxes.get(&Node::B)) {
+        on_both.insert("candidates", a.intersection(b).count());
+        for (hash, _) in a.intersection(b) {
+            check.problem(format!(
+                "candidate {hash} is the same row in both outboxes: {copied}"
+            ));
+        }
+    }
+    if let (Some(a), Some(b)) = (decisions.get(&Node::A), decisions.get(&Node::B)) {
+        on_both.insert("offer_decisions", a.intersection(b).count());
+        for (hash, _) in a.intersection(b) {
+            check.problem(format!(
+                "the offer decision for block {hash} is the same row on both nodes: {copied}"
+            ));
+        }
+    }
+    if let (Some(a), Some(b)) = (deferred.get(&Node::A), deferred.get(&Node::B)) {
+        on_both.insert("deferred_shares", a.intersection(b).count());
+        for (hash, share) in a.intersection(b) {
+            check.problem(format!(
+                "the deferred solving share {share} of block {hash} is on both nodes, so both \
+                 could credit it: {copied}"
+            ));
+        }
+    }
+    check.data("since", json!(since));
+    check.data("same_rows_on_both_nodes", json!(on_both));
+    check.data(
+        "candidates_since",
+        json!(outboxes
+            .iter()
+            .map(|(node, rows)| (node.label(), rows.len()))
+            .collect::<BTreeMap<_, _>>()),
+    );
+    check.data(
+        "deferred_shares_since",
+        json!(deferred
+            .iter()
+            .map(|(node, rows)| (node.label(), rows.len()))
+            .collect::<BTreeMap<_, _>>()),
+    );
+    Ok(check.finish(format!(
+        "candidates, deferred shares, issued jobs, offer decisions and identities since {since} \
+         are each node's own"
+    )))
+}
+
+/// How long `copied-state-identical` waits for rows still in flight (a
+/// prepared record or journal row written just before the check) to settle.
+pub const COPIED_STATE_BOUND: Duration = Duration::from_secs(20);
+
+/// CONTRACT.md D-1, D-11 and D-17 for the copied tables the other checks do
+/// not compare: prepared records with the template and balance blobs they
+/// reference, and the carry-owner journal. For each origin node, against
+/// its peer:
+///
+/// - **The journal.** Append-only and copied whole, so the origin's rows are
+///   the same on both nodes, in every column.
+/// - **Prepared records.** Every unexpired one the origin had written when
+///   the check began is on the peer (the pull takes them all, expired or
+///   not; a stream that stopped leaves them missing, whatever its cursor
+///   says), equal in every carried column but `expires_at`, which
+///   each node keeps for itself (D1's own comparison). Every unexpired copy
+///   the peer holds is still on the origin: its own expiry only extends, so
+///   such a record was lost there, which own-log recovery must prevent.
+/// - **Blobs.** The template and balance snapshot of each record on both
+///   nodes are on both, byte for byte.
+///
+/// What each origin holds is read once, when the check begins; rows still
+/// in flight to the peer are waited for, up to [`COPIED_STATE_BOUND`].
+async fn copied_state_identical(sim: &Sim, pools: &BTreeMap<Node, PgPool>) -> Result<Check> {
+    const ID: &str = "copied-state-identical";
+    if sim.config.topology != Topology::DualWriter || pools.len() < 2 {
+        return Ok(Check::skip(
+            ID,
+            "no dual-writer pair with both databases checked: nothing is copied",
+        ));
+    }
+    // What each origin holds when the check begins, fixed here: a record
+    // that ages during the retries stays required (its copy is kept 24 h
+    // past its expiry), and rows the origin lost while its peer kept them
+    // are found once, at the start.
+    let mut targets = Vec::new();
+    let mut lost = Vec::new();
+    for origin in Node::BOTH {
+        let peer = origin.peer();
+        let (Some(own), Some(copy)) = (pools.get(&origin), pools.get(&peer)) else {
+            continue;
+        };
+        targets.push(copied_state_target(own, copy, origin, &mut lost).await?);
+    }
+    let started = Instant::now();
+    loop {
+        let mut problems = lost.clone();
+        let mut compared = serde_json::Map::new();
+        for target in &targets {
+            let copy = &pools[&target.origin.peer()];
+            compared.insert(
+                target.origin.label().to_owned(),
+                copied_state_on_peer(copy, target, &mut problems).await?,
+            );
+        }
+        if problems.is_empty() || started.elapsed() >= COPIED_STATE_BOUND {
+            let mut check = CheckBuilder::new(ID);
+            for problem in problems {
+                check.problem(problem);
+            }
+            let compared = Value::Object(compared);
+            check.data("compared", compared.clone());
+            return Ok(check.finish(format!(
+                "prepared records, their blobs and the journal compared for both origins: {compared}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// What an origin held at the start of [`copied_state_identical`], which its
+/// peer must hold too.
+struct CopiedStateTarget {
+    origin: Node,
+    highest: Option<i64>,
+    journal: BTreeMap<i64, Value>,
+    prepared: BTreeMap<String, (i64, Value)>,
+    templates: BTreeMap<String, String>,
+    balances: BTreeMap<String, String>,
+}
+
+/// Read `origin`'s target from its own database `own`, and record in `lost`
+/// each row its peer `copy` holds that `own` no longer does: an unexpired
+/// prepared copy (its original's expiry only extends, so the original was
+/// lost) or a journal row (the journal is append-only).
+async fn copied_state_target(
+    own: &PgPool,
+    copy: &PgPool,
+    origin: Node,
+    lost: &mut Vec<String>,
+) -> Result<CopiedStateTarget> {
+    let peer = origin.peer();
+    // The peer first: whatever it holds, the origin wrote before, so the
+    // origin's later read holds it too unless it was lost there. Read the
+    // other way round, a row written and pulled between the reads would
+    // look lost.
+    let copies = prepared_records(copy, origin, true).await?;
+    let copied_journal = journal_rows(copy, origin).await?;
+    let highest: Option<i64> = sqlx::query_scalar(
+        "SELECT max(sync_seq) FROM qbit_prism_jobs \
+         WHERE origin_node = $1 AND job_id LIKE 'prepared:%'",
+    )
+    .bind(origin.index() as i16)
+    .fetch_one(own)
+    .await?;
+    let journal = journal_rows(own, origin).await?;
+    let originals = prepared_records(own, origin, false).await?;
+    let prepared: BTreeMap<String, (i64, Value)> = prepared_records(own, origin, true)
+        .await?
+        .into_iter()
+        .filter(|(_, (seq, _))| highest.is_some_and(|highest| *seq <= highest))
+        .collect();
+    for job in copies.keys() {
+        if !originals.contains_key(job) {
+            lost.push(format!(
+                "node {peer:?} holds node {origin:?}'s unexpired prepared record {job}, which \
+                 node {origin:?} no longer holds: an own row lost there (D-17)"
+            ));
+        }
+    }
+    for epoch in copied_journal.keys() {
+        if !journal.contains_key(epoch) {
+            lost.push(format!(
+                "node {peer:?} holds node {origin:?}'s journal row of epoch {epoch}, which node \
+                 {origin:?} no longer holds: an own row lost there (D-17)"
+            ));
+        }
+    }
+    let referenced = |name: &str| -> Vec<String> {
+        prepared
+            .values()
+            .filter_map(|(_, doc)| doc.get(name).and_then(Value::as_str).map(str::to_owned))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    let (template_keys, balance_keys) = (
+        referenced("template_sha256"),
+        referenced("window_prior_balances_sha256"),
+    );
+    let templates = blob_digests(
+        own,
+        "qbit_prism_templates",
+        "template_sha256",
+        "template_bytes",
+        &template_keys,
+    )
+    .await?;
+    let balances = blob_digests(
+        own,
+        "qbit_prism_balance_snapshots",
+        "prior_balances_digest",
+        "balances",
+        &balance_keys,
+    )
+    .await?;
+    for (table, keys, held) in [
+        ("qbit_prism_templates", &template_keys, &templates),
+        ("qbit_prism_balance_snapshots", &balance_keys, &balances),
+    ] {
+        for key in keys.iter().filter(|key| !held.contains_key(*key)) {
+            lost.push(format!(
+                "node {origin:?}'s prepared records reference {table} {key}, which node \
+                 {origin:?} does not hold"
+            ));
+        }
+    }
+    Ok(CopiedStateTarget {
+        origin,
+        highest,
+        journal,
+        prepared,
+        templates,
+        balances,
+    })
+}
+
+/// One pass of [`copied_state_identical`] over `target`'s peer `copy`:
+/// every target row there, the same. Returns what it compared.
+async fn copied_state_on_peer(
+    copy: &PgPool,
+    target: &CopiedStateTarget,
+    problems: &mut Vec<String>,
+) -> Result<Value> {
+    let origin = target.origin;
+    let peer = origin.peer();
+    let copies = prepared_records(copy, origin, false).await?;
+    for (job, (seq, doc)) in &target.prepared {
+        match copies.get(job) {
+            None => problems.push(format!(
+                "node {origin:?}'s prepared record {job} (sync_seq {seq}, unexpired when the \
+                 check began) is not on node {peer:?}"
+            )),
+            Some((_, other)) if other != doc => problems.push(format!(
+                "node {origin:?}'s prepared record {job} differs on node {peer:?}: {}",
+                json_differences(doc, other).join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    let journal = journal_rows(copy, origin).await?;
+    for (epoch, row) in &target.journal {
+        match journal.get(epoch) {
+            None => problems.push(format!(
+                "node {origin:?}'s journal row of epoch {epoch} is not on node {peer:?}"
+            )),
+            Some(other) if other != row => problems.push(format!(
+                "node {origin:?}'s journal row of epoch {epoch} differs on node {peer:?}: {}",
+                json_differences(row, other).join("; ")
+            )),
+            Some(_) => {}
+        }
+    }
+    for (table, key, bytes, expected) in [
+        (
+            "qbit_prism_templates",
+            "template_sha256",
+            "template_bytes",
+            &target.templates,
+        ),
+        (
+            "qbit_prism_balance_snapshots",
+            "prior_balances_digest",
+            "balances",
+            &target.balances,
+        ),
+    ] {
+        let keys: Vec<String> = expected.keys().cloned().collect();
+        let there = blob_digests(copy, table, key, bytes, &keys).await?;
+        for (blob, digest) in expected {
+            if there.get(blob) != Some(digest) {
+                problems.push(format!(
+                    "{table} {blob}, referenced by node {origin:?}'s prepared records, is \
+                     {digest} there and {:?} on node {peer:?}",
+                    there.get(blob)
+                ));
+            }
+        }
+    }
+    let cursor: Option<i64> = sqlx::query_scalar(
+        "SELECT scanned_through FROM qbit_prism_peer_sync_cursors \
+         WHERE stream = 'prepared' AND peer_node = $1",
+    )
+    .bind(origin.index() as i16)
+    .fetch_optional(copy)
+    .await?;
+    Ok(json!({
+        "journal_rows": target.journal.len(),
+        "prepared_unexpired_at_start": target.prepared.len(),
+        "highest_at_start": target.highest,
+        "peer_cursor": cursor,
+        "templates": target.templates.len(),
+        "balance_snapshots": target.balances.len(),
+    }))
+}
+
+/// One node's prepared records of `origin`: `job_id -> (sync_seq, every
+/// carried column but expires_at)`, the unexpired ones only when `unexpired`.
+pub(crate) async fn prepared_records(
+    pool: &PgPool,
+    origin: Node,
+    unexpired: bool,
+) -> Result<BTreeMap<String, (i64, Value)>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let carried = CarriedColumns::read(&mut tx).await?;
+    let columns: Vec<String> = carried
+        .of("qbit_prism_jobs")
+        .iter()
+        .filter(|column| column.as_str() != "expires_at")
+        .cloned()
+        .collect();
+    let rows: Vec<(String, i64, Value)> = sqlx::query_as(
+        "SELECT j.job_id, j.sync_seq, (SELECT jsonb_object_agg(e.key, e.value) \
+                FROM jsonb_each(to_jsonb(j)) e WHERE e.key = ANY($3)) \
+         FROM qbit_prism_jobs j \
+         WHERE j.origin_node = $1 AND j.job_id LIKE 'prepared:%' AND j.sync_seq IS NOT NULL \
+           AND (NOT $2 OR j.expires_at > clock_timestamp() + interval '5 seconds')",
+    )
+    .bind(origin.index() as i16)
+    .bind(unexpired)
+    .bind(&columns)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|(job, seq, doc)| (job, (seq, doc)))
+        .collect())
+}
+
+/// One node's carry-owner journal rows of `origin`, by epoch, whole.
+pub(crate) async fn journal_rows(pool: &PgPool, origin: Node) -> Result<BTreeMap<i64, Value>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await?;
+    let rows: Vec<(i64, Value)> = sqlx::query_as(
+        "SELECT r.epoch, to_jsonb(r) FROM qbit_prism_node_roles r WHERE r.origin_node = $1",
+    )
+    .bind(origin.index() as i16)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// md5 of each blob of `table` (keyed by `key`, bytes in `bytes`) among `keys`.
+async fn blob_digests(
+    pool: &PgPool,
+    table: &str,
+    key: &str,
+    bytes: &str,
+    keys: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT {key}, md5({bytes}) FROM {table} WHERE {key} = ANY($1)"
+    ))
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+fn short(program: &str) -> String {
+    program.chars().take(12).collect()
+}
+
+/// Write the report as JSON next to the scenario's logs.
+pub fn write(report: &InvariantReport, dir: &Path) -> Result<PathBuf> {
+    let path = dir.join("invariants.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_differences_names_each_disagreement_with_both_values() {
+        let a = serde_json::json!({"origin_node": 0, "share_seq": 7, "credit_policy": "full"});
+        let b = serde_json::json!({"origin_node": 1, "share_seq": 7, "credit_policy": "full"});
+        assert_eq!(
+            super::json_differences(&a, &b),
+            vec!["origin_node: node A 0, node B 1".to_owned()]
+        );
+        assert!(super::json_differences(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn a_share_missing_from_both_databases_counts_once() {
+        use crate::frontend::Node;
+        use std::collections::{BTreeMap, BTreeSet};
+        let set =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|id| (*id).to_owned()).collect() };
+        // S7: B's unsynced tail (t1, t2) is on neither database after B's
+        // disk was rebuilt from A; l1 is lost on both, l2 on B only.
+        let missing = BTreeMap::from([
+            (Node::A, set(&["t1", "t2", "l1"])),
+            (Node::B, set(&["t1", "t2", "l1", "l2"])),
+        ]);
+        let excused = BTreeMap::from([
+            ("t1".to_owned(), "B's unsynced tail".to_owned()),
+            ("t2".to_owned(), "B's unsynced tail".to_owned()),
+        ]);
+        let tally = super::tally_missing(&missing, &excused);
+        assert_eq!(
+            tally.excused,
+            BTreeMap::from([("B's unsynced tail".to_owned(), set(&["t1", "t2"]))])
+        );
+        assert_eq!(
+            tally.lost,
+            BTreeMap::from([
+                ("l1".to_owned(), vec![Node::A, Node::B]),
+                ("l2".to_owned(), vec![Node::B]),
+            ])
+        );
+        assert_eq!(
+            super::tally_missing(&BTreeMap::new(), &excused),
+            super::MissingShares::default()
+        );
+    }
+
+    #[test]
+    fn json_differences_follows_a_landing_down_to_the_column() {
+        let a = serde_json::json!({
+            "qbit_pool_blocks": {"origin_node": 0, "sync_seq": 4, "block_height": 210},
+            "qbit_pool_payout_entries": [{"miner_id": "m1", "action": "pay"}, {"miner_id": "m2", "action": "pay"}],
+            "qbit_payout_carry_forward": [{"miner_id": "m1"}],
+            "qbit_ctv_fanout_sets": {"fanout_count": 1, "settlement_mode": "ctv"},
+        });
+        let b = serde_json::json!({
+            "qbit_pool_blocks": {"origin_node": 1, "sync_seq": 4, "block_height": 210},
+            "qbit_pool_payout_entries": [{"miner_id": "m1", "action": "pay"}, {"miner_id": "m2", "action": "carry"}],
+            "qbit_payout_carry_forward": [],
+            "qbit_ctv_fanout_sets": {"fanout_count": 1},
+        });
+        assert_eq!(
+            super::json_differences(&a, &b),
+            vec![
+                "qbit_ctv_fanout_sets.settlement_mode: node A \"ctv\", node B absent".to_owned(),
+                "qbit_payout_carry_forward: node A 1 entries, node B 0 entries".to_owned(),
+                "qbit_pool_blocks.origin_node: node A 0, node B 1".to_owned(),
+                "qbit_pool_payout_entries[1].action: node A \"pay\", node B \"carry\"".to_owned(),
+            ]
+        );
+        // A part one node lacks altogether is named whole.
+        let missing = serde_json::json!({"qbit_pool_blocks": {"origin_node": 0}, "qbit_ctv_fanout_sets": null});
+        let present = serde_json::json!({"qbit_pool_blocks": {"origin_node": 0}, "qbit_ctv_fanout_sets": {"fanout_count": 1}});
+        assert_eq!(
+            super::json_differences(&missing, &present),
+            vec!["qbit_ctv_fanout_sets: node A null, node B {\"fanout_count\":1}".to_owned()]
+        );
+    }
+
+    #[test]
+    fn json_differences_cuts_long_values_and_counts_what_it_leaves_out() {
+        let long = "x".repeat(super::DIFFERENCE_VALUE_CHARS + 40);
+        let a = serde_json::json!({ "audit_bundle": long });
+        let b = serde_json::json!({ "audit_bundle": "y" });
+        let named = super::json_differences(&a, &b);
+        assert_eq!(named.len(), 1);
+        assert!(named[0].starts_with("audit_bundle: node A \"xxx"));
+        assert!(named[0].contains("…, node B \"y\""));
+        assert!(named[0].chars().count() < super::DIFFERENCE_VALUE_CHARS + 60);
+
+        let many_a: serde_json::Map<String, serde_json::Value> = (0..super::DIFFERENCES_SHOWN + 3)
+            .map(|i| (format!("c{i:02}"), serde_json::json!(0)))
+            .collect();
+        let many_b: serde_json::Map<String, serde_json::Value> = (0..super::DIFFERENCES_SHOWN + 3)
+            .map(|i| (format!("c{i:02}"), serde_json::json!(1)))
+            .collect();
+        let named = super::json_differences(&many_a.into(), &many_b.into());
+        assert_eq!(named.len(), super::DIFFERENCES_SHOWN + 1);
+        assert_eq!(named.last().map(String::as_str), Some("and 3 more"));
+    }
+
+    use super::*;
+
+    #[test]
+    fn eligibility_names_the_cut_only_with_one_and_treats_two_nulls_as_none() {
+        let anchored = eligibility("$1", None);
+        assert!(anchored.contains("l.accepted_at <= to_timestamp(($1)::double precision / 1000)"));
+        assert!(!anchored.contains("origin_node"), "reads a 3.0 schema");
+        let cut = eligibility("s.anchor_ms", Some(("s.cut_seq_0", "s.cut_seq_1")));
+        assert!(cut.contains("((s.cut_seq_0) IS NULL AND (s.cut_seq_1) IS NULL)"));
+        assert!(cut.contains("(l.origin_node = 1 AND l.share_seq <= (s.cut_seq_1))"));
+        let recorded = RecordedWindow {
+            snapshot: String::new(),
+            first: 1,
+            last: 2,
+            anchor_ms: 3,
+            count: 2,
+            cut: None,
+        };
+        assert!(eligible_sql(&recorded).ends_with("AND $2::bigint IS NULL AND $3::bigint IS NULL"));
+        let cut_window = RecordedWindow {
+            cut: Some((Some(5), None)),
+            ..recorded
+        };
+        assert!(eligible_sql(&cut_window).contains("l.share_seq <= ($2::bigint)"));
+    }
+
+    #[test]
+    fn the_pinned_keys_are_the_test_seeds_keys() -> Result<()> {
+        let (ledger, manifest) = pinned_keys()?;
+        assert_eq!(
+            ledger,
+            "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+        );
+        assert_eq!(
+            manifest,
+            "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+        );
+        Ok(())
+    }
+
+    fn rows(hash: &str, carry: &[(&str, i128, i128)], recorded: &[(&str, i128)]) -> BlockRows {
+        BlockRows {
+            hash: hash.into(),
+            height: 0,
+            origin: Some(Node::A),
+            carry: carry
+                .iter()
+                .map(|(program, gross, onchain)| ((*program).to_owned(), (*gross, *onchain, 0)))
+                .collect(),
+            recorded_overpay: recorded
+                .iter()
+                .map(|(program, sats)| ((*program).to_owned(), *sats))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn ownership_epochs_name_the_owner_by_height() {
+        let default = CheckOptions::default();
+        assert_eq!(default.owner_at(Topology::DualWriter, 5), Some(Node::A));
+        assert_eq!(default.owner_at(Topology::SingleWriter, 5), None);
+        let cutover = CheckOptions {
+            ownership: vec![(100, Some(Node::A))],
+            ..CheckOptions::default()
+        };
+        assert_eq!(cutover.owner_at(Topology::DualWriter, 99), None);
+        assert_eq!(cutover.owner_at(Topology::DualWriter, 100), Some(Node::A));
+        let transfer = CheckOptions {
+            ownership: vec![(0, Some(Node::A)), (200, Some(Node::B))],
+            ..CheckOptions::default()
+        };
+        assert_eq!(transfer.owner_at(Topology::DualWriter, 199), Some(Node::A));
+        assert_eq!(transfer.owner_at(Topology::DualWriter, 200), Some(Node::B));
+    }
+
+    #[test]
+    fn paying_one_carry_twice_raises_debt_and_is_caught() {
+        // Block 1 accrues 100 for m (sub-floor). Block 2 pays it down (prior
+        // 100, gross 10, onchain 110). Block 3 pays the same 100 again: m's
+        // balance goes to -100.
+        let blocks = [
+            rows("b1", &[("m", 100, 0)], &[]),
+            rows("b2", &[("m", 10, 110)], &[]),
+            rows("b3", &[("m", 10, 110)], &[]),
+        ];
+        let (increases, balances, excused) = debt_walk(&blocks);
+        assert_eq!(balances["m"], -100);
+        assert_eq!(excused, 0);
+        assert_eq!(
+            increases,
+            vec![DebtIncrease {
+                block: "b3".into(),
+                program: "m".into(),
+                increase: 100,
+                debt_after: 100,
+                recorded: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_recorded_478_overpay_covers_exactly_the_debt_it_records() {
+        let blocks = [
+            rows("b1", &[("m", 100, 0)], &[]),
+            rows("b2", &[("m", 10, 110)], &[]),
+            rows("b3", &[("m", 10, 110)], &[("m", 100)]),
+        ];
+        let (increases, _, excused) = debt_walk(&blocks);
+        assert!(increases.is_empty());
+        assert_eq!(excused, 1);
+        // A record smaller than the increase does not cover it.
+        let short = [
+            rows("b1", &[("m", 100, 0)], &[]),
+            rows("b2", &[("m", 10, 110)], &[]),
+            rows("b3", &[("m", 10, 110)], &[("m", 99)]),
+        ];
+        assert_eq!(debt_walk(&short).0.len(), 1);
+    }
+
+    #[test]
+    fn existing_debt_that_shrinks_or_holds_is_not_an_increase() {
+        let blocks = [
+            rows("b1", &[("m", 0, 50)], &[("m", 50)]),
+            rows("b2", &[("m", 30, 0)], &[]),
+            rows("b3", &[("m", 0, 0)], &[]),
+        ];
+        let (increases, balances, _) = debt_walk(&blocks);
+        assert!(increases.is_empty());
+        assert_eq!(balances["m"], -20);
+    }
+
+    #[test]
+    fn a_check_with_problems_fails_and_lists_at_most_the_limit() {
+        let mut check = CheckBuilder::new("x");
+        for index in 0..(PROBLEM_LIMIT + 5) {
+            check.problem(format!("problem {index}"));
+        }
+        let check = check.finish("summary".into());
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(check.problem_count, PROBLEM_LIMIT + 5);
+        assert_eq!(check.problems.len(), PROBLEM_LIMIT);
+        assert_eq!(
+            CheckBuilder::new("y").finish("ok".into()).status,
+            Status::Pass
+        );
+    }
+}
