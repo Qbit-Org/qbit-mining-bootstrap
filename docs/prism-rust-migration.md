@@ -689,8 +689,50 @@ its partitions included, a `sync_seq` pull order on `qbit_pool_blocks` and
 `qbit_prism_jobs`, the carry-owner journal (`qbit_prism_node_roles`), the
 node identity and lineage, and the peer sync's cursor and conflict tables.
 Every new column has a constant default or none, so no table is rewritten and
-no constraint is validated by a scan; each `ALTER` holds its table's lock only
-for the catalog change, until the migration commits. Its three indexes are
+no constraint is validated by a scan. Earlier frontends may keep serving while
+it runs, as they do during the 3.1 pre-migrate, so `migrate` first locks every
+table 027 and 028 alter, the share ledger's partitions included, in one
+statement that waits at most 100 ms in all, and only then runs the two files:
+catalog changes, three small index builds and 028's check, then the commit.
+The statement takes the tables in order and keeps those it has while it waits
+for the next, but for those 100 ms at most, so a frontend statement waits
+behind it at most that long, well under PostgreSQL's 1 s `deadlock_timeout`
+and the 500 ms lock timeout of rc.6's metrics collector, and the migration
+gives up any lock cycle with a frontend within it, long before PostgreSQL
+would break the cycle by aborting one side (#789). That holds only while the
+bound stays well under `deadlock_timeout` and every frontend lock timeout. The migration history's lock, which every migration transaction takes
+first and a starting frontend's read waits for, is taken within the same
+100 ms. Because every table is locked first, the share ledger and
+`qbit_prism_share_hashes`, which 027 alters last, are held from the start of
+027 to the commit, through its index builds on `qbit_pool_blocks` and
+`qbit_prism_jobs` and 028's check, where before they were held only from
+their own `ALTER`. `qbit_pool_blocks` was held through those builds either
+way; it has a row per landed block, and the expiry prune keeps
+`qbit_prism_jobs` to its unexpired jobs, so both builds are small. In two
+runs of the R1 pre-migrate scenario 027 and 028 committed 372 and 558 ms after
+`migrate` started, and no share sent meanwhile waited over 39 ms for its
+answer. If a transaction holds the history or one of the tables past those
+100 ms, or
+PostgreSQL aborts the request as a deadlock (possible only with a
+`deadlock_timeout` below 100 ms), the attempt gives up, the whole migration
+transaction rolls back, holding nothing, and `migrate` tries again from the
+start after a backoff of 100 ms doubling to 2 s, for up to ten minutes.
+Nothing is recorded before the commit, so each attempt plans afresh from what
+it finds. Every connect that migrates goes through this, a start with
+`PRISM_POSTGRES_INIT_SCHEMA=1` included, and on a fully migrated database too,
+since each takes the history's lock: a start that could not take it used to
+fail after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s), and now tries again for up
+to ten minutes, logging a warning on its first attempt and every tenth. Then
+it stops with `refusing to wait any longer for the table locks of migration
+27, 28: <n> attempts over <s> s each waited 100 ms for <tables> and gave up,
+so that no serving frontend waits on the migrate longer than that. Nothing was
+changed: they are not recorded. Holding them now: pid <pid> (<state>, its
+transaction open <s> s) holding <tables>: <query>`, naming up to five
+transactions from `pg_locks` and `pg_stat_activity`, longest open first, each
+once with the tables it holds (a partition's lock counted as its table's), or
+with `the table locks of the migration history` and
+`qbit_prism_schema_migrations` when the history was held: end those
+transactions, or stop the frontends, and migrate again. Its three indexes are
 small: two are partial, over rows written after 027 only, and the third is
 `qbit_prism_jobs (origin_node, expires_at)` for the dual-mode expiry prune,
 built in the transaction over a table the expiry prune keeps to its unexpired

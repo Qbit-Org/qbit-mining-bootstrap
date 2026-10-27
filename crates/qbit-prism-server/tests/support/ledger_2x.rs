@@ -3609,8 +3609,7 @@ async fn undo_006(earlier: &Ledger, pool: &PgPool, state: SourceState) -> Result
     // 027's dual-writer identity (the origin columns, the two streams' pull
     // order, the node-role row and the peer sync's tables), or 031's index
     // on the origin column, which undo_027 undoes first.
-    sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=28; ALTER TABLE qbit_prism_audit_snapshots DROP CONSTRAINT qbit_prism_audit_snapshots_cut_check, DROP COLUMN cut_seq_0, DROP COLUMN cut_seq_1")
-        .execute(pool).await?;
+    undo_028(pool).await?;
     undo_027(pool).await?;
     // The historical fixture predates the offline policy journal, the
     // signing-key rotation journal, the payout-divergence evidence, the
@@ -3649,6 +3648,14 @@ async fn undo_006(earlier: &Ledger, pool: &PgPool, state: SourceState) -> Result
     }
     assert_eq!(schema_versions(pool).await?, [2, 3, 4, 5, 7, 8, 9, 10]);
     assert!(objects_006_absent(pool, state).await?);
+    Ok(())
+}
+
+/// Undo 028 on a fully migrated database: the window cut columns and their
+/// check on the audit share snapshots, and its version record.
+pub(crate) async fn undo_028(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql("DELETE FROM qbit_prism_schema_migrations WHERE version=28; ALTER TABLE qbit_prism_audit_snapshots DROP CONSTRAINT qbit_prism_audit_snapshots_cut_check, DROP COLUMN cut_seq_0, DROP COLUMN cut_seq_1")
+        .execute(pool).await?;
     Ok(())
 }
 

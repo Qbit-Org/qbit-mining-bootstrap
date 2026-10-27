@@ -21,6 +21,10 @@ const APPEND_LOCK_TIMEOUT_MS: u64 = 5_000;
 /// What a frontend's log says when one of its statements was cancelled, by
 /// its lock timeout or its statement timeout.
 const CANCELLED: &str = "canceling statement due to";
+/// What a frontend's log says when PostgreSQL aborted one of its
+/// statements to break a lock cycle (#789: an rc.6 CTV broadcaster's, with
+/// 027 on the other side).
+const DEADLOCK: &str = "deadlock detected";
 /// rc.6's warning for a migration it does not know.
 const UNKNOWN_MIGRATIONS: &str = "database has schema migrations this server does not know";
 
@@ -146,7 +150,8 @@ async fn restart(sim: &mut Sim, node: Node) -> Result<Restart> {
 /// index invalid. The reader ends, 031 completes and is recorded, the index
 /// is valid on the primary and on the standby, B's frontend restarts and
 /// serves at 31, and A lands a block on the migrated schema, its rows taking
-/// 027's defaults. No frontend statement is cancelled throughout.
+/// 027's defaults. From the migrate's start, no frontend statement is
+/// cancelled or aborted as a deadlock.
 pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.load()?.resume();
     steady(sim, 6).await;
@@ -401,10 +406,11 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     for node in Node::BOTH {
         // From the migrate's start: what a frontend meets on its own before
         // it (a start beside the other's) is not the migrate's doing.
-        let cancelled = log_lines_since(sim, node, CANCELLED, Some(migrate_from));
+        let mut cancelled = log_lines_since(sim, node, CANCELLED, Some(migrate_from));
+        cancelled.extend(log_lines_since(sim, node, DEADLOCK, Some(migrate_from)));
         body.expect(
             &format!(
-                "no statement of node {node:?}'s frontend was cancelled from the migrate's start"
+                "no statement of node {node:?}'s frontend was cancelled or aborted as a deadlock from the migrate's start"
             ),
             cancelled.is_empty(),
             format!("{cancelled:?}"),

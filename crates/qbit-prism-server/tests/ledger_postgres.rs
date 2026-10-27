@@ -56,6 +56,9 @@ mod share_partitions;
 #[path = "support/origin_index.rs"]
 mod origin_index;
 
+#[path = "support/premigrate_lock_order.rs"]
+mod premigrate_lock_order;
+
 #[path = "support/share_hash_backfill.rs"]
 mod share_hash_backfill;
 
