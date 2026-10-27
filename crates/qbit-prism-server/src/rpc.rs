@@ -48,8 +48,9 @@ impl RpcReplyError {
 /// A call that provably never reached the node: the client failed to
 /// establish the connection the request would have been written to (the
 /// connection was refused, the name did not resolve, no route, the connect
-/// timeout, or a TLS or proxy handshake failure), so not one byte of the
-/// request left this process for the node (#522).
+/// timeout, a relaying call's connect deadline (#762), or a TLS or proxy
+/// handshake failure), so not one byte of the request left this process for
+/// the node (#522).
 ///
 /// The boundary is reqwest's `is_connect()`, which holds exactly when hyper's
 /// client reports its `Connect` error kind. hyper raises that kind only while
@@ -59,9 +60,12 @@ impl RpcReplyError {
 /// unwritten, so a connect error after such a retry still proves that no
 /// attempt wrote the request. A failure on an established connection, a reset
 /// or a closed connection after the write, a lost reply, the request timeout
-/// (even one that expires while connecting) and every HTTP or JSON-RPC error
-/// are not this type: the request may have reached the node. The message keeps
-/// the transport-failure wording every caller already matched on.
+/// and every HTTP or JSON-RPC error are not this type: the request may have
+/// reached the node. That includes a request timeout that expires while
+/// connecting, which only a call without a connect deadline can meet: the
+/// timeout cannot tell a connect from a request written to a pooled
+/// connection. The message keeps the transport-failure wording every caller
+/// already matched on.
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("qbit RPC {method} transport failed before the request was sent: the connection could not be established ({cause})")]
 pub struct RpcNotSentError {
@@ -123,11 +127,80 @@ pub const QBITD_DEFAULT_RPCSERVERTIMEOUT: Duration = Duration::from_secs(30);
 /// connection first.
 ///
 /// [`RELAY_METHODS`] calls share the bounded pool. A new connection for each
-/// would put its connect inside `submitblock`'s short deadline, and a deadline
-/// that passes while connecting is not [`RpcNotSentError`]: the block would
-/// count as an unknown offer.
+/// would put a connect inside every `submitblock`'s short deadline, and a
+/// connect that outlasts half of it returns the block unsent (#762).
 pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const _: () = assert!(POOL_IDLE_TIMEOUT.as_secs() < QBITD_DEFAULT_RPCSERVERTIMEOUT.as_secs());
+
+tokio::task_local! {
+    /// The instant by which the relaying call this task is sending must have
+    /// its connection (#762); [`ConnectDeadline`] reads it.
+    static CONNECT_DEADLINE: tokio::time::Instant;
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// [`Rpc`]'s connector layer (#762). A connect that a relaying call with its
+/// own deadline starts fails, as a connect error, once that call's
+/// [`CONNECT_DEADLINE`] passes. hyper reports a failed connect as its
+/// `Connect` error kind only to a request that has not been handed a
+/// connection, so the call fails as [`RpcNotSentError`]. A request that was
+/// handed one meanwhile, from the pool, goes on: the connect it no longer
+/// waits for fails on its own, and the call's outcome is that request's.
+/// Every other connect keeps only the client's connect timeout.
+#[derive(Clone, Copy)]
+struct ConnectDeadlineLayer;
+
+impl<S> tower::Layer<S> for ConnectDeadlineLayer {
+    type Service = ConnectDeadline<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConnectDeadline(inner)
+    }
+}
+
+#[derive(Clone)]
+struct ConnectDeadline<S>(S);
+
+impl<S, Target> tower::Service<Target> for ConnectDeadline<S>
+where
+    S: tower::Service<Target, Error = BoxError>,
+    S::Response: Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        self.0.poll_ready(cx)
+    }
+
+    /// hyper starts a connect from the task of the request that needs it, so
+    /// the deadline read here is that request's call's.
+    fn call(&mut self, target: Target) -> Self::Future {
+        let deadline = CONNECT_DEADLINE.try_with(|deadline| *deadline).ok();
+        let connecting = self.0.call(target);
+        Box::pin(async move {
+            let Some(deadline) = deadline else {
+                return connecting.await;
+            };
+            tokio::time::timeout_at(deadline, connecting)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the connect outlasted half the call's deadline",
+                    )
+                    .into())
+                })
+        })
+    }
+}
 
 /// An HTTP client builder for a node's RPC endpoint, keeping idle connections
 /// for at most [`POOL_IDLE_TIMEOUT`]. Every node client starts from it:
@@ -202,6 +275,7 @@ impl Rpc {
             .connect_timeout(Duration::from_secs(5))
             .timeout(timeout)
             .pool_idle_timeout(pool_idle_timeout)
+            .connector_layer(ConnectDeadlineLayer)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
@@ -226,6 +300,12 @@ impl Rpc {
         self.call_timeout(method, params, None).await
     }
 
+    /// [`Rpc::call`] with its own deadline, `timeout`, in place of the
+    /// client's. The deadline bounds the whole call, its connect included.
+    /// A [`RELAY_METHODS`] call spends at most the first half of it obtaining
+    /// a connection (#762): a connect still running then fails as
+    /// [`RpcNotSentError`], whereas the deadline itself cannot tell a connect
+    /// from a request already written, and leaves the outcome unknown.
     pub async fn call_timeout(
         &self,
         method: &str,
@@ -238,6 +318,9 @@ impl Rpc {
             }
             .into());
         }
+        let connect_deadline = timeout
+            .filter(|_| RELAY_METHODS.contains(&method))
+            .map(|timeout| tokio::time::Instant::now() + timeout / 2);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = self
             .client
@@ -247,8 +330,15 @@ impl Rpc {
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
+        // Sent from inside the scope, so that every connect it starts reads
+        // the deadline.
+        let send = async move { request.send().await };
+        let sent = match connect_deadline {
+            Some(deadline) => CONNECT_DEADLINE.scope(deadline, send).await,
+            None => send.await,
+        };
         // Do not include the request URL or credentials in diagnostics.
-        let response = request.send().await.map_err(|error| {
+        let response = sent.map_err(|error| {
             if error.is_connect() {
                 RpcNotSentError::from_connect(method, &error).into()
             } else {

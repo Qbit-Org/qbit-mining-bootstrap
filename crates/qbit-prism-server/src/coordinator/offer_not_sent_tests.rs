@@ -1,11 +1,12 @@
 //! #522 on a real PostgreSQL: a `submitblock` whose connection was never
 //! established returns its reservation to `pending` and the block is offered
-//! once the node is reachable again, exactly once; a failure after the
-//! request was written stays unknown and is never offered again; and a crash
-//! between the refused connect and the row update recovers as delivery
-//! unknown. The offering frontend reaches the fixture's node through a small
-//! TCP relay the test controls, so "refused" is a closed port and a reset is
-//! a real RST.
+//! once the node is reachable again, exactly once, as does one whose connect
+//! outlasted half its deadline (#762); a failure after the request was
+//! written, the deadline included, stays unknown and is never offered again;
+//! and a crash between the refused connect and the row update recovers as
+//! delivery unknown. The offering frontend reaches the fixture's node through
+//! a small TCP relay the test controls, so "refused" is a closed port and a
+//! reset is a real RST.
 use super::*;
 use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -22,6 +23,10 @@ enum Submit {
     /// instead of relaying the reply: the node acted on the request and the
     /// offering frontend cannot know.
     ResetAfterReply,
+    /// Forward it, read the node's reply, and hold the client's connection
+    /// without relaying the reply: the offering frontend's deadline passes
+    /// after the node acted on the request (#762).
+    HoldReply,
     /// Answer it as qbitd does while it is still warming up after a restart,
     /// without forwarding it: the node never sees the block (#526).
     Warmup,
@@ -194,10 +199,28 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
             let _ = client.set_zero_linger();
             return;
         }
+        if submit && mode == Submit::HoldReply {
+            return std::future::pending().await;
+        }
         if client.get_mut().write_all(&reply).await.is_err() {
             return;
         }
     }
+}
+
+/// A node address whose connects an `https` client can never finish: the
+/// listener accepts and holds each connection without answering, so the TLS
+/// handshake, which is part of the connect, never completes (#762).
+async fn handshake_stall() -> Result<(SocketAddr, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let held = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        while let Ok((connection, _)) = listener.accept().await {
+            connections.push(connection);
+        }
+    });
+    Ok((address, held))
 }
 
 /// qbitd's answer to a JSON-RPC 1.0 call while it is still warming up, as
@@ -392,6 +415,160 @@ async fn a_reset_after_the_submitblock_was_written_stays_unknown_and_is_never_of
         ensure!(
             fixture.submissions().await == 1,
             "the block was offered again after a reset that followed the write"
+        );
+        ensure!(fixture.state().await? == "submitted");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(relay);
+    frontend.ledger.pool.close().await;
+    fixture.close().await?;
+    result
+}
+
+/// #762: the frontend has no connection to its node, and the one it opens
+/// cannot finish within the `submitblock` deadline: here the node never
+/// completes the TLS handshake, as a lost SYN, a full accept queue or a slow
+/// name lookup would hold a plain connect. The connect fails at half the
+/// deadline, so the request was never written: the row returns to `pending`,
+/// as after a refused connection, and the next claim lands the block with one
+/// `submitblock`. Before #762 the deadline fired during the connect, the
+/// offer was recorded as unknown, and the block was never offered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submitblock_whose_connect_outlasts_the_submit_deadline_returns_the_row_to_pending_and_lands_the_block_once(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let (stall, held) = handshake_stall().await?;
+    let config = (*fixture.coordinator.config).clone();
+    let mut frontend = Coordinator::new(
+        Config {
+            instance_id: "candidate-slow-connect".into(),
+            ..config.clone()
+        },
+        Arc::new(crate::metrics::Metrics::default()),
+    )
+    .await?;
+    *frontend.observed_tip.write().await = TipState::baseline("aa".repeat(32));
+    // Started against the node, the frontend now reaches it only through a
+    // connect that never finishes.
+    Arc::get_mut(&mut frontend)
+        .context("the new frontend is already shared")?
+        .rpc = Rpc::new(
+        format!("https://{stall}/"),
+        config.rpc_user,
+        config.rpc_password,
+        config.rpc_timeout,
+    )?;
+    let result = async {
+        frontend
+            .process_candidate_with_lease(&fixture.claim, CANDIDATE_LEASE)
+            .await?;
+        let row = fixture.row().await?;
+        let reason = row.last_error.clone().unwrap_or_default();
+        ensure!(
+            row.state == "pending"
+                && row.token.is_none()
+                && row.outcome.is_none()
+                && row.offered_at_ms.is_none()
+                && row.reserved_by.is_none()
+                && row.evidence,
+            "a connect cut short by the deadline did not return the row to pending with its offer columns empty: state {}, outcome {:?}, reason {reason}",
+            row.state,
+            row.outcome
+        );
+        ensure!(
+            reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX)
+                && reason.contains("timed out")
+                && reason.contains("candidate-slow-connect"),
+            "the not-sent attempt is not recorded: {reason}"
+        );
+        ensure!(fixture.backed_off().await?, "the unsent row did not back off");
+        ensure!(fixture.submissions().await == 0);
+        ensure!(fixture.unknown_outcomes().await? == 0, "a connect cut short by the deadline was counted as an unknown outcome");
+        ensure!(
+            first_offer_samples(&frontend.metrics) == 0,
+            "an attempt that never reached the node recorded a first-offer sample"
+        );
+        // The next claim, on a frontend that connects, offers the block.
+        fixture.expire().await?;
+        let offer = fixture
+            .successor
+            .claim_candidate(10)
+            .await?
+            .context("the unsent row was not claimable")?;
+        ensure!(offer.lifecycle.state == CandidateState::Pending);
+        fixture
+            .successor_coordinator
+            .process_candidate_with_lease(&offer, CANDIDATE_LEASE)
+            .await?;
+        let row = fixture.row().await?;
+        ensure!(
+            row.state == "submitted"
+                && row.outcome.as_deref() == Some("accepted")
+                && row.reserved_by.as_deref() == Some("candidate-successor"),
+            "the re-offered block did not land: state {}, outcome {:?}",
+            row.state,
+            row.outcome
+        );
+        ensure!(fixture.landed().await?);
+        ensure!(fixture.submissions().await == 1, "the block was offered more than once");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    held.abort();
+    frontend.ledger.pool.close().await;
+    fixture.close().await?;
+    result
+}
+
+/// #762's other side: the `submitblock` was written and the node accepted the
+/// block, but no reply came back before the deadline. The request may have
+/// run, so delivery is unknown, the row never returns to `pending`, and no
+/// frontend offers the block again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submitblock_deadline_that_passes_after_the_request_was_written_stays_unknown_and_is_never_offered_again(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let relay = Relay::start(fixture.node_address()?).await?;
+    let frontend = fixture.relayed_frontend(&relay, "candidate-held").await?;
+    let result = async {
+        relay.submit(Submit::HoldReply);
+        frontend
+            .process_candidate_with_lease(&fixture.claim, CANDIDATE_LEASE)
+            .await?;
+        relay.submit(Submit::Forward);
+        let row = fixture.row().await?;
+        let reason = row.last_error.clone().unwrap_or_default();
+        ensure!(
+            row.state != "pending"
+                && row.outcome.as_deref() == Some("unknown")
+                && row.offered_at_ms.is_some()
+                && !reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX),
+            "a deadline after the write was not recorded as an unknown outcome: state {}, outcome {:?}, reason {reason}",
+            row.state,
+            row.outcome
+        );
+        ensure!(fixture.submissions().await == 1);
+        // Every later claim, on any frontend, observes and never offers.
+        for _ in 0..2 {
+            fixture.expire().await?;
+            if let Some(claim) = fixture.successor.claim_candidate(10).await? {
+                ensure!(claim.lifecycle.state != CandidateState::Pending);
+                fixture
+                    .successor_coordinator
+                    .process_candidate_with_lease(&claim, CANDIDATE_LEASE)
+                    .await?;
+            }
+        }
+        ensure!(
+            fixture.submissions().await == 1,
+            "the block was offered again after a deadline that followed the write"
         );
         ensure!(fixture.state().await? == "submitted");
         Ok::<_, anyhow::Error>(())
