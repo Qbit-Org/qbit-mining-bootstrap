@@ -24,7 +24,8 @@ pub mod archive;
 mod audit;
 pub use audit::{
     audit_canonical_bytes, audit_canonical_bytes_admitted, audit_completeness,
-    decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReader,
+    decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReaddressed,
+    AuditReader,
 };
 mod candidates;
 #[cfg(test)]

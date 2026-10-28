@@ -107,9 +107,14 @@ production `self-check` fails at audit completeness and skips its other checks
 (#734). `scripts/prism_legacy_import_admission_gate.sh` checks every other fact
 `self-check` checks, against the frontend's own environment on each host. It
 reports legacy completeness as pending, and fails on any incomplete native
-audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
-for an audit whose 2.x body can't be read on that host (#735), and the block's
-audit view answers 404.
+audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers a
+`no-store` 404 for an audit whose 2.x body file, or a share segment it names,
+isn't on that host, as the block's audit view does (#735). A body file that is there but can't be read or
+verified still answers 500, as does a body recorded under a URI scheme other
+than `file://`. A 2.x audit-bundle.v2 body whose share segments are there
+answers 500 until 3.x can verify it (#731), so expect those 500s on a host that
+holds the 2.x bodies; one whose segments are missing answers 404 like any
+absent body.
 
 The gate's carry-forward integrity check runs the same report `self-check`
 runs. At production size it took about a minute before migration 026 (#737).
@@ -2083,8 +2088,14 @@ qbitd's `-rpcservertimeout`, and the idle timeout of any proxy in front of the
 node, above 20 seconds; qbitd's default is 30. Otherwise a call can be written
 into the idle close and fail after the connection existed, which `submitblock`
 records as an unknown outcome.
-`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
-ambiguous submission results retain the durable candidate for reconciliation.
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`,
+its connect included. A new connection gets at most half of it, and never
+more than 4.9 s (`rpc::relay_connect_budget`). A call still waiting for its
+connection then is never sent, and the block is offered again (#762); a call
+that took a pooled connection meanwhile was sent on it, and an unknown outcome
+stays unknown. That connect runs on, and once established serves the next
+call while the node keeps it open.
+Ambiguous submission results retain the durable candidate for reconciliation.
 Candidate claims renew throughout processing, including waits for build workers.
 Losing the lease cancels the attempt; the durable row remains recoverable.
 Fresh candidates take priority over retries, with periodic oldest-due selection

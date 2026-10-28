@@ -47,6 +47,7 @@ mod offer_shutdown;
 mod prepared_storage;
 mod publication_authority;
 mod refresh_window;
+pub mod revision_wake;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
@@ -382,14 +383,15 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 
 /// Why the one `submitblock` call provably did not run on the node, if it
 /// did not: its connection was never established, so no byte of it left this
-/// process (`rpc::RpcNotSentError`, #522), the client refused to send it
+/// process (`rpc::RpcNotSentError`, #522, a connect that outlasted half the
+/// submit deadline included, #762), the client refused to send it
 /// under `PRISM_BLOCK_SUBMIT_ENABLED` (`rpc::RpcRelayRefused`, #291), or the
 /// node answered it with `RPC_IN_WARMUP`, which qbitd returns before it
 /// dispatches any call (`rpc::RpcReplyError::in_warmup`, #526). Only a
 /// `submitblock` reply counts: a warmup answer to another call says nothing
 /// about this one. Every other result, any other error code, a transport
-/// failure after the connection existed or a timeout included, may have run
-/// and is `None`.
+/// failure after the connection existed or the submit deadline included, may
+/// have run and is `None`.
 fn offer_not_executed(result: &Result<Value>) -> Option<String> {
     let error = result.as_ref().err()?;
     if let Some(not_sent) = error.downcast_ref::<crate::rpc::RpcNotSentError>() {
@@ -2318,6 +2320,10 @@ impl Coordinator {
     }
 
     pub async fn refresh_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        // #752: a payout revision another frontend moves under this one's
+        // work wakes this loop at once, not on its tick (`revision_wake`).
+        // The listener ends with the loop.
+        let _revision_wake = revision_wake::start(self.clone(), shutdown.clone()).await;
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_hint_prune = Instant::now();
