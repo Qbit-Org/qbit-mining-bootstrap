@@ -883,8 +883,10 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   never sees a partial one. Import re-verifies every sidecar against the
   digest, the recorded coinbase and the trusted ledger key.
 
-The post-GA follow-up is #709: 3.x accepting the escaped form, so that these
-bodies verify without sidecars.
+Since #709's fix, 3.x accepts the escaped form as well. A canonicalizer and an
+import built from a release that includes it verify these bodies without
+sidecars, and the tool reports them as `ok-in-3x`; a range digest of neither
+form is still refused.
 
 ### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
 

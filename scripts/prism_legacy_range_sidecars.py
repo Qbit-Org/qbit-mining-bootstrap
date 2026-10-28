@@ -9,7 +9,9 @@ separators=(",", ":"))`, with the default ensure_ascii=True, so non-ASCII
 text is written as \\uXXXX escapes. 3.x re-serializes the same shares with
 serde_json, which writes raw UTF-8. A range whose shares carry any non-ASCII
 string (a worker name, say) therefore fails 3.x's range check, and
-`import-audits` refuses the body. The content itself is intact.
+`import-audits` refuses the body. The content itself is intact. 3.x accepts
+the escaped form as well since #709's fix, so a canonicalizer built with it
+finds such a body `ok-in-3x` and the tool writes no sidecar for it.
 
 For each row (`block_hash,body_uri,audit_bundle_sha256`) the tool:
 1. checks an existing sidecar, if `--sidecar-dir` holds one: it must be one

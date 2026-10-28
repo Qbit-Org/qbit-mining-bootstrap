@@ -1,5 +1,6 @@
 use crate::{
-    build_prism_reward_manifest_with_cut, canonical_audit_bundle_bytes, AcceptedShare, AuditBundle,
+    build_prism_reward_manifest_with_cut, canonical_audit_bundle_bytes,
+    window::push_python_json_escaped_contents, AcceptedShare, AuditBundle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -456,15 +457,7 @@ fn append_share_part(
                 share_count,
                 "share segment range",
             )?;
-            let actual_sha256 =
-                canonical_share_segment_sha256(first_share_seq, last_share_seq, &selected)?;
-            let expected_sha256 = range_sha256.to_lowercase();
-            if actual_sha256 != expected_sha256 {
-                return Err(AuditBodyRefError::HashMismatch {
-                    expected: expected_sha256,
-                    actual: actual_sha256,
-                });
-            }
+            verify_share_segment_sha256(first_share_seq, last_share_seq, &selected, &range_sha256)?;
             append_contiguous(shares, selected)?;
         }
         SharePart::SegmentPrefix {
@@ -491,15 +484,12 @@ fn append_share_part(
                 share_count,
                 "share segment prefix",
             )?;
-            let actual_sha256 =
-                canonical_share_segment_sha256(first_share_seq, last_share_seq, &selected)?;
-            let expected_sha256 = prefix_sha256.to_lowercase();
-            if actual_sha256 != expected_sha256 {
-                return Err(AuditBodyRefError::HashMismatch {
-                    expected: expected_sha256,
-                    actual: actual_sha256,
-                });
-            }
+            verify_share_segment_sha256(
+                first_share_seq,
+                last_share_seq,
+                &selected,
+                &prefix_sha256,
+            )?;
             append_contiguous(shares, selected)?;
         }
         SharePart::Inline {
@@ -583,11 +573,18 @@ fn select_share_segment_range(
     Ok(selected)
 }
 
-fn canonical_share_segment_sha256(
+/// Check a range or prefix part's digest over its selected shares. 3.x hashes
+/// the range as serde_json writes it. 1.x and 2.x hashed it with Python's
+/// `json.dumps`, which escapes non-ASCII text as `\uXXXX` (#709). The two
+/// forms differ only when a share carries non-ASCII text, such as a worker
+/// name, and each encodes the same shares, so either form is accepted. A
+/// digest of neither form is a mismatch, reported against the serde_json form.
+fn verify_share_segment_sha256(
     first_share_seq: u64,
     last_share_seq: u64,
     shares: &[AcceptedShare],
-) -> Result<String, AuditBodyRefError> {
+    expected_sha256: &str,
+) -> Result<(), AuditBodyRefError> {
     let segment = AuditShareSegment {
         schema: AUDIT_SHARE_SEGMENT_SCHEMA.to_string(),
         first_share_seq,
@@ -595,7 +592,46 @@ fn canonical_share_segment_sha256(
         share_count: shares.len(),
         shares: shares.to_vec(),
     };
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&segment)?)))
+    let expected_sha256 = expected_sha256.to_lowercase();
+    let actual_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&segment)?));
+    if actual_sha256 == expected_sha256 || python_json_sha256(&segment)? == expected_sha256 {
+        return Ok(());
+    }
+    Err(AuditBodyRefError::HashMismatch {
+        expected: expected_sha256,
+        actual: actual_sha256,
+    })
+}
+
+/// sha256 of `value` as CPython's `json.dumps(value, separators=(",", ":"))`
+/// writes it, which is how 1.x and 2.x hashed their storage artifacts: compact
+/// serde_json in field order, with non-ASCII text escaped.
+fn python_json_sha256<T: Serialize + ?Sized>(value: &T) -> Result<String, AuditBodyRefError> {
+    let mut bytes = Vec::new();
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut bytes,
+        PythonJsonFormatter,
+    ))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// serde_json's compact formatter with `json.dumps`'s default
+/// `ensure_ascii=True`: every character outside printable ASCII is written as
+/// `\uXXXX`, and one above the BMP as a UTF-16 surrogate pair. serde_json
+/// passes `"`, `\` and control characters to `write_char_escape`, whose
+/// escapes are CPython's too, and everything else in a string to
+/// `write_string_fragment`.
+struct PythonJsonFormatter;
+
+impl serde_json::ser::Formatter for PythonJsonFormatter {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut escaped = Vec::with_capacity(fragment.len());
+        push_python_json_escaped_contents(&mut escaped, fragment);
+        writer.write_all(&escaped)
+    }
 }
 
 fn resolve_body_uri(body_uri: &str, base_dir: Option<&Path>) -> PathBuf {
@@ -679,4 +715,26 @@ fn validate_contiguous_shares(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod python_json_tests {
+    use super::*;
+
+    #[test]
+    fn python_json_formatter_writes_cpython_json_dumps_bytes() {
+        let value = serde_json::json!({"text": "\"\\\n\u{1}\u{7f}\u{1f}ø€\u{1f980}/"});
+        let mut bytes = Vec::new();
+        value
+            .serialize(&mut serde_json::Serializer::with_formatter(
+                &mut bytes,
+                PythonJsonFormatter,
+            ))
+            .unwrap();
+        // CPython's json.dumps(value, separators=(",", ":")).
+        assert_eq!(
+            bytes,
+            br#"{"text":"\"\\\n\u0001\u007f\u001f\u00f8\u20ac\ud83e\udd80/"}"#
+        );
+    }
 }

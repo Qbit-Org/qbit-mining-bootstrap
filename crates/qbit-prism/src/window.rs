@@ -334,6 +334,13 @@ pub struct WindowAdvanceByteDelta {
 
 fn push_python_json_escaped(out: &mut Vec<u8>, value: &str) {
     out.push(b'"');
+    push_python_json_escaped_contents(out, value);
+    out.push(b'"');
+}
+
+/// The inside of a JSON string as CPython's `json.dumps` writes it with its
+/// default `ensure_ascii=True`: the quotes are the caller's.
+pub(crate) fn push_python_json_escaped_contents(out: &mut Vec<u8>, value: &str) {
     for character in value.chars() {
         let code_point = character as u32;
         match character {
@@ -358,7 +365,6 @@ fn push_python_json_escaped(out: &mut Vec<u8>, value: &str) {
             }
         }
     }
-    out.push(b'"');
 }
 
 fn push_u16_escape(out: &mut Vec<u8>, unit: u16) {

@@ -847,6 +847,163 @@ fn audit_clis_accept_v2_range_proof_bundle() {
     );
 }
 
+/// `json.dumps`'s default `ensure_ascii` escaping applied to serde_json's
+/// compact bytes, where non-ASCII text only occurs inside strings: each
+/// character outside printable ASCII becomes `\uXXXX`, a UTF-16 surrogate pair
+/// above the BMP.
+fn python_escaped(json: &[u8]) -> Vec<u8> {
+    let mut out = String::new();
+    for character in std::str::from_utf8(json).unwrap().chars() {
+        if character.is_ascii() && character != '\u{7f}' {
+            out.push(character);
+        } else {
+            for unit in character.encode_utf16(&mut [0; 2]) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out.into_bytes()
+}
+
+/// #709: 1.x and 2.x hashed each range and prefix part over Python's escaped
+/// JSON, so a part whose shares carry a non-ASCII worker name verifies without
+/// a sidecar. A digest of neither form, or a changed share, is still refused.
+#[test]
+fn audit_clis_accept_a_body_ref_whose_range_digests_escape_non_ascii_workers() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let mut shares = fixture.shares;
+    shares[1].miner_id.push_str(".Bjørn-rig");
+    shares[4].miner_id.push_str(".rig-\u{1f980}");
+    let bundle = build_audit_bundle(
+        shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "qbit-prism-escaped-range-body-ref-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    // One slot holds the window, as 1.x wrote it. A prefix part selects shares
+    // 1-3 and a range part 4-6, each with one non-ASCII worker.
+    let count = bundle.shares.len() as u64;
+    let slot = canonical_share_segment_bytes(1, count, &bundle.shares);
+    fs::write(tmp_dir.join("slot.json"), python_escaped(&slot)).unwrap();
+    let escaped_sha256 = |first: u64, last: u64| {
+        let selected = &bundle.shares[first as usize - 1..last as usize];
+        let raw = canonical_share_segment_bytes(first, last, selected);
+        let escaped = python_escaped(&raw);
+        assert_ne!(escaped, raw, "the part must carry non-ASCII text");
+        hex::encode(Sha256::digest(escaped))
+    };
+    let mut bundle_without_shares = serde_json::to_value(&bundle).unwrap();
+    bundle_without_shares
+        .as_object_mut()
+        .unwrap()
+        .remove("shares");
+    let body_ref = serde_json::json!({
+        "schema": "qbit.prism.audit-body-ref.v1",
+        "audit_bundle_sha256": report.audit_bundle_sha256_hex,
+        "share_count": count,
+        "bundle_without_shares": bundle_without_shares,
+        "share_parts": [
+            {
+                "kind": "segment_prefix",
+                "first_share_seq": 1,
+                "last_share_seq": 3,
+                "share_count": 3,
+                "prefix_sha256": escaped_sha256(1, 3),
+                "body_uri": "slot.json",
+            },
+            {
+                "kind": "segment_range",
+                "first_share_seq": 4,
+                "last_share_seq": count,
+                "share_count": count - 3,
+                "range_sha256": escaped_sha256(4, count),
+                "body_uri": "slot.json",
+            }
+        ],
+    });
+    let body_ref_path = tmp_dir.join("body-ref.json");
+    fs::write(&body_ref_path, serde_json::to_vec(&body_ref).unwrap()).unwrap();
+
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-verify"))
+        .arg(&body_ref_path)
+        .arg("--coinbase-tx-hex")
+        .arg(&report.coinbase_tx_hex)
+        .arg("--ledger-writer-public-key-hex")
+        .arg(ledger_public_key_hex())
+        .arg("--expected-coinbase-value-sats")
+        .arg(report.coinbase_value_sats.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        verify_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verify_output.stdout),
+        String::from_utf8_lossy(&verify_output.stderr)
+    );
+    let canonical_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+        .arg("--input")
+        .arg(&body_ref_path)
+        .output()
+        .unwrap();
+    assert!(
+        canonical_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&canonical_output.stdout),
+        String::from_utf8_lossy(&canonical_output.stderr)
+    );
+    assert_eq!(
+        canonical_output.stdout,
+        canonical_audit_bundle_bytes(&bundle).unwrap()
+    );
+
+    // Each part's digest is checked: one that is neither form is refused.
+    for (index, key) in [(0, "prefix_sha256"), (1, "range_sha256")] {
+        let digest = body_ref["share_parts"][index][key].as_str().unwrap();
+        let flipped = if digest.starts_with('0') { "1" } else { "0" };
+        let digest = format!("{flipped}{}", &digest[1..]);
+        let mut tampered = body_ref.clone();
+        tampered["share_parts"][index][key] = serde_json::json!(digest);
+        let path = tmp_dir.join(format!("tampered-{key}.json"));
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        match qbit_prism::load_audit_bundle_from_path(&path) {
+            Err(qbit_prism::AuditBodyRefError::HashMismatch { expected, .. }) => {
+                assert_eq!(expected, digest, "{key}")
+            }
+            other => panic!("{key}: expected a hash mismatch, got {other:?}"),
+        }
+    }
+    // A changed share in the slot matches neither form of the range digest.
+    let tampered_slot =
+        String::from_utf8(python_escaped(&slot))
+            .unwrap()
+            .replacen("Bj\\u00f8rn", "Bjorn", 1);
+    fs::write(tmp_dir.join("slot.json"), tampered_slot).unwrap();
+    let refused = qbit_prism::load_audit_bundle_from_path(&body_ref_path);
+    let _ = fs::remove_dir_all(&tmp_dir);
+    match refused {
+        Err(qbit_prism::AuditBodyRefError::HashMismatch { expected, .. }) => assert_eq!(
+            expected,
+            body_ref["share_parts"][0]["prefix_sha256"]
+                .as_str()
+                .unwrap()
+        ),
+        other => panic!("expected a hash mismatch, got {other:?}"),
+    }
+}
+
 #[test]
 fn build_audit_bundle_cli_emits_suffix_aware_bundle() {
     let suffix = "111111112222222222222222".to_string();
