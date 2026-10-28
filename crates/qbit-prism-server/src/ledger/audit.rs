@@ -173,18 +173,26 @@ pub async fn audit_canonical_bytes<'a>(
     reader: impl Into<AuditReader<'a>>,
     block_hash: &str,
 ) -> Result<Option<Vec<u8>>> {
-    audit_canonical_bytes_admitted(reader, block_hash, None).await
+    audit_canonical_bytes_admitted(reader, block_hash, None, None).await
 }
+
+/// The audit row an artifact address found no longer answers it: it was
+/// re-imported under another digest between the lookup and the read.
+#[derive(Debug, thiserror::Error)]
+#[error("the audit row no longer answers the artifact address it was found by")]
+pub struct AuditReaddressed;
 
 /// [`audit_canonical_bytes`] under an admission `permit`. The stored bytes'
 /// digest and parse, and a native row's rebuild and canonical serialization,
 /// are proportional to the window, so they run on one blocking thread that
 /// holds the permit itself: Tokio keeps running that job after its awaiting
-/// caller is dropped, and the permit must bound it anyway. Callers outside the
-/// public API pass `None`.
+/// caller is dropped, and the permit must bound it anyway. A read for an
+/// artifact `address` refuses, with [`AuditReaddressed`], a row that no longer
+/// advertises it. Callers outside the public API pass `None` for both.
 pub async fn audit_canonical_bytes_admitted<'a>(
     reader: impl Into<AuditReader<'a>>,
     block_hash: &str,
+    address: Option<&str>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Option<Vec<u8>>> {
     let mut reader = reader.into();
@@ -192,6 +200,11 @@ pub async fn audit_canonical_bytes_admitted<'a>(
         .bind(block_hash).fetch_optional(&mut *reader.connection(None).await?).await?;
     let Some(row) = row else { return Ok(None) };
     let expected: String = row.try_get("audit_bundle_sha256")?;
+    // Checked before any work proportional to the window: a re-imported row
+    // is another audit, whose bytes must not be served under this address.
+    if address.is_some_and(|address| address != expected) {
+        return Err(AuditReaddressed.into());
+    }
     let canonical: Option<Vec<u8>> = row.try_get("canonical_audit_bytes")?;
     let snapshot: Option<String> = row.try_get("share_snapshot_sha256")?;
     let body: Option<Value> = match (&canonical, &snapshot) {
