@@ -18,7 +18,7 @@ from jinja2.meta import find_undeclared_variables
 import yaml
 
 from check_prism_alert_uids import GRAFANA_UID
-from generate_prism_alerts import ROOT, deployment_template, load
+from generate_prism_alerts import ROOT, deployment_template, load, miners_now, miners_recently
 
 
 def main():
@@ -155,13 +155,16 @@ def main():
             assert after["qbit-prism-revision-work-unknown"]["noDataState"] == "Alerting"
             assert after["qbit-prism-accepted-block-unlanded"]["noDataState"] == "OK"
             assert after["qbit-prism-revision-work-pending"]["for"] == "0s"
-            # #758: both revision-work warnings carry their critical twin's
-            # miner gate, so an idle backup frontend stays quiet after a pool block.
-            miners = ('and on(job, instance, network) (qbit_prism_authorized_clients'
-                      '{job=\\"qbit-prism\\",network=\\"mainnet\\"} > 0)')
-            for uid in ["qbit-prism-revision-work-pending-crit", "qbit-prism-revision-work-pending",
-                        "qbit-prism-revision-work-unknown"]:
-                assert miners in json.dumps(after[uid]), uid
+            # #758: the critical pages only with miners now; both warnings
+            # count only where a miner was authorized within the window, so a
+            # long-idle backup stays quiet after a pool block.
+            def rendered(gate):
+                return json.dumps("and on(job, instance, network) " + gate.replace("__NETWORK__", "mainnet"))[1:-1]
+            critical = json.dumps(after["qbit-prism-revision-work-pending-crit"])
+            assert rendered(miners_now()) in critical and "max_over_time" not in critical
+            for uid in ["qbit-prism-revision-work-pending", "qbit-prism-revision-work-unknown"]:
+                warning = json.dumps(after[uid])
+                assert rendered(miners_recently()) in warning and rendered(miners_now()) not in warning, uid
             # #529: a found block offered without a confirmed standby copy
             # warns at once, never pages, and is quiet on no data.
             standby = after["qbit-prism-offer-standby-unconfirmed"]

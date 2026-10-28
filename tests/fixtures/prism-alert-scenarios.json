@@ -2115,7 +2115,7 @@
     }
   },
   {
-    "name": "landing backup frontend that takes miners reports its earlier unknown tracking after the dwell",
+    "name": "landing unknown tracking that persists once miners arrive warns after the dwell",
     "series": {
       "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x30 0+1x20 -1x309",
       "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x51 1x309",
@@ -2141,7 +2141,7 @@
     }
   },
   {
-    "name": "landing backup frontend that takes miners is pending under the unknown dwell",
+    "name": "landing unknown tracking that persists once miners arrive is pending under the dwell",
     "series": {
       "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x30 0+1x20 -1x309",
       "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x51 1x309",
@@ -2157,6 +2157,78 @@
     "alerts": {
       "PrismAcceptedRevisionWorkPending": [],
       "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing a stall that drives every miner away keeps warning inside the recent-miner window",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x1200",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x120 0x1080"
+    },
+    "eval_time": "10m",
+    "expect": {
+      "PrismAcceptedRevisionWorkPending": 1,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkPending": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing a frontend idle longer than the recent-miner window stops warning",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0+1x1200",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x120 0x1080"
+    },
+    "eval_time": "18m",
+    "expect": {
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 0,
+      "PrismAcceptedRevisionWorkPendingCritical": null
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [],
+      "PrismAcceptedRevisionWorkPendingCritical": []
+    }
+  },
+  {
+    "name": "landing unknown tracking inside the recent-miner window warns after the dwell",
+    "series": {
+      "qbit_prism_accepted_block_revision_work_pending_seconds{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x299 -1x900",
+      "qbit_prism_accepted_block_revision_work_tracking_unknown{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x299 1x900",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x120 0x1080"
+    },
+    "eval_time": "10m",
+    "expect": {
+      "PrismAcceptedRevisionWorkPending": 0,
+      "PrismAcceptedRevisionWorkTrackingUnknown": 1,
+      "PrismAcceptedRevisionWorkPendingCritical": null
+    },
+    "alerts": {
+      "PrismAcceptedRevisionWorkPending": [],
+      "PrismAcceptedRevisionWorkTrackingUnknown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
       "PrismAcceptedRevisionWorkPendingCritical": []
     }
   },

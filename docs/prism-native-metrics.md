@@ -461,7 +461,11 @@ are retained as deduplication tombstones until a coherent mature accounting
 checkpoint retires their height. A monotonic height watermark then rejects
 delayed proofs even after the identity is released; unresolved intervals are
 never retired by that checkpoint. Revision events are released when all known
-deliveries resolve. Nothing is evicted to make a duplicate look new.
+deliveries resolve. Once every open wait is bound to a target or a covering
+revision, or awaits only its orphan verdict, only the newest revision is kept,
+because a later write of an older one is obsolete; waits that stay open on a
+frontend that writes nothing therefore cannot exhaust revision history (#758).
+Nothing is evicted to make a duplicate look new.
 Exceeding a bound sets `accepted_block_revision_work_tracking_unknown` to
 **1 until restart**. Missing identities have no fabricated observations; known
 pending ages remain visible after identity-only saturation. Lost revision or
@@ -477,7 +481,14 @@ stays unresolved: a current-revision proof cannot safely reconstruct that
 original revision. A later proven first confirmation can recover an attempt
 that did not commit; an already-confirmed replay cannot invent the lost fact.
 The same unknown boundary applies when a peer confirms a locally accepted
-block during audit landing, before the local settlement observer starts. Only
+block during audit landing, before the local settlement observer starts.
+Neither keeps the wait open until restart (#758): a later settlement of the
+block by this frontend that finds it already confirmed commits at a revision
+covering the landing, and the first eligible write at or above that revision
+closes the wait without a sample, since its true end stays unknown. A delayed
+local first confirmation still in flight takes precedence and measures the
+exact revision. A frontend with no miners writes nothing, so it keeps such a
+wait unknown until a miner receives work. Only
 a newly observed already-confirmed peer block may begin at its current local
 proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
 Universal exactly-once reporting beyond these knowledge/capacity boundaries
@@ -522,11 +533,12 @@ older cancelled refresh cannot overwrite a newer completed observation. No
 block, job, worker, frontend or height label is emitted.
 
 There are **five concrete alert rules**: `PrismAcceptedRevisionWorkPending`
-warns above one second on a frontend with an authorized miner, and on any
-frontend for a missing pending series or a failed scrape,
+warns above one second on a frontend that had an authorized miner in the last
+15 minutes, and on any frontend for a missing pending series or a failed scrape,
 `PrismAcceptedRevisionWorkTrackingUnknown` warns for unknown tracking (a -1
-age or the tracking-unknown gauge on a frontend with an authorized miner, or a
-missing unknown gauge on any frontend) after a two-minute dwell,
+age or the tracking-unknown gauge on a frontend that had an authorized miner in
+the last 15 minutes, or a missing unknown gauge on any frontend) after a
+two-minute dwell,
 `PrismAcceptedRevisionWorkPendingCritical` uses the provisional
 307-second incident-duration floor, `PrismRevisionWorkBuildTimeouts` warns on
 a five-minute increase, and `PrismAcceptedBlockUnlanded` warns when an
@@ -536,15 +548,14 @@ missing measurement is always visible. The unknown warning dwells (#493
 point 7): a failed template refresh marks tracking unknown only until the
 next successful refresh, one poll interval later, so a single transient
 refresh error never spans the eight consecutive 15-second scrapes the dwell
-requires, while a lost settlement reply, an unsettled orphan verdict,
-saturation or lost ordering persist and still warn. Both warnings take the
-critical's miner gate (#758): a frontend with no authorized miner has no
-mining.notify write that can close its wait, and one that loses each pool
-block's settlement to a peer, such as an idle backup, marks that block's
-revision unknown until a restart or an orphan clears it, so without the gate
-it would warn after every pool block and never clear. The gate hides that
-state rather than clearing it: a backup that later takes miners warns once
-the dwell passes. The paging
+requires, while an unsettled orphan verdict, saturation or lost ordering
+persist and still warn, as does a lost settlement reply until a later
+settlement proves a covering revision and this frontend writes at it. Both
+warnings count only on a frontend that had an authorized miner in the last 15
+minutes (#758): a frontend with no miner has no mining.notify write that can
+close its wait, so a long-idle backup would otherwise warn after every pool
+block, while a stall that drives every miner away keeps warning for 15
+minutes after the last one leaves. The paging
 critical is gated (#493): the age must be known, the target scraped and at
 least one miner authorized on that frontend, with a one-minute dwell and
 no-data and evaluation errors treated as OK. It is deliberately not gated on
@@ -558,8 +569,9 @@ during a stall and stays well under the five-minute hold that delayed #413.
 If every miner leaves a frontend during a stall, this page resolves and
 nothing else pages for that frontend: the coverage rules cannot fire with
 zero authorized clients and the connected-clients rule is a cluster-wide
-non-paging warning; the pending warning is gated the same way, and both
-report the still-growing age again once a miner reconnects. A lost race
+non-paging warning; the pending warning keeps reporting the age for 15
+minutes after the last miner leaves, and both report it again once a miner
+reconnects. A lost race
 on the offering frontend never pages (#493 point 1): its acceptance is
 unlanded, outside the known
 age, until an active-chain observation lands it or its orphan is proven. A

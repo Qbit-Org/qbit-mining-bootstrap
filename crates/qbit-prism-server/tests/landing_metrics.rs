@@ -733,13 +733,17 @@ async fn peer_confirmation_during_audit_reply_wait_cannot_invent_the_original_ta
         f.b.refresh_once().await?;
         land_from(f, &f.b).await?;
         f.a.refresh_once().await?;
+        // A's reconciliation committed after B's confirmation: its revision
+        // covers the landing but is not the original target (#758).
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
         deliver(&f.a).await?;
-        ensure!(sample(&f.a.metrics, PENDING) == -1.);
+        ensure!(sample(&f.a.metrics, PENDING) == 0., "a covering write left the wait open");
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
         ensure!(count(&f.a.metrics, "published") == 1., "later proof fabricated an original target");
         ensure!(count(&f.a.metrics, "superseded") == 0., "unknown original revision was guessed");
         reply.release();
         timeout(Duration::from_secs(5), processing).await???;
-        ensure!(sample(&f.a.metrics, PENDING) == -1.);
+        ensure!(sample(&f.a.metrics, PENDING) == 0., "a late reply reopened a closed wait");
         ensure!(count(&f.a.metrics, "published") == 1.);
         ensure!(count(&f.a.metrics, "superseded") == 0.);
         Ok(())
@@ -811,8 +815,12 @@ async fn cancelled_commit_reply_keeps_unknown_without_fabricated_histogram() -> 
         reply.release();
         ensure!(sample(&f.a.metrics, PENDING) == -1.);
         f.a.refresh_once().await?;
-        deliver(&f.a).await?;
         ensure!(sample(&f.a.metrics, PENDING) == -1., "current revision guessed the lost committed revision");
+        // The refresh's reconciliation proved a covering revision; the first
+        // write at it ends the wait without a sample (#758).
+        deliver(&f.a).await?;
+        ensure!(sample(&f.a.metrics, PENDING) == 0., "a covering write left the wait open");
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
         for result in ["published", "degraded", "superseded"] {
             ensure!(count(&f.a.metrics, result) == 0.);
         }
@@ -883,13 +891,16 @@ async fn lost_commit_reply_timeouts_are_not_revision_work_failures() -> Result<(
         // Real delivery after the deadline, from a listener with the default
         // deadlines: the held session is closed on its first one-second tick
         // past the 0.05 s deadline while it still has no job (#528).
+        // The refresh's reconciliation found the block already confirmed, so
+        // its revision covers the landing: this write ends the unknown wait,
+        // unmeasured, without guessing the lost revision (#758).
         deliver(&f.a).await?;
-        ensure!(sample(&f.a.metrics, PENDING) == -1., "current revision guessed the lost committed revision");
+        ensure!(sample(&f.a.metrics, PENDING) == 0., "a covering write left the wait open");
         for result in ["published", "degraded", "superseded"] {
             ensure!(count(&f.a.metrics, result) == 0., "unknown tracking fabricated a {result} delivery");
         }
         ensure!(sample(&f.a.metrics, TIMEOUTS) == 0.);
-        ensure!(sample(&f.a.metrics, UNKNOWN) == 1.);
+        ensure!(sample(&f.a.metrics, UNKNOWN) == 0.);
         shutdown.send_replace(true);
         timeout(Duration::from_secs(5), task).await???;
         Ok(())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render migration tables and a review-only qbit-tools patch from the frozen snapshot."""
+"""Render the revision-work rule expressions, migration tables and a review-only qbit-tools patch from the frozen snapshot."""
 
 import argparse
 import difflib
@@ -26,6 +26,61 @@ def specification_digest():
         "docs/prism-postgres-exporter-queries.yaml", "docs/prism-alert-migration.json",
         "tests/fixtures/prism-deployed-alerts.json", "scripts/generate_prism_alerts.py",
     ])).hexdigest()
+
+
+# #758: the revision-work rules' miner gates come from here, so the warnings
+# and their critical twin cannot drift apart.
+TARGET = 'job="qbit-prism",network="__NETWORK__"'
+TARGETS = "on(job, instance, network)"
+# Longer than the critical's 307-second floor plus its one-minute dwell, so a
+# stall that drives every miner away before it pages still warns for minutes;
+# a backup that has been idle longer stays quiet.
+MINER_WINDOW = "15m"
+
+
+def prism(name):
+    return name + "{" + TARGET + "}"
+
+
+def miners_now():
+    """At least one authorized miner on the reporting frontend now."""
+    return f"({prism('qbit_prism_authorized_clients')} > 0)"
+
+
+def miners_recently():
+    """At least one authorized miner on the reporting frontend within MINER_WINDOW."""
+    return f"(max_over_time({prism('qbit_prism_authorized_clients')}[{MINER_WINDOW}]) > 0)"
+
+
+def miner_gated(term):
+    # The term where the frontend served miners recently, else a present zero,
+    # so the rule's missing-series fallbacks still key on the term's presence.
+    return f"(({term} and {TARGETS} {miners_recently()}) or {TARGETS} (0 * {term}))"
+
+
+def native_rules():
+    """Generate the revision-work expressions; everything else is authored in the file."""
+    spec = load("docs/prism-native-alert-rules.json")
+    assert spec["network_placeholder"] == "__NETWORK__"
+    pending = prism("qbit_prism_accepted_block_revision_work_pending_seconds")
+    unknown = prism("qbit_prism_accepted_block_revision_work_tracking_unknown")
+    up = prism("up")
+    configured = f"or {TARGETS} (0 * {up} + 1)"
+    expressions = {
+        "PrismAcceptedRevisionWorkPending":
+            f"clamp_max(({miner_gated(f'({pending} > bool 1)')} {configured}) + {TARGETS} ({up} == bool 0), 1)",
+        "PrismAcceptedRevisionWorkTrackingUnknown":
+            f"clamp_max({miner_gated(f'({pending} < bool 0)')} + {TARGETS} "
+            f"({miner_gated(f'({unknown} > bool 0)')} {configured}), 1)",
+        "PrismAcceptedRevisionWorkPendingCritical":
+            f"(({pending} >= bool 307) and {TARGETS} ({pending} >= 0)) "
+            f"and {TARGETS} {miners_now()} and {TARGETS} ({up} == 1)",
+    }
+    rules = [rule for rule in spec["rules"] if rule["title"] in expressions]
+    assert len(rules) == len(expressions)
+    for rule in rules:
+        rule["expr"] = expressions[rule["title"]]
+    return spec
 
 
 def postgres_rules():
@@ -207,6 +262,7 @@ def main():
     parser.add_argument("--snapshot", type=Path, help="read-only snapshot directory, required to regenerate the deployment patch")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    update(ROOT / "docs/prism-native-alert-rules.json", json.dumps(native_rules(), indent=2) + "\n", args.check)
     update(ROOT / "docs/prism-postgres-alert-rules.json", json.dumps(postgres_rules(), indent=2) + "\n", args.check)
     doc = ROOT / "docs/prism-alert-migration.md"
     before, rest = doc.read_text().split(START)
