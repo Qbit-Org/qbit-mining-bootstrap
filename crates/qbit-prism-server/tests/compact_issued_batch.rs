@@ -419,8 +419,9 @@ async fn ordinary_authority_updates_wait_for_atomic_64_child_commit() -> Result<
 }
 
 /// The cohort's cluster fence is `FOR KEY SHARE` (#479): it must not queue
-/// the share append, whose non-key `ledger_clock_ms` `UPDATE` runs under
-/// ORDER_LOCK and would hold every later share behind the cohort. The real
+/// the share append, which runs under ORDER_LOCK and would hold every later
+/// share behind the cohort (its non-key `ledger_clock_ms` `UPDATE` until
+/// #738; the snapshot anchor's since). The real
 /// 64-child cohort is held between its fence and its commit (its last insert
 /// is gated), and a share append must commit meanwhile, well inside the
 /// cohort's own five-second lock timeout.

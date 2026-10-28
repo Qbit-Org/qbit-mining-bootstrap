@@ -82,13 +82,14 @@ The cluster row's lock matrix (#479):
 | Authority writers (`payout_revision`, `config_fingerprint`, `fatal_error`) | `FOR UPDATE`, then the `UPDATE` |
 | Job persistence cohorts, repair and prepared storage | `FOR KEY SHARE` |
 | Blob GC | `FOR UPDATE` |
-| Share append clock and snapshot anchor (`ledger_clock_ms`) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
+| Snapshot anchor (`ledger_clock_ms`; share appends only read it, #738) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
 | Candidate, offer and append revision readers | `FOR SHARE` |
 
 `FOR KEY SHARE` conflicts with `FOR UPDATE`, so a cohort still serialises
 against every authority change and against blob GC, but it does not conflict
-with the clock `UPDATE`: shares and cohorts no longer queue behind each other
-on the clock, which no persistence path reads. A **bare `UPDATE` of an
+with the clock `UPDATE`: the snapshot anchor, which holds `ORDER_LOCK`, and
+cohorts no longer queue behind each other on the clock, which no persistence
+path reads. A **bare `UPDATE` of an
 authority column is forbidden**: it takes only `FOR NO KEY UPDATE` and passes a
 held cohort fence. Every authority writer takes the row `FOR UPDATE` in the
 same transaction before it writes (`lock_cluster_authority`, or its own
@@ -134,7 +135,7 @@ Job expiry remains a separate statement with its outer renewal recheck.
 | Compact prepared / issued / batch | Cluster SHARE → dependency/blob writes or locks → commit; no later advisory acquisition |
 | Blob collector | SETTLEMENT → ORDER → cluster UPDATE → fresh scans/deletes |
 | Candidate enqueue | ORDER → cluster SHARE → balance blob → candidate |
-| Share append with candidate | ORDER → cluster clock UPDATE → balance blob → candidate |
+| Share append with candidate | ORDER → cluster SHARE (fenced) → balance blob → candidate |
 | Chain observation | SETTLEMENT → cluster UPDATE |
 | Accounting/recovery | SETTLEMENT → ORDER → authority UPDATE (some also take instance/lease table fences) |
 | Configuration | Cluster UPDATE → configuration checks/write |
@@ -142,8 +143,8 @@ Job expiry remains a separate statement with its outer renewal recheck.
 The collector must acquire ORDER **before** its exclusive row fence: a candidate
 can already hold ORDER while waiting for the cluster row. Compact writers never
 reacquire either advisory lock. Native authority writers do not lock compact job
-or blob rows and then wait for their cluster fence; ordinary ledger-clock updates
-can still cause legitimate row contention. This removes unrelated advisory
+or blob rows and then wait for their cluster fence; the snapshot anchor's
+ledger-clock update can still cause legitimate row contention. This removes unrelated advisory
 serialization, not contention with actual authority changes.
 
 **Coordinated upgrade required:** stop all frontends and collectors, replace all

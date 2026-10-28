@@ -295,12 +295,12 @@ pub const TABLE_INVENTORY: &[TableEntry] = &[
     local("qbit_payout_carry_forward_current", Reset::Keep),
     // Keep, every column. payout_revision and chain_epoch never go back
     // (prepared work and chain transitions are checked against them);
-    // ledger_clock_ms stays at or above every share's stamp; best_chainwork,
-    // best_tip_hash and best_tip_height are the chain view this node's
-    // observer must not regress from (a lagging node is refused as behind,
-    // never read as a reorganisation of the balances); config_fingerprint is
-    // the pair's (D-6); a halt recorded on the peer (fatal_error) holds here
-    // too until fatal-state clear.
+    // ledger_clock_ms is a floor of every stamp and anchor (#738);
+    // best_chainwork, best_tip_hash and best_tip_height are the chain view
+    // this node's observer must not regress from (a lagging node is refused
+    // as behind, never read as a reorganisation of the balances);
+    // config_fingerprint is the pair's (D-6); a halt recorded on the peer
+    // (fatal_error) holds here too until fatal-state clear.
     local("qbit_prism_cluster", Reset::Keep),
     // Keep. The debt this database's confirmations created (#478), which the
     // integrity report sums; cleared, the report would forget debt the

@@ -900,7 +900,7 @@ pub(super) async fn writable_unless_held(
 /// holds this (or its own `SELECT … FOR UPDATE` on the row) before its
 /// `UPDATE`, so a job-persistence transaction can fence authority with
 /// `FOR KEY SHARE`: that lock conflicts with `FOR UPDATE` and with blob GC's
-/// exclusive fence, but not with the share append's `ledger_clock_ms`
+/// exclusive fence, but not with the snapshot anchor's `ledger_clock_ms`
 /// `UPDATE`, which changes no key column and is not an authority write. A
 /// bare `UPDATE` of a non-key column would take `FOR NO KEY UPDATE` and slip
 /// past a `KEY SHARE` fence, which is why authority writers never rely on the
