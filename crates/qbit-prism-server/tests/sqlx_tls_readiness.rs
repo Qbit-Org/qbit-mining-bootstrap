@@ -8,6 +8,17 @@
 //! over an in-memory socket whose readiness they control, and poll by hand so
 //! each interleaving is deterministic. A client left pending with no wakeup
 //! that can still arrive is a stall; the unpatched crate stalls in both.
+//!
+//! The harness depends on rustls 0.23.46's `ConnectionCommon::complete_io`:
+//! when a write blocks before sending anything and the connection wants to
+//! read, it tries a read before it returns `WouldBlock`, and that read is
+//! where the first test frees the send buffer. sqlx-core also switches to
+//! native-tls when both backends are enabled. A change that removes that read
+//! fails the first test's check that some drain found no waker, rather than
+//! passing on another path. On a rustls bump, also run both tests against the
+//! unpatched `util.rs` from the crates.io sqlx-core 0.8.6: they must still
+//! stall there and pass here, or the harness needs rework for the new
+//! `complete_io`.
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection};
 use sqlx_core::bytes::BufMut;
@@ -42,10 +53,12 @@ struct Wire {
     write_waker: Option<Waker>,
     /// Frees the client's send buffer when the client tries a read after its
     /// write blocked, the way a peer draining the socket between the two
-    /// does. Like a readiness event whose waker was already spent, it wakes
-    /// nobody, so only a client that polls write readiness again sees it.
+    /// does. It wakes a stored write waker as an I/O driver would; with none
+    /// stored, as when the wakeup that started this poll spent it, only a
+    /// client that polls write readiness again sees the space.
     drain_on_blocked_read: bool,
-    drains_on_blocked_read: usize,
+    /// Drains that found no write waker to wake: the lost-wakeup window.
+    unwoken_drains: usize,
     socket_calls: usize,
 }
 
@@ -81,8 +94,9 @@ impl Socket for ClientSocket {
         wire.count_call();
         if wire.to_client.is_empty() {
             if wire.drain_on_blocked_read && wire.to_server.len() == WIRE_CAPACITY {
-                assert!(wire.write_waker.is_none(), "the drain must wake nobody");
-                wire.drains_on_blocked_read += 1;
+                if wire.write_waker.is_none() {
+                    wire.unwoken_drains += 1;
+                }
                 wire.take_to_server();
             }
             return Err(io::ErrorKind::WouldBlock.into());
@@ -373,7 +387,11 @@ fn write_readiness_after_a_blocked_write_resumes_the_write() {
         .unwrap_or_else(|stall| panic!("{stall}"))
         .unwrap();
 
-    assert!(server.wire.lock().unwrap().drains_on_blocked_read > 0);
+    assert!(
+        server.wire.lock().unwrap().unwoken_drains > 0,
+        "no blocked write was followed by a read with no write waker stored, so \
+         the lost-wakeup window was never reached; see the module comment"
+    );
     assert!(
         server.request == request,
         "the server got a different request"
