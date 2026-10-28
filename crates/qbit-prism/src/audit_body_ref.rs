@@ -197,6 +197,28 @@ mod inline_share_tests {
     }
 }
 
+#[cfg(test)]
+mod body_uri_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_uri_segment_resolves_to_its_local_path() {
+        let base = Path::new("/audits/block");
+        for (uri, path) in [
+            ("file:///segments/a.json", PathBuf::from("/segments/a.json")),
+            ("/segments/a.json", PathBuf::from("/segments/a.json")),
+            ("file://segments/a.json", base.join("segments/a.json")),
+            ("segments/a.json", base.join("segments/a.json")),
+        ] {
+            assert_eq!(resolve_body_uri(uri, Some(base)), path, "{uri}");
+        }
+        assert_eq!(
+            resolve_body_uri("file:///segments/a.json", None),
+            PathBuf::from("/segments/a.json")
+        );
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AuditShareSegment {
     schema: String,
@@ -599,7 +621,9 @@ fn canonical_share_segment_sha256(
 }
 
 fn resolve_body_uri(body_uri: &str, base_dir: Option<&Path>) -> PathBuf {
-    let path = PathBuf::from(body_uri);
+    // A `file://` URI names the same local path, as it does for a row's own
+    // `body_uri`, which the import and the API strip too.
+    let path = PathBuf::from(body_uri.strip_prefix("file://").unwrap_or(body_uri));
     if path.is_absolute() {
         path
     } else if let Some(base_dir) = base_dir {

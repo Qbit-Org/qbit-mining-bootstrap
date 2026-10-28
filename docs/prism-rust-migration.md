@@ -110,8 +110,11 @@ reports legacy completeness as pending, and fails on any incomplete native
 audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers a
 `no-store` 404 for an audit whose 2.x body file, or a share segment it names,
 isn't on that host, as the block's audit view does (#735). A body file that is there but can't be read or
-verified still answers 500, and so does a 2.x audit-bundle.v2 body until 3.x
-can verify it (#731): expect those 500s on a host that holds the 2.x bodies.
+verified still answers 500, as does a body recorded under a URI scheme other
+than `file://`. A 2.x audit-bundle.v2 body whose share segments are there
+answers 500 until 3.x can verify it (#731), so expect those 500s on a host that
+holds the 2.x bodies; one whose segments are missing answers 404 like any
+absent body.
 
 The gate's carry-forward integrity check runs the same report `self-check`
 runs. At production size it took about a minute before migration 026 (#737).

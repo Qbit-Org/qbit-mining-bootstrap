@@ -639,18 +639,18 @@ async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_5
         };
         const ABSENT:&str="legacy audit body is not at its recorded location";
         const FAULT:&str="legacy audit body cannot be served";
-        // Asked twice: the first 404 is not kept by the origin cache. The
-        // audit view logs nothing, as before.
+        // Asked twice: the first 404 is not kept by the origin cache. Every
+        // reader logs an absence at debug.
         absent("absent body",get(&app,&path).await)?;absent("absent body, asked again",get(&app,&path).await)?;
         audit_view("absent body","audit bundle body is not retrievable").await?;
-        logged("absent body",&[("DEBUG",ABSENT,None),("DEBUG",ABSENT,None)])?;
+        logged("absent body",&[("DEBUG",ABSENT,None),("DEBUG",ABSENT,None),("DEBUG",ABSENT,None)])?;
         unlinked("absent body").await?;
         logged("absent body, link check",&[("DEBUG",ABSENT,None)])?;
         // A body-ref envelope whose share segment is not there is absent too.
         std::fs::write(&file,serde_json::to_vec(&json!({"schema":"qbit.prism.audit-body-ref.v1","audit_bundle_sha256":hash,"share_count":1,"bundle_without_shares":{},"share_parts":[{"kind":"segment","first_share_seq":1,"last_share_seq":1,"share_count":1,"sha256":"0".repeat(64),"body_uri":"segment.json"}]}))?)?;
         absent("absent segment",get(&app,&path).await)?;
         audit_view("absent segment","audit bundle body is not retrievable").await?;
-        logged("absent segment",&[("DEBUG",ABSENT,None)])?;
+        logged("absent segment",&[("DEBUG",ABSENT,None),("DEBUG",ABSENT,None)])?;
         // A segment that is there but does not prove is a fault.
         std::fs::write(dir.path().join("segment.json"),b"{}")?;
         fault("unproven segment",get(&app,&path).await)?;
@@ -672,15 +672,27 @@ async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_5
         fault("another audit's envelope",get(&app,&path).await)?;
         audit_view("another audit's envelope","audit bundle body hash mismatch").await?;
         logged("another audit's envelope",&[("WARN",FAULT,Some("audit bundle body hash mismatch"))])?;
+        // A share segment recorded as a `file://` URI is read from its path.
+        let segmented=f.block(4,104,"confirmed",at).await?;
+        let segment=serde_json::to_vec(&json!({"schema":"qbit.prism.audit-share-segment.v1","first_share_seq":1,"last_share_seq":1,"share_count":1,"shares":shares}))?;
+        let segment_path=dir.path().join("file-uri-segment.json");
+        std::fs::write(&segment_path,&segment)?;
+        let envelope=dir.path().join("segmented-audit.json");
+        std::fs::write(&envelope,serde_json::to_vec(&json!({"schema":"qbit.prism.audit-body-ref.v1","audit_bundle_sha256":own,"share_count":1,"bundle_without_shares":without,"share_parts":[{"kind":"segment","first_share_seq":1,"last_share_seq":1,"share_count":1,"sha256":hex::encode(Sha256::digest(&segment)),"body_uri":format!("file://{}",segment_path.display())}]}))?)?;
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle_sha256,body_uri,coinbase_tx_hex) VALUES($1,$2,$3,'00')")
+            .bind(&segmented).bind(&own).bind(format!("file://{}",envelope.display())).execute(&f.pool).await?;
+        let(status,headers,served)=raw_get(&app,&format!("/public/v1/artifacts/{own}")).await;
+        ensure!(status==StatusCode::OK&&serde_json::from_slice::<Value>(&served)?==serde_json::to_value(&other)?&&headers["x-prism-artifact-canonical-state"]=="missing","file:// segment: {status}: {headers:?}");
+        ensure!(logs.drain()?.is_empty(),"file:// segment: the legacy body reader logged");
         // So are a body that is not JSON, one that is not the advertised
         // body, and one that cannot be read. The link check serves none of
-        // these 500s, so it logs at debug only.
+        // these 500s, so it logs no fault.
         std::fs::write(&file,b"not json")?;
         fault("not JSON",get(&app,&path).await)?;
         audit_view("not JSON","audit bundle body is not valid JSON").await?;
         logged("not JSON",&[("WARN",FAULT,Some("audit bundle body is not valid JSON"))])?;
         unlinked("not JSON").await?;
-        logged("not JSON, link check",&[("DEBUG",FAULT,Some("audit bundle body is not valid JSON"))])?;
+        logged("not JSON, link check",&[])?;
         std::fs::write(&file,b"{\"schema\":\"historical\",\"legacy\":false}")?;
         fault("another body",get(&app,&path).await)?;
         audit_view("another body","audit bundle body hash mismatch").await?;
@@ -690,6 +702,15 @@ async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_5
         audit_view("unreadable body","audit bundle body is not retrievable").await?;
         logged("unreadable body",&[("WARN",FAULT,Some("audit bundle body is not retrievable"))])?;
         std::fs::remove_dir(&file)?;
+        // So is a body recorded under a scheme this server does not read: no
+        // wait makes it retrievable here.
+        let elsewhere="s3://audits/legacy-audit.json";
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET body_uri=$2 WHERE block_hash=$1").bind(&legacy).bind(elsewhere).execute(&f.pool).await?;
+        fault("another scheme",get(&app,&path).await)?;
+        audit_view("another scheme","audit bundle body is not retrievable").await?;
+        let events=logs.drain()?;
+        ensure!(events.len()==1&&events[0].0=="WARN"&&events[0].1["message"]==FAULT&&events[0].1["error"]=="unsupported body URI scheme"&&events[0].1["body_uri"]==elsewhere,"another scheme: logged {events:?}");
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET body_uri=$2 WHERE block_hash=$1").bind(&legacy).bind(&uri).execute(&f.pool).await?;
         // Once the body arrives, the same address serves it at once.
         std::fs::write(&file,body)?;
         let(status,headers,served)=raw_get(&app,&path).await;
@@ -702,7 +723,55 @@ async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_5
         // Only the faults count toward the 5xx alert.
         let(_,_,metrics)=raw_get(&app,"/metrics").await;
         let metrics=String::from_utf8(metrics)?;
-        ensure!(metrics.contains("qbit_prism_public_responses_total{status=\"404\"} 3\n")&&metrics.contains("qbit_prism_public_responses_total{status=\"500\"} 6\n"),"metrics: {metrics}");
+        ensure!(metrics.contains("qbit_prism_public_responses_total{status=\"404\"} 3\n")&&metrics.contains("qbit_prism_public_responses_total{status=\"500\"} 7\n"),"metrics: {metrics}");
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    f.close(result).await
+}
+
+/// #735: `/public/v1/artifacts/<sha>` finds an audit row by its address and
+/// then reads its legacy body by block. A row re-imported between the two
+/// reads answers another address, so its body is not served under the old
+/// one, which answers the unknown-artifact 404.
+#[tokio::test]
+async fn an_audit_reimported_between_lookup_and_read_is_not_served_under_its_old_address(
+) -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result=async {
+        let block=f.block(1,101,"confirmed",chrono::Utc::now().timestamp()-10).await?;
+        let old=hex::encode(Sha256::digest(b"the body first advertised"));
+        let body=b"{\"schema\":\"historical\",\"reimported\":true}";
+        let new=hex::encode(Sha256::digest(body));
+        let dir=tempfile::tempdir()?;
+        let file=dir.path().join("legacy-audit.json");
+        std::fs::write(&file,body)?;
+        sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle_sha256,body_uri,coinbase_tx_hex) VALUES($1,$2,$3,'00')")
+            .bind(&block).bind(&old).bind(format!("file://{}",file.display())).execute(&f.pool).await?;
+        // Uncached, with a read deadline the interleaving cannot reach.
+        let app=api::router(ApiState::new(f.pool.clone(),ApiConfig{rpc_url:f.rpc.clone(),cache_enabled:false,read_timeout:Duration::from_secs(30),..Default::default()},Arc::new(qbit_prism_server::metrics::Metrics::default())));
+        // The lookup reads only the audit table and the body read joins the
+        // blocks table, so holding that table stops the request between them.
+        // `pg_stat_activity` keeps only a query's first kilobyte, so the body
+        // read is recognised by its opening projection.
+        let mut lock=f.pool.begin().await?;
+        sqlx::query("LOCK TABLE qbit_pool_blocks IN ACCESS EXCLUSIVE MODE").execute(&mut*lock).await?;
+        let request=tokio::spawn({let app=app.clone();let path=format!("/public/v1/artifacts/{old}");async move{get(&app,&path).await}});
+        tokio::time::timeout(Duration::from_secs(10),async{
+            loop {
+                let waiting:i64=sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%bundle.block_hash%'").fetch_one(&f.pool).await?;
+                if waiting>0 {return Ok::<_,anyhow::Error>(());}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.map_err(|_|anyhow::anyhow!("the body read never waited on the blocks table"))??;
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET audit_bundle_sha256=$2 WHERE block_hash=$1").bind(&block).bind(&new).execute(&mut*lock).await?;
+        lock.commit().await?;
+        let(status,headers,error)=request.await?;
+        ensure!(status==StatusCode::NOT_FOUND&&error["error"]["code"]=="not_found"&&error["error"]["message"]=="unknown public PRISM artifact"&&headers["cache-control"]=="no-store","old address after the re-import: {status}: {error}");
+        // The re-imported row answers its own address.
+        let(status,_,served)=get(&app,&format!("/public/v1/artifacts/{new}")).await;
+        ensure!(status==StatusCode::OK&&served==serde_json::from_slice::<Value>(body)?,"new address: {status}: {served}");
         Ok::<_,anyhow::Error>(())
     }.await;
     f.close(result).await

@@ -421,8 +421,8 @@ closed. The database row remains the visibility authority: an artifact whose
 row has not replayed returns a non-cacheable `404`. So does a legacy row whose
 body, or a share segment its envelope names, is not on the serving host yet,
 with the message `audit bundle body is not retrievable`, until the migration
-stores its canonical bytes; a body that is there but cannot be read or verified
-answers `500`. A row or block that goes away between lookup and read answers
+stores its canonical bytes; a body that is there but cannot be read or verified,
+or one recorded under a URI scheme other than `file://`, answers `500`. A row or block that goes away between lookup and read answers
 `404` with `unknown PRISM block`. Immutable artifacts remain exempt from
 ordinary replica freshness refusals.
 
