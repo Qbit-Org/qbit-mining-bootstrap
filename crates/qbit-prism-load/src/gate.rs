@@ -29,6 +29,9 @@ pub struct Budgets {
     pub max_unanswered_submits: Option<u64>,
     /// `None` reports the tip times without gating on them.
     pub tip_last_notify_p99_ms: Option<f64>,
+    /// The same per-tip figure's median over the tips (#790); `None` does
+    /// not gate on it.
+    pub tip_last_notify_median_ms: Option<f64>,
     /// Print #473's D1 verdict table for `steady_state` and `burst`.
     pub d1_verdict_table: bool,
     /// The churn phase's tip delivery, over the sessions connected at each
@@ -47,6 +50,7 @@ impl From<&crate::preset::Gates> for Budgets {
             max_rejected_valid_shares: gates.max_rejected_valid_shares,
             max_unanswered_submits: gates.max_unanswered_submits,
             tip_last_notify_p99_ms: gates.tip_last_notify_p99_budget_ms,
+            tip_last_notify_median_ms: gates.tip_last_notify_median_budget_ms,
             d1_verdict_table: gates.d1_verdict_table,
             churn_tip_last_notify_p99_ms: gates.churn_tip_last_notify_p99_budget_ms,
             new_session_first_job_p99_ms: gates.new_session_first_job_p99_budget_ms,
@@ -120,6 +124,104 @@ pub fn tip_last_notify(report: &Value) -> Result<Vec<f64>, String> {
     } else {
         Err(missing.join("; "))
     }
+}
+
+/// Where each tip's time went, one line per tip, for a failed run's output
+/// (#790): the CI run directory is not kept, so a slow tip has to be read
+/// from what the test prints. In order: the node's tip stamp, the peer's
+/// mint and the pool node's sighting of it (real-node mode), the first,
+/// median and slowest session's first usable job, each frontend's share of
+/// the sessions, and when the next tip replaced it. Then the node's RPC
+/// latencies, which bound how long a template fetch took.
+pub fn tip_timeline(report: &Value) -> String {
+    let ms = |value: &Value| {
+        value
+            .as_f64()
+            .map_or("n/a".into(), |v| format!("{v:.0} ms"))
+    };
+    let mut out = String::from("--- per-tip timeline (ms after the node's tip stamp) ---\n");
+    let Some(tips) = report["time_to_usable_work"]["tips"].as_array() else {
+        out.push_str("the report has no time_to_usable_work.tips\n");
+        return out;
+    };
+    let slowest = tip_last_notify(report)
+        .ok()
+        .and_then(|times| {
+            times
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+        })
+        .map(|(index, _)| index);
+    let mints = report["node"]["mints"].as_array();
+    for (index, tip) in tips.iter().enumerate() {
+        let hash = tip["tip"].as_str().unwrap_or("?");
+        let latency = &tip["latency_milliseconds"];
+        out.push_str(&format!(
+            "tip {index}{}: height {} ({}) {hash}, stamped {}\n",
+            if slowest == Some(index) {
+                " (slowest)"
+            } else {
+                ""
+            },
+            tip["height"],
+            tip["origin"].as_str().unwrap_or("?"),
+            tip["minted_at"].as_str().unwrap_or("?"),
+        ));
+        if let Some(mint) = mints.and_then(|mints| mints.iter().find(|m| m["hash"] == hash)) {
+            out.push_str(&format!(
+                "  mint: requested {}, took {}, seen on the pool node {} after it\n",
+                mint["requested_at"].as_str().unwrap_or("?"),
+                ms(&mint["mint_milliseconds"]),
+                ms(&mint["seen_on_pool_node_milliseconds"]),
+            ));
+        }
+        out.push_str(&format!(
+            "  first usable job: first session {}, median {}, slowest {}; {} of {} sessions\n",
+            ms(&latency["min"]),
+            ms(&latency["p50"]),
+            match tip["all_sessions_milliseconds"].as_f64() {
+                Some(_) => ms(&tip["all_sessions_milliseconds"]),
+                None => format!(
+                    "unmeasured ({})",
+                    tip["all_sessions_unavailable_reason"]
+                        .as_str()
+                        .unwrap_or("no figure")
+                ),
+            },
+            tip["sessions_with_work"],
+            tip["sessions_total"],
+        ));
+        for frontend in tip["by_frontend"].as_array().into_iter().flatten() {
+            let latency = &frontend["latency_milliseconds"];
+            out.push_str(&format!(
+                "  frontend {}: {} sessions, first {}, median {}, slowest {}\n",
+                frontend["frontend"],
+                latency["samples"],
+                ms(&latency["min"]),
+                ms(&latency["p50"]),
+                ms(&latency["max"]),
+            ));
+        }
+        out.push_str(&format!(
+            "  replaced by the next tip: {}\n",
+            match tip["replaced_after_milliseconds"].as_f64() {
+                Some(_) => format!("after {}", ms(&tip["replaced_after_milliseconds"])),
+                None => "never".into(),
+            }
+        ));
+    }
+    if let Some(rpc) = report["node"]["relay"]["rpc_latency_milliseconds"].as_object() {
+        out.push_str("node RPC latency over the run (count, p50 / p99 / max ms):\n");
+        for (method, latency) in rpc {
+            out.push_str(&format!(
+                "  {method}: {}, {} / {} / {}\n",
+                latency["count"], latency["p50"], latency["p99"], latency["max"]
+            ));
+        }
+    }
+    out
 }
 
 /// One phase's figures for #473's rule; `None` where the report has none.
@@ -366,37 +468,25 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
             ),
         ));
     }
-    let name = "tip to last session's notify, p99 over tips";
-    let budget = budgets
-        .tip_last_notify_p99_ms
-        .map_or("not gated".into(), |ms| format!("<= {ms} ms"));
-    match (tip_last_notify(report), budgets.tip_last_notify_p99_ms) {
-        (Ok(times), limit) => {
-            let p99 = nearest_rank(&times, 0.99);
-            let observed = p99.map_or("no tips".into(), |p| {
-                format!(
-                    "{p:.0} ms over {} tips (max {:.0} ms)",
-                    times.len(),
-                    max(&times)
-                )
-            });
-            match limit {
-                Some(limit) => checks.push(Check::gate(
-                    name,
-                    observed,
-                    budget,
-                    p99.is_some_and(|p| p <= limit),
-                )),
-                None => checks.push(Check::info(name, observed)),
-            }
-        }
-        (Err(reason), Some(_)) => checks.push(Check::gate(
-            name,
-            format!("unmeasured: {reason}"),
-            budget,
-            false,
-        )),
-        (Err(reason), None) => checks.push(Check::info(name, format!("unmeasured: {reason}"))),
+    let tips = tip_last_notify(report);
+    tip_last_notify_check(
+        &mut checks,
+        "tip to last session's notify, p99 over tips",
+        0.99,
+        &tips,
+        budgets.tip_last_notify_p99_ms,
+    );
+    // The p99 of a few tips is their slowest (#790). A preset with few tips
+    // can also hold their median to a budget, which one slow tip cannot fail
+    // and a frontend slow on most tips does. Reported only where gated.
+    if budgets.tip_last_notify_median_ms.is_some() {
+        tip_last_notify_check(
+            &mut checks,
+            "tip to last session's notify, median over tips",
+            0.5,
+            &tips,
+            budgets.tip_last_notify_median_ms,
+        );
     }
     churn_checks(report, budgets, &mut checks);
     let population = &report["population"];
@@ -436,6 +526,39 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         ));
     }
     checks
+}
+
+/// One row over every tip's slowest-session time: the `quantile`'s nearest
+/// rank, gated against `limit` or reported. A tip some session never got
+/// work on leaves the figure unmeasured, which fails a gated row.
+fn tip_last_notify_check(
+    checks: &mut Vec<Check>,
+    name: &str,
+    quantile: f64,
+    tips: &Result<Vec<f64>, String>,
+    limit: Option<f64>,
+) {
+    let budget = limit.map_or("not gated".into(), |ms| format!("<= {ms} ms"));
+    let (observed, figure) = match tips {
+        Ok(times) => {
+            let figure = nearest_rank(times, quantile);
+            (
+                figure.map_or("no tips".into(), |f| {
+                    format!(
+                        "{f:.0} ms over {} tips (max {:.0} ms)",
+                        times.len(),
+                        max(times)
+                    )
+                }),
+                figure,
+            )
+        }
+        Err(reason) => (format!("unmeasured: {reason}"), None),
+    };
+    checks.push(match limit {
+        Some(limit) => Check::gate(name, observed, budget, figure.is_some_and(|f| f <= limit)),
+        None => Check::info(name, observed),
+    });
 }
 
 /// Every churn tip's slowest served session among those connected at the
