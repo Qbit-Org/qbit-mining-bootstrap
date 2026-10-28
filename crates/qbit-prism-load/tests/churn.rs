@@ -344,6 +344,7 @@ fn the_gate_holds_churn_tips_and_first_jobs_and_fails_what_it_cannot_measure() {
         max_rejected_valid_shares: None,
         max_unanswered_submits: None,
         tip_last_notify_p99_ms: None,
+        tip_last_notify_median_ms: None,
         d1_verdict_table: false,
         churn_tip_last_notify_p99_ms: Some(3000.0),
         new_session_first_job_p99_ms: Some(10_000.0),

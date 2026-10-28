@@ -298,6 +298,52 @@ fn post_ramp_node_logs(logs: &std::path::Path) -> String {
     text
 }
 
+/// Each frontend's logs at the end of the run (#790): every warning and
+/// error line, then the last 200 lines, so a slow tip's stall can be read
+/// against the per-tip timeline's stamps.
+fn frontend_log_tails(report: &Value) -> String {
+    let mut text = String::new();
+    for frontend in report["frontend_environment"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for key in ["stderr_log", "stdout_log"] {
+            let Some(path) = frontend[key].as_str() else {
+                continue;
+            };
+            let log = match std::fs::read(path) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => {
+                    text.push_str(&format!("--- {path} could not be read: {error} ---\n"));
+                    continue;
+                }
+            };
+            let lines: Vec<&str> = log.lines().collect();
+            let flagged: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| line.contains("WARN") || line.contains("ERROR"))
+                .collect();
+            text.push_str(&format!(
+                "--- {path}: {} lines, {} warnings or errors (the last 200 of those) ---\n",
+                lines.len(),
+                flagged.len()
+            ));
+            for line in &flagged[flagged.len().saturating_sub(200)..] {
+                text.push_str(line);
+                text.push('\n');
+            }
+            text.push_str(&format!("--- {path}: the last 200 lines ---\n"));
+            for line in &lines[lines.len().saturating_sub(200)..] {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    text
+}
+
 /// The per-PR real-node smoke run (#547): the `real-node-smoke` preset
 /// against a managed regtest qbitd pair ramped to the fake node's
 /// difficulty. The harness has to exit 0 -- every share reconciled against
@@ -358,11 +404,14 @@ async fn real_node_smoke_reconciles_against_postgres_and_the_chain() -> Result<(
     );
     if !gate::passed(&checks) {
         // The run directory goes with the test, and CI keeps only this
-        // output: what the nodes said has to be printed to be seen.
+        // output: what the nodes and the frontends said, and where each
+        // tip's time went (#790), have to be printed to be seen.
         eprintln!(
-            "chain reconciliation: {:#}\n{}",
+            "chain reconciliation: {:#}\n{}{}\n{}",
             node["chain_reconciliation"],
-            post_ramp_node_logs(&out.path.join("logs"))
+            post_ramp_node_logs(&out.path.join("logs")),
+            gate::tip_timeline(&report),
+            frontend_log_tails(&report)
         );
     }
     assert!(gate::passed(&checks), "{table}");
