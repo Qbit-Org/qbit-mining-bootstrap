@@ -203,6 +203,18 @@ pub fn expected(populated: bool) -> Census {
         &labels("outcome", "confirmed,absent,lagging,failed"),
         &[],
     );
+    let revision_races: Vec<_> = ["landing", "settlement"]
+        .into_iter()
+        .flat_map(|phase| {
+            ["retried", "spent"].map(|outcome| format!("phase=\"{phase}\",outcome=\"{outcome}\""))
+        })
+        .collect();
+    result.family(
+        "post_offer_revision_races_total",
+        "counter",
+        &revision_races,
+        &[],
+    );
     result.family(
         "job_preparation_deferrals_total",
         "counter",

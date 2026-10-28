@@ -101,6 +101,7 @@ families! {
     ConnectionLimit: Gauge, "stratum_connection_limit", "Configured global Stratum connection limit, not currently available permits; -1 before a listener starts.";
     StaleJobRejections: Counter, "stale_job_rejections_total", "Stale-job share rejections by the internal decision that refused them.";
     CandidatesOrphaned: Counter, "block_candidates_orphaned_total", "Offered block candidates this instance settled as proven orphans since process start.";
+    PostOfferRevisionRaces: Counter, "post_offer_revision_races_total", "Post-offer writes this instance had refused by a payout revision that moved after their observation (#630), by write phase and by whether the write was retried in place or its retry budget was spent.";
     WindowAcquisitions: Counter, "refresh_window_acquisitions_total", "Refresh payout-window snapshots by acquisition outcome: advanced by the delta path, or the reason the full scan ran.";
     RefreshSeconds: Histogram, "refresh_seconds", "Template refresh from entry to published work, in seconds, by what triggered the rebuild and how its window was acquired.";
     CaptureOfferDecisions: Counter, "capture_offer_decisions_total", "Offer decisions this instance made for pending blocks on the current tip whose payout revision was superseded (#478 block capture), by decision.";

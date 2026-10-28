@@ -694,6 +694,18 @@ async fn append_preserves_old_rejected_share_ids() -> Result<()> {
         for cell in [8, 24] {
             db.set_next_seq(cell * width + 10).await?;
             partitions::ensure(db.pool()).await?;
+            // The jump leaves every own share below the probe floor, so the
+            // first append after it finds none between the bounds and the
+            // ledger clock looks for the newest one in every partition, once
+            // (#738); appends move the sequence only past their own shares.
+            // That append goes first, unobserved, so the check below sees an
+            // append in the steady state.
+            sqlx::raw_sql("ALTER TABLE qbit_share_ledger DISABLE TRIGGER check_append_partition_scans")
+                .execute(db.pool()).await?;
+            ensure!(db.ledger.append(share(u64::try_from(cell)? + 1000, "alice"), None).await?.inserted,
+                "the first share after the jump to partition {cell} was refused");
+            sqlx::raw_sql("ALTER TABLE qbit_share_ledger ENABLE TRIGGER check_append_partition_scans")
+                .execute(db.pool()).await?;
             // Flush setup's pending backend-local scan counters on every
             // pool connection before the trigger observes the append.
             let mut connections = Vec::new();

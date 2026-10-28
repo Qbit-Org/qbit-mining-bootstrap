@@ -7,7 +7,9 @@ use crate::{
         HeartbeatHealth, Ledger, OfferOutcome, OfferReservation, RecoveryClaim, SignerKeys,
         Snapshot, Window, WindowError, WindowRef, ORPHANED_STATE,
     },
-    metrics::{RefreshAcquisition, RefreshTrigger},
+    metrics::{
+        Metrics, RefreshAcquisition, RefreshTrigger, RevisionRaceOutcome, RevisionRacePhase,
+    },
     rpc::Rpc,
     stratum::{MiningBackend, MiningJob, StaleGrace, StratumError, Worker},
     waiting::{self, on_database, Dependency, Waiting},
@@ -536,6 +538,385 @@ const CANDIDATE_LEASE: CandidateLease = CandidateLease {
     timeout: Duration::from_secs(5),
     rebuild_deadline: Duration::from_secs(60),
 };
+
+/// How many times one post-offer write phase writes again after a
+/// payout-revision race, and how long after its first lost race it may still
+/// start one (#630). See [`RevisionRetry`].
+const REVISION_RACE_RETRIES: u32 = 3;
+const REVISION_RACE_DEADLINE: Duration = Duration::from_secs(60);
+/// The first retry waits about this long, jittered by ±50%, and each later
+/// one twice the one before, so a retry does not land between two bumps of
+/// one sibling refresh (its tip record, then the confirmation).
+const REVISION_RACE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// The retry budget of one post-offer write phase (#630): the landing, or
+/// the settlement (the finish as `submitted` or the settlement as
+/// `orphaned`). Each has its own, so races the landing lost leave the
+/// settlement's retries and deadline untouched.
+///
+/// Each of those writes is fenced on the payout revision its own observation
+/// returned. A sibling frontend that records a tip or confirms a block
+/// between that observation and the write moves the revision, and the write
+/// is refused with
+/// [`ObservedRevisionChanged`](crate::ledger::ObservedRevisionChanged)
+/// before it writes anything. That refusal alone is a lost race, not a
+/// failure: after a short jittered backoff the caller observes again and
+/// writes once more at the new revision, at most [`REVISION_RACE_RETRIES`]
+/// times per phase and never starting a retry [`REVISION_RACE_DEADLINE`] or
+/// more after the phase's first lost race. The deadline starts there, not at
+/// the phase's start: the rebuild before the first write waits for build
+/// capacity and can take most of a minute under the same load that makes the
+/// race likely. A started write is not cancelled at the deadline, so its
+/// outcome stays known; the node's RPC timeout and the database's statement
+/// timeout bound it. Any other error, and a race that outlasts the budget, is
+/// returned for the caller's ordinary settlement in reconciliation, with its
+/// `ALERT`. Every retry and every spent budget is counted in
+/// `qbit_prism_post_offer_revision_races_total`.
+#[derive(Default)]
+struct RevisionRetry {
+    /// Set at the first lost race.
+    deadline: Option<tokio::time::Instant>,
+    retries: u32,
+}
+
+impl RevisionRetry {
+    /// `Ok(())` once the backoff has passed when `error` was a lost revision
+    /// race within the budget, and the caller writes again after a fresh
+    /// observation; otherwise the error, for the caller to settle. The
+    /// deadline is checked again once the backoff has passed: the backoff is
+    /// clipped to the time left, and the runtime may wake late, so a race lost
+    /// just before the deadline starts no retry at or after it.
+    async fn again(
+        &mut self,
+        block: &str,
+        phase: RevisionRacePhase,
+        metrics: &Metrics,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        let Some(race) = error.downcast_ref::<crate::ledger::ObservedRevisionChanged>() else {
+            return Err(error);
+        };
+        let (expected, current) = (race.expected, race.current);
+        let now = tokio::time::Instant::now();
+        let deadline = *self.deadline.get_or_insert(now + REVISION_RACE_DEADLINE);
+        if self.retries >= REVISION_RACE_RETRIES {
+            return Err(Self::spent(
+                phase,
+                metrics,
+                error,
+                format!("all {REVISION_RACE_RETRIES} of its retries are used"),
+            ));
+        }
+        if now < deadline {
+            let jitter = {
+                use rand::Rng;
+                rand::thread_rng().gen_range(0.5..1.5)
+            };
+            let backoff = (REVISION_RACE_BACKOFF * (1 << self.retries))
+                .mul_f64(jitter)
+                .min(deadline.saturating_duration_since(now));
+            tokio::time::sleep(backoff).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let reason = format!(
+                "its {} s retry deadline from the first lost race has passed, after {} of at most {REVISION_RACE_RETRIES} retries",
+                REVISION_RACE_DEADLINE.as_secs(),
+                self.retries
+            );
+            return Err(Self::spent(phase, metrics, error, reason));
+        }
+        self.retries += 1;
+        metrics.record_post_offer_revision_race(phase, RevisionRaceOutcome::Retried);
+        tracing::info!(
+            %block,
+            phase = phase.as_str(),
+            observed_revision = expected,
+            current_revision = current,
+            retry = self.retries,
+            backoff_ms = now.elapsed().as_millis() as u64,
+            "post-offer write lost a payout revision race; observing again and writing at the new revision"
+        );
+        Ok(())
+    }
+
+    /// The refusal of a race this phase's budget does not retry, with why.
+    fn spent(
+        phase: RevisionRacePhase,
+        metrics: &Metrics,
+        error: anyhow::Error,
+        reason: String,
+    ) -> anyhow::Error {
+        metrics.record_post_offer_revision_race(phase, RevisionRaceOutcome::Spent);
+        error.context(format!(
+            "the post-offer {} lost a payout revision race and is not retried again: {reason}",
+            phase.as_str()
+        ))
+    }
+}
+
+/// Run one post-offer write phase through its payout-revision races (#630),
+/// with that phase's own [`RevisionRetry`] budget. `attempt` observes and
+/// writes once; it is told how many retries came before it. Its outer error
+/// (an observation that failed, or any stop that is not the write's
+/// refusal) is returned at once and never retried. Its inner error is the
+/// write's refusal: a lost race is retried within the budget, and anything
+/// else, or a race past the budget, is returned as the inner error. The
+/// caller applies every effect of the write after this returns, so nothing is
+/// done for a write that did not commit.
+async fn through_revision_races<T, F>(
+    block: &str,
+    phase: RevisionRacePhase,
+    metrics: &Metrics,
+    mut attempt: impl FnMut(u32) -> F,
+) -> Result<Result<T>>
+where
+    F: std::future::Future<Output = Result<Result<T>>>,
+{
+    let mut retry = RevisionRetry::default();
+    loop {
+        let refusal = match attempt(retry.retries).await? {
+            Ok(written) => return Ok(Ok(written)),
+            Err(refusal) => refusal,
+        };
+        if let Err(refusal) = retry.again(block, phase, metrics, refusal).await {
+            return Ok(Err(refusal));
+        }
+    }
+}
+
+#[cfg(test)]
+mod revision_retry_tests {
+    use super::*;
+    use crate::ledger::ObservedRevisionChanged;
+
+    const RACE: &str = "payout revision changed while observing chain state";
+
+    fn race() -> anyhow::Error {
+        anyhow::Error::from(ObservedRevisionChanged {
+            expected: 7,
+            current: 8,
+        })
+        .context("landing the candidate")
+    }
+
+    fn counted(metrics: &Metrics, phase: &str, outcome: &str) -> String {
+        let series = format!(
+            "qbit_prism_post_offer_revision_races_total{{phase=\"{phase}\",outcome=\"{outcome}\"}} "
+        );
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| panic!("no {series}sample"))
+    }
+
+    /// #630: only the typed fence refusal is a race, found under the context
+    /// its callers add; an untyped error with the same words is a failure and
+    /// is returned unchanged. A race is retried `REVISION_RACE_RETRIES` times
+    /// per phase, each after a jittered backoff that doubles, and the next
+    /// one is returned with the spent budget named and still typed, so its
+    /// reason still ends with the fence's message. Each retry and the spent
+    /// budget are counted under the phase.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_typed_race_is_retried_and_only_within_the_attempt_budget() {
+        let metrics = Metrics::default();
+        let mut retry = RevisionRetry::default();
+        let untyped = retry
+            .again(
+                "block",
+                RevisionRacePhase::Settlement,
+                &metrics,
+                anyhow::anyhow!(RACE),
+            )
+            .await
+            .expect_err("an untyped error was retried");
+        assert_eq!(format!("{untyped:#}"), RACE);
+        for retried in 0..REVISION_RACE_RETRIES {
+            let started = tokio::time::Instant::now();
+            retry
+                .again("block", RevisionRacePhase::Settlement, &metrics, race())
+                .await
+                .expect("a race within the budget was not retried");
+            let base = REVISION_RACE_BACKOFF * (1 << retried);
+            let waited = started.elapsed();
+            assert!(
+                waited >= base / 2 && waited <= base * 3 / 2,
+                "retry {retried} waited {waited:?}, outside {base:?} ±50%"
+            );
+        }
+        let spent = retry
+            .again("block", RevisionRacePhase::Settlement, &metrics, race())
+            .await
+            .expect_err("a race past the budget was retried");
+        let reason = format!("{spent:#}");
+        assert!(
+            reason.starts_with("the post-offer settlement lost a payout revision race and is not retried again: all 3 of its retries are used")
+                && reason.ends_with(RACE),
+            "{reason}"
+        );
+        assert!(spent.downcast_ref::<ObservedRevisionChanged>().is_some());
+        assert_eq!(counted(&metrics, "settlement", "retried"), "3");
+        assert_eq!(counted(&metrics, "settlement", "spent"), "1");
+        assert_eq!(counted(&metrics, "landing", "retried"), "0");
+    }
+
+    /// The phase's deadline runs from its first lost race, as the phase
+    /// drives it: an attempt that takes longer than the deadline before its
+    /// first refusal (a slow verification, or a write waiting on the
+    /// settlement lock) is still retried, and once the deadline from that
+    /// first refusal has passed no retry starts, with retries left. A budget
+    /// whose clock started anywhere earlier, such as when the phase began,
+    /// fails the first half.
+    #[tokio::test(start_paused = true)]
+    async fn the_phase_deadline_runs_from_its_first_lost_race() {
+        let metrics = Metrics::default();
+        let attempts = std::cell::Cell::new(0);
+        let written =
+            through_revision_races("block", RevisionRacePhase::Landing, &metrics, |retries| {
+                attempts.set(attempts.get() + 1);
+                async move {
+                    Ok(if retries == 0 {
+                        tokio::time::advance(REVISION_RACE_DEADLINE * 2).await;
+                        Err(race())
+                    } else {
+                        Ok(retries)
+                    })
+                }
+            })
+            .await
+            .expect("the attempt failed")
+            .expect("a first race after a slow attempt was not retried");
+        assert_eq!((written, attempts.get()), (1, 2));
+
+        let first_refusal = std::cell::Cell::new(None);
+        let refused =
+            through_revision_races("block", RevisionRacePhase::Landing, &metrics, |retries| {
+                if retries == 0 {
+                    first_refusal.set(Some(tokio::time::Instant::now()));
+                }
+                async move {
+                    if retries > 0 {
+                        tokio::time::advance(REVISION_RACE_DEADLINE / 2).await;
+                    }
+                    Ok::<Result<()>, anyhow::Error>(Err(race()))
+                }
+            })
+            .await
+            .expect("the attempt failed")
+            .expect_err("a race past the deadline was retried");
+        let reason = format!("{refused:#}");
+        assert!(
+            reason.contains("is not retried again: its 60 s retry deadline from the first lost race has passed, after 2 of at most 3 retries"),
+            "{reason}"
+        );
+        assert!(first_refusal.get().unwrap().elapsed() >= REVISION_RACE_DEADLINE);
+        assert_eq!(counted(&metrics, "landing", "retried"), "3");
+        assert_eq!(counted(&metrics, "landing", "spent"), "1");
+    }
+
+    /// A race lost just before the deadline, with retries left, starts no
+    /// retry: its backoff is clipped to the time left and ends at the
+    /// deadline, and the deadline is checked again then (Codex P2 on #798).
+    #[tokio::test(start_paused = true)]
+    async fn a_race_lost_just_before_the_deadline_starts_no_retry() {
+        let metrics = Metrics::default();
+        let attempts = std::cell::Cell::new(0);
+        let first_refusal = std::cell::Cell::new(None);
+        let refused = through_revision_races(
+            "block",
+            RevisionRacePhase::Settlement,
+            &metrics,
+            |retries| {
+                attempts.set(attempts.get() + 1);
+                let now = tokio::time::Instant::now();
+                let first = *first_refusal.get().get_or_insert(now);
+                first_refusal.set(Some(first));
+                async move {
+                    if retries > 0 {
+                        let just_before = first + REVISION_RACE_DEADLINE - Duration::from_millis(1);
+                        tokio::time::advance(just_before.saturating_duration_since(now)).await;
+                    }
+                    Ok::<Result<()>, anyhow::Error>(Err(race()))
+                }
+            },
+        )
+        .await
+        .expect("the attempt failed")
+        .expect_err("a race past the deadline was retried");
+        let reason = format!("{refused:#}");
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a retry started at the deadline: {reason}"
+        );
+        assert!(
+            reason.contains("is not retried again: its 60 s retry deadline from the first lost race has passed, after 1 of at most 3 retries"),
+            "{reason}"
+        );
+        assert_eq!(counted(&metrics, "settlement", "retried"), "1");
+        assert_eq!(counted(&metrics, "settlement", "spent"), "1");
+    }
+
+    /// An attempt's outer error is returned at once, and a refusal that is
+    /// not a race comes back as the inner error, unchanged and not retried.
+    #[tokio::test(start_paused = true)]
+    async fn the_phase_retries_nothing_but_a_lost_race() {
+        let metrics = Metrics::default();
+        let attempts = std::cell::Cell::new(0);
+        let failed =
+            through_revision_races("block", RevisionRacePhase::Settlement, &metrics, |_| {
+                attempts.set(attempts.get() + 1);
+                async { Err::<Result<()>, _>(anyhow::anyhow!("the node did not answer")) }
+            })
+            .await
+            .expect_err("an outer error was not returned");
+        assert_eq!(
+            (format!("{failed:#}").as_str(), attempts.get()),
+            ("the node did not answer", 1)
+        );
+        let refused =
+            through_revision_races("block", RevisionRacePhase::Settlement, &metrics, |_| {
+                attempts.set(attempts.get() + 1);
+                async {
+                    Ok::<Result<()>, anyhow::Error>(Err(anyhow::anyhow!("its block is confirmed")))
+                }
+            })
+            .await
+            .expect("a refusal became an outer error")
+            .expect_err("a refusal was written");
+        assert_eq!(
+            (format!("{refused:#}").as_str(), attempts.get()),
+            ("its block is confirmed", 2)
+        );
+        assert_eq!(counted(&metrics, "settlement", "retried"), "0");
+        assert_eq!(counted(&metrics, "settlement", "spent"), "0");
+    }
+}
+
+/// What [`Coordinator::land_offered`] did with an offered block's audit.
+enum Landing {
+    /// The audit is durable.
+    Landed,
+    /// The landing was refused, with the reason the caller settles the row
+    /// with.
+    Refused(String),
+    /// A landing retried after a lost payout-revision race (#630) found the
+    /// block no longer active, with this tip: nothing landed, and the row
+    /// awaits reconciliation like any block not active after its offer.
+    LeftActiveChain(String),
+}
+
+/// What the settlement phase after a landing wrote, applied by its caller
+/// once the write has committed.
+enum Settled {
+    /// Finished `submitted`; whether this commit was the block's first
+    /// confirmation.
+    Finished(bool),
+    /// Settled `orphaned`, with the chain's evidence.
+    Orphaned(String),
+    /// Neither: the block is not active and no orphan is proven yet.
+    NotActive,
+}
 
 /// Why a claim's window read or rebuild did not produce parts. Every variant
 /// is recoverable and none abandons a candidate: after the offer the attempt
@@ -2458,27 +2839,48 @@ impl Coordinator {
                 .await?;
         }
         // The normal post-offer landing, refusals and all.
-        if let Err(reason) = self.land_offered(claim, lease).await? {
-            return Err(RecoveryStop::Refused(reason).into());
+        match self.land_offered(claim, lease).await? {
+            Landing::Landed => {}
+            Landing::Refused(reason) => return Err(RecoveryStop::Refused(reason).into()),
+            Landing::LeftActiveChain(tip) => {
+                return Err(RecoveryStop::NotActive(format!(
+                    "the node's active chain (tip {tip}) stopped holding {block} at height {height} while its landing retried a lost payout revision race; nothing landed and the row awaits reconciliation"
+                ))
+                .into())
+            }
         }
         // Finished only on active-chain evidence observed now, at a revision
-        // proven now, exactly as the post-offer phase finishes.
-        let CandidateObservation {
-            active,
-            revision,
-            tip,
-            ..
-        } = self.observe_candidate(claim).await?;
-        if !active {
-            return Err(RecoveryStop::NotActive(format!(
-                "after the landing the node's active chain (tip {tip}) no longer holds {block} at height {height}; the audit is durable and the row awaits reconciliation"
-            ))
-            .into());
-        }
-        self.ledger
-            .finish_candidate_at_revision(claim, true, None, revision)
-            .await?;
-        self.blocks.fetch_add(1, Ordering::Relaxed);
+        // proven now, exactly as the post-offer phase finishes, a lost
+        // revision race included (#630). The block is counted only when this
+        // commit was its first confirmation: a sibling may have confirmed it
+        // first.
+        let first_confirmation = through_revision_races(
+            block,
+            RevisionRacePhase::Settlement,
+            &self.metrics,
+            |_| async move {
+                let CandidateObservation {
+                    active,
+                    revision,
+                    tip,
+                    ..
+                } = self.observe_candidate(claim).await?;
+                if !active {
+                    return Err(RecoveryStop::NotActive(format!(
+                        "after the landing the node's active chain (tip {tip}) no longer holds {block} at height {height}; the audit is durable and the row awaits reconciliation"
+                    ))
+                    .into());
+                }
+                Ok(self
+                    .ledger
+                    .finish_candidate_counted_at_revision(claim, true, None, revision)
+                    .await
+                    .map(|(first_confirmation, _)| first_confirmation))
+            },
+        )
+        .await??;
+        self.blocks
+            .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
         Ok(())
     }
 
@@ -2639,36 +3041,39 @@ impl Coordinator {
     }
 
     /// Land the audit the block commits to, or say why that could not be
-    /// done. `Ok(Ok(()))` means the audit is durable: an earlier attempt
-    /// landed it and the row authenticates against the block, or it was
-    /// rebuilt now from the as-issued balances and landed at the revision
-    /// observed immediately before the landing transaction. The builder
-    /// admission, the rebuild, the signature and coinbase verification and
-    /// the landing's own fences all run here, after the offer. Every refusal
-    /// is returned as its reason so the caller settles the row; only node and
-    /// database errors propagate.
+    /// done. [`Landing::Landed`] means the audit is durable: an earlier
+    /// attempt landed it and the row authenticates against the block, or it
+    /// was rebuilt now from the as-issued balances and landed at the
+    /// revision observed immediately before the landing transaction. The
+    /// builder admission, the rebuild, the signature and coinbase
+    /// verification and the landing's own fences all run here, after the
+    /// offer. Every refusal is returned as its reason so the caller settles
+    /// the row; only node and database errors propagate.
     ///
     /// The rebuild reads `AsIssued`: the snapshot every enqueue writes for
     /// its reference. A row enqueued without one (a bare caller) falls back
     /// to a `Current` read, which proves the current set still hashes to the
     /// reference before returning it, so it is the as-issued set exactly
     /// when it succeeds; if the balances have moved the audit cannot be
-    /// rebuilt anywhere and the reason says so. The revision is observed
-    /// after the rebuild, so however long the wait for build capacity was,
-    /// a block that confirmed meanwhile does not fail the fence.
-    async fn land_offered(
-        &self,
-        claim: &CandidateClaim,
-        lease: CandidateLease,
-    ) -> Result<Result<(), String>> {
+    /// rebuilt anywhere and the reason says so.
+    ///
+    /// The parts are verified once, and only then is the revision observed,
+    /// so however long the wait for build capacity and the verification
+    /// were, a block that confirmed meanwhile does not fail the fence. Only
+    /// the landing's transaction runs again when it loses the revision race
+    /// anyway (#630), each time right after a fresh observation, with the
+    /// landing phase's own budget. A retry lands only a block the fresh
+    /// observation still shows active; one that left the active chain
+    /// meanwhile is [`Landing::LeftActiveChain`], with nothing landed.
+    async fn land_offered(&self, claim: &CandidateClaim, lease: CandidateLease) -> Result<Landing> {
         let candidate = &claim.candidate;
         match self.landed_audit_authenticated(claim).await? {
-            Some(Ok(())) => return Ok(Ok(())),
-            Some(Err(reason)) => return Ok(Err(reason)),
+            Some(Ok(())) => return Ok(Landing::Landed),
+            Some(Err(reason)) => return Ok(Landing::Refused(reason)),
             None => {}
         }
         if let Some(reason) = self.stored_inputs_mismatch(candidate)? {
-            return Ok(Err(reason));
+            return Ok(Landing::Refused(reason));
         }
         let parts = match self
             .rebuild_claim_parts(claim, BalanceSource::AsIssued, lease)
@@ -2681,27 +3086,52 @@ impl Coordinator {
                     .await?
                 {
                     Ok(parts) => parts,
-                    Err(failure) => return Ok(Err(Self::rebuild_reason(candidate, failure))),
+                    Err(failure) => {
+                        return Ok(Landing::Refused(Self::rebuild_reason(candidate, failure)))
+                    }
                 }
             }
-            Err(failure) => return Ok(Err(Self::rebuild_reason(candidate, failure))),
+            Err(failure) => return Ok(Landing::Refused(Self::rebuild_reason(candidate, failure))),
         };
         // The rebuilt window is released off the runtime once the landing
-        // returns, whichever way it went. The same blocking thread, holding
-        // no lock and no transaction, then trims (#600), so glibc returns the
-        // heap the landing freed instead of keeping it.
+        // and its retries return, whichever way they went. The same
+        // blocking thread, holding no lock and no transaction, then trims
+        // (#600), so glibc returns the heap the landing freed instead of
+        // keeping it.
         let (trimmer, metrics) = (self.landing_trim.clone(), self.metrics.clone());
         let rebuilt = OffRuntime::new(claim.clone().with_parts(parts))
             .then(move || trimmer.after_landing(&metrics));
-        let revision = self.observe_candidate(claim).await?.revision;
-        match self
+        let verified = match self
             .ledger
-            .land_candidate_at_revision(&rebuilt, &self.config.ledger_public_key, revision)
+            .verify_landing(&rebuilt, &self.config.ledger_public_key)
             .await
         {
-            Ok(_) => Ok(Ok(())),
-            Err(error) => Ok(Err(format!("{error:#}"))),
-        }
+            Ok(verified) => verified,
+            Err(error) => return Ok(Landing::Refused(format!("{error:#}"))),
+        };
+        // A refused landing rolled back before its first write, so a retry
+        // lands once; an audit landed meanwhile by anyone else is compared,
+        // never written again. The attempts borrow the claim, not the
+        // release wrapper around it.
+        let (rebuilt_claim, verified): (&CandidateClaim, _) = (&rebuilt, &verified);
+        let landed = through_revision_races(
+            &candidate.block_hash,
+            RevisionRacePhase::Landing,
+            &self.metrics,
+            |retries| async move {
+                let observation = self.observe_candidate(claim).await?;
+                if retries > 0 && !observation.active {
+                    return Ok(Ok(Landing::LeftActiveChain(observation.tip)));
+                }
+                Ok(self
+                    .ledger
+                    .land_verified_at_revision(rebuilt_claim, verified, observation.revision)
+                    .await
+                    .map(|_| Landing::Landed))
+            },
+        )
+        .await?;
+        Ok(landed.unwrap_or_else(|refusal| Landing::Refused(format!("{refusal:#}"))))
     }
 
     async fn process_candidate_inner(
@@ -3111,7 +3541,12 @@ impl Coordinator {
     /// observations and never another `submitblock`. Only
     /// when even that settlement cannot be written (the database is
     /// unavailable, or the claim was lost) does the error propagate, and the
-    /// row keeps its reservation or offer record for a later recovery.
+    /// row keeps its reservation or offer record for a later recovery. A
+    /// write refused only because the payout revision moved after its
+    /// observation is not a failure: it is observed and written again, within
+    /// its own phase's [`RevisionRetry`] budget (#630), one for the landing
+    /// and one for the settlement, and reaches reconciliation only once that
+    /// budget is spent.
     async fn settle_offered_candidate(
         &self,
         claim: &CandidateClaim,
@@ -3148,55 +3583,97 @@ impl Coordinator {
         offer: &str,
     ) -> Result<()> {
         let block = &claim.candidate.block_hash;
-        if let Err(reason) = self.land_offered(claim, lease).await? {
-            let reason = format!(
-                "{} ({offer}): {reason}",
-                crate::ledger::LANDING_FAILED_REASON_PREFIX
-            );
-            tracing::error!(
-                %block,
-                %reason,
-                "ALERT: offered candidate could not land; kept for reconciliation, never offered again"
-            );
-            return self.ledger.reconcile_candidate(claim, &reason).await;
+        match self.land_offered(claim, lease).await? {
+            Landing::Landed => {}
+            Landing::Refused(reason) => {
+                let reason = format!(
+                    "{} ({offer}): {reason}",
+                    crate::ledger::LANDING_FAILED_REASON_PREFIX
+                );
+                tracing::error!(
+                    %block,
+                    %reason,
+                    "ALERT: offered candidate could not land; kept for reconciliation, never offered again"
+                );
+                return self.ledger.reconcile_candidate(claim, &reason).await;
+            }
+            Landing::LeftActiveChain(tip) => {
+                let reason = format!(
+                    "block left the active chain (tip {tip}) while its landing retried a lost payout revision race after the offer ({offer}); nothing landed; kept for reconciliation, never offered again"
+                );
+                tracing::warn!(%block, %reason, "offered candidate awaits chain reconciliation");
+                return self.ledger.reconcile_candidate(claim, &reason).await;
+            }
         }
         // A null reply can still describe a known side-chain block, and the
         // landing may have taken long: only active-chain evidence observed
         // now, at a revision proven now, advances the shared payout state.
-        let observation = self.observe_candidate(claim).await?;
-        if observation.active {
-            let (first_confirmation, _) = self
-                .ledger
-                .finish_candidate_counted_at_revision(claim, true, None, observation.revision)
-                .await?;
-            self.blocks
-                .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
-            self.wake.notify_one();
-            return Ok(());
+        // The landing is durable from here on and is never repeated: a
+        // settlement that loses the revision race (#630) observes again and
+        // settles from that newer observation, whatever it now shows. A
+        // sibling that confirmed the block meanwhile already committed its
+        // confirmation and credit; the finish then records only the row's
+        // own completion.
+        let settled = through_revision_races(
+            block,
+            RevisionRacePhase::Settlement,
+            &self.metrics,
+            |_| async move {
+                let observation = self.observe_candidate(claim).await?;
+                if observation.active {
+                    return Ok(self
+                        .ledger
+                        .finish_candidate_counted_at_revision(
+                            claim,
+                            true,
+                            None,
+                            observation.revision,
+                        )
+                        .await
+                        .map(|(first_confirmation, _)| Settled::Finished(first_confirmation)));
+                }
+                // The proven orphan (#415): the audit above is durable, and
+                // this one coherent observation shows a DIFFERENT block
+                // active at the candidate's height with the configured
+                // confirmations. The row is settled terminal at the observed
+                // revision, with the evidence as its reason; a reorg
+                // reconciler that confirmed the block meanwhile has bumped
+                // that revision, so the settlement is refused and the next
+                // observation decides again. An observation that failed
+                // never reaches here, so a failed observation never settles.
+                if let Some(reason) = self.orphan_evidence(claim, &observation) {
+                    return Ok(self
+                        .ledger
+                        .orphan_candidate_at_revision(claim, &reason, observation.revision)
+                        .await
+                        .map(|()| Settled::Orphaned(reason)));
+                }
+                Ok(Ok(Settled::NotActive))
+            },
+        )
+        .await??;
+        // Everything below follows a committed settlement only; a refused
+        // one reports nothing terminal.
+        match settled {
+            Settled::Finished(first_confirmation) => {
+                self.blocks
+                    .fetch_add(u64::from(first_confirmation), Ordering::Relaxed);
+                self.wake.notify_one();
+                Ok(())
+            }
+            Settled::Orphaned(reason) => {
+                self.metrics.record_candidate_orphaned();
+                tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
+                Ok(())
+            }
+            Settled::NotActive => {
+                let reason = format!(
+                    "block is not on the active chain after the offer ({offer}); kept for reconciliation, never offered again"
+                );
+                tracing::warn!(%block, %reason, "offered candidate awaits chain reconciliation");
+                self.ledger.reconcile_candidate(claim, &reason).await
+            }
         }
-        // The proven orphan (#415): the audit above is durable, and this one
-        // coherent observation shows a DIFFERENT block active at the
-        // candidate's height with the configured confirmations. The row is
-        // settled terminal at the observed revision, with the evidence as its
-        // reason; a reorg reconciler that confirmed the block meanwhile has
-        // bumped that revision, and the settlement then fails and falls to
-        // the ordinary reconciliation retry below. An observation that
-        // failed never reaches here, so a failed observation never settles.
-        // The log line and the counter follow the committed settlement only;
-        // a refused one reports nothing terminal.
-        if let Some(reason) = self.orphan_evidence(claim, &observation) {
-            self.ledger
-                .orphan_candidate_at_revision(claim, &reason, observation.revision)
-                .await?;
-            self.metrics.record_candidate_orphaned();
-            tracing::warn!(%block, %reason, "offered candidate settled as a proven orphan");
-            return Ok(());
-        }
-        let reason = format!(
-            "block is not on the active chain after the offer ({offer}); kept for reconciliation, never offered again"
-        );
-        tracing::warn!(%block, %reason, "offered candidate awaits chain reconciliation");
-        self.ledger.reconcile_candidate(claim, &reason).await
     }
 
     /// The evidence that settles an offered candidate as a proven orphan, or
