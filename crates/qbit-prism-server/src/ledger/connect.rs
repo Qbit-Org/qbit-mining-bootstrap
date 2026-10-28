@@ -914,18 +914,36 @@ pub(super) async fn lock_cluster_authority(tx: &mut Transaction<'_, Postgres>) -
     Ok(())
 }
 
+/// [`require_revision`] refused a write: the payout revision moved from
+/// `expected`, the one its caller observed, to `current` before the write's
+/// transaction read it. It is raised before that transaction's first write,
+/// so the refused transaction rolls back having changed nothing, and a caller
+/// may observe again and write at the new revision (#630).
+#[derive(Debug)]
+pub struct ObservedRevisionChanged {
+    pub expected: i64,
+    pub current: i64,
+}
+
+impl std::fmt::Display for ObservedRevisionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("payout revision changed while observing chain state")
+    }
+}
+
+impl std::error::Error for ObservedRevisionChanged {}
+
 pub(super) async fn require_revision(
     tx: &mut Transaction<'_, Postgres>,
     expected: i64,
 ) -> Result<()> {
-    let revision: i64 =
+    let current: i64 =
         sqlx::query_scalar("SELECT payout_revision FROM qbit_prism_cluster WHERE singleton")
             .fetch_one(&mut **tx)
             .await?;
-    ensure!(
-        revision == expected,
-        "payout revision changed while observing chain state"
-    );
+    if current != expected {
+        return Err(ObservedRevisionChanged { expected, current }.into());
+    }
     Ok(())
 }
 

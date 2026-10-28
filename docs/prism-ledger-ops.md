@@ -229,55 +229,76 @@ accounting after it, and the row records where the block is between them:
 
 ### A lost revision race after the offer (#630)
 
-After an offer, a frontend can log either of these ERROR lines:
+Each post-offer write is fenced on the payout revision its own candidate
+observation returned: the landing, the finish as `submitted`, and the
+settlement as `orphaned`. The revision moves whenever a frontend records a new
+chain tip, or confirms, deactivates or matures a block, and on a policy
+transition or a fatal-state clear. An accepted own block becomes the node's
+tip, so a template refresh on either frontend records that tip and, once the
+audit has landed, confirms the block, credits its deferred share and bumps the
+revision again. If such a bump commits between an observation and its write,
+the write is refused before it changes anything.
 
-```
-ALERT: offered candidate could not land; kept for reconciliation, never offered again
-ALERT: offered candidate could not be processed; kept for reconciliation, never offered again
-```
+- **Retried in place.** A refused write is a lost race, not a failure. The
+  frontend observes the chain again and writes again at the new revision, in
+  the same attempt, and logs one INFO line per retry:
 
-When the reason ends `payout revision changed while observing chain state`,
-the line records a lost race, not a failure. The reason starts `landing
-failed after the offer (…)` on the first line and `post-offer processing
-failed (…)` on the second. The parentheses hold the offer's outcome: usually
-`node accepted the offer`, or `offer outcome unknown: …` for a recovered
-reservation or an adopted block.
+  ```
+  post-offer write lost a payout revision race; observing again and writing at the new revision
+  ```
 
-- **What happened.** Each post-offer write is fenced on the payout revision
-  its claim observed: the landing, the finish as `submitted`, and the
-  settlement as `orphaned`. The revision moves whenever a frontend records a
-  new chain tip, or confirms, deactivates or matures a block, and on a policy
-  transition or a fatal-state clear. An accepted own block becomes the node's
-  tip, so a template refresh on either frontend records that tip and, once the
-  audit has landed, confirms the block, credits its deferred share and bumps
-  the revision again. If such a bump commits between a claim's observation and
-  its write, the write is refused, and the row is settled in `reconciliation`
-  with that reason.
-- **Why it is benign.** The refused write changed nothing. The row keeps its
-  offer record and is never offered again. Its next claim comes at the
-  `next_attempt` that `candidates list` shows, the `reconciliation` backoff
-  above. It observes again, lands the audit if it had not landed, and settles
-  the row `submitted`, or `orphaned` once the chain proves a competitor. The
-  block's confirmation and deferred-share credit commit once, whichever side
-  commits them first. A retry that loses the race again logs the line again,
-  and waits longer.
-- **What to do.** Nothing, as long as the row finishes. Run
+  Its fields name the `block`, the `write` (`landing`, `finish` or
+  `orphan settlement`), the `observed_revision` the write was fenced on, the
+  `current_revision` that refused it, and the `retry` number. The row then
+  finishes as usual: no `ALERT`, no `reconciliation`, no extra attempt. A
+  landing that committed is never repeated; only the refused write is. The
+  block's confirmation and deferred-share credit commit once, whichever
+  frontend commits them first, so a finish that lost the race to a sibling's
+  confirmation records only the row's completion. Nothing to do.
+- **When the race outlasts the retries.** One post-offer phase retries at
+  most 3 times, and starts no retry 60 s or more after its first lost race (a
+  write already running is never cut off). A race lost beyond that falls back
+  to the behaviour before #630, with one of these ERROR lines:
+
+  ```
+  ALERT: offered candidate could not land; kept for reconciliation, never offered again
+  ALERT: offered candidate could not be processed; kept for reconciliation, never offered again
+  ```
+
+  The reason starts `landing failed after the offer (…)` on the first line and
+  `post-offer processing failed (…)` on the second; the parentheses hold the
+  offer's outcome, usually `node accepted the offer`, or `offer outcome
+  unknown: …` for a recovered reservation or an adopted block. It then says
+  `the post-offer <write> lost a payout revision race with this phase's
+  retries spent (…)` and ends `payout revision changed while observing chain
+  state`. The refused writes changed nothing, the row keeps its offer record
+  and is never offered again, and its next claim (at the `next_attempt` that
+  `candidates list` shows, the `reconciliation` backoff above) observes again,
+  lands the audit if it had not landed, and settles the row `submitted`, or
+  `orphaned` once the chain proves a competitor. That claim retries a race the
+  same way.
+- **What to do.** For the INFO line, nothing. For the ALERT, run
   `qbit-prism-server candidates list` once its `next_attempt` has passed; the
-  block should be gone. Act only if it is still listed after a few retries, or
-  its `last_error` names another reason. Then handle it as any other
+  block should be gone. Act if it is still listed after a few retries, or its
+  `last_error` names another reason; then handle it as any other
   `reconciliation` row. Never try to abandon it: `candidates abandon` refuses
-  an offered row (exit 3).
-- **Alerts.** While it lasts, a lost landing counts as landing-failed, a lost
+  an offered row (exit 3). The revision moving before every write of a phase
+  is not the sibling race this retry absorbs. If the ALERT recurs, look for
+  what is moving the revision that often.
+- **Alerts.** A race retried in place never leaves the row's ordinary
+  lifecycle: the row counts toward the candidate gauges only while its attempt
+  runs, as every attempt's row does. A row that falls back to
+  `reconciliation` counts as before: a lost landing as landing-failed, a lost
   finish as pending only, and a recovered reservation as unacknowledged, for
   its unknown outcome. The candidate alerts measure a row's age from when it
   was created or reserved, not from the race, and none fires before a row has
-  been unfinished for at least 3 minutes. So a freshly found block whose race
-  clears on the next retry or two stays under all of them. A row that was
-  already old, or that has many attempts behind it (its retry waits
-  `10 × attempt_count` s), can fire one anyway. If one fires, look at the row.
+  been unfinished for at least 3 minutes. A row that was already old, or that
+  has many attempts behind it (its retry waits `10 × attempt_count` s), can
+  fire one anyway. If one fires, look at the row.
 
-#630 tracks retrying the write in place, so that a lost race stops logging an
-ALERT.
+`candidates recover` lands the same way, retrying a landing that loses the
+race; its finish is not retried, so a recovery that loses the race at the
+finish stops with that reason and can be run again.
 
 ### Candidate commands
 
