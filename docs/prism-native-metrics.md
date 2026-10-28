@@ -462,7 +462,17 @@ are retained as deduplication tombstones until a coherent mature accounting
 checkpoint retires their height. A monotonic height watermark then rejects
 delayed proofs even after the identity is released; unresolved intervals are
 never retired by that checkpoint. Revision events are released when all known
-deliveries resolve. Nothing is evicted to make a duplicate look new.
+deliveries resolve. While waits are open, revisions below the lowest one an
+open wait may still need are released (#758): a bound or covered wait has
+been matched against every recorded write, and a later write below the newest
+observed revision is obsolete; a binding still to come comes from a
+settlement that runs under the settlement lock at no older revision than any
+observed; only a settlement observer still out keeps the history from the
+newest revision it saw. Waits that stay open on a frontend that writes
+nothing, bound or not and landed or not, therefore cannot exhaust revision
+history. A first revision that would need released writes is covered rather
+than measured.
+Nothing is evicted to make a duplicate look new.
 Exceeding a bound sets `accepted_block_revision_work_tracking_unknown` to
 **1 until restart**. Missing identities have no fabricated observations; known
 pending ages remain visible after identity-only saturation. Lost revision or
@@ -478,7 +488,16 @@ stays unresolved: a current-revision proof cannot safely reconstruct that
 original revision. A later proven first confirmation can recover an attempt
 that did not commit; an already-confirmed replay cannot invent the lost fact.
 The same unknown boundary applies when a peer confirms a locally accepted
-block during audit landing, before the local settlement observer starts. Only
+block during audit landing, before the local settlement observer starts.
+Neither keeps the wait open until restart (#758): any later settlement of the
+block by this frontend that finds it already confirmed commits at a revision
+covering the landing, and the first eligible write at or above that revision
+closes the wait without a sample, since its true end stays unknown. A first
+confirmation that commits without a bump (the fatal early return) covers it
+only from the next revision, because work at its own revision may predate the
+landing. A delayed local first confirmation still in flight takes precedence
+and measures the exact revision. A frontend with no miners writes nothing, so
+it keeps such a wait unknown until a miner receives work. Only
 a newly observed already-confirmed peer block may begin at its current local
 proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
 Universal exactly-once reporting beyond these knowledge/capacity boundaries
@@ -523,10 +542,13 @@ older cancelled refresh cannot overwrite a newer completed observation. No
 block, job, worker, frontend or height label is emitted.
 
 There are **five concrete alert rules**: `PrismAcceptedRevisionWorkPending`
-warns above one second and for a missing pending series or a failed scrape,
+warns above one second on a frontend that had an authorized miner in the last
+15 minutes, and on any frontend for a missing pending series or a failed scrape,
 `PrismAcceptedRevisionWorkTrackingUnknown` warns for unknown tracking (a -1
-age, the tracking-unknown gauge or a missing unknown gauge) after a two-minute
-dwell, `PrismAcceptedRevisionWorkPendingCritical` uses the provisional
+age or the tracking-unknown gauge on a frontend that had an authorized miner in
+the last 15 minutes, or a missing unknown gauge on any frontend) after a
+two-minute dwell,
+`PrismAcceptedRevisionWorkPendingCritical` uses the provisional
 307-second incident-duration floor, `PrismRevisionWorkBuildTimeouts` warns on
 a five-minute increase, and `PrismAcceptedBlockUnlanded` warns when an
 unlanded acceptance is 30 minutes old for three minutes. The budget and
@@ -535,8 +557,14 @@ missing measurement is always visible. The unknown warning dwells (#493
 point 7): a failed template refresh marks tracking unknown only until the
 next successful refresh, one poll interval later, so a single transient
 refresh error never spans the eight consecutive 15-second scrapes the dwell
-requires, while a lost settlement reply, an unsettled orphan verdict,
-saturation or lost ordering persist and still warn. The paging
+requires, while an unsettled orphan verdict, saturation or lost ordering
+persist and still warn, as does a lost settlement reply until a later
+settlement proves a covering revision and this frontend writes at it. Both
+warnings count only on a frontend that had an authorized miner in the last 15
+minutes (#758): a frontend with no miner has no mining.notify write that can
+close its wait, so a long-idle backup would otherwise warn after every pool
+block, while a stall that drives every miner away keeps warning for 15
+minutes after the last one leaves. The paging
 critical is gated (#493): the age must be known, the target scraped and at
 least one miner authorized on that frontend, with a one-minute dwell and
 no-data and evaluation errors treated as OK. It is deliberately not gated on
@@ -550,9 +578,11 @@ during a stall and stays well under the five-minute hold that delayed #413.
 If every miner leaves a frontend during a stall, this page resolves and
 nothing else pages for that frontend: the coverage rules cannot fire with
 zero authorized clients and the connected-clients rule is a cluster-wide
-non-paging warning, so only the pending warning keeps reporting the age until
-a miner reconnects and receives work. A lost race on the offering frontend
-never pages (#493 point 1): its acceptance is unlanded, outside the known
+non-paging warning; the pending warning keeps reporting the age for 15
+minutes after the last miner leaves, and both report it again once a miner
+reconnects. A lost race
+on the offering frontend never pages (#493 point 1): its acceptance is
+unlanded, outside the known
 age, until an active-chain observation lands it or its orphan is proven. A
 routine lost race is proven within a few block intervals (six competitor
 confirmations at the 60-second target spacing plus the reconciliation retry
