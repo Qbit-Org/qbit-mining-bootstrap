@@ -10,7 +10,11 @@ serde_json without `preserve_order` sorts every object's keys, so 3.x refuses
 every 2.x v2 body (crates/qbit-prism/src/audit_body_ref.rs). `import-audits`
 reads a row's canonical sidecar before its body, so only a v2 body without one
 in the import root reaches that check; prism_legacy_range_sidecars.py writes
-the missing sidecars.
+the missing sidecars. The statuses below are those of a 3.x without #731's
+fix, the cutover's release. With the fix, 3.x recomputes 2.x's form and
+imports a `2x-order-only` body as it is, so the listing then holds rows
+import no longer refuses: the sidecar tool reports such a row `ok-in-3x` and
+writes nothing for it.
 
 For each row (`block_hash,body_uri,audit_bundle_sha256`) the status is:
   has-sidecar      the import root holds the row's canonical sidecar, which
@@ -85,7 +89,8 @@ def part_as_3x(part: dict) -> dict:
 
 
 def digest_3x(parts: list) -> str:
-    """What 3.x recomputes: the parsed parts' known fields, keys sorted, raw UTF-8."""
+    """What 3.x without #731's fix recomputes: the parsed parts' known fields,
+    keys sorted, raw UTF-8."""
     view = {"share_parts": [part_as_3x(part) for part in parts]}
     return hashlib.sha256(
         json.dumps(view, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
