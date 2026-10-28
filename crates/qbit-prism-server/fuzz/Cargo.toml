@@ -49,3 +49,8 @@ bench = false
 
 [profile.release]
 debug = 1
+
+# The repository workspace's sqlx-core patch (#771): this workspace resolves
+# on its own, so it needs the same entry to build what the server ships.
+[patch.crates-io]
+sqlx-core = { path = "../../../vendor/sqlx-core" }

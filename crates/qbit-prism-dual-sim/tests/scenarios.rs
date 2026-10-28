@@ -372,7 +372,9 @@ async fn premigrate_outcome(
 fn check_premigrate(outcome: &premigrate::Outcome) -> Result<()> {
     let mut failed = Vec::new();
     if !outcome.migrate_success
-        || ![27, 28, 31].iter().all(|v| outcome.versions.contains(v))
+        || ![27, 28, 31, 32]
+            .iter()
+            .all(|v| outcome.versions.contains(v))
         || !outcome.index_valid
     {
         failed.push(format!(
@@ -455,6 +457,7 @@ async fn r01_the_premigrate_never_rewrites_freezes_vacuums_or_analyzes_the_ledge
         audit_snapshots: 690,
         maintenance_work_mem: "64MB".into(),
         maintenance_workers: 2,
+        shared_buffers: "128MB".into(),
         append_every_ms: 50,
     };
     let outcome = premigrate_outcome("r01-premigrate-p0", plan, gated).await?;
@@ -474,7 +477,8 @@ fn measure_setting<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
 /// The same run at scale, by hand: `PRISM_PREMIGRATE_ROWS` rows (default
 /// 15,000,000, below p0's 2^24 bound), with `PRISM_PREMIGRATE_MWM`
 /// (default 2GB) and `PRISM_PREMIGRATE_WORKERS` (default 4) as
-/// `maintenance_work_mem` and `max_parallel_maintenance_workers`. It checks
+/// `maintenance_work_mem` and `max_parallel_maintenance_workers`, and
+/// `PRISM_PREMIGRATE_SHARED_BUFFERS` (default 2GB). It checks
 /// the same guarantees and writes the measurement to
 /// `target/<profile>/../dual-sim-reports/r01-premigrate-scale/outcome.json`.
 /// No lane runs it: it takes a few minutes and tens of GB of disk.
@@ -491,6 +495,7 @@ async fn r01_measure_the_premigrate_on_a_ledger_of_millions_of_rows() -> Result<
         audit_snapshots: 690,
         maintenance_work_mem: measure_setting("PRISM_PREMIGRATE_MWM", "2GB".to_owned())?,
         maintenance_workers: measure_setting("PRISM_PREMIGRATE_WORKERS", 4)?,
+        shared_buffers: measure_setting("PRISM_PREMIGRATE_SHARED_BUFFERS", "2GB".to_owned())?,
         append_every_ms: 100,
     };
     let outcome = premigrate_outcome("r01-premigrate-scale", plan, gated).await?;

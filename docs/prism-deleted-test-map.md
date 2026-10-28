@@ -241,7 +241,7 @@ The Python payout-state owner, the incremental payout artifact, the Rust daemon 
 
 ## Audit bundles, artifacts, audit HTTP and canonical backfill
 
-Audit bodies live in PostgreSQL in 3.x.x and are served content-addressed by `/public/v1/artifacts`; the on-disk audit root, its scans, its share-segment slot repair and the Python streaming bundle view are retired. The canonical backfill maps to `import-audits`, which #287 made an enforced step: `self-check` reports the audit rows that lack a stored body or canonical bytes and fails on them in production mode (`crates/qbit-prism-server/tests/audit_completeness.rs`).
+Audit bodies live in PostgreSQL in 3.x.x and are served content-addressed by `/public/v1/artifacts`; the on-disk audit root, its scans, its share-segment slot repair and the Python streaming bundle view are retired. The canonical backfill maps to `import-audits`, which #287 made an enforced step: `self-check` reports the audit rows that lack a stored body or canonical bytes and fails on them in production mode, after its local checks; `PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1` reports legacy rows awaiting the import as pending instead, never native ones (#734, `crates/qbit-prism-server/tests/audit_completeness.rs`).
 
 | 2.x.x file | Covered | 3.x.x replacement or status |
 | --- | --- | --- |

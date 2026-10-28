@@ -750,7 +750,7 @@ impl Ledger {
         // relation ... found for row". That refusal is definite and total. It
         // is raised by the ledger INSERT itself, inside the transaction
         // `append_prepared` opened, and that transaction is rolled back with
-        // the share, the clock update, the hash row and any prepared
+        // the share, the hash row and any prepared
         // candidate bytes undone together, so nothing of the attempt
         // survives it. [`crate::partitions::run`] should have kept the lead
         // attached; where it has not, a miner's share is not the place to
@@ -816,6 +816,17 @@ impl Ledger {
         expected_revision: Option<i64>,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
+        // A share without a block is appended in one server-side call
+        // (#711). One whose own fields fail the checks takes the statements
+        // below, which refuse it after the write guard and the fence, as
+        // they always have.
+        if prepared.is_none() {
+            if let Ok(valid) = validated_share(share.clone()) {
+                return self
+                    .append_called(valid, expected_revision, pre_commit)
+                    .await;
+            }
+        }
         // Everything the first statement needs is ready before the lock.
         let header_hash = share_header_hash(&share.share_id);
         let first_read: &str = if expected_revision.is_some() {
@@ -930,20 +941,7 @@ impl Ledger {
                 result
             }
         };
-        if pre_commit.is_some_and(|allow| !allow()) {
-            // Release ORDER_LOCK before the refusal is observed.
-            if let Err(error) = tx.rollback().await {
-                tracing::debug!(%error, "rollback after a closed commit gate failed");
-            }
-            // append_probed returns inserted=false only after matching the entire
-            // immutable, already-durable row, before any share/clock/hash write.
-            // With no candidate write, rollback cannot undo that prior credit.
-            if !result.inserted && prepared.is_none() {
-                return Ok(result);
-            }
-            return Err(CommitGateClosed.into());
-        }
-        tx.commit().await?;
+        let result = Self::commit_gated(tx, result, prepared.is_some(), pre_commit).await?;
         if let (Some((admitted, observed)), true) = (moved, result.captured) {
             tracing::warn!(
                 block = %prepared.map(|prepared| prepared.block_hash()).unwrap_or_default(),
@@ -953,6 +951,115 @@ impl Ledger {
                 "payout revision moved before a block-bearing share's commit; captured the block, its share deferred until the block confirms (#657)"
             );
         }
+        Ok(result)
+    }
+
+    /// #711: a share without a block, appended in one server-side call,
+    /// migration 032's `qbit_prism_append_share` ([`APPEND_SHARE_SQL`]). The
+    /// function takes `ORDER_LOCK` and runs, each as a statement of its own,
+    /// what [`Self::append_prepared`]'s statements run: the write guard, the
+    /// payout-revision fence, the share_id probe and its fallback, and, for a
+    /// new share, the stamped row and its header mapping. `ORDER_LOCK` is
+    /// then held for that call and the COMMIT, where the statements held it
+    /// for the lock statement, three statements and the COMMIT. The function
+    /// refuses with SQLSTATEs mapped back to the errors the statements return
+    /// ([`AppendRefusal`]), and the pre-commit gate is decided between its
+    /// reply and COMMIT, as there. `share` has passed [`validated_share`].
+    async fn append_called(
+        &self,
+        mut share: AcceptedShare,
+        expected_revision: Option<i64>,
+        pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<AppendResult> {
+        let header_hash = share_header_hash(&share.share_id);
+        let admission = super::append_admission::Admission::acquire(&self.pool).await?;
+        let mut connection = admission.attach(self.acquire().await?);
+        let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
+        let lock = self.called_order_lock(crate::metrics::OrderLockHolder::Append);
+        let reply = sqlx::query(APPEND_SHARE_SQL)
+            .bind(&share.share_id)
+            .bind(&share.miner_id)
+            .bind(&share.order_key)
+            .bind(&share.p2mr_program_hex)
+            .bind(share.share_difficulty.to_string())
+            .bind(share.network_difficulty.to_string())
+            .bind(i64::try_from(share.template_height)?)
+            .bind(&share.job_id)
+            .bind(share.job_issued_at_ms)
+            .bind(i64::from(share.ntime))
+            .bind(&share.credit_policy)
+            .bind(&self.instance_id)
+            .bind(&header_hash)
+            .bind(expected_revision)
+            .bind(self.own_origin())
+            .fetch_one(&mut *tx)
+            .await;
+        let row = match reply {
+            Ok(row) => row,
+            Err(error) => {
+                let Some(refusal) = AppendRefusal::of(&error, expected_revision) else {
+                    if failed_past_the_lock(&error) {
+                        lock.granted_unmeasured();
+                    }
+                    return Err(error.into());
+                };
+                // The hold ends as the refusal returns, a moment before the
+                // queued ROLLBACK releases the lock, as on the statement path.
+                let _order = lock.granted(refusal.waited, refusal.held);
+                return Err(refusal.error);
+            }
+        };
+        // Dropped on every path out: after the COMMIT or the gate's ROLLBACK
+        // below, or, on an error, just before the queued ROLLBACK runs.
+        let _order = lock.granted(
+            micros(row.try_get("lock_waited_us")?),
+            micros(row.try_get("lock_held_us")?),
+        );
+        let result = if row.try_get("inserted")? {
+            share.share_seq = u64::try_from(row.try_get::<i64, _>("share_seq")?)?;
+            share.accepted_at_ms = row.try_get("accepted_at_ms")?;
+            AppendResult {
+                share,
+                inserted: true,
+                captured: false,
+            }
+        } else {
+            let previous = share_from_row(&row)?;
+            share.share_seq = previous.share_seq;
+            share.accepted_at_ms = previous.accepted_at_ms;
+            ensure!(share == previous, "duplicate share_id payload mismatch");
+            AppendResult {
+                share: previous,
+                inserted: false,
+                captured: false,
+            }
+        };
+        Self::commit_gated(tx, result, false, pre_commit).await
+    }
+
+    /// The end of a share append's transaction once its statements have
+    /// succeeded: the pre-commit gate, then COMMIT. `wrote_candidate` says
+    /// whether the transaction also wrote a block's candidate or capture.
+    async fn commit_gated(
+        tx: Transaction<'_, Postgres>,
+        result: AppendResult,
+        wrote_candidate: bool,
+        pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) -> Result<AppendResult> {
+        if pre_commit.is_some_and(|allow| !allow()) {
+            // Release ORDER_LOCK before the refusal is observed.
+            if let Err(error) = tx.rollback().await {
+                tracing::debug!(%error, "rollback after a closed commit gate failed");
+            }
+            // An append returns inserted=false only after matching the entire
+            // immutable, already-durable row, before any share/hash write.
+            // With no candidate write, rollback cannot undo that prior credit.
+            if !result.inserted && !wrote_candidate {
+                return Ok(result);
+            }
+            return Err(CommitGateClosed.into());
+        }
+        tx.commit().await?;
         Ok(result)
     }
 
@@ -972,6 +1079,14 @@ impl Ledger {
         let share = validated_share(share)?;
         let probe = Self::read_append_probe(tx, &share).await?;
         self.append_probed(tx, share, probe).await
+    }
+
+    /// This frontend's dual-writer node as the ledger clock's `own`
+    /// parameter, NULL for a single writer (migration 032's
+    /// `qbit_prism_ledger_clock`).
+    fn own_origin(&self) -> Option<i16> {
+        self.dual_writer_identity()
+            .map(|identity| identity.node.index())
     }
 
     /// [`Self::APPEND_PROBE_SQL`] for `share`, as a statement of its own.
@@ -1076,20 +1191,23 @@ impl Ledger {
         )
     }
 
-    /// The share append's write (#711): the ledger clock, the share row and
-    /// its header mapping in one statement. The clock is the same `GREATEST`
-    /// as before, and the share's `accepted_at` the same expression of it.
+    /// The share append's write (#711): the share row and its header mapping
+    /// in one statement, stamped with migration 032's ledger clock,
+    /// `qbit_prism_ledger_clock` (#738). It reads the cluster row and writes
+    /// nothing to it: with the stored clock written only by the snapshot
+    /// anchor and the peer sync, a snapshot held on the primary no longer
+    /// leaves one dead version of the singleton per share for every later
+    /// append to walk. `$14` is this frontend's dual-writer node or NULL,
+    /// `$15` and `$16` the probe's share_seq bounds ([`AppendProbe`]).
+    ///
     /// A share whose job was issued after that clock inserts nothing:
-    /// `share_seq` comes back NULL and the caller refuses the share, which
-    /// rolls the clock back with the transaction, as when the check ran
-    /// between two statements. Nothing on these tables observes the
-    /// difference: no trigger fires on an INSERT into either table, the
-    /// cluster row's only trigger is on `fatal_error`, and
-    /// qbit_prism_share_hashes has no foreign key (migration 016 dropped
-    /// it). A missing partition still raises SQLSTATE 23514 from the ledger
-    /// INSERT, which fails the whole statement, and `append_checked` still
-    /// retries it.
-    const APPEND_WRITE_SQL: &str = "WITH clock AS (UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE singleton RETURNING ledger_clock_ms),\
+    /// `share_seq` comes back NULL, no sequence value is drawn, and the
+    /// caller refuses the share. No trigger fires on an INSERT into either
+    /// table, and qbit_prism_share_hashes has no foreign key (migration 016
+    /// dropped it). A missing partition still raises SQLSTATE 23514 from
+    /// the ledger INSERT, which fails the whole statement, and
+    /// `append_checked` still retries it.
+    const APPEND_WRITE_SQL: &str = "WITH clock AS (SELECT qbit_prism_ledger_clock(c.ledger_clock_ms,$14,$15,$16) AS ledger_clock_ms FROM qbit_prism_cluster c WHERE c.singleton),\
          appended AS (INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) \
             SELECT $1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,to_timestamp($9::double precision/1000),$10,to_timestamp(clock.ledger_clock_ms::double precision/1000),$11,true,$12,0 \
             FROM clock WHERE $9<=clock.ledger_clock_ms RETURNING share_seq),\
@@ -1196,6 +1314,9 @@ impl Ledger {
             .bind(&share.credit_policy)
             .bind(&self.instance_id)
             .bind(share_header_hash(&share.share_id))
+            .bind(self.own_origin())
+            .bind(floor)
+            .bind(ceiling)
             .fetch_one(&mut **tx)
             .await?;
         ensure!(
@@ -1270,7 +1391,13 @@ impl Ledger {
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Prepared)
             .await?;
         writable(&mut tx).await?;
-        let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision").fetch_one(&mut *tx).await?;
+        // The ledger clock, plus one (#738): the anchor takes the newest own
+        // share's stamp too, so it is never below a share at or under the
+        // cutoff read next.
+        let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=qbit_prism_ledger_clock(ledger_clock_ms,$1,qbit_prism_share_probe_floor(),qbit_prism_share_next_seq())+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision")
+            .bind(self.own_origin())
+            .fetch_one(&mut *tx)
+            .await?;
         let anchor_ms: i64 = row.try_get("anchor_ms")?;
         let payout_revision: i64 = row.try_get("payout_revision")?;
         let (cutoff, own_bound, peer_high_water) = match dual_writer_node {
@@ -2125,6 +2252,81 @@ static APPEND_BOUNDED_PROBE_SQL: std::sync::LazyLock<String> = std::sync::LazyLo
 });
 static APPEND_FULL_PARENT_PROBE_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{SELECT_SHARE} WHERE share_id=$1"));
+/// The share append's one server-side call (#711), migration 032's
+/// `qbit_prism_append_share`; see [`Ledger::append_called`].
+const APPEND_SHARE_SQL: &str =
+    "SELECT * FROM qbit_prism_append_share($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)";
+
+/// A refusal `qbit_prism_append_share` raised before any write (migration
+/// 032, #711), as the error the statements return for the same share, with
+/// the call's own measures of its `ORDER_LOCK` wait and hold, which DETAIL
+/// carries as "waited_us held_us", then the revision found for a moved one.
+struct AppendRefusal {
+    error: anyhow::Error,
+    waited: std::time::Duration,
+    held: std::time::Duration,
+}
+
+impl AppendRefusal {
+    fn of(error: &sqlx::Error, expected_revision: Option<i64>) -> Option<Self> {
+        let database = error
+            .as_database_error()?
+            .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()?;
+        let mut detail = database
+            .detail()?
+            .split(' ')
+            .map(|field| field.parse::<i64>().ok());
+        let waited = micros(detail.next()??);
+        let held = micros(detail.next()??);
+        let error = match database.code() {
+            "QP001" => anyhow::anyhow!("cluster halted: {}", database.message()),
+            "QP002" => anyhow::anyhow!("live legacy Python writer lease"),
+            "QP003" => PayoutRevisionChanged {
+                expected: expected_revision?,
+                observed: detail.next()??,
+            }
+            .into(),
+            "QP004" => anyhow::anyhow!(
+                "duplicate-share: rejected share_id is retained globally, and its share is archived"
+            ),
+            "QP005" => anyhow::anyhow!("duplicate-share: header already credited globally"),
+            "QP006" => anyhow::anyhow!(
+                "duplicate-share: header already credited globally, and its share is archived"
+            ),
+            "QP007" => anyhow::anyhow!("share references a job from the future"),
+            _ => return None,
+        };
+        Some(Self {
+            error,
+            waited,
+            held,
+        })
+    }
+}
+
+/// Whether `error`, from a call of `qbit_prism_append_share`, was raised
+/// past the function's lock statement, its only `PERFORM`: PostgreSQL names
+/// the failing statement of each function in the error's context, innermost
+/// first. One that was not, or that is not a database error at all, may
+/// have failed waiting for `ORDER_LOCK`.
+fn failed_past_the_lock(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+        .and_then(sqlx::postgres::PgDatabaseError::r#where)
+        .and_then(|context| {
+            context
+                .lines()
+                .find(|line| line.contains("function qbit_prism_append_share("))
+        })
+        .is_some_and(|line| !line.ends_with(" at PERFORM"))
+}
+
+/// A server-measured duration in microseconds; a negative one, from a step
+/// of the server's clock, counts as none.
+fn micros(us: i64) -> std::time::Duration {
+    std::time::Duration::from_micros(u64::try_from(us).unwrap_or(0))
+}
 
 /// What the share append reads before its share_id probe, from
 /// [`Ledger::APPEND_PROBE_SQL`]'s columns; see there.

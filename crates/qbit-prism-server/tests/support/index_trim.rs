@@ -541,7 +541,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
             schema_versions(&pool).await?,
             [
                 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-                27, 28
+                27, 28, 32
             ]
         );
         sqlx::raw_sql(&format!("DROP INDEX {SEQ_WALK}"))
@@ -622,7 +622,7 @@ async fn migration_013_resumes_an_interrupted_build_keeps_its_own_index_and_refu
         schema_versions(&pool).await?,
         [
             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-            28
+            28, 32
         ]
     );
     // The declared definition under the reserved name is an earlier build
@@ -790,7 +790,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
         schema_versions(&pool).await?,
         [
             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-            28
+            28, 32
         ]
     );
     assert_eq!(share_count(&pool).await?, 2);
@@ -873,7 +873,7 @@ async fn migration_013_refuses_a_drop_target_swapped_while_it_built() -> Result<
         schema_versions(&pool).await?,
         [
             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-            28
+            28, 32
         ]
     );
     sqlx::raw_sql(&format!(
@@ -954,7 +954,7 @@ async fn migration_013_refuses_to_record_when_a_kept_index_moved_while_it_built(
         schema_versions(&pool).await?,
         [
             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-            28
+            28, 32
         ]
     );
     let after_refusal = ledger_indexes(&pool).await?;

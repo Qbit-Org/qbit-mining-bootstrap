@@ -65,6 +65,13 @@ Python script-specific filtering flags are replaced by the commands above.
 difficulty. On an empty pool without a configured fallback/fee address, set
 `PRISM_SELF_CHECK_ADDRESS` to a valid P2MR payout address for that probe.
 
+In production, `self-check` fails while any audit row lacks its stored bytes,
+after running its local checks. While `import-audits` is storing legacy audits,
+set `PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1` for that run only: the legacy
+rows are reported as `legacy_import_pending` instead of failing, and an
+incomplete native row still fails. See
+[the migration guide](../../docs/prism-rust-migration.md) (#734).
+
 `public-api` needs its read DSN in `PRISM_DATABASE_URL` and the advertised
 `PRISM_PUBLIC_STRATUM_URL`. It listens on port 3342 by default and can enforce a
 streaming-standby heartbeat contract with `PRISM_PUBLIC_REPLICA_MODE=require`.
@@ -88,7 +95,7 @@ cache budgets, schema readiness, and read-role configuration.
 | `PRISM_PAYOUT_ARTIFACT_REANCHOR_SECONDS` | 60 | Periodic reward snapshot renewal |
 | `PRISM_BLOCKPOLL_SECONDS` | 2 | Template polling interval |
 | `PRISM_RPC_TIMEOUT_SECONDS` | 15 | General node and wallet RPC deadline |
-| `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` | 1 | `submitblock` deadline; ambiguous results retain the durable candidate for recovery |
+| `PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` | 1 | `submitblock` deadline, its connect included; ambiguous results retain the durable candidate for recovery. A new connection gets at most half of it, and never more than 4.9 s (`rpc::relay_connect_budget`, #762). A call still waiting for its connection then fails as never sent, and the block is offered again; a call that took a pooled connection meanwhile was sent on it, and keeps that request's outcome, unknown if the deadline then passes. The connect runs on, and once established serves the next call while the node keeps it open |
 | `PRISM_BLOCK_SUBMIT_ENABLED` | true | #291 rehearsal kill switch. `0`: the submit loop claims no candidate, so every found block stays `pending` and `submitblock` is never called; the CTV fanout broadcaster does not start whatever `PRISM_CTV_BROADCASTER_ENABLED` says, `broadcast-ctv` refuses, and the node client refuses every call that would relay a block or a transaction. `check-config` and `self-check` lead with a warning, the health payload carries `block_submission_enabled` and `qbit_prism_block_submission_enabled` reads 0. Per frontend, read at startup; never `0` in production. A cluster-wide hold set with `submission-hold set` (migration 023, #664) holds every frontend whatever this says. See [the rehearsal procedure](../../docs/prism-ledger-ops.md#block-submission-kill-switch-for-rehearsals) |
 | `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` | 6 | Confirmations a different active block at an offered candidate's height needs, on one coherent tip observation after the candidate's audit landed, before the row is settled `orphaned` (terminal, evidence kept, out of the pending gauges) instead of staying in reconciliation; 1 to 1000. A reorg back is still credited from the landed audit |
 | `PRISM_CAPTURE_OVERPAY_CEILING_BPS` | 100 | #478 block capture: the most a block found on work whose payout revision was superseded on the still-current tip may overpay, in basis points of its own coinbase value. Such a block is offered only when its positive as-issued float (the most debt its confirmation can create, in any order) is within this ceiling; otherwise it is abandoned and counted. `0` turns capture off (the pre-#478 behaviour). Read per frontend: set the same value everywhere and restart every frontend to change it; 0 to 10000 |

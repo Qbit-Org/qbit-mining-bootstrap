@@ -82,6 +82,7 @@ Executed and passed on corrective implementation `2bf64f2fbf6861320e05e62e07a9c7
 Reproduce the added consumer checks:
 
 ```sh
+python3 scripts/check_prism_alert_uids.py
 python3 scripts/test_prism_alert_promql.py --promtool /path/to/promtool
 PRISM_TEST_PG_BIN_DIR=/path/to/postgresql/bin python3 scripts/test_prism_postgres_alerts.py --promtool /path/to/promtool
 python3 scripts/test_prism_alert_deployment.py --snapshot /path/to/read-only-snapshot

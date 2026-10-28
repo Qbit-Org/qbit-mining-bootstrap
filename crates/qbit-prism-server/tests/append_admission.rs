@@ -2,6 +2,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::ledger::{CommitGateClosed, Ledger};
+use qbit_prism_server::metrics::Metrics;
 use qbit_prism_test_gate as gate;
 use sqlx::{postgres::PgPoolOptions, Connection, PgConnection, PgPool};
 use std::{
@@ -665,28 +666,21 @@ async fn missing_partition_retry_reacquires_admission_and_preserves_gate_deadlin
     h.close(result).await
 }
 
-/// The statements a share append ran on its connection while it held
-/// ORDER_LOCK: every execution after its lock statement and before the
-/// COMMIT that ended its transaction, oldest first.
-fn statements_under_order_lock(executions: &[Execution]) -> Result<Vec<String>> {
+/// The statements a share append's transaction ran on its connection after
+/// its BEGIN, up to the COMMIT that ended it, oldest first. Since #711 the
+/// append's first statement, `qbit_prism_append_share`, takes ORDER_LOCK
+/// itself, so every one of them runs while the lock is held.
+fn statements_until_commit(executions: &[Execution]) -> Result<Vec<String>> {
     let begin = executions
         .iter()
         .position(|e| e.sql.starts_with("BEGIN; SET LOCAL plan_cache_mode"))
         .context("no share append transaction was observed")?;
     let connection = executions[begin].connection;
-    let mut on_connection = executions[begin + 1..]
-        .iter()
-        .filter(|e| e.connection == connection);
-    let lock = on_connection
-        .next()
-        .context("the append sent nothing after its BEGIN")?;
-    ensure!(
-        lock.sql == "SELECT pg_advisory_xact_lock($1)",
-        "the append's first statement after BEGIN was {:?}, not its ORDER_LOCK",
-        lock.sql
-    );
     let mut statements = Vec::new();
-    for execution in on_connection {
+    for execution in executions[begin + 1..]
+        .iter()
+        .filter(|e| e.connection == connection)
+    {
         if execution.is_commit() {
             return Ok(statements);
         }
@@ -696,19 +690,21 @@ fn statements_under_order_lock(executions: &[Execution]) -> Result<Vec<String>> 
 }
 
 /// #711: every client round trip a share append makes while it holds
-/// ORDER_LOCK is time every other share waits behind it. A new share's
-/// append reads its write guard, its payout-revision fence and its probe
-/// bounds in one statement, probes for its share_id in a second, and writes
-/// the clock, the row and the header mapping in a third; a duplicate stops
-/// after the probe. Pin those counts, so a round trip cannot creep back in.
+/// ORDER_LOCK is time every other share waits behind it. A share without a
+/// block is appended by one call, migration 032's `qbit_prism_append_share`,
+/// which takes the lock and runs the write guard, the payout-revision fence,
+/// the share_id probe and, for a new share, the write, each as a statement
+/// of its own, server-side; then the COMMIT. Pin that for a new share,
+/// fenced or not, and for a duplicate, so a round trip cannot creep back in,
+/// and pin that none of it writes the cluster row (#738).
 #[tokio::test]
-async fn a_share_append_holds_order_lock_for_three_statements_and_its_commit() -> Result<()> {
+async fn a_share_append_holds_order_lock_for_one_call_and_its_commit() -> Result<()> {
     let Some(h) = Harness::open().await? else {
         return Ok(());
     };
     let result = async {
         let revision = h.ledger.payout_revision().await?;
-        for (id, fenced) in [(1, true), (2, false)] {
+        for (id, fenced, new) in [(1, true, true), (2, false, true), (1, true, false)] {
             let mark = h.proxy.mark();
             let appended = if fenced {
                 h.ledger
@@ -717,46 +713,290 @@ async fn a_share_append_holds_order_lock_for_three_statements_and_its_commit() -
             } else {
                 h.ledger.append(share(id), None).await?
             };
-            ensure!(appended.inserted, "share {id} was not appended");
-            let statements = statements_under_order_lock(&h.proxy.executions_since(mark)?)?;
             ensure!(
-                statements.len() == 3,
-                "a new share's append ran {} statements under ORDER_LOCK, not 3: {statements:#?}",
-                statements.len()
+                appended.inserted == new,
+                "share {id}: inserted={}",
+                appended.inserted
             );
+            let statements = statements_until_commit(&h.proxy.executions_since(mark)?)?;
             ensure!(
-                statements[0].contains("FOR SHARE OF c") == fenced,
-                "the first statement's payout-revision fence is wrong for fenced={fenced}: {:?}",
-                statements[0]
-            );
-            ensure!(
-                statements[2].starts_with("WITH clock AS (UPDATE qbit_prism_cluster"),
-                "the append's last statement is not its write: {:?}",
-                statements[2]
+                statements.len() == 1
+                    && statements[0].starts_with("SELECT * FROM qbit_prism_append_share("),
+                "share {id}'s append ran more than its one call under ORDER_LOCK: {statements:#?}"
             );
         }
-        let mark = h.proxy.mark();
-        ensure!(
-            !h.ledger
-                .append_at_revision(share(1), None, revision)
-                .await?
-                .inserted,
-            "a replayed share was appended again"
-        );
-        let statements = statements_under_order_lock(&h.proxy.executions_since(mark)?)?;
-        ensure!(
-            statements.len() == 2,
-            "a duplicate's append ran {} statements under ORDER_LOCK, not 2: {statements:#?}",
-            statements.len()
-        );
         Ok(())
     }
     .await;
     h.close(result).await
 }
 
-/// The ledger clock, the share sequence and the count of header mappings:
-/// everything a share append's write statement changes besides the row.
+/// The value of one sample of `metrics`, 0 when it has none yet.
+fn sample(metrics: &Metrics, key: &str) -> f64 {
+    metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key} ")))
+        .map_or(0., |value| value.parse().unwrap_or(f64::NAN))
+}
+
+/// The ORDER_LOCK waits recorded with `result`, and the `append` holds.
+fn order_lock_counts(metrics: &Metrics) -> (f64, f64, f64) {
+    let wait = |result: &str| {
+        sample(
+            metrics,
+            &format!(
+                "qbit_prism_database_advisory_lock_wait_seconds_count{{lock=\"order\",result=\"{result}\"}}"
+            ),
+        )
+    };
+    (
+        wait("success"),
+        wait("failure"),
+        sample(
+            metrics,
+            "qbit_prism_database_order_lock_hold_seconds_count{holder=\"append\"}",
+        ),
+    )
+}
+
+/// The backend of the one append call waiting on a lock of `kind`.
+async fn waiting_call(pool: &PgPool, advisory: bool) -> Result<i32> {
+    timeout(WAIT, async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity WHERE datname=current_database() \
+                 AND wait_event_type='Lock' AND (wait_event='advisory')=$1 \
+                 AND query LIKE 'SELECT * FROM qbit_prism_append_share(%'",
+            )
+            .bind(advisory)
+            .fetch_optional(pool)
+            .await?;
+            if let Some(pid) = pid {
+                return Ok::<_, anyhow::Error>(pid);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("no append call waited on the lock")?
+}
+
+/// #711, EP-ERRORS and EP-OBSERVABILITY. The call takes ORDER_LOCK itself
+/// and reports its wait and its hold on the server's clock:
+/// - an append, and a refusal raised past the lock, each record one
+///   successful ORDER_LOCK wait and one `append` hold;
+/// - a call cancelled while it waits for ORDER_LOCK, as a lock or statement
+///   timeout cancels it, records a failed wait and no hold;
+/// - a call cancelled past its lock statement, here while its fence waits on
+///   a cluster-row writer, records neither, as it cannot know them.
+/// A cancelled call rolls back whole: nothing is written and the commit gate
+/// is never asked, so its answer stays a failure, never an unknown outcome,
+/// and the next append goes through.
+#[tokio::test]
+async fn an_append_call_reports_its_lock_and_a_cancelled_one_rolls_back_whole() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = FixtureDatabase::open(&raw, "prism_admission_").await?;
+    let metrics = Arc::new(Metrics::default());
+    let ledger = match Ledger::connect_with_metrics(
+        &db.url,
+        "append-call".into(),
+        4,
+        true,
+        Some(metrics.clone()),
+    )
+    .await
+    {
+        Ok(ledger) => ledger,
+        Err(error) => return Err(db.abandon(error).await),
+    };
+    let control = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&db.url)
+        .await?;
+    let result = async {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gated = |id: u64, revision: i64| {
+            let ledger = ledger.clone();
+            let asked = asked.clone();
+            Running(tokio::spawn(async move {
+                let gate = move || {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    true
+                };
+                ledger
+                    .append_at_revision_gated(share(id), None, revision, &gate)
+                    .await
+            }))
+        };
+        let revision = ledger.payout_revision().await?;
+        let (success, failure, holds) = order_lock_counts(&metrics);
+        ensure!(timeout(WAIT, &mut gated(1, revision).0).await???.inserted);
+        let refused = ledger
+            .append_at_revision(share(2), None, revision + 1)
+            .await
+            .err()
+            .context("an append at a stale revision succeeded")?;
+        ensure!(
+            refused
+                .downcast_ref::<qbit_prism_server::ledger::PayoutRevisionChanged>()
+                .is_some(),
+            "{refused:#}"
+        );
+        ensure!(
+            order_lock_counts(&metrics) == (success + 2., failure, holds + 2.),
+            "an append and a refusal recorded {:?} after {:?}",
+            order_lock_counts(&metrics),
+            (success, failure, holds)
+        );
+        ensure!(asked.load(Ordering::SeqCst) == 1);
+
+        // Cancelled while it waits for ORDER_LOCK.
+        let mut holder = control.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ORDER_LOCK)
+            .execute(&mut *holder)
+            .await?;
+        let mut waiting = gated(3, revision);
+        let pid = waiting_call(&control, true).await?;
+        sqlx::query("SELECT pg_cancel_backend($1)")
+            .bind(pid)
+            .execute(&control)
+            .await?;
+        let error = timeout(WAIT, &mut waiting.0)
+            .await??
+            .err()
+            .context("a cancelled append succeeded")?;
+        ensure!(
+            format!("{error:#}").contains("canceling statement"),
+            "{error:#}"
+        );
+        holder.rollback().await?;
+        ensure!(
+            order_lock_counts(&metrics) == (success + 2., failure + 1., holds + 2.),
+            "a call cancelled waiting for the lock recorded {:?}",
+            order_lock_counts(&metrics)
+        );
+
+        // Cancelled past its lock statement, its fence waiting on a writer.
+        let mut writer = control.begin().await?;
+        sqlx::query("UPDATE qbit_prism_cluster SET updated_at=clock_timestamp() WHERE singleton")
+            .execute(&mut *writer)
+            .await?;
+        let mut fenced = gated(4, revision);
+        let pid = waiting_call(&control, false).await?;
+        sqlx::query("SELECT pg_cancel_backend($1)")
+            .bind(pid)
+            .execute(&control)
+            .await?;
+        let error = timeout(WAIT, &mut fenced.0)
+            .await??
+            .err()
+            .context("a cancelled append succeeded")?;
+        ensure!(
+            format!("{error:#}").contains("canceling statement"),
+            "{error:#}"
+        );
+        writer.rollback().await?;
+        ensure!(
+            order_lock_counts(&metrics) == (success + 2., failure + 1., holds + 2.),
+            "a call cancelled past its lock recorded {:?}",
+            order_lock_counts(&metrics)
+        );
+
+        ensure!(
+            asked.load(Ordering::SeqCst) == 1,
+            "a cancelled append asked its gate"
+        );
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT share_id FROM qbit_share_ledger ORDER BY share_id")
+                .fetch_all(&control)
+                .await?;
+        ensure!(ids == vec![share(1).share_id], "{ids:?}");
+        ensure!(timeout(WAIT, &mut gated(5, revision).0).await???.inserted);
+        Ok(())
+    }
+    .await;
+    ledger.pool.close().await;
+    control.close().await;
+    db.close(result).await
+}
+
+/// #738: a share append writes no version of the cluster row. While a
+/// snapshot is held on the primary (a long read, `pg_dump`, an evidence
+/// export, a standby's feedback), every version the singleton gains stays
+/// until that snapshot ends, and every later append's reads of the row walk
+/// them all under ORDER_LOCK. Appends, fenced and not, under such a snapshot
+/// leave the row the version it was, on the page it was, and send no
+/// statement that updates it; the snapshot anchor, once per window, is the
+/// clock's one writer.
+#[tokio::test]
+async fn appends_under_a_held_snapshot_leave_the_cluster_row_one_version() -> Result<()> {
+    const APPENDS: u64 = 200;
+    let Some(h) = Harness::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut reader = h.control.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *reader)
+            .await?;
+        sqlx::query("SELECT count(*) FROM qbit_share_ledger")
+            .execute(&mut *reader)
+            .await?;
+        let version = || async {
+            Ok::<(String, String, i64), anyhow::Error>(
+                sqlx::query_as(
+                    "SELECT xmin::text,ctid::text,pg_relation_size('qbit_prism_cluster') \
+                     FROM qbit_prism_cluster WHERE singleton",
+                )
+                .fetch_one(&h.control)
+                .await?,
+            )
+        };
+        let before = version().await?;
+        let revision = h.ledger.payout_revision().await?;
+        let mark = h.proxy.mark();
+        for id in 1..=APPENDS {
+            let appended = if id % 2 == 0 {
+                h.ledger
+                    .append_at_revision(share(id), None, revision)
+                    .await?
+            } else {
+                h.ledger.append(share(id), None).await?
+            };
+            ensure!(appended.inserted, "share {id} was not appended");
+        }
+        ensure!(
+            version().await? == before,
+            "{APPENDS} appends under a held snapshot changed the cluster row's version or heap: {before:?} -> {:?}",
+            version().await?
+        );
+        let updates: Vec<String> = h
+            .proxy
+            .executions_since(mark)?
+            .into_iter()
+            .filter(|execution| execution.sql.contains("UPDATE qbit_prism_cluster"))
+            .map(|execution| execution.sql)
+            .collect();
+        ensure!(updates.is_empty(), "the appends updated the cluster row: {updates:#?}");
+        h.ledger.snapshot(1_000_000).await?;
+        ensure!(
+            version().await?.0 != before.0,
+            "the snapshot anchor wrote no clock"
+        );
+        reader.rollback().await?;
+        Ok(())
+    }
+    .await;
+    h.close(result).await
+}
+
+/// The stored ledger clock, the share sequence and the count of header
+/// mappings: everything besides the row that a share append's write
+/// statement could change; since #738 it only reads the clock.
 async fn ledger_write_state(pool: &PgPool) -> Result<(i64, i64, bool, i64)> {
     Ok(sqlx::query_as(
         "SELECT (SELECT ledger_clock_ms FROM qbit_prism_cluster WHERE singleton),last_value,is_called,\
@@ -766,10 +1006,9 @@ async fn ledger_write_state(pool: &PgPool) -> Result<(i64, i64, bool, i64)> {
     .await?)
 }
 
-/// A share whose job was issued after the ledger clock is refused, and the
-/// one statement that advanced the clock leaves nothing behind (#711): no
-/// row, no header mapping, no share_seq handed out, and the clock back where
-/// it was.
+/// A share whose job was issued after the ledger clock is refused, and its
+/// write statement leaves nothing behind (#711): no row, no header mapping,
+/// no share_seq handed out, and the stored clock where it was.
 #[tokio::test]
 async fn a_share_from_a_future_job_is_refused_and_its_write_rolls_back() -> Result<()> {
     let Some(h) = Harness::open().await? else {
@@ -804,9 +1043,9 @@ async fn a_share_from_a_future_job_is_refused_and_its_write_rolls_back() -> Resu
     h.close(result).await
 }
 
-/// The append's first statement still refuses a halted cluster and a live
-/// legacy Python writer before it compares the payout revision, fenced or
-/// not, as the separate write guard did (#711), and writes nothing.
+/// The append's call still refuses a halted cluster and a live legacy
+/// Python writer before it compares the payout revision, fenced or not, as
+/// the separate write guard did, and writes nothing (#711).
 #[tokio::test]
 async fn a_halted_cluster_or_a_live_legacy_writer_refuses_the_append_before_its_fence() -> Result<()>
 {
@@ -879,10 +1118,9 @@ async fn a_halted_cluster_or_a_live_legacy_writer_refuses_the_append_before_its_
     h.close(result).await
 }
 
-/// A fenced append whose first statement finds a revision writer holding the
-/// cluster row waits it out and compares the revision that writer committed,
-/// and goes ahead when the writer rolls back: `FOR SHARE` still rechecks the
-/// latest row although the statement also reads the probe's bounds (#711).
+/// A fenced append whose call finds a revision writer holding the cluster
+/// row waits it out in its fence's `FOR SHARE`, compares the revision that
+/// writer committed, and goes ahead when the writer rolls back (#711).
 #[tokio::test]
 async fn a_fenced_append_waits_out_a_revision_writer_and_compares_what_it_commits() -> Result<()> {
     let Some(h) = Harness::open().await? else {
@@ -908,7 +1146,7 @@ async fn a_fenced_append_waits_out_a_revision_writer_and_compares_what_it_commit
                 loop {
                     let waiting: bool = sqlx::query_scalar(
                         "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
-                         AND wait_event_type='Lock' AND query LIKE 'WITH probe AS MATERIALIZED%')",
+                         AND wait_event_type='Lock' AND wait_event<>'advisory' AND query LIKE 'SELECT * FROM qbit_prism_append_share(%')",
                     )
                     .fetch_one(&mut *observer)
                     .await?;
@@ -919,7 +1157,7 @@ async fn a_fenced_append_waits_out_a_revision_writer_and_compares_what_it_commit
                 }
             })
             .await
-            .context("the append's first statement never waited on the revision writer")??;
+            .context("the append's call never waited on the revision writer")??;
             drop(observer);
             if commit {
                 writer.commit().await?;
@@ -946,12 +1184,12 @@ async fn a_fenced_append_waits_out_a_revision_writer_and_compares_what_it_commit
     h.close(result).await
 }
 
-/// The fenced first statement's probe columns keep the snapshot taken before
-/// it waited on the cluster row. When the writer it waited on commits a
-/// change to that row but leaves the revision alone, the append reads its
-/// probe again (#711). Here the writer also mapped the share's header to
-/// another share, so the append must refuse the header as already credited,
-/// not take it for a new one and collide with the mapping on insert.
+/// A fenced append's probe sees what a writer its fence waited on committed:
+/// it runs as a statement of its own after the fence, inside the call
+/// (#711). When the writer commits a change to the cluster row but leaves
+/// the revision alone, and also maps the share's header to another share,
+/// the append must refuse the header as already credited, not take it for a
+/// new one and collide with the mapping on insert.
 #[tokio::test]
 async fn a_fenced_append_rereads_its_probe_after_waiting_on_a_cluster_row_writer() -> Result<()> {
     let Some(h) = Harness::open().await? else {
@@ -980,7 +1218,7 @@ async fn a_fenced_append_rereads_its_probe_after_waiting_on_a_cluster_row_writer
             loop {
                 let waiting: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() \
-                     AND wait_event_type='Lock' AND query LIKE 'WITH probe AS MATERIALIZED%')",
+                     AND wait_event_type='Lock' AND wait_event<>'advisory' AND query LIKE 'SELECT * FROM qbit_prism_append_share(%')",
                 )
                 .fetch_one(&mut *observer)
                 .await?;
@@ -991,7 +1229,7 @@ async fn a_fenced_append_rereads_its_probe_after_waiting_on_a_cluster_row_writer
             }
         })
         .await
-        .context("the append's first statement never waited on the cluster row's writer")??;
+        .context("the append's call never waited on the cluster row's writer")??;
         drop(observer);
         writer.commit().await?;
         let error = timeout(WAIT, &mut append.0)

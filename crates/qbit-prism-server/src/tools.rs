@@ -2324,7 +2324,7 @@ struct SelfCheckReport {
     /// #529: the found-block offer's failover standby, when its wait is on.
     #[serde(skip_serializing_if = "Option::is_none")]
     offer_standby: Option<crate::ledger::OfferStandbyReport>,
-    audit_completeness: Option<AuditCompleteness>,
+    audit_completeness: Option<AuditCompletenessReport>,
     /// Migration 2's share-hash backfill while `migrate --defer-share-hashes`
     /// has left it pending, and `backfill-share-hashes` has still to map the
     /// rest: its fence and cursor, or `unknown` when the database could not
@@ -2333,6 +2333,57 @@ struct SelfCheckReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     share_hash_backfill: Option<ShareHashBackfillReport>,
     live_instances: LiveInstancesReport,
+}
+
+/// #734: the operator's declaration, for one `self-check` run, that
+/// `import-audits` is storing the legacy audit bodies still missing.
+const LEGACY_IMPORT_PENDING: &str = "PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING";
+
+/// self-check's audit completeness: the counts, and what they mean here.
+#[derive(Clone, Copy, Serialize)]
+struct AuditCompletenessReport {
+    status: AuditCompletenessStatus,
+    #[serde(flatten)]
+    counts: AuditCompleteness,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuditCompletenessStatus {
+    Complete,
+    /// Only legacy rows lack their bytes, and the operator has declared
+    /// their import under way with [`LEGACY_IMPORT_PENDING`].
+    LegacyImportPending,
+    Incomplete,
+}
+
+impl AuditCompletenessReport {
+    fn new(counts: AuditCompleteness, legacy_import_pending: bool) -> Self {
+        let status = if counts.require_complete().is_ok() {
+            AuditCompletenessStatus::Complete
+        } else if legacy_import_pending && counts.require_native_complete().is_ok() {
+            AuditCompletenessStatus::LegacyImportPending
+        } else {
+            AuditCompletenessStatus::Incomplete
+        };
+        Self { status, counts }
+    }
+
+    /// Production's verdict: an incomplete history fails, naming the native
+    /// rows no import repairs before the legacy rows an import would.
+    fn require_complete(&self) -> Result<()> {
+        if self.status != AuditCompletenessStatus::Incomplete {
+            return Ok(());
+        }
+        self.counts.require_native_complete()?;
+        self.counts.require_complete().with_context(|| {
+            format!(
+                "{} legacy audit rows await import-audits; while it runs, set \
+                 {LEGACY_IMPORT_PENDING}=1 to report them as pending and pass on the rest",
+                self.counts.pending_legacy_rows
+            )
+        })
+    }
 }
 
 async fn self_check() -> Result<()> {
@@ -2356,6 +2407,8 @@ async fn self_check() -> Result<()> {
     };
     let result = async {
         let config = Config::from_env()?;
+        let production = config::production_mode()?;
+        let legacy_import_pending = config::flag(LEGACY_IMPORT_PENDING, false)?;
         let freshness =
             crate::api::health_stale_after(crate::api::health_refresh_interval_from_env()?);
         report.instance_id = Some(config.instance_id.clone());
@@ -2415,18 +2468,37 @@ async fn self_check() -> Result<()> {
             );
         }
         report.submission_hold = hold;
-        report.audit_completeness = completeness.as_ref().ok().copied();
-        if let Some(completeness) = &report.audit_completeness {
-            if config::production_mode()? {
-                completeness.require_complete()?;
-            }
+        report.audit_completeness = completeness
+            .as_ref()
+            .ok()
+            .map(|counts| AuditCompletenessReport::new(*counts, legacy_import_pending));
+        if let Some(audits) = report
+            .audit_completeness
+            .filter(|audits| audits.status == AuditCompletenessStatus::LegacyImportPending)
+        {
+            eprintln!(
+                "WARNING: {} legacy audit rows await import-audits, as {LEGACY_IMPORT_PENDING} \
+                 declares; self-check reports them as pending, not as a failure, and the import \
+                 must still finish",
+                audits.counts.pending_legacy_rows
+            );
         }
+        // #734: production refuses an incomplete history, but only after the
+        // local checks have filled in the report, as #525 does below.
+        let audits = match &report.audit_completeness {
+            Some(audits) if production => audits.require_complete(),
+            _ => Ok(()),
+        };
         // #525: a refused payout policy fails the check, but only after the
         // local checks have filled in the report.
         let pool_fee = config.ensure_pool_fee_settles_dust();
         // A failed heartbeat sample must not suppress the remaining local checks.
         let local = self_check_local(config, &mut report).await;
         pool_fee?;
+        if let (Err(_), Err(local)) = (&audits, &local) {
+            eprintln!("ERROR: the local checks failed too: {local:#}");
+        }
+        audits?;
         local?;
         completeness?;
         ensure!(

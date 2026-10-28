@@ -65,8 +65,10 @@ pub enum Schedule {
 }
 
 /// What the gate holds a run of the preset to. See [`crate::gate`]. Every
-/// key is required, `null` included, so a preset states what it does not
-/// gate as plainly as what it does.
+/// key of [`GATE_KEYS`] is required, `null` included, so a preset states
+/// what it does not gate as plainly as what it does. The one optional key,
+/// `tip_last_notify_median_budget_ms`, is absent from every preset but the
+/// one it was added for (#790), and absent means `null`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Gates {
@@ -84,6 +86,11 @@ pub struct Gates {
     /// Per tip, the slowest session's time to usable work on it; the p99
     /// over the run's tips (nearest rank). `null` reports it ungated.
     pub tip_last_notify_p99_budget_ms: Option<f64>,
+    /// The same per-tip figure, its median over the run's tips (#790): a
+    /// statistic a run with few tips can support, where the p99 of 3 tips is
+    /// their maximum. Optional; absent or `null` does not gate on it.
+    #[serde(default)]
+    pub tip_last_notify_median_budget_ms: Option<f64>,
     /// Print #473's D1 verdict table.
     pub d1_verdict_table: bool,
     /// The churn phase's tips: per tip, the slowest of the sessions connected
@@ -180,6 +187,10 @@ impl Preset {
             (
                 "tip_last_notify_p99_budget_ms",
                 gates.tip_last_notify_p99_budget_ms,
+            ),
+            (
+                "tip_last_notify_median_budget_ms",
+                gates.tip_last_notify_median_budget_ms,
             ),
             (
                 "churn_tip_last_notify_p99_budget_ms",

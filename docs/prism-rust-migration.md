@@ -90,26 +90,46 @@ qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
    public edge, including the oldest history, a sidecar-only import and a
    reconstructed body. Require the exact SHA and matching ETag, as below.
 
-Nothing on the serving path reads a legacy row's canonical bytes. So
-frontends can admit traffic before `import-audits` finishes. From 3.0.0 and
-3.1.0-rc.1, and so in 3.1.0, an import beside them holds `SETTLEMENT_LOCK`
-only to check the write guard and commit each row, except toward a lock holder that needs the very row being
-imported, which waits for that row's UPDATE
-([ledger operations](prism-ledger-ops.md)). It sends and stores the row first, within
-`PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`; `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS`
-bounds its wait for the lock and its hold. SIGTERM stops it (#765). Through
-3.0.0-rc.6 it held the lock while it sent and stored each body, which stalls
-settlement and template refresh for as long, so run an earlier build's
-import beside serving frontends only under a guard that kills it with
-SIGKILL once a settlement waiter has waited a few seconds: as a container's
-PID 1 it ignores SIGTERM. Until `import-audits` finishes,
-production `self-check` fails at audit completeness and skips its other checks
-(#734). `scripts/prism_legacy_import_admission_gate.sh` checks every other fact
-`self-check` checks, against the frontend's own environment on each host. It
-reports legacy completeness as pending, and fails on any incomplete native
-audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
-for an audit whose 2.x body can't be read on that host (#735), and the block's
-audit view answers 404.
+Nothing on the serving path reads a legacy row's canonical bytes. So frontends
+can admit traffic before `import-audits` finishes. From 3.0.0 and 3.1.0-rc.1,
+and so in 3.1.0, an import beside them holds `SETTLEMENT_LOCK` only to check the
+write guard and commit each row, except toward a lock holder that needs the very
+row being imported, which waits for that row's UPDATE
+([ledger operations](prism-ledger-ops.md)). It sends and stores the row first,
+within `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`;
+`PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS` bounds its wait for the lock and its hold.
+SIGTERM stops it (#765). Through 3.0.0-rc.6 it held the lock while it sent and
+stored each body, which stalls settlement and template refresh for as long, so
+run an earlier build's import beside serving frontends only under a guard that
+kills it with SIGKILL once a settlement waiter has waited a few seconds: as a
+container's PID 1 it ignores SIGTERM. Until `import-audits` finishes, production
+`self-check` fails at audit completeness, but runs and reports every local check
+first (#734). While the import runs, declare it for that run with
+`PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1`
+(`PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 make prism-self-check`, which passes
+it to the container, or `docker compose exec -e
+PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 prism-coordinator qbit-prism-server
+self-check`). `self-check` then reports `audit_completeness.status` as
+`legacy_import_pending`, with `pending_legacy_rows`, and passes on the rest. The
+declaration excuses only legacy rows, those with no share snapshot that the
+importer selects: a native row in `incomplete_native_rows` still fails, and an
+unreadable count is still `null` and a failure. Without the declaration the
+status is `incomplete` and production fails, as before. Don't leave it in the
+frontend's environment: it would hide an import that stopped. `status` is
+`complete` once nothing is missing.
+`scripts/prism_legacy_import_admission_gate.sh` checks the same facts against
+the frontend's own environment on each host, and also reports whether an
+`import-audits` session can be seen. Until a legacy row is imported,
+`/public/v1/artifacts/<sha>` answers a `no-store` 404 for an audit whose 2.x
+body file, or a share segment it names, isn't on that host, as the block's audit
+view does (#735). A body file that is there but can't be read or verified still
+answers 500, as does a body recorded under a URI scheme other than `file://`. A
+2.x audit-bundle.v2 body whose share segments are there is verified as
+`import-audits` verifies it, with the same parser and the same canonical-digest
+check: since #731's fix (#809) the route serves one whose parts digest is in
+2.x's order, and answers 500 for a parts digest of any other form, the
+sorted-key one included; one whose segments are missing answers 404 like any
+absent body.
 
 The gate's carry-forward integrity check runs the same report `self-check`
 runs. At production size it took about a minute before migration 026 (#737).
@@ -689,8 +709,50 @@ its partitions included, a `sync_seq` pull order on `qbit_pool_blocks` and
 `qbit_prism_jobs`, the carry-owner journal (`qbit_prism_node_roles`), the
 node identity and lineage, and the peer sync's cursor and conflict tables.
 Every new column has a constant default or none, so no table is rewritten and
-no constraint is validated by a scan; each `ALTER` holds its table's lock only
-for the catalog change, until the migration commits. Its three indexes are
+no constraint is validated by a scan. Earlier frontends may keep serving while
+it runs, as they do during the 3.1 pre-migrate, so `migrate` first locks every
+table 027 and 028 alter, the share ledger's partitions included, in one
+statement that waits at most 100 ms in all, and only then runs the two files:
+catalog changes, three small index builds and 028's check, then the commit.
+The statement takes the tables in order and keeps those it has while it waits
+for the next, but for those 100 ms at most, so a frontend statement waits
+behind it at most that long, well under PostgreSQL's 1 s `deadlock_timeout`
+and the 500 ms lock timeout of rc.6's metrics collector, and the migration
+gives up any lock cycle with a frontend within it, long before PostgreSQL
+would break the cycle by aborting one side (#789). That holds only while the
+bound stays well under `deadlock_timeout` and every frontend lock timeout. The migration history's lock, which every migration transaction takes
+first and a starting frontend's read waits for, is taken within the same
+100 ms. Because every table is locked first, the share ledger and
+`qbit_prism_share_hashes`, which 027 alters last, are held from the start of
+027 to the commit, through its index builds on `qbit_pool_blocks` and
+`qbit_prism_jobs` and 028's check, where before they were held only from
+their own `ALTER`. `qbit_pool_blocks` was held through those builds either
+way; it has a row per landed block, and the expiry prune keeps
+`qbit_prism_jobs` to its unexpired jobs, so both builds are small. In two
+runs of the R1 pre-migrate scenario 027 and 028 committed 372 and 558 ms after
+`migrate` started, and no share sent meanwhile waited over 39 ms for its
+answer. If a transaction holds the history or one of the tables past those
+100 ms, or
+PostgreSQL aborts the request as a deadlock (possible only with a
+`deadlock_timeout` below 100 ms), the attempt gives up, the whole migration
+transaction rolls back, holding nothing, and `migrate` tries again from the
+start after a backoff of 100 ms doubling to 2 s, for up to ten minutes.
+Nothing is recorded before the commit, so each attempt plans afresh from what
+it finds. Every connect that migrates goes through this, a start with
+`PRISM_POSTGRES_INIT_SCHEMA=1` included, and on a fully migrated database too,
+since each takes the history's lock: a start that could not take it used to
+fail after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s), and now tries again for up
+to ten minutes, logging a warning on its first attempt and every tenth. Then
+it stops with `refusing to wait any longer for the table locks of migration
+27, 28: <n> attempts over <s> s each waited 100 ms for <tables> and gave up,
+so that no serving frontend waits on the migrate longer than that. Nothing was
+changed: they are not recorded. Holding them now: pid <pid> (<state>, its
+transaction open <s> s) holding <tables>: <query>`, naming up to five
+transactions from `pg_locks` and `pg_stat_activity`, longest open first, each
+once with the tables it holds (a partition's lock counted as its table's), or
+with `the table locks of the migration history` and
+`qbit_prism_schema_migrations` when the history was held: end those
+transactions, or stop the frontends, and migrate again. Its three indexes are
 small: two are partial, over rows written after 027 only, and the third is
 `qbit_prism_jobs (origin_node, expires_at)` for the dual-mode expiry prune,
 built in the transaction over a table the expiry prune keeps to its unexpired
@@ -841,8 +903,10 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   never sees a partial one. Import re-verifies every sidecar against the
   digest, the recorded coinbase and the trusted ledger key.
 
-The post-GA follow-up is #709: 3.x accepting the escaped form, so that these
-bodies verify without sidecars.
+Since #709's fix, 3.x accepts the escaped form as well. A canonicalizer and an
+import built from a release that includes it verify these bodies without
+sidecars, and the tool reports them as `ok-in-3x`; a range digest of neither
+form is still refused.
 
 ### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
 
@@ -899,8 +963,13 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   against a copy of the tree, writing into the directory import will read.
   In the window, rerun them for the rows added since.
 
-The post-cutover follow-up is #731: 3.x recomputing the digest in 2.x's
-order, so that these bodies verify without sidecars.
+Since #731's fix, 3.x recomputes the digest as 2.x wrote it: each part's keys
+in insertion order and non-ASCII text escaped. A canonicalizer and an import
+built from a release that includes it verify these bodies without sidecars.
+The checker's statuses stay those of a release without the fix, so with such
+a release its `2x-order-only` rows are ones import accepts, and the sidecar
+tool reports them as `ok-in-3x` without writing a sidecar. A parts digest of
+any other form, including the sorted-key one, is refused.
 
 ### Migration 002's share-hash backfill, applied online
 
@@ -1879,6 +1948,51 @@ leaf by leaf; the index adds about 30 bytes per row. Run `migrate` from a
 shell where a long command is acceptable, rather than relying on a starting
 frontend, whose readiness stays down until the build completes.
 
+### Migration 032: the share append in one server-side call
+
+Migration 032 adds two functions and changes no table (#711, #738).
+`qbit_prism_append_share` appends a share that carries no block in one call:
+it takes `ORDER_LOCK` and then, each as a statement of its own, reads the
+write guard and the payout revision (`FOR SHARE` when the append is fenced),
+the share_id probe's inputs, the share_id probe and its fallback, and, for a
+new share, stamps it with the ledger clock and inserts the row and its header
+mapping: the statements a frontend sent itself before. The frontend then
+decides its pre-commit gate and sends `COMMIT`, so `ORDER_LOCK` is held for
+that one call and the `COMMIT`, where it was held for the lock statement,
+three statements and the `COMMIT`. A refusal is raised before any write, with
+a SQLSTATE from `QP001` to `QP007` that the frontend maps back to the error,
+and so to the answer to the miner, it gave before.
+
+`qbit_prism_ledger_clock` is the clock every share is stamped with and every
+window anchored at since #738: the greatest of the stored `ledger_clock_ms`,
+the database's clock and the newest stamp among the node's own shares. No
+share append writes the cluster row any more, so a snapshot held on the
+primary no longer leaves a dead version of the singleton per share; the
+snapshot anchor and the peer sync's own-log floor are the only writers of the
+stored clock. A share that carries a block, and the settlement's credit of a
+deferred share, keep their statements and stamp with the same clock.
+
+It is additive and applied in the migration transaction, with no capability
+and no shutdown proof, and it alters no table, so `migrate` takes no table
+lock for it up front (as for 027 and 028, [above](#supported-2xx-source-schemas)):
+`CREATE FUNCTION` takes no lock a serving frontend waits for. A frontend of an
+earlier release never calls either function. It goes on appending with its
+own statements beside a frontend that calls them, on one database and under
+the same `ORDER_LOCK`, as in a rolling upgrade or the pre-migrate, and the
+shares of both stay in `share_seq` order with rising stamps: the earlier
+frontend stores each stamp it takes in `ledger_clock_ms`, which
+`qbit_prism_ledger_clock` reads as its floor, and every stamp
+`qbit_prism_ledger_clock` gives is that floor, the database's clock, or an own
+share's stamp the floor already covers, all of which the earlier frontend
+reads in turn. The one exception needs the database's own clock to step back
+(an NTP step, or a promotion to a host whose clock lags) while both releases
+append: the earlier release reads only the stored floor and the database's
+clock, so a share it appends after the step can be stamped below one this
+release appended just before it, and an anchor it takes can be below that
+share, which then joins only windows anchored once the clock has passed its
+stamp again. Upgrade every frontend of a database before a promotion to a
+host whose clock may lag.
+
 ## Bring up native instances
 
 Start one instance first and verify readiness before admitting controlled miners
@@ -2034,8 +2148,14 @@ qbitd's `-rpcservertimeout`, and the idle timeout of any proxy in front of the
 node, above 20 seconds; qbitd's default is 30. Otherwise a call can be written
 into the idle close and fail after the connection existed, which `submitblock`
 records as an unknown outcome.
-`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
-ambiguous submission results retain the durable candidate for reconciliation.
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`,
+its connect included. A new connection gets at most half of it, and never
+more than 4.9 s (`rpc::relay_connect_budget`). A call still waiting for its
+connection then is never sent, and the block is offered again (#762); a call
+that took a pooled connection meanwhile was sent on it, and an unknown outcome
+stays unknown. That connect runs on, and once established serves the next
+call while the node keeps it open.
+Ambiguous submission results retain the durable candidate for reconciliation.
 Candidate claims renew throughout processing, including waits for build workers.
 Losing the lease cancels the attempt; the durable row remains recoverable.
 Fresh candidates take priority over retries, with periodic oldest-due selection
@@ -2501,7 +2621,7 @@ The checks, each reported as PASS or FAIL:
 | window prior balances unchanged | the snapshot's prior balances equal `2.x.x`'s `qbit_current_carry_forward_balances()` |
 | frontend ready, first job issued | `/healthz` answers 200 and the frontend sends `mining.notify` |
 | API balances equal the source | every address's balances served by the running frontend equal the source's |
-| self-check, audit completeness | `self-check` exits 0 and reports both completeness counts 0 |
+| self-check, audit completeness | `self-check` exits 0 and reports audit completeness `complete`, every count 0 |
 | history unchanged after the frontend ran | once the frontend has started, reconciled and stopped, every fact above except retained worker difficulty (which it prunes past its TTL) is still the source's |
 
 Run it from a checkout of the release to be deployed, with a Rust toolchain

@@ -204,7 +204,7 @@ impl Ledger {
         let mut tx = self.begin().await?;
         // Fence authority writers (each takes the row FOR UPDATE first; see
         // `lock_cluster_authority`) and blob GC before ALL authority checks,
-        // without blocking the share append's non-key clock UPDATE. No
+        // without blocking the snapshot anchor's non-key clock UPDATE. No
         // advisory lock may be acquired after this shared row fence. The one
         // exception is migration 027's sync barrier, which the `sync_seq`
         // default takes shared: its only exclusive holder is the peer's

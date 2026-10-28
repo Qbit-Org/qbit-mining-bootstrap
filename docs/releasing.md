@@ -1,7 +1,7 @@
 # Publishing a release
 
 `main` is the release promotion branch. `3.x.x` is the development branch and
-production line for the 3.x series, whose current release is 3.1.0; `2.x.x` is
+production line for the 3.x series, whose current release is 3.1.1; `2.x.x` is
 the maintenance branch of the 2.x series. A release cut from an earlier point
 of a development branch gets its own branch at that cutoff, as `3.0.x` does
 for 3.0.0. A version is published only when its tag and GitHub release exist.
@@ -46,6 +46,12 @@ also keeps #781's disposition-poll change: 3.1.0 made #781's tokio update
 itself (#782) but not the poll change, since it changed no runtime code after
 its release candidate. It adds no tag. #779 records the 400k two-frontend L3
 failures on 3.0.0's tree; 3.1.0 doesn't fix their cause, #716.
+
+3.1.1, a patch release of 3.1.0, was prepared on `3.x.x` (#810, `60309f95`)
+and is tagged on the promoted `main` commit, as this guide's default is: its
+notes were undated at #810's squash. `3.x.x` already carried everything
+`main` had, since #786 merged 3.1.0's promotion back, so the promotion gives
+`main` `3.x.x`'s tree at `60309f95` plus the release date and this record.
 
 Merge the intended development cutoff into the promotion branch and retain
 fixes already made during promotion review. The repository allows only squash
@@ -97,12 +103,18 @@ will take patch releases. Preserve subsequent development and resolve metadata
 and notes deliberately; do not reset or force-push the shared branch. Run its
 checks before merging.
 
-For 3.0.0 and 3.1.0 this step is still outstanding and required: neither
-`3.x.x` nor `3.0.x` has merged a released `main`. Both lack this guide, the
-README banner and #781's disposition-poll change; `3.0.x` also lacks its
-tokio update. `3.x.x` also
-lacks the local copy of the released 3.0.0 notes. The next release from
-either branch must not drop them.
+For 3.1.0 and 3.0.0 this step merges the released `main` (`b9187551`, #783)
+into `3.x.x`, and `main` at `b9579c67` into `3.0.x`. That commit is 3.0.0's
+promotion (#778) plus #781, before 3.1.0's, because a 3.0 patch branch must
+not take the 3.1 dual writer. Both branches gain this guide, the README banner
+and #781's disposition-poll change. `3.0.x` also gains #781's tokio update,
+and `3.x.x` the released 3.0.0 notes in place of its pre-release copy. The
+next release from either branch must not drop them.
+
+For 3.1.1 this step merges the released `main` back into `3.x.x`. It brings
+only the promotion's edits: the release date in the 3.1.1 notes and this
+guide's 3.1.1 record. `3.0.x` takes nothing from it, since 3.1.1 is a 3.1
+release.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization
