@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, PoisonError, Weak,
     },
+    task::{Poll, Waker},
     time::Duration,
 };
 
@@ -71,7 +74,9 @@ impl RpcReplyError {
 pub struct RpcNotSentError {
     pub method: String,
     /// The operating system's reason, when the failure carries one (such as
-    /// "connection refused"), else "connect failed". Never the URL.
+    /// "connection refused"); for a connect cut at its call's connect
+    /// deadline, that budget and the call's deadline (#762); else "connect
+    /// failed". Never the URL.
     pub cause: String,
 }
 
@@ -80,6 +85,10 @@ impl RpcNotSentError {
         let mut source = std::error::Error::source(error);
         let mut cause = None;
         while let Some(error) = source {
+            if let Some(cut) = error.downcast_ref::<ConnectCut>() {
+                cause = Some(cut.to_string());
+                break;
+            }
             if let Some(io) = error.downcast_ref::<std::io::Error>() {
                 cause = Some(io.kind().to_string());
             }
@@ -128,76 +137,238 @@ pub const QBITD_DEFAULT_RPCSERVERTIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// [`RELAY_METHODS`] calls share the bounded pool. A new connection for each
 /// would put a connect inside every `submitblock`'s short deadline, and a
-/// connect that outlasts half of it returns the block unsent (#762).
+/// connect that outlasts its share of it returns the block unsent (#762).
 pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const _: () = assert!(POOL_IDLE_TIMEOUT.as_secs() < QBITD_DEFAULT_RPCSERVERTIMEOUT.as_secs());
 
+/// How long [`Rpc`]'s client gives a new connection before its connect fails.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A [`RELAY_METHODS`] call with its own deadline may spend the first
+/// `1 / RELAY_CONNECT_DIVISOR` of it, the first half, obtaining its
+/// connection (#762); see [`relay_connect_budget`].
+pub const RELAY_CONNECT_DIVISOR: u32 = 2;
+
+/// How long a [`RELAY_METHODS`] call with its own `deadline` may spend
+/// obtaining a connection before it fails as [`RpcNotSentError`] (#762). The
+/// rest of the deadline is the request's.
+pub fn relay_connect_budget(deadline: Duration) -> Duration {
+    deadline / RELAY_CONNECT_DIVISOR
+}
+
+/// The connect deadline of the relaying call a task is sending (#762).
+#[derive(Clone, Copy)]
+struct CallConnectDeadline {
+    at: tokio::time::Instant,
+    /// The call's whole deadline, named by the reason of a cut connect.
+    deadline: Duration,
+}
+
 tokio::task_local! {
-    /// The instant by which the relaying call this task is sending must have
-    /// its connection (#762); [`ConnectDeadline`] reads it.
-    static CONNECT_DEADLINE: tokio::time::Instant;
+    /// Read by [`ConnectBound`].
+    static CONNECT_DEADLINE: CallConnectDeadline;
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// [`Rpc`]'s connector layer (#762). A connect that a relaying call with its
-/// own deadline starts fails, as a connect error, once that call's
-/// [`CONNECT_DEADLINE`] passes. hyper reports a failed connect as its
-/// `Connect` error kind only to a request that has not been handed a
-/// connection, so the call fails as [`RpcNotSentError`]. A request that was
-/// handed one meanwhile, from the pool, goes on: the connect it no longer
-/// waits for fails on its own, and the call's outcome is that request's.
-/// Every other connect keeps only the client's connect timeout.
-#[derive(Clone, Copy)]
-struct ConnectDeadlineLayer;
+/// The reason of a connect [`ConnectBound`] stopped waiting for at its call's
+/// connect deadline (#762). [`RpcNotSentError`] carries it, so that the
+/// offer's `last_error` tells it apart from every other connect failure.
+#[derive(Debug, thiserror::Error)]
+#[error("no connection within {budget:?}, its share of the call's {deadline:?} deadline")]
+struct ConnectCut {
+    budget: Duration,
+    deadline: Duration,
+}
 
-impl<S> tower::Layer<S> for ConnectDeadlineLayer {
-    type Service = ConnectDeadline<S>;
+/// [`Rpc`]'s connector layer (#762). A relaying call with its own deadline
+/// waits for a new connection only until its [`CONNECT_DEADLINE`]; it then
+/// fails as a connect error. hyper reports a failed connect as its `Connect`
+/// error kind only to a request that has not been handed a connection, so the
+/// call fails as [`RpcNotSentError`]. A request handed a pooled connection
+/// meanwhile goes on, and its outcome is that request's.
+///
+/// The connect itself is not abandoned. It runs in its own task, bounded by
+/// the client's [`CONNECT_TIMEOUT`]. One established after its call stopped
+/// waiting, whether the call was cut or hyper moved the connect to the
+/// background when the request took a pooled connection, is kept as the
+/// spare: the next connect the client starts takes it at once, if it is
+/// younger than the client's idle bound and the node has not closed it. So
+/// the offer that follows a cut, or any call before it, finds the connection
+/// ready. Every connect of an [`Rpc`] client is to its one node (a wallet
+/// client changes only the path), so the spare serves any of them. Every
+/// other connect runs as before, unless it can take the spare.
+struct ConnectBoundLayer<Target> {
+    idle_timeout: Duration,
+    target: std::marker::PhantomData<fn(Target)>,
+}
 
-    fn layer(&self, inner: S) -> Self::Service {
-        ConnectDeadline(inner)
+impl<Target> ConnectBoundLayer<Target> {
+    fn new(idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout,
+            target: std::marker::PhantomData,
+        }
     }
 }
 
-#[derive(Clone)]
-struct ConnectDeadline<S>(S);
+impl<Target> Clone for ConnectBoundLayer<Target> {
+    fn clone(&self) -> Self {
+        Self::new(self.idle_timeout)
+    }
+}
 
-impl<S, Target> tower::Service<Target> for ConnectDeadline<S>
+impl<S, Target> tower::Layer<S> for ConnectBoundLayer<Target>
 where
-    S: tower::Service<Target, Error = BoxError>,
-    S::Response: Send + 'static,
-    S::Future: Send + 'static,
+    S: tower::Service<Target>,
 {
-    type Response = S::Response;
-    type Error = BoxError;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>>;
+    type Service = ConnectBound<S, S::Response>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), BoxError>> {
-        self.0.poll_ready(cx)
+    fn layer(&self, inner: S) -> Self::Service {
+        ConnectBound {
+            inner,
+            idle_timeout: self.idle_timeout,
+            spare: Arc::new(Mutex::new(Spare {
+                generation: 0,
+                conn: None,
+            })),
+        }
+    }
+}
+
+/// The connection a connect established after its call stopped waiting.
+struct Spare<C> {
+    /// Advanced by each park, so that an expiry drops only its own connection.
+    generation: u64,
+    conn: Option<C>,
+}
+
+struct ConnectBound<S, C> {
+    inner: S,
+    idle_timeout: Duration,
+    /// Shared by every clone: hyper clones the connector for each connect.
+    spare: Arc<Mutex<Spare<C>>>,
+}
+
+impl<S: Clone, C> Clone for ConnectBound<S, C> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            idle_timeout: self.idle_timeout,
+            spare: self.spare.clone(),
+        }
+    }
+}
+
+impl<S, C> ConnectBound<S, C>
+where
+    C: hyper::rt::Read + Unpin + Send + 'static,
+{
+    fn take_spare(&self) -> Option<C> {
+        let mut conn = self
+            .spare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .conn
+            .take()?;
+        idle_and_open(&mut conn).then_some(conn)
+    }
+
+    /// Keep `conn` as the spare, in place of an older one, until the idle
+    /// bound passes.
+    fn park(spare: &Arc<Mutex<Spare<C>>>, conn: C, idle_timeout: Duration) {
+        let (generation, older) = {
+            let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
+            spare.generation += 1;
+            (spare.generation, spare.conn.replace(conn))
+        };
+        drop(older);
+        let spare: Weak<Mutex<Spare<C>>> = Arc::downgrade(spare);
+        tokio::spawn(async move {
+            tokio::time::sleep(idle_timeout).await;
+            let Some(spare) = spare.upgrade() else {
+                return;
+            };
+            let expired = {
+                let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
+                if spare.generation == generation {
+                    spare.conn.take()
+                } else {
+                    None
+                }
+            };
+            drop(expired);
+        });
+    }
+}
+
+/// Whether a connection that has carried no request is still open: a read
+/// finds neither the node's close nor bytes it sent unasked. A request
+/// written to a connection the node closed fails after the write, with its
+/// outcome unknown, so such a connection is never handed out.
+fn idle_and_open<C: hyper::rt::Read + Unpin>(conn: &mut C) -> bool {
+    let mut byte = [std::mem::MaybeUninit::uninit()];
+    let mut buf = hyper::rt::ReadBuf::uninit(&mut byte);
+    let mut cx = std::task::Context::from_waker(Waker::noop());
+    Pin::new(conn)
+        .poll_read(&mut cx, buf.unfilled())
+        .is_pending()
+}
+
+impl<S, Target, C> tower::Service<Target> for ConnectBound<S, C>
+where
+    S: tower::Service<Target, Response = C, Error = BoxError>,
+    S::Future: Send + 'static,
+    C: hyper::rt::Read + Unpin + Send + 'static,
+{
+    type Response = C;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<C, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), BoxError>> {
+        self.inner.poll_ready(cx)
     }
 
     /// hyper starts a connect from the task of the request that needs it, so
     /// the deadline read here is that request's call's.
     fn call(&mut self, target: Target) -> Self::Future {
-        let deadline = CONNECT_DEADLINE.try_with(|deadline| *deadline).ok();
-        let connecting = self.0.call(target);
+        if let Some(conn) = self.take_spare() {
+            return Box::pin(std::future::ready(Ok(conn)));
+        }
+        let connecting = self.inner.call(target);
+        let Ok(bound) = CONNECT_DEADLINE.try_with(|bound| *bound) else {
+            return Box::pin(connecting);
+        };
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let (spare, idle_timeout) = (self.spare.clone(), self.idle_timeout);
+        tokio::spawn({
+            let spare = spare.clone();
+            async move {
+                let connected = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
+                    .await
+                    .unwrap_or_else(|_| Err(tower::timeout::error::Elapsed::new().into()));
+                if let Err(Ok(conn)) = sender.send(connected) {
+                    Self::park(&spare, conn, idle_timeout);
+                }
+            }
+        });
         Box::pin(async move {
-            let Some(deadline) = deadline else {
-                return connecting.await;
-            };
-            tokio::time::timeout_at(deadline, connecting)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "the connect outlasted half the call's deadline",
-                    )
+            match tokio::time::timeout_at(bound.at, &mut receiver).await {
+                Ok(Ok(connected)) => connected,
+                Ok(Err(_)) => Err("the connect task ended without a result".into()),
+                Err(_) => {
+                    // A connect that finished at the deadline is kept too.
+                    receiver.close();
+                    if let Ok(Ok(conn)) = receiver.try_recv() {
+                        Self::park(&spare, conn, idle_timeout);
+                    }
+                    Err(ConnectCut {
+                        budget: relay_connect_budget(bound.deadline),
+                        deadline: bound.deadline,
+                    }
                     .into())
-                })
+                }
+            }
         })
     }
 }
@@ -272,10 +443,10 @@ impl Rpc {
             "QBIT RPC URL must use http(s)"
         );
         let client = node_client_builder()
-            .connect_timeout(Duration::from_secs(5))
+            .connect_timeout(CONNECT_TIMEOUT)
             .timeout(timeout)
             .pool_idle_timeout(pool_idle_timeout)
-            .connector_layer(ConnectDeadlineLayer)
+            .connector_layer(ConnectBoundLayer::new(pool_idle_timeout))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
@@ -302,10 +473,11 @@ impl Rpc {
 
     /// [`Rpc::call`] with its own deadline, `timeout`, in place of the
     /// client's. The deadline bounds the whole call, its connect included.
-    /// A [`RELAY_METHODS`] call spends at most the first half of it obtaining
-    /// a connection (#762): a connect still running then fails as
+    /// A [`RELAY_METHODS`] call spends at most [`relay_connect_budget`] of it
+    /// obtaining a connection (#762): still connecting then, it fails as
     /// [`RpcNotSentError`], whereas the deadline itself cannot tell a connect
-    /// from a request already written, and leaves the outcome unknown.
+    /// from a request already written, and leaves the outcome unknown. A
+    /// relaying call without its own deadline keeps the client's.
     pub async fn call_timeout(
         &self,
         method: &str,
@@ -318,9 +490,13 @@ impl Rpc {
             }
             .into());
         }
-        let connect_deadline = timeout
-            .filter(|_| RELAY_METHODS.contains(&method))
-            .map(|timeout| tokio::time::Instant::now() + timeout / 2);
+        let connect_deadline =
+            timeout
+                .filter(|_| RELAY_METHODS.contains(&method))
+                .map(|deadline| CallConnectDeadline {
+                    at: tokio::time::Instant::now() + relay_connect_budget(deadline),
+                    deadline,
+                });
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut request = self
             .client

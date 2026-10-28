@@ -1,7 +1,7 @@
 //! #522 on a real PostgreSQL: a `submitblock` whose connection was never
 //! established returns its reservation to `pending` and the block is offered
 //! once the node is reachable again, exactly once, as does one whose connect
-//! outlasted half its deadline (#762); a failure after the request was
+//! outlasted its share of the deadline (#762); a failure after the request was
 //! written, the deadline included, stays unknown and is never offered again;
 //! and a crash between the refused connect and the row update recovers as
 //! delivery unknown. The offering frontend reaches the fixture's node through
@@ -429,10 +429,10 @@ async fn a_reset_after_the_submitblock_was_written_stays_unknown_and_is_never_of
 /// #762: the frontend has no connection to its node, and the one it opens
 /// cannot finish within the `submitblock` deadline: here the node never
 /// completes the TLS handshake, as a lost SYN, a full accept queue or a slow
-/// name lookup would hold a plain connect. The connect fails at half the
-/// deadline, so the request was never written: the row returns to `pending`,
-/// as after a refused connection, and the next claim lands the block with one
-/// `submitblock`. Before #762 the deadline fired during the connect, the
+/// name lookup would hold a plain connect. The call stops waiting for it at
+/// half the deadline, so the request was never written: the row returns to
+/// `pending`, with that reason, as after a refused connection, and the next
+/// claim lands the block with one `submitblock`. Before #762 the deadline fired during the connect, the
 /// offer was recorded as unknown, and the block was never offered again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_submitblock_whose_connect_outlasts_the_submit_deadline_returns_the_row_to_pending_and_lands_the_block_once(
@@ -481,7 +481,7 @@ async fn a_submitblock_whose_connect_outlasts_the_submit_deadline_returns_the_ro
         );
         ensure!(
             reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX)
-                && reason.contains("timed out")
+                && reason.contains("no connection within 500ms, its share of the call's 1s deadline")
                 && reason.contains("candidate-slow-connect"),
             "the not-sent attempt is not recorded: {reason}"
         );
