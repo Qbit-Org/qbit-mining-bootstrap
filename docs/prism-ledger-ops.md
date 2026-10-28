@@ -240,25 +240,40 @@ revision again. If such a bump commits between an observation and its write,
 the write is refused before it changes anything.
 
 - **Retried in place.** A refused write is a lost race, not a failure. The
-  frontend observes the chain again and writes again at the new revision, in
+  frontend waits a short jittered backoff (about 50 ms, doubling with each
+  retry), observes the chain again and writes again at the new revision, in
   the same attempt, and logs one INFO line per retry:
 
   ```
   post-offer write lost a payout revision race; observing again and writing at the new revision
   ```
 
-  Its fields name the `block`, the `write` (`landing`, `finish` or
-  `orphan settlement`), the `observed_revision` the write was fenced on, the
-  `current_revision` that refused it, and the `retry` number. The row then
-  finishes as usual: no `ALERT`, no `reconciliation`, no extra attempt. A
-  landing that committed is never repeated; only the refused write is. The
-  block's confirmation and deferred-share credit commit once, whichever
-  frontend commits them first, so a finish that lost the race to a sibling's
-  confirmation records only the row's completion. Nothing to do.
-- **When the race outlasts the retries.** One post-offer phase retries at
-  most 3 times, and starts no retry 60 s or more after its first lost race (a
-  write already running is never cut off). A race lost beyond that falls back
-  to the behaviour before #630, with one of these ERROR lines:
+  Its fields name the `block`, the `phase` (`landing`, or `settlement` for the
+  finish or the orphan settlement), the `observed_revision` the write was
+  fenced on, the `current_revision` that refused it, the `retry` number and
+  the `backoff_ms` it waits. The row then finishes as usual: no `ALERT`, no
+  `reconciliation`, no extra attempt. The landing verifies the block's audit
+  once and retries only its transaction. A landing that committed is never
+  repeated; only the refused write is. The block's confirmation and
+  deferred-share credit commit once, whichever frontend commits them first, so
+  a finish that lost the race to a sibling's confirmation records only the
+  row's completion. Nothing to do. `qbit_prism_post_offer_revision_races_total`
+  counts every retry (`outcome="retried"`) and every spent budget
+  (`outcome="spent"`) by `phase`: the race rate the ALERT lines used to show.
+- **A block that left the active chain.** A landing retry lands only a block
+  its fresh observation still shows active. If the block was disconnected
+  between the lost race and the retry, nothing lands, and the row is settled
+  in `reconciliation` with a WARN `offered candidate awaits chain
+  reconciliation`, reason `block left the active chain (tip …) while its
+  landing retried a lost payout revision race …`, like any block that is not
+  active after its offer. Its next claim lands the audit and settles the row
+  from what the chain then shows. Until then the row has no landed audit, so
+  the landing-failed age counts it.
+- **When the race outlasts the retries.** The landing and the settlement each
+  have their own budget: at most 3 retries, none started 60 s or more after
+  that phase's first lost race (a write already running is never cut off). A
+  race lost beyond that falls back to the behaviour before #630, with one of
+  these ERROR lines:
 
   ```
   ALERT: offered candidate could not land; kept for reconciliation, never offered again
@@ -269,10 +284,12 @@ the write is refused before it changes anything.
   `post-offer processing failed (…)` on the second; the parentheses hold the
   offer's outcome, usually `node accepted the offer`, or `offer outcome
   unknown: …` for a recovered reservation or an adopted block. It then says
-  `the post-offer <write> lost a payout revision race with this phase's
-  retries spent (…)` and ends `payout revision changed while observing chain
-  state`. The refused writes changed nothing, the row keeps its offer record
-  and is never offered again, and its next claim (at the `next_attempt` that
+  `the post-offer <phase> lost a payout revision race and is not retried
+  again:` and why (`all 3 of its retries are used`, or `its 60 s retry
+  deadline from the first lost race has passed, after N of at most 3
+  retries`), and ends `payout revision changed while observing chain state`.
+  The refused writes changed nothing, the row keeps its offer record and is
+  never offered again, and its next claim (at the `next_attempt` that
   `candidates list` shows, the `reconciliation` backoff above) observes again,
   lands the audit if it had not landed, and settles the row `submitted`, or
   `orphaned` once the chain proves a competitor. That claim retries a race the
@@ -283,8 +300,8 @@ the write is refused before it changes anything.
   `last_error` names another reason; then handle it as any other
   `reconciliation` row. Never try to abandon it: `candidates abandon` refuses
   an offered row (exit 3). The revision moving before every write of a phase
-  is not the sibling race this retry absorbs. If the ALERT recurs, look for
-  what is moving the revision that often.
+  is not the sibling race this retry absorbs. If the ALERT recurs, or
+  `outcome="spent"` grows, look for what is moving the revision that often.
 - **Alerts.** A race retried in place never leaves the row's ordinary
   lifecycle: the row counts toward the candidate gauges only while its attempt
   runs, as every attempt's row does. A row that falls back to
@@ -296,9 +313,10 @@ the write is refused before it changes anything.
   has many attempts behind it (its retry waits `10 × attempt_count` s), can
   fire one anyway. If one fires, look at the row.
 
-`candidates recover` lands the same way, retrying a landing that loses the
-race; its finish is not retried, so a recovery that loses the race at the
-finish stops with that reason and can be run again.
+`candidates recover` lands and finishes the same way: both its landing and its
+finish retry a lost race within their own budgets, and it counts the block
+toward `qbit_prism_blocks_total` only when its finish was the block's first
+confirmation.
 
 ### Candidate commands
 

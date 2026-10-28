@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 mod append_admission;
 mod blocks;
-pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
+pub use blocks::{BlockObservation, FanoutClaim, PoolBlock, VerifiedLanding};
 /// Share ledger retention: the operator commands behind `share-archive`.
 pub mod archive;
 mod audit;

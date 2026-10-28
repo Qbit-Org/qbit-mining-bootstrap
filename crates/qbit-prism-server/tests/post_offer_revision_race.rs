@@ -14,7 +14,10 @@
 //!   balances, payout entries and credits equal the no-race case's;
 //! - a race that outlasts the phase's retry budget, and any error that is not
 //!   a revision race, still settle the row in reconciliation with today's
-//!   `ALERT`, and the next attempt finishes it with the same accounting.
+//!   `ALERT`, and the next attempt finishes it with the same accounting;
+//! - the landing and the settlement each have their own budget, a landing
+//!   retry lands nothing once the block has left the active chain, and
+//!   `candidates recover` retries its finish the same way.
 //!
 //! The interleaving is forced at the node, not by timing: the coordinator is
 //! pointed at a front for the scripted node (`support/scripted_node.rs`)
@@ -34,7 +37,8 @@ use qbit_prism_server::{
     config::Config,
     coordinator::{Coordinator, TipState},
     ledger::{
-        BlockObservation, Candidate, CandidateClaim, Ledger, SignerKeys, Snapshot, WindowRef,
+        BlockObservation, Candidate, CandidateClaim, Ledger, RecoveryClaim, RecoveryTakeover,
+        SignerKeys, Snapshot, WindowRef,
     },
     metrics::Metrics,
 };
@@ -103,6 +107,14 @@ enum Step {
     SiblingConfirms(String),
     /// Answer with an RPC error: a node failure, not a revision race.
     Fail,
+    /// Move the payout revision first, and replace the candidate's block at
+    /// its height with this competitor just before the observation after
+    /// this one starts: the node's own reorg, between a lost race and the
+    /// retry that observes again. The reorg waits for that observation's
+    /// first `getblockchaininfo`, the second after this call (this
+    /// observation's readiness proof makes the first), so this observation
+    /// still sees one coherent tip.
+    BumpThenReorg(String),
 }
 
 struct FrontState {
@@ -118,6 +130,11 @@ struct FrontState {
     observations: AtomicUsize,
     /// A step that could not be carried out; the test fails on any.
     failures: std::sync::Mutex<Vec<String>>,
+    /// The scripted node's chain, for a scripted reorg.
+    chain: Arc<Mutex<ChainState>>,
+    /// A reorg to this competitor, made before the `getblockchaininfo`
+    /// this many calls from now.
+    reorg: std::sync::Mutex<Option<(usize, String)>>,
 }
 
 impl FrontState {
@@ -151,6 +168,10 @@ impl FrontState {
                 );
             }
             Step::Fail => return Ok(Some(json!({"code": -1, "message": INJECTED}))),
+            Step::BumpThenReorg(competitor) => {
+                Box::pin(self.take(Step::Bump)).await?;
+                *self.reorg.lock().unwrap() = Some((2, competitor));
+            }
         }
         Ok(None)
     }
@@ -161,6 +182,22 @@ async fn relay(
     axum::Json(request): axum::Json<Value>,
 ) -> axum::Json<Value> {
     let error = |error: Value| json!({"id": request["id"], "result": null, "error": error});
+    if request["method"] == "getblockchaininfo" {
+        let due = {
+            let mut reorg = front.reorg.lock().unwrap();
+            match reorg.as_mut() {
+                Some((calls, _)) if *calls > 1 => {
+                    *calls -= 1;
+                    None
+                }
+                Some(_) => reorg.take().map(|(_, competitor)| competitor),
+                None => None,
+            }
+        };
+        if let Some(competitor) = due {
+            front.chain.lock().await.reorg_to(HEIGHT, &competitor);
+        }
+    }
     if request["method"] == "getblockhash" && request["params"][0].as_u64() == Some(HEIGHT) {
         front.observations.fetch_add(1, Ordering::SeqCst);
         let step = front
@@ -190,6 +227,16 @@ async fn relay(
             .await
     };
     match forwarded.await {
+        // The scripted node's header names only the parent; `candidates
+        // recover` also reads the block's height, which the chain holds.
+        Ok(mut reply) if request["method"] == "getblockheader" && reply["result"].is_object() => {
+            let hash = request["params"][0].as_str().unwrap_or_default();
+            let chain = front.chain.lock().await;
+            if let Some(height) = (0..=chain.height).find(|&at| chain.block_at(at) == Some(hash)) {
+                reply["result"]["height"] = json!(height);
+            }
+            axum::Json(reply)
+        }
         Ok(reply) => axum::Json(reply),
         Err(failure) => {
             let failure = format!("front could not reach the scripted node: {failure}");
@@ -206,15 +253,17 @@ struct Front {
 }
 
 impl Front {
-    async fn open(upstream: &str, pool: PgPool) -> Result<Self> {
+    async fn open(node: &ScriptedNode, pool: PgPool) -> Result<Self> {
         let state = Arc::new(FrontState {
-            upstream: upstream.to_owned(),
+            upstream: node.url.clone(),
             client: reqwest::Client::builder().no_proxy().build()?,
             pool,
             sibling: OnceLock::new(),
             script: Mutex::default(),
             observations: AtomicUsize::new(0),
             failures: std::sync::Mutex::default(),
+            chain: node.state.clone(),
+            reorg: std::sync::Mutex::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/", listener.local_addr()?);
@@ -270,7 +319,7 @@ impl Fixture {
     ) -> Result<(PgPool, Arc<Coordinator>, ScriptedNode, Front)> {
         let pool = PgPool::connect(&database.url).await?;
         let node = ScriptedNode::open(ChainState::new(&PARENT.repeat(32), HEIGHT - 1)).await?;
-        let front = Front::open(&node.url, pool.clone()).await?;
+        let front = Front::open(&node, pool.clone()).await?;
         let config = Config {
             database_url: database.url.clone(),
             instance_id: "revision-race".into(),
@@ -440,14 +489,36 @@ impl Fixture {
     /// Run one attempt on `claim` with `script` loaded into the front,
     /// capturing the attempt's events at INFO and above.
     async fn process(&self, claim: &CandidateClaim, script: Vec<Step>) -> Result<Attempt> {
+        self.scripted(script, self.coordinator.process_candidate(claim))
+            .await
+    }
+
+    /// The operator's `candidates recover` for `block_hash`, claimed and run
+    /// as the command runs it, with `script` loaded into the front.
+    async fn recover(&self, block_hash: &str, script: Vec<Step>) -> Result<Attempt> {
+        let deadline = tokio::time::Instant::now() + PROCESS_BOUND;
+        let claimed = self
+            .coordinator
+            .claim_candidate_for_recovery(block_hash, deadline, RecoveryTakeover::Observed)
+            .await?;
+        let RecoveryClaim::Claimed(claim) = claimed else {
+            anyhow::bail!("the row was not claimed for recovery: {claimed:?}");
+        };
+        self.scripted(script, self.coordinator.recover_candidate(&claim, deadline))
+            .await
+    }
+
+    async fn scripted(
+        &self,
+        script: Vec<Step>,
+        work: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<Attempt> {
         *self.front.state.script.lock().await = script.into();
         let before = self.front.state.observations.load(Ordering::SeqCst);
         let capture = LogCapture::default();
         tokio::time::timeout(
             PROCESS_BOUND,
-            self.coordinator
-                .process_candidate(claim)
-                .with_subscriber(capturing_subscriber(&capture)),
+            work.with_subscriber(capturing_subscriber(&capture)),
         )
         .await
         .context("the attempt did not complete")??;
@@ -491,6 +562,20 @@ impl Fixture {
         .bind(block_hash)
         .fetch_one(&self.pool)
         .await?)
+    }
+
+    /// `qbit_prism_post_offer_revision_races_total` for `phase` and
+    /// `outcome`, as this frontend renders it.
+    fn races(&self, phase: &str, outcome: &str) -> String {
+        let series = format!(
+            "qbit_prism_post_offer_revision_races_total{{phase=\"{phase}\",outcome=\"{outcome}\"}} "
+        );
+        self.coordinator
+            .metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str()).map(str::to_owned))
+            .unwrap_or_default()
     }
 
     async fn revision(&self) -> Result<i64> {
@@ -677,7 +762,7 @@ async fn a_finish_that_loses_the_race_to_a_sibling_confirmation_settles_in_place
         ensure!(
             retries.len() == 1
                 && retries[0]["level"] == "INFO"
-                && retries[0]["fields"]["write"] == "finish"
+                && retries[0]["fields"]["phase"] == "settlement"
                 && retries[0]["fields"]["block"] == hash.as_str(),
             "the lost race was not logged once, below ALERT, for the finish: {:?}",
             attempt.events
@@ -742,7 +827,7 @@ async fn a_landing_that_loses_the_race_lands_once_in_place() -> Result<()> {
         ensure!(
             retries.len() == 1
                 && retries[0]["level"] == "INFO"
-                && retries[0]["fields"]["write"] == "landing",
+                && retries[0]["fields"]["phase"] == "landing",
             "the lost race was not logged once, below ALERT, for the landing: {:?}",
             attempt.events
         );
@@ -756,6 +841,11 @@ async fn a_landing_that_loses_the_race_lands_once_in_place() -> Result<()> {
         );
         ensure!(fixture.revision().await? - before == control.revision_moves + 1);
         ensure!(fixture.coordinator.blocks.load(Ordering::Relaxed) == 1);
+        ensure!(
+            (fixture.races("landing", "retried"), fixture.races("landing", "spent"))
+                == ("1".into(), "0".into()),
+            "the retried landing was not counted once"
+        );
         let accounting = fixture.accounting().await?;
         ensure!(
             accounting == control.accounting,
@@ -809,11 +899,16 @@ async fn a_race_that_outlasts_the_retry_budget_keeps_the_alert_and_reconciles() 
             row["state"] == "reconciliation"
                 && reason.starts_with(qbit_prism_server::ledger::LANDING_FAILED_REASON_PREFIX)
                 && reason.ends_with(RACE)
-                && reason.contains("retries spent"),
+                && reason.contains("is not retried again: all 3 of its retries are used"),
             "the row was not reconciled with the spent race as its reason: {row}"
         );
         ensure!(alerts[0]["fields"]["reason"] == reason);
         ensure!(fixture.accounting().await?.audits == 0, "a refused landing wrote an audit");
+        ensure!(
+            (fixture.races("landing", "retried"), fixture.races("landing", "spent"))
+                == (RETRIES.to_string(), "1".into()),
+            "the retries and the spent budget were not counted"
+        );
 
         let next = fixture.retry(&hash, vec![]).await?;
         ensure!(next.alerts().is_empty() && next.messages(RETRY_LINE).is_empty());
@@ -949,7 +1044,7 @@ async fn an_orphan_settlement_retries_a_race_but_not_a_genuine_refusal() -> Resu
         ensure!(
             retries.len() == 1
                 && retries[0]["level"] == "INFO"
-                && retries[0]["fields"]["write"] == "orphan settlement",
+                && retries[0]["fields"]["phase"] == "settlement",
             "the orphan settlement's lost race was not retried once: {:?}",
             attempt.events
         );
@@ -983,6 +1078,202 @@ async fn an_orphan_settlement_retries_a_race_but_not_a_genuine_refusal() -> Resu
                 .get(&hash)
                 .map(Vec::len)
                 == Some(1)
+        );
+        Ok(())
+    }
+    .await;
+    fixture.close(result).await
+}
+
+/// A landing retry lands only a block its fresh observation still shows
+/// active. The revision moves before the first landing, and the node reorgs
+/// a competitor in at the block's height before the retry observes again:
+/// the retry lands nothing, logs no `ALERT`, and the row is settled in
+/// reconciliation as a block not active after its offer. The next attempt
+/// lands the audit, as every first landing does, and keeps the row in
+/// reconciliation for the chain to decide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_landing_retry_lands_nothing_once_the_block_has_left_the_active_chain() -> Result<()> {
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let claim = fixture.claim_found().await?;
+        let hash = claim.candidate.block_hash.clone();
+        let script = vec![Step::BumpThenReorg(COMPETITOR.repeat(32))];
+        let attempt = fixture.process(&claim, script).await?;
+
+        ensure!(
+            attempt.observations == 2,
+            "expected the refused landing's and the retry's observations, saw {}",
+            attempt.observations
+        );
+        let retries = attempt.messages(RETRY_LINE);
+        ensure!(
+            retries.len() == 1 && retries[0]["fields"]["phase"] == "landing",
+            "the lost landing race was not retried once: {:?}",
+            attempt.events
+        );
+        ensure!(
+            attempt.alerts().is_empty(),
+            "a reorg after a lost race logged an ALERT: {:?}",
+            attempt.alerts()
+        );
+        let row = fixture.row(&hash).await?;
+        ensure!(
+            row["state"] == "reconciliation"
+                && row["last_error"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("block left the active chain")),
+            "the row was not reconciled as a block that left the active chain: {row}"
+        );
+        ensure!(
+            fixture.accounting().await?.audits == 0,
+            "a retry landed a block that was no longer active"
+        );
+
+        let next = fixture.retry(&hash, vec![]).await?;
+        ensure!(next.alerts().is_empty() && next.messages(RETRY_LINE).is_empty());
+        ensure!(
+            fixture.accounting().await?.audits == 1,
+            "the next attempt did not land the audit"
+        );
+        let row = fixture.row(&hash).await?;
+        ensure!(
+            row["state"] == "reconciliation"
+                && row["last_error"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("not on the active chain")),
+            "{row}"
+        );
+        ensure!(
+            fixture
+                .node
+                .state
+                .lock()
+                .await
+                .submissions
+                .get(&hash)
+                .map(Vec::len)
+                == Some(1)
+        );
+        Ok(())
+    }
+    .await;
+    fixture.close(result).await
+}
+
+/// The landing and the settlement each have their own retry budget: the
+/// landing loses the race on every one of its retries but the last, and
+/// lands; the finish then loses one race of its own and is still retried,
+/// with no `ALERT`. One budget shared by both would have been spent by the
+/// landing. The accounting equals the no-race case's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_landing_and_the_settlement_each_have_their_own_retry_budget() -> Result<()> {
+    let Some(control) = control().await? else {
+        return Ok(());
+    };
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let claim = fixture.claim_found().await?;
+        let hash = claim.candidate.block_hash.clone();
+        let before = fixture.revision().await?;
+        let mut script = vec![Step::Bump; RETRIES];
+        script.extend([Step::Forward, Step::Bump, Step::Forward]);
+        let attempt = fixture.process(&claim, script).await?;
+
+        ensure!(
+            attempt.observations == RETRIES + 3,
+            "expected {} observations, saw {}",
+            RETRIES + 3,
+            attempt.observations
+        );
+        let retries = attempt.messages(RETRY_LINE);
+        let phases: Vec<_> = retries
+            .iter()
+            .map(|event| event["fields"]["phase"].as_str().unwrap_or_default())
+            .collect();
+        ensure!(
+            phases == ["landing", "landing", "landing", "settlement"],
+            "the retries were not the landing's three and the settlement's one: {phases:?}"
+        );
+        ensure!(attempt.alerts().is_empty(), "the settlement's race found its budget spent: {:?}", attempt.alerts());
+        let row = fixture.row(&hash).await?;
+        ensure!(row["state"] == "submitted" && row["last_error"].is_null(), "{row}");
+        ensure!(fixture.revision().await? - before == control.revision_moves + RETRIES as i64 + 1);
+        ensure!(
+            (
+                fixture.races("landing", "retried"),
+                fixture.races("settlement", "retried"),
+                fixture.races("landing", "spent"),
+                fixture.races("settlement", "spent"),
+            ) == (RETRIES.to_string(), "1".into(), "0".into(), "0".into()),
+            "the phases' retries were not counted apart"
+        );
+        let accounting = fixture.accounting().await?;
+        ensure!(
+            accounting == control.accounting,
+            "the raced settlement differs from the no-race case:\n raced: {accounting:?}\nno race: {:?}",
+            control.accounting
+        );
+        Ok(())
+    }
+    .await;
+    fixture.close(result).await
+}
+
+/// `candidates recover` finishes through a lost race too, and counts the
+/// block only when its finish was the block's first confirmation. A node
+/// failure after the landing leaves the row in reconciliation with its
+/// audit landed. The operator's recovery observes the block active, reuses
+/// the audit, and its finish loses the race to a sibling frontend's
+/// confirmation: it is observed again and retried, the row is `submitted`,
+/// and this frontend's `qbit_prism_blocks_total` stays at zero because the
+/// sibling counted the confirmation. The accounting equals the no-race
+/// case's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn candidates_recover_retries_its_finish_and_counts_only_a_first_confirmation() -> Result<()>
+{
+    let Some(control) = control().await? else {
+        return Ok(());
+    };
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let claim = fixture.claim_found().await?;
+        let hash = claim.candidate.block_hash.clone();
+        fixture.process(&claim, vec![Step::Forward, Step::Fail]).await?;
+        ensure!(fixture.row(&hash).await?["state"] == "reconciliation");
+        ensure!(fixture.accounting().await?.audits == 1);
+
+        let script = vec![Step::Forward, Step::SiblingConfirms(hash.clone()), Step::Forward];
+        let recovery = fixture.recover(&hash, script).await?;
+        ensure!(
+            recovery.observations == 3,
+            "expected the recovery's check, its refused finish's and the retry's observations, saw {}",
+            recovery.observations
+        );
+        let retries = recovery.messages(RETRY_LINE);
+        ensure!(
+            retries.len() == 1 && retries[0]["fields"]["phase"] == "settlement",
+            "the recovery's finish was not retried once: {:?}",
+            recovery.events
+        );
+        ensure!(recovery.alerts().is_empty(), "{:?}", recovery.alerts());
+        let row = fixture.row(&hash).await?;
+        ensure!(row["state"] == "submitted", "the recovery did not finish the row: {row}");
+        ensure!(
+            fixture.coordinator.blocks.load(Ordering::Relaxed) == 0,
+            "the recovery counted a block the sibling had confirmed first"
+        );
+        let accounting = fixture.accounting().await?;
+        ensure!(
+            accounting == control.accounting,
+            "the recovered block differs from the no-race case:\n recovered: {accounting:?}\n   no race: {:?}",
+            control.accounting
         );
         Ok(())
     }
