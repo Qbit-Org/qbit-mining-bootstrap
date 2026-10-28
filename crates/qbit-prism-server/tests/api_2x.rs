@@ -499,41 +499,86 @@ async fn content_addressed_bytes_and_legacy_fallback_headers_are_exact() -> Resu
     f.close(result).await
 }
 
+/// The read model's events on the test's thread, as JSON lines.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl LogCapture {
+    /// The events logged since the last drain, as `(level, fields)`.
+    fn drain(&self) -> Result<Vec<(String, Value)>> {
+        let bytes = std::mem::take(&mut *self.0.lock().unwrap());
+        String::from_utf8(bytes)?
+            .lines()
+            .map(|line| {
+                let event: Value = serde_json::from_str(line)?;
+                Ok((
+                    event["level"].as_str().unwrap_or_default().to_owned(),
+                    event["fields"].clone(),
+                ))
+            })
+            .collect()
+    }
+}
+
 /// #735: a legacy artifact whose body is not at its recorded location yet
 /// answers a 404 that no cache keeps and no 5xx count sees; a body that is
-/// there but cannot be read or proven still answers 500. The block's audit
-/// view keeps answering 404 with its own messages.
+/// there but cannot be read or proven still answers 500, logged with its
+/// block, artifact and location. The block's audit view keeps answering 404
+/// with its own messages, and the settlement-artifacts link check, which
+/// serves no artifact, logs nothing above debug.
 #[tokio::test]
 async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_500() -> Result<()> {
     let Some(f) = Fixture::open().await? else {
         return Ok(());
     };
+    // `#[tokio::test]` polls every task on this thread, so a thread default
+    // sees every event the requests below log, and no other test's.
+    let logs = LogCapture::default();
+    let writer = logs.clone();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter("qbit_prism_server::api::read_models=debug")
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
     let result=async {
         let at=chrono::Utc::now().timestamp()-10;
         let(app,service)=public_service::router(f.state(true),ServiceConfig::default());
         service.probe_once().await;
+        // Uncached, so every settlement-artifacts request runs its link check.
         let audit=api::router(f.state(false));
-        let immutable=|status:StatusCode,headers:&HeaderMap,hash:&str|->Result<()>{
-            ensure!(status==StatusCode::OK&&headers["etag"]==format!("\"{hash}\""),"{status}: {headers:?}");
-            ensure!(headers["cache-control"]=="public, max-age=0, must-revalidate","{headers:?}");
+        let immutable=|step:&str,status:StatusCode,headers:&HeaderMap,hash:&str|->Result<()>{
+            ensure!(status==StatusCode::OK&&headers["etag"]==format!("\"{hash}\""),"{step}: {status}: {headers:?}");
+            ensure!(headers["cache-control"]=="public, max-age=0, must-revalidate","{step}: {headers:?}");
             for header in ["cdn-cache-control","vercel-cdn-cache-control"] {
-                ensure!(headers[header]=="public, max-age=86400, stale-while-revalidate=86400, immutable","{header}: {headers:?}");
+                ensure!(headers[header]=="public, max-age=86400, stale-while-revalidate=86400, immutable","{step}: {header}: {headers:?}");
             }
-            ensure!(headers["x-prism-staleness-budget-seconds"]=="unbounded"&&!headers.contains_key("x-prism-artifact-canonical-state"),"{headers:?}");
+            ensure!(headers["x-prism-staleness-budget-seconds"]=="unbounded"&&!headers.contains_key("x-prism-artifact-canonical-state"),"{step}: {headers:?}");
             Ok(())
         };
-        let absent=|(status,headers,body):(StatusCode,HeaderMap,Value)|->Result<()>{
-            ensure!(status==StatusCode::NOT_FOUND&&body==json!({"schema":"prism.dashboard.error.v1","error":{"code":"not_found","message":"audit bundle body is not retrievable","request_id":null}}),"{status}: {body}");
-            ensure!(headers["cache-control"]=="no-store","{headers:?}");
+        let absent=|step:&str,(status,headers,body):(StatusCode,HeaderMap,Value)|->Result<()>{
+            ensure!(status==StatusCode::NOT_FOUND&&body==json!({"schema":"prism.dashboard.error.v1","error":{"code":"not_found","message":"audit bundle body is not retrievable","request_id":null}}),"{step}: {status}: {body}");
+            ensure!(headers["cache-control"]=="no-store","{step}: {headers:?}");
             for header in ["cdn-cache-control","vercel-cdn-cache-control","etag"] {
-                ensure!(!headers.contains_key(header),"a 404 carries {header}: {headers:?}");
+                ensure!(!headers.contains_key(header),"{step}: a 404 carries {header}: {headers:?}");
             }
-            ensure!(!headers.values().any(|value|value.to_str().is_ok_and(|value|value.contains("immutable"))),"{headers:?}");
+            ensure!(!headers.values().any(|value|value.to_str().is_ok_and(|value|value.contains("immutable"))),"{step}: {headers:?}");
             Ok(())
         };
-        let fault=|(status,headers,body):(StatusCode,HeaderMap,Value)|->Result<()>{
-            ensure!(status==StatusCode::INTERNAL_SERVER_ERROR&&body["error"]["code"]=="internal_error","{status}: {body}");
-            ensure!(headers["cache-control"]=="no-store"&&!headers.contains_key("cdn-cache-control"),"{headers:?}");
+        let fault=|step:&str,(status,headers,body):(StatusCode,HeaderMap,Value)|->Result<()>{
+            ensure!(status==StatusCode::INTERNAL_SERVER_ERROR&&body["error"]["code"]=="internal_error","{step}: {status}: {body}");
+            ensure!(headers["cache-control"]=="no-store"&&!headers.contains_key("cdn-cache-control"),"{step}: {headers:?}");
             Ok(())
         };
         // A stored artifact keeps today's immutable answer.
@@ -543,64 +588,121 @@ async fn legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_5
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,canonical_audit_bytes,coinbase_tx_hex) VALUES($1,$2,$3,$4,'00')")
             .bind(&stored).bind(json!({"z":3,"a":1,"schema":"historical"})).bind(&stored_hash).bind(canonical.as_slice()).execute(&f.pool).await?;
         let(status,headers,body)=raw_get(&app,&format!("/public/v1/artifacts/{stored_hash}")).await;
-        ensure!(body==canonical);immutable(status,&headers,&stored_hash)?;
+        ensure!(body==canonical,"stored artifact: body");immutable("stored artifact",status,&headers,&stored_hash)?;
         // Corrupt stored canonical bytes are a server fault.
         let corrupt=f.block(3,103,"confirmed",at).await?;
         let corrupt_hash=hex::encode(Sha256::digest(b"never stored"));
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,canonical_audit_bytes,coinbase_tx_hex) VALUES($1,'{}',$2,'{}'::bytea,'00')")
             .bind(&corrupt).bind(&corrupt_hash).execute(&f.pool).await?;
-        fault(get(&app,&format!("/public/v1/artifacts/{corrupt_hash}")).await)?;
+        fault("corrupt stored canonical bytes",get(&app,&format!("/public/v1/artifacts/{corrupt_hash}")).await)?;
+        ensure!(logs.drain()?.is_empty(),"stored rows: the legacy body reader logged");
         // A legacy row that `import-audits` has not stored, whose body is not
-        // on this host yet.
+        // on this host yet. Its block settles through a CTV fanout, so its
+        // settlement artifacts check the body before linking it.
         let legacy=f.block(2,102,"confirmed",at).await?;
         let body=b"{\"schema\":\"historical\",\"legacy\":true}";
         let hash=hex::encode(Sha256::digest(body));
         let dir=tempfile::tempdir()?;
         let file=dir.path().join("legacy-audit.json");
+        let uri=format!("file://{}",file.display());
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle_sha256,body_uri,coinbase_tx_hex) VALUES($1,$2,$3,'00')")
-            .bind(&legacy).bind(&hash).bind(format!("file://{}",file.display())).execute(&f.pool).await?;
+            .bind(&legacy).bind(&hash).bind(&uri).execute(&f.pool).await?;
+        let set_hash=hex::encode(Sha256::digest(b"{\"z\":2,\"a\":1}"));
+        let manifest_hash=hex::encode(Sha256::digest(b"{\"z\":1,\"a\":2}"));
+        sqlx::query("INSERT INTO qbit_ctv_fanout_sets(block_hash,manifest_set_json,manifest_set,manifest_set_sha256,settlement_mode,parent_coinbase_txid,parent_coinbase_tx_hex,fanout_count,fanout_output_sum_sats,covenant_output_value_sats) VALUES($1,'{\"z\":2,\"a\":1}','{\"z\":2,\"a\":1}',$2,'ctv_fanout',$3,'00',1,100,100)")
+            .bind(&legacy).bind(&set_hash).bind("5".repeat(64)).execute(&f.pool).await?;
+        sqlx::query("INSERT INTO qbit_ctv_fanout_artifacts(fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats,settlement_status) VALUES($1,$2,$3,'{\"z\":1,\"a\":2}','{\"z\":1,\"a\":2}',$4,$4,$4,$4,0,1,$5,0,'00','00',1,100,100,'broadcastable')")
+            .bind("8".repeat(64)).bind(&legacy).bind(&set_hash).bind(&manifest_hash).bind("5".repeat(64)).execute(&f.pool).await?;
         let path=format!("/public/v1/artifacts/{hash}");
         let view=format!("/audit/blocks/{legacy}/bundle");
-        let audit_view=|message:&'static str|{let audit=audit.clone();let view=view.clone();async move{
+        let settlement=format!("/public/v1/blocks/{legacy}/settlement-artifacts");
+        let audit_view=|step:&'static str,message:&'static str|{let audit=audit.clone();let view=view.clone();async move{
             let(status,_,body)=get(&audit,&view).await;
-            ensure!(status==StatusCode::NOT_FOUND&&body["error"]==message,"{status}: {body}");
+            ensure!(status==StatusCode::NOT_FOUND&&body["error"]==message,"{step}: audit view: {status}: {body}");
             Ok::<_,anyhow::Error>(())
         }};
-        // Asked twice: the first 404 is not kept by the origin cache.
-        absent(get(&app,&path).await)?;absent(get(&app,&path).await)?;
-        audit_view("audit bundle body is not retrievable").await?;
+        let unlinked=|step:&'static str|{let audit=audit.clone();let settlement=settlement.clone();async move{
+            let(status,_,body)=get(&audit,&settlement).await;
+            ensure!(status==StatusCode::OK&&body["artifact_links"].as_array().is_some_and(|links|links.iter().all(|link|link["kind"]!="audit_bundle")),"{step}: settlement artifacts: {status}: {body}");
+            Ok::<_,anyhow::Error>(())
+        }};
+        // Every event for the legacy row names its block, artifact and body.
+        let logged=|step:&str,expected:&[(&str,&str,Option<&str>)]|->Result<()>{
+            let events=logs.drain()?;
+            let seen:Vec<_>=events.iter().map(|(level,fields)|(level.clone(),fields["message"].as_str().unwrap_or_default().to_owned(),fields["reason"].as_str().map(str::to_owned))).collect();
+            let wanted:Vec<_>=expected.iter().map(|(level,message,reason)|(level.to_string(),message.to_string(),reason.map(str::to_owned))).collect();
+            ensure!(seen==wanted,"{step}: logged {events:?}");
+            for(_,fields) in &events {
+                ensure!(fields["block_hash"]==legacy.as_str()&&fields["artifact_sha256"]==hash.as_str()&&fields["body_uri"]==uri.as_str(),"{step}: {fields}");
+            }
+            Ok(())
+        };
+        const ABSENT:&str="legacy audit body is not at its recorded location";
+        const FAULT:&str="legacy audit body cannot be served";
+        // Asked twice: the first 404 is not kept by the origin cache. The
+        // audit view logs nothing, as before.
+        absent("absent body",get(&app,&path).await)?;absent("absent body, asked again",get(&app,&path).await)?;
+        audit_view("absent body","audit bundle body is not retrievable").await?;
+        logged("absent body",&[("DEBUG",ABSENT,None),("DEBUG",ABSENT,None)])?;
+        unlinked("absent body").await?;
+        logged("absent body, link check",&[("DEBUG",ABSENT,None)])?;
         // A body-ref envelope whose share segment is not there is absent too.
         std::fs::write(&file,serde_json::to_vec(&json!({"schema":"qbit.prism.audit-body-ref.v1","audit_bundle_sha256":hash,"share_count":1,"bundle_without_shares":{},"share_parts":[{"kind":"segment","first_share_seq":1,"last_share_seq":1,"share_count":1,"sha256":"0".repeat(64),"body_uri":"segment.json"}]}))?)?;
-        absent(get(&app,&path).await)?;
-        audit_view("audit bundle body is not retrievable").await?;
+        absent("absent segment",get(&app,&path).await)?;
+        audit_view("absent segment","audit bundle body is not retrievable").await?;
+        logged("absent segment",&[("DEBUG",ABSENT,None)])?;
         // A segment that is there but does not prove is a fault.
         std::fs::write(dir.path().join("segment.json"),b"{}")?;
-        fault(get(&app,&path).await)?;
-        audit_view("audit bundle body is not retrievable").await?;
+        fault("unproven segment",get(&app,&path).await)?;
+        audit_view("unproven segment","audit bundle body is not retrievable").await?;
+        logged("unproven segment",&[("WARN",FAULT,Some("audit bundle body is not retrievable"))])?;
+        // So is an envelope that proves itself but is another audit's body.
+        let other=qbit_prism::build_audit_bundle(
+            vec![qbit_prism::AcceptedShare{share_seq:1,share_id:"share".into(),miner_id:"miner".into(),order_key:"miner".into(),p2mr_program_hex:"11".repeat(32),share_difficulty:1,network_difficulty:100,template_height:100,job_id:"job".into(),job_issued_at_ms:0,accepted_at_ms:0,ntime:1,credit_policy:None}],
+            qbit_prism::FoundBlock{block_height:102,coinbase_value_sats:500_000_000,network_difficulty:100,anchor_job_issued_at_ms:1},
+            vec![],qbit_prism::PayoutPolicy::day_one_default(),
+            &qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"93".repeat(32))?,
+            &qbit_pool_builder::ManifestSigningKey::from_seed_hex(&"94".repeat(32))?,
+        )?;
+        let own=hex::encode(Sha256::digest(qbit_prism::canonical_audit_bundle_bytes(&other)?));
+        let mut without=serde_json::to_value(&other)?;
+        let shares=without.as_object_mut().and_then(|object|object.remove("shares")).ok_or_else(||anyhow::anyhow!("an audit bundle has shares"))?;
+        ensure!(own!=hash);
+        std::fs::write(&file,serde_json::to_vec(&json!({"schema":"qbit.prism.audit-body-ref.v1","audit_bundle_sha256":own,"share_count":1,"bundle_without_shares":without,"share_parts":[{"kind":"inline","first_share_seq":1,"last_share_seq":1,"share_count":1,"shares":shares}]}))?)?;
+        fault("another audit's envelope",get(&app,&path).await)?;
+        audit_view("another audit's envelope","audit bundle body hash mismatch").await?;
+        logged("another audit's envelope",&[("WARN",FAULT,Some("audit bundle body hash mismatch"))])?;
         // So are a body that is not JSON, one that is not the advertised
-        // body, and one that cannot be read.
+        // body, and one that cannot be read. The link check serves none of
+        // these 500s, so it logs at debug only.
         std::fs::write(&file,b"not json")?;
-        fault(get(&app,&path).await)?;
-        audit_view("audit bundle body is not valid JSON").await?;
+        fault("not JSON",get(&app,&path).await)?;
+        audit_view("not JSON","audit bundle body is not valid JSON").await?;
+        logged("not JSON",&[("WARN",FAULT,Some("audit bundle body is not valid JSON"))])?;
+        unlinked("not JSON").await?;
+        logged("not JSON, link check",&[("DEBUG",FAULT,Some("audit bundle body is not valid JSON"))])?;
         std::fs::write(&file,b"{\"schema\":\"historical\",\"legacy\":false}")?;
-        fault(get(&app,&path).await)?;
-        audit_view("audit bundle body hash mismatch").await?;
+        fault("another body",get(&app,&path).await)?;
+        audit_view("another body","audit bundle body hash mismatch").await?;
+        logged("another body",&[("WARN",FAULT,Some("audit bundle body hash mismatch"))])?;
         std::fs::remove_file(&file)?;std::fs::create_dir(&file)?;
-        fault(get(&app,&path).await)?;
-        audit_view("audit bundle body is not retrievable").await?;
+        fault("unreadable body",get(&app,&path).await)?;
+        audit_view("unreadable body","audit bundle body is not retrievable").await?;
+        logged("unreadable body",&[("WARN",FAULT,Some("audit bundle body is not retrievable"))])?;
         std::fs::remove_dir(&file)?;
         // Once the body arrives, the same address serves it at once.
         std::fs::write(&file,body)?;
         let(status,headers,served)=raw_get(&app,&path).await;
-        ensure!(status==StatusCode::OK&&serde_json::from_slice::<Value>(&served)?==serde_json::from_slice::<Value>(body)?&&headers["cache-control"]=="no-store"&&headers["x-prism-artifact-canonical-state"]=="missing","{status}: {headers:?}");
+        ensure!(status==StatusCode::OK&&serde_json::from_slice::<Value>(&served)?==serde_json::from_slice::<Value>(body)?&&headers["cache-control"]=="no-store"&&headers["x-prism-artifact-canonical-state"]=="missing","body arrived: {status}: {headers:?}");
         // And once `import-audits` stores it, as immutably as any artifact.
         sqlx::query("UPDATE qbit_pool_audit_bundles SET canonical_audit_bytes=$2 WHERE block_hash=$1").bind(&legacy).bind(body.as_slice()).execute(&f.pool).await?;
         let(status,headers,served)=raw_get(&app,&path).await;
-        ensure!(served==body);immutable(status,&headers,&hash)?;
+        ensure!(served==body,"body imported: body");immutable("body imported",status,&headers,&hash)?;
+        logged("body served",&[])?;
         // Only the faults count toward the 5xx alert.
         let(_,_,metrics)=raw_get(&app,"/metrics").await;
         let metrics=String::from_utf8(metrics)?;
-        ensure!(metrics.contains("qbit_prism_public_responses_total{status=\"404\"} 3\n")&&metrics.contains("qbit_prism_public_responses_total{status=\"500\"} 5\n"),"{metrics}");
+        ensure!(metrics.contains("qbit_prism_public_responses_total{status=\"404\"} 3\n")&&metrics.contains("qbit_prism_public_responses_total{status=\"500\"} 6\n"),"metrics: {metrics}");
         Ok::<_,anyhow::Error>(())
     }.await;
     f.close(result).await

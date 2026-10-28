@@ -152,7 +152,7 @@ pub(super) async fn audit_payouts(state: &ApiState, hash: &str) -> ApiResult<Val
     )
 }
 pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiResult<Value> {
-    bundle_with(state, id, commitment, LegacyBodyError::for_audit).await
+    bundle_with(state, id, commitment, BodyReader::Audit).await
 }
 /// The message of a legacy body that is not at its recorded location.
 const BODY_NOT_RETRIEVABLE: &str = "audit bundle body is not retrievable";
@@ -189,26 +189,67 @@ impl LegacyBodyError {
             error: error.to_string(),
         }
     }
-    /// The audit routes answer 404 for any legacy body they cannot serve.
-    fn for_audit(self) -> ApiError {
-        match self {
-            Self::Absent => ApiError::missing(BODY_NOT_RETRIEVABLE),
-            Self::Fault { message, .. } => ApiError::missing(message),
-            Self::Internal => ApiError::internal(),
-        }
-    }
-    /// A public artifact answers 404 only for a body that is not there, as
-    /// before `import-audits` stores the row (#735). A body that is there but
-    /// cannot be read or proven is a server fault, and so is a 2.x v2 body
-    /// this build cannot verify yet (#731).
-    fn for_artifact(self) -> ApiError {
-        match self {
-            Self::Absent => ApiError::missing(BODY_NOT_RETRIEVABLE),
-            Self::Fault { message, error } => {
-                tracing::warn!(%error, reason = message, "legacy audit body cannot be served");
+}
+/// Who reads a legacy body, which decides what its failure answers and logs.
+#[derive(Clone, Copy)]
+enum BodyReader {
+    /// The audit views answer 404 for any legacy body they cannot serve.
+    Audit,
+    /// `/public/v1/artifacts/<sha>` answers 404 only for a body that is not
+    /// there, as before `import-audits` stores the row (#735). A body that is
+    /// there but cannot be read or proven is a server fault, and so is a 2.x
+    /// v2 body this build cannot verify yet (#731): each 500 it serves is
+    /// logged at warn.
+    Artifact,
+    /// `artifact()` answers the same, logged at debug only: its live caller,
+    /// the settlement-artifacts link check, serves none of these answers.
+    LinkCheck,
+}
+impl BodyReader {
+    /// The block, the artifact and the body's recorded location go to the
+    /// server log only, never into a response.
+    fn body_failure(
+        self,
+        error: LegacyBodyError,
+        block_hash: &str,
+        artifact_sha256: &str,
+        body_uri: &str,
+    ) -> ApiError {
+        match (self, error) {
+            (_, LegacyBodyError::Internal) => ApiError::internal(),
+            (Self::Audit, LegacyBodyError::Absent) => ApiError::missing(BODY_NOT_RETRIEVABLE),
+            (Self::Audit, LegacyBodyError::Fault { message, .. }) => ApiError::missing(message),
+            (_, LegacyBodyError::Absent) => {
+                tracing::debug!(
+                    block_hash,
+                    artifact_sha256,
+                    body_uri,
+                    "legacy audit body is not at its recorded location"
+                );
+                ApiError::missing(BODY_NOT_RETRIEVABLE)
+            }
+            (Self::Artifact, LegacyBodyError::Fault { message, error }) => {
+                tracing::warn!(
+                    block_hash,
+                    artifact_sha256,
+                    body_uri,
+                    reason = message,
+                    %error,
+                    "legacy audit body cannot be served"
+                );
                 ApiError::internal()
             }
-            Self::Internal => ApiError::internal(),
+            (Self::LinkCheck, LegacyBodyError::Fault { message, error }) => {
+                tracing::debug!(
+                    block_hash,
+                    artifact_sha256,
+                    body_uri,
+                    reason = message,
+                    %error,
+                    "legacy audit body cannot be served"
+                );
+                ApiError::internal()
+            }
         }
     }
 }
@@ -216,7 +257,7 @@ async fn bundle_with(
     state: &ApiState,
     id: &str,
     commitment: bool,
-    body_error: fn(LegacyBodyError) -> ApiError,
+    reader: BodyReader,
 ) -> ApiResult<Value> {
     let sql = if commitment {
         include_str!("queries/audit_bundle_by_commitment.sql")
@@ -317,6 +358,7 @@ async fn bundle_with(
             .as_str()
             .ok_or_else(ApiError::internal)?
             .to_string();
+        let (body_uri, artifact_sha256) = (uri.clone(), expected.clone());
         let read = tokio::task::spawn_blocking(move || {
             let path = std::path::Path::new(uri.strip_prefix("file://").unwrap_or(&uri));
             let bytes = std::fs::read(path).map_err(LegacyBodyError::io)?;
@@ -350,7 +392,10 @@ async fn bundle_with(
         })
         .await
         .map_err(|_| ApiError::internal())?;
-        value["audit_bundle"] = read.map_err(body_error)?;
+        let block_hash = value["block_hash"].as_str().unwrap_or_default();
+        let read = read
+            .map_err(|error| reader.body_failure(error, block_hash, &artifact_sha256, &body_uri));
+        value["audit_bundle"] = read?;
     }
     let object = value.as_object_mut().unwrap();
     for internal in [
@@ -453,7 +498,7 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
         return Ok(Payload::addressed(canonical, hash));
     }
     let mut payload = Payload::json(
-        bundle_with(state, &block_hash, false, LegacyBodyError::for_artifact)
+        bundle_with(state, &block_hash, false, BodyReader::Artifact)
             .await
             .map_err(artifact_fallback_error)?["audit_bundle"]
             .take(),
@@ -474,12 +519,10 @@ pub(super) async fn artifact(state: &ApiState, hash: &str) -> ApiResult<Value> {
     .fetch_optional(&state.pool)
     .await?;
     if let Some(hash) = hash {
-        return Ok(
-            bundle_with(state, &hash, false, LegacyBodyError::for_artifact)
-                .await
-                .map_err(artifact_fallback_error)?["audit_bundle"]
-                .take(),
-        );
+        return Ok(bundle_with(state, &hash, false, BodyReader::LinkCheck)
+            .await
+            .map_err(artifact_fallback_error)?["audit_bundle"]
+            .take());
     }
     Err(ApiError::missing("unknown public PRISM artifact"))
 }
@@ -491,7 +534,7 @@ fn audit_read_error(error: anyhow::Error) -> ApiError {
 }
 /// A not_found reaching here is proven absence: the row went away after it
 /// was found, or its legacy body is not at its recorded location. Every other
-/// legacy body failure was made internal by `LegacyBodyError::for_artifact`.
+/// legacy body failure was made internal by `BodyReader::body_failure`.
 fn artifact_fallback_error(error: ApiError) -> ApiError {
     if matches!(error.code, "read_timeout" | "not_found") {
         error

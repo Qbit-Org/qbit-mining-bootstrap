@@ -419,10 +419,12 @@ uses `Cache-Control: no-store` and `X-Prism-Artifact-Canonical-State: missing`.
 It never enters the origin or immutable CDN cache. Corrupt present bytes fail
 closed. The database row remains the visibility authority: an artifact whose
 row has not replayed returns a non-cacheable `404`. So does a legacy row whose
-body is not on the serving host yet, with the message `audit bundle body is not
-retrievable`, until the migration stores its canonical bytes; a body that is
-there but cannot be read or verified answers `500`. Immutable artifacts remain
-exempt from ordinary replica freshness refusals.
+body, or a share segment its envelope names, is not on the serving host yet,
+with the message `audit bundle body is not retrievable`, until the migration
+stores its canonical bytes; a body that is there but cannot be read or verified
+answers `500`. A row or block that goes away between lookup and read answers
+`404` with `unknown PRISM block`. Immutable artifacts remain exempt from
+ordinary replica freshness refusals.
 
 Direct-coinbase blocks return the same settlement-artifacts wrapper with
 `settlement_mode: direct_coinbase` and `fanouts: []`. A `404` means no public
