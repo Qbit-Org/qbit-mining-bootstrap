@@ -848,6 +848,201 @@ fn audit_clis_accept_v2_range_proof_bundle() {
 }
 
 #[test]
+fn audit_clis_accept_ranges_beside_a_slot_gap_and_refuse_a_range_across_it() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    // The window starts at share 101, so its first slot can hold older shares.
+    let shares = fixture
+        .shares
+        .into_iter()
+        .map(|share| AcceptedShare {
+            share_seq: share.share_seq + 100,
+            ..share
+        })
+        .collect();
+    let bundle = build_audit_bundle(
+        shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    let tmp_dir =
+        std::env::temp_dir().join(format!("qbit-prism-audit-slot-gap-{}", std::process::id()));
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    // Each slot records a ledger gap outside the window (#733): slot A holds
+    // shares 91-95 and then the window's head, slot B the window's tail, three
+    // missing shares and three more.
+    let (head, tail) = bundle.shares.split_at(bundle.shares.len() / 2);
+    let other_share = |share_seq: u64| AcceptedShare {
+        share_seq,
+        share_id: format!("other-share-{share_seq}"),
+        ..head[0].clone()
+    };
+    let tail_last_seq = tail.last().unwrap().share_seq;
+    let slot_a = (91..=95)
+        .map(&other_share)
+        .chain(head.iter().cloned())
+        .collect::<Vec<_>>();
+    let slot_b = tail
+        .iter()
+        .cloned()
+        .chain((tail_last_seq + 4..=tail_last_seq + 6).map(&other_share))
+        .collect::<Vec<_>>();
+    for (name, slot) in [("slot-a.json", &slot_a), ("slot-b.json", &slot_b)] {
+        let segment = serde_json::json!({
+            "schema": "qbit.prism.audit-share-segment.v1",
+            "first_share_seq": slot.first().unwrap().share_seq,
+            "last_share_seq": slot.last().unwrap().share_seq,
+            "share_count": slot.len(),
+            "shares": slot,
+        });
+        fs::write(tmp_dir.join(name), serde_json::to_vec(&segment).unwrap()).unwrap();
+    }
+
+    let range_part = |kind: &str, body_uri: &str, shares: &[AcceptedShare]| {
+        let first_share_seq = shares.first().unwrap().share_seq;
+        let last_share_seq = shares.last().unwrap().share_seq;
+        let digest_key = match kind {
+            "segment_prefix" => "prefix_sha256",
+            _ => "range_sha256",
+        };
+        let digest = hex::encode(Sha256::digest(canonical_share_segment_bytes(
+            first_share_seq,
+            last_share_seq,
+            shares,
+        )));
+        serde_json::json!({
+            "kind": kind,
+            "first_share_seq": first_share_seq,
+            "last_share_seq": last_share_seq,
+            "share_count": shares.len(),
+            digest_key: digest,
+            "body_uri": body_uri,
+        })
+    };
+    let mut bundle_without_shares = serde_json::to_value(&bundle).unwrap();
+    bundle_without_shares
+        .as_object_mut()
+        .unwrap()
+        .remove("shares");
+    let write_body_ref = |name: &str, share_parts: [serde_json::Value; 2]| {
+        let body_ref = serde_json::json!({
+            "schema": "qbit.prism.audit-body-ref.v1",
+            "audit_bundle_sha256": report.audit_bundle_sha256_hex,
+            "share_count": bundle.shares.len(),
+            "bundle_without_shares": bundle_without_shares,
+            "share_parts": share_parts,
+        });
+        let body_ref_path = tmp_dir.join(name);
+        fs::write(&body_ref_path, serde_json::to_vec(&body_ref).unwrap()).unwrap();
+        body_ref_path
+    };
+    let canonicalize = |body_ref_path: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-canonicalize"))
+            .arg("--input")
+            .arg(body_ref_path)
+            .output()
+            .unwrap()
+    };
+    let assert_refused = |output: std::process::Output, expected: String| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(&expected),
+            "expected a refusal with {expected:?}\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    };
+
+    // The second part reads slot B from its first share, which 2.x wrote as
+    // either kind.
+    for (kind, label) in [
+        ("segment_range", "share segment range"),
+        ("segment_prefix", "share segment prefix"),
+    ] {
+        // A range after slot A's gap, then a range before slot B's.
+        let body_ref_path = write_body_ref(
+            &format!("beside-{kind}.json"),
+            [
+                range_part("segment_range", "slot-a.json", head),
+                range_part(kind, "slot-b.json", tail),
+            ],
+        );
+        let verify_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-audit-verify"))
+            .arg(&body_ref_path)
+            .arg("--coinbase-tx-hex")
+            .arg(&report.coinbase_tx_hex)
+            .arg("--ledger-writer-public-key-hex")
+            .arg(ledger_public_key_hex())
+            .arg("--expected-coinbase-value-sats")
+            .arg(report.coinbase_value_sats.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            verify_output.status.success(),
+            "{kind}: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&verify_output.stdout),
+            String::from_utf8_lossy(&verify_output.stderr)
+        );
+        let canonical_output = canonicalize(&body_ref_path);
+        assert!(
+            canonical_output.status.success(),
+            "{kind}: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&canonical_output.stdout),
+            String::from_utf8_lossy(&canonical_output.stderr)
+        );
+        assert_eq!(
+            canonical_output.stdout,
+            canonical_audit_bundle_bytes(&bundle).unwrap()
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&canonical_output.stdout)),
+            report.audit_bundle_sha256_hex
+        );
+
+        // A range across slot B's gap, with a digest over the shares it
+        // selects, is still refused.
+        let body_ref_path = write_body_ref(
+            &format!("across-{kind}.json"),
+            [
+                range_part("segment_range", "slot-a.json", head),
+                range_part(kind, "slot-b.json", &slot_b),
+            ],
+        );
+        assert_refused(
+            canonicalize(&body_ref_path),
+            format!(
+                "{label} has non-contiguous share_seq values: {tail_last_seq} then {}",
+                tail_last_seq + 4
+            ),
+        );
+    }
+
+    // So is a range across slot A's gap.
+    let body_ref_path = write_body_ref(
+        "across-segment_range-slot-a.json",
+        [
+            range_part("segment_range", "slot-a.json", &slot_a),
+            range_part("segment_range", "slot-b.json", tail),
+        ],
+    );
+    assert_refused(
+        canonicalize(&body_ref_path),
+        format!(
+            "share segment range has non-contiguous share_seq values: 95 then {}",
+            head[0].share_seq
+        ),
+    );
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
 fn build_audit_bundle_cli_emits_suffix_aware_bundle() {
     let suffix = "111111112222222222222222".to_string();
     let witness_leaf = "11".repeat(32);
