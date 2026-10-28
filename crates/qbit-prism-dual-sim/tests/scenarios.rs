@@ -372,7 +372,9 @@ async fn premigrate_outcome(
 fn check_premigrate(outcome: &premigrate::Outcome) -> Result<()> {
     let mut failed = Vec::new();
     if !outcome.migrate_success
-        || ![27, 28, 31].iter().all(|v| outcome.versions.contains(v))
+        || ![27, 28, 31, 32]
+            .iter()
+            .all(|v| outcome.versions.contains(v))
         || !outcome.index_valid
     {
         failed.push(format!(

@@ -326,8 +326,8 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     )?;
     sim.mark("3.1 migrate finished");
     body.expect(
-        "3.1's migrate succeeds and reports 31 ready",
-        output.status.success() && stdout.contains("26, 27, 28, 31 ready"),
+        "3.1's migrate succeeds and reports 31 and 32 ready",
+        output.status.success() && stdout.contains("26, 27, 28, 31, 32 ready"),
         format!("{}: {}", output.status, stdout.trim()),
     );
     let after = versions(&pool).await?;
@@ -345,8 +345,8 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     ));
     let warned = log_lines(sim, Node::B, UNKNOWN_MIGRATIONS);
     body.expect(
-        "rc.6 stops gracefully, restarts and serves at 31, warning of 27, 28 and 31",
-        restarted.graceful && warned.iter().any(|line| line.contains("27, 28, 31")),
+        "rc.6 stops gracefully, restarts and serves at 31, warning of 27, 28, 31 and 32",
+        restarted.graceful && warned.iter().any(|line| line.contains("27, 28, 31, 32")),
         format!(
             "stopped gracefully {}; B's warnings {warned:?}",
             restarted.graceful

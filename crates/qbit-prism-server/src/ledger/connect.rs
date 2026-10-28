@@ -230,6 +230,12 @@ impl Ledger {
         lock(tx, key, self.metrics.as_deref()).await
     }
 
+    /// The metrics of an `ORDER_LOCK` a server-side call takes itself
+    /// ([`CalledOrderLock`], #711), armed before the call is sent.
+    pub(super) fn called_order_lock(&self, holder: OrderLockHolder) -> CalledOrderLock<'_> {
+        CalledOrderLock::arm(self.metrics.as_deref(), holder)
+    }
+
     /// Take `ORDER_LOCK`, recording this ledger's wait for it and, through the
     /// returned guard, how long `holder` then holds it (#602). Keep the guard
     /// until the transaction has committed or rolled back.
@@ -661,6 +667,11 @@ impl<'a> WaitGuard<'a> {
             metrics.observe_advisory_lock(self.kind, result, elapsed);
         }
     }
+
+    /// Disarm without recording, handing back the registry.
+    fn disarm(mut self) -> Option<&'a Metrics> {
+        self.metrics.take()
+    }
 }
 
 impl Drop for WaitGuard<'_> {
@@ -688,6 +699,58 @@ impl OrderHold<'_> {
     /// settlement that confirmed its block for the first time.
     pub(super) fn relabel(&mut self, holder: OrderLockHolder) {
         self.holder = holder;
+    }
+}
+
+/// An `ORDER_LOCK` that a server-side call takes itself (#711): migration
+/// 032's `qbit_prism_append_share` takes the lock as its first statement
+/// and reports, on the server's clock, how long it waited for it and how
+/// long it held it before it returned, in its reply or its refusal. They are
+/// recorded where the lock statement's wait and the start of its hold were:
+/// the wait without the round trip the lock statement's own measure carried,
+/// and the hold from the grant, which [`OrderHold`] then extends to the
+/// COMMIT or ROLLBACK. A call that fails or is abandoned without that report,
+/// and so without proof that it was granted the lock, is a failed wait of
+/// the time it ran, as a lock statement's would be; one that failed past its
+/// lock statement records neither ([`CalledOrderLock::granted_unmeasured`]).
+pub(super) struct CalledOrderLock<'a> {
+    wait: Option<WaitGuard<'a>>,
+    holder: OrderLockHolder,
+}
+
+impl<'a> CalledOrderLock<'a> {
+    /// Armed just before the call is sent.
+    pub(super) fn arm(metrics: Option<&'a Metrics>, holder: OrderLockHolder) -> Self {
+        Self {
+            wait: metrics.map(|metrics| WaitGuard::arm(metrics, LockKind::Order)),
+            holder,
+        }
+    }
+
+    /// The call reported the lock granted after `waited`, and held it for
+    /// `held` before it replied; the returned guard ends the hold.
+    pub(super) fn granted(
+        mut self,
+        waited: std::time::Duration,
+        held: std::time::Duration,
+    ) -> OrderHold<'a> {
+        let metrics = self.wait.take().and_then(WaitGuard::disarm);
+        if let Some(metrics) = metrics {
+            metrics.observe_advisory_lock(LockKind::Order, Outcome::Success, waited);
+        }
+        let now = std::time::Instant::now();
+        OrderHold {
+            started: metrics.map(|metrics| (metrics, now.checked_sub(held).unwrap_or(now))),
+            holder: self.holder,
+        }
+    }
+
+    /// The call failed past its lock statement without reporting: the wait
+    /// did not fail, and neither it nor the hold is known here.
+    pub(super) fn granted_unmeasured(mut self) {
+        if let Some(wait) = self.wait.take() {
+            wait.disarm();
+        }
     }
 }
 

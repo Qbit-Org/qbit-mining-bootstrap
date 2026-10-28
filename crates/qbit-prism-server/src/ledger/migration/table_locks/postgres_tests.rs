@@ -1,5 +1,5 @@
 //! 027's and 028's up-front table locks against a real PostgreSQL, on the
-//! schema rc.6 serves (26, without 27, 28 and 31): what the migration
+//! schema rc.6 serves (26, without 27, 28, 31 and 32): what the migration
 //! transaction holds while it waits for them, that the files wait for no
 //! other lock once it has them, and what a migrate that cannot take them by
 //! its deadline leaves and says. The cycle with a serving frontend itself
@@ -17,7 +17,7 @@ struct Database {
 
 impl Database {
     /// A native ledger in a schema of its own, every migration applied, and
-    /// then 031, 028 and 027 undone, as rc.6 left it.
+    /// then 032, 031, 028 and 027 undone, as rc.6 left it.
     async fn open() -> Result<Option<Self>> {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
@@ -33,7 +33,8 @@ impl Database {
         let ledger =
             crate::ledger::Ledger::connect(url.as_str(), "table-locks".into(), 2, true).await?;
         let mut undo = String::from(
-            "DELETE FROM qbit_prism_schema_migrations WHERE version IN (27,28,31); \
+            "DELETE FROM qbit_prism_schema_migrations WHERE version IN (27,28,31,32); \
+             DROP FUNCTION qbit_prism_append_share, qbit_prism_ledger_clock; \
              DROP INDEX qbit_share_ledger_origin_seq_idx; \
              ALTER TABLE qbit_prism_audit_snapshots DROP CONSTRAINT qbit_prism_audit_snapshots_cut_check, DROP COLUMN cut_seq_0, DROP COLUMN cut_seq_1; \
              DROP TABLE qbit_prism_peer_sync_conflicts, qbit_prism_peer_sync_cursors, \

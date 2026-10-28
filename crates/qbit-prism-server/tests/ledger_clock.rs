@@ -563,10 +563,11 @@ async fn old_frontend_append(pool: &PgPool, id: u64) -> Result<i64> {
     Ok(accepted_at_ms)
 }
 
-/// EP-COMPAT: a 3.1.0 frontend, which stores the clock on every append, and
-/// this one, which derives it, interleave on one ledger with the stored clock
-/// ahead of the database's and moving: stamps rise with `share_seq` and
-/// every window holds every share. Each direction holds by construction: the
+/// EP-COMPAT: a 3.1.0 frontend, which stores the clock on every append with
+/// its own statements, and this one, which appends with migration 032's
+/// `qbit_prism_append_share` (#711) and derives the clock, interleave on one
+/// ledger after 032, with the stored clock ahead of the database's and
+/// moving: stamps rise with `share_seq` and every window holds every share. Each direction holds by construction: the
 /// old write stores its stamp, which the derivation reads; the derivation's
 /// stamp is the stored clock or the database's clock or an earlier own stamp
 /// the stored clock already covers, which the old write reads in turn. The
