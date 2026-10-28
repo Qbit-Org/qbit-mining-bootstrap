@@ -422,9 +422,12 @@ row has not replayed returns a non-cacheable `404`. So does a legacy row whose
 body, or a share segment its envelope names, is not on the serving host yet,
 with the message `audit bundle body is not retrievable`, until the migration
 stores its canonical bytes; a body that is there but cannot be read or verified,
-or one recorded under a URI scheme other than `file://`, answers `500`. A row or block that goes away between lookup and read answers
-`404` with `unknown PRISM block`. Immutable artifacts remain exempt from
-ordinary replica freshness refusals.
+or a body or share segment recorded under a URI scheme other than `file://`,
+answers `500`. A row or block that goes away between lookup and read answers
+`404` with `unknown PRISM block`, and a row re-imported under another digest
+between lookup and read answers `404` with `unknown public PRISM artifact`, so
+neither its stored bytes nor its body is served under the old address.
+Immutable artifacts remain exempt from ordinary replica freshness refusals.
 
 Direct-coinbase blocks return the same settlement-artifacts wrapper with
 `settlement_mode: direct_coinbase` and `fanouts: []`. A `404` means no public

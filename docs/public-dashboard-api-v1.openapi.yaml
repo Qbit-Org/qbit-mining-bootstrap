@@ -427,8 +427,10 @@ paths:
             segment its envelope names, is not on the serving host yet (message
             `audit bundle body is not retrievable`) until the migration stores
             its canonical bytes; or its row or block went away between lookup
-            and read (message `unknown PRISM block`). Never cached, so a later
-            request can succeed.
+            and read (message `unknown PRISM block`); or its row was re-imported
+            under another digest between lookup and read (message `unknown
+            public PRISM artifact`). Never cached, so a later request can
+            succeed.
           headers:
             Cache-Control:
               description: Error responses are never cached.
