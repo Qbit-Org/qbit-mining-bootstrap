@@ -155,6 +155,13 @@ def main():
             assert after["qbit-prism-revision-work-unknown"]["noDataState"] == "Alerting"
             assert after["qbit-prism-accepted-block-unlanded"]["noDataState"] == "OK"
             assert after["qbit-prism-revision-work-pending"]["for"] == "0s"
+            # #758: both revision-work warnings carry their critical twin's
+            # miner gate, so an idle backup frontend stays quiet after a pool block.
+            miners = ('and on(job, instance, network) (qbit_prism_authorized_clients'
+                      '{job=\\"qbit-prism\\",network=\\"mainnet\\"} > 0)')
+            for uid in ["qbit-prism-revision-work-pending-crit", "qbit-prism-revision-work-pending",
+                        "qbit-prism-revision-work-unknown"]:
+                assert miners in json.dumps(after[uid]), uid
             # #529: a found block offered without a confirmed standby copy
             # warns at once, never pages, and is quiet on no data.
             standby = after["qbit-prism-offer-standby-unconfirmed"]

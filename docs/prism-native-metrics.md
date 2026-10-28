@@ -522,10 +522,12 @@ older cancelled refresh cannot overwrite a newer completed observation. No
 block, job, worker, frontend or height label is emitted.
 
 There are **five concrete alert rules**: `PrismAcceptedRevisionWorkPending`
-warns above one second and for a missing pending series or a failed scrape,
+warns above one second on a frontend with an authorized miner, and on any
+frontend for a missing pending series or a failed scrape,
 `PrismAcceptedRevisionWorkTrackingUnknown` warns for unknown tracking (a -1
-age, the tracking-unknown gauge or a missing unknown gauge) after a two-minute
-dwell, `PrismAcceptedRevisionWorkPendingCritical` uses the provisional
+age or the tracking-unknown gauge on a frontend with an authorized miner, or a
+missing unknown gauge on any frontend) after a two-minute dwell,
+`PrismAcceptedRevisionWorkPendingCritical` uses the provisional
 307-second incident-duration floor, `PrismRevisionWorkBuildTimeouts` warns on
 a five-minute increase, and `PrismAcceptedBlockUnlanded` warns when an
 unlanded acceptance is 30 minutes old for three minutes. The budget and
@@ -535,7 +537,14 @@ point 7): a failed template refresh marks tracking unknown only until the
 next successful refresh, one poll interval later, so a single transient
 refresh error never spans the eight consecutive 15-second scrapes the dwell
 requires, while a lost settlement reply, an unsettled orphan verdict,
-saturation or lost ordering persist and still warn. The paging
+saturation or lost ordering persist and still warn. Both warnings take the
+critical's miner gate (#758): a frontend with no authorized miner has no
+mining.notify write that can close its wait, and one that loses each pool
+block's settlement to a peer, such as an idle backup, marks that block's
+revision unknown until a restart or an orphan clears it, so without the gate
+it would warn after every pool block and never clear. The gate hides that
+state rather than clearing it: a backup that later takes miners warns once
+the dwell passes. The paging
 critical is gated (#493): the age must be known, the target scraped and at
 least one miner authorized on that frontend, with a one-minute dwell and
 no-data and evaluation errors treated as OK. It is deliberately not gated on
@@ -549,9 +558,10 @@ during a stall and stays well under the five-minute hold that delayed #413.
 If every miner leaves a frontend during a stall, this page resolves and
 nothing else pages for that frontend: the coverage rules cannot fire with
 zero authorized clients and the connected-clients rule is a cluster-wide
-non-paging warning, so only the pending warning keeps reporting the age until
-a miner reconnects and receives work. A lost race on the offering frontend
-never pages (#493 point 1): its acceptance is unlanded, outside the known
+non-paging warning; the pending warning is gated the same way, and both
+report the still-growing age again once a miner reconnects. A lost race
+on the offering frontend never pages (#493 point 1): its acceptance is
+unlanded, outside the known
 age, until an active-chain observation lands it or its orphan is proven. A
 routine lost race is proven within a few block intervals (six competitor
 confirmations at the 60-second target spacing plus the reconciliation retry
