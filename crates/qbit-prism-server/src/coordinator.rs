@@ -582,7 +582,10 @@ struct RevisionRetry {
 impl RevisionRetry {
     /// `Ok(())` once the backoff has passed when `error` was a lost revision
     /// race within the budget, and the caller writes again after a fresh
-    /// observation; otherwise the error, for the caller to settle.
+    /// observation; otherwise the error, for the caller to settle. The
+    /// deadline is checked again once the backoff has passed: the backoff is
+    /// clipped to the time left, and the runtime may wake late, so a race lost
+    /// just before the deadline starts no retry at or after it.
     async fn again(
         &mut self,
         block: &str,
@@ -593,48 +596,61 @@ impl RevisionRetry {
         let Some(race) = error.downcast_ref::<crate::ledger::ObservedRevisionChanged>() else {
             return Err(error);
         };
+        let (expected, current) = (race.expected, race.current);
         let now = tokio::time::Instant::now();
         let deadline = *self.deadline.get_or_insert(now + REVISION_RACE_DEADLINE);
-        let spent = if self.retries >= REVISION_RACE_RETRIES {
-            Some(format!(
-                "all {REVISION_RACE_RETRIES} of its retries are used"
-            ))
-        } else if now >= deadline {
-            Some(format!(
+        if self.retries >= REVISION_RACE_RETRIES {
+            return Err(Self::spent(
+                phase,
+                metrics,
+                error,
+                format!("all {REVISION_RACE_RETRIES} of its retries are used"),
+            ));
+        }
+        if now < deadline {
+            let jitter = {
+                use rand::Rng;
+                rand::thread_rng().gen_range(0.5..1.5)
+            };
+            let backoff = (REVISION_RACE_BACKOFF * (1 << self.retries))
+                .mul_f64(jitter)
+                .min(deadline.saturating_duration_since(now));
+            tokio::time::sleep(backoff).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let reason = format!(
                 "its {} s retry deadline from the first lost race has passed, after {} of at most {REVISION_RACE_RETRIES} retries",
                 REVISION_RACE_DEADLINE.as_secs(),
                 self.retries
-            ))
-        } else {
-            None
-        };
-        if let Some(spent) = spent {
-            metrics.record_post_offer_revision_race(phase, RevisionRaceOutcome::Spent);
-            return Err(error.context(format!(
-                "the post-offer {} lost a payout revision race and is not retried again: {spent}",
-                phase.as_str()
-            )));
+            );
+            return Err(Self::spent(phase, metrics, error, reason));
         }
         self.retries += 1;
         metrics.record_post_offer_revision_race(phase, RevisionRaceOutcome::Retried);
-        let jitter = {
-            use rand::Rng;
-            rand::thread_rng().gen_range(0.5..1.5)
-        };
-        let backoff = (REVISION_RACE_BACKOFF * (1 << (self.retries - 1)))
-            .mul_f64(jitter)
-            .min(deadline.saturating_duration_since(now));
         tracing::info!(
             %block,
             phase = phase.as_str(),
-            observed_revision = race.expected,
-            current_revision = race.current,
+            observed_revision = expected,
+            current_revision = current,
             retry = self.retries,
-            backoff_ms = backoff.as_millis() as u64,
+            backoff_ms = now.elapsed().as_millis() as u64,
             "post-offer write lost a payout revision race; observing again and writing at the new revision"
         );
-        tokio::time::sleep(backoff).await;
         Ok(())
+    }
+
+    /// The refusal of a race this phase's budget does not retry, with why.
+    fn spent(
+        phase: RevisionRacePhase,
+        metrics: &Metrics,
+        error: anyhow::Error,
+        reason: String,
+    ) -> anyhow::Error {
+        metrics.record_post_offer_revision_race(phase, RevisionRaceOutcome::Spent);
+        error.context(format!(
+            "the post-offer {} lost a payout revision race and is not retried again: {reason}",
+            phase.as_str()
+        ))
     }
 }
 
@@ -796,6 +812,49 @@ mod revision_retry_tests {
         assert!(first_refusal.get().unwrap().elapsed() >= REVISION_RACE_DEADLINE);
         assert_eq!(counted(&metrics, "landing", "retried"), "3");
         assert_eq!(counted(&metrics, "landing", "spent"), "1");
+    }
+
+    /// A race lost just before the deadline, with retries left, starts no
+    /// retry: its backoff is clipped to the time left and ends at the
+    /// deadline, and the deadline is checked again then (Codex P2 on #798).
+    #[tokio::test(start_paused = true)]
+    async fn a_race_lost_just_before_the_deadline_starts_no_retry() {
+        let metrics = Metrics::default();
+        let attempts = std::cell::Cell::new(0);
+        let first_refusal = std::cell::Cell::new(None);
+        let refused = through_revision_races(
+            "block",
+            RevisionRacePhase::Settlement,
+            &metrics,
+            |retries| {
+                attempts.set(attempts.get() + 1);
+                let now = tokio::time::Instant::now();
+                let first = *first_refusal.get().get_or_insert(now);
+                first_refusal.set(Some(first));
+                async move {
+                    if retries > 0 {
+                        let just_before = first + REVISION_RACE_DEADLINE - Duration::from_millis(1);
+                        tokio::time::advance(just_before.saturating_duration_since(now)).await;
+                    }
+                    Ok::<Result<()>, anyhow::Error>(Err(race()))
+                }
+            },
+        )
+        .await
+        .expect("the attempt failed")
+        .expect_err("a race past the deadline was retried");
+        let reason = format!("{refused:#}");
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a retry started at the deadline: {reason}"
+        );
+        assert!(
+            reason.contains("is not retried again: its 60 s retry deadline from the first lost race has passed, after 1 of at most 3 retries"),
+            "{reason}"
+        );
+        assert_eq!(counted(&metrics, "settlement", "retried"), "1");
+        assert_eq!(counted(&metrics, "settlement", "spent"), "1");
     }
 
     /// An attempt's outer error is returned at once, and a refusal that is
