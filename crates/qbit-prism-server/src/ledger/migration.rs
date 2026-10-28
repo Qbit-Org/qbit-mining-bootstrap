@@ -39,7 +39,9 @@ pub(super) use table_locks::migrate_schema_committed;
 /// record each after its last change, so a start refuses the database until
 /// that has completed. Version 28 is the dual writer's window cuts, and 29
 /// and 30 are reserved for the rest of the 3.1 dual writer; each version is
-/// checked on its own, so 31 needs none of them. A populated 2.x.x source
+/// checked on its own, so 31 needs none of them. 32 is the share append's
+/// server-side call and ledger clock (#711, #738), which every share append
+/// of this binary calls. A populated 2.x.x source
 /// records 2 the same way, after its
 /// share-hash backfill (`share_hashes.rs`, #582); once
 /// `migrate --defer-share-hashes` has mapped the backfill's recent range
@@ -47,7 +49,7 @@ pub(super) use table_locks::migrate_schema_committed;
 /// plain `migrate` records it.
 pub const REQUIRED_SCHEMA_VERSIONS: &[i32] = &[
     2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 31,
+    28, 31, 32,
 ];
 
 /// The schema migrations a start requires: `REQUIRED_SCHEMA_VERSIONS`, but
@@ -2285,6 +2287,10 @@ const NATIVE_MIGRATIONS: &[(i32, &str)] = &[
         31,
         include_str!("../../migrations/031_share_ledger_origin_index.sql"),
     ),
+    (
+        32,
+        include_str!("../../migrations/032_share_append_call.sql"),
+    ),
 ];
 
 /// The native migrations applied after the commit on existing native
@@ -3519,6 +3525,18 @@ pub(super) async fn migrate_schema(
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(28)")
+            .execute(&mut **tx)
+            .await?;
+    }
+    // #711, #738: the share append's server-side call and the ledger clock.
+    // Two functions an earlier binary never calls, which alter no table, so
+    // the migration needs no capability, no shutdown proof and no up-front
+    // table lock. They name 031's index only in plans made when called.
+    if !versions.contains(&32) {
+        sqlx::raw_sql(native_migration(32))
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_schema_migrations(version) VALUES(32)")
             .execute(&mut **tx)
             .await?;
     }

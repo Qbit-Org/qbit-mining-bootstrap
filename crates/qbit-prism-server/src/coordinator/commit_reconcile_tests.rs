@@ -547,7 +547,10 @@ async fn commit_reconcile_append_queued_on_the_order_lock_is_aborted_at_the_dead
             .execute(&mut *holder)
             .await?;
         // Every backend that queued behind the holder has now been granted
-        // the lock or given up; the aborted append must run nothing more.
+        // the lock or given up. Since #711 the aborted append queued inside
+        // its one call, which, once granted, runs server-side to its end (it
+        // may draw a share_seq) before its connection's cleanup rolls the
+        // transaction back: it must leave no row and release ORDER_LOCK.
         until("the queued backends to stop waiting", || async {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity WHERE pid=ANY($1) AND wait_event_type='Lock'",
@@ -558,11 +561,24 @@ async fn commit_reconcile_append_queued_on_the_order_lock_is_aborted_at_the_dead
             Ok(waiting == 0)
         })
         .await?;
+        until("the aborted append to release ORDER_LOCK", || async {
+            let holding: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE pid=ANY($1) AND locktype='advisory' AND granted",
+            )
+            .bind(&queued)
+            .fetch_one(&fixture.side)
+            .await?;
+            Ok(holding == 0)
+        })
+        .await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         ensure!(fixture.rows(&share_id).await? == 0, "a refused append left a row");
+        // One share_seq at most, drawn by the call's INSERT, whose sequence
+        // steps by 2 on a personalised database.
+        let drawn = fixture.share_sequence().await?.unwrap_or(0) - sequence.unwrap_or(0);
         ensure!(
-            fixture.share_sequence().await? == sequence,
-            "the aborted append kept running after the lock was released"
+            (0..=2).contains(&drawn),
+            "the aborted append drew {drawn} share_seq values after the lock was released"
         );
         drop(holder);
         Ok::<_, anyhow::Error>(())

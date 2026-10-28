@@ -1921,6 +1921,51 @@ leaf by leaf; the index adds about 30 bytes per row. Run `migrate` from a
 shell where a long command is acceptable, rather than relying on a starting
 frontend, whose readiness stays down until the build completes.
 
+### Migration 032: the share append in one server-side call
+
+Migration 032 adds two functions and changes no table (#711, #738).
+`qbit_prism_append_share` appends a share that carries no block in one call:
+it takes `ORDER_LOCK` and then, each as a statement of its own, reads the
+write guard and the payout revision (`FOR SHARE` when the append is fenced),
+the share_id probe's inputs, the share_id probe and its fallback, and, for a
+new share, stamps it with the ledger clock and inserts the row and its header
+mapping: the statements a frontend sent itself before. The frontend then
+decides its pre-commit gate and sends `COMMIT`, so `ORDER_LOCK` is held for
+that one call and the `COMMIT`, where it was held for the lock statement,
+three statements and the `COMMIT`. A refusal is raised before any write, with
+a SQLSTATE from `QP001` to `QP007` that the frontend maps back to the error,
+and so to the answer to the miner, it gave before.
+
+`qbit_prism_ledger_clock` is the clock every share is stamped with and every
+window anchored at since #738: the greatest of the stored `ledger_clock_ms`,
+the database's clock and the newest stamp among the node's own shares. No
+share append writes the cluster row any more, so a snapshot held on the
+primary no longer leaves a dead version of the singleton per share; the
+snapshot anchor and the peer sync's own-log floor are the only writers of the
+stored clock. A share that carries a block, and the settlement's credit of a
+deferred share, keep their statements and stamp with the same clock.
+
+It is additive and applied in the migration transaction, with no capability
+and no shutdown proof, and it alters no table, so `migrate` takes no table
+lock for it up front (as for 027 and 028, [above](#supported-2xx-source-schemas)):
+`CREATE FUNCTION` takes no lock a serving frontend waits for. A frontend of an
+earlier release never calls either function. It goes on appending with its
+own statements beside a frontend that calls them, on one database and under
+the same `ORDER_LOCK`, as in a rolling upgrade or the pre-migrate, and the
+shares of both stay in `share_seq` order with rising stamps: the earlier
+frontend stores each stamp it takes in `ledger_clock_ms`, which
+`qbit_prism_ledger_clock` reads as its floor, and every stamp
+`qbit_prism_ledger_clock` gives is that floor, the database's clock, or an own
+share's stamp the floor already covers, all of which the earlier frontend
+reads in turn. The one exception needs the database's own clock to step back
+(an NTP step, or a promotion to a host whose clock lags) while both releases
+append: the earlier release reads only the stored floor and the database's
+clock, so a share it appends after the step can be stamped below one this
+release appended just before it, and an anchor it takes can be below that
+share, which then joins only windows anchored once the clock has passed its
+stamp again. Upgrade every frontend of a database before a promotion to a
+host whose clock may lag.
+
 ## Bring up native instances
 
 Start one instance first and verify readiness before admitting controlled miners

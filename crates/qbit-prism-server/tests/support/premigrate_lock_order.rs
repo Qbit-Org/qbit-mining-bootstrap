@@ -123,8 +123,10 @@ async fn migration_027_backs_off_instead_of_closing_a_lock_cycle_with_a_serving_
     let migrated = migrated?;
     let after = versions(&a.pool).await?;
     ensure!(
-        [27, 28, 31].iter().all(|version| after.contains(version)),
-        "the migrate finished without 27, 28 and 31: {after:?}"
+        [27, 28, 31, 32]
+            .iter()
+            .all(|version| after.contains(version)),
+        "the migrate finished without 27, 28, 31 and 32: {after:?}"
     );
     db.close(vec![a, migrated]).await
 }

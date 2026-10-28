@@ -135,6 +135,7 @@ Job expiry remains a separate statement with its outer renewal recheck.
 | Compact prepared / issued / batch | Cluster SHARE → dependency/blob writes or locks → commit; no later advisory acquisition |
 | Blob collector | SETTLEMENT → ORDER → cluster UPDATE → fresh scans/deletes |
 | Candidate enqueue | ORDER → cluster SHARE → balance blob → candidate |
+| Share append without a block | ORDER → cluster SHARE (fenced), both inside `qbit_prism_append_share` (#711) |
 | Share append with candidate | ORDER → cluster SHARE (fenced) → balance blob → candidate |
 | Chain observation | SETTLEMENT → cluster UPDATE |
 | Accounting/recovery | SETTLEMENT → ORDER → authority UPDATE (some also take instance/lease table fences) |
