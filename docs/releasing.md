@@ -1,7 +1,7 @@
 # Publishing a release
 
 `main` is the release promotion branch. `3.x.x` is the development branch and
-production line for the 3.x series, whose current release is 3.1.0; `2.x.x` is
+production line for the 3.x series, whose current release is 3.1.1; `2.x.x` is
 the maintenance branch of the 2.x series. A release cut from an earlier point
 of a development branch gets its own branch at that cutoff, as `3.0.x` does
 for 3.0.0. A version is published only when its tag and GitHub release exist.
