@@ -62,7 +62,7 @@ use tokio_util::task::AbortOnDropHandle;
 pub const CHANNEL: &str = "qbit_prism_payout_revision";
 /// The `RETURNING` item of a same-tip bump of `qbit_prism_cluster`: it
 /// announces the new revision on [`CHANNEL`]. The payload is for logs only.
-pub(crate) const ANNOUNCE: &str = "pg_notify('qbit_prism_payout_revision',payout_revision::text)";
+pub const ANNOUNCE: &str = "pg_notify('qbit_prism_payout_revision',payout_revision::text)";
 /// The listener's `application_name`, which names its session in
 /// `pg_stat_activity`.
 pub const APPLICATION_NAME: &str = "qbit-prism-revision-wake";
@@ -210,9 +210,13 @@ async fn subscribe(options: &sqlx::Result<PgConnectOptions>) -> Result<PgListene
         Ok(options) => options.clone(),
         Err(error) => return Err(anyhow!("invalid PRISM_DATABASE_URL: {error}")),
     };
+    // No idle or lifetime limit: either would start a maintenance task per
+    // attempt that sleeps for minutes, and the listener holds its connection.
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(CONNECT_TIMEOUT)
+        .idle_timeout(None)
+        .max_lifetime(None)
         .connect_lazy_with(options);
     let mut listener = PgListener::connect_with(&pool).await?;
     // A lost connection ends `serve`; `listen` reconnects, so it knows to

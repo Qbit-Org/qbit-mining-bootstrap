@@ -20,7 +20,9 @@
 //! and a listener that reconnects wakes its refresh for the announcement it
 //! missed and is woken by the next one; a late announcement of an older
 //! revision republishes nothing older. The third has a dual-writer node's
-//! carry gate change, fenced by `ledger::bump_payout_revision`, wake B.
+//! carry gate change, fenced by `ledger::bump_payout_revision`, wake B. The
+//! fourth commits a bump between the refresh loop's first refresh and its
+//! listener's first LISTEN, which must still wake the refresh.
 //!
 //! Run through: test/prism-native-tests.sh cargo-args --locked -p
 //! qbit-prism-server --test revision_wake -- --nocapture
@@ -409,8 +411,8 @@ async fn until_listeners(
 /// A same-tip bump with its announcement, as `ledger/blocks.rs` runs it.
 async fn bump(connection: &mut PgConnection) -> Result<i64> {
     Ok(sqlx::query_scalar(&format!(
-        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision,pg_notify('{}',payout_revision::text)",
-        revision_wake::CHANNEL
+        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision,{}",
+        revision_wake::ANNOUNCE
     ))
     .fetch_one(connection)
     .await?)
@@ -577,6 +579,95 @@ async fn carry_gate(db: &ledger_database::FixtureDatabase, f: &Frontends) -> Res
         .await;
         node.pool.close().await;
         gated
+    }
+    .await;
+    let stopped = stop_loops(stop, loops).await;
+    result.and(stopped)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bump_before_the_first_listen_still_wakes_the_refresh() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = ledger_database::FixtureDatabase::open(&raw, "revision_wake_").await?;
+    let result = async {
+        let f = frontends(&db, [LONG_TICK, LONG_TICK]).await?;
+        let result = tokio::time::timeout(CASE_LIMIT, first_listen(&db, &f))
+            .await
+            .with_context(|| format!("the case exceeded {CASE_LIMIT:?}"))
+            .and_then(|result| result);
+        let reopened = sqlx::query(&format!(
+            "ALTER DATABASE \"{}\" WITH ALLOW_CONNECTIONS true",
+            db.name()
+        ))
+        .execute(&db.admin)
+        .await;
+        close(f).await;
+        result.and(reopened.map(|_| ()).map_err(Into::into))
+    }
+    .await;
+    db.close(result).await
+}
+
+/// B's refresh loop starts while the database refuses new connections, so
+/// its listener's first attempt fails and the loop's first refresh runs with
+/// no LISTEN in place. A same-tip bump then commits before the listener's
+/// first LISTEN. That LISTEN, once connections are allowed, must wake the
+/// refresh well before B's tick of [`LONG_TICK`].
+async fn first_listen(db: &ledger_database::FixtureDatabase, f: &Frontends) -> Result<()> {
+    f.b.refresh_once().await?;
+    // Opened while the database still takes connections; B's ledger pool
+    // keeps the ones its refreshes opened.
+    let mut bumper = PgConnection::connect(&db.url).await?;
+    let first = durable_revision(&mut bumper).await?;
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{}\" WITH ALLOW_CONNECTIONS false",
+        db.name()
+    ))
+    .execute(&db.admin)
+    .await?;
+    let started = Instant::now();
+    let (stop, _) = watch::channel(false);
+    let loops = vec![refresh_loop(&f.b, &stop)];
+    let result = async {
+        // The loop's first refresh, after its listener's first attempt failed.
+        while f.b.work_refresh_age() >= started.elapsed() {
+            ensure!(
+                started.elapsed() < WAKE_BOUND,
+                "B's refresh loop did not refresh at its start"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ensure!(
+            listeners(db).await? == 0,
+            "a listener connected while the database refused connections"
+        );
+        let missed = bump(&mut bumper).await?;
+        ensure!(missed == first + 1);
+        let (now, _) = published(&f.b).await?;
+        ensure!(
+            now == first,
+            "B republished at {now} without a listener or a tick"
+        );
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{}\" WITH ALLOW_CONNECTIONS true",
+            db.name()
+        ))
+        .execute(&db.admin)
+        .await?;
+        let reopened = Instant::now();
+        let took = republished(
+            &f.b,
+            missed,
+            reopened,
+            revision_wake::RETRY_LONGEST + WAKE_BOUND,
+        )
+        .await
+        .context("B's first LISTEN, after its first refresh, did not wake the refresh for the bump in between")?;
+        eprintln!("B's first LISTEN woke its refresh {took:?} after the database took connections");
+        Ok(())
     }
     .await;
     let stopped = stop_loops(stop, loops).await;

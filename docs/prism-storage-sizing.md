@@ -332,10 +332,11 @@ its durable bounded scan; account for that when choosing a node pruning policy.
 
 The native runtime uses `PRISM_RUNTIME_WORKERS` and a bounded
 `PRISM_JOB_BUILD_EXECUTOR_WORKERS` CPU builder limit. Increasing threads cannot
-remove PostgreSQL commit or storage bottlenecks. Sum
-`PRISM_DATABASE_MAX_CONNECTIONS` across frontends before setting the database
-connection budget, plus one per frontend for its payout-revision listener
-(#752); reserve operational connections as well.
+remove PostgreSQL commit or storage bottlenecks. Budget database connections for
+all frontends together before setting the connection limit: each frontend uses
+up to `PRISM_DATABASE_MAX_CONNECTIONS` + 1 database connections (its
+payout-revision listener, #752), + 2 more in dual-writer mode (its health pool).
+Reserve operational connections as well.
 
 ## Durability, WAL, and recovery
 

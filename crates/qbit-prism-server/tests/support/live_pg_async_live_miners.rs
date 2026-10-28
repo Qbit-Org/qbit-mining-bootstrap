@@ -1247,6 +1247,20 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
         )
         .await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
+    // The ledger's revision once the final block has landed: new-tip work
+    // below it is work the final block moved past.
+    let landed_revision: i64 = phase
+        .bound(
+            || "the ledger's payout revision after the final block was read".into(),
+            async {
+                Ok(sqlx::query_scalar(
+                    "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
+                )
+                .fetch_one(&f.pool)
+                .await?)
+            },
+        )
+        .await?;
     let mut on_new_tip = 0;
     // Every job passed over on superseded work, or refused after a later
     // revision move: (miner, job, work revision, ledger revision).
@@ -1328,21 +1342,22 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                 None => unrecorded.push((miner, job.clone())),
             }
             // The final block moves the revision past new-tip work once,
-            // with its confirmation. So a session meets work on at most one
-            // superseded revision: the first revision, whether its job was
-            // passed over or its share refused when a bump landed after the
-            // check. It can pass over more than one job on that revision,
-            // such as a republication for new shares before the
-            // confirmation, so only distinct revisions are bounded. A second
-            // one would be a revision move this drill never makes.
+            // with its confirmation. So a session meets work below the
+            // revision it landed at on at most one revision, the first. It
+            // can pass over more than one job on that revision, such as a
+            // republication for new shares before the confirmation, so only
+            // distinct revisions are bounded. Work at or above the landed
+            // revision that a later same-tip bump (maturity, carry)
+            // superseded, passed over or refused after the check, is not the
+            // final block's move and is not bounded.
             let stale: BTreeSet<i64> = superseded
                 .iter()
-                .filter(|entry| entry.0 == miner)
+                .filter(|entry| entry.0 == miner && entry.2 < landed_revision)
                 .map(|entry| entry.2)
                 .collect();
             ensure!(
                 stale.len() <= 1,
-                "miner {miner}'s surviving session met new-tip work on {} superseded payout revisions {stale:?}, but the final block supersedes its new-tip work once: {}",
+                "miner {miner}'s surviving session met new-tip work on {} payout revisions {stale:?} below the final block's {landed_revision}, but the final block supersedes its new-tip work once: {}",
                 stale.len(),
                 passed_over(miner, &tip, &superseded, &unrecorded, &retired)
             );
@@ -1409,8 +1424,8 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                 || "the drill's same-tip revision bump committed".into(),
                 async {
                     Ok(sqlx::query_scalar(&format!(
-                        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision,pg_notify('{}',payout_revision::text)",
-                        qbit_prism_server::coordinator::revision_wake::CHANNEL
+                        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision,{}",
+                        qbit_prism_server::coordinator::revision_wake::ANNOUNCE
                     ))
                     .fetch_one(&f.pool)
                     .await?)
