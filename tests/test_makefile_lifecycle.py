@@ -118,6 +118,29 @@ class MakefileLifecycleTests(unittest.TestCase):
             ["config/upstream.env", ".env"],
         )
 
+    def test_prism_self_check_passes_only_a_declared_legacy_import_into_the_container(self) -> None:
+        def self_check_command(**declared: str) -> list[str]:
+            env = os.environ.copy()
+            env.pop("PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING", None)
+            env.update(declared)
+            result = subprocess.run(
+                ["make", "--no-print-directory", "-s", "-n", "prism-self-check"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return shlex.split(result.stdout.strip())
+
+        self.assertNotIn("-e", self_check_command())
+        tokens = self_check_command(PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING="1")
+        flag = tokens.index("-e")
+        self.assertEqual(tokens[flag + 1], "PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1")
+        self.assertEqual(tokens[flag - 2:flag], ["exec", "-T"])
+        self.assertEqual(tokens[flag + 2:], ["prism-coordinator", "qbit-prism-server", "self-check"])
+
     def test_destructive_test_cleanup_uses_disposable_projects_only(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         destructive_lines = [line.strip() for line in makefile.splitlines() if "down -v" in line]

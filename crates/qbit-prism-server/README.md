@@ -65,6 +65,13 @@ Python script-specific filtering flags are replaced by the commands above.
 difficulty. On an empty pool without a configured fallback/fee address, set
 `PRISM_SELF_CHECK_ADDRESS` to a valid P2MR payout address for that probe.
 
+In production, `self-check` fails while any audit row lacks its stored bytes,
+after running its local checks. While `import-audits` is storing legacy audits,
+set `PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1` for that run only: the legacy
+rows are reported as `legacy_import_pending` instead of failing, and an
+incomplete native row still fails. See
+[the migration guide](../../docs/prism-rust-migration.md) (#734).
+
 `public-api` needs its read DSN in `PRISM_DATABASE_URL` and the advertised
 `PRISM_PUBLIC_STRATUM_URL`. It listens on port 3342 by default and can enforce a
 streaming-standby heartbeat contract with `PRISM_PUBLIC_REPLICA_MODE=require`.

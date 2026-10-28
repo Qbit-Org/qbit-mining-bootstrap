@@ -1299,7 +1299,13 @@ async fn frontend(
     report.check(
         "audit completeness",
         parsed["audit_completeness"]
-            == json!({"missing_stored_bodies": 0, "missing_canonical_bytes": 0}),
+            == json!({
+                "status": "complete",
+                "missing_stored_bodies": 0,
+                "missing_canonical_bytes": 0,
+                "pending_legacy_rows": 0,
+                "incomplete_native_rows": 0,
+            }),
         parsed["audit_completeness"].to_string(),
     );
     frontend.0.kill().await?;
