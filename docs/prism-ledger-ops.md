@@ -732,15 +732,19 @@ connection is established, the request provably never reached the node. That
 covers connection refused (the node or its RPC server restarting), a name or
 route failure, and the 5-second connect timeout. Since #762 it also covers a
 new connection that is not ready by half the submit deadline
-(`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS`, 1 s by default;
-`rpc::RELAY_CONNECT_DIVISOR`): a lost SYN, a full accept queue on the node or
-a slow name lookup. The call stops waiting there, with `last_error` naming
-that share, as in `... the connection could not be established (no connection
-within 500ms, its share of the call's 1s deadline)`, rather than letting the
-deadline pass while connecting, which could not be told from a request
-already written. The connect itself runs on, up to the 5-second connect
-timeout, and once established it serves the client's next call, so the
-re-offer finds the connection ready. The attempt that holds the
+(`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS`, 1 s by default), and never later
+than 4.9 s (`rpc::relay_connect_budget`): a lost SYN, a full accept queue on
+the node or a slow name lookup. A call still waiting for its connection stops
+there, with `last_error` naming that share, as in `... the connection could
+not be established (no connection within 500ms, its share of the call's 1s
+deadline)`, rather than letting the deadline pass while connecting, which
+could not be told from a request already written. A call that took a pooled
+connection meanwhile was sent on it instead, and keeps that request's outcome
+(see below). The connect itself runs on, up to the 5-second connect timeout,
+and once established it serves the client's next call, so the re-offer finds
+the connection ready; the client hands it out only while the kernel reports
+it open and unread, and only within the 20-second idle bound. The attempt
+that holds the
 reservation returns the row to `pending`, and the next claim runs the
 pre-offer phase again: an ordinary candidate whose parent was superseded
 meanwhile is abandoned there, and a leased candidate is offered without that

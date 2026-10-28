@@ -10,13 +10,14 @@ use qbit_prism_server::rpc::{
     relay_connect_budget, Rpc, RpcNotSentError, RpcRelayRefused, RpcReplyError, RELAY_METHODS,
 };
 use serde_json::{json, Value};
-use std::{
-    net::SocketAddr,
-    time::{Duration, Instant},
-};
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use tokio::net::TcpSocket;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::{TcpListener, TcpStream},
 };
 
 /// The deadline [`submit`] gives its call.
@@ -298,6 +299,7 @@ async fn a_relaying_call_without_its_own_deadline_keeps_the_clients() {
 
 /// A `listen(0)` listener on `address`: Linux queues one connection for it
 /// and, while that one waits, drops every SYN.
+#[cfg(target_os = "linux")]
 fn listen0(address: SocketAddr) -> TcpListener {
     let socket = TcpSocket::new_v4().unwrap();
     socket.set_reuseaddr(true).unwrap();
@@ -305,11 +307,19 @@ fn listen0(address: SocketAddr) -> TcpListener {
     socket.listen(0).unwrap()
 }
 
+/// Set to `1` to let the accept-queue tests pass, skipped, on a kernel that
+/// does not drop SYNs to a full accept queue. They fail there otherwise: they
+/// hold a core assertion, that a request written to a pooled connection
+/// stays unknown.
+#[cfg(target_os = "linux")]
+const ALLOW_SYN_SKIP: &str = "PRISM_TEST_ALLOW_SYN_SKIP";
+
 /// Fill the accept queue of a [`listen0`] listener: one connection queued and
 /// never accepted. A probe whose connect does not finish proves the queue
 /// full; a probe that connects raced the queued connection's handshake, and
-/// another probe follows. `None`, with the reason printed, on a kernel that
-/// does not drop SYNs to a full queue: the caller skips.
+/// another probe follows. On a kernel that does not drop SYNs to a full queue
+/// this panics, or, with [`ALLOW_SYN_SKIP`] set, prints why and returns
+/// `None` for the caller to skip.
 async fn fill_accept_queue(address: SocketAddr) -> Option<Vec<TcpStream>> {
     let mut queued = vec![TcpStream::connect(address).await.unwrap()];
     for _ in 0..10 {
@@ -319,13 +329,17 @@ async fn fill_accept_queue(address: SocketAddr) -> Option<Vec<TcpStream>> {
             Ok(probe) => queued.push(probe.unwrap()),
         }
     }
-    println!(
-        "skipped: this kernel does not drop SYNs to a full accept queue, which holds the connect open"
+    let why = "this kernel does not drop SYNs to a full accept queue, which holds the connect open";
+    assert!(
+        std::env::var(ALLOW_SYN_SKIP).is_ok_and(|allow| allow == "1"),
+        "{why}; set {ALLOW_SYN_SKIP}=1 to skip the accept-queue tests here"
     );
+    println!("skipped ({ALLOW_SYN_SKIP}=1): {why}");
     None
 }
 
 /// Answer one call on `stream` with `result` and return the call's method.
+#[cfg(target_os = "linux")]
 async fn answer(stream: &mut BufReader<TcpStream>, result: Value) -> Value {
     let (_, call) = read_call(stream).await;
     let reply = json!({"result": result, "error": null, "id": call["id"]}).to_string();
@@ -343,22 +357,17 @@ async fn answer(stream: &mut BufReader<TcpStream>, result: Value) -> Value {
     call["method"].clone()
 }
 
-/// #762: a connect its call stopped waiting for keeps running, and once
-/// established serves the next call. The node's accept queue is full when the
-/// first `submitblock` connects, so its SYN is dropped and the call is cut at
-/// its connect budget, unsent. The node then makes room, before the SYN's
-/// first retransmission, and the connect gets through. With the queue full
-/// again, so that no new connect could finish, the next `submitblock` goes out
-/// on the connection the cut connect opened, and the node accepts the block.
+/// A connect its call stopped waiting for, landed: the node's accept queue is
+/// full when a `submitblock` connects, so its SYN is dropped and the call is
+/// cut at its connect budget, unsent. The node then makes room, before the
+/// SYN's first retransmission, and the connect gets through. Returns the
+/// client, which keeps that connection as its spare, the node's listener, with
+/// an empty queue, and the node's end of the connection.
 #[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_connect_cut_at_its_budget_serves_the_next_call() {
-    let deadline = Duration::from_secs(1);
+async fn land_a_cut_connect(deadline: Duration) -> Option<(Rpc, TcpListener, TcpStream)> {
     let listener = listen0("127.0.0.1:0".parse().unwrap());
     let address = listener.local_addr().unwrap();
-    let Some(queued) = fill_accept_queue(address).await else {
-        return;
-    };
+    let queued = fill_accept_queue(address).await?;
     let rpc = rpc(address.port());
     let error = rpc
         .call_timeout("submitblock", json!(["00"]), Some(deadline))
@@ -371,7 +380,21 @@ async fn a_connect_cut_at_its_budget_serves_the_next_call() {
         .await
         .expect("the cut connect was abandoned")
         .unwrap();
-    let Some(_queued) = fill_accept_queue(address).await else {
+    Some((rpc, listener, stream))
+}
+
+/// #762: a connect its call stopped waiting for keeps running, and once
+/// established serves the next call. With the node's queue full again, so
+/// that no new connect could finish, the next `submitblock` goes out on the
+/// connection the cut connect opened, and the node accepts the block.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_connect_cut_at_its_budget_serves_the_next_call() {
+    let deadline = Duration::from_secs(1);
+    let Some((rpc, listener, stream)) = land_a_cut_connect(deadline).await else {
+        return;
+    };
+    let Some(_queued) = fill_accept_queue(listener.local_addr().unwrap()).await else {
         return;
     };
     let node = tokio::spawn(async move { answer(&mut BufReader::new(stream), Value::Null).await });
@@ -383,6 +406,62 @@ async fn a_connect_cut_at_its_budget_serves_the_next_call() {
         });
     assert_eq!(accepted, Value::Null);
     assert_eq!(node.await.unwrap(), "submitblock");
+}
+
+/// #762: a spare the node has closed is never handed out: a request written
+/// into it would fail after the write, its outcome unknown. The kernel is
+/// asked, not the runtime. Here the node's FIN has reached the client's socket
+/// on the loopback while the runtime, its one thread blocked, has not yet
+/// seen it. The next call opens a new connection instead, and the node
+/// accepts the block on that.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_spare_the_node_closed_is_never_handed_out() {
+    let deadline = Duration::from_secs(1);
+    let Some((rpc, listener, stream)) = land_a_cut_connect(deadline).await else {
+        return;
+    };
+    // The client parks the connection as its spare.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(50));
+    let node = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        answer(&mut BufReader::new(stream), Value::Null).await
+    });
+    let accepted = rpc
+        .call_timeout("submitblock", json!(["00"]), Some(deadline))
+        .await
+        .unwrap_or_else(|error| panic!("the closed spare was handed out: {error:#}"));
+    assert_eq!(accepted, Value::Null);
+    assert_eq!(node.await.unwrap(), "submitblock");
+}
+
+/// #762: a long deadline's budget still ends before the client's 5 s connect
+/// timeout, so the call reports the cut with its reason. Half of 10 s would
+/// meet that timeout, and the plain timeout could win the race and say only
+/// "connect failed". The clock is paused, so the test does not wait.
+#[tokio::test(start_paused = true)]
+async fn a_long_deadline_reports_its_cut_before_the_connect_timeout() {
+    let (port, _sent) = handshake_stall().await;
+    let rpc = https_rpc(port, Duration::from_secs(30));
+    let deadline = Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let error = rpc
+        .call_timeout("submitblock", json!(["00"]), Some(deadline))
+        .await
+        .expect_err("the connect cannot finish");
+    let elapsed = started.elapsed();
+    let not_sent = not_sent(&error).unwrap_or_else(|| panic!("not proven unsent: {error:#}"));
+    assert_eq!(
+        not_sent.cause,
+        "no connection within 4.9s, its share of the call's 10s deadline"
+    );
+    assert_eq!(relay_connect_budget(deadline), Duration::from_millis(4_900));
+    assert!(
+        elapsed >= relay_connect_budget(deadline) && elapsed < Duration::from_secs(5),
+        "{elapsed:?}"
+    );
 }
 
 /// #762's other side. A `submitblock` finds the client's one connection busy,

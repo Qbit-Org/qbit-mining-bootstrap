@@ -5,9 +5,9 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError, Weak,
+        Arc, Mutex, PoisonError,
     },
-    task::{Poll, Waker},
+    task::Poll,
     time::Duration,
 };
 
@@ -144,16 +144,24 @@ const _: () = assert!(POOL_IDLE_TIMEOUT.as_secs() < QBITD_DEFAULT_RPCSERVERTIMEO
 /// How long [`Rpc`]'s client gives a new connection before its connect fails.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A relaying call's connect budget ends at least this long before
+/// [`CONNECT_TIMEOUT`] would. So a call whose connect outlasts its budget
+/// always reports the cut, with its reason, never the plain connect timeout,
+/// whatever its deadline (#762).
+const CONNECT_BUDGET_MARGIN: Duration = Duration::from_millis(100);
+
 /// A [`RELAY_METHODS`] call with its own deadline may spend the first
 /// `1 / RELAY_CONNECT_DIVISOR` of it, the first half, obtaining its
 /// connection (#762); see [`relay_connect_budget`].
 pub const RELAY_CONNECT_DIVISOR: u32 = 2;
 
 /// How long a [`RELAY_METHODS`] call with its own `deadline` may spend
-/// obtaining a connection before it fails as [`RpcNotSentError`] (#762). The
-/// rest of the deadline is the request's.
+/// obtaining a connection before it fails as [`RpcNotSentError`] (#762): the
+/// first `1 / RELAY_CONNECT_DIVISOR` of it, and never longer than 4.9 s, just
+/// under the client's 5 s connect timeout. The rest of the deadline is the
+/// request's.
 pub fn relay_connect_budget(deadline: Duration) -> Duration {
-    deadline / RELAY_CONNECT_DIVISOR
+    (deadline / RELAY_CONNECT_DIVISOR).min(CONNECT_TIMEOUT.saturating_sub(CONNECT_BUDGET_MARGIN))
 }
 
 /// The connect deadline of the relaying call a task is sending (#762).
@@ -193,11 +201,20 @@ struct ConnectCut {
 /// waiting, whether the call was cut or hyper moved the connect to the
 /// background when the request took a pooled connection, is kept as the
 /// spare: the next connect the client starts takes it at once, if it is
-/// younger than the client's idle bound and the node has not closed it. So
-/// the offer that follows a cut, or any call before it, finds the connection
-/// ready. Every connect of an [`Rpc`] client is to its one node (a wallet
-/// client changes only the path), so the spare serves any of them. Every
-/// other connect runs as before, unless it can take the spare.
+/// younger than the client's idle bound, which stays under the node's idle
+/// close, and the kernel says the node has neither closed it nor sent on it
+/// ([`KernelSocket::idle_and_open`]). So the offer that follows a cut, or any
+/// call before it, finds the connection ready. Every connect of an [`Rpc`]
+/// client is to its one node (a wallet client changes only the path), so the
+/// spare serves any of them. Every other connect runs as before, unless it can
+/// take the spare.
+///
+/// The node can still close the spare between that check and the request's
+/// write, as it can a pooled connection. A request written into the close
+/// fails after the write, and its outcome is unknown: hyper-util knows that
+/// such a request on a new connection came back unwritten, but it does not
+/// say so (its error kind for it, `Canceled`, is private), so the call cannot
+/// prove it unsent.
 struct ConnectBoundLayer<Target> {
     idle_timeout: Duration,
     target: std::marker::PhantomData<fn(Target)>,
@@ -228,26 +245,23 @@ where
         ConnectBound {
             inner,
             idle_timeout: self.idle_timeout,
-            spare: Arc::new(Mutex::new(Spare {
-                generation: 0,
-                conn: None,
-            })),
+            spare: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 /// The connection a connect established after its call stopped waiting.
 struct Spare<C> {
-    /// Advanced by each park, so that an expiry drops only its own connection.
-    generation: u64,
-    conn: Option<C>,
+    conn: C,
+    socket: KernelSocket,
+    parked_at: tokio::time::Instant,
 }
 
 struct ConnectBound<S, C> {
     inner: S,
     idle_timeout: Duration,
     /// Shared by every clone: hyper clones the connector for each connect.
-    spare: Arc<Mutex<Spare<C>>>,
+    spare: Arc<Mutex<Option<Spare<C>>>>,
 }
 
 impl<S: Clone, C> Clone for ConnectBound<S, C> {
@@ -262,64 +276,185 @@ impl<S: Clone, C> Clone for ConnectBound<S, C> {
 
 impl<S, C> ConnectBound<S, C>
 where
-    C: hyper::rt::Read + Unpin + Send + 'static,
+    C: hyper_util::client::legacy::connect::Connection + Send + 'static,
 {
     fn take_spare(&self) -> Option<C> {
-        let mut conn = self
+        let spare = self
             .spare
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .conn
             .take()?;
-        idle_and_open(&mut conn).then_some(conn)
+        (spare.parked_at.elapsed() < self.idle_timeout && spare.socket.idle_and_open())
+            .then_some(spare.conn)
     }
 
-    /// Keep `conn` as the spare, in place of an older one, until the idle
-    /// bound passes.
-    fn park(spare: &Arc<Mutex<Spare<C>>>, conn: C, idle_timeout: Duration) {
-        let (generation, older) = {
-            let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
-            spare.generation += 1;
-            (spare.generation, spare.conn.replace(conn))
+    /// Keep `conn` as the spare, in place of an older one. A connection whose
+    /// socket the kernel cannot be asked about is not kept.
+    fn park(spare: &Mutex<Option<Spare<C>>>, conn: C) {
+        let mut extras = hyper::http::Extensions::new();
+        conn.connected().get_extras(&mut extras);
+        let Some(socket) = extras
+            .get::<hyper_util::client::legacy::connect::HttpInfo>()
+            .and_then(|info| KernelSocket::find(info.local_addr(), info.remote_addr()))
+        else {
+            return;
         };
+        let older = spare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(Spare {
+                conn,
+                socket,
+                parked_at: tokio::time::Instant::now(),
+            });
         drop(older);
-        let spare: Weak<Mutex<Spare<C>>> = Arc::downgrade(spare);
-        tokio::spawn(async move {
-            tokio::time::sleep(idle_timeout).await;
-            let Some(spare) = spare.upgrade() else {
-                return;
-            };
-            let expired = {
-                let mut spare = spare.lock().unwrap_or_else(PoisonError::into_inner);
-                if spare.generation == generation {
-                    spare.conn.take()
-                } else {
-                    None
-                }
-            };
-            drop(expired);
-        });
     }
 }
 
-/// Whether a connection that has carried no request is still open: a read
-/// finds neither the node's close nor bytes it sent unasked. A request
-/// written to a connection the node closed fails after the write, with its
-/// outcome unknown, so such a connection is never handed out.
-fn idle_and_open<C: hyper::rt::Read + Unpin>(conn: &mut C) -> bool {
-    let mut byte = [std::mem::MaybeUninit::uninit()];
-    let mut buf = hyper::rt::ReadBuf::uninit(&mut byte);
-    let mut cx = std::task::Context::from_waker(Waker::noop());
-    Pin::new(conn)
-        .poll_read(&mut cx, buf.unfilled())
-        .is_pending()
+/// This process's TCP socket under a spare, below any TLS layer, which the
+/// kernel answers for (#762).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct KernelSocket {
+    fd: std::os::fd::RawFd,
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelSocket {
+    /// The socket connected from `local` to `remote`, if this process holds
+    /// it: the two addresses name one connected TCP socket.
+    fn find(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Option<Self> {
+        std::fs::read_dir("/proc/self/fd")
+            .ok()?
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .map(|fd| Self { fd, local, remote })
+            .find(Self::holds_it)
+    }
+
+    /// Whether the descriptor still holds this socket.
+    fn holds_it(&self) -> bool {
+        socket_type(self.fd) == Some(libc::SOCK_STREAM)
+            && socket_address(self.fd, libc::getsockname) == Some(self.local)
+            && socket_address(self.fd, libc::getpeername) == Some(self.remote)
+    }
+
+    /// Whether the connection is open with nothing to read: a non-blocking
+    /// peek finds no byte yet. The kernel answers it, whatever the runtime has
+    /// seen of the socket so far. The node's close (a read of zero bytes), a
+    /// byte it sent unasked, an error, or a descriptor that no longer holds
+    /// this socket all mean that the connection must carry no request: one
+    /// written to a connection the node closed fails after the write, with
+    /// its outcome unknown.
+    fn idle_and_open(&self) -> bool {
+        if !self.holds_it() {
+            return false;
+        }
+        let mut byte = 0u8;
+        // SAFETY: `byte` is valid for the one byte asked for.
+        let read = unsafe {
+            libc::recv(
+                self.fd,
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_type(fd: std::os::fd::RawFd) -> Option<libc::c_int> {
+    let mut kind: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `kind` is valid for `length` bytes.
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    (read == 0).then_some(kind)
+}
+
+#[cfg(target_os = "linux")]
+type SocketAddressCall =
+    unsafe extern "C" fn(libc::c_int, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int;
+
+/// `fd`'s own (`getsockname`) or peer (`getpeername`) address.
+#[cfg(target_os = "linux")]
+fn socket_address(
+    fd: std::os::fd::RawFd,
+    address_of: SocketAddressCall,
+) -> Option<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+    // SAFETY: all zeroes is a valid `sockaddr_storage`.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` is valid for `length` bytes, room for any address.
+    let read = unsafe {
+        address_of(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut length,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    match libc::c_int::from(storage.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: the family says that `storage` holds a `sockaddr_in`.
+            let v4 = unsafe {
+                &*(&storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>()
+            };
+            Some(SocketAddr::from((
+                Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr)),
+                u16::from_be(v4.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: the family says that `storage` holds a `sockaddr_in6`.
+            let v6 = unsafe {
+                &*(&storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
+            };
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(v6.sin6_addr.s6_addr),
+                u16::from_be(v6.sin6_port),
+                v6.sin6_flowinfo,
+                v6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Elsewhere the kernel is not asked, and no connection is kept as a spare.
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct KernelSocket;
+
+#[cfg(not(target_os = "linux"))]
+impl KernelSocket {
+    fn find(_local: std::net::SocketAddr, _remote: std::net::SocketAddr) -> Option<Self> {
+        None
+    }
+
+    fn idle_and_open(&self) -> bool {
+        false
+    }
 }
 
 impl<S, Target, C> tower::Service<Target> for ConnectBound<S, C>
 where
     S: tower::Service<Target, Response = C, Error = BoxError>,
     S::Future: Send + 'static,
-    C: hyper::rt::Read + Unpin + Send + 'static,
+    C: hyper_util::client::legacy::connect::Connection + Send + 'static,
 {
     type Response = C;
     type Error = BoxError;
@@ -340,15 +475,17 @@ where
             return Box::pin(connecting);
         };
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        let (spare, idle_timeout) = (self.spare.clone(), self.idle_timeout);
+        let spare = self.spare.clone();
         tokio::spawn({
             let spare = spare.clone();
             async move {
+                // The budget ends first (`CONNECT_BUDGET_MARGIN`): this bound
+                // only ends a connect nothing waits for any more.
                 let connected = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
                     .await
                     .unwrap_or_else(|_| Err(tower::timeout::error::Elapsed::new().into()));
                 if let Err(Ok(conn)) = sender.send(connected) {
-                    Self::park(&spare, conn, idle_timeout);
+                    Self::park(&spare, conn);
                 }
             }
         });
@@ -360,7 +497,7 @@ where
                     // A connect that finished at the deadline is kept too.
                     receiver.close();
                     if let Ok(Ok(conn)) = receiver.try_recv() {
-                        Self::park(&spare, conn, idle_timeout);
+                        Self::park(&spare, conn);
                     }
                     Err(ConnectCut {
                         budget: relay_connect_budget(bound.deadline),

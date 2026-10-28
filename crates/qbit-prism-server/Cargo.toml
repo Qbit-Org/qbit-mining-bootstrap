@@ -30,7 +30,7 @@ hex = "0.4"
 # The readiness endpoint's HTTP/1 connections, with their own deadlines (3.1).
 # Both are already in the graph through axum.
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 num-bigint = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 percent-encoding = "2"
