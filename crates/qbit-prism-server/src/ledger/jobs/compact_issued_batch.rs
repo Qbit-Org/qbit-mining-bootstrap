@@ -193,8 +193,8 @@ impl Ledger {
             .bind(remaining).execute(&mut *tx).await?;
         // KEY SHARE fences every authority writer (each takes the row FOR
         // UPDATE first; see `lock_cluster_authority`) and the collector's
-        // exclusive cluster fence until commit, without blocking the share
-        // append's `ledger_clock_ms` UPDATE, which holds ORDER_LOCK while it
+        // exclusive cluster fence until commit, without blocking the snapshot
+        // anchor's `ledger_clock_ms` UPDATE, which holds ORDER_LOCK while it
         // waits and would otherwise queue every share behind this cohort.
         // Check authority only after acquiring it; this path must never
         // acquire either advisory lock while holding it. Migration 027's sync

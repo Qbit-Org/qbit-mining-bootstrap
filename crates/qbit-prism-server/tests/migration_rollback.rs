@@ -335,9 +335,17 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
         );
         let after = recovery::evidence(&source, pg_bin).await?;
         ensure!(after["accepted_shares"] == 4);
+        // Since #738 a share append stamps from the newest share and writes no
+        // clock; a window's anchor stores the clock.
+        ensure!(
+            after["records"]["ledger_clock"]["count"] == 0,
+            "the acknowledged append wrote the ledger clock"
+        );
+        ledger.snapshot(100).await?;
+        let after = recovery::evidence(&source, pg_bin).await?;
         ensure!(
             after["records"]["ledger_clock"]["count"] == 1,
-            "the acknowledged append left the ledger clock at its migration default"
+            "the window's anchor left the ledger clock at its migration default"
         );
         ensure!(
             after["records"]["shares"]["sha256"] != source_evidence["records"]["shares"]["sha256"]
@@ -566,9 +574,9 @@ async fn frozen_2x_backup_restore_reconciles_before_ack_and_exposes_post_ack_los
             .execute(&source.pool).await?;
         prior = recovery::evidence(&source, pg_bin).await?;
         ensure!(prior["records"]["cluster_config"]["count"] == 1);
-        // append and snapshot advance the ledger clock as the monotonic barrier
-        // behind share timestamps and window anchors, so a rewound clock must
-        // be visible even when every stamped share and anchor is unchanged.
+        // The snapshot anchor advances the ledger clock, the monotonic floor
+        // behind share timestamps and window anchors (#738), so a rewound clock
+        // must be visible even when every stamped share and anchor is unchanged.
         let ledger_clock_ms: i64 =
             sqlx::query_scalar("SELECT ledger_clock_ms FROM qbit_prism_cluster WHERE singleton")
                 .fetch_one(&source.pool)
