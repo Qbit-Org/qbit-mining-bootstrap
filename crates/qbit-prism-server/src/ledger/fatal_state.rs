@@ -370,8 +370,10 @@ impl Ledger {
             "final_tip_hash":final_tip.as_deref().unwrap_or(tip),"tip_extended":final_tip.is_some(),
             "blocks_checked":blocks.len(),"deep_fanouts_checked":fanouts.len(),"integrity":integrity});
         // Even a recovery with no changed payout rows invalidates old jobs and
-        // chain observations collected before the operator's decision.
-        sqlx::query("UPDATE qbit_prism_cluster SET fatal_error=NULL,payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton")
+        // chain observations collected before the operator's decision. The
+        // bump keeps the tip, so it is announced (#752,
+        // `coordinator::revision_wake`).
+        sqlx::query(&format!("UPDATE qbit_prism_cluster SET fatal_error=NULL,payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING {}", crate::coordinator::revision_wake::ANNOUNCE))
             .execute(&mut *tx).await?;
         let event: Value = sqlx::query_scalar(
             "INSERT INTO qbit_prism_fatal_state_events(reason,fatal_error,fatal_error_set_at,instances,reconciliation) \
