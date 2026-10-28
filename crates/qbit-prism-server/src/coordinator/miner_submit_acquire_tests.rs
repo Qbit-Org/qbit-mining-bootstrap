@@ -207,14 +207,27 @@ async fn outbox_rows(h: &Harness, expected: i64) -> Result<()> {
     .context("outbox row count not reached")?
 }
 
-async fn wait_counts(metrics: &Metrics, expected: (f64, f64)) -> Result<()> {
-    tokio::time::timeout(WAIT, async {
-        while counts(metrics) != expected {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .context("checkout boundary not reached")
+/// A timeout names the awaiting line and the counts it last saw.
+#[track_caller]
+fn wait_counts(
+    metrics: &Metrics,
+    expected: (f64, f64),
+) -> impl std::future::Future<Output = Result<()>> + '_ {
+    let site = std::panic::Location::caller();
+    async move {
+        tokio::time::timeout(WAIT, async {
+            while counts(metrics) != expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "checkout boundary {expected:?} not reached at {site}; counts {:?}",
+                counts(metrics)
+            )
+        })
+    }
 }
 
 #[tokio::test]
@@ -473,6 +486,14 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
 // Drive exactly through the initial probe, enqueue transaction and first
 // disposition probe. Taking the sole slot while the caller sleeps proves it
 // released at the statement boundary, and lets tests stop the next checkout.
+//
+// The caller is polled before the slot on every wake. Its poll task finished
+// before that task's connection could return, so by the time the test holds
+// the slot the caller has taken the answer and started its 50 ms sleep on the
+// real clock. Polled after the slot, it missed that answer whenever the return
+// and the test's checkout both completed in one wake (a slow runner): it then
+// began the sleep only after the test paused the clock and advanced past it,
+// and never spawned the poll the test expects to queue behind the slot.
 async fn first_poll<'a>(
     h: &'a Harness,
     persist: &mut std::pin::Pin<Box<impl std::future::Future<Output = SaveOutcome> + 'a>>,
@@ -485,8 +506,8 @@ async fn first_poll<'a>(
     }
     let connection = tokio::select! {
         biased;
-        result = tokio::time::timeout(WAIT, h.ledger().pool.acquire()) => result??,
         result = &mut *persist => panic!("pending candidate answered: {result:?}"),
+        result = tokio::time::timeout(WAIT, h.ledger().pool.acquire()) => result??,
     };
     assert_eq!(counts(h.metrics()), (before.0 + 3., before.1));
     Ok(connection)
@@ -709,10 +730,12 @@ async fn block_only_poll_missing_and_sql_error_stay_unknown() -> Result<()> {
                 let acquired = family(h.metrics());
                 // Drain that statement and hold the returned slot across
                 // the next sleep: errors/missing rows remain indeterminate.
+                // The caller goes first, as in `first_poll`, so it is asleep
+                // on that answer when the test holds the slot.
                 let held = tokio::select! {
                     biased;
-                    connection = h.ledger().pool.acquire() => connection?,
                     answer = &mut persist => panic!("nonterminal: {answer:?}"),
+                    connection = h.ledger().pool.acquire() => connection?,
                 };
                 assert_eq!(family(h.metrics()), acquired);
                 tokio::time::pause();

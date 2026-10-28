@@ -609,7 +609,8 @@ fn select_share_segment_range(
     share_count: usize,
     label: &str,
 ) -> Result<Vec<AcceptedShare>, AuditBodyRefError> {
-    validate_contiguous_shares(&segment_shares, label)?;
+    // Only the referenced range must be contiguous: a slot may hold a ledger
+    // gap outside it (#733), and only the selected shares enter the bundle.
     let selected = segment_shares
         .into_iter()
         .filter(|share| share.share_seq >= first_share_seq && share.share_seq <= last_share_seq)
