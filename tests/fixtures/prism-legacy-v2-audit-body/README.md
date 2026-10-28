@@ -3,17 +3,21 @@
 These three files are a v2 audit body and its two share-segment slots, as 2.x.x
 publishes them. Two `segment_range` parts cover shares 1–4 and 5–6. The
 window proof's `share_parts_digest_hex` is 2.x's: sha256 over the parts in
-insertion order. 3.x recomputes that digest with sorted keys and refuses the
-body with "window proof share_parts_digest_hex mismatch" (#731), which is how
-`import-audits` refuses such a body when its canonical sidecar is missing.
+insertion order. 3.x without #731's fix recomputes that digest with sorted
+keys and refuses the body with "window proof share_parts_digest_hex mismatch",
+which is how its `import-audits` refuses such a body when its canonical
+sidecar is missing. With the fix, 3.x recomputes 2.x's form.
 
-`tests/test_prism_legacy_parts_digest_check.py` reads them:
+`tests/test_prism_legacy_parts_digest_check.py` reads them, and so does
+`crates/qbit-prism/src/audit_body_ref.rs`'s `share_parts_digest_tests`:
 
 - `scripts/prism_legacy_parts_digest_check.py` must call the body
   `2x-order-only`, and its `digest_2x` must reproduce the stored digest;
-- the real `qbit-prism-audit-canonicalize` must refuse the body, and accept it
-  once the digest is recomputed by the checker's `digest_3x`, with canonical
-  bytes whose sha256 is the body's `audit_bundle_sha256`;
+- the real `qbit-prism-audit-canonicalize` must accept the body's parts
+  digest. Once the parts name the slots beside the body and the checker's
+  `digest_2x` recomputes that digest, the canonical bytes must hash to the
+  body's `audit_bundle_sha256`. It must refuse the digest recomputed by the
+  checker's `digest_3x`, as it does a changed part descriptor;
 - `scripts/prism_legacy_range_sidecars_sharded.sh` must turn copies of it into
   proven canonical sidecars.
 
@@ -46,4 +50,5 @@ The generator needs 2.x.x's `lab/` tree, so it isn't in this repository.
 
 Two runs produced identical files. 2.x's v2 writer only emits `segment_range`
 parts. Inline parts occur only in `audit-body-ref.v1` bodies, which carry no
-parts digest, so this fixture has none.
+parts digest, so this fixture has none; `../prism-legacy-v2-inline-audit-body`
+is a v2 body with one.

@@ -1,5 +1,6 @@
 use crate::{
-    build_prism_reward_manifest_with_cut, canonical_audit_bundle_bytes, AcceptedShare, AuditBundle,
+    build_prism_reward_manifest_with_cut, canonical_audit_bundle_bytes,
+    window::push_python_json_escaped_contents, AcceptedShare, AuditBundle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +68,8 @@ struct AuditWindowCompletenessProof {
     share_parts: Vec<SharePart>,
 }
 
+// Each variant's fields are in 2.x's insertion order, which the window proof's
+// parts digest covers (`share_parts_digest_hex`): do not reorder them.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind")]
 enum SharePart {
@@ -359,10 +362,7 @@ fn resolve_audit_bundle_v2(
 
     let share_parts = proof.share_parts;
     if let Some(expected_digest) = proof.share_parts_digest_hex.as_ref() {
-        let actual_digest = hex::encode(Sha256::digest(serde_json::to_vec(
-            &serde_json::json!({ "share_parts": &share_parts }),
-        )?));
-        if !expected_digest.eq_ignore_ascii_case(&actual_digest) {
+        if !expected_digest.eq_ignore_ascii_case(&share_parts_digest_hex(&share_parts)?) {
             return Err(AuditBodyRefError::Invalid(
                 "window proof share_parts_digest_hex mismatch".to_string(),
             ));
@@ -432,6 +432,22 @@ fn resolve_audit_bundle_v2(
     Ok(bundle)
 }
 
+/// A window proof's `share_parts_digest_hex` as 2.x wrote it (#731): sha256 of
+/// Python's `json.dumps({"share_parts": parts}, separators=(",", ":"))`, so each
+/// part's keys are in insertion order, `kind` first, and non-ASCII text is
+/// escaped. Each [`SharePart`] serializes its tag and then its fields in
+/// declaration order, which is that order, and an inline share in
+/// [`AcceptedShare`]'s order, as 2.x's share records hold it. Through a
+/// `serde_json::Value` the keys would come out sorted instead, because the
+/// workspace builds serde_json without `preserve_order`.
+fn share_parts_digest_hex(share_parts: &[SharePart]) -> Result<String, AuditBodyRefError> {
+    #[derive(Serialize)]
+    struct SharePartsDigest<'a> {
+        share_parts: &'a [SharePart],
+    }
+    python_json_sha256(&SharePartsDigest { share_parts })
+}
+
 fn bundle_value_with_shares(
     mut bundle_without_shares: Value,
     _shares_key_index: Option<usize>,
@@ -497,15 +513,7 @@ fn append_share_part(
                 share_count,
                 "share segment range",
             )?;
-            let actual_sha256 =
-                canonical_share_segment_sha256(first_share_seq, last_share_seq, &selected)?;
-            let expected_sha256 = range_sha256.to_lowercase();
-            if actual_sha256 != expected_sha256 {
-                return Err(AuditBodyRefError::HashMismatch {
-                    expected: expected_sha256,
-                    actual: actual_sha256,
-                });
-            }
+            verify_share_segment_sha256(first_share_seq, last_share_seq, &selected, &range_sha256)?;
             append_contiguous(shares, selected)?;
         }
         SharePart::SegmentPrefix {
@@ -532,15 +540,12 @@ fn append_share_part(
                 share_count,
                 "share segment prefix",
             )?;
-            let actual_sha256 =
-                canonical_share_segment_sha256(first_share_seq, last_share_seq, &selected)?;
-            let expected_sha256 = prefix_sha256.to_lowercase();
-            if actual_sha256 != expected_sha256 {
-                return Err(AuditBodyRefError::HashMismatch {
-                    expected: expected_sha256,
-                    actual: actual_sha256,
-                });
-            }
+            verify_share_segment_sha256(
+                first_share_seq,
+                last_share_seq,
+                &selected,
+                &prefix_sha256,
+            )?;
             append_contiguous(shares, selected)?;
         }
         SharePart::Inline {
@@ -625,11 +630,18 @@ fn select_share_segment_range(
     Ok(selected)
 }
 
-fn canonical_share_segment_sha256(
+/// Check a range or prefix part's digest over its selected shares. 3.x hashes
+/// the range as serde_json writes it. 1.x and 2.x hashed it with Python's
+/// `json.dumps`, which escapes non-ASCII text as `\uXXXX` (#709). The two
+/// forms differ only when a share carries non-ASCII text, such as a worker
+/// name, and each encodes the same shares, so either form is accepted. A
+/// digest of neither form is a mismatch, reported against the serde_json form.
+fn verify_share_segment_sha256(
     first_share_seq: u64,
     last_share_seq: u64,
     shares: &[AcceptedShare],
-) -> Result<String, AuditBodyRefError> {
+    expected_sha256: &str,
+) -> Result<(), AuditBodyRefError> {
     let segment = AuditShareSegment {
         schema: AUDIT_SHARE_SEGMENT_SCHEMA.to_string(),
         first_share_seq,
@@ -637,7 +649,46 @@ fn canonical_share_segment_sha256(
         share_count: shares.len(),
         shares: shares.to_vec(),
     };
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&segment)?)))
+    let expected_sha256 = expected_sha256.to_lowercase();
+    let actual_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&segment)?));
+    if actual_sha256 == expected_sha256 || python_json_sha256(&segment)? == expected_sha256 {
+        return Ok(());
+    }
+    Err(AuditBodyRefError::HashMismatch {
+        expected: expected_sha256,
+        actual: actual_sha256,
+    })
+}
+
+/// sha256 of `value` as CPython's `json.dumps(value, separators=(",", ":"))`
+/// writes it, which is how 1.x and 2.x hashed their storage artifacts: compact
+/// serde_json in field order, with non-ASCII text escaped.
+fn python_json_sha256<T: Serialize + ?Sized>(value: &T) -> Result<String, AuditBodyRefError> {
+    let mut bytes = Vec::new();
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut bytes,
+        PythonJsonFormatter,
+    ))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// serde_json's compact formatter with `json.dumps`'s default
+/// `ensure_ascii=True`: every character outside printable ASCII is written as
+/// `\uXXXX`, and one above the BMP as a UTF-16 surrogate pair. serde_json
+/// passes `"`, `\` and control characters to `write_char_escape`, whose
+/// escapes are CPython's too, and everything else in a string to
+/// `write_string_fragment`.
+struct PythonJsonFormatter;
+
+impl serde_json::ser::Formatter for PythonJsonFormatter {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut escaped = Vec::with_capacity(fragment.len());
+        push_python_json_escaped_contents(&mut escaped, fragment);
+        writer.write_all(&escaped)
+    }
 }
 
 fn resolve_body_uri(body_uri: &str, base_dir: Option<&Path>) -> Result<PathBuf, AuditBodyRefError> {
@@ -737,4 +788,143 @@ fn validate_contiguous_shares(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod python_json_tests {
+    use super::*;
+
+    #[test]
+    fn python_json_formatter_writes_cpython_json_dumps_bytes() {
+        let value = serde_json::json!({"text": "\"\\\n\u{1}\u{7f}\u{1f}ø€\u{1f980}/"});
+        let mut bytes = Vec::new();
+        value
+            .serialize(&mut serde_json::Serializer::with_formatter(
+                &mut bytes,
+                PythonJsonFormatter,
+            ))
+            .unwrap();
+        // CPython's json.dumps(value, separators=(",", ":")).
+        assert_eq!(
+            bytes,
+            br#"{"text":"\"\\\n\u0001\u007f\u001f\u00f8\u20ac\ud83e\udd80/"}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod share_parts_digest_tests {
+    use super::*;
+
+    /// 2.x.x's v2 body with two segment_range parts; its slots are named by
+    /// their production paths (tests/fixtures/prism-legacy-v2-audit-body).
+    const SEGMENT_RANGE_BODY: &str = include_str!(
+        "../../../tests/fixtures/prism-legacy-v2-audit-body/prism-audit-bundle-body-0000000000000000000000000000000000000000000000000000c8c8c8c8c8c8-65b11e1b7e2025472fad2e4cd6b555eaba5eab2a4903e17179ba792d58780a4b.json"
+    );
+    /// A v2 body written by 2.x.x's AuditArtifactStore with one inline part
+    /// whose workers are non-ASCII (tests/fixtures/prism-legacy-v2-inline-audit-body).
+    const INLINE_BODY: &str = include_str!(
+        "../../../tests/fixtures/prism-legacy-v2-inline-audit-body/prism-audit-bundle-body-0000000000000000000000000000000000000000000000000000c9c9c9c9c9c9-c328186054819ca745a8dfbd3bc2ab6e9e1a73d88adc0417356781c28b06cbd5.json"
+    );
+
+    fn is_parts_digest_mismatch(result: &Result<AuditBundle, AuditBodyRefError>) -> bool {
+        matches!(
+            result,
+            Err(AuditBodyRefError::Invalid(message))
+                if message == "window proof share_parts_digest_hex mismatch"
+        )
+    }
+
+    #[test]
+    fn parts_digest_reproduces_the_digests_2x_wrote() {
+        for body in [SEGMENT_RANGE_BODY, INLINE_BODY] {
+            let body: Value = serde_json::from_str(body).unwrap();
+            let proof = &body["share_window_proof"];
+            let parts: Vec<SharePart> =
+                serde_json::from_value(proof["share_parts"].clone()).unwrap();
+            assert_eq!(
+                share_parts_digest_hex(&parts).unwrap(),
+                proof["share_parts_digest_hex"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_2x_inline_body_with_non_ascii_workers_canonicalizes() {
+        let bundle = parse_audit_bundle_json(INLINE_BODY, None).unwrap();
+        let body: Value = serde_json::from_str(INLINE_BODY).unwrap();
+        let canonical = canonical_audit_bundle_bytes(&bundle).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&canonical)),
+            body["audit_bundle_sha256"].as_str().unwrap()
+        );
+        assert!(INLINE_BODY.contains("Bj\\u00f8rn-rig") && INLINE_BODY.contains("\\ud83e\\udd80"));
+        assert!(bundle.shares[1].miner_id.ends_with(".Bj\u{f8}rn-rig"));
+        assert!(bundle.shares[4].miner_id.ends_with(".rig-\u{1f980}"));
+    }
+
+    #[test]
+    fn a_changed_part_descriptor_or_inline_share_is_refused() {
+        let segment_range_body: Value = serde_json::from_str(SEGMENT_RANGE_BODY).unwrap();
+        // As 2.x wrote it, the descriptor passes the parts digest and the
+        // check goes on to the slots, which are not on this host.
+        let unchanged = parse_audit_bundle_value(segment_range_body.clone(), None);
+        assert!(!is_parts_digest_mismatch(&unchanged), "{unchanged:?}");
+
+        let parts_path = "/share_window_proof/share_parts";
+        type Change = (&'static str, fn(&mut Value));
+        let changes: [Change; 5] = [
+            ("range digest", |parts| {
+                parts[0]["range_sha256"] = Value::from("00".repeat(32));
+            }),
+            ("slot", |parts| {
+                parts[1]["body_uri"] = parts[0]["body_uri"].clone();
+            }),
+            ("bounds", |parts| {
+                parts[0]["last_share_seq"] = Value::from(3);
+                parts[0]["share_count"] = Value::from(3);
+                parts[1]["first_share_seq"] = Value::from(4);
+                parts[1]["share_count"] = Value::from(3);
+            }),
+            ("segment bounds dropped", |parts| {
+                let part = parts[0].as_object_mut().unwrap();
+                part.remove("segment_first_share_seq");
+                part.remove("segment_last_share_seq");
+            }),
+            ("part order", |parts| {
+                parts.as_array_mut().unwrap().reverse();
+            }),
+        ];
+        for (label, change) in changes {
+            let mut body = segment_range_body.clone();
+            change(body.pointer_mut(parts_path).unwrap());
+            let result = parse_audit_bundle_value(body, None);
+            assert!(is_parts_digest_mismatch(&result), "{label}: {result:?}");
+        }
+
+        // The form 3.x recomputed before #731, over sorted keys, matches no
+        // writer's digest.
+        let mut body = segment_range_body;
+        let sorted = hex::encode(Sha256::digest(
+            serde_json::to_vec(
+                &serde_json::json!({ "share_parts": body.pointer(parts_path).unwrap() }),
+            )
+            .unwrap(),
+        ));
+        body["share_window_proof"]["share_parts_digest_hex"] = Value::from(sorted);
+        let result = parse_audit_bundle_value(body, None);
+        assert!(is_parts_digest_mismatch(&result), "sorted keys: {result:?}");
+
+        // A changed inline share is refused by the parts digest.
+        let mut body: Value = serde_json::from_str(INLINE_BODY).unwrap();
+        let share = body
+            .pointer_mut("/share_window_proof/share_parts/0/shares/1")
+            .unwrap();
+        share["miner_id"] = Value::from("miner-mid-a.Bjorn-rig");
+        let result = parse_audit_bundle_value(body, None);
+        assert!(
+            is_parts_digest_mismatch(&result),
+            "inline share: {result:?}"
+        );
+    }
 }
