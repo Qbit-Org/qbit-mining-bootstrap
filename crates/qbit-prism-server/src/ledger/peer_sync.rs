@@ -33,6 +33,7 @@ use super::*;
 use crate::metrics::OrderLockHolder;
 use crate::node_identity::NodeIndex;
 use crate::peer_sync::COPIED_TABLES;
+use sqlx::types::Json;
 use sqlx::PgConnection;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -334,6 +335,138 @@ impl Applied {
 
 fn array_len(value: &Value) -> usize {
     value.as_array().map_or(0, Vec::len)
+}
+
+/// The most prepared jobs one transaction of [`Ledger::apply_prepared`]
+/// applies under the blob-GC fence (#785).
+pub const PREPARED_CHUNK_ROWS: usize = 1000;
+
+/// The most JSON, of jobs and the blobs they name, one such transaction
+/// applies, but for a job whose blobs alone are larger, which goes alone.
+/// A fenced apply was measured at about 0.14 ms a job and 48 ms a MB of
+/// blob JSON, so a chunk holds the fence, and keeps the tip observation
+/// (SETTLEMENT held) and the blob collector (SETTLEMENT and ORDER held)
+/// waiting behind it, for about 250 ms at most.
+pub const PREPARED_CHUNK_BYTES: usize = 2 << 20;
+
+/// One transaction's part of a [`PreparedBatch`]: consecutive jobs with
+/// every blob they name, so it applies alone (D-19).
+struct PreparedChunk<'a> {
+    jobs: &'a [Value],
+    templates: Vec<&'a Value>,
+    balances: Vec<&'a Value>,
+    highest: Option<i64>,
+}
+
+impl PreparedBatch {
+    /// The batch in runs of at most [`PREPARED_CHUNK_ROWS`] jobs and
+    /// [`PREPARED_CHUNK_BYTES`], in `sync_seq` order. A blob several runs
+    /// name goes in each, one no job names in the last. Each run's `highest`
+    /// is its last job's `sync_seq`, the last run's the batch's.
+    fn chunks(&self) -> Vec<PreparedChunk<'_>> {
+        let jobs = self.jobs.as_array().map_or(&[][..], Vec::as_slice);
+        let templates = blobs_by_key(&self.templates, "template_sha256");
+        let balances = blobs_by_key(&self.balances, "prior_balances_digest");
+        let mut chunks = Vec::new();
+        let (mut start, mut bytes) = (0, 0);
+        let (mut named_templates, mut named_balances) = (BTreeSet::new(), BTreeSet::new());
+        for (index, job) in jobs.iter().enumerate() {
+            let template = named_blob(job, "template_sha256", &templates);
+            let balance = named_blob(job, "window_prior_balances_sha256", &balances);
+            let own = json_len(job);
+            let size = |templates: &BTreeSet<&str>, balances: &BTreeSet<&str>| {
+                own + template
+                    .filter(|(key, _)| !templates.contains(key))
+                    .map_or(0, |(_, size)| size)
+                    + balance
+                        .filter(|(key, _)| !balances.contains(key))
+                        .map_or(0, |(_, size)| size)
+            };
+            if index > start
+                && (index - start == PREPARED_CHUNK_ROWS
+                    || bytes + size(&named_templates, &named_balances) > PREPARED_CHUNK_BYTES)
+            {
+                chunks.push(PreparedChunk {
+                    jobs: &jobs[start..index],
+                    templates: blob_documents(&templates, &std::mem::take(&mut named_templates)),
+                    balances: blob_documents(&balances, &std::mem::take(&mut named_balances)),
+                    highest: jobs[index - 1].get("sync_seq").and_then(Value::as_i64),
+                });
+                (start, bytes) = (index, 0);
+            }
+            bytes += size(&named_templates, &named_balances);
+            named_templates.extend(template.map(|(key, _)| key));
+            named_balances.extend(balance.map(|(key, _)| key));
+        }
+        for (blobs, column, named) in [
+            (&templates, "template_sha256", &mut named_templates),
+            (
+                &balances,
+                "window_prior_balances_sha256",
+                &mut named_balances,
+            ),
+        ] {
+            let any: BTreeSet<&str> = jobs
+                .iter()
+                .filter_map(|job| job.get(column)?.as_str())
+                .collect();
+            named.extend(blobs.keys().filter(|key| !any.contains(*key)));
+        }
+        if start < jobs.len() || !named_templates.is_empty() || !named_balances.is_empty() {
+            chunks.push(PreparedChunk {
+                jobs: &jobs[start..],
+                templates: blob_documents(&templates, &named_templates),
+                balances: blob_documents(&balances, &named_balances),
+                highest: self.highest,
+            });
+        }
+        chunks
+    }
+}
+
+fn json_len(value: &Value) -> usize {
+    value.to_string().len()
+}
+
+/// Each blob document of `documents` by its `key`, with its JSON length.
+fn blobs_by_key<'a>(documents: &'a Value, key: &str) -> BTreeMap<&'a str, (&'a Value, usize)> {
+    documents
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|document| Some((document.get(key)?.as_str()?, (document, json_len(document)))))
+        .collect()
+}
+
+/// The key and JSON length of the blob `job` names in `column`, when the
+/// batch carries it.
+fn named_blob<'a>(
+    job: &Value,
+    column: &str,
+    blobs: &BTreeMap<&'a str, (&'a Value, usize)>,
+) -> Option<(&'a str, usize)> {
+    let (key, (_, size)) = blobs.get_key_value(job.get(column)?.as_str()?)?;
+    Some((*key, *size))
+}
+
+fn blob_documents<'a>(
+    blobs: &BTreeMap<&'a str, (&'a Value, usize)>,
+    keys: &BTreeSet<&str>,
+) -> Vec<&'a Value> {
+    keys.iter()
+        .filter_map(|key| blobs.get(key).map(|(document, _)| *document))
+        .collect()
+}
+
+/// A prepared job's carried `columns` compared when it is held already: all
+/// but its expiry, which its writer renews.
+fn compared_job_columns(columns: &str) -> String {
+    columns
+        .replace('"', "")
+        .split(',')
+        .filter(|column| *column != "expires_at")
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Reads on the peer's database, as its read-only sync role.
@@ -1396,12 +1529,16 @@ impl Ledger {
         Ok(rows)
     }
 
-    /// Apply prepared jobs with their blobs, blobs first, in one transaction
-    /// (D-19): a node that holds a record then holds both blobs it names. A
-    /// content-addressed blob held here already must be byte-identical; a
-    /// job held here already must match on everything but its expiry, which
-    /// its writer renews. `stream` names the cursor to advance, when the
-    /// jobs are the peer's.
+    /// Apply prepared jobs with their blobs (D-19): a node that holds a
+    /// record then holds both blobs it names. A content-addressed blob held
+    /// here already must be byte-identical; a job held here already must
+    /// match on everything but its expiry, which its writer renews. `stream`
+    /// names the cursor to advance, when the jobs are the peer's.
+    ///
+    /// The batch goes in [`PreparedBatch::chunks`], each in a transaction of
+    /// its own under the blob-GC fence, blobs first, that advances the cursor
+    /// through its last job (#785). An error leaves the chunks before it
+    /// applied and the cursor past them; applying them again changes nothing.
     pub async fn apply_prepared(
         &self,
         batch: &PreparedBatch,
@@ -1409,36 +1546,57 @@ impl Ledger {
         stream: Option<&str>,
     ) -> Result<Applied> {
         let mut applied = Applied::default();
-        let mut tx = self.begin().await?;
-        if batch.count > 0 || array_len(&batch.templates) > 0 || array_len(&batch.balances) > 0 {
-            // Fence blob GC as `save_compact_prepared` does, before any blob
-            // is inserted or found held, through the commit: the collector
-            // deletes, under the cluster row FOR UPDATE, every blob no
-            // committed job names, and `ON CONFLICT DO NOTHING` locks no held
-            // blob. It then either commits first, and the inserts below put
-            // the blobs back, or scans after these jobs are visible. No
-            // advisory lock may follow this fence (the collector takes
-            // SETTLEMENT and ORDER before it), and none does: the job insert
-            // names `sync_seq`, so its barrier-taking default never runs.
-            sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE")
-                .fetch_one(&mut *tx)
-                .await?;
+        // A blob conflict is recorded once for the batch, however many of
+        // its chunks name the blob; each of them is refused.
+        let mut recorded = BTreeSet::new();
+        for chunk in batch.chunks() {
+            applied.merge(
+                self.apply_prepared_chunk(&chunk, origin, stream, &mut recorded)
+                    .await?,
+            );
         }
+        Ok(applied)
+    }
+
+    async fn apply_prepared_chunk(
+        &self,
+        chunk: &PreparedChunk<'_>,
+        origin: NodeIndex,
+        stream: Option<&str>,
+        recorded: &mut BTreeSet<(&'static str, String)>,
+    ) -> Result<Applied> {
+        let mut applied = Applied::default();
+        let mut refused = false;
+        let mut tx = self.begin().await?;
+        // Fence blob GC as `save_compact_prepared` does, before any blob is
+        // inserted or found held, through the commit: the collector deletes,
+        // under the cluster row FOR UPDATE, every blob no committed job
+        // names, and `ON CONFLICT DO NOTHING` locks no held blob. It then
+        // either commits first, and the inserts below put the blobs back, or
+        // scans after these jobs are visible. No advisory lock may follow
+        // this fence (the collector takes SETTLEMENT and ORDER before it),
+        // and none does: the job insert names `sync_seq`, so its
+        // barrier-taking default never runs. No `writable()` check, as in
+        // every peer-sync apply: a halted node still ingests the peer's log,
+        // so it keeps D-19 for the blocks the peer finds.
+        sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR KEY SHARE")
+            .fetch_one(&mut *tx)
+            .await?;
         for (table, key, documents, compared) in [
             (
                 "qbit_prism_templates",
                 "template_sha256",
-                &batch.templates,
+                &chunk.templates,
                 "template_bytes",
             ),
             (
                 "qbit_prism_balance_snapshots",
                 "prior_balances_digest",
-                &batch.balances,
+                &chunk.balances,
                 "balances",
             ),
         ] {
-            if array_len(documents) == 0 {
+            if documents.is_empty() {
                 continue;
             }
             let columns = self.carried_columns_in(&mut tx, table).await?;
@@ -1446,7 +1604,7 @@ impl Ledger {
                 "INSERT INTO {table}({columns}) SELECT {columns} FROM jsonb_populate_recordset(NULL::{table},$1) \
                  ON CONFLICT DO NOTHING"
             ))
-            .bind(documents)
+            .bind(Json(documents))
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -1455,14 +1613,18 @@ impl Ledger {
                 "SELECT i.{key} FROM jsonb_populate_recordset(NULL::{table},$1) i JOIN {table} l USING ({key}) \
                  WHERE l.{compared} IS DISTINCT FROM i.{compared}"
             ))
-            .bind(documents)
+            .bind(Json(documents))
             .fetch_all(&mut *tx)
             .await?;
-            for digest in &differing {
+            for digest in differing {
+                refused = true;
+                if !recorded.insert((table, digest.clone())) {
+                    continue;
+                }
                 Self::record_conflict(
                     &mut tx,
                     table,
-                    digest,
+                    &digest,
                     origin.index(),
                     "a content-addressed blob is held here with other bytes",
                 )
@@ -1470,33 +1632,29 @@ impl Ledger {
                 applied.conflict(table);
             }
         }
-        if batch.count > 0 {
+        if !chunk.jobs.is_empty() {
             let columns = self.carried_columns_in(&mut tx, "qbit_prism_jobs").await?;
             let inserted = sqlx::query(&format!(
                 "INSERT INTO qbit_prism_jobs({columns}) SELECT {columns} FROM \
                  jsonb_populate_recordset(NULL::qbit_prism_jobs,$1) ON CONFLICT DO NOTHING"
             ))
-            .bind(&batch.jobs)
+            .bind(Json(chunk.jobs))
             .execute(&mut *tx)
             .await?
             .rows_affected();
             applied.add("qbit_prism_jobs", inserted);
-            let compared = columns
-                .replace('"', "")
-                .split(',')
-                .filter(|column| *column != "expires_at")
-                .collect::<Vec<_>>()
-                .join(",");
+            let compared = compared_job_columns(&columns);
             let differing: Vec<String> = sqlx::query_scalar(&format!(
                 "SELECT i.job_id FROM jsonb_populate_recordset(NULL::qbit_prism_jobs,$1) i JOIN qbit_prism_jobs l USING (job_id) \
                  WHERE ROW({l}) IS DISTINCT FROM ROW({i})",
                 l = prefixed(&compared, "l."),
                 i = prefixed(&compared, "i."),
             ))
-            .bind(&batch.jobs)
+            .bind(Json(chunk.jobs))
             .fetch_all(&mut *tx)
             .await?;
             for job_id in &differing {
+                refused = true;
                 Self::record_conflict(
                     &mut tx,
                     "qbit_prism_jobs",
@@ -1508,14 +1666,43 @@ impl Ledger {
                 applied.conflict("qbit_prism_jobs");
             }
         }
-        if let (Some(stream), Some(highest)) = (stream, batch.highest) {
-            // A conflict anywhere in the batch, a job or a blob it names:
-            // refused through the batch's highest job.
-            let refused_through = (applied.total_conflicts() > 0).then_some(highest);
+        if let (Some(stream), Some(highest)) = (stream, chunk.highest) {
+            // A conflict anywhere in the chunk, a job or a blob it names:
+            // refused through the chunk's highest job.
+            let refused_through = refused.then_some(highest);
             Self::advance_cursor(&mut tx, stream, origin, highest, refused_through).await?;
         }
         tx.commit().await?;
         Ok(applied)
+    }
+
+    /// Whether this node holds every job of `batch` and every blob in it as
+    /// the batch has them, a job's expiry aside: applying it would insert
+    /// nothing and find no conflict, so own-log recovery skips its fenced
+    /// apply (#785).
+    pub async fn prepared_held_alike(&self, batch: &PreparedBatch) -> Result<bool> {
+        let mut tx = self.begin().await?;
+        let compared =
+            compared_job_columns(&self.carried_columns_in(&mut tx, "qbit_prism_jobs").await?);
+        let unlike: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM jsonb_populate_recordset(NULL::qbit_prism_jobs,$1) i \
+                LEFT JOIN qbit_prism_jobs l USING (job_id) WHERE l.job_id IS NULL OR ROW({l}) IS DISTINCT FROM ROW({i})) \
+             OR EXISTS(SELECT 1 FROM jsonb_populate_recordset(NULL::qbit_prism_templates,$2) i \
+                LEFT JOIN qbit_prism_templates l USING (template_sha256) \
+                WHERE l.template_sha256 IS NULL OR l.template_bytes IS DISTINCT FROM i.template_bytes) \
+             OR EXISTS(SELECT 1 FROM jsonb_populate_recordset(NULL::qbit_prism_balance_snapshots,$3) i \
+                LEFT JOIN qbit_prism_balance_snapshots l USING (prior_balances_digest) \
+                WHERE l.prior_balances_digest IS NULL OR l.balances IS DISTINCT FROM i.balances)",
+            l = prefixed(&compared, "l."),
+            i = prefixed(&compared, "i."),
+        ))
+        .bind(&batch.jobs)
+        .bind(&batch.templates)
+        .bind(&batch.balances)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(!unlike)
     }
 
     /// Apply journal rows `origin` wrote (D-4): append-only, so a row held
@@ -1824,6 +2011,114 @@ mod tests {
             .iter()
             .any(|column| column.starts_with("claim_") || column.contains("broadcast")));
         assert!(!artifact.contains(&"settlement_status"));
+    }
+
+    fn job(seq: i64, template: &str, balances: &str) -> Value {
+        json!({"job_id": format!("prepared:{seq}"), "sync_seq": seq,
+            "template_sha256": template, "window_prior_balances_sha256": balances})
+    }
+
+    fn blob(key: &str, column: &str, digest: &str, len: usize) -> Value {
+        json!({key: digest, column: "x".repeat(len)})
+    }
+
+    fn keys(documents: &[&Value], key: &str) -> Vec<String> {
+        documents
+            .iter()
+            .map(|document| document[key].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// #785: chunks keep to the row and byte bounds, in order, a job whose
+    /// blobs alone pass the byte bound goes alone, and each chunk carries
+    /// every blob its jobs name: a shared one in each, an unnamed one in the
+    /// last. An empty batch has none.
+    #[test]
+    fn prepared_chunks_keep_their_bounds_and_carry_every_blob_their_jobs_name() {
+        let total = 2 * PREPARED_CHUNK_ROWS + PREPARED_CHUNK_ROWS / 2;
+        let rows = PreparedBatch {
+            jobs: Value::Array((1..=total as i64).map(|seq| job(seq, "t", "b")).collect()),
+            templates: json!([blob("template_sha256", "template_bytes", "t", 8)]),
+            balances: json!([blob("prior_balances_digest", "balances", "b", 8)]),
+            count: total,
+            highest: Some(total as i64),
+        };
+        let chunks = rows.chunks();
+        let rows_per_chunk = PREPARED_CHUNK_ROWS as i64;
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.jobs.len(), chunk.highest))
+                .collect::<Vec<_>>(),
+            [
+                (PREPARED_CHUNK_ROWS, Some(rows_per_chunk)),
+                (PREPARED_CHUNK_ROWS, Some(2 * rows_per_chunk)),
+                (PREPARED_CHUNK_ROWS / 2, Some(total as i64)),
+            ]
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.templates.len() == 1 && chunk.balances.len() == 1));
+
+        // Templates of two fifths of the byte bound: two jobs a chunk, then
+        // one whose template alone passes it, alone, with the unnamed blob.
+        let fifth = PREPARED_CHUNK_BYTES / 5;
+        let mut templates: Vec<Value> = (1..=5)
+            .map(|n| {
+                blob(
+                    "template_sha256",
+                    "template_bytes",
+                    &format!("t{n}"),
+                    2 * fifth,
+                )
+            })
+            .collect();
+        templates.push(blob("template_sha256", "template_bytes", "t6", 6 * fifth));
+        templates.push(blob("template_sha256", "template_bytes", "unnamed", 8));
+        let bytes = PreparedBatch {
+            jobs: Value::Array((1..=6).map(|n| job(n, &format!("t{n}"), "b")).collect()),
+            templates: Value::Array(templates),
+            balances: json!([blob("prior_balances_digest", "balances", "b", 8)]),
+            count: 6,
+            highest: Some(6),
+        };
+        let chunks = bytes.chunks();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.jobs.len(), chunk.highest))
+                .collect::<Vec<_>>(),
+            [(2, Some(2)), (2, Some(4)), (1, Some(5)), (1, Some(6))]
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| keys(&chunk.templates, "template_sha256"))
+                .collect::<Vec<_>>(),
+            [
+                vec!["t1", "t2"],
+                vec!["t3", "t4"],
+                vec!["t5"],
+                vec!["t6", "unnamed"]
+            ]
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| keys(&chunk.balances, "prior_balances_digest") == ["b"]));
+        for chunk in &chunks {
+            let size: usize = chunk
+                .jobs
+                .iter()
+                .chain(chunk.templates.iter().copied())
+                .chain(chunk.balances.iter().copied())
+                .map(json_len)
+                .sum();
+            assert!(
+                chunk.jobs.len() == 1 || size <= PREPARED_CHUNK_BYTES,
+                "{size}"
+            );
+        }
+        assert!(PreparedBatch::default().chunks().is_empty());
     }
 
     #[test]

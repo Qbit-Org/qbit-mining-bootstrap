@@ -782,11 +782,15 @@ impl PeerSync {
             let Some(last) = batch.highest else {
                 break;
             };
-            if self.ledger.missing_prepared(&batch).await? > 0 {
-                self.own_rows_missing().await?;
+            // Held here as the peer holds them, blobs too: an apply would
+            // only take the blob-GC fence (#785).
+            if !self.ledger.prepared_held_alike(&batch).await? {
+                if self.ledger.missing_prepared(&batch).await? > 0 {
+                    self.own_rows_missing().await?;
+                }
+                applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
+                self.ensure_progress(&applied)?;
             }
-            applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
-            self.ensure_progress(&applied)?;
             after = last;
         }
         let roles = bounded(peer::node_roles(connection, node)).await?;

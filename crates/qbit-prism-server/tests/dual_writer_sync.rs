@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use qbit_prism_server::{
     config::DualWriterConfig,
     ledger::{
-        peer_sync::{peer, Applied, PreparedBatch, PREPARED},
+        peer_sync::{peer, Applied, PreparedBatch, PREPARED, PREPARED_CHUNK_ROWS},
         BlobPruneCursor, BlobPruneResult, Ledger,
     },
     metrics::Metrics,
@@ -2316,13 +2316,13 @@ async fn a_pull_that_found_no_progress_row_folds_against_the_first_sweep() -> Re
 /// The advisory lock [`gate_on`]'s trigger takes, while a test holds it.
 const BLOB_GATE: i64 = 0x0785_0001;
 
-/// Make every row `trigger` (its timing, event and table) fires for wait
-/// for [`BLOB_GATE`].
+/// Make every row `trigger` (its timing, event, table and `FOR EACH ROW`,
+/// with any `WHEN`) fires for wait for [`BLOB_GATE`].
 async fn gate_on(pool: &PgPool, trigger: &str) -> Result<()> {
     sqlx::raw_sql(&format!(
         "CREATE OR REPLACE FUNCTION blob_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
          PERFORM pg_advisory_xact_lock({BLOB_GATE}); IF TG_OP='DELETE' THEN RETURN OLD; END IF; \
-         RETURN NEW; END $$; CREATE TRIGGER blob_gate {trigger} FOR EACH ROW EXECUTE FUNCTION blob_gate();"
+         RETURN NEW; END $$; CREATE TRIGGER blob_gate {trigger} EXECUTE FUNCTION blob_gate();"
     ))
     .execute(pool)
     .await?;
@@ -2393,10 +2393,11 @@ async fn hold_unreferenced_blobs(ledger: &Ledger, seed: &str) -> Result<()> {
     Ok(())
 }
 
-/// A's prepared jobs above `after`, as B's pull reads them.
-async fn prepared_of_a(pair: &Pair, after: i64) -> Result<PreparedBatch> {
+/// At most `limit` of A's prepared jobs above `after`, as B's pull reads
+/// them.
+async fn prepared_of_a(pair: &Pair, after: i64, limit: i64) -> Result<PreparedBatch> {
     let mut connection = pair.a.pool.acquire().await?;
-    peer::prepared(&mut connection, NodeIndex::A, after, None, 100, false).await
+    peer::prepared(&mut connection, NodeIndex::A, after, None, limit, false).await
 }
 
 /// Whether `pool` holds the job `job_id` with both blobs it names (D-19).
@@ -2433,8 +2434,9 @@ fn apply(ledger: &Ledger, batch: &PreparedBatch) -> tokio::task::JoinHandle<Resu
 /// #785, D-19: a pulled prepared job may name blobs B already holds that no
 /// job of B's names any more. The pull's blob inserts then change nothing,
 /// so the blob collector must wait for the pull's commit at the cluster row,
-/// not delete those blobs while the job is still invisible to it. Applying
-/// the batch again changes nothing.
+/// not delete those blobs while the job is still invisible to it. The fence
+/// is `FOR KEY SHARE`, so a share append's clock UPDATE meanwhile does not
+/// wait for the pull. Applying the batch again changes nothing.
 #[tokio::test]
 async fn a_pulled_prepared_job_keeps_the_held_blobs_it_names_from_the_collector() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -2443,12 +2445,12 @@ async fn a_pulled_prepared_job_keeps_the_held_blobs_it_names_from_the_collector(
     pair(&raw, async |pair| {
         let job = prepare(&pair.a, "reused").await?;
         hold_unreferenced_blobs(&pair.b, "reused").await?;
-        let batch = prepared_of_a(pair, 0).await?;
+        let batch = prepared_of_a(pair, 0, 100).await?;
         ensure!(batch.count == 1, "{batch:?}");
         // The pull has done all but its commit: it waits at its cursor.
         gate_on(
             &pair.b.pool,
-            "BEFORE INSERT ON qbit_prism_peer_sync_cursors",
+            "BEFORE INSERT ON qbit_prism_peer_sync_cursors FOR EACH ROW",
         )
         .await?;
         let mut gate = pair.b.pool.begin().await?;
@@ -2466,6 +2468,13 @@ async fn a_pulled_prepared_job_keeps_the_held_blobs_it_names_from_the_collector(
             "INSERT INTO qbit_prism_peer_sync_cursors",
         )
         .await?;
+        // Before the collector, which waits holding ORDER: the append needs it.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            append(&pair.b, &["beside a held pull"]),
+        )
+        .await
+        .context("a share append waited for a held pull's blob fence")??;
         let collector = sweep_blobs(&pair.b);
         ran_against(
             &pair.b.pool,
@@ -2519,10 +2528,14 @@ async fn a_pulled_prepared_job_puts_back_the_blobs_the_collector_took_first() ->
     pair(&raw, async |pair| {
         let job = prepare(&pair.a, "collected").await?;
         hold_unreferenced_blobs(&pair.b, "collected").await?;
-        let batch = prepared_of_a(pair, 0).await?;
+        let batch = prepared_of_a(pair, 0, 100).await?;
         ensure!(batch.count == 1, "{batch:?}");
         // The collector holds the cluster row and waits in its first DELETE.
-        gate_on(&pair.b.pool, "BEFORE DELETE ON qbit_prism_templates").await?;
+        gate_on(
+            &pair.b.pool,
+            "BEFORE DELETE ON qbit_prism_templates FOR EACH ROW",
+        )
+        .await?;
         let mut gate = pair.b.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(BLOB_GATE)
@@ -2577,7 +2590,7 @@ async fn a_pulled_prepared_job_puts_back_the_blobs_the_collector_took_first() ->
             "{cursor:?}"
         );
         let next = prepare(&pair.a, "cancelled").await?;
-        let retried = prepared_of_a(pair, batch.highest.unwrap_or_default()).await?;
+        let retried = prepared_of_a(pair, batch.highest.unwrap_or_default(), 100).await?;
         ensure!(retried.count == 1, "{retried:?}");
         let mut authority = pair.b.pool.begin().await?;
         sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE")
@@ -2620,6 +2633,193 @@ async fn a_pulled_prepared_job_puts_back_the_blobs_the_collector_took_first() ->
         ensure!(
             pair.b.peer_sync_cursor(PREPARED).await?
                 == retried.highest.map(|highest| (highest, None))
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Save `count` prepared jobs on one template and one balance snapshot, in
+/// one transaction, as `count` publications of the same work would.
+async fn prepare_many(ledger: &Ledger, seed: &str, count: usize) -> Result<()> {
+    let template = hex(&format!("template {seed}"));
+    let balances = hex(&format!("balances {seed}"));
+    let mut tx = ledger.pool.begin().await?;
+    sqlx::query("INSERT INTO qbit_prism_templates(template_sha256,template_bytes) VALUES($1,$2)")
+        .bind(&template)
+        .bind(seed.as_bytes())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,$2)",
+    )
+    .bind(&balances)
+    .bind(format!("[{seed}]").as_bytes())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at,window_anchor_ms,window_prior_balances_sha256,template_sha256) \
+                 SELECT format('prepared:%s:%s:%s',$1,$2,i),$1,$3,0,'{\"compact\":true}'::jsonb,clock_timestamp()+interval '1 hour',1000,$4,$5 FROM generate_series(1,$6) i")
+        .bind(&ledger.instance_id).bind(hex(seed)).bind(hex(&format!("parent {seed}")))
+        .bind(&balances).bind(&template).bind(i32::try_from(count)?).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// How many of A's prepared jobs B holds, and how many of those with both
+/// their blobs (D-19).
+async fn held_of_a(pool: &PgPool) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE EXISTS(SELECT 1 FROM qbit_prism_templates t WHERE t.template_sha256=j.template_sha256) \
+         AND EXISTS(SELECT 1 FROM qbit_prism_balance_snapshots b WHERE b.prior_balances_digest=j.window_prior_balances_sha256)) \
+         FROM qbit_prism_jobs j WHERE j.origin_node=0 AND j.job_id LIKE 'prepared:%'",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// #785: a pull larger than one chunk applies in fenced transactions of at
+/// most `PREPARED_CHUNK_ROWS` jobs, each committed with the blobs its jobs
+/// name and the cursor through its last job, so the fence is let go between
+/// them. A chunk that fails, cancelled here at its cursor advance with its
+/// rows written, applies nothing and leaves the chunks before it and the
+/// cursor past them; a cancelled wait for the fence leaves them too. Read
+/// again from the cursor, the pull applies whole, and applying the first
+/// read again changes nothing. A blob held here with other bytes is one
+/// conflict however many chunks name it, and refuses every one of them.
+#[tokio::test]
+async fn a_large_pull_applies_in_fenced_chunks_and_resumes_after_a_failed_one() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let total = 2 * PREPARED_CHUNK_ROWS + PREPARED_CHUNK_ROWS / 2;
+        prepare_many(&pair.a, "chunked", total).await?;
+        let batch = prepared_of_a(pair, 0, 5000).await?;
+        ensure!(batch.count == total, "{}", batch.count);
+        let seqs = batch
+            .jobs
+            .as_array()
+            .context("jobs")?
+            .iter()
+            .map(|job| job["sync_seq"].as_i64())
+            .collect::<Option<Vec<i64>>>()
+            .context("a job without sync_seq")?;
+        let (first, second) = (seqs[PREPARED_CHUNK_ROWS - 1], seqs[2 * PREPARED_CHUNK_ROWS - 1]);
+        let chunk = PREPARED_CHUNK_ROWS as i64;
+        // The second chunk waits at its cursor advance, its rows written.
+        gate_on(
+            &pair.b.pool,
+            &format!("BEFORE INSERT ON qbit_prism_peer_sync_cursors FOR EACH ROW WHEN (NEW.scanned_through={second})"),
+        )
+        .await?;
+        let mut gate = pair.b.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(BLOB_GATE).execute(&mut *gate).await?;
+        let gate_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *gate).await?;
+        let pull = apply(&pair.b, &batch);
+        let pull_pid = blocked_by(&pair.b.pool, gate_pid, "INSERT INTO qbit_prism_peer_sync_cursors").await?;
+        ensure!(held_of_a(&pair.b.pool).await? == (chunk, chunk), "the first chunk is not committed whole");
+        ensure!(pair.b.peer_sync_cursor(PREPARED).await? == Some((first, None)));
+        sqlx::query("SELECT pg_cancel_backend($1)").bind(pull_pid).execute(&pair.b.pool).await?;
+        ensure!(pull.await?.is_err(), "the cancelled pull succeeded");
+        gate.rollback().await?;
+        sqlx::raw_sql("DROP TRIGGER blob_gate ON qbit_prism_peer_sync_cursors").execute(&pair.b.pool).await?;
+        ensure!(held_of_a(&pair.b.pool).await? == (chunk, chunk), "the failed chunk left rows");
+        ensure!(pair.b.peer_sync_cursor(PREPARED).await? == Some((first, None)));
+
+        // A cancelled wait for the fence, behind an authority writer.
+        let rest = prepared_of_a(pair, first, 5000).await?;
+        ensure!(rest.count == total - PREPARED_CHUNK_ROWS, "{}", rest.count);
+        let mut authority = pair.b.pool.begin().await?;
+        sqlx::query("SELECT singleton FROM qbit_prism_cluster WHERE singleton FOR UPDATE").execute(&mut *authority).await?;
+        let authority_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *authority).await?;
+        let pull = apply(&pair.b, &rest);
+        let pull_pid = blocked_by(&pair.b.pool, authority_pid, "SELECT singleton FROM qbit_prism_cluster").await?;
+        sqlx::query("SELECT pg_cancel_backend($1)").bind(pull_pid).execute(&pair.b.pool).await?;
+        ensure!(pull.await?.is_err(), "the cancelled pull succeeded");
+        authority.rollback().await?;
+        ensure!(held_of_a(&pair.b.pool).await? == (chunk, chunk));
+        ensure!(pair.b.peer_sync_cursor(PREPARED).await? == Some((first, None)));
+
+        // Whole from the cursor, and the first read again changes nothing.
+        let applied = pair.b.apply_prepared(&rest, NodeIndex::A, Some(PREPARED)).await?;
+        ensure!(
+            applied.inserted == BTreeMap::from([("qbit_prism_jobs", rest.count as u64)]) && applied.conflicts.is_empty(),
+            "{applied:?}"
+        );
+        let all = total as i64;
+        ensure!(held_of_a(&pair.b.pool).await? == (all, all));
+        ensure!(pair.b.peer_sync_cursor(PREPARED).await? == batch.highest.map(|highest| (highest, None)));
+        let again = pair.b.apply_prepared(&batch, NodeIndex::A, Some(PREPARED)).await?;
+        ensure!(again == Applied::default(), "{again:?}");
+
+        // One blob conflict over two chunks: recorded once, both refused.
+        prepare_many(&pair.a, "conflicted", PREPARED_CHUNK_ROWS + 1).await?;
+        sqlx::query("INSERT INTO qbit_prism_templates(template_sha256,template_bytes) VALUES($1,'other bytes')")
+            .bind(hex("template conflicted")).execute(&pair.b.pool).await?;
+        let conflicted = prepared_of_a(pair, batch.highest.unwrap_or_default(), 5000).await?;
+        ensure!(conflicted.count == PREPARED_CHUNK_ROWS + 1, "{}", conflicted.count);
+        let applied = pair.b.apply_prepared(&conflicted, NodeIndex::A, Some(PREPARED)).await?;
+        ensure!(
+            applied.conflicts == BTreeMap::from([("qbit_prism_templates", 1)])
+                && applied.inserted.get("qbit_prism_jobs") == Some(&(conflicted.count as u64)),
+            "{applied:?}"
+        );
+        let seen: i64 = sqlx::query_scalar("SELECT seen_count FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_prism_templates'")
+            .fetch_one(&pair.b.pool).await?;
+        ensure!(seen == 1, "the conflict was recorded {seen} times");
+        ensure!(
+            pair.b.peer_sync_cursor(PREPARED).await? == conflicted.highest.map(|highest| (highest, Some(highest))),
+            "{:?}",
+            pair.b.peer_sync_cursor(PREPARED).await?
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// #785: own-log recovery applies, and so fences, only a batch of its own
+/// prepared jobs that is missing here or held otherwise. One held here as the
+/// peer holds it, blobs too, is not applied at all; one held with other
+/// content is still a conflict that stops recovery (D-17).
+#[tokio::test]
+async fn recovery_applies_only_own_prepared_jobs_missing_or_held_otherwise() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let job = prepare(&pair.a, "recovered alike").await?;
+        let held = format!("SELECT count(*) FROM qbit_prism_jobs WHERE job_id='{job}'");
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| Ok(count(&pair.b.pool, &held).await? == 1)).await?;
+        // Any apply of A's own batch would insert into A's jobs.
+        sqlx::raw_sql(
+            "CREATE FUNCTION refuse_job_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             RAISE EXCEPTION 'recovery applied own prepared jobs held alike'; END $$; \
+             CREATE TRIGGER refuse_job_insert BEFORE INSERT ON qbit_prism_jobs FOR EACH ROW \
+             EXECUTE FUNCTION refuse_job_insert();",
+        )
+        .execute(&pair.a.pool)
+        .await?;
+        let (mut restarted, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut restarted, async |report| Ok(report.own_log_caught_up)).await?;
+        sqlx::raw_sql("DROP TRIGGER refuse_job_insert ON qbit_prism_jobs")
+            .execute(&pair.a.pool)
+            .await?;
+        // A's own job now differs from the peer's copy of it.
+        sqlx::query("UPDATE qbit_prism_jobs SET parent_hash=$2 WHERE job_id=$1")
+            .bind(&job)
+            .bind(hex("another parent"))
+            .execute(&pair.a.pool)
+            .await?;
+        let (mut diverged, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let error = diverged
+            .pass()
+            .await
+            .err()
+            .context("recovery passed over a diverged own prepared job")?;
+        ensure!(format!("{error:#}").contains("has diverged"), "{error:#}");
+        ensure!(
+            count(&pair.a.pool, &format!("SELECT count(*) FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_prism_jobs' AND row_key='{job}'")).await? == 1
         );
         Ok(())
     })
