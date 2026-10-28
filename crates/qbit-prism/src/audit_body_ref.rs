@@ -197,6 +197,47 @@ mod inline_share_tests {
     }
 }
 
+#[cfg(test)]
+mod body_uri_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_uri_segment_resolves_to_its_local_path() {
+        let base = Path::new("/audits/block");
+        for (uri, path) in [
+            ("file:///segments/a.json", PathBuf::from("/segments/a.json")),
+            (
+                "file://localhost/segments/a.json",
+                PathBuf::from("/segments/a.json"),
+            ),
+            ("/segments/a.json", PathBuf::from("/segments/a.json")),
+            ("file://segments/a.json", base.join("segments/a.json")),
+            ("segments/a.json", base.join("segments/a.json")),
+        ] {
+            assert_eq!(resolve_body_uri(uri, Some(base)).unwrap(), path, "{uri}");
+        }
+        assert_eq!(
+            resolve_body_uri("file:///segments/a.json", None).unwrap(),
+            PathBuf::from("/segments/a.json")
+        );
+    }
+
+    /// A segment in a store this build does not read is refused, never read
+    /// as a missing local path.
+    #[test]
+    fn a_segment_uri_with_another_scheme_is_refused() {
+        for uri in ["s3://audits/a.json", "https://audits.invalid/a.json"] {
+            assert!(
+                matches!(
+                    resolve_body_uri(uri, Some(Path::new("/audits/block"))),
+                    Err(AuditBodyRefError::Invalid(_))
+                ),
+                "{uri}"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AuditShareSegment {
     schema: String,
@@ -416,7 +457,7 @@ fn append_share_part(
             sha256,
             body_uri,
         } => {
-            let segment_path = resolve_body_uri(&body_uri, base_dir);
+            let segment_path = resolve_body_uri(&body_uri, base_dir)?;
             let segment_bytes = fs::read(&segment_path)?;
             let actual_sha256 = hex::encode(Sha256::digest(&segment_bytes));
             let expected_sha256 = sha256.to_lowercase();
@@ -445,7 +486,7 @@ fn append_share_part(
             range_sha256,
             body_uri,
         } => {
-            let segment_path = resolve_body_uri(&body_uri, base_dir);
+            let segment_path = resolve_body_uri(&body_uri, base_dir)?;
             let segment_bytes = fs::read(&segment_path)?;
             let segment: AuditShareSegment = serde_json::from_slice(&segment_bytes)?;
             validate_share_segment_schema(&segment, &segment_path)?;
@@ -474,7 +515,7 @@ fn append_share_part(
             prefix_sha256,
             body_uri,
         } => {
-            let segment_path = resolve_body_uri(&body_uri, base_dir);
+            let segment_path = resolve_body_uri(&body_uri, base_dir)?;
             let segment_bytes = fs::read(&segment_path)?;
             let segment: AuditShareSegment = serde_json::from_slice(&segment_bytes)?;
             validate_share_segment_schema(&segment, &segment_path)?;
@@ -598,15 +639,31 @@ fn canonical_share_segment_sha256(
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&segment)?)))
 }
 
-fn resolve_body_uri(body_uri: &str, base_dir: Option<&Path>) -> PathBuf {
-    let path = PathBuf::from(body_uri);
-    if path.is_absolute() {
+fn resolve_body_uri(body_uri: &str, base_dir: Option<&Path>) -> Result<PathBuf, AuditBodyRefError> {
+    let path = match body_uri.strip_prefix("file://") {
+        // RFC 8089 names this host `localhost`, before an absolute path.
+        Some(path) if path.starts_with("localhost/") => &path["localhost".len()..],
+        // Otherwise a `file://` URI names the same local path, as it does for
+        // a row's own `body_uri`, which the import, the API and the sidecar
+        // tooling strip the same way.
+        Some(path) => path,
+        // A segment in a store this build does not read is not absent: no
+        // wait makes it readable here, so it is refused, not read as a path.
+        None if body_uri.contains("://") => {
+            return Err(AuditBodyRefError::Invalid(format!(
+                "unsupported share segment URI scheme: {body_uri}"
+            )))
+        }
+        None => body_uri,
+    };
+    let path = PathBuf::from(path);
+    Ok(if path.is_absolute() {
         path
     } else if let Some(base_dir) = base_dir {
         base_dir.join(path)
     } else {
         path
-    }
+    })
 }
 
 fn validate_part_shares(

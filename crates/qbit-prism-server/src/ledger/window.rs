@@ -750,7 +750,7 @@ impl Ledger {
         // relation ... found for row". That refusal is definite and total. It
         // is raised by the ledger INSERT itself, inside the transaction
         // `append_prepared` opened, and that transaction is rolled back with
-        // the share, the clock update, the hash row and any prepared
+        // the share, the hash row and any prepared
         // candidate bytes undone together, so nothing of the attempt
         // survives it. [`crate::partitions::run`] should have kept the lead
         // attached; where it has not, a miner's share is not the place to
@@ -974,6 +974,13 @@ impl Ledger {
         self.append_probed(tx, share, probe).await
     }
 
+    /// This frontend's dual-writer node as the ledger clock's own-origin
+    /// parameter, NULL for a single writer (`own_origin_sql`).
+    fn own_origin(&self) -> Option<i16> {
+        self.dual_writer_identity()
+            .map(|identity| identity.node.index())
+    }
+
     /// [`Self::APPEND_PROBE_SQL`] for `share`, as a statement of its own.
     async fn read_append_probe(
         tx: &mut Transaction<'_, Postgres>,
@@ -1076,28 +1083,36 @@ impl Ledger {
         )
     }
 
-    /// The share append's write (#711): the ledger clock, the share row and
-    /// its header mapping in one statement. The clock is the same `GREATEST`
-    /// as before, and the share's `accepted_at` the same expression of it.
+    /// The share append's write (#711): the share row and its header mapping
+    /// in one statement, stamped with the ledger clock [`ledger_clock_sql`]
+    /// derives (#738). It reads the cluster row and writes nothing to it:
+    /// with the stored clock written only by the snapshot anchor and the
+    /// peer sync, a snapshot held on the primary no longer leaves one dead
+    /// version of the singleton per share for every later append to walk.
+    /// `$14` is this frontend's dual-writer node or NULL, `$15` and `$16`
+    /// the probe's share_seq bounds ([`AppendProbe`]).
+    ///
     /// A share whose job was issued after that clock inserts nothing:
-    /// `share_seq` comes back NULL and the caller refuses the share, which
-    /// rolls the clock back with the transaction, as when the check ran
-    /// between two statements. Nothing on these tables observes the
-    /// difference: no trigger fires on an INSERT into either table, the
-    /// cluster row's only trigger is on `fatal_error`, and
-    /// qbit_prism_share_hashes has no foreign key (migration 016 dropped
-    /// it). A missing partition still raises SQLSTATE 23514 from the ledger
-    /// INSERT, which fails the whole statement, and `append_checked` still
-    /// retries it.
-    const APPEND_WRITE_SQL: &str = "WITH clock AS (UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE singleton RETURNING ledger_clock_ms),\
-         appended AS (INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) \
-            SELECT $1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,to_timestamp($9::double precision/1000),$10,to_timestamp(clock.ledger_clock_ms::double precision/1000),$11,true,$12,0 \
-            FROM clock WHERE $9<=clock.ledger_clock_ms RETURNING share_seq),\
-         hashed AS (INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT $13,$1 FROM appended) \
-         SELECT clock.ledger_clock_ms AS accepted_at_ms,appended.share_seq FROM clock LEFT JOIN appended ON true";
+    /// `share_seq` comes back NULL, no sequence value is drawn, and the
+    /// caller refuses the share. No trigger fires on an INSERT into either
+    /// table, and qbit_prism_share_hashes has no foreign key (migration 016
+    /// dropped it). A missing partition still raises SQLSTATE 23514 from
+    /// the ledger INSERT, which fails the whole statement, and
+    /// `append_checked` still retries it.
+    fn append_write_sql() -> String {
+        format!(
+            "WITH clock AS (SELECT {} AS ledger_clock_ms FROM qbit_prism_cluster c WHERE c.singleton),\
+             appended AS (INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,credit_policy,accepted,writer_id,writer_epoch) \
+                SELECT $1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,to_timestamp($9::double precision/1000),$10,to_timestamp(clock.ledger_clock_ms::double precision/1000),$11,true,$12,0 \
+                FROM clock WHERE $9<=clock.ledger_clock_ms RETURNING share_seq),\
+             hashed AS (INSERT INTO qbit_prism_share_hashes(header_hash,share_id) SELECT $13,$1 FROM appended) \
+             SELECT clock.ledger_clock_ms AS accepted_at_ms,appended.share_seq FROM clock LEFT JOIN appended ON true",
+            ledger_clock_sql("c.ledger_clock_ms", &own_origin_sql("$14"), "$15", "$16")
+        )
+    }
 
     /// The share append once `probe` has been read under `ORDER_LOCK`: the
-    /// share_id probe, then, for a new share, [`Self::APPEND_WRITE_SQL`].
+    /// share_id probe, then, for a new share, [`Self::append_write_sql`].
     ///
     /// The probe tries the newest partitions first, between the bounds, then
     /// a registered rejected sequence or the legacy range on an unmapped
@@ -1182,7 +1197,7 @@ impl Ledger {
             );
             bail!("duplicate-share: header already credited globally, and its share is archived");
         }
-        let (accepted_at_ms, seq): (i64, Option<i64>) = sqlx::query_as(Self::APPEND_WRITE_SQL)
+        let (accepted_at_ms, seq): (i64, Option<i64>) = sqlx::query_as(&APPEND_WRITE_SQL)
             .bind(&share.share_id)
             .bind(&share.miner_id)
             .bind(&share.order_key)
@@ -1196,6 +1211,9 @@ impl Ledger {
             .bind(&share.credit_policy)
             .bind(&self.instance_id)
             .bind(share_header_hash(&share.share_id))
+            .bind(self.own_origin())
+            .bind(floor)
+            .bind(ceiling)
             .fetch_one(&mut **tx)
             .await?;
         ensure!(
@@ -1270,7 +1288,12 @@ impl Ledger {
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Prepared)
             .await?;
         writable(&mut tx).await?;
-        let row = sqlx::query("UPDATE qbit_prism_cluster SET ledger_clock_ms=GREATEST(ledger_clock_ms,floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+1 WHERE singleton RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision").fetch_one(&mut *tx).await?;
+        // The anchor reads the newest own share's stamp too (#738), so it is
+        // never below a share at or under the cutoff read next.
+        let row = sqlx::query(&ANCHOR_SQL)
+            .bind(self.own_origin())
+            .fetch_one(&mut *tx)
+            .await?;
         let anchor_ms: i64 = row.try_get("anchor_ms")?;
         let payout_revision: i64 = row.try_get("payout_revision")?;
         let (cutoff, own_bound, peer_high_water) = match dual_writer_node {
@@ -2125,6 +2148,108 @@ static APPEND_BOUNDED_PROBE_SQL: std::sync::LazyLock<String> = std::sync::LazyLo
 });
 static APPEND_FULL_PARENT_PROBE_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("{SELECT_SHARE} WHERE share_id=$1"));
+static APPEND_WRITE_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(Ledger::append_write_sql);
+/// The snapshot's anchor (#738): the ledger clock [`ledger_clock_sql`]
+/// derives, plus one, stored, and returned less the one with the payout
+/// revision. `$1` is this frontend's dual-writer node or NULL. The share
+/// probe's bounds are migration 016's functions, each read once.
+static ANCHOR_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "UPDATE qbit_prism_cluster SET ledger_clock_ms={}+1 WHERE singleton \
+         RETURNING ledger_clock_ms-1 AS anchor_ms,payout_revision",
+        ledger_clock_sql(
+            "ledger_clock_ms",
+            &own_origin_sql("$1"),
+            "(SELECT qbit_prism_share_probe_floor())",
+            "(SELECT qbit_prism_share_next_seq())"
+        )
+    )
+});
+
+/// The `origin_node` this database's own share appends write, from `node`,
+/// a parameter holding the frontend's dual-writer node or NULL. An append
+/// never names the column, so it takes the default that personalisation set
+/// to the node's index in the transaction that recorded the identity
+/// (`ledger/node_identity.rs`); a database nobody personalised keeps 0 and
+/// has no identity row. A dual-writer frontend checks the identity and the
+/// defaults at start and stops if either changes; a single writer reads
+/// none of it, so on a database that ran as a node (the deliberate
+/// downgrade) the identity row says which rows are its own.
+fn own_origin_sql(node: &str) -> String {
+    format!(
+        "COALESCE({node}::smallint,(SELECT node_index FROM qbit_prism_node_identity WHERE singleton),0::smallint)"
+    )
+}
+
+/// The newest `accepted_at` among this node's own accepted shares, in UNIX
+/// ms, or NULL without one (#738). `own` is [`own_origin_sql`]; `floor` and
+/// `ceiling` bound the first probe as they bound the share_id probe
+/// ([`Ledger::APPEND_PROBE_SQL`]).
+///
+/// Every own share is appended under `ORDER_LOCK` and stamped with the
+/// clock this derives, so stamps rise with `share_seq` and the newest own
+/// share holds the highest stamp any own append made. Only own shares
+/// count: a peer's rows carry the peer's clock (`window/cut.rs`), and a
+/// row stamped by another clock can lie above an own share stamped later.
+/// The probe walks the `(origin_node, share_seq)` index (migration 031)
+/// backwards, origin bounded from both sides as `cut::OWN_CUT_SQL` is,
+/// first between the bounds, where a node that has appended lately finds
+/// its newest share in the lead, then, only when that finds nothing (a node
+/// that idled while its peer served, or that has no own share), over every
+/// partition. `accepted` skips legacy rejected rows; a native append is
+/// always accepted.
+///
+/// The millisecond is the least one whose conversion, as the append and
+/// the window's predicate convert it (`to_timestamp(ms/1000)`), is at or
+/// above the row's stamp: the one the row was stamped with, which a stored
+/// conversion can miss by a microsecond either way past about 2^43 ms
+/// (`window_read_oracle`), and for a legacy row stamped with a fraction of
+/// one, the next.
+fn newest_own_stamp_sql(own: &str, floor: &str, ceiling: &str) -> String {
+    let newest = |bounds: String| {
+        format!(
+            "(SELECT CASE WHEN to_timestamp(ms::double precision/1000)>=accepted_at THEN ms ELSE ms+1 END \
+             FROM (SELECT floor(extract(epoch FROM accepted_at)*1000)::bigint AS ms,accepted_at \
+             FROM qbit_share_ledger WHERE origin_node BETWEEN {own} AND {own}{bounds} AND accepted \
+             ORDER BY origin_node DESC,share_seq DESC LIMIT 1) AS newest)"
+        )
+    };
+    format!(
+        "COALESCE({},{})",
+        newest(format!(" AND share_seq>={floor} AND share_seq<{ceiling}")),
+        newest(String::new())
+    )
+}
+
+/// The ledger clock (#738), in UNIX ms: the greatest of the stored clock
+/// (`stored`, the cluster row's `ledger_clock_ms`), the database's clock
+/// and the newest own share's stamp ([`newest_own_stamp_sql`]).
+///
+/// A share append stamps `accepted_at` with it and writes nothing to the
+/// cluster row. The stored clock is written only by the snapshot anchor
+/// (`GREATEST(...)+1`, once per window, [`ANCHOR_SQL`]) and raised by the
+/// peer sync's own-log recovery (`Ledger::raise_own_sequences`), both under
+/// `ORDER_LOCK`, so it is a floor every append reads. Together:
+/// - an own share's stamp is at least every earlier own share's: stamps
+///   rise with `share_seq`, whatever the database's clock does;
+/// - a share appended after an anchor is stamped above it, the stored clock
+///   being one past it;
+/// - an anchor is at or above every own share already committed, so a
+///   backward step of the database's clock (an NTP step, a promotion to a
+///   host whose clock lags) never places one below a share at or under the
+///   window's cutoff;
+/// - the peer sync's floor holds for every later stamp.
+///
+/// These are the stamps and anchors the per-append `UPDATE` of the stored
+/// clock gave before: that clock was the newest own stamp, or an anchor or
+/// a floor above it.
+fn ledger_clock_sql(stored: &str, own: &str, floor: &str, ceiling: &str) -> String {
+    format!(
+        "GREATEST({stored},floor(extract(epoch FROM clock_timestamp())*1000)::bigint,{})",
+        newest_own_stamp_sql(own, floor, ceiling)
+    )
+}
 
 /// What the share append reads before its share_id probe, from
 /// [`Ledger::APPEND_PROBE_SQL`]'s columns; see there.
