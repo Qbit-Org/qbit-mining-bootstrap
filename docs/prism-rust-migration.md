@@ -2081,8 +2081,14 @@ qbitd's `-rpcservertimeout`, and the idle timeout of any proxy in front of the
 node, above 20 seconds; qbitd's default is 30. Otherwise a call can be written
 into the idle close and fail after the connection existed, which `submitblock`
 records as an unknown outcome.
-`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`;
-ambiguous submission results retain the durable candidate for reconciliation.
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` (1 second) bounds only `submitblock`,
+its connect included. A new connection gets at most half of it, and never
+more than 4.9 s (`rpc::relay_connect_budget`). A call still waiting for its
+connection then is never sent, and the block is offered again (#762); a call
+that took a pooled connection meanwhile was sent on it, and an unknown outcome
+stays unknown. That connect runs on, and once established serves the next
+call while the node keeps it open.
+Ambiguous submission results retain the durable candidate for reconciliation.
 Candidate claims renew throughout processing, including waits for build workers.
 Losing the lease cancels the attempt; the durable row remains recoverable.
 Fresh candidates take priority over retries, with periodic oldest-due selection

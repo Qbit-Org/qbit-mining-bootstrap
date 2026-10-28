@@ -221,7 +221,7 @@ accounting after it, and the row records where the block is between them:
 | State | Meaning |
 | --- | --- |
 | `pending` | Durable and never offered. The only state a claim may offer from, and the only one that may still be abandoned: a block proven superseded before it was ever offered. |
-| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
+| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522, or a connect still running at half the `submitblock` deadline, #762), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
 | `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
 | `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout after the connection was established, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
 | `orphaned` | Terminal (migration 015, #415). Reachable from the three offer states only. One coherent read-only observation proved a *different* block active at the candidate's height with at least `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted as `tip_height − height + 1`), after the row's audit landed: the lost tip race of the 2026-09-16 mainnet orphan stall (#413). `last_error` names the competitor, the height, the confirmations and the tip. Like the other terminal states, the row releases its document, block bytes and window reference, so terminal history does not pin candidate payloads or balance snapshots. It preserves its offer metadata and reason; the landed audit and pool-block row retain the accounting evidence. Never claimed again, never offered again, and no longer counted by `qbit_prism_block_candidates_pending` / `qbit_prism_block_candidate_oldest_pending_seconds`; `qbit_prism_block_candidates_orphaned_total` counts completions observed by this process after commit and may undercount if cancellation or restart intervenes. The block's `qbit_pool_blocks` row is marked `inactive` and keeps its landed audit, so a later reorg that reactivates the block is confirmed and credited (deferred share included) by the ordinary reorg reconciler, from that preserved evidence, without this row ever reopening. `orphaned` describes the completed outbox processing decision, not the block's permanent chain status. |
@@ -770,14 +770,29 @@ offered again. A crash in the same window still recovers as delivery unknown.
 **A call that never connected (#522).** When `submitblock` fails before its
 connection is established, the request provably never reached the node. That
 covers connection refused (the node or its RPC server restarting), a name or
-route failure, and the 5-second connect timeout. The attempt that holds the
+route failure, and the 5-second connect timeout. Since #762 it also covers a
+new connection that is not ready by half the submit deadline
+(`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS`, 1 s by default), and never later
+than 4.9 s (`rpc::relay_connect_budget`): a lost SYN, a full accept queue on
+the node or a slow name lookup. A call still waiting for its connection stops
+there, with `last_error` naming that share, as in `... the connection could
+not be established (no connection within 500ms, its share of the call's 1s
+deadline)`, rather than letting the deadline pass while connecting, which
+could not be told from a request already written. A call that took a pooled
+connection meanwhile was sent on it instead, and keeps that request's outcome
+(see below). The connect itself runs on, up to the 5-second connect timeout,
+and once established it serves the client's next call, so the re-offer finds
+the connection ready; the client hands it out only while the kernel reports
+it open and unread, and only within the 20-second idle bound. The attempt
+that holds the
 reservation returns the row to `pending`, and the next claim runs the
 pre-offer phase again: an ordinary candidate whose parent was superseded
 meanwhile is abandoned there, and a leased candidate is offered without that
 screen, as every leased candidate is (#350). Nothing else is treated this way. A reset, closed connection, lost
 reply or timeout after the connection was established, and any HTTP or
 JSON-RPC error, stay unknown and are never offered again, because the request
-may have been written. A crash or a lost claim between the failed connect and
+may have been written. So does a deadline that passes on a request that went
+out on a pooled connection while this call's own connect was still running. A crash or a lost claim between the failed connect and
 the row update leaves `offer_reserved`. Recovery treats that row as delivery
 unknown, since nothing durable proves the call was not made. Such an attempt
 records no outcome and no first-offer sample. While the node refuses, the
