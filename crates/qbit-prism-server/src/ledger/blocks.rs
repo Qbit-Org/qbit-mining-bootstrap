@@ -436,7 +436,7 @@ impl Ledger {
         tx.commit().await?;
         drop(order);
         if let Some(landing) = landing {
-            landing.committed(first_confirmation, committed_revision);
+            landing.committed(first_confirmation, expected_revision, committed_revision);
         }
         self.record_debt_metrics(divergence.iter(), debt);
         Ok((first_confirmation, committed_revision))
@@ -613,14 +613,14 @@ impl Ledger {
         drop(order);
         self.record_debt_metrics(effects.divergences.iter(), effects.debt);
         for (hash, observation) in landing {
-            let first = effects.first_confirmations.contains(hash);
             // A fatal early return can commit a first confirmation before the
-            // usual revision bump. It proves no eligible post-landing revision:
-            // retain unknown instead of matching pre-existing work at this R.
-            if first && effects.revision_bumps == 0 {
-                continue;
-            }
-            observation.committed(first, expected_revision + effects.revision_bumps);
+            // usual revision bump; the tracker then treats only later
+            // revisions as including it, never `expected_revision` (#758).
+            observation.committed(
+                effects.first_confirmations.contains(hash),
+                expected_revision,
+                expected_revision + effects.revision_bumps,
+            );
         }
         if let Some(message) = fatal {
             bail!(message);

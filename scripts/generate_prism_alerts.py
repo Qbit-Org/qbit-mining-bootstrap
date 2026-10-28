@@ -34,8 +34,11 @@ TARGET = 'job="qbit-prism",network="__NETWORK__"'
 TARGETS = "on(job, instance, network)"
 # Longer than the critical's 307-second floor plus its one-minute dwell, so a
 # stall that drives every miner away before it pages still warns for minutes;
-# a backup that has been idle longer stays quiet.
-MINER_WINDOW = "15m"
+# a backup that has been idle longer stays quiet. The rule texts say it too.
+MINER_WINDOW_MINUTES = 15
+MINER_WINDOW = f"{MINER_WINDOW_MINUTES}m"
+REVISION_WORK_PREFIX = ("Acceptance is observed locally; completion requires an actual successful "
+                        "mining.notify write at the post-landing revision. ")
 
 
 def prism(name):
@@ -76,11 +79,85 @@ def native_rules():
             f"(({pending} >= bool 307) and {TARGETS} ({pending} >= 0)) "
             f"and {TARGETS} {miners_now()} and {TARGETS} ({up} == 1)",
     }
+    window = f"{MINER_WINDOW_MINUTES} minutes"
+    bases = {
+        "PrismAcceptedRevisionWorkPending":
+            "Provisional warning at more than one second, with no additional dwell: the #275 budget is a target, "
+            "not a measured production percentile; measure in #291. Missing series on a configured target and "
+            f"failed scrapes also warn. Counts only on a frontend that has had an authorized miner within the last {window} "
+            "(#758): a frontend with no miners has no mining.notify write that can close its wait, so a long-idle "
+            "backup frontend would otherwise warn after every pool block, while a stall that drives every miner away "
+            f"keeps warning here for {window} after the last one leaves, after the critical rule, gated on miners now, "
+            "has resolved. The missing-series and failed-scrape warnings are not gated; a miner count absent for the "
+            "whole window closes the gate, as an absent count does for the critical rule. Unknown tracking (a -1 age, "
+            "the tracking-unknown gauge, or a missing unknown gauge) is owned by PrismAcceptedRevisionWorkTrackingUnknown, "
+            "which dwells so a single failed refresh does not warn (#493); a known pending age beside unknown tracking "
+            "still warns here and remains eligible for the critical rule. An offer the node accepted but has not reported "
+            "active is an unlanded acceptance, excluded from this age and owned by PrismAcceptedBlockUnlanded (#493).",
+        "PrismAcceptedRevisionWorkTrackingUnknown":
+            "Unknown or incomplete local landing tracking (#493 point 7): the pending age is -1 (no known wait remains "
+            "but tracking is unknown), the tracking-unknown gauge is one beside any known age, or the unknown gauge is "
+            "missing on a configured target during a mixed-version rollout. The -1 age and the tracking-unknown gauge "
+            f"count only on a frontend that has had an authorized miner within the last {window}, the pending warning's "
+            "gate (#758). When this frontend cannot know the first revision that includes a block's landing, a committed "
+            "revision proven to include it ends the unknown wait at the first eligible write at or above it, without a "
+            "sample (#758): any local settlement that found the block already confirmed proves its own revision, and a "
+            "first confirmation that committed without a bump (the fatal early return) proves only the revisions after "
+            "it. A serving frontend so clears the wait at its next such write; a long-idle backup keeps it, quietly, "
+            "until a miner receives work. The missing-gauge warning is not gated. Two-minute dwell: a failed template "
+            "refresh marks tracking unknown only until the next successful refresh, one poll interval later (two seconds "
+            "by default), so a single transient refresh error cannot span the eight consecutive 15-second scrapes this "
+            "dwell requires, while a lost or cancelled settlement COMMIT reply persists until a later settlement of the "
+            "block proves a covering revision and this frontend writes at it, and an unsettled orphan verdict, "
+            "bounded-tracking saturation and lost ordering history persist until terminal evidence or restart; all still "
+            "warn. No-data and evaluation errors alert so a missing measurement stays visible after the same dwell. "
+            "Non-paging: the critical rule owns known stalls and gates out unknown ages itself; the pending warning owns "
+            "the no-dwell budget signal. Measure the dwell in #291.",
+        "PrismAcceptedRevisionWorkPendingCritical":
+            "Provisional critical floor of 307 seconds comes from the #413 incident duration, not an early-warning result. "
+            "Gates (#493): the age must be known (not -1), the target scraped, and at least one authorized miner on the "
+            "reporting frontend, because a frontend with no connected miners has no mining.notify write that can close "
+            "its wait and would otherwise page after every pool block. The pending gauge is a live overlay rendered on "
+            "every scrape, so it is not gated on the metrics snapshot: a database-pool stall that also stalls the health "
+            "publisher must still page. The miner count is a snapshot family and may be a few refresh intervals old while "
+            "the snapshot is stale; a false page on a frontend whose miners left inside that window is accepted in exchange "
+            "for never missing a real stall. If every miner leaves a frontend during a stall, this page resolves and "
+            "nothing else pages for that frontend: the coverage rules cannot fire with zero authorized clients and the "
+            "connected-clients rule is a cluster-wide non-paging warning; the pending warning keeps reporting the age "
+            f"for {window} after the last miner leaves (#758), and both report it again once a miner reconnects. "
+            "One-minute dwell: the gauge is monotonic during a stall, so the dwell only absorbs a brief gate gap and stays "
+            "well under the five-minute hold that delayed #413. No-data and evaluation errors are OK: the warning rules "
+            "own missing or unknown measurements. The floor and dwell are literals in this specification, not deployment "
+            "variables. A lost race on the offering frontend never counts here (#493 point 1): an offer the node accepted "
+            "without an active-chain observation is an unlanded acceptance, excluded from the known pending age until an "
+            "active-chain observation lands it or its orphan is proven, and reported by accepted_block_unlanded_seconds "
+            "and PrismAcceptedBlockUnlanded instead. Measure thresholds and scrape/evaluation delay in #291; no "
+            "operational deployment is claimed.",
+    }
     rules = [rule for rule in spec["rules"] if rule["title"] in expressions]
     assert len(rules) == len(expressions)
     for rule in rules:
         rule["expr"] = expressions[rule["title"]]
+        rule["basis"] = bases[rule["title"]]
+        rule["description"] = REVISION_WORK_PREFIX + bases[rule["title"]]
     return spec
+
+
+# How the operator docs state the window; checked against MINER_WINDOW_MINUTES.
+WINDOW_PROSE = [r"authorized\s+miner\s+in\s+the\s+last\s+(\d+)\s+minutes",
+                r"for\s+(\d+)\s+minutes\s+after\s+(?:the|its)\s+last",
+                r"qbit_prism_authorized_clients\[(\d+)m\]"]
+
+
+def check_window_prose():
+    """#758: the operator docs state the recent-miner window the rules use."""
+    for path in ["docs/prism-alert-migration.md", "docs/prism-native-metrics.md"]:
+        text = (ROOT / path).read_text()
+        found = [int(match.group(1)) for pattern in WINDOW_PROSE for match in re.finditer(pattern, text)]
+        if not found:
+            raise SystemExit(f"{path} no longer states the recent-miner window")
+        if any(minutes != MINER_WINDOW_MINUTES for minutes in found):
+            raise SystemExit(f"{path} states a recent-miner window other than MINER_WINDOW_MINUTES={MINER_WINDOW_MINUTES}")
 
 
 def postgres_rules():
@@ -262,6 +339,7 @@ def main():
     parser.add_argument("--snapshot", type=Path, help="read-only snapshot directory, required to regenerate the deployment patch")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    check_window_prose()
     update(ROOT / "docs/prism-native-alert-rules.json", json.dumps(native_rules(), indent=2) + "\n", args.check)
     update(ROOT / "docs/prism-postgres-alert-rules.json", json.dumps(postgres_rules(), indent=2) + "\n", args.check)
     doc = ROOT / "docs/prism-alert-migration.md"

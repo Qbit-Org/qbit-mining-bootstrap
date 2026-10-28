@@ -461,10 +461,16 @@ are retained as deduplication tombstones until a coherent mature accounting
 checkpoint retires their height. A monotonic height watermark then rejects
 delayed proofs even after the identity is released; unresolved intervals are
 never retired by that checkpoint. Revision events are released when all known
-deliveries resolve. Once every open wait is bound to a target or a covering
-revision, or awaits only its orphan verdict, only the newest revision is kept,
-because a later write of an older one is obsolete; waits that stay open on a
-frontend that writes nothing therefore cannot exhaust revision history (#758).
+deliveries resolve. While waits are open, revisions below the lowest one an
+open wait may still need are released (#758): a bound or covered wait has
+been matched against every recorded write, and a later write below the newest
+observed revision is obsolete; a binding still to come comes from a
+settlement that runs under the settlement lock at no older revision than any
+observed; only a settlement observer still out keeps the history from the
+newest revision it saw. Waits that stay open on a frontend that writes
+nothing, bound or not and landed or not, therefore cannot exhaust revision
+history. A first revision that would need released writes is covered rather
+than measured.
 Nothing is evicted to make a duplicate look new.
 Exceeding a bound sets `accepted_block_revision_work_tracking_unknown` to
 **1 until restart**. Missing identities have no fabricated observations; known
@@ -482,13 +488,15 @@ original revision. A later proven first confirmation can recover an attempt
 that did not commit; an already-confirmed replay cannot invent the lost fact.
 The same unknown boundary applies when a peer confirms a locally accepted
 block during audit landing, before the local settlement observer starts.
-Neither keeps the wait open until restart (#758): a later settlement of the
+Neither keeps the wait open until restart (#758): any later settlement of the
 block by this frontend that finds it already confirmed commits at a revision
 covering the landing, and the first eligible write at or above that revision
-closes the wait without a sample, since its true end stays unknown. A delayed
-local first confirmation still in flight takes precedence and measures the
-exact revision. A frontend with no miners writes nothing, so it keeps such a
-wait unknown until a miner receives work. Only
+closes the wait without a sample, since its true end stays unknown. A first
+confirmation that commits without a bump (the fatal early return) covers it
+only from the next revision, because work at its own revision may predate the
+landing. A delayed local first confirmation still in flight takes precedence
+and measures the exact revision. A frontend with no miners writes nothing, so
+it keeps such a wait unknown until a miner receives work. Only
 a newly observed already-confirmed peer block may begin at its current local
 proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
 Universal exactly-once reporting beyond these knowledge/capacity boundaries
