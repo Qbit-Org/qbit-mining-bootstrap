@@ -699,8 +699,10 @@ fn statements_under_order_lock(executions: &[Execution]) -> Result<Vec<String>> 
 /// ORDER_LOCK is time every other share waits behind it. A new share's
 /// append reads its write guard, its payout-revision fence and its probe
 /// bounds in one statement, probes for its share_id in a second, and writes
-/// the clock, the row and the header mapping in a third; a duplicate stops
-/// after the probe. Pin those counts, so a round trip cannot creep back in.
+/// the row and the header mapping, stamped with the derived clock, in a
+/// third; a duplicate stops after the probe. Pin those counts, so a round
+/// trip cannot creep back in, and pin that none of them writes the cluster
+/// row (#738).
 #[tokio::test]
 async fn a_share_append_holds_order_lock_for_three_statements_and_its_commit() -> Result<()> {
     let Some(h) = Harness::open().await? else {
@@ -730,9 +732,16 @@ async fn a_share_append_holds_order_lock_for_three_statements_and_its_commit() -
                 statements[0]
             );
             ensure!(
-                statements[2].starts_with("WITH clock AS (UPDATE qbit_prism_cluster"),
+                statements[2].starts_with("WITH clock AS (SELECT GREATEST(c.ledger_clock_ms,")
+                    && statements[2].contains("INSERT INTO qbit_share_ledger"),
                 "the append's last statement is not its write: {:?}",
                 statements[2]
+            );
+            ensure!(
+                !statements
+                    .iter()
+                    .any(|statement| statement.contains("UPDATE qbit_prism_cluster")),
+                "a share append wrote the cluster row: {statements:#?}"
             );
         }
         let mark = h.proxy.mark();
@@ -755,8 +764,79 @@ async fn a_share_append_holds_order_lock_for_three_statements_and_its_commit() -
     h.close(result).await
 }
 
-/// The ledger clock, the share sequence and the count of header mappings:
-/// everything a share append's write statement changes besides the row.
+/// #738: a share append writes no version of the cluster row. While a
+/// snapshot is held on the primary (a long read, `pg_dump`, an evidence
+/// export, a standby's feedback), every version the singleton gains stays
+/// until that snapshot ends, and every later append's reads of the row walk
+/// them all under ORDER_LOCK. Appends, fenced and not, under such a snapshot
+/// leave the row the version it was, on the page it was, and send no
+/// statement that updates it; the snapshot anchor, once per window, is the
+/// clock's one writer.
+#[tokio::test]
+async fn appends_under_a_held_snapshot_leave_the_cluster_row_one_version() -> Result<()> {
+    const APPENDS: u64 = 200;
+    let Some(h) = Harness::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut reader = h.control.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *reader)
+            .await?;
+        sqlx::query("SELECT count(*) FROM qbit_share_ledger")
+            .execute(&mut *reader)
+            .await?;
+        let version = || async {
+            Ok::<(String, String, i64), anyhow::Error>(
+                sqlx::query_as(
+                    "SELECT xmin::text,ctid::text,pg_relation_size('qbit_prism_cluster') \
+                     FROM qbit_prism_cluster WHERE singleton",
+                )
+                .fetch_one(&h.control)
+                .await?,
+            )
+        };
+        let before = version().await?;
+        let revision = h.ledger.payout_revision().await?;
+        let mark = h.proxy.mark();
+        for id in 1..=APPENDS {
+            let appended = if id % 2 == 0 {
+                h.ledger
+                    .append_at_revision(share(id), None, revision)
+                    .await?
+            } else {
+                h.ledger.append(share(id), None).await?
+            };
+            ensure!(appended.inserted, "share {id} was not appended");
+        }
+        ensure!(
+            version().await? == before,
+            "{APPENDS} appends under a held snapshot changed the cluster row's version or heap: {before:?} -> {:?}",
+            version().await?
+        );
+        let updates: Vec<String> = h
+            .proxy
+            .executions_since(mark)?
+            .into_iter()
+            .filter(|execution| execution.sql.contains("UPDATE qbit_prism_cluster"))
+            .map(|execution| execution.sql)
+            .collect();
+        ensure!(updates.is_empty(), "the appends updated the cluster row: {updates:#?}");
+        h.ledger.snapshot(1_000_000).await?;
+        ensure!(
+            version().await?.0 != before.0,
+            "the snapshot anchor wrote no clock"
+        );
+        reader.rollback().await?;
+        Ok(())
+    }
+    .await;
+    h.close(result).await
+}
+
+/// The stored ledger clock, the share sequence and the count of header
+/// mappings: everything besides the row that a share append's write
+/// statement could change; since #738 it only reads the clock.
 async fn ledger_write_state(pool: &PgPool) -> Result<(i64, i64, bool, i64)> {
     Ok(sqlx::query_as(
         "SELECT (SELECT ledger_clock_ms FROM qbit_prism_cluster WHERE singleton),last_value,is_called,\
@@ -766,10 +846,9 @@ async fn ledger_write_state(pool: &PgPool) -> Result<(i64, i64, bool, i64)> {
     .await?)
 }
 
-/// A share whose job was issued after the ledger clock is refused, and the
-/// one statement that advanced the clock leaves nothing behind (#711): no
-/// row, no header mapping, no share_seq handed out, and the clock back where
-/// it was.
+/// A share whose job was issued after the ledger clock is refused, and its
+/// write statement leaves nothing behind (#711): no row, no header mapping,
+/// no share_seq handed out, and the stored clock where it was.
 #[tokio::test]
 async fn a_share_from_a_future_job_is_refused_and_its_write_rolls_back() -> Result<()> {
     let Some(h) = Harness::open().await? else {

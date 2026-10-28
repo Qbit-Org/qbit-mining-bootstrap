@@ -161,6 +161,9 @@ struct ShareSpec {
     ntime: i64,
     credit_policy: Option<String>,
     accepted: bool,
+    /// The node whose clock stamped the row (migration 027): 0 for this
+    /// one, 1 for a peer's row a dual-writer node left in the ledger.
+    origin_node: i16,
 }
 
 impl ShareSpec {
@@ -181,6 +184,7 @@ impl ShareSpec {
             ntime: 1_800_000_000 + index_i64 % 97,
             credit_policy: None,
             accepted: true,
+            origin_node: 0,
         }
     }
 
@@ -196,6 +200,11 @@ impl ShareSpec {
 
     fn issued_at_us(mut self, micros: i64) -> Self {
         self.job_issued_at_us = micros;
+        self
+    }
+
+    fn origin(mut self, node: i16) -> Self {
+        self.origin_node = node;
         self
     }
 }
@@ -220,27 +229,19 @@ fn writer_share(index: u64, job_issued_at_ms: i64) -> AcceptedShare {
     }
 }
 
-/// Places two shares on the anchor through the public append path, and
-/// returns their sequences as `(on the anchor, one millisecond after it)`.
+/// Appends a share through the public append path accepted exactly on the
+/// anchor, on both timestamps, and returns it.
 ///
-/// `Ledger::append` stamps `accepted_at` with
-/// `GREATEST(ledger_clock_ms, floor(now))` -- no `+1`, unlike the read's
-/// anchor bump -- and stores both timestamps through the writer's own
-/// conversion, requiring only that `job_issued_at_ms <= accepted_at_ms`. So
-/// pinning the ledger clock chooses the acceptance millisecond exactly, and
-/// the public API alone can put a real share on either side of an anchor: one
-/// accepted at the anchor on both timestamps, and one accepted a millisecond
-/// past it. The credited window must contain the first and not the second.
-async fn append_anchor_pair(ledger: &Ledger, anchor_ms: i64, index: u64) -> Result<(u64, u64)> {
-    set_ledger_clock(&ledger.pool, anchor_ms + 1).await?;
-    let after = ledger
-        .append(writer_share(index, anchor_ms), None)
-        .await
-        .context("appending the share accepted after the anchor")?
-        .share;
+/// `Ledger::append` stamps `accepted_at` with the ledger clock,
+/// `GREATEST(ledger_clock_ms, floor(now), the newest own share's stamp)` --
+/// no `+1`, unlike the read's anchor bump (#738) -- and stores both
+/// timestamps through the writer's own conversion, requiring only that
+/// `job_issued_at_ms <= accepted_at_ms`. So pinning the stored clock above
+/// the wall clock and every share chooses the acceptance millisecond exactly.
+async fn append_on_anchor(ledger: &Ledger, anchor_ms: i64, index: u64) -> Result<AcceptedShare> {
     set_ledger_clock(&ledger.pool, anchor_ms).await?;
     let on = ledger
-        .append(writer_share(index + 1, anchor_ms), None)
+        .append(writer_share(index, anchor_ms), None)
         .await
         .context("appending the share accepted on the anchor")?
         .share;
@@ -251,13 +252,44 @@ async fn append_anchor_pair(ledger: &Ledger, anchor_ms: i64, index: u64) -> Resu
         on.accepted_at_ms,
         on.job_issued_at_ms
     );
+    Ok(on)
+}
+
+/// Appends a share through the public append path once the window anchored
+/// at `snapshot` is taken, and checks it is accepted a millisecond past the
+/// anchor and outside the window.
+///
+/// An anchor is never below a share already appended (#738: the anchor
+/// takes the newest own share's stamp too), so a share the append path
+/// accepts after the anchor is one appended after the snapshot: the stored
+/// clock the snapshot left one past its anchor stamps it there. Direct
+/// inserts still place rows past the anchor and under the cutoff.
+async fn append_after_anchor(
+    ledger: &Ledger,
+    snapshot: &Snapshot,
+    index: u64,
+) -> Result<AcceptedShare> {
+    let anchor_ms = snapshot.anchor_ms;
+    let after = ledger
+        .append(writer_share(index, anchor_ms), None)
+        .await
+        .context("appending the share accepted after the anchor")?
+        .share;
     ensure!(
         after.accepted_at_ms == anchor_ms + 1,
         "the append path was expected to accept a share one millisecond after anchor \
          {anchor_ms}, got accepted_at_ms={}",
         after.accepted_at_ms
     );
-    Ok((on.share_seq, after.share_seq))
+    ensure!(
+        after.share_seq > snapshot.share_seq
+            && !snapshot
+                .shares
+                .iter()
+                .any(|share| share.share_id == after.share_id),
+        "the share appended after the window's snapshot is in it"
+    );
+    Ok(after)
 }
 
 /// Inserts one fixture row and returns the sequence PostgreSQL assigned it.
@@ -265,9 +297,9 @@ async fn insert_share(pool: &PgPool, spec: &ShareSpec) -> Result<i64> {
     let sql = format!(
         "INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,\
          share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,\
-         accepted_at,credit_policy,accepted,reject_reason,writer_id,writer_epoch) \
+         accepted_at,credit_policy,accepted,reject_reason,writer_id,writer_epoch,origin_node) \
          VALUES($1,$2,$3,decode($4,'hex'),$5::text::numeric,$6::text::numeric,$7,$8,{job},$10,\
-         {accepted},$12,$13,$14,'window-read-oracle',0) RETURNING share_seq",
+         {accepted},$12,$13,$14,'window-read-oracle',0,$15) RETURNING share_seq",
         job = timestamp_from_micros("$9"),
         accepted = timestamp_from_micros("$11"),
     );
@@ -291,6 +323,7 @@ async fn insert_share(pool: &PgPool, spec: &ShareSpec) -> Result<i64> {
         .bind(&spec.credit_policy)
         .bind(spec.accepted)
         .bind(reject_reason)
+        .bind(spec.origin_node)
         .fetch_one(pool)
         .await?;
     Ok(seq)
@@ -324,8 +357,9 @@ async fn insert_run(pool: &PgPool, count: i64, last_accepted_us: i64) -> Result<
 /// Pins the anchor `Ledger::snapshot` will capture, and the millisecond
 /// `Ledger::append` will stamp on the next share it accepts.
 ///
-/// Both take `GREATEST(ledger_clock_ms, floor(now))`, so any value above the
-/// wall clock becomes that millisecond exactly.
+/// Both take `GREATEST(ledger_clock_ms, floor(now), the newest own share's
+/// stamp)` (#738), so any value above the wall clock and every share already
+/// appended becomes that millisecond exactly.
 async fn set_ledger_clock(pool: &PgPool, anchor_ms: i64) -> Result<()> {
     let now_ms = wall_clock_ms(pool).await?;
     ensure!(
@@ -964,9 +998,10 @@ async fn compare_conversion(pool: &PgPool, ms: i64, operator: &str) -> Result<bo
 /// the share was accepted, which no real writer does, because that is the only
 /// way to isolate the `job_issued_at` predicate from the `accepted_at` one.
 ///
-/// On top of those, one pair goes in through the public append path, so the
-/// barrier is asserted against a share the writer could really have produced
-/// and not only against fixtures.
+/// On top of those, one share goes in through the public append path on the
+/// anchor before the snapshot, and one after it, so the barrier is asserted
+/// against shares the writer could really have produced and not only against
+/// fixtures.
 ///
 /// The weight far exceeds the fixture's total difficulty, so the anchor
 /// barrier -- not the weight cut -- decides membership.
@@ -998,10 +1033,14 @@ async fn check_anchor_boundary(
             )
             .await?;
         }
-        let (writer_on_anchor, writer_after_anchor) =
-            append_anchor_pair(&ledger, anchor_ms, WRITER_INDEX_BASE).await?;
+        let writer_on_anchor = append_on_anchor(&ledger, anchor_ms, WRITER_INDEX_BASE)
+            .await?
+            .share_seq;
 
         let snapshot = check_scenario(scenario, &ledger, anchor_ms, 1_000_000).await?;
+        let writer_after_anchor = append_after_anchor(&ledger, &snapshot, WRITER_INDEX_BASE + 1)
+            .await?
+            .share_seq;
         // Two rows per non-positive offset, one from each predicate family,
         // plus the appended share accepted on the anchor.
         let expected = offsets.iter().filter(|offset| **offset <= 0).count() * 2 + 1;
@@ -1054,8 +1093,8 @@ async fn rows_on_the_anchor_are_credited_and_rows_after_it_are_not() -> Result<(
 /// ordinary magnitude is derived, so it can never become a dated fuse. Every
 /// anchor here converts exactly, which `ensure_anchor_converts_exactly`
 /// enforces, so all three row kinds -- direct inserts on the anchor and 400
-/// microseconds either side of it, and the appended pair -- must agree with the
-/// oracle. Past 2^43 the conversion stops being exact, and that region is
+/// microseconds either side of it, and the appended shares -- must agree with
+/// the oracle. Past 2^43 the conversion stops being exact, and that region is
 /// covered by `writer_rows_follow_integer_milliseconds_past_2_43` instead.
 #[tokio::test]
 async fn the_anchor_barrier_holds_at_large_millisecond_values() -> Result<()> {
@@ -1141,9 +1180,10 @@ async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
     ] {
         let scenario = format!("g:{label}");
         in_fresh_schema(&url, |ledger| async move {
-            // One share a millisecond before the anchor, one on it, one after.
+            // One share a millisecond before the anchor and one on it, then
+            // the snapshot, and one a millisecond after it.
             let mut appended = Vec::new();
-            for (position, offset) in [("before", -1_i64), ("on", 0), ("after", 1)] {
+            for (position, offset) in [("before", -1_i64), ("on", 0)] {
                 let accepted_ms = anchor_ms
                     .checked_add(offset)
                     .context("writer anchor offset overflow")?;
@@ -1165,6 +1205,11 @@ async fn writer_rows_follow_integer_milliseconds_past_2_43() -> Result<()> {
             }
 
             let snapshot = pinned_snapshot(&scenario, &ledger, anchor_ms, 1_000_000).await?;
+            let index = WRITER_INDEX_BASE + u64::try_from(appended.len())?;
+            let after = append_after_anchor(&ledger, &snapshot, index)
+                .await
+                .with_context(|| format!("{scenario}: appending the after share"))?;
+            appended.push(("after", after));
             let mut read_back_early = Vec::new();
             for (position, share) in &appended {
                 // The contract: credited exactly when the accepted millisecond is
@@ -1301,7 +1346,9 @@ async fn rejected_rows_are_excluded_and_consume_no_weight() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// An empty window arises three ways: no rows at all, only rejected rows, and
-/// accepted rows that all sit after the anchor.
+/// accepted rows that all sit after the anchor. An anchor is at or above
+/// every own share (#738), so the rows after it are a peer's, stamped ahead
+/// by its clock, as a dual-writer node can leave them in the ledger.
 #[tokio::test]
 async fn empty_windows_return_no_shares() -> Result<()> {
     with_schema(|ledger| async move {
@@ -1333,7 +1380,11 @@ async fn empty_windows_return_no_shares() -> Result<()> {
         let future_anchor_ms = anchor_ms + 100_000;
         for index in 0..4_u64 {
             let accepted_at_us = future_anchor_ms * 1_000 + 1_000 + i64::try_from(index)? * 1_000;
-            insert_share(&ledger.pool, &ShareSpec::new(index + 100, accepted_at_us)).await?;
+            insert_share(
+                &ledger.pool,
+                &ShareSpec::new(index + 100, accepted_at_us).origin(1),
+            )
+            .await?;
         }
         let snapshot = check_scenario(
             "f:all-rows-after-the-anchor",

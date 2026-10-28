@@ -164,7 +164,7 @@ impl Ledger {
         // waits behind an authority writer's FOR UPDATE, all checks below see
         // its committed state. KEY SHARE conflicts with that FOR UPDATE and
         // with blob GC's exclusive fence through commit, including repair that
-        // reuses surviving orphan blobs, but not with the share append's
+        // reuses surviving orphan blobs, but not with the snapshot anchor's
         // non-key `ledger_clock_ms` UPDATE (see `lock_cluster_authority`).
         // Never acquire SETTLEMENT or ORDER after this fence.
         let fingerprint: Option<String> = sqlx::query_scalar(

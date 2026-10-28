@@ -17,6 +17,7 @@ import jinja2
 from jinja2.meta import find_undeclared_variables
 import yaml
 
+from check_prism_alert_uids import GRAFANA_UID
 from generate_prism_alerts import ROOT, deployment_template, load
 
 
@@ -75,6 +76,9 @@ def main():
         rows = [rule for group in document.get("groups", []) or [] for rule in group["rules"]]
         result = {rule["uid"]: rule for rule in rows}
         assert len(rows) == len(result), "duplicate UIDs"
+        # #757: Grafana refuses to start on a provisioned UID it cannot store.
+        invalid = sorted(uid for uid in result if not GRAFANA_UID.fullmatch(str(uid)))
+        assert not invalid, f"UIDs Grafana cannot provision: {invalid}"
         return result
 
     combinations = [{}, {key: False for key in gates}] + [{key: False} for key in gates]
@@ -109,8 +113,8 @@ def main():
             paging = {uid: rule for uid, rule in after.items()
                       if uid in native_uids and rule["labels"].get("page") == "true"}
             assert {"qbit-prism-candidate-oldest-critical", "qbit-prism-semantic-coverage-critical",
-                    "qbit-prism-revision-work-pending-critical",
-                    "qbit-prism-candidate-landing-failed-critical",
+                    "qbit-prism-revision-work-pending-crit",
+                    "qbit-prism-candidate-landing-failed-crit",
                     "qbit-prism-work-refresh-stalled-critical",
                     "qbit-prism-database-unavailable",
                     "qbit-prism-block-submission-held"} <= set(paging), sorted(paging)
@@ -123,7 +127,7 @@ def main():
                 fresh = "qbit_prism_metrics_snapshot_available{" in expr and "qbit_prism_metrics_snapshot_stale{" in expr
                 scraped = "up{" in expr and "== 1" in expr
                 assert fresh or scraped, uid
-            assert paging["qbit-prism-revision-work-pending-critical"]["for"] == "1m"
+            assert paging["qbit-prism-revision-work-pending-crit"]["for"] == "1m"
             # #525: a refresh that keeps failing pages on this frontend's own gauge.
             assert paging["qbit-prism-work-refresh-stalled-critical"]["for"] == "1m"
             # #581: a database outage pages on its own rule, on the live
@@ -153,8 +157,8 @@ def main():
             assert after["qbit-prism-revision-work-pending"]["for"] == "0s"
             # #529: a found block offered without a confirmed standby copy
             # warns at once, never pages, and is quiet on no data.
-            standby = after["qbit-prism-block-offer-standby-unconfirmed"]
-            assert "qbit-prism-block-offer-standby-unconfirmed" not in paging
+            standby = after["qbit-prism-offer-standby-unconfirmed"]
+            assert "qbit-prism-offer-standby-unconfirmed" not in paging
             assert standby["labels"]["severity"] == "warning" and standby["labels"].get("page") is None
             assert standby["for"] == "0s" and standby["noDataState"] == "OK"
             assert 'outcome=~\\"absent|lagging|failed\\"' in json.dumps(standby), json.dumps(standby)
@@ -162,12 +166,12 @@ def main():
             critical = json.dumps(after["qbit-prism-candidate-oldest-critical"])
             assert "qbit_prism_block_candidate_oldest_unacknowledged_seconds{" in critical
             assert " or on(job, instance, network) qbit_prism_block_candidate_oldest_pending_seconds{" in critical, "no mixed-version fallback"
-            assert paging["qbit-prism-candidate-landing-failed-critical"]["for"] == "1m"
+            assert paging["qbit-prism-candidate-landing-failed-crit"]["for"] == "1m"
             # #602: slow landing windows ticket and warn, and never page; the
             # pool-wide resubmission reject ratio warns.
             for uid, severity, dwell in [("qbit-prism-landing-ack-p99-slow", "ticket", "1m"),
                                          ("qbit-prism-landing-ack-p99-high", "warning", "1m"),
-                                         ("qbit-prism-pool-resubmission-reject-ratio", "warning", "5m")]:
+                                         ("qbit-prism-pool-resubmit-reject-ratio", "warning", "5m")]:
                 assert uid not in paging and after[uid]["labels"].get("page") is None, uid
                 assert after[uid]["labels"]["severity"] == severity and after[uid]["for"] == dwell, uid
                 assert after[uid]["noDataState"] == after[uid]["execErrState"] == "OK", uid

@@ -144,6 +144,21 @@ impl Metrics {
             .increment(Family::BlockAckCapped, Labels::One(("path", path.as_str())));
     }
     /// #529: one found block's standby flush wait, ended just before its offer.
+    /// #630: a post-offer write's payout-revision race, retried in place or
+    /// with its retry budget spent.
+    pub fn record_post_offer_revision_race(
+        &self,
+        phase: RevisionRacePhase,
+        outcome: RevisionRaceOutcome,
+    ) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(
+                Family::PostOfferRevisionRaces,
+                Labels::Two(("phase", phase.as_str()), ("outcome", outcome.as_str())),
+            );
+    }
     pub fn record_offer_standby_wait(&self, outcome: StandbyWaitOutcome) {
         self.inner
             .lock()

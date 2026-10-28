@@ -1,0 +1,12 @@
+# RustSec advisories against sqlx-core, reviewed for this vendored copy.
+#
+# cargo-deny matches advisories only against registry crates, so it does not
+# check this path dependency. scripts/check_vendored_sqlx_core.py lists every
+# advisory the RustSec database holds for sqlx-core and fails on any that is
+# not withdrawn and not named here. Add one as
+#
+#   "RUSTSEC-YYYY-NNNN" = "<one line: why it does not apply here, or the issue that handles it>"
+#
+# None existed when this file was written (RustSec database of 2026-10-27).
+
+[reviewed]

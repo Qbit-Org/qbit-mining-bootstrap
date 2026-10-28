@@ -63,11 +63,17 @@ jobs:
           python scripts/test_prism_alert_promql.py \
             --promtool "${prism_prometheus_dir}/prometheus-3.14.0.linux-amd64/promtool"
 
+      - name: Check that published alert rule UIDs are unique and within Grafana's limits
+        run: python3 scripts/check_prism_alert_uids.py
+
       - name: Check that gated tests read their inputs only through the shared gate
         run: python3 scripts/check_gate_env_reads.py
 
       - name: Check that the Rust toolchain pin is held in one version
         run: python3 scripts/check_toolchain_pin.py
+
+      - name: Check that both lock files build the vendored sqlx-core
+        run: python3 scripts/check_vendored_sqlx_core.py
 
       - name: Check PRISM setting inventories and retired-setting guidance
         run: python3 scripts/check_prism_settings.py
@@ -243,6 +249,11 @@ jobs:
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny --locked check
+
+      # cargo-deny matches advisories only against registry crates, so the
+      # vendored sqlx-core's are reviewed against the database it just fetched.
+      - name: Check that every sqlx-core advisory is reviewed
+        run: python3 scripts/check_vendored_sqlx_core.py --require-advisory-db
 
   dockerfile-lint:
     name: Dockerfile lint

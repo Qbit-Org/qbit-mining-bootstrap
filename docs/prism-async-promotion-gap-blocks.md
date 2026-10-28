@@ -121,7 +121,8 @@ Estimates are labelled as estimates.
   `00000002` in each of the 9 runs that recorded it.
 - **Clock.** The ledger clock (`qbit_prism_cluster.ledger_clock_ms`) is
   replicated. A reissued row's `accepted_at` is
-  `GREATEST(replicated clock, promoted host's clock)` (`ledger/window.rs:850`).
+  `GREATEST(replicated clock, promoted host's clock)` (`ledger/window.rs:850`;
+  since #738 also the newest replicated own share's stamp).
   A window anchored in the gap has `anchor_ms` above every row the old primary
   had credited by then (`ledger/window.rs:903`). Reissued rows therefore land
   *after* the anchor, unless the promoted host's clock runs behind the old

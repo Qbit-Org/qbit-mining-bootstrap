@@ -643,7 +643,8 @@ FROM qbit_prism_cluster c WHERE config_fingerprint IS NOT NULL ORDER BY singleto
 SELECT jsonb_build_object('kind', 'payout_revision', 'row', jsonb_build_object(
     'payout_revision', payout_revision))
 FROM qbit_prism_cluster c WHERE payout_revision <> 0 ORDER BY singleton;
--- append and snapshot advance this monotonic barrier so share timestamps and
+-- the snapshot anchor advances this monotonic barrier, and every share append
+-- stamps at least it and the newest own share (#738), so share timestamps and
 -- window anchors never depend on host clock sync; a rewound clock can stamp
 -- new shares below existing anchors. Only the migration default of zero is omitted.
 SELECT jsonb_build_object('kind', 'ledger_clock', 'row', jsonb_build_object(
