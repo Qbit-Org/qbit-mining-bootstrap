@@ -4309,8 +4309,10 @@ credits to another share, a block with other landing facts, or a payout or
 carry key reused. Each is recorded once in `qbit_prism_peer_sync_conflicts`,
 counted on every sighting in `qbit_prism_peer_sync_conflicts_total{table}`, and
 logged as an `ALERT`, and the stream moves past it. Any other failure to apply
-a row, such as a lock or statement timeout, keeps that stream's cursor, and the
-next pass applies the row again; the other streams go on meanwhile. The
+a row, such as a lock or statement timeout, stops that stream's cursor before
+the unit that failed: what the pull committed before it (whole blocks, whole
+chunks of prepared jobs) stays and is counted, and the next pass applies the
+rest again; the other streams go on meanwhile. The
 stream's `qbit_prism_peer_sync_lag_seconds` grows while it fails, and after
 20 failed passes in a row an `ALERT` line names it, repeated every minute
 while it lasts. In normal operation the conflicts table stays empty:

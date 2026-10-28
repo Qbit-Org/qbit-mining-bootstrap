@@ -2425,9 +2425,9 @@ fn sweep_blobs(ledger: &Ledger) -> tokio::task::JoinHandle<Result<BlobPruneResul
 fn apply(ledger: &Ledger, batch: &PreparedBatch) -> tokio::task::JoinHandle<Result<Applied>> {
     let (ledger, batch) = (ledger.clone(), batch.clone());
     tokio::spawn(async move {
-        ledger
+        Ok(ledger
             .apply_prepared(&batch, NodeIndex::A, Some(PREPARED))
-            .await
+            .await?)
     })
 }
 
@@ -2779,8 +2779,9 @@ async fn a_large_pull_applies_in_fenced_chunks_and_resumes_after_a_failed_one() 
 
 /// #785: own-log recovery applies, and so fences, only a batch of its own
 /// prepared jobs that is missing here or held otherwise. One held here as the
-/// peer holds it, blobs too, is not applied at all; one held with other
-/// content is still a conflict that stops recovery (D-17).
+/// peer holds it, blobs too, is not applied at all. A blob lost here is put
+/// back, and a blob or job held with other content is still a conflict that
+/// stops recovery (D-17).
 #[tokio::test]
 async fn recovery_applies_only_own_prepared_jobs_missing_or_held_otherwise() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -2805,6 +2806,42 @@ async fn recovery_applies_only_own_prepared_jobs_missing_or_held_otherwise() -> 
         sqlx::raw_sql("DROP TRIGGER refuse_job_insert ON qbit_prism_jobs")
             .execute(&pair.a.pool)
             .await?;
+        // A lost its own template: recovery puts it back from the peer.
+        let template = hex("template recovered alike");
+        let templates =
+            format!("SELECT count(*) FROM qbit_prism_templates WHERE template_sha256='{template}'");
+        sqlx::query("DELETE FROM qbit_prism_templates WHERE template_sha256=$1")
+            .bind(&template)
+            .execute(&pair.a.pool)
+            .await?;
+        let (mut repaired, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        pass_until(&mut repaired, async |report| Ok(report.own_log_caught_up)).await?;
+        ensure!(count(&pair.a.pool, &templates).await? == 1, "recovery left a lost own blob lost");
+        // A holds its own balances with other bytes: a conflict that stops
+        // recovery. Without them, recovery then puts them back.
+        let balances = hex("balances recovered alike");
+        sqlx::query("DELETE FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1")
+            .bind(&balances)
+            .execute(&pair.a.pool)
+            .await?;
+        sqlx::query("INSERT INTO qbit_prism_balance_snapshots(prior_balances_digest,balances) VALUES($1,'other bytes')")
+            .bind(&balances)
+            .execute(&pair.a.pool)
+            .await?;
+        let (mut unlike, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let error = unlike
+            .pass()
+            .await
+            .err()
+            .context("recovery passed over own balances held with other bytes")?;
+        ensure!(format!("{error:#}").contains("has diverged"), "{error:#}");
+        ensure!(
+            count(&pair.a.pool, &format!("SELECT count(*) FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_prism_balance_snapshots' AND row_key='{balances}'")).await? == 1
+        );
+        sqlx::query("DELETE FROM qbit_prism_balance_snapshots WHERE prior_balances_digest=$1")
+            .bind(&balances)
+            .execute(&pair.a.pool)
+            .await?;
         // A's own job now differs from the peer's copy of it.
         sqlx::query("UPDATE qbit_prism_jobs SET parent_hash=$2 WHERE job_id=$1")
             .bind(&job)
@@ -2820,6 +2857,161 @@ async fn recovery_applies_only_own_prepared_jobs_missing_or_held_otherwise() -> 
         ensure!(format!("{error:#}").contains("has diverged"), "{error:#}");
         ensure!(
             count(&pair.a.pool, &format!("SELECT count(*) FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_prism_jobs' AND row_key='{job}'")).await? == 1
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// The first and last of `ledger`'s own prepared jobs, in `sync_seq` order.
+async fn first_and_last_prepared(ledger: &Ledger) -> Result<(String, String)> {
+    let first = "SELECT job_id FROM qbit_prism_jobs WHERE job_id LIKE 'prepared:%' ORDER BY sync_seq LIMIT 1";
+    Ok((
+        sqlx::query_scalar(first).fetch_one(&ledger.pool).await?,
+        sqlx::query_scalar(&first.replace("sync_seq", "sync_seq DESC"))
+            .fetch_one(&ledger.pool)
+            .await?,
+    ))
+}
+
+/// #785: a pull that stops at a failed chunk counts and keeps what it
+/// committed before it. The first chunk records a conflict, the second is
+/// clean, the third fails: the pass counts the first two chunks' rows and
+/// the conflict, in its report and the metrics, the stream lags by the
+/// third chunk alone, and the cursor stands past the second, refused only
+/// through the first. The next pass applies the rest.
+#[tokio::test]
+async fn a_pull_that_fails_partway_counts_and_keeps_the_chunks_before_it() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let total = 2 * PREPARED_CHUNK_ROWS + PREPARED_CHUNK_ROWS / 2;
+        prepare_many(&pair.a, "partway", total).await?;
+        let batch = prepared_of_a(pair, 0, 5000).await?;
+        ensure!(batch.count == total, "{}", batch.count);
+        let jobs = batch.jobs.as_array().context("jobs")?;
+        let seq = |index: usize| jobs[index]["sync_seq"].as_i64().context("sync_seq");
+        let (first, second, last) = (
+            seq(PREPARED_CHUNK_ROWS - 1)?,
+            seq(2 * PREPARED_CHUNK_ROWS - 1)?,
+            seq(total - 1)?,
+        );
+        // B holds the first chunk's first job with other content.
+        let (instance, parent): (String, String) = sqlx::query_as(
+            "SELECT instance_id,parent_hash FROM qbit_prism_jobs WHERE job_id=$1",
+        )
+        .bind(jobs[0]["job_id"].as_str().context("job_id")?)
+        .fetch_one(&pair.a.pool)
+        .await?;
+        sqlx::query("INSERT INTO qbit_prism_jobs(job_id,instance_id,parent_hash,payout_revision,payload,expires_at) VALUES($1,$2,$3,0,'{}'::jsonb,clock_timestamp()+interval '1 hour')")
+            .bind(jobs[0]["job_id"].as_str().context("job_id")?)
+            .bind(&instance)
+            .bind(&parent)
+            .execute(&pair.b.pool)
+            .await?;
+        // The third chunk fails at its cursor advance.
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION fail_last_chunk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             RAISE EXCEPTION 'the last chunk fails'; END $$; \
+             CREATE TRIGGER fail_last_chunk BEFORE INSERT ON qbit_prism_peer_sync_cursors FOR EACH ROW \
+             WHEN (NEW.stream='prepared' AND NEW.scanned_through={last}) EXECUTE FUNCTION fail_last_chunk();"
+        ))
+        .execute(&pair.b.pool)
+        .await?;
+        let (mut on_b, metrics) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        let report = pass_until(&mut on_b, async |report| {
+            Ok(report.failed_streams.contains(&PREPARED))
+        })
+        .await?;
+        let committed = (2 * PREPARED_CHUNK_ROWS - 1) as u64;
+        ensure!(
+            report.applied.inserted.get("qbit_prism_jobs") == Some(&committed)
+                && report.applied.conflicts == BTreeMap::from([("qbit_prism_jobs", 1)]),
+            "the pass did not count the chunks it committed: {:?}",
+            report.applied
+        );
+        let scrape = metrics.render();
+        for line in [
+            format!("qbit_prism_peer_sync_rows_total{{table=\"qbit_prism_jobs\"}} {committed}"),
+            "qbit_prism_peer_sync_conflicts_total{table=\"qbit_prism_jobs\"} 1".to_owned(),
+            format!(
+                "qbit_prism_peer_sync_lag_rows{{stream=\"prepared\"}} {}",
+                total - 2 * PREPARED_CHUNK_ROWS
+            ),
+        ] {
+            ensure!(scrape.contains(&line), "{line} missing from {scrape}");
+        }
+        // Past the second chunk, refused through the first alone.
+        ensure!(
+            pair.b.peer_sync_cursor(PREPARED).await? == Some((second, Some(first))),
+            "{:?}",
+            pair.b.peer_sync_cursor(PREPARED).await?
+        );
+        sqlx::raw_sql("DROP TRIGGER fail_last_chunk ON qbit_prism_peer_sync_cursors")
+            .execute(&pair.b.pool)
+            .await?;
+        let rest = pass_until(&mut on_b, async |report| {
+            Ok(report.applied.inserted.contains_key("qbit_prism_jobs"))
+        })
+        .await?;
+        ensure!(
+            rest.applied.inserted.get("qbit_prism_jobs")
+                == Some(&((total - 2 * PREPARED_CHUNK_ROWS) as u64))
+                && rest.failed_streams.is_empty(),
+            "{rest:?}"
+        );
+        // All of A's jobs but the refused one, which stays B's own row.
+        let held = total as i64 - 1;
+        ensure!(held_of_a(&pair.b.pool).await? == (held, held));
+        Ok(())
+    })
+    .await
+}
+
+/// #785: own-log recovery that stops at a failed chunk still meets a
+/// conflict a chunk before it committed: the own log has diverged, and the
+/// pass says so rather than reporting the later failure alone (D-17).
+#[tokio::test]
+async fn recovery_stopped_partway_still_meets_a_conflict_it_committed() -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    pair(&raw, async |pair| {
+        let total = PREPARED_CHUNK_ROWS + PREPARED_CHUNK_ROWS / 2;
+        prepare_many(&pair.a, "own partway", total).await?;
+        let (mut on_b, _) = sync(&pair.b, NodeIndex::B, &pair.a_url);
+        pass_until(&mut on_b, async |_| Ok(held_of_a(&pair.b.pool).await?.0 == total as i64))
+            .await?;
+        // On A: the first chunk's first job diverges, the second chunk's last
+        // is missing, and putting it back fails.
+        let (first, last) = first_and_last_prepared(&pair.a).await?;
+        sqlx::query("UPDATE qbit_prism_jobs SET parent_hash=$2 WHERE job_id=$1")
+            .bind(&first)
+            .bind(hex("another parent"))
+            .execute(&pair.a.pool)
+            .await?;
+        sqlx::query("DELETE FROM qbit_prism_jobs WHERE job_id=$1")
+            .bind(&last)
+            .execute(&pair.a.pool)
+            .await?;
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION fail_put_back() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             RAISE EXCEPTION 'putting the missing job back fails'; END $$; \
+             CREATE TRIGGER fail_put_back BEFORE INSERT ON qbit_prism_jobs FOR EACH ROW \
+             WHEN (NEW.job_id='{last}') EXECUTE FUNCTION fail_put_back();"
+        ))
+        .execute(&pair.a.pool)
+        .await?;
+        let (mut restarted, _) = sync(&pair.a, NodeIndex::A, &pair.b_url);
+        let error = restarted
+            .pass()
+            .await
+            .err()
+            .context("recovery passed with a failed chunk")?;
+        ensure!(format!("{error:#}").contains("has diverged"), "{error:#}");
+        ensure!(
+            count(&pair.a.pool, &format!("SELECT count(*) FROM qbit_prism_peer_sync_conflicts WHERE source_table='qbit_prism_jobs' AND row_key='{first}'")).await? == 1
         );
         Ok(())
     })

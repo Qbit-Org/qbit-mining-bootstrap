@@ -784,11 +784,21 @@ impl PeerSync {
             };
             // Held here as the peer holds them, blobs too: an apply would
             // only take the blob-GC fence (#785).
-            if !self.ledger.prepared_held_alike(&batch).await? {
-                if self.ledger.missing_prepared(&batch).await? > 0 {
+            let (missing, alike) = self.ledger.prepared_held(&batch).await?;
+            if !alike {
+                if missing > 0 {
                     self.own_rows_missing().await?;
                 }
-                applied.merge(self.ledger.apply_prepared(&batch, node, None).await?);
+                match self.ledger.apply_prepared(&batch, node, None).await {
+                    Ok(done) => applied.merge(done),
+                    Err(stopped) => {
+                        // A conflict a chunk before the failed one committed
+                        // is the divergence, whatever failed after it.
+                        applied.merge(stopped.applied);
+                        self.ensure_progress(&applied)?;
+                        return Err(stopped.error);
+                    }
+                }
                 self.ensure_progress(&applied)?;
             }
             after = last;
@@ -1017,7 +1027,12 @@ impl PeerSync {
                     self.stream_done(PREPARED, batch.count as u64);
                 }
             }
-            Err(error) => self.stream_failed(PREPARED, batch.count as u64, &error, report),
+            Err(stopped) => {
+                // The chunks before the failed one are applied and counted,
+                // the cursor past them; only the rest is pending.
+                report.applied.merge(stopped.applied);
+                self.stream_failed(PREPARED, stopped.pending, &stopped.error, report);
+            }
         }
         Ok(())
     }
@@ -1062,10 +1077,12 @@ impl PeerSync {
     }
 
     /// A stream's next peer rows could not be applied here (a lock or
-    /// statement timeout, say). Nothing of the failed unit was kept and its
-    /// cursor stands, so the next pass applies it again; the other streams
-    /// go on. The stream counts as at least `pending` rows behind, so its
-    /// lag grows, and a run of failures is alerted.
+    /// statement timeout, say). The unit that failed (a share batch, a
+    /// block, a chunk of prepared jobs) kept nothing and the cursor stands
+    /// before it, past the units this pass applied, so the next pass applies
+    /// it again; the other streams go on. The stream counts as at least
+    /// `pending` rows behind, so its lag grows, and a run of failures is
+    /// alerted.
     fn stream_failed(
         &mut self,
         stream: &'static str,
