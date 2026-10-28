@@ -160,6 +160,11 @@ labels!(CaptureDecision {
     Offered => "offered", AbandonedCeiling => "abandoned_ceiling",
     AbandonedDisabled => "abandoned_disabled"
 });
+// #630: which post-offer write lost a payout-revision race (the landing, or
+// the settlement as submitted or orphaned), and whether the race was retried
+// in place or the write's retry budget was spent.
+labels!(RevisionRacePhase { Landing => "landing", Settlement => "settlement" });
+labels!(RevisionRaceOutcome { Retried => "retried", Spent => "spent" });
 // #529: how a found block's wait for the failover standby's flush ended
 // before its offer; the block is offered in every case.
 labels!(StandbyWaitOutcome {

@@ -199,6 +199,15 @@ impl Metrics {
                 0.,
             );
         }
+        for phase in RevisionRacePhase::ALL {
+            for outcome in RevisionRaceOutcome::ALL {
+                registry.register(
+                    Family::PostOfferRevisionRaces,
+                    Labels::Two(("phase", phase.as_str()), ("outcome", outcome.as_str())),
+                    0.,
+                );
+            }
+        }
         for reason in JobDeferral::ALL {
             registry.register(
                 Family::JobPreparationDeferrals,

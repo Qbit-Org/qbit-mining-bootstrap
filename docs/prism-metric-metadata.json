@@ -182,6 +182,13 @@
     "block_candidates_orphaned_total": {
       "status": "Counts offered-candidate orphan settlements whose successful completion this instance observed after commit (#415): its landed audit is durable, and one coherent tip observation showed a different block active at its height with at least PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS confirmations. May undercount if cancellation or restart occurs after the database commit and before the process records completion. Never counts a failed observation; a reorg that later reactivates the block is credited by the reorg reconciler without touching this counter. Process-local; starts at zero. No firing rule."
     },
+    "post_offer_revision_races_total": {
+      "labels": {
+        "phase": "RevisionRacePhase",
+        "outcome": "RevisionRaceOutcome"
+      },
+      "status": "#630. Counts each post-offer write this instance had refused because the payout revision moved between the write's own candidate observation and its transaction: a sibling frontend recorded a tip or confirmed a block in between, and the fence refused the write before it wrote anything. `phase=landing` is the audit landing; `phase=settlement` is the finish as submitted or the settlement as orphaned, including `candidates recover`'s finish. `outcome=retried`: the write was observed again and retried in place after a jittered backoff, with no ALERT and no reconciliation. `outcome=spent`: the phase's own budget (3 retries, none started 60 s or more after its first lost race) was used, and the row went to reconciliation with today's ALERT. Before #630 every such refusal was an ALERT and a reconciliation, so `retried` is the race rate the ALERT lines used to show. Process-local; every series starts at zero. No firing rule."
+    },
     "node_peers": {
       "status": "Recorded only when the readiness attempt reached getnetworkinfo and it answered, which is never on regtest, during initial block download, or while blocks and headers disagree; observation adds no RPC call. -1 means the latest attempt did not learn the count, including RPC failure; the gauge never keeps an earlier reading. An answered zero is a real zero, and it is below every configured PRISM_MIN_PEERS floor."
     },
