@@ -8,6 +8,8 @@ FROM rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
+# The root Cargo.toml patches sqlx-core to this vendored copy (#771).
+COPY vendor/ ./vendor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --locked --release -p qbit-prism-server -p qbit-prism --bins
