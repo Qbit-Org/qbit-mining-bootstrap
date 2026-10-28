@@ -398,8 +398,11 @@ PRISM_DATABASE_ACQUIRE_PROBE_IDLE_MS=100
 ```
 
 These values are an example resource allocation, not a capacity qualification.
-Budget database connections for all frontends together and measure ACK latency,
-job delivery, and build/refresh work under representative load. The old Python
+Budget database connections for all frontends together: each frontend uses up to
+`PRISM_DATABASE_MAX_CONNECTIONS` + 1 database connections (its payout-revision
+listener, #752), + 2 more in dual-writer mode (its health pool). Measure ACK
+latency, job delivery, and build/refresh work under representative load. The
+old Python
 batch-writer, lease, subprocess, and refresh-scheduler variables were removed.
 
 Use `compose.prism-external-db.yaml` after the production overlay (and before

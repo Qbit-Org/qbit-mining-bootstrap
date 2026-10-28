@@ -91,6 +91,16 @@ async fn helper(database: &sqlx::PgPool) {
 ''')
         self.assertTrue(any("negative_module.rs" in e for e in self.errors()))
 
+    def test_listener_on_the_run_pool_is_rejected(self):
+        # #752: a PgListener holds a pool connection for as long as it
+        # listens; on the ledger's pool it would be a checkout like acquire.
+        self.append("coordinator/revision_wake.rs", '''
+async fn negative_listener(coordinator: &super::Coordinator) {
+    let _ = sqlx::postgres::PgListener::connect_with(&coordinator.ledger.pool).await;
+}
+''')
+        self.assertTrue(any("unclassified" in e and "negative_listener" in e for e in self.errors()))
+
     def test_borrowed_connection_is_not_counted_as_checkout(self):
         before = guard.census(self.root)
         self.append("ledger/window.rs", '''
