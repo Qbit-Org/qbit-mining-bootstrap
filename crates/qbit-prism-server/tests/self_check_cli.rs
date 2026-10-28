@@ -382,8 +382,11 @@ async fn sample_before_startup(database_url: &str, ledger: &Ledger) -> Result<()
         "pending_candidates": 0,
     });
     expected["audit_completeness"] = json!({
+        "status": "complete",
         "missing_stored_bodies": 0,
         "missing_canonical_bytes": 0,
+        "pending_legacy_rows": 0,
+        "incomplete_native_rows": 0,
     });
     expected["live_instances"] = json!({
         "status": "observed",

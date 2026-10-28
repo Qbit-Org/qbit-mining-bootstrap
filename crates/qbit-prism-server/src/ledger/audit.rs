@@ -13,6 +13,12 @@ pub struct AuditCompleteness {
     /// Native bodies with an existing immutable snapshot can reconstruct the
     /// bytes and do not need `canonical_audit_bytes` to be stored separately.
     pub missing_canonical_bytes: i64,
+    /// #734: the rows in `missing_canonical_bytes`, split by kind. A legacy
+    /// row (no share snapshot) is one `import-audits` stores; a native row
+    /// (with one) lacks its metadata body or its snapshot, which no import
+    /// repairs.
+    pub pending_legacy_rows: i64,
+    pub incomplete_native_rows: i64,
 }
 
 impl AuditCompleteness {
@@ -25,20 +31,39 @@ impl AuditCompleteness {
         );
         Ok(())
     }
+
+    /// #734: complete but for the legacy rows `import-audits` has still to
+    /// store.
+    pub fn require_native_complete(&self) -> Result<()> {
+        ensure!(
+            self.incomplete_native_rows == 0,
+            "audit history is incomplete: {} native rows lack their metadata body or share snapshot, which import-audits does not repair",
+            self.incomplete_native_rows,
+        );
+        Ok(())
+    }
 }
 
 /// Count each missing representation in one database snapshot. A legacy body
 /// stored inline needs canonical import; an external-only legacy body needs
 /// both. Imported canonical bytes themselves are a stored body. Native bodies
 /// need their referenced snapshot to make canonical reconstruction available.
+/// A legacy row is one the importer selects: no bytes and no snapshot.
 pub async fn audit_completeness<'e>(
     executor: impl sqlx::Executor<'e, Database = Postgres>,
 ) -> Result<AuditCompleteness> {
-    let (missing_stored_bodies, missing_canonical_bytes) = sqlx::query_as(
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT \
          count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
              AND jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object'), \
          count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND (jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object' \
+                 OR NOT EXISTS (SELECT 1 FROM qbit_prism_audit_snapshots s \
+                     WHERE s.snapshot_sha256=a.share_snapshot_sha256))), \
+         count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND share_snapshot_sha256 IS NULL), \
+         count(*) FILTER (WHERE canonical_audit_bytes IS NULL \
+             AND share_snapshot_sha256 IS NOT NULL \
              AND (jsonb_typeof(audit_bundle) IS DISTINCT FROM 'object' \
                  OR NOT EXISTS (SELECT 1 FROM qbit_prism_audit_snapshots s \
                      WHERE s.snapshot_sha256=a.share_snapshot_sha256))) \
@@ -46,9 +71,17 @@ pub async fn audit_completeness<'e>(
     )
     .fetch_one(executor)
     .await?;
+    let (
+        missing_stored_bodies,
+        missing_canonical_bytes,
+        pending_legacy_rows,
+        incomplete_native_rows,
+    ) = counts;
     Ok(AuditCompleteness {
         missing_stored_bodies,
         missing_canonical_bytes,
+        pending_legacy_rows,
+        incomplete_native_rows,
     })
 }
 

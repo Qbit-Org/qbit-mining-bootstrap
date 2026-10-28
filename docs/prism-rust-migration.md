@@ -103,11 +103,23 @@ settlement and template refresh for as long, so run an earlier build's
 import beside serving frontends only under a guard that kills it with
 SIGKILL once a settlement waiter has waited a few seconds: as a container's
 PID 1 it ignores SIGTERM. Until `import-audits` finishes,
-production `self-check` fails at audit completeness and skips its other checks
-(#734). `scripts/prism_legacy_import_admission_gate.sh` checks every other fact
-`self-check` checks, against the frontend's own environment on each host. It
-reports legacy completeness as pending, and fails on any incomplete native
-audit. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
+production `self-check` fails at audit completeness, but runs and reports
+every local check first (#734). While the import runs, declare it for that
+run with `PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1`
+(`PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 make prism-self-check`, which
+passes it to the container, or `docker compose exec -e
+PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 prism-coordinator qbit-prism-server
+self-check`). `self-check` then reports `audit_completeness.status` as
+`legacy_import_pending`, with `pending_legacy_rows`, and passes on the rest.
+The declaration excuses only legacy rows, those with no share snapshot that
+the importer selects: a native row in `incomplete_native_rows` still fails,
+and an unreadable count is still `null` and a failure. Without the
+declaration the status is `incomplete` and production fails, as before. Don't
+leave it in the frontend's environment: it would hide an import that stopped.
+`status` is `complete` once nothing is missing.
+`scripts/prism_legacy_import_admission_gate.sh` checks the same facts against
+the frontend's own environment on each host, and also reports whether an
+`import-audits` session can be seen. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers 500
 for an audit whose 2.x body can't be read on that host (#735), and the block's
 audit view answers 404.
 
@@ -2543,7 +2555,7 @@ The checks, each reported as PASS or FAIL:
 | window prior balances unchanged | the snapshot's prior balances equal `2.x.x`'s `qbit_current_carry_forward_balances()` |
 | frontend ready, first job issued | `/healthz` answers 200 and the frontend sends `mining.notify` |
 | API balances equal the source | every address's balances served by the running frontend equal the source's |
-| self-check, audit completeness | `self-check` exits 0 and reports both completeness counts 0 |
+| self-check, audit completeness | `self-check` exits 0 and reports audit completeness `complete`, every count 0 |
 | history unchanged after the frontend ran | once the frontend has started, reconciled and stopped, every fact above except retained worker difficulty (which it prunes past its TTL) is still the source's |
 
 Run it from a checkout of the release to be deployed, with a Rust toolchain

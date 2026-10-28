@@ -108,8 +108,10 @@ doctor:
 	@$(WITH_RESOLVED_QBIT)
 
 prism-self-check: export MINING_LANES=prism
+# #734: `PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 make prism-self-check` declares,
+# for this run only, that import-audits is storing the missing legacy audits.
 prism-self-check:
-	$(COMPOSE) --profile prism exec -T prism-coordinator qbit-prism-server self-check
+	$(COMPOSE) --profile prism exec -T $(if $(PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING),-e 'PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=$(PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING)') prism-coordinator qbit-prism-server self-check
 
 check-version-skew:
 	python3 scripts/check_version_skew.py
