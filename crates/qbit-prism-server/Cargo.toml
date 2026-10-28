@@ -59,3 +59,7 @@ tempfile = "3"
 http-body-util = "0.1"
 # Property tests for the Stratum line codec and target conversions (#575).
 proptest = { version = "1", default-features = false, features = ["std"] }
+# The TLS readiness test (#771) drives sqlx-core's rustls client against a
+# rustls server; both are already in the graph through sqlx.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sqlx-core = "0.8"
