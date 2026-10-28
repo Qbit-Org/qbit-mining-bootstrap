@@ -90,42 +90,45 @@ qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
    public edge, including the oldest history, a sidecar-only import and a
    reconstructed body. Require the exact SHA and matching ETag, as below.
 
-Nothing on the serving path reads a legacy row's canonical bytes. So
-frontends can admit traffic before `import-audits` finishes. From 3.0.0 and
-3.1.0-rc.1, and so in 3.1.0, an import beside them holds `SETTLEMENT_LOCK`
-only to check the write guard and commit each row, except toward a lock holder that needs the very row being
-imported, which waits for that row's UPDATE
-([ledger operations](prism-ledger-ops.md)). It sends and stores the row first, within
-`PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`; `PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS`
-bounds its wait for the lock and its hold. SIGTERM stops it (#765). Through
-3.0.0-rc.6 it held the lock while it sent and stored each body, which stalls
-settlement and template refresh for as long, so run an earlier build's
-import beside serving frontends only under a guard that kills it with
-SIGKILL once a settlement waiter has waited a few seconds: as a container's
-PID 1 it ignores SIGTERM. Until `import-audits` finishes,
-production `self-check` fails at audit completeness, but runs and reports
-every local check first (#734). While the import runs, declare it for that
-run with `PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1`
-(`PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 make prism-self-check`, which
-passes it to the container, or `docker compose exec -e
+Nothing on the serving path reads a legacy row's canonical bytes. So frontends
+can admit traffic before `import-audits` finishes. From 3.0.0 and 3.1.0-rc.1,
+and so in 3.1.0, an import beside them holds `SETTLEMENT_LOCK` only to check the
+write guard and commit each row, except toward a lock holder that needs the very
+row being imported, which waits for that row's UPDATE
+([ledger operations](prism-ledger-ops.md)). It sends and stores the row first,
+within `PRISM_IMPORT_AUDITS_WRITE_TIMEOUT_MS`;
+`PRISM_IMPORT_AUDITS_LOCK_TIMEOUT_MS` bounds its wait for the lock and its hold.
+SIGTERM stops it (#765). Through 3.0.0-rc.6 it held the lock while it sent and
+stored each body, which stalls settlement and template refresh for as long, so
+run an earlier build's import beside serving frontends only under a guard that
+kills it with SIGKILL once a settlement waiter has waited a few seconds: as a
+container's PID 1 it ignores SIGTERM. Until `import-audits` finishes, production
+`self-check` fails at audit completeness, but runs and reports every local check
+first (#734). While the import runs, declare it for that run with
+`PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1`
+(`PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 make prism-self-check`, which passes
+it to the container, or `docker compose exec -e
 PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 prism-coordinator qbit-prism-server
 self-check`). `self-check` then reports `audit_completeness.status` as
-`legacy_import_pending`, with `pending_legacy_rows`, and passes on the rest.
-The declaration excuses only legacy rows, those with no share snapshot that
-the importer selects: a native row in `incomplete_native_rows` still fails,
-and an unreadable count is still `null` and a failure. Without the
-declaration the status is `incomplete` and production fails, as before. Don't
-leave it in the frontend's environment: it would hide an import that stopped.
-`status` is `complete` once nothing is missing.
+`legacy_import_pending`, with `pending_legacy_rows`, and passes on the rest. The
+declaration excuses only legacy rows, those with no share snapshot that the
+importer selects: a native row in `incomplete_native_rows` still fails, and an
+unreadable count is still `null` and a failure. Without the declaration the
+status is `incomplete` and production fails, as before. Don't leave it in the
+frontend's environment: it would hide an import that stopped. `status` is
+`complete` once nothing is missing.
 `scripts/prism_legacy_import_admission_gate.sh` checks the same facts against
 the frontend's own environment on each host, and also reports whether an
-`import-audits` session can be seen. Until a legacy row is imported, `/public/v1/artifacts/<sha>` answers a
-`no-store` 404 for an audit whose 2.x body file, or a share segment it names,
-isn't on that host, as the block's audit view does (#735). A body file that is there but can't be read or
-verified still answers 500, as does a body recorded under a URI scheme other
-than `file://`. A 2.x audit-bundle.v2 body whose share segments are there
-answers 500 until 3.x can verify it (#731), so expect those 500s on a host that
-holds the 2.x bodies; one whose segments are missing answers 404 like any
+`import-audits` session can be seen. Until a legacy row is imported,
+`/public/v1/artifacts/<sha>` answers a `no-store` 404 for an audit whose 2.x
+body file, or a share segment it names, isn't on that host, as the block's audit
+view does (#735). A body file that is there but can't be read or verified still
+answers 500, as does a body recorded under a URI scheme other than `file://`. A
+2.x audit-bundle.v2 body whose share segments are there is verified as
+`import-audits` verifies it, with the same parser and the same canonical-digest
+check: since #731's fix (#809) the route serves one whose parts digest is in
+2.x's order, and answers 500 for a parts digest of any other form, the
+sorted-key one included; one whose segments are missing answers 404 like any
 absent body.
 
 The gate's carry-forward integrity check runs the same report `self-check`

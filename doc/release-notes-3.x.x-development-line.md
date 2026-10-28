@@ -2,17 +2,18 @@
 
 Release date: none. This note describes the `3.x.x` line as a whole, not
 one release. Its releases are [3.0.0](release-notes-3.0.0.md),
-cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md), cut on
-`3.x.x`.
+cut on the `3.0.x` branch, and [3.1.0](release-notes-3.1.0.md) and
+[3.1.1](release-notes-3.1.1.md), cut on `3.x.x`.
 
 ## Status
 
-`3.x.x` is the production line, and 3.1.0 is its current release. Deploy
-3.1.0 from the `v3.1.0` tag, not from the `3.x.x` head, which moves on after
-the release. 3.0.0 is on the `3.0.x` branch, which starts at `4c134913`; 3.1.0
-contains everything it adds to 3.0.0-rc.6. The previous production line is
-`2.x.x`, whose tip is version 2.0.2 (see `release-notes-2.0.2.md`); the
-upgrade from it, and from 3.0.0, is in the 3.1.0 notes.
+`3.x.x` is the production line, and 3.1.1 is its current release, a patch
+release of 3.1.0. Deploy 3.1.1 from the `v3.1.1` tag, not from the `3.x.x`
+head, which moves on after the release. 3.0.0 is on the `3.0.x` branch, which
+starts at `4c134913`; 3.1.0, and so 3.1.1, contains everything it adds to
+3.0.0-rc.6. The previous production line is `2.x.x`, whose tip is version
+2.0.2 (see `release-notes-2.0.2.md`); the upgrade from it, from 3.0.0 and
+from 3.1.0 is in the 3.1.1 notes.
 
 This line exists so that three engineers can work in parallel on the native
 Rust PRISM server without sharing one open pull request. Work is split into
@@ -52,8 +53,9 @@ carries a banner with the same statement.
   submodules, `ledger/candidates.rs`, `ledger/jobs.rs`, `ledger/window.rs`,
   and `ledger/connect.rs`, with no behaviour change and no signature change,
   so parallel workstream pull requests stop colliding on one file.
-- One release identity per #284, currently `3.1.0`, after its release
-  candidate `3.1.0-rc.1`, which followed `3.0.0-rc.6` (#557). The single source is
+- One release identity per #284, currently `3.1.1`, the patch release of
+  `3.1.0`, whose candidate `3.1.0-rc.1` followed `3.0.0-rc.6` (#557). The
+  single source is
   `[workspace.package].version` in the root `Cargo.toml`, which every crate
   inherits with `version.workspace = true`, plus the `VERSION` file; bump the
   two together. `scripts/check_version_skew.py` (also `make
@@ -125,7 +127,8 @@ they fixed or configured no longer exists on this line:
 - The Postgres-backed and live-regtest Rust suites need a PostgreSQL server
   and a `qbitd` binary; see `test/prism-native-tests.sh`. They are not part
   of this note's verification.
-- The tree reads 3.1.0 ([its notes](release-notes-3.1.0.md); its release
+- The tree reads 3.1.1 ([its notes](release-notes-3.1.1.md)), a patch
+  release of 3.1.0 ([its notes](release-notes-3.1.0.md); its release
   candidate's are [3.1.0-rc.1](release-notes-3.1.0-rc.1.md)), which follows
   the six 3.0.0 candidates
   ([3.0.0-rc.1](release-notes-3.0.0-rc.1.md),
@@ -141,8 +144,8 @@ they fixed or configured no longer exists on this line:
 
 ## Upgrade and rollback
 
-The supported production upgrade is to 3.1.0, as its
-[notes](release-notes-3.1.0.md#upgrading) and `docs/prism-rust-migration.md`
+The supported production upgrade is to 3.1.1, as its
+[notes](release-notes-3.1.1.md#upgrading) and `docs/prism-rust-migration.md`
 describe. The Rust migrator refuses to start against a live legacy Python
 writer lease and against an undrained legacy block outbox, as a guard against
 an accidental cutover.
