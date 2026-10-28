@@ -100,6 +100,11 @@
       "owner": "dual-writer readiness",
       "reason": "The dual-writer frontend's own two-connection health pool (3.1): the writer probe and the health reads, a 2 s acquire timeout and one retry on a fresh connection. Built from the run pool's connect options, it never checks out from the run pool, and stays out of database_pool_acquire_seconds so that histogram remains the run pool's saturation signal."
     },
+    "revision-listener": {
+      "class": "public",
+      "owner": "refresh wake (#752)",
+      "reason": "The payout-revision listener's own one-connection pool, built per connection attempt from the run pool's connect options: PgListener holds that connection for as long as it listens. It never checks out from the run pool and stays out of database_pool_acquire_seconds; a PgListener on the run pool would be a new, unclassified site."
+    },
     "shielded-begin": {
       "class": "borrowed",
       "owner": "ledger",
@@ -206,6 +211,7 @@
     "coordinator/miner_submit.rs::deferred_share_disposition#1::ledger .acquire()": [1,"ledger"],
     "coordinator/miner_submit.rs::persist_block_only#1::ledger .acquire()": [1,"ledger"],
     "coordinator/refresh_window.rs::capture_refresh_window#1::prepare(std :: mem :: take ( & mut snapshot . snapshot . prior_balances ) , & admission ,)": [1,"non-database"],
+    "coordinator/revision_wake.rs::subscribe#1::connect_with(& pool)": [1,"revision-listener"],
     "coordinator/work_ledger.rs::clocked_payout_revision#1::self .acquire()": [1,"ledger"],
     "coordinator/work_ledger.rs::now_ms#1::self .acquire()": [1,"ledger"],
     "coordinator/work_ledger.rs::window_held#1::self .acquire()": [1,"ledger"],

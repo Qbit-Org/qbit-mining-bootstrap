@@ -398,7 +398,9 @@ PRISM_DATABASE_ACQUIRE_PROBE_IDLE_MS=100
 ```
 
 These values are an example resource allocation, not a capacity qualification.
-Budget database connections for all frontends together and measure ACK latency,
+Budget database connections for all frontends together, counting one more per
+frontend beside `PRISM_DATABASE_MAX_CONNECTIONS` for its payout-revision
+listener (#752), and measure ACK latency,
 job delivery, and build/refresh work under representative load. The old Python
 batch-writer, lease, subprocess, and refresh-scheduler variables were removed.
 

@@ -10,40 +10,53 @@
 //! its blockpoll tick, up to `PRISM_BLOCKPOLL_SECONDS`.
 //!
 //! Every same-tip bump (a block's confirmation, abandonment, orphan
-//! settlement, reorg reconciliation and maturity in `ledger/blocks.rs`, and a
-//! carry claim or transfer through `ledger::bump_payout_revision`) announces
-//! itself with [`ANNOUNCE`] in its own transaction. NOTIFY is transactional:
+//! settlement, reorg reconciliation and maturity in `ledger/blocks.rs`, a
+//! carry gate change, release or transfer through
+//! `ledger::bump_payout_revision`, and `fatal-state clear`) announces itself
+//! with [`ANNOUNCE`] in its own transaction. NOTIFY is transactional:
 //! listeners hear a bump once it has committed, and never one that rolled
-//! back. The tip's own bump (`ledger/window.rs`) is not announced: each
-//! frontend learns the tip from its own node, and a wake would only send one
-//! whose node is behind to refresh against the older tip.
+//! back. Two bumps are not announced. The tip's own (`ledger/window.rs`):
+//! each frontend learns the tip from its own node, and a wake would only send
+//! one whose node is behind to refresh against the older tip. And a policy
+//! transition's (`ledger/policy_transition.rs`), which requires every
+//! frontend stopped, so no listener is there to hear it.
 //!
-//! Each frontend's refresh loop runs [`listen`] beside it, on one dedicated
-//! connection outside the ledger pool and its sizing, and wakes the refresh
-//! on every announcement. A wake is only a hint: the refresh reads the
+//! Each frontend's refresh loop [`start`]s [`listen`] beside it, on one
+//! dedicated connection outside the ledger pool and its sizing, and the
+//! listener wakes the refresh on every announcement. A wake is only a hint: the refresh reads the
 //! durable revision itself, so a late, repeated or foreign announcement can
 //! never republish older work. Announcements fold into the refresh's single
 //! wake permit, and wakes are at least [`WAKE_SPACING`] apart, so a burst
 //! costs one refresh.
 //!
 //! The listener never holds the refresh up. While it is lost the refresh
-//! keeps its tick, as before #752, and the listener reconnects with backoff;
-//! a reconnect wakes the refresh once, for an announcement it may have
-//! missed. A probe every [`PROBE_INTERVAL`] finds a connection that died
-//! without closing.
+//! keeps its tick, as before #752, and the listener reconnects with backoff.
+//! Every LISTEN wakes the refresh once, for an announcement it may have
+//! missed, unless it was in place before the loop's first refresh read the
+//! revision: the loop waits up to [`STARTUP_WAIT`] for the listener's first
+//! attempt, so normally the first refresh already runs under LISTEN. A probe
+//! every [`PROBE_INTERVAL`] finds a connection that died without closing.
 //!
 //! In dual-writer mode (3.1) each node's frontends listen on their own
 //! database. The peer sync never copies the payout revision: a peer's block
 //! counts here only once this node's reconciler confirms it, and that
 //! confirmation's bump is announced on this node's database.
-use super::refresh_window::AlertEveryMinute;
+use super::{refresh_window::AlertEveryMinute, Coordinator};
 use anyhow::{anyhow, Result};
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{watch, Notify},
     time::{sleep, sleep_until, timeout, Instant},
 };
+use tokio_util::task::AbortOnDropHandle;
 
 /// The channel every same-tip payout revision bump notifies.
 pub const CHANNEL: &str = "qbit_prism_payout_revision";
@@ -55,6 +68,11 @@ pub(crate) const ANNOUNCE: &str = "pg_notify('qbit_prism_payout_revision',payout
 pub const APPLICATION_NAME: &str = "qbit-prism-revision-wake";
 /// One connection attempt, its LISTEN included.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the refresh loop waits for the listener's first attempt before
+/// its first refresh. A database that answers takes milliseconds; one that
+/// does not is the tick's, as before #752, and the listener wakes the
+/// refresh once it connects.
+const STARTUP_WAIT: Duration = Duration::from_secs(1);
 /// How long an idle connection goes before a probe checks it.
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,28 +88,78 @@ pub const RETRY_LONGEST: Duration = Duration::from_secs(5);
 /// at its end.
 const WAKE_SPACING: Duration = Duration::from_millis(250);
 
+/// What the refresh loop and its listener share.
+#[derive(Default)]
+struct Startup {
+    /// Set before the refresh loop's first refresh reads the revision.
+    refreshing: AtomicBool,
+    /// Notified when the listener's first attempt has ended, either way.
+    attempted: Notify,
+}
+
+/// Start `coordinator`'s listener, wait up to [`STARTUP_WAIT`] for its
+/// first attempt, and return the handle that stops it when dropped. The
+/// caller's first refresh follows.
+pub(super) async fn start(
+    coordinator: Arc<Coordinator>,
+    shutdown: watch::Receiver<bool>,
+) -> AbortOnDropHandle<()> {
+    let startup = Arc::new(Startup::default());
+    let listener = AbortOnDropHandle::new(tokio::spawn({
+        let startup = startup.clone();
+        async move {
+            listen(
+                &coordinator.config.database_url,
+                &coordinator.wake,
+                &startup,
+                shutdown,
+            )
+            .await;
+        }
+    }));
+    let _ = timeout(STARTUP_WAIT, startup.attempted.notified()).await;
+    startup.refreshing.store(true, Ordering::SeqCst);
+    listener
+}
+
 /// Wake `wake` on every announcement on [`CHANNEL`] at `database_url`, and
-/// once after every reconnect, until `shutdown` changes. Never returns
-/// before that: a failure only delays the next attempt.
-pub(super) async fn listen(database_url: &str, wake: &Notify, mut shutdown: watch::Receiver<bool>) {
+/// once after every LISTEN that `startup`'s first refresh did not follow,
+/// until `shutdown` changes. Never returns before that: a failure only delays
+/// the next attempt.
+async fn listen(
+    database_url: &str,
+    wake: &Notify,
+    startup: &Startup,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut retry = RETRY_FIRST;
-    let mut connected = false;
     let mut wakes = Wakes::default();
     let mut alert = AlertEveryMinute::default();
     let mut reported = false;
+    let mut first = true;
+    // Parsed once; the pool is not, so a connection that died without
+    // closing cannot hold the next attempt's (see `subscribe`).
+    let options = PgConnectOptions::from_str(database_url)
+        .map(|options| options.application_name(APPLICATION_NAME));
     loop {
         let subscribed = tokio::select! {
             biased;
             _ = shutdown.changed() => return,
-            subscribed = timeout(CONNECT_TIMEOUT, subscribe(database_url)) => subscribed
+            subscribed = timeout(CONNECT_TIMEOUT, subscribe(&options)) => subscribed
                 .unwrap_or_else(|_| Err(anyhow!("connecting timed out after {CONNECT_TIMEOUT:?}"))),
         };
+        // Read before the loop is released: one that has not refreshed yet
+        // reads the revision after this LISTEN, so it misses nothing.
+        let refreshing = startup.refreshing.load(Ordering::SeqCst);
+        if std::mem::take(&mut first) {
+            startup.attempted.notify_one();
+        }
         let error = match subscribed {
             Ok(listener) => {
-                // The first connection starts with the refresh loop, whose
-                // first refresh runs at once. A later one may have missed
-                // announcements while it was down.
-                if connected {
+                // A bump may have committed after the refresh read the
+                // revision and before this LISTEN: while the listener was
+                // down or connecting, or before its first attempt.
+                if refreshing {
                     wake.notify_one();
                     wakes.woke(Instant::now());
                 }
@@ -100,7 +168,6 @@ pub(super) async fn listen(database_url: &str, wake: &Notify, mut shutdown: watc
                         "payout-revision listener reconnected; refresh woken once (#752)"
                     );
                 }
-                connected = true;
                 let started = Instant::now();
                 let error = match serve(listener, wake, &mut wakes, &mut shutdown).await {
                     Some(error) => error,
@@ -133,14 +200,19 @@ pub(super) async fn listen(database_url: &str, wake: &Notify, mut shutdown: watc
     }
 }
 
-/// A listener on its own one-connection pool, never shared with the ledger.
-async fn subscribe(database_url: &str) -> Result<PgListener> {
-    let options = PgConnectOptions::from_str(database_url)?.application_name(APPLICATION_NAME);
+/// A listener on a one-connection pool of its own, never shared with the
+/// ledger. Each attempt has a new pool: a dropped `PgListener` hands its
+/// connection back to its pool only after an UNLISTEN, which never finishes
+/// on a connection that died without closing, so a shared pool's one
+/// connection could stay held until TCP gave up on it, minutes later.
+async fn subscribe(options: &sqlx::Result<PgConnectOptions>) -> Result<PgListener> {
+    let options = match options {
+        Ok(options) => options.clone(),
+        Err(error) => return Err(anyhow!("invalid PRISM_DATABASE_URL: {error}")),
+    };
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(CONNECT_TIMEOUT)
-        .idle_timeout(None)
-        .max_lifetime(None)
         .connect_lazy_with(options);
     let mut listener = PgListener::connect_with(&pool).await?;
     // A lost connection ends `serve`; `listen` reconnects, so it knows to

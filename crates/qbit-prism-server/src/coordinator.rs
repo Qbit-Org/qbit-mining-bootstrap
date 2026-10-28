@@ -1941,18 +1941,7 @@ impl Coordinator {
         // #752: a payout revision another frontend moves under this one's
         // work wakes this loop at once, not on its tick (`revision_wake`).
         // The listener ends with the loop.
-        let _revision_wake = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
-            let coordinator = self.clone();
-            let shutdown = shutdown.clone();
-            async move {
-                revision_wake::listen(
-                    &coordinator.config.database_url,
-                    &coordinator.wake,
-                    shutdown,
-                )
-                .await;
-            }
-        }));
+        let _revision_wake = revision_wake::start(self.clone(), shutdown.clone()).await;
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_hint_prune = Instant::now();

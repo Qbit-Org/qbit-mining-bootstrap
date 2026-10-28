@@ -2627,8 +2627,10 @@ never a repair or quarantine step.
 
 Point every instance at the same writable primary endpoint. Do not route ledger
 queries to a lagging read replica or distribute writes among independent
-PostgreSQL primaries. Sum `PRISM_DATABASE_MAX_CONNECTIONS` across frontends and
-reserve capacity for migrations, monitoring, backup, and failover administration.
+PostgreSQL primaries. Sum `PRISM_DATABASE_MAX_CONNECTIONS` across frontends, add
+one connection per frontend for its payout-revision listener (#752) and, in
+dual-writer mode, two per frontend for its health pool, and reserve capacity
+for migrations, monitoring, backup, and failover administration.
 
 The cluster records its highest observed cumulative chain work. A node that is
 still synchronizing, follows a lower-work tip, or disagrees at equal work cannot

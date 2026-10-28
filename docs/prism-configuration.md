@@ -293,7 +293,10 @@ families show only their HELP and TYPE lines, and
 mode `qbit-prism-server healthcheck` reports liveness, not readiness, and needs
 the operator listener; the frontend's health path also keeps its own pool of
 at most two database connections beside `PRISM_DATABASE_MAX_CONNECTIONS`. See
-[dual-writer readiness](prism-dual-writer-readiness.md).
+[dual-writer readiness](prism-dual-writer-readiness.md). In either mode every
+running frontend also holds one more connection beside
+`PRISM_DATABASE_MAX_CONNECTIONS`: its payout-revision listener (#752), which
+wakes its refresh when another frontend moves the payout revision.
 
 ## Preventing stale guidance
 

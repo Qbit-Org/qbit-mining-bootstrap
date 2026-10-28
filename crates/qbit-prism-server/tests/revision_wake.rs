@@ -11,7 +11,7 @@
 //! (`coordinator::revision_wake`).
 //!
 //! Two frontends share one database and one fake node. The first case lands
-//! a real block on frontend A while frontend B, whose tick is a minute,
+//! a real block on frontend A while frontend B, whose tick is [`LONG_TICK`],
 //! publishes new-tip work at the first revision; B must republish at the
 //! confirmed revision within [`WAKE_BOUND`], and a share on that work is
 //! accepted while one on its superseded work is still refused. On the base
@@ -19,16 +19,20 @@
 //! bound. The second case cuts the listeners off: a frontend keeps its tick,
 //! and a listener that reconnects wakes its refresh for the announcement it
 //! missed and is woken by the next one; a late announcement of an older
-//! revision republishes nothing older.
+//! revision republishes nothing older. The third has a dual-writer node's
+//! carry gate change, fenced by `ledger::bump_payout_revision`, wake B.
 //!
 //! Run through: test/prism-native-tests.sh cargo-args --locked -p
 //! qbit-prism-server --test revision_wake -- --nocapture
 use anyhow::{bail, ensure, Context, Result};
 use qbit_prism_server::{
+    carry_owner::seed_role,
     codec,
     config::Config,
     coordinator::{revision_wake, Coordinator, JobContext},
+    ledger::Ledger,
     metrics::Metrics,
+    node_identity::{NodeIdentity, NodeIndex},
     stratum::{MiningBackend, MiningJob, Worker},
 };
 use qbit_prism_test_gate as gate;
@@ -47,16 +51,23 @@ mod ledger_database;
 mod window_fixture;
 
 const DIFFICULTY: f64 = 1e-12;
-/// The tick of a frontend that must be woken: a republish inside the bounds
-/// below cannot be its tick.
-const LONG_TICK: Duration = Duration::from_secs(60);
+/// The tick of a frontend that must be woken. Its loop's first refresh runs
+/// at once and its next one only after every case has ended (see
+/// [`CASE_LIMIT`]), so no republish a case waits for can be its tick.
+const LONG_TICK: Duration = Duration::from_secs(300);
+/// How long a case may run.
+const CASE_LIMIT: Duration = Duration::from_secs(150);
 /// How soon a woken frontend republishes after the announcing commit: the
-/// notification's delivery and one refresh's rebuild, with room for a
-/// loaded CI host. Far below [`LONG_TICK`] and above any plausible
-/// delivery, so a pass is a wake and a fail is a missing one.
-const WAKE_BOUND: Duration = Duration::from_secs(5);
+/// notification's delivery and one refresh's rebuild (about 0.1 s), with room
+/// for a loaded CI host. Far below [`LONG_TICK`], so a pass is a wake and a
+/// fail is a missing one.
+const WAKE_BOUND: Duration = Duration::from_secs(10);
 /// The production default tick, for the frontend whose listener is cut off.
 const SHORT_TICK: Duration = Duration::from_secs(2);
+/// How long the frontend without a listener may take to republish on its
+/// tick. Generous: that it was the tick is shown by the order of events (no
+/// listener session existed meanwhile), not by the time it took.
+const TICK_FALLBACK_LIMIT: Duration = Duration::from_secs(30);
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Frontends {
@@ -230,9 +241,9 @@ async fn another_frontends_landing_wakes_this_one_to_republish_at_the_confirmed_
     let db = ledger_database::FixtureDatabase::open(&raw, "revision_wake_").await?;
     let result = async {
         let f = frontends(&db, [LONG_TICK, LONG_TICK]).await?;
-        let result = tokio::time::timeout(Duration::from_secs(60), landing(&f))
+        let result = tokio::time::timeout(CASE_LIMIT, landing(&f))
             .await
-            .context("the case exceeded 60 seconds")
+            .with_context(|| format!("the case exceeded {CASE_LIMIT:?}"))
             .and_then(|result| result);
         close(f).await;
         result
@@ -298,7 +309,7 @@ async fn landing(f: &Frontends) -> Result<()> {
         );
         let took = republished(&f.b, revision, confirmed, WAKE_BOUND)
             .await
-            .context("B was not woken by A's confirmation (#752); its tick is a minute")?;
+            .context("B was not woken by A's confirmation (#752); its tick is five minutes")?;
         eprintln!("B republished at the confirmed revision {took:?} after A's landing returned");
 
         // The fence is unchanged: a share on the work the confirmation
@@ -346,9 +357,9 @@ async fn a_lost_listener_keeps_the_tick_and_wakes_again_once_it_reconnects() -> 
     let result = async {
         // A ticks at the production default; B only on wakes.
         let f = frontends(&db, [SHORT_TICK, LONG_TICK]).await?;
-        let result = tokio::time::timeout(Duration::from_secs(60), lost_listener(&db, &f))
+        let result = tokio::time::timeout(CASE_LIMIT, lost_listener(&db, &f))
             .await
-            .context("the case exceeded 60 seconds")
+            .with_context(|| format!("the case exceeded {CASE_LIMIT:?}"))
             .and_then(|result| result);
         // Whatever happened, the database takes connections again before
         // anything closes it.
@@ -433,11 +444,13 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
         until_listeners(db, 0, Duration::from_secs(10)).await?;
 
         // An announcement nobody hears. A keeps its tick: the refresh is
-        // never held up by its listener.
+        // never held up by its listener. No listener session exists until
+        // connections are allowed again (checked below), so A's republish
+        // can only be its tick.
         let missed = bump(&mut bumper).await?;
         ensure!(missed == first + 1);
         let bumped = Instant::now();
-        let took = republished(&f.a, missed, bumped, SHORT_TICK + WAKE_BOUND)
+        let took = republished(&f.a, missed, bumped, TICK_FALLBACK_LIMIT)
             .await
             .context("A, its listener gone, did not republish on its tick")?;
         eprintln!("A republished on its tick {took:?} after the unheard announcement");
@@ -499,6 +512,71 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
             "a late announcement of revision {first} left B publishing {now}, not {heard}"
         );
         Ok(())
+    }
+    .await;
+    let stopped = stop_loops(stop, loops).await;
+    result.and(stopped)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carry_gate_change_on_a_dual_writer_ledger_wakes_another_frontend() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let db = ledger_database::FixtureDatabase::open(&raw, "revision_wake_").await?;
+    let result = async {
+        let f = frontends(&db, [LONG_TICK, LONG_TICK]).await?;
+        let result = tokio::time::timeout(CASE_LIMIT, carry_gate(&db, &f))
+            .await
+            .with_context(|| format!("the case exceeded {CASE_LIMIT:?}"))
+            .and_then(|result| result);
+        close(f).await;
+        result
+    }
+    .await;
+    db.close(result).await
+}
+
+/// A carry owner guard opens its node's gate (`Ledger::set_carry_paying`),
+/// which commits the fence `ledger::bump_payout_revision` writes, the bump a
+/// carry-owner release or transfer writes too. B, on the same database and
+/// with a tick of [`LONG_TICK`], must be woken by it.
+async fn carry_gate(db: &ledger_database::FixtureDatabase, f: &Frontends) -> Result<()> {
+    f.b.refresh_once().await?;
+    let mut reader = PgConnection::connect(&db.url).await?;
+    let first = durable_revision(&mut reader).await?;
+    let (stop, _) = watch::channel(false);
+    let loops = vec![refresh_loop(&f.b, &stop)];
+    let result = async {
+        until_listeners(db, 1, Duration::from_secs(10)).await?;
+        let node = Ledger::connect(&db.url, "carry-node".into(), 2, false).await?;
+        let gated = async {
+            node.set_dual_writer_identity(NodeIdentity {
+                node: NodeIndex::B,
+                carry_owner: false,
+            })?;
+            seed_role(&node, NodeIndex::B.index(), true).await?;
+            let opened = Instant::now();
+            ensure!(
+                node.set_carry_paying(true).await?,
+                "opening the closed carry gate was not a change"
+            );
+            let revision = durable_revision(&mut reader).await?;
+            ensure!(
+                revision == first + 1,
+                "the carry gate's fence left revision {revision}, not {}",
+                first + 1
+            );
+            let took = republished(&f.b, revision, opened, WAKE_BOUND)
+                .await
+                .context("B was not woken by the carry gate's fence (#752)")?;
+            eprintln!("B republished {took:?} after the carry gate's fence");
+            Ok(())
+        }
+        .await;
+        node.pool.close().await;
+        gated
     }
     .await;
     let stopped = stop_loops(stop, loops).await;

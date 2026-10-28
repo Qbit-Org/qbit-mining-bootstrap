@@ -1227,15 +1227,18 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     // refuse every share on it as stale-job, until its blockpoll tick
     // (#724). A session may still read a job from that work before the one
     // that replaced it, so each session passes over jobs on superseded work
-    // without a share and submits on work at the ledger's revision. No share
-    // on new-tip work is refused stale-job: one that is fails the drill,
-    // where before #752 it was waited out. A job without its issued row or
-    // prepared record is passed over too, as the final block's loop passes
-    // over a window the promoted ledger lacks (#619), and so is a job whose
-    // share is answered unknown-job, the server having pruned it past its
-    // retention. One deadline bounds the whole phase: every step in it,
-    // share submissions and ledger reads included, so a slow answer to one
-    // miner cannot run the phase past it (Codex on #753).
+    // without a share and submits on work at the ledger's revision. A share
+    // refused stale-job because a later same-tip bump (a maturity or carry
+    // change) committed after that check is waited out the same way; any
+    // other refusal of a share on work at the ledger's revision fails the
+    // drill. A job without its issued row or prepared record is passed over
+    // too, as the final block's loop passes over a window the promoted ledger
+    // lacks (#619), and so is a job whose share is answered unknown-job, the
+    // server having pruned it past its retention. Once every session is
+    // credited, the drill supersedes one session's work itself and checks the
+    // fence still refuses it (below). One deadline bounds the whole phase:
+    // every step in it, share submissions and ledger reads included, so a
+    // slow answer to one miner cannot run the phase past it (Codex on #753).
     let phase = PhaseDeadline::start(Duration::from_secs(30));
     let tip = phase
         .bound(
@@ -1245,8 +1248,8 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
         .await?;
     let tip = tip.as_str().context("tip missing")?.to_owned();
     let mut on_new_tip = 0;
-    // Every job passed over on superseded work: (miner, job, work revision,
-    // ledger revision).
+    // Every job passed over on superseded work, or refused after a later
+    // revision move: (miner, job, work revision, ledger revision).
     let mut superseded: Vec<(usize, String, i64, i64)> = Vec::new();
     // Every job passed over without its issued row or prepared record.
     let mut unrecorded: Vec<(usize, String)> = Vec::new();
@@ -1283,10 +1286,11 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                     if share.answer.accepted() {
                         break share;
                     }
-                    // Refused. Only unknown-job is waited out: a job the
-                    // server pruned, retired past its retention before this
-                    // session read the job that replaced it. Stale-job on
-                    // work at the ledger's revision is the burst #752 ended.
+                    // Refused. Two answers are waited out: stale-job for a
+                    // revision that moved past this job's work after the
+                    // check (a maturity or carry bump), and unknown-job for
+                    // a job the server pruned, retired past its retention
+                    // before this session read the job that replaced it.
                     let now = phase
                         .bound(
                             || format!("miner {miner}'s job {job} had its payout revisions read after its share was answered {}", share.answer),
@@ -1294,6 +1298,16 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                         )
                         .await?;
                     match (share.answer.reason_id(), now) {
+                        (Some("stale-job"), Some((work, ledger))) if work != ledger => {
+                            phase
+                                .bound(
+                                    || format!("miner {miner}'s refused share on job {job} was looked up in the ledger"),
+                                    ensure_no_ledger_row(f, miner, &job, &share),
+                                )
+                                .await?;
+                            superseded.push((miner, job.clone(), work, ledger));
+                            after.push(("on new-tip work a later revision move superseded", share));
+                        }
                         (Some("unknown-job"), _) => {
                             phase
                                 .bound(
@@ -1305,7 +1319,7 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
                             after.push(("on new-tip work retired past retention", share));
                         }
                         (_, now) => bail!(
-                            "miner {miner}'s share on work for the new tip at the ledger's payout revision was answered {} (job {job}; its work and the ledger's payout revisions {revisions:?} before the share, {now:?} after it); since #752 no share on current new-tip work is refused stale-job",
+                            "miner {miner}'s share on work for the new tip at the ledger's payout revision was answered {} (job {job}; its work and the ledger's payout revisions {revisions:?} before the share, {now:?} after it)",
                             share.answer
                         ),
                     }
@@ -1315,11 +1329,12 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
             }
             // The final block moves the revision past new-tip work once,
             // with its confirmation. So a session meets work on at most one
-            // superseded revision, the first. It can pass over more than one
-            // job on that revision, such as a republication for new shares
-            // before the confirmation, so only distinct revisions are
-            // bounded. A second one would be a revision move this drill never
-            // makes.
+            // superseded revision: the first revision, whether its job was
+            // passed over or its share refused when a bump landed after the
+            // check. It can pass over more than one job on that revision,
+            // such as a republication for new shares before the
+            // confirmation, so only distinct revisions are bounded. A second
+            // one would be a revision move this drill never makes.
             let stale: BTreeSet<i64> = superseded
                 .iter()
                 .filter(|entry| entry.0 == miner)
@@ -1374,6 +1389,66 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
         on_new_tip += 1;
     }
 
+    // #752 refreshes faster; it does not loosen the fence. The drill moves
+    // the revision past the work miner 0's surviving session holds with a
+    // same-tip bump of its own, announced as a maturity or carry bump is, so
+    // that work is superseded on every run, not only when a session happened
+    // to read first-revision work. One share on it must be refused,
+    // stale-job or, pruned, unknown-job, and leave no ledger row.
+    // Its own deadline, as long as the phase's: the loop above may have
+    // spent most of that.
+    let fence = PhaseDeadline::start(Duration::from_secs(30));
+    let refused_on_superseded = {
+        let (miner, session) = (0, &mut sessions[0]);
+        let job = session
+            .job_id()
+            .context("miner 0's surviving session holds no job")?
+            .to_owned();
+        let bumped: i64 = fence
+            .bound(
+                || "the drill's same-tip revision bump committed".into(),
+                async {
+                    Ok(sqlx::query_scalar(&format!(
+                        "UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision,pg_notify('{}',payout_revision::text)",
+                        qbit_prism_server::coordinator::revision_wake::CHANNEL
+                    ))
+                    .fetch_one(&f.pool)
+                    .await?)
+                },
+            )
+            .await?;
+        let share = fence
+            .bound(
+                || format!("miner {miner}'s surviving session waited for the answer to its share on job {job}, superseded by revision {bumped}"),
+                session.submit(Proof::Share),
+            )
+            .await?;
+        let revisions = fence
+            .bound(
+                || format!("miner {miner}'s job {job} had its payout revisions read"),
+                work_revision(f, &job),
+            )
+            .await?;
+        ensure!(
+            matches!(share.answer.reason_id(), Some("stale-job" | "unknown-job")),
+            "miner {miner}'s share on job {job}, new-tip work the drill's bump to revision {bumped} superseded (its work and the ledger's payout revisions: {revisions:?}), was answered {}, not stale-job or, for a job retired past retention, unknown-job",
+            share.answer
+        );
+        fence
+            .bound(
+                || {
+                    format!(
+                        "miner {miner}'s refused share on job {job} was looked up in the ledger"
+                    )
+                },
+                ensure_no_ledger_row(f, miner, &job, &share),
+            )
+            .await?;
+        let refused = (miner, job, share.share_id.clone(), share.answer.to_string());
+        after.push(("on new-tip work a same-tip bump superseded", share));
+        refused
+    };
+
     f.quiesce().await?;
     let (rows, ids, seqs, headers): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*),count(DISTINCT share_id),count(DISTINCT share_seq),(SELECT count(*) FROM qbit_prism_share_hashes h JOIN qbit_share_ledger l USING(share_id) WHERE l.accepted AND h.header_hash=right(l.share_id,64)) FROM qbit_share_ledger WHERE accepted",
@@ -1400,7 +1475,7 @@ async fn promotion(f: &mut Fixture, pair: &mut Pair, timeline: &mut Timeline) ->
     eprintln!(
         "live async promotion with live miners: {} shares offered by {MINERS} miners on 2 frontends: {} acknowledged, {} rejected {rejected:?}, {} unknown {unknown:?}; \
          {} in flight at the fence, answered {:?}; {} committed before the cut, {} lost in the gap ({gap_bytes} WAL bytes), of which {} acknowledged: {acked_missing:?} ({} of them answered before the cut flag: {acked_before_cut:?}); \
-         the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, {on_new_tip} surviving session(s) credited on work for the new tip (jobs passed over on superseded work, as (miner, job, work revision, ledger revision): {superseded:?}; without an issued row or prepared record, as (miner, job): {unrecorded:?}; jobs answered unknown-job, retired past retention, as (miner, job): {retired:?}), a surviving share replayed: {}; \
+         the old writer committed only its {} held COMMIT(s) after the fence; after the promotion: {answered_after:?}, {on_new_tip} surviving session(s) credited on work for the new tip (jobs passed over on superseded work, as (miner, job, work revision, ledger revision): {superseded:?}; without an issued row or prepared record, as (miner, job): {unrecorded:?}; jobs answered unknown-job, retired past retention, as (miner, job): {retired:?}; a share on work the drill's bump superseded, refused without a ledger row, as (miner, job, share, answer): {refused_on_superseded:?}), a surviving share replayed: {}; \
          the gap-issued block: {} (gap sessions replaced first for older work, their windows' last shares: {older:?}); the final block {} paid {} shares, a full read of the promoted window (sessions replaced first for a stale window: {stale_windows:?}; new sessions right after the move: {first_jobs:?}) (of which sequence numbers a lost share had: {paid_reused:?}); {} lost sequence number(s) since reused: {replaced:?}; timeline: {}",
         records.len(),
         count(|outcome| *outcome == Outcome::Acknowledged),
