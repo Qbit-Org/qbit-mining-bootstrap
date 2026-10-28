@@ -421,7 +421,26 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
-          $ref: "#/components/responses/NotFound"
+          description: >
+            No public artifact has this SHA-256 (message `unknown public PRISM
+            artifact`); or it is a legacy audit bundle whose body, or a share
+            segment its envelope names, is not on the serving host yet (message
+            `audit bundle body is not retrievable`) until the migration stores
+            its canonical bytes; or its row or block went away between lookup
+            and read (message `unknown PRISM block`); or its row was re-imported
+            under another digest between lookup and read (message `unknown
+            public PRISM artifact`). Never cached, so a later request can
+            succeed.
+          headers:
+            Cache-Control:
+              description: Error responses are never cached.
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           $ref: "#/components/responses/UpstreamUnavailable"
   /mining-configuration:

@@ -27,6 +27,9 @@ OPERATIONS = {
     "prepare", "prepare_with", "describe",
 }
 EXECUTORS = OPERATIONS - {"acquire", "try_acquire", "begin", "try_begin", "begin_with", "try_begin_with"}
+# A PgListener built on a pool holds one of its connections for as long as it
+# listens (#752): a checkout like `acquire`, counted only under that receiver.
+LISTENER_OPERATIONS = {"connect_with"}
 CLASSES = {"timed", "delegated", "borrowed", "startup", "operator", "public", "compatibility", "non-database"}
 TOKEN = re.compile(
     r'\s+|//[^\n]*|/\*|(?:br|r)(?P<hash>\#*)"|(?:b|c)?"(?:\\.|[^"\\])*"'
@@ -232,7 +235,11 @@ def census(root: Path) -> tuple[Counter, list[dict], int]:
         declarations = {start + 1 for start, *_ in definitions}
         for i in range(1, len(tokens) - 1):
             name = tokens[i].value
-            if i in declarations or name not in OPERATIONS | helpers:
+            if i in declarations or name not in OPERATIONS | helpers | LISTENER_OPERATIONS:
+                continue
+            if name in LISTENER_OPERATIONS and name not in OPERATIONS | helpers and [
+                t.value for t in tokens[i - 2:i]
+            ] != ["PgListener", "::"]:
                 continue
             opening = i + 1
             # Generic method calls (fetch_one::<...>) are uncommon, but must
