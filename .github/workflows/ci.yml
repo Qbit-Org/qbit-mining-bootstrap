@@ -63,6 +63,9 @@ jobs:
           python scripts/test_prism_alert_promql.py \
             --promtool "${prism_prometheus_dir}/prometheus-3.14.0.linux-amd64/promtool"
 
+      - name: Check that published alert rule UIDs are unique and within Grafana's limits
+        run: python3 scripts/check_prism_alert_uids.py
+
       - name: Check that gated tests read their inputs only through the shared gate
         run: python3 scripts/check_gate_env_reads.py
 

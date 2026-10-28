@@ -41,6 +41,26 @@ critical-named bounds are warnings without page
 labels until #291 qualifies the native thresholds; existing external paging is
 preserved. Sidecar miner-impact and host-loss pages remain the outage net.
 
+Every rule UID in both rules files is unique and matches `^[A-Za-z0-9_-]{1,40}$`;
+Grafana refuses to start on a provisioning file that breaks this, and
+`scripts/check_prism_alert_uids.py` enforces it in CI. Five native UIDs were
+shortened in #757; titles, labels and expressions are unchanged:
+
+| Rule | Former UID (never provisionable) | UID |
+| --- | --- | --- |
+| PrismPoolResubmissionRejectRatioHigh | `qbit-prism-pool-resubmission-reject-ratio` | `qbit-prism-pool-resubmit-reject-ratio` |
+| PrismBlockCandidateLandingFailedCritical | `qbit-prism-candidate-landing-failed-critical` | `qbit-prism-candidate-landing-failed-crit` |
+| PrismBlockOfferStandbyUnconfirmed | `qbit-prism-block-offer-standby-unconfirmed` | `qbit-prism-offer-standby-unconfirmed` |
+| PrismDatabaseAdvisoryLockFailuresCritical | `qbit-prism-database-advisory-lock-failures-critical` | `qbit-prism-advisory-lock-failures-crit` |
+| PrismAcceptedRevisionWorkPendingCritical | `qbit-prism-revision-work-pending-critical` | `qbit-prism-revision-work-pending-crit` |
+
+Grafana never stored a rule under a former UID, so there is nothing to delete.
+A deployment that renamed them at render time to exactly these UIDs keeps its
+rules and alert state and can drop the rename. One that used other names must
+delete those UIDs when it adopts these: Grafana treats a new UID as a new rule,
+so state history and any silence matching `__alert_rule_uid__` start over.
+Routing and label-based silences are unaffected.
+
 Before cutover, render with the deployment's actual Ansible variables and
 confirm the scrape selectors: `qbit-prism`, `qbit-prism-public-read`, and the new
 primary exporter job `qbit-postgres-primary`, all with `network`. Exporter-owned
