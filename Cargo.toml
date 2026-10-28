@@ -19,8 +19,9 @@ rust-version = "1.98.1"
 lto = "thin"
 codegen-units = 1
 
-# sqlx-core 0.8.6 with launchbadge/sqlx#4251's TLS readiness fix backported
-# (#771); vendor/sqlx-core/README.md says what changed and when to drop it.
+# sqlx-core 0.8.6 with launchbadge/sqlx#4251's TLS readiness fix (#771) and
+# #3861's verify-ca fix (#713) backported; vendor/sqlx-core/README.md says
+# what changed and when to drop it.
 # crates/qbit-prism-server/fuzz/Cargo.toml carries the same patch.
 [patch.crates-io]
 sqlx-core = { path = "vendor/sqlx-core" }

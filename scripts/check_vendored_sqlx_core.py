@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Fail unless every build still uses vendor/sqlx-core, and its advisories are reviewed.
 
-vendor/sqlx-core is sqlx-core with launchbadge/sqlx#4251 backported (#771),
-and two workspaces patch it in: the repository's (`Cargo.toml`) and the
-Stratum fuzz targets' (`crates/qbit-prism-server/fuzz/Cargo.toml`). sqlx pins
-its sqlx-core with `=`, so moving sqlx to another version leaves the patch
-unused: Cargo only warns, and the unfixed crates.io sqlx-core comes back. For
-each workspace this requires that
+vendor/sqlx-core is sqlx-core with launchbadge/sqlx#4251 (#771) and #3861
+(#713) backported, and two workspaces patch it in: the repository's
+(`Cargo.toml`) and the Stratum fuzz targets'
+(`crates/qbit-prism-server/fuzz/Cargo.toml`). sqlx pins its sqlx-core with
+`=`, so moving sqlx to another version leaves the patch unused: Cargo only
+warns, and the unfixed crates.io sqlx-core comes back. For each workspace
+this requires that
 
 - its `Cargo.toml` patches sqlx-core to vendor/sqlx-core;
 - its lock file holds exactly one sqlx-core, with no `source` or `checksum`
