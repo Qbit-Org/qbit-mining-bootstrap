@@ -45,6 +45,7 @@ mod offer_shutdown;
 mod prepared_storage;
 mod publication_authority;
 mod refresh_window;
+pub mod revision_wake;
 mod submit_ledger;
 // The reviewed authority facade retains legacy entrypoints exercised by
 // compatibility fixtures; activation uses the opaque issuance-proof API.
@@ -1937,6 +1938,21 @@ impl Coordinator {
     }
 
     pub async fn refresh_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        // #752: a payout revision another frontend moves under this one's
+        // work wakes this loop at once, not on its tick (`revision_wake`).
+        // The listener ends with the loop.
+        let _revision_wake = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
+            let coordinator = self.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                revision_wake::listen(
+                    &coordinator.config.database_url,
+                    &coordinator.wake,
+                    shutdown,
+                )
+                .await;
+            }
+        }));
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_hint_prune = Instant::now();

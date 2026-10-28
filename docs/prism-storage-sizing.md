@@ -334,7 +334,8 @@ The native runtime uses `PRISM_RUNTIME_WORKERS` and a bounded
 `PRISM_JOB_BUILD_EXECUTOR_WORKERS` CPU builder limit. Increasing threads cannot
 remove PostgreSQL commit or storage bottlenecks. Sum
 `PRISM_DATABASE_MAX_CONNECTIONS` across frontends before setting the database
-connection budget; reserve operational connections as well.
+connection budget, plus one per frontend for its payout-revision listener
+(#752); reserve operational connections as well.
 
 ## Durability, WAL, and recovery
 

@@ -409,10 +409,11 @@ impl Ledger {
 
 /// Bump the payout revision in a transaction that holds `SETTLEMENT_LOCK`
 /// ([`Ledger::settlement_transaction`]), superseding all work built at the
-/// revisions before it. Returns the new revision.
+/// revisions before it, and announce it to every frontend's refresh once it
+/// commits (#752, `coordinator::revision_wake`). Returns the new revision.
 pub async fn bump_payout_revision(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
     connect::lock_cluster_authority(tx).await?;
-    Ok(sqlx::query_scalar("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision")
+    Ok(sqlx::query_scalar(&format!("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING payout_revision,{}", crate::coordinator::revision_wake::ANNOUNCE))
         .fetch_one(&mut **tx)
         .await?)
 }
