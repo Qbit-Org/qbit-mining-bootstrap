@@ -714,6 +714,9 @@ it runs, as they do during the 3.1 pre-migrate, so `migrate` first locks every
 table 027 and 028 alter, the share ledger's partitions included, in one
 statement that waits at most 100 ms in all, and only then runs the two files:
 catalog changes, three small index builds and 028's check, then the commit.
+From 3.1.1 the same transaction also creates 032's two functions. On a
+database already at 028, `migrate` takes only the migration history's lock up
+front, within the same 100 ms bound, and applies 032 alone.
 The statement takes the tables in order and keeps those it has while it waits
 for the next, but for those 100 ms at most, so a frontend statement waits
 behind it at most that long, well under PostgreSQL's 1 s `deadlock_timeout`
@@ -827,9 +830,10 @@ without a shared filesystem.
 it does **not** rewrite an absolute URI to a different root. Mount old absolute
 paths at their recorded locations. Keep referenced segment paths readable as
 well. Import failure is a reason to repair the missing/corrupt artifact before
-continuing; a matching hash without recoverable bytes is insufficient. A legacy
-body that fails only because a range digest was written as escaped JSON is
-intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
+continuing; a matching hash without recoverable bytes is insufficient. From
+3.1.1, import verifies the two kinds of legacy body below as they are (#709,
+#731). With an earlier release, a legacy body that fails only because a range
+digest was written as escaped JSON is intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
 So is a 2.x v2 body that fails with `window proof share_parts_digest_hex
 mismatch`; [list those rows and write their sidecars](#2x-v2-bodies-whose-window-proof-parts-digest-3x-recomputes-differently-731).
 
@@ -845,6 +849,10 @@ and never overwrites a running frontend's row. `self-check` and `broadcast-ctv`
 behave the same way.
 
 ### Legacy bodies whose range digests use Python's escaped JSON (#709)
+
+**From 3.1.1 this procedure isn't needed:** 3.1.1's `import-audits`
+verifies these bodies as they are. It describes import with an earlier
+release.
 
 `1.x` and `2.x` hashed each `segment_range` and `segment_prefix` share part
 over Python's `json.dumps`, which writes non-ASCII text as `\uXXXX` escapes;
@@ -910,6 +918,14 @@ form is still refused.
 
 ### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
 
+**From 3.1.1 this procedure isn't needed:** 3.1.1's `import-audits`
+verifies these bodies as they are, so run it directly. The checker still
+reports for a release without the fix: with 3.1.1 it counts a
+`2x-order-only` row in `import_refuses`, and exits 3, although import accepts
+the row. If you run it anyway, read its `totals`: any other status that
+stops it still needs the action below. The procedure describes import with an
+earlier release.
+
 2.x wrote each audit-bundle.v2 body's `share_parts_digest_hex` over its share
 parts in insertion order; 3.x recomputes it with sorted keys. 3.x therefore
 refuses every such body, and `import-audits` stops on the first one with
@@ -951,7 +967,8 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   `body-missing`, `body-unreadable` or `body-digest-differs` evidence instead.
   It checks nothing else: a body-ref or plain bundle is `no-window-proof`, and
   rows that import refuses for other reasons, such as the escaped range
-  digests above, need the previous section's classification run.
+  digests above with a release before 3.1.1, need the previous section's
+  classification run.
 - The runner splits the rows round robin into shards, each with its own CSV,
   work directory and report, and runs the tool with `--write` on each. Its
   last argument is the number of shards, 8 by default. The output directory
@@ -2660,7 +2677,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`, and `025` to `028`), 002's share-hash backfill, 013's, 024's
+(`001` and native `002` to `023`, `025` to `028`, and `032`), 002's share-hash backfill, 013's, 024's
 and 031's concurrent index builds, 031's parent index and leaf attachments, and 017's prepare,
 validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its

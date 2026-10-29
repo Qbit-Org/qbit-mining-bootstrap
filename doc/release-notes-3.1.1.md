@@ -223,9 +223,9 @@ manifest changes touch only crates already in the graph:
   Every 3.1.1 frontend, tool and operator command but `migrate` refuses a
   database without it.
 - **No released migration changed.** `git diff --stat v3.1.0` over
-  `crates/qbit-prism-server/migrations` shows only the new 032, so sqlx's
-  checksums of 001 to 031 are unchanged. #791 changes the runner around 027
-  and 028, not their SQL.
+  `crates/qbit-prism-server/migrations` shows only the new 032, so the SQL of
+  001 to 031 is unchanged. #791 changes the runner around 027 and 028, not
+  their SQL.
 
 ### Settings
 
@@ -365,7 +365,12 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
   frontends as above. 032 adds no table or column, so it changes nothing the
   peer sync copies or compares, and each node's listener hears only its own
   database's bumps. Nothing refuses a 3.1.0 node beside a 3.1.1 peer, but
-  no test runs that pair.
+  no test runs that pair. Each frontend runs its own peer sync, and a 3.1.0
+  frontend's still applies a pulled prepared job to its own node's database
+  without the blob-GC fence, so #785 can still leave that job without its
+  blobs there until the node's last 3.1.0 frontend is gone (#799). Replace a
+  dual-writer node's frontends together. 3.1.1 doesn't repair a job that
+  lost its blobs earlier; it ages out 24 hours after it expires.
 
   Don't overlap the migrate with heavy disk jobs on the database host, as
   for 3.1.0.
@@ -441,12 +446,16 @@ Change each such URL in one of two ways:
 ## Verification
 
 Each fix's tests are in its pull request. For this release:
-- CI runs on the version-bump pull request, including the required
-  `prism-dual-writer` lane and its R1 pre-migrate scenario, and is
-  dispatched on the tag;
-- the L3 production-window matrix runs on the version-bump pull request,
-  which the tag promotes on a tree match (#608). It is the first `l3-full` on
-  a tree with #788 ([#779](#known-issues));
+- CI runs on the version-bump and promotion pull requests, including the
+  required `prism-dual-writer` lane and its R1 pre-migrate scenario, and on
+  the push of the promoted `main` commit the tag points at;
+- the L3 production-window matrix runs `l3-full` on each pull request that
+  changes `VERSION`, the version bump and the promotion, and the tag
+  promotes the run whose tree it matches (#608). The first `l3-full` runs on
+  a tree with #788, on #810 and on #811's first head, passed all 33 planned
+  runs, including the three repeats of
+  `throughput-400k-window-2fe-async-3-blocks` that failed on 3.0.0's tree
+  ([#779](#known-issues));
 - `cargo deny --locked check` passes, and CI also checks that every
   sqlx-core RustSec advisory is reviewed (#794).
 
@@ -473,10 +482,11 @@ changes.
 - **#779, the L3 matrix on 3.0.0's tree:** the
   `throughput-400k-window-2fe-async-3-blocks` preset failed its gate in four
   of six repeats, each with one valid share refused, #716's commit-gate
-  class. #788 removes that refusal, but no `l3-full` has yet run on a tree
-  with it. #779 also records a steady-state shortfall in one repeat of
-  `throughput-400k-window-2fe-sync`, not yet traced to the code or the
-  runner.
+  class. #788 removes that refusal: the first `l3-full` runs on a tree with
+  it, on #810 and on #811's first head, passed all three repeats. #779 stays
+  open for `3.0.x`, which doesn't have #788, and for a steady-state
+  shortfall it records in one repeat of `throughput-400k-window-2fe-sync`,
+  not yet traced to the code or the runner; that preset passed in both runs.
 - **#739:** `backfill-ctv` refuses every legacy CTV set. The cutover skips
   it.
 - **#737's open part:** fatal-state clear asks the node one call at a time
