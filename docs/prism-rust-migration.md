@@ -755,23 +755,34 @@ stop it: a pass over a share ledger partition, `qbit_prism_share_hashes` or
 that blocks a lock request, unless it prevents wraparound, from the waiter's
 deadlock check, which runs once the waiter has waited `deadlock_timeout`
 (1 s): 3.1.0's 027 waited that long and so had the pass cancelled, but no
-100 ms attempt does. So each attempt's transaction lowers its own
-`deadlock_timeout` to 50 ms: PostgreSQL then cancels the worker blocking the
-request within the attempt, logging `canceling autovacuum task` in the
-server log, and the attempt, or else the next, takes the lock. PostgreSQL
-picks the worker, the one directly blocking the request, and never cancels
-an anti-wraparound vacuum; it needs no permission to do so, and the migrate
-role need not see the worker. The setting is the migrate's own, so every
-frontend keeps its `deadlock_timeout`, the 100 ms bound above stays as it
-is, and no frontend is checked for a deadlock, let alone aborted, for a wait
-on the migrate. A real deadlock that the earlier check finds aborts the
-migrate's own request, which is retried like a timeout. With
-`log_lock_waits` on, each attempt that waits past 50 ms logs the wait.
-Lowering `deadlock_timeout` takes a superuser, or from PostgreSQL 15 a role
-granted `SET` on it (`GRANT SET ON PARAMETER deadlock_timeout TO <role>`).
-`migrate` checks that once per run; a role without it warns `this role may
-not lower its deadlock_timeout` and waits a blocking pass out, attempt by
-attempt, as before.
+100 ms attempt does. So from its second attempt on, `migrate` lowers its
+own `deadlock_timeout` to 50 ms for its two lock requests only, the
+history's and the tables', with their 100 ms timeouts, and restores it
+after each; 027's, 028's and 032's statements run under the session's own.
+PostgreSQL then cancels the worker blocking the request within the attempt,
+logging `canceling autovacuum task` in the server log, and the attempt, or
+else the next, takes the lock. PostgreSQL picks the worker, the one directly
+blocking the request, and never cancels an anti-wraparound vacuum; it needs
+no permission to do so, and the migrate role need not see the worker. The
+setting is the migrate's own, so every frontend keeps its
+`deadlock_timeout`, the 100 ms bound above stays as it is, and no frontend
+is checked for a deadlock, let alone aborted, for a wait on the migrate. A
+real deadlock that the earlier check finds aborts the migrate's own
+request, which is retried like a timeout. With `log_lock_waits` on, each
+request that waits past 50 ms logs the wait. Lowering `deadlock_timeout`
+takes a superuser, or from PostgreSQL 15 a role granted `SET` on it
+(`GRANT SET ON PARAMETER deadlock_timeout TO <role>`). `migrate` asks
+which, in one query, only once its first attempt has met contention, so a
+migrate that takes its locks at once, every frontend start on a migrated
+schema included, asks nothing; if the question fails, it does not lower
+the timeout. A role that may not waits a blocking pass out, attempt by
+attempt, as before, and warns `an autovacuum worker holds a table the
+migration must lock, and this role may not lower its deadlock_timeout`,
+naming the worker, only once it sees one among the holders; contention
+with client transactions alone warns nothing about the privilege. To check
+the migrate role beforehand, run `SELECT rolsuper FROM pg_roles WHERE
+rolname = current_user` or, from PostgreSQL 15, `SELECT
+has_parameter_privilege('deadlock_timeout', 'SET')` as that role.
 Every connect that migrates goes through this, a start with
 `PRISM_POSTGRES_INIT_SCHEMA=1` included, and on a fully migrated database too,
 since each takes the history's lock: a start that could not take it used to

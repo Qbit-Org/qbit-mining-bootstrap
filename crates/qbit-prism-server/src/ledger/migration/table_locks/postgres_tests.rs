@@ -490,11 +490,59 @@ async fn a_deadlock_abort_of_the_up_front_request_is_contention() -> Result<()> 
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let result = deadlock_is_contention(&db).await;
+    let result = deadlock_is_contention(&db, false).await;
     finish(db, result).await
 }
 
-async fn deadlock_is_contention(db: &Database) -> Result<()> {
+/// Where the run lowers `deadlock_timeout` (`LOWER_DEADLOCK_TIMEOUT`), the
+/// request itself is checked for a deadlock after `DEADLOCK_CHECK`, with no
+/// lowering of its own, so the same cycle is broken within the attempt by
+/// aborting it, which is contention. A request that takes its tables
+/// leaves the transaction's `deadlock_timeout` as it found it, so nothing
+/// after the up-front locks runs under the lowered one.
+#[tokio::test]
+async fn a_lowered_deadlock_timeout_holds_for_the_lock_request_only() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = lowered_for_the_request(&db).await;
+    finish(db, result).await
+}
+
+async fn lowered_for_the_request(db: &Database) -> Result<()> {
+    deadlock_is_contention(db, true).await?;
+    let mut migrate = PgConnection::connect(&db.url).await?;
+    let mut tx = migrate.begin().await?;
+    let before: String = sqlx::query_scalar("SELECT current_setting('deadlock_timeout')")
+        .fetch_one(&mut *tx)
+        .await?;
+    LOWER_DEADLOCK_TIMEOUT
+        .scope(
+            true,
+            lock_within_attempt(
+                &mut tx,
+                "LOCK TABLE deadlock_first, deadlock_second IN ACCESS EXCLUSIVE MODE",
+                Locking::Migrations(vec![27]),
+                vec!["deadlock_first", "deadlock_second"],
+                "the test's request".to_owned(),
+            ),
+        )
+        .await?;
+    let after: String = sqlx::query_scalar("SELECT current_setting('deadlock_timeout')")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.rollback().await?;
+    migrate.close().await?;
+    ensure!(
+        before == after && after != format!("{}ms", DEADLOCK_CHECK.as_millis()),
+        "deadlock_timeout {before} before the request, {after} after it"
+    );
+    Ok(())
+}
+
+/// The cycle above, the request's deadlock check due after 80 ms of its
+/// own, or after `DEADLOCK_CHECK` where the run lowers it (`lowered`).
+async fn deadlock_is_contention(db: &Database, lowered: bool) -> Result<()> {
     sqlx::raw_sql("CREATE TABLE deadlock_first(x int); CREATE TABLE deadlock_second(x int)")
         .execute(&db.ledger.pool)
         .await?;
@@ -509,15 +557,20 @@ async fn deadlock_is_contention(db: &Database) -> Result<()> {
         .await?;
     let mut migrate = PgConnection::connect(&db.url).await?;
     let mut tx = migrate.begin().await?;
-    sqlx::query("SET LOCAL deadlock_timeout = '80ms'")
-        .execute(&mut *tx)
-        .await?;
-    let request = lock_within_attempt(
-        &mut tx,
-        "LOCK TABLE deadlock_first, deadlock_second IN ACCESS EXCLUSIVE MODE",
-        Locking::Migrations(vec![27]),
-        vec!["deadlock_first", "deadlock_second"],
-        "the test's request".to_owned(),
+    if !lowered {
+        sqlx::query("SET LOCAL deadlock_timeout = '80ms'")
+            .execute(&mut *tx)
+            .await?;
+    }
+    let request = LOWER_DEADLOCK_TIMEOUT.scope(
+        lowered,
+        lock_within_attempt(
+            &mut tx,
+            "LOCK TABLE deadlock_first, deadlock_second IN ACCESS EXCLUSIVE MODE",
+            Locking::Migrations(vec![27]),
+            vec!["deadlock_first", "deadlock_second"],
+            "the test's request".to_owned(),
+        ),
     );
     let reader_side = async {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -560,8 +613,10 @@ async fn deadlock_is_contention(db: &Database) -> Result<()> {
 }
 
 /// A PostgreSQL of the test's own, from `PRISM_TEST_PG_BIN_DIR`, whose
-/// autovacuum visits the database every second, which the shared test
-/// database's does not. Like `cutover_rehearsal`'s cluster it listens on
+/// autovacuum visits the database every second but, by its thresholds,
+/// processes no table that does not lower them itself: so the one pass a
+/// test starts is the only one. (`autovacuum = off` would not do: a table's
+/// own `autovacuum_enabled` can only turn it off.) Like `cutover_rehearsal`'s cluster it listens on
 /// loopback TCP only, with no Unix socket, and every role logs in with a
 /// random password, so a shared host's other users cannot reach it;
 /// stopped when dropped, even after a start that failed half way.
@@ -610,7 +665,9 @@ impl Cluster {
             .arg(cluster.dir.path().join("postgres.log"))
             .arg("-o")
             .arg(format!(
-                "-p {} -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c autovacuum_naptime=1s",
+                "-p {} -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c autovacuum_naptime=1s \
+                 -c autovacuum_vacuum_threshold=2000000000 -c autovacuum_vacuum_insert_threshold=2000000000 \
+                 -c autovacuum_analyze_threshold=2000000000",
                 cluster.port
             ))
             .args(["-w", "start"])
@@ -663,13 +720,15 @@ struct Pass {
     superuser: PgPool,
     pid: i32,
     partition: String,
+    oid: sqlx::postgres::types::Oid,
 }
 
 impl Pass {
-    /// Every leaf partition of the share ledger is vacuumed after any
-    /// insert, one page per 100 ms, so the pass on the rows inserted lasts
-    /// minutes, idle nearly all of it. Once a worker holds a partition,
-    /// autovacuum is turned off: that pass runs on, and no other starts.
+    /// Rows go into a share ledger partition, which is then, alone in the
+    /// cluster, vacuumed after any insert, one page per 100 ms, so the pass
+    /// lasts minutes, idle nearly all of it. Once its worker holds the
+    /// partition, autovacuum is turned off: that pass runs on, and no other
+    /// starts.
     async fn start(cluster: &Cluster) -> Result<Self> {
         let root = PgPool::connect(&cluster.url(Cluster::SUPERUSER)).await?;
         sqlx::raw_sql(&format!(
@@ -679,20 +738,6 @@ impl Pass {
         .execute(&root)
         .await?;
         let db = Database::open_at(&cluster.url("migrator")).await?;
-        let partitions: Vec<(sqlx::postgres::types::Oid, String)> = sqlx::query_as(
-            "SELECT relid::oid,relid::regclass::text FROM pg_partition_tree('qbit_share_ledger') WHERE isleaf",
-        )
-        .fetch_all(&db.ledger.pool)
-        .await?;
-        ensure!(!partitions.is_empty(), "the share ledger has no partition");
-        for (_, partition) in &partitions {
-            sqlx::query(&format!(
-                "ALTER TABLE {partition} SET (autovacuum_vacuum_insert_threshold = 1, autovacuum_vacuum_insert_scale_factor = 0, \
-                     autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)"
-            ))
-            .execute(&db.ledger.pool)
-            .await?;
-        }
         sqlx::query(
             "INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) \
              SELECT 'autovacuum:'||g,'miner','miner',decode(repeat('11',32),'hex'),1,1,1,'job',to_timestamp(1),1,to_timestamp(2),true,'fixture',0 \
@@ -700,15 +745,28 @@ impl Pass {
         )
         .execute(&db.ledger.pool)
         .await?;
-        let oids: Vec<sqlx::postgres::types::Oid> =
-            partitions.iter().map(|(oid, _)| *oid).collect();
-        let (pid, oid) = tokio::time::timeout(Duration::from_secs(60), async {
+        let partitions: Vec<(sqlx::postgres::types::Oid, String)> = sqlx::query_as(
+            "SELECT DISTINCT tableoid,tableoid::regclass::text FROM qbit_share_ledger",
+        )
+        .fetch_all(&db.ledger.pool)
+        .await?;
+        let [(oid, partition)] = &partitions[..] else {
+            bail!("the rows went into {partitions:?}, not one partition");
+        };
+        let (oid, partition) = (*oid, partition.clone());
+        sqlx::query(&format!(
+            "ALTER TABLE {partition} SET (autovacuum_vacuum_insert_threshold = 1, autovacuum_vacuum_insert_scale_factor = 0, \
+                 autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)"
+        ))
+        .execute(&db.ledger.pool)
+        .await?;
+        let pid = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                let found: Option<(i32, sqlx::postgres::types::Oid)> = sqlx::query_as(
-                    "SELECT a.pid,l.relation FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
-                     WHERE a.backend_type='autovacuum worker' AND l.locktype='relation' AND l.granted AND l.relation=ANY($1) LIMIT 1",
+                let found: Option<i32> = sqlx::query_scalar(
+                    "SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+                     WHERE a.backend_type='autovacuum worker' AND l.locktype='relation' AND l.granted AND l.relation=$1",
                 )
-                .bind(&oids)
+                .bind(oid)
                 .fetch_optional(&root)
                 .await?;
                 if let Some(found) = found {
@@ -718,7 +776,7 @@ impl Pass {
             }
         })
         .await
-        .context("no autovacuum worker took a share ledger partition within 60 s")??;
+        .with_context(|| format!("no autovacuum worker took {partition} within 60 s"))??;
         sqlx::query("ALTER SYSTEM SET autovacuum = off")
             .execute(&root)
             .await?;
@@ -726,10 +784,6 @@ impl Pass {
             .execute(&root)
             .await?;
         root.close().await;
-        let partition = partitions
-            .into_iter()
-            .find_map(|(partition_oid, name)| (partition_oid == oid).then_some(name))
-            .context("the worker's partition")?;
         let superuser =
             PgPool::connect(&in_schema(&cluster.url(Cluster::SUPERUSER), &db.schema)?).await?;
         Ok(Self {
@@ -737,14 +791,18 @@ impl Pass {
             superuser,
             pid,
             partition,
+            oid,
         })
     }
 
-    async fn running(&self) -> Result<bool> {
+    /// Whether the worker still holds the partition: a cancelled pass
+    /// leaves it, though the worker goes on with the rest of its list.
+    async fn holding(&self) -> Result<bool> {
         Ok(sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND backend_type='autovacuum worker')",
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='relation' AND relation=$2 AND granted)",
         )
         .bind(self.pid)
+        .bind(self.oid)
         .fetch_one(&self.superuser)
         .await?)
     }
@@ -763,11 +821,11 @@ impl Pass {
         .map(drop)
     }
 
-    /// After a migrate that took the tables: the pass is gone, PostgreSQL
-    /// logged the cancel it sent from the migrate's deadlock check, and 27
-    /// and 28 are recorded.
+    /// After a migrate that took the tables: the worker no longer holds the
+    /// partition, PostgreSQL logged the cancel it sent from the migrate's
+    /// deadlock check, and 27 and 28 are recorded.
     async fn cancelled(&self, cluster: &Cluster) -> Result<()> {
-        ensure!(!self.running().await?, "the pass outlived the migrate");
+        ensure!(!self.holding().await?, "the pass outlived the migrate");
         let server = cluster.server_log()?;
         ensure!(
             server.contains("canceling autovacuum task"),
@@ -807,7 +865,7 @@ async fn the_migrate_cancels_an_autovacuum_pass_holding_a_share_ledger_partition
 }
 
 async fn cancelled_by_the_migrate(cluster: &Cluster, pass: &Pass) -> Result<()> {
-    ensure!(pass.running().await?, "the pass ended before the migrate");
+    ensure!(pass.holding().await?, "the pass ended before the migrate");
     let log = SharedLog::default();
     Pass::migrate(&pass.superuser, Duration::from_secs(20), &log)
         .await
@@ -821,9 +879,9 @@ async fn cancelled_by_the_migrate(cluster: &Cluster, pass: &Pass) -> Result<()> 
 }
 
 /// A role that may not lower `deadlock_timeout` waits the pass out: it is
-/// warned once, keeps trying until its deadline, and is then refused, with
-/// the worker named on its partition, though its query is hidden from the
-/// role, and the remedies, the grant first. Nothing is recorded and the
+/// warned once, naming the worker, keeps trying until its deadline, and is
+/// then refused, with the worker named first, on its partition, though its
+/// query is hidden from the role, and the remedies, the grant first. Nothing is recorded and the
 /// pass runs on. Once the role is granted `SET` on the parameter, the
 /// migrate takes the tables as a superuser's does.
 #[tokio::test]
@@ -845,11 +903,18 @@ async fn named_then_granted(cluster: &Cluster, pass: &Pass) -> Result<()> {
         .err()
         .context("the migrate took the tables while the pass held a partition")?;
     let message = format!("{error:#}");
+    let worker = format!(
+        "autovacuum worker pid {} on {}, its query hidden from this role, so whether it is an anti-wraparound vacuum is unknown",
+        pass.pid, pass.partition
+    );
     ensure!(
         message.contains("refusing to wait any longer for the table locks of migration 27, 28")
-            && message.contains(&format!(
-                "Nothing was changed: they are not recorded. Holding them now: autovacuum worker pid {} on {}, its query hidden from this role, so whether it is an anti-wraparound vacuum is unknown. {LOWER_REMEDY}. {AUTOVACUUM_REMEDY}, and migrate again",
-                pass.pid, pass.partition
+            && message.contains(
+                "Nothing was changed: they are not recorded. Holding them now: autovacuum worker pid "
+            )
+            && message.contains(&worker)
+            && message.ends_with(&format!(
+                ". {LOWER_REMEDY}. {AUTOVACUUM_REMEDY}, and migrate again"
             )),
         "{message}"
     );
@@ -857,10 +922,11 @@ async fn named_then_granted(cluster: &Cluster, pass: &Pass) -> Result<()> {
     ensure!(
         logs.matches("this role may not lower its deadlock_timeout")
             .count()
-            == 1,
+            == 1
+            && logs.contains(&worker),
         "{message}\n{logs}"
     );
-    ensure!(pass.running().await?, "the pass ended: {message}");
+    ensure!(pass.holding().await?, "the pass ended: {message}");
     ensure!(
         !pass.db.versions().await?.contains(&27),
         "a refused migrate recorded 27"

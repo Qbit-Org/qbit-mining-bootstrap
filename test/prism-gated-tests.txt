@@ -866,6 +866,7 @@ qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_
 qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_tests::a_record_whose_connection_drops_before_its_commit_stops_for_a_rerun
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_deadlock_abort_of_the_up_front_request_is_contention
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_history_read_held_past_the_deadline_is_refused_like_the_tables
+qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_lowered_deadlock_timeout_holds_for_the_lock_request_only
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_migrate_that_cannot_lock_027s_tables_by_its_deadline_names_the_holder_and_changes_nothing
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::an_autovacuum_pass_the_role_may_not_cancel_is_named_in_the_refusal
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::once_it_holds_their_tables_027_and_028_wait_for_no_other_lock

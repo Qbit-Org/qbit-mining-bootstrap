@@ -56,29 +56,37 @@
 //! unless the worker prevents wraparound, from the waiter's own deadlock
 //! check, which runs once the waiter has waited its `deadlock_timeout`:
 //! before #791, 027's `ALTER TABLE` waited that second and PostgreSQL
-//! cancelled the pass, but no attempt waits that long. So each attempt's
-//! transaction lowers its own `deadlock_timeout` to `DEADLOCK_CHECK`, half of
-//! `ATTEMPT`: the check then runs within the attempt and cancels the worker
-//! blocking the request it waits on, whose lock is then usually granted
-//! within the attempt, or else in the next. PostgreSQL itself picks that
-//! worker, the one directly blocking the request, and tells an
-//! anti-wraparound one by its flags, with no permission check and whatever
-//! this role can see. The setting is the migrate's own: every frontend keeps
-//! its `deadlock_timeout`, so the frontend waits above stay as they are, and
-//! no frontend is checked, let alone aborted, for a wait on the migrate.
-//! Where the early check finds a real deadlock, PostgreSQL aborts the
-//! migrate's request, which is contention as a timeout is (`gave_up`). With
-//! `log_lock_waits` on, each attempt that waits past `DEADLOCK_CHECK` logs
-//! the wait.
+//! cancelled the pass, but no attempt waits that long. So, from a run's
+//! second attempt on, `lock_within_attempt` lowers the migrate's own
+//! `deadlock_timeout` to `DEADLOCK_CHECK`, half of `ATTEMPT`, for its two
+//! requests only, the history's `LOCK TABLE` and the tables', together with
+//! their lock and statement timeouts, and restores all three after each:
+//! everything else in the transaction, the files' DDL, index builds and
+//! checks included, waits under the session's own. The check then runs
+//! within the request and cancels the worker blocking it, whose lock is then
+//! usually granted within the attempt, or else in the next. PostgreSQL
+//! itself picks that worker, the one directly blocking the request, and
+//! tells an anti-wraparound one by its flags, with no permission check and
+//! whatever this role can see. The setting is the migrate's own: every
+//! frontend keeps its `deadlock_timeout`, so the frontend waits above stay
+//! as they are, and no frontend is checked, let alone aborted, for a wait on
+//! the migrate. Where the early check finds a real deadlock, PostgreSQL
+//! aborts the migrate's request, which is contention as a timeout is
+//! (`gave_up`). With `log_lock_waits` on, each request that waits past
+//! `DEADLOCK_CHECK` logs the wait.
 //!
 //! Only a superuser may lower `deadlock_timeout`, or from PostgreSQL 15 a
-//! role granted `SET` on it, which `committed_within` reads once per run,
-//! so no attempt fails on the `SET`. A role without either waits a blocking
-//! pass out as before, warned once, and its refusal names the worker and
-//! the remedies: the grant, or an administrator's `pg_cancel_backend`
-//! (a superuser's, since CVE-2023-5870's fix in 16.1, 15.5 and 14.10, and
-//! from PostgreSQL 18 a member of `pg_signal_autovacuum_worker`'s too), or
-//! autovacuum turned off on the table until the migrate is done.
+//! role granted `SET` on it. A run asks which once, in one query, after its
+//! first attempt has met contention, so a migrate that takes its locks at
+//! once, a frontend's start on a migrated schema included, asks nothing,
+//! and no attempt can fail on the `SET`; a failure to ask counts as no. A
+//! role that may not waits a blocking pass out as before: once an
+//! autovacuum worker is seen holding the tables it is warned, and its
+//! refusal names the worker and the remedies: the grant, or an
+//! administrator's `pg_cancel_backend` (a superuser's, since CVE-2023-5870's
+//! fix in 16.1, 15.5 and 14.10, and from PostgreSQL 18 a member of
+//! `pg_signal_autovacuum_worker`'s too), or autovacuum turned off on the
+//! table until the migrate is done.
 //!
 //! Every connect that migrates goes through `migrate_schema_committed`, a
 //! frontend's start with `PRISM_POSTGRES_INIT_SCHEMA=1` included, also on a
@@ -126,6 +134,13 @@ const HISTORY: &str = "qbit_prism_schema_migrations";
 /// may lower its `deadlock_timeout`: well within `ATTEMPT` (see the module
 /// docs).
 const DEADLOCK_CHECK: Duration = Duration::from_millis(50);
+
+tokio::task_local! {
+    /// Whether this attempt's lock requests lower `deadlock_timeout` to
+    /// `DEADLOCK_CHECK`: set by `committed_within` around `migrate_schema`,
+    /// read by `lock_within_attempt`, and nowhere else.
+    static LOWER_DEADLOCK_TIMEOUT: bool;
+}
 /// How an anti-wraparound autovacuum's query ends: PostgreSQL does not
 /// cancel one for a lock request.
 const ANTI_WRAPAROUND: &str = " (to prevent wraparound)";
@@ -256,9 +271,11 @@ fn gave_up(error: &sqlx::Error) -> Option<String> {
         .map(|error| error.message().to_owned())
 }
 
-/// Take `statement`'s locks on `tables` within `ATTEMPT` in all, under the
-/// transaction's own timeouts again afterwards. Giving up is
-/// `LockContention`; any other failure is returned with `context`.
+/// Take `statement`'s locks on `tables` within `ATTEMPT` in all, checked
+/// for a deadlock after `DEADLOCK_CHECK` where this run lowers
+/// `deadlock_timeout` (`LOWER_DEADLOCK_TIMEOUT`), under the transaction's
+/// own timeouts again afterwards. Giving up is `LockContention`; any other
+/// failure is returned with `context`.
 async fn lock_within_attempt(
     tx: &mut Transaction<'_, Postgres>,
     statement: &str,
@@ -266,17 +283,27 @@ async fn lock_within_attempt(
     tables: Vec<&'static str>,
     context: String,
 ) -> Result<()> {
-    let (lock_timeout, statement_timeout): (String, String) = sqlx::query_as(
-        "SELECT current_setting('lock_timeout'),current_setting('statement_timeout')",
-    )
-    .fetch_one(&mut **tx)
-    .await?;
-    sqlx::query(
-        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$1,true)",
-    )
-    .bind(ATTEMPT.as_millis().to_string())
-    .execute(&mut **tx)
-    .await?;
+    let lower = LOWER_DEADLOCK_TIMEOUT
+        .try_with(|lower| *lower)
+        .unwrap_or(false);
+    let (lock_timeout, statement_timeout, deadlock_timeout): (String, String, String) =
+        sqlx::query_as(
+            "SELECT current_setting('lock_timeout'),current_setting('statement_timeout'),current_setting('deadlock_timeout')",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+    let bound = sqlx::query(if lower {
+        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$1,true),set_config('deadlock_timeout',$2,true)"
+    } else {
+        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$1,true)"
+    })
+    .bind(ATTEMPT.as_millis().to_string());
+    let bound = if lower {
+        bound.bind(DEADLOCK_CHECK.as_millis().to_string())
+    } else {
+        bound
+    };
+    bound.execute(&mut **tx).await?;
     if let Err(error) = sqlx::query(statement).execute(&mut **tx).await {
         return Err(match gave_up(&error) {
             Some(reason) => LockContention {
@@ -288,13 +315,19 @@ async fn lock_within_attempt(
             None => anyhow::Error::from(error).context(context),
         });
     }
-    sqlx::query(
-        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)",
-    )
+    let restored = sqlx::query(if lower {
+        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true),set_config('deadlock_timeout',$3,true)"
+    } else {
+        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)"
+    })
     .bind(lock_timeout)
-    .bind(statement_timeout)
-    .execute(&mut **tx)
-    .await?;
+    .bind(statement_timeout);
+    let restored = if lower {
+        restored.bind(deadlock_timeout)
+    } else {
+        restored
+    };
+    restored.execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -341,9 +374,10 @@ pub(super) async fn lock_altered_tables(
 /// that could not take the migration history's lock or the tables of
 /// `ALTERED` is rolled back, holding nothing through the backoff, and the
 /// whole transaction runs again from the start, until `BUDGET` has passed;
-/// then the refusal names who holds the tables. Each attempt lowers its own
-/// `deadlock_timeout` where the role may (see the module docs). Any other
-/// failure is returned as it was, its transaction rolled back.
+/// then the refusal names who holds the tables. From the second attempt on,
+/// each attempt's lock requests lower `deadlock_timeout` where the role may
+/// (see the module docs). Any other failure is returned as it was, its
+/// transaction rolled back.
 pub(in crate::ledger) async fn migrate_schema_committed(
     pool: &PgPool,
     instance_id: &str,
@@ -364,23 +398,22 @@ async fn committed_within(
     let deadline = started + budget;
     let mut backoff = BACKOFF;
     let mut attempt: u32 = 1;
-    // Whether this run's role may lower its `deadlock_timeout`, read once,
-    // in the first attempt, so that no attempt fails on the `SET`.
+    // Whether this run's role may lower its `deadlock_timeout`, asked once,
+    // after the first attempt met contention; until then, no.
     let mut lowers = None;
+    // Whether an autovacuum worker was seen holding the tables while the
+    // role may not, which is warned once.
+    let mut warned = false;
     loop {
         let mut tx = begin(pool, metrics).await?;
-        let lower = match lowers {
-            Some(lower) => lower,
-            None => *lowers.insert(may_lower_deadlock_timeout(&mut tx).await?),
-        };
-        if lower {
-            // Its own only: every frontend keeps its `deadlock_timeout`.
-            sqlx::query("SELECT set_config('deadlock_timeout',$1,true)")
-                .bind(DEADLOCK_CHECK.as_millis().to_string())
-                .execute(&mut *tx)
-                .await?;
-        }
-        let error = match migrate_schema(&mut tx, instance_id, backfill_mode, metrics).await {
+        let lower = lowers.unwrap_or(false);
+        let error = match LOWER_DEADLOCK_TIMEOUT
+            .scope(
+                lower,
+                migrate_schema(&mut tx, instance_id, backfill_mode, metrics),
+            )
+            .await
+        {
             Ok(online) => {
                 tx.commit().await?;
                 return Ok(online);
@@ -403,11 +436,34 @@ async fn committed_within(
             tables,
             reason,
         } = contention;
-        // Once per run, at its first contention, refused or not.
-        if attempt == 1 && !lower {
-            tracing::warn!(
-                "this role may not lower its deadlock_timeout, so PostgreSQL cannot cancel an autovacuum pass that blocks the migration's locks within an attempt, and such a pass holds every attempt off until it ends. Grant the role SET ON PARAMETER deadlock_timeout (PostgreSQL 15 and later), or migrate as a superuser"
-            );
+        let lower = match lowers {
+            Some(lower) => lower,
+            None => *lowers.insert(may_lower_deadlock_timeout(pool).await),
+        };
+        // Where the role may not, an autovacuum worker among the holders is
+        // warned about once: looked for on the first attempt and every
+        // `WARN_EVERY`th, refused or not.
+        if !lower && !warned && (attempt == 1 || attempt.is_multiple_of(WARN_EVERY)) {
+            match holders(pool, &tables).await {
+                Ok(held) => {
+                    let workers: Vec<String> = held
+                        .iter()
+                        .filter(|holder| holder.autovacuum)
+                        .map(Holder::to_string)
+                        .collect();
+                    if !workers.is_empty() {
+                        warned = true;
+                        tracing::warn!(
+                            workers = %workers.join("; "),
+                            "an autovacuum worker holds a table the migration must lock, and this role may not lower its deadlock_timeout, so PostgreSQL cannot cancel the pass within an attempt and it holds every attempt off until it ends. Grant the role SET ON PARAMETER deadlock_timeout (PostgreSQL 15 and later), or migrate as a superuser"
+                        );
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    error = %format!("{error:#}"),
+                    "could not read who holds the migration's tables"
+                ),
+            }
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -449,23 +505,33 @@ async fn committed_within(
     }
 }
 
-/// Whether this transaction's role may lower its `deadlock_timeout`, which
-/// only a superuser may set, or from PostgreSQL 15 a role granted `SET` on
-/// it.
-async fn may_lower_deadlock_timeout(
-    connection: &mut sqlx::PgConnection,
-) -> Result<bool, sqlx::Error> {
-    let (version, superuser): (i32, bool) = sqlx::query_as(
-        "SELECT current_setting('server_version_num')::int,current_setting('is_superuser')='on'",
-    )
-    .fetch_one(&mut *connection)
-    .await?;
-    if superuser || version < 150_000 {
-        return Ok(superuser);
+/// Whether `pool`'s role may lower its `deadlock_timeout`, which only a
+/// superuser may set, or from PostgreSQL 15 a role granted `SET` on it: one
+/// query, which names `has_parameter_privilege` only where the server's
+/// version, from the connection's startup, has it. A failure to ask is a
+/// no, at debug, so the question never fails the run.
+async fn may_lower_deadlock_timeout(pool: &PgPool) -> bool {
+    let asked = async {
+        let mut connection = pool.acquire().await?;
+        let query = if connection.server_version_num().unwrap_or(0) >= 150_000 {
+            "SELECT current_setting('is_superuser')='on' OR has_parameter_privilege(current_user,'deadlock_timeout','SET')"
+        } else {
+            "SELECT current_setting('is_superuser')='on'"
+        };
+        sqlx::query_scalar::<_, bool>(query)
+            .fetch_one(&mut *connection)
+            .await
+    };
+    match asked.await {
+        Ok(may) => may,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "could not ask whether this role may lower its deadlock_timeout; the migration does not lower it"
+            );
+            false
+        }
     }
-    sqlx::query_scalar("SELECT has_parameter_privilege(current_user,'deadlock_timeout','SET')")
-        .fetch_one(&mut *connection)
-        .await
 }
 
 /// A backend holding a lock on the tables an attempt could not take, as a
