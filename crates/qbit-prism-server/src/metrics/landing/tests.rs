@@ -1132,3 +1132,49 @@ async fn the_mature_checkpoint_retires_only_waits_no_miner_could_have_received()
     assert_eq!((age(&m), unknown(&m)), (0., 0.));
     assert_eq!(unlanded(&m), 1.);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_whose_settlement_is_in_flight_retires_only_after_it_reports() {
+    for lost in [false, true] {
+        let m = Metrics::default();
+        m.revision_work_sessions_tracked();
+        let settling = "11".repeat(32);
+        m.accepted_block(&settling, 1);
+        m.revision_work_observed(5);
+        let observer = m.revision_work_settlement(&settling);
+        m.revision_work_observed(6);
+        let open = "22".repeat(32);
+        m.accepted_block(&open, 2);
+        m.landed_block(&open, 7);
+        // The checkpoint passes the block while its COMMIT is in flight.
+        m.revision_work_matured(1);
+        {
+            let state = m.landing.lock().unwrap();
+            assert_eq!(state.blocks.len(), 2, "a settling wait was retired");
+            let history: Vec<_> = state.revisions.keys().copied().collect();
+            assert_eq!(history, [5, 6, 7]);
+        }
+        // Its report still finds the wait, so its evidence counts.
+        if lost {
+            drop(observer);
+        } else {
+            observer.committed(true, 4, 5);
+        }
+        assert_eq!(unknown(&m), f64::from(lost));
+        m.revision_work_matured(1);
+        {
+            // Retired at the next checkpoint; the history it alone needed was
+            // already released, so only what the open wait needs remains.
+            let state = m.landing.lock().unwrap();
+            assert_eq!(state.blocks.len(), 1);
+            let history: Vec<_> = state.revisions.keys().copied().collect();
+            assert_eq!(history, [7]);
+        }
+        assert_eq!(unknown(&m), 0.);
+        m.revision_work_session_authorized();
+        m.revision_work_delivered(7);
+        assert_eq!(count(&m, "published"), 1.);
+        assert_eq!(count(&m, "superseded"), 0.);
+        assert_eq!(age(&m), 0.);
+    }
+}

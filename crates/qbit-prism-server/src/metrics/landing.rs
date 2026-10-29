@@ -462,7 +462,13 @@ impl Landing {
     /// there is nothing to measure. Left open, they would hold identities
     /// until saturation hid every later wait at -1. A wait a miner may have
     /// needed stays, so a real stall still saturates; an unlanded acceptance
-    /// or an unsettled orphan verdict ends without a write either way.
+    /// or an unsettled orphan verdict ends without a write either way. A wait
+    /// with a settlement observer still out stays until it reports, which
+    /// must find it open, and retires at a later checkpoint.
+    ///
+    /// Nothing is left to release: a retired wait pins no revision history.
+    /// With no observer out it keeps no `settling_from`, and a landed wait
+    /// with an unknown first revision has no target (see `resolve`).
     fn retire_unattended(&mut self, floor: u64) {
         if !self.sessions_tracked || self.sessions > 0 {
             return;
@@ -472,6 +478,7 @@ impl Landing {
             !block.closed
                 && !block.unlanded
                 && !block.orphan_uncertain
+                && block.settling == 0
                 && block.height <= floor
                 && block.epoch > attended_through
         }) {

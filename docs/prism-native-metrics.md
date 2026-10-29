@@ -472,7 +472,8 @@ later stall's pending age at -1 once the frontend serves miners after a
 failover. A wait accepted while a miner was connected, or before the Stratum
 listener started, is kept as before, so a real stall still saturates; an
 unlanded acceptance and an unsettled orphan verdict keep their own terminal
-evidence. Revision events are released when all known
+evidence, and a wait whose settlement reply is still out retires only at a
+checkpoint after that reply. Revision events are released when all known
 deliveries resolve. While waits are open, revisions below the lowest one an
 open wait may still need are released (#758): a bound or covered wait has
 been matched against every recorded write, and a later write below the newest

@@ -2475,6 +2475,108 @@ pub async fn probe_first_difficulty(
 #[cfg(test)]
 mod stale_grace_tests;
 
+/// The landing tracker counts the sessions `serve_connection` authorizes
+/// (#758): without them its mature checkpoint would retire a stall's waits.
+#[cfg(test)]
+mod landing_session_tests {
+    use super::*;
+
+    /// Authorizes any username and has no work to build.
+    struct Authorizing;
+    impl MiningBackend for Authorizing {
+        type Context = ();
+        async fn new_session_id(&self) -> Result<SessionId, StratumError> {
+            Err(StratumError::backend("no session in this test"))
+        }
+        async fn authorize(&self, username: &str) -> Result<Worker, StratumError> {
+            Ok(Worker {
+                username: username.into(),
+                payout_address: String::new(),
+                worker_name: None,
+                p2mr_program_hex: String::new(),
+            })
+        }
+        async fn build_job(
+            &self,
+            _worker: &Worker,
+            _extranonce1: &str,
+            _difficulty: f64,
+            _minimum: f64,
+        ) -> Result<MiningJob<()>, StratumError> {
+            Err(StratumError::backend("no work in this test"))
+        }
+        async fn submit(
+            &self,
+            _worker: &Worker,
+            _job: &MiningJob<()>,
+            _submission: Submission,
+            _grace: StaleGrace,
+        ) -> Result<(), StratumError> {
+            Err(StratumError::backend("no work in this test"))
+        }
+    }
+
+    fn published(metrics: &crate::metrics::Metrics) -> f64 {
+        let name =
+            "qbit_prism_accepted_block_to_revision_work_seconds_count{result=\"published\"} ";
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_authorized_session_keeps_its_waits_and_its_end_lets_later_ones_retire() {
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        metrics.revision_work_sessions_tracked();
+        let attended = "11".repeat(32);
+        metrics.accepted_block(&attended, 1);
+        metrics.landed_block(&attended, 1);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(server);
+        let (_refresh, refresh) = watch::channel(0);
+        let (_shutdown, shutdown) = watch::channel(false);
+        let session = tokio::spawn(serve_connection(
+            reader,
+            writer,
+            Arc::new(Authorizing),
+            StratumConfig::default(),
+            refresh,
+            shutdown,
+            metrics.clone(),
+        ));
+        let (client_reader, mut client_writer) = tokio::io::split(client);
+        client_writer
+            .write_all(b"{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"rig\",\"x\"]}\n")
+            .await
+            .unwrap();
+        let mut client_reader = BufReader::new(client_reader);
+        let mut line = String::new();
+        client_reader.read_line(&mut line).await.unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["result"], true, "{reply}");
+        // The session is authorized: the checkpoint keeps the wait it may need.
+        metrics.revision_work_matured(1);
+        drop((client_reader, client_writer));
+        let _ = timeout(Duration::from_secs(5), session).await.unwrap();
+        // The session ended after that acceptance, so the wait stays; one
+        // accepted after it, with no session since, retires unmeasured.
+        let unattended = "22".repeat(32);
+        metrics.accepted_block(&unattended, 2);
+        metrics.landed_block(&unattended, 1);
+        metrics.revision_work_matured(2);
+        metrics.revision_work_delivered(1);
+        assert_eq!(
+            published(&metrics),
+            1.,
+            "the tracker missed the session's authorization or its end"
+        );
+    }
+}
+
 /// Test-only (#575): keeps 16 KiB per accepted share for the life of the
 /// process, so the load harness's soak can be shown to fail its resident
 /// memory gate within a short run. Compiled only with the `soak-leak-mutant`
