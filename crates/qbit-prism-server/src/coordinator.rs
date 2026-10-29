@@ -44,6 +44,7 @@ mod compact_runtime;
 mod issued_batcher;
 mod miner_submit;
 mod offer_shutdown;
+mod payout_identity;
 mod prepared_storage;
 mod publication_authority;
 mod refresh_window;
@@ -316,7 +317,7 @@ pub struct Coordinator {
     resume_flights: compact_resume::ResumeFlights,
     /// One shared clock+revision read per fan-out burst; see `clocked_flight`.
     clocked_flights: clocked_flight::ClockedFlights,
-    identities: Mutex<HashMap<String, (Worker, Instant)>>,
+    identities: payout_identity::PayoutIdentities,
     chain_cache: Mutex<Option<ChainCache>>,
     /// The ledger sessions' effective `statement_timeout`, `None` when
     /// disabled. A COMMIT that ran this long may be a cancelled synchronous
@@ -1404,7 +1405,7 @@ impl Coordinator {
             refreshed_at: std::sync::Mutex::new(Instant::now()),
             refresh_lock: Mutex::new(RefreshState::default()),
             refresh_in_flight: std::sync::Mutex::new(None),
-            identities: Mutex::new(HashMap::new()),
+            identities: payout_identity::PayoutIdentities::new(),
             chain_cache: Mutex::new(None),
             statement_timeout,
             #[cfg(test)]
@@ -4163,22 +4164,39 @@ impl MiningBackend for Coordinator {
         if username.is_empty() || username.len() > 512 || username.chars().any(char::is_control) {
             return Err(protocol_error("unauthorized-worker", "invalid username"));
         }
-        if let Some((worker, at)) = self.identities.lock().await.get(username) {
-            if at.elapsed() < Duration::from_secs(3600) {
-                return Ok(worker.clone());
-            }
-        }
         let (address, worker_name) = username
             .split_once('.')
             .map_or((username, None), |(address, worker)| {
                 (address, Some(worker.to_string()))
             });
+        let worker = |identity: payout_identity::PayoutIdentity| Worker {
+            username: username.into(),
+            payout_address: identity.payout_address,
+            worker_name: worker_name.clone(),
+            p2mr_program_hex: identity.p2mr_program_hex,
+        };
+        // Only the address decides the payout, so a new worker suffix on a
+        // known address costs no node RPC (#823).
+        if let Some(identity) = self.identities.cached(address) {
+            return Ok(worker(identity));
+        }
+        // A session behind another's validation of the same address reads
+        // its result instead of repeating it. That wait and the wait for a
+        // validation slot share one bound.
+        let deadline = tokio::time::Instant::now() + payout_identity::VALIDATION_WAIT;
+        let flight = self.identities.flight(address);
+        let _flight = tokio::time::timeout_at(deadline, flight.lock())
+            .await
+            .map_err(|_| payout_identity::busy())?;
+        if let Some(identity) = self.identities.cached(address) {
+            return Ok(worker(identity));
+        }
         let resolve = |address: String| async move {
-            let validation = self
-                .rpc
-                .call("validateaddress", json!([address]))
-                .await
-                .map_err(|_| StratumError::backend("payout address validation unavailable"))?;
+            let validation = {
+                let _slot = self.identities.validation_slot(deadline).await?;
+                self.rpc.call("validateaddress", json!([address])).await
+            }
+            .map_err(|_| StratumError::backend("payout address validation unavailable"))?;
             match validation["isvalid"].as_bool() {
                 Some(false) => return Ok(None),
                 Some(true) => {}
@@ -4230,21 +4248,12 @@ impl MiningBackend for Coordinator {
                 }
             },
         };
-        let worker = Worker {
-            username: username.into(),
+        let identity = payout_identity::PayoutIdentity {
             payout_address,
-            worker_name,
             p2mr_program_hex,
         };
-        let mut cache = self.identities.lock().await;
-        if cache.len() >= 4096 {
-            cache.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(300));
-            if cache.len() >= 4096 {
-                cache.clear();
-            }
-        }
-        cache.insert(username.into(), (worker.clone(), Instant::now()));
-        Ok(worker)
+        self.identities.remember(address, identity.clone());
+        Ok(worker(identity))
     }
 
     async fn build_job(

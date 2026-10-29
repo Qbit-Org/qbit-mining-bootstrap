@@ -144,9 +144,8 @@ in `/metrics` reports the remaining headroom; see
 
 ## Stratum per-source cap and per-session budgets
 
-Five settings bound what one source address or one connection can cost. Every
-one defaults to the value that keeps today's behavior, and `check-config`
-rejects an out-of-range value rather than falling back.
+Five settings bound what one source address or one connection can cost.
+`check-config` rejects an out-of-range value rather than falling back.
 
 | Setting | Default | Accepted range | Failure when rejected |
 | --- | --- | --- | --- |
@@ -154,7 +153,7 @@ rejects an out-of-range value rather than falling back.
 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS` | 60 | finite, above 0, at most 3600 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS must be finite, positive and at most 3600` |
 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL must be at most 1000000` |
 | `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL must be at most 1000000` |
-| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL must be at most 1000000` |
+| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 32 | 0 (disabled) through 1000000 | `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL must be at most 1000000` |
 
 A value that is not a number fails as `invalid <name>`; an empty value selects
 the default. The three budgets are rates measured over the shared interval, not
@@ -162,8 +161,25 @@ session lifetime totals: a full window's allowance is admitted as a burst and
 refills whole at the next window. Valid `mining.submit` traffic is never
 charged against any of them.
 
+The authorization budget is on by default (#823): a username is not
+authenticated, and an address the frontend has not seen costs a node
+`validateaddress` call. Only the address before the first `.` decides the
+payout, so a resolved address is cached for an hour and a new worker suffix on
+it costs no call. Sessions naming the same new address share one validation,
+and a frontend runs at most four validations at once, so authorization cannot
+fill the node's RPC work queue ahead of templates and block submission; a
+session that has waited five seconds, behind another session's validation of
+its address and then for one of the four, is refused with
+`backend-rpc-unavailable` and may retry. Share submission, `getblocktemplate`
+and `submitblock` never wait on that bound. When the cache is full, the
+entries of addresses the node refused, which resolved to the configured
+fallback (`PRISM_USERNAME_FALLBACK_ADDRESS`), are dropped before the others.
+
 The per-source cap keys on the address this listener observed, which is the
 last hop. Leave it at 0 unless the deployment preserves miner source addresses.
+This repository has no PROXY-protocol support, so behind a load balancer that
+sends no PROXY header every miner arrives from the balancer's few addresses and
+any cap throttles the whole pool; that is why it stays 0 by default.
 See [prism-b4-stratum-admission.md](prism-b4-stratum-admission.md) for the
 runbook, the recommended starting values and the topologies that make a cap
 unsafe.

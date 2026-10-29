@@ -12,6 +12,7 @@ use submit_ledger::{Appended, CommitGate};
 
 mod admission_races;
 mod authority_lease;
+mod authorize;
 mod block_only;
 mod blockwait;
 mod candidate_preparation;
@@ -425,6 +426,9 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
                 json!({"chain":"regtest","initialblockdownload":false,"blocks":100,"headers":100,"bestblockhash":node.tip,"chainwork":"01"})
             }
             "estimatesmartfee" => json!({"feerate":0.001,"blocks":2}),
+            "validateaddress" => {
+                json!({"isvalid":true,"scriptPubKey":format!("5220{}", hash(0xcd))})
+            }
             "getmempoolinfo" => node
                 .mempool
                 .clone()
@@ -543,7 +547,7 @@ impl Fixture {
             refresh_in_flight: std::sync::Mutex::new(None),
             clocked_flights: clocked_flight::ClockedFlights::default(),
             resume_flights: compact_resume::ResumeFlights::new(1),
-            identities: Mutex::new(HashMap::new()),
+            identities: payout_identity::PayoutIdentities::new(),
             chain_cache: Mutex::new(None),
             statement_timeout,
             offer_probe: Default::default(),

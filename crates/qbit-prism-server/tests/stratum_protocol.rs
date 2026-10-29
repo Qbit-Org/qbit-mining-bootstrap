@@ -1484,6 +1484,8 @@ async fn per_username_capacity_preserves_prior_authorization_on_failed_reauthori
     task.await.unwrap();
 }
 
+/// Polls `mining.authorize` every 20 ms, so a test using it disables the
+/// authorization budget, which it does not measure.
 async fn authorize_eventually(client: &mut Client, username: &str) {
     timeout(Duration::from_secs(5), async {
         loop {
@@ -1519,6 +1521,7 @@ async fn reauthorization_retains_original_username_capacity_until_timer_expiry()
         max_jobs_per_connection: 1,
         job_retention_seconds: 0.5,
         stale_grace_seconds: 0.0,
+        max_authorize_attempts_per_interval: 0,
         ..Default::default()
     };
     config.vardiff.enabled = false;
@@ -1567,6 +1570,7 @@ async fn reauthorization_disconnect_reclaims_current_and_retained_username_capac
     let (address, _backend, _refresh, shutdown, task) = start(StratumConfig {
         max_connections_per_username: 1,
         max_jobs_per_connection: 1,
+        max_authorize_attempts_per_interval: 0,
         ..Default::default()
     })
     .await;
@@ -2160,6 +2164,39 @@ async fn authorize_budget_bounds_username_cycling_and_keeps_reauthorization_work
         calls <= 8,
         "{calls} address validations for 200 authorize attempts beyond a budget of 8"
     );
+    assert_eq!(budget_refusals(&metrics), [0., 0., 1.]);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+/// #823: unconfigured, a session has 32 authorization attempts per interval,
+/// so username cycling on one connection is bounded by default.
+#[tokio::test]
+async fn the_default_authorize_budget_bounds_username_cycling() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig::default();
+    assert_eq!(config.max_authorize_attempts_per_interval, 32);
+    assert_eq!(config.session_budget_interval_seconds, 60.0);
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    let mut client = Client::connect(address).await;
+    client.login("miner.first").await;
+    let mut switched = 0;
+    for id in 0..200 {
+        client
+            .send(json!({"id":600+id,"method":"mining.authorize","params":[format!("miner.cycle{id}"),"x"]}))
+            .await;
+        let response = client.response(600 + id).await;
+        if response["result"] != true {
+            assert_eq!(response["error"][1], "too many authorization attempts");
+            break;
+        }
+        switched += 1;
+    }
+    // The login and 31 switches spend the whole window's allowance.
+    assert_eq!(switched, 31);
+    client.expect_closed().await;
+    assert_eq!(backend.authorize_calls.load(Ordering::SeqCst), 32);
     assert_eq!(budget_refusals(&metrics), [0., 0., 1.]);
     shutdown.send(true).unwrap();
     task.await.unwrap();
