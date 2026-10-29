@@ -439,6 +439,8 @@ struct SessionObservation {
     authorized: bool,
     generation: Option<u64>,
     observation_id: u64,
+    /// The landing tracker, told of the same authorization (#758).
+    landing: Option<Arc<crate::metrics::Metrics>>,
 }
 impl SessionObservation {
     fn new(stats: Arc<StratumStats>) -> Self {
@@ -449,7 +451,12 @@ impl SessionObservation {
             observation_id,
             authorized: false,
             generation: None,
+            landing: None,
         }
+    }
+    fn reporting_to(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.landing = Some(metrics);
+        self
     }
     fn authorize(&mut self) {
         self.stats
@@ -470,6 +477,9 @@ impl SessionObservation {
         if !self.authorized {
             self.stats.authorized.fetch_add(1, Ordering::Relaxed);
             self.authorized = true;
+            if let Some(metrics) = &self.landing {
+                metrics.revision_work_session_authorized();
+            }
         }
     }
     fn delivered(&mut self, generation: u64) {
@@ -505,6 +515,9 @@ impl Drop for SessionObservation {
         self.stats.connections.fetch_sub(1, Ordering::Relaxed);
         if self.authorized {
             self.stats.authorized.fetch_sub(1, Ordering::Relaxed);
+            if let Some(metrics) = &self.landing {
+                metrics.revision_work_session_ended();
+            }
         }
         if let Some(generation) = self.generation {
             let mut generations = self.stats.delivered_generations.lock().unwrap();
@@ -1999,7 +2012,7 @@ pub async fn serve_connection<B: MiningBackend>(
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<()> {
-    let observation = SessionObservation::new(config.stats.clone());
+    let observation = SessionObservation::new(config.stats.clone()).reporting_to(metrics.clone());
     let mut session = Session::new(&config, observation);
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
@@ -2154,6 +2167,7 @@ pub async fn run_listener<B: MiningBackend>(
     config.validate()?;
     // Both listeners share this one limit, so either may report its capacity.
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
+    metrics.revision_work_sessions_tracked();
     let mut connections = JoinSet::new();
     let sessions = Sessions {
         config: config.clone(),
@@ -2200,6 +2214,7 @@ pub async fn run_gated_listener<B: MiningBackend>(
 ) -> Result<()> {
     config.validate()?;
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
+    metrics.revision_work_sessions_tracked();
     metrics.publish_stratum_listener_accepting(&config.listener_name, false);
     let mut connections = JoinSet::new();
     // The sessions' stop signal, raised on shutdown and on a withdrawal that

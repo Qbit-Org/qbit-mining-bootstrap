@@ -1034,3 +1034,101 @@ async fn the_last_observer_out_ends_a_covered_wait_whose_write_was_seen() {
         "no later event should be needed"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_frontend_cannot_exhaust_identities_and_hide_a_stall_after_failover() {
+    // An idle backup (#758) reconciles every pool block with no miner to
+    // write to; each wait stays open until the block is mature. After a
+    // failover the same frontend serves every miner, so its stall must page.
+    const MATURITY: u64 = 100;
+    for miner in [false, true] {
+        let m = Metrics::default();
+        m.revision_work_sessions_tracked();
+        if miner {
+            m.revision_work_session_authorized();
+        }
+        for height in 1..=LIMIT as u64 + 1 {
+            // A peer settled it first; this frontend's settlement binds its
+            // own committed revision (#493).
+            let hash = format!("{height:064x}");
+            let revision = height as i64;
+            m.accepted_landed_block(&hash, height, false);
+            m.revision_work_settlement(&hash)
+                .committed(false, revision, revision);
+            m.revision_work_matured(height.saturating_sub(MATURITY));
+        }
+        {
+            let state = m.landing.lock().unwrap();
+            assert_eq!(state.saturated, miner);
+            let tracked = if miner { LIMIT } else { MATURITY as usize };
+            assert_eq!(state.blocks.len(), tracked);
+        }
+        if !miner {
+            m.revision_work_session_authorized();
+        }
+        m.revision_work_delivered(LIMIT as i64 + 1);
+        let stall = format!("{:064x}", LIMIT + 2);
+        m.accepted_landed_block(&stall, LIMIT as u64 + 2, false);
+        m.revision_work_settlement(&stall)
+            .committed(false, LIMIT as i64 + 2, LIMIT as i64 + 2);
+        tokio::time::advance(Duration::from_secs(308)).await;
+        if miner {
+            // A real stall with a miner connected still saturates, unknown
+            // until restart, as before.
+            assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+        } else {
+            assert_eq!(
+                (age(&m), unknown(&m)),
+                (308., 0.),
+                "idle waits latched saturation and hid the stall from the page"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_mature_checkpoint_retires_only_waits_no_miner_could_have_received() {
+    let m = Metrics::default();
+    // Accepted before the listener tracked sessions: a miner may have been
+    // there.
+    let untracked = "11".repeat(32);
+    m.accepted_block(&untracked, 1);
+    m.landed_block(&untracked, 1);
+    m.revision_work_sessions_tracked();
+    // A miner connected after it and left without its work.
+    let left = "22".repeat(32);
+    m.accepted_block(&left, 1);
+    m.landed_block(&left, 1);
+    m.revision_work_session_authorized();
+    m.revision_work_session_ended();
+    // No miner since: a known wait, a lost settlement reply and an unlanded
+    // acceptance, which no write ends anyway.
+    let idle = "33".repeat(32);
+    m.accepted_block(&idle, 1);
+    m.landed_block(&idle, 1);
+    let lost = "44".repeat(32);
+    m.accepted_block(&lost, 1);
+    drop(m.revision_work_settlement(&lost));
+    let not_landed = "55".repeat(32);
+    m.accepted_unlanded_block(&not_landed, 1);
+    let immature = "66".repeat(32);
+    m.accepted_block(&immature, 2);
+    m.landed_block(&immature, 1);
+    tick().await;
+    assert_eq!((age(&m), unknown(&m)), (1., 1.));
+    m.revision_work_matured(1);
+    assert_eq!((age(&m), unknown(&m)), (1., 0.));
+    assert_eq!(unlanded(&m), 1.);
+    assert_eq!(m.landing.lock().unwrap().blocks.len(), 4);
+    // A retired identity is never recounted, and retirement measured nothing.
+    m.accepted_block(&idle, 1);
+    m.landed_block(&idle, 1);
+    m.revision_work_session_authorized();
+    m.revision_work_delivered(1);
+    assert_eq!(count(&m, "published"), 3.);
+    for result in ["degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0.);
+    }
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    assert_eq!(unlanded(&m), 1.);
+}
