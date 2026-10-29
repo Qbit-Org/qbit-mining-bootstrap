@@ -49,9 +49,12 @@ failures on 3.0.0's tree; 3.1.0 doesn't fix their cause, #716.
 
 3.1.1, a patch release of 3.1.0, was prepared on `3.x.x` (#810, `60309f95`)
 and is tagged on the promoted `main` commit, as this guide's default is: its
-notes were undated at #810's squash. `3.x.x` already carried everything
-`main` had, since #786 merged 3.1.0's promotion back, so the promotion gives
-`main` `3.x.x`'s tree at `60309f95` plus the release date and this record.
+notes were undated at #810's squash. The promotion's review led to #818 to
+#821 on `3.x.x`, and the promotion takes `3.x.x` after them (`987027fe`) as
+its cutoff. `3.x.x` already carried everything `main` had, since #786
+merged 3.1.0's promotion back, so the promotion gives `main` `3.x.x`'s tree
+at `987027fe` plus the release date, the fix PRs' numbers in the notes and
+this record.
 
 Merge the intended development cutoff into the promotion branch and retain
 fixes already made during promotion review. The repository allows only squash
@@ -79,10 +82,19 @@ git fetch origin main --tags
 git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
 git verify-tag v<version>
 git push origin refs/tags/v<version>
-git show v<version>:doc/release-notes-<version>.md > /tmp/qbit-release-notes.md
+git show v<version>:doc/release-notes-<version>.md | sed -E \
+  -e 's#\]\(\.\./#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/#g' \
+  -e 's#\]\(([^)#/:][^):]*)\)#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/doc/\1)#g' \
+  > /tmp/qbit-release-notes.md
 gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
   --notes-file /tmp/qbit-release-notes.md
 ```
+
+The `sed` points each inline relative link in the notes, `](path)`, at the
+tagged file, since a GitHub release body can't resolve one relative to the
+notes; `](#...)` anchors, absolute `](/...)` paths and URLs stay as they are.
+It doesn't handle reference-style links or link titles, so keep release
+notes to inline links without titles.
 
 Pushing a `v*` tag also runs the L3 production-window matrix
 (`prism-load-l3.yml`), which promotes the promotion PR's run on the same tree
@@ -112,8 +124,8 @@ and `3.x.x` the released 3.0.0 notes in place of its pre-release copy. The
 next release from either branch must not drop them.
 
 For 3.1.1 this step merges the released `main` back into `3.x.x`. It brings
-only the promotion's edits: the release date in the 3.1.1 notes and this
-guide's 3.1.1 record. `3.0.x` takes nothing from it, since 3.1.1 is a 3.1
+only the promotion's edits: the release date and the fix PRs' numbers in the
+3.1.1 notes, and this guide's 3.1.1 record. `3.0.x` takes nothing from it, since 3.1.1 is a 3.1
 release.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the

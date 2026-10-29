@@ -1,7 +1,7 @@
 # qbit-mining-bootstrap 3.1.1 Release Notes
 
-Release date: 2026-10-28. Prepared on `3.x.x` (#810) and tagged `v3.1.1`
-on its promotion into `main`.
+Release date: 2026-10-29. Prepared on `3.x.x` (#810, then #818 to #821)
+and tagged `v3.1.1` on its promotion into `main`.
 
 3.1.1 is a patch release of [3.1.0](release-notes-3.1.0.md): fixes only, with
 no new feature. Its one new setting is for a `self-check` run, not a frontend
@@ -97,18 +97,30 @@ changes below.
 
 ### Migration runner
 
-- **#791 (#789):** 3.1's `migrate` can no longer deadlock with frontends that
+- **#791 and #821 (#789):** 3.1's `migrate` can no longer deadlock with frontends that
   serve the database while 027 and 028 run, as rc.6 frontends do during the
   pre-migrate from 3.0. It locks every table 027 and 028 alter in one
   statement that waits at most 100 ms, and on a timeout or deadlock rolls the
   whole migration transaction back and tries again, backing off from 100 ms
   to 2 s, for up to ten minutes. 027's and 028's SQL is unchanged. Past ten
   minutes it stops, records nothing, and names up to five holding
-  transactions. Every connect that migrates takes the migration history's
-  lock the same way, so a start with `PRISM_POSTGRES_INIT_SCHEMA=1` that
-  can't take it now retries for up to ten minutes, warning on the first
-  attempt and every tenth, where it failed after
-  `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
+  transactions. PostgreSQL cancels an autovacuum pass that blocks a lock
+  request only from the waiter's deadlock check after `deadlock_timeout`
+  (1 s), which no 100 ms attempt reaches, so from its second attempt on
+  `migrate` lowers its own `deadlock_timeout` to 50 ms for its lock
+  requests only: PostgreSQL then cancels the worker blocking them, unless
+  the pass prevents wraparound, as it did for 3.1.0's 027. The rest of the
+  transaction, and every frontend, keeps its own `deadlock_timeout`.
+  Lowering it takes a superuser, or from PostgreSQL 15 `SET` on the
+  parameter, which `migrate` asks only after contention; a role without
+  either waits a blocking pass out, warns once it sees an autovacuum
+  worker, and its refusal names the worker and the remedies. The 100 ms
+  bound holds for frontends on the primary only: a hot standby replays the
+  locks each attempt took. Every connect that migrates takes the migration
+  history's lock the same way, so a start with
+  `PRISM_POSTGRES_INIT_SCHEMA=1` that can't take it now retries for up to
+  ten minutes, warning on the first attempt and every tenth, where it failed
+  after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
   ([the migration guide](../docs/prism-rust-migration.md#supported-2xx-source-schemas)).
 
 ### Database TLS: the vendored sqlx-core
@@ -120,11 +132,22 @@ changes below.
   directory, and `lab/prism/Dockerfile` copies it, so a build from the tag
   needs `vendor/`. CI checks that both lockfiles build the vendored crate
   and that every sqlx-core RustSec advisory is reviewed.
-- **#807 (#713):** `sslmode=verify-ca` accepts a CA-signed certificate issued
-  for another host name, as libpq's `verify-ca` does: it checks the chain,
-  not the name. Before, it refused one, as `verify-full` does. `verify-full`
-  still checks the name. This backports launchbadge/sqlx#3861 into the same
-  vendored crate.
+- **#807 and #818 (#713):** `sslmode=verify-ca` behaves as libpq's `verify-ca` does.
+  It checks the server's certificate chain against the root certificates in
+  `sslrootcert` (or `PGSSLROOTCERT`) only, never against the public roots,
+  and it does not check the host name. So it accepts a certificate your CA
+  issued for another host name; before, it refused one, as `verify-full`
+  does. `verify-ca` without `sslrootcert`, or with an `sslrootcert` that
+  holds no certificate, is refused before the TLS handshake, with
+  `sslmode=verify-ca requires sslrootcert` or `holds no certificate`
+  ([Upgrading](#upgrading)). Use `verify-full` wherever the certificate's
+  names match the host you connect to: it checks the name as well.
+  `verify-full` is unchanged, so it still trusts the public roots beside
+  `sslrootcert`, unlike libpq's `verify-full`; only `verify-ca` now matches
+  libpq. This backports launchbadge/sqlx#3861 into the same vendored
+  crate, with a local change that is not upstream's: sqlx-core trusts the
+  public roots beside `sslrootcert`, so #3861 alone would have let
+  `verify-ca` accept any publicly issued certificate, for any name.
 
 ### Dual writer
 
@@ -174,14 +197,20 @@ changes below.
 - **#793 (#757):** five native alert rule UIDs are shortened to Grafana's
   40-character limit ([Alert rules](#alert-rules)). CI rejects any UID that
   is too long, has other characters or is duplicated.
-- **#800 (#758):** `PrismAcceptedRevisionWorkPending` and
+- **#800 and #820 (#758):** `PrismAcceptedRevisionWorkPending` and
   `PrismAcceptedRevisionWorkTrackingUnknown` count only on a frontend that
   had an authorized miner in the last 15 minutes, so an idle backup frontend
   no longer warns after every pool block. On the server, a frontend no
   longer keeps a block's wait unknown until restart when another settlement
   confirmed the block first (a peer's, or its own attempt whose reply was
   lost): its own later settlement proves a covering revision, and its next
-  write at or above it ends the wait without a sample.
+  write at or above it ends the wait without a sample. Nor can an idle
+  frontend's waits exhaust its 4,096 tracked block identities any longer:
+  once a block matures, a wait that no authorized miner was connected to
+  receive since its acceptance ends without a sample. Before, an idle
+  backup latched tracking unknown after about 4,096 pool blocks, and after
+  a failover `PrismAcceptedRevisionWorkPendingCritical` could not page on
+  it until it restarted.
 
 ### Tests and CI only
 
@@ -212,9 +241,9 @@ manifest changes touch only crates already in the graph:
   Every 3.1.1 frontend, tool and operator command but `migrate` refuses a
   database without it.
 - **No released migration changed.** `git diff --stat v3.1.0` over
-  `crates/qbit-prism-server/migrations` shows only the new 032, so sqlx's
-  checksums of 001 to 031 are unchanged. #791 changes the runner around 027
-  and 028, not their SQL.
+  `crates/qbit-prism-server/migrations` shows only the new 032, so the SQL of
+  001 to 031 is unchanged. #791 changes the runner around 027 and 028, not
+  their SQL.
 
 ### Settings
 
@@ -354,7 +383,12 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
   frontends as above. 032 adds no table or column, so it changes nothing the
   peer sync copies or compares, and each node's listener hears only its own
   database's bumps. Nothing refuses a 3.1.0 node beside a 3.1.1 peer, but
-  no test runs that pair.
+  no test runs that pair. Each frontend runs its own peer sync, and a 3.1.0
+  frontend's still applies a pulled prepared job to its own node's database
+  without the blob-GC fence, so #785 can still leave that job without its
+  blobs there until the node's last 3.1.0 frontend is gone (#799). Replace a
+  dual-writer node's frontends together. 3.1.1 doesn't repair a job that
+  lost its blobs earlier; it ages out 24 hours after it expires.
 
   Don't overlap the migrate with heavy disk jobs on the database host, as
   for 3.1.0.
@@ -371,12 +405,45 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
     027 and 028 committed 372 and 558 ms after `migrate` started, and no
     share waited over 39 ms for its answer;
   - while another transaction holds one of the tables for long, each retry
-    queues the frontends behind its request for up to 100 ms, so they see
-    repeated short queues rather than one long one or a deadlock;
+    queues the frontends on the primary behind its request for up to
+    100 ms, so they see repeated short queues rather than one long one or a
+    deadlock;
+  - while an autovacuum pass holds one of the tables or a share ledger
+    partition, PostgreSQL cancels it from the next attempt it blocks
+    (`canceling autovacuum task` in the server log), because from the
+    second attempt on the migrate's lock requests lower its own
+    `deadlock_timeout` to 50 ms; it never cancels an anti-wraparound
+    vacuum. With `log_lock_waits` on, each request that waits past 50 ms
+    logs the wait. Lowering it takes a superuser, or from PostgreSQL 15
+    `GRANT SET ON PARAMETER deadlock_timeout TO <role>`; check the role
+    beforehand with `SELECT has_parameter_privilege('deadlock_timeout',
+    'SET')` or `rolsuper`. A migrate role without either waits the pass out
+    attempt by attempt, warns `an autovacuum worker holds a table the
+    migration must lock. This role may not lower its deadlock_timeout` once
+    it sees one (`Whether this role may lower its deadlock_timeout could not
+    be checked` where `migrate` could not ask, which it then asks again at
+    the next contention), and if it is refused, the refusal names the
+    worker: grant the parameter, or an administrator runs `SELECT pg_cancel_backend(<pid>)` (a superuser since
+    CVE-2023-5870's fix in 16.1, 15.5 and 14.10, and from PostgreSQL 18 a
+    member of `pg_signal_autovacuum_worker`), or keeps autovacuum off its
+    table (the partition, for the share ledger) with `ALTER TABLE <table>
+    SET (autovacuum_enabled = off)` until the migrate is done, then `ALTER
+    TABLE <table> RESET (autovacuum_enabled)`; let an anti-wraparound
+    vacuum finish;
+  - the 100 ms bound is for the primary. Each attempt that took some of its
+    locks before giving up is replayed on every hot standby, so a reader
+    there, the public-read replica `prism-public-api` reads included, can
+    stall for up to that standby's `max_standby_streaming_delay` at each
+    retry, or be cancelled with `canceling statement due to conflict with
+    recovery`, and a primary that waits for a standby's apply
+    (`synchronous_commit = remote_apply`) waits for that replay too. Run
+    the pre-migrate while public traffic is low, or point the public API at
+    the primary for the window;
   - if the locks can't be taken for ten minutes, `migrate` stops with
     `refusing to wait any longer for the table locks of migration 27, 28`,
-    changes nothing, and names the holding transactions: end them, or stop
-    the frontends, and migrate again.
+    changes nothing, and names the holding transactions and autovacuum
+    workers: end the transactions, or stop the frontends, deal with the
+    workers as above, and migrate again.
 
   3.0.0 and rc.6 append with the same statement as 3.1.0, so while 3.0 and
   3.1.1 frontends serve one database, the clock caveat above applies to them
@@ -384,6 +451,30 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
   from 3.1.0.
 - **From 2.0.x, or from a 3.0.0 candidate before rc.6:** as the 3.1.0 notes
   say, with 3.1.1 in 3.1.0's place. Its `migrate` applies 032 with the rest.
+
+**If a database URL uses `sslmode=verify-ca`,** check it before you
+replace the binaries. 3.1.1's `verify-ca` trusts only the certificates in
+`sslrootcert` (or `PGSSLROOTCERT`). 3.1.0's also trusted the public roots,
+and checked the host name (#713). This covers any URL a 3.1.1 binary or
+tool connects with, such as `PRISM_DATABASE_URL`,
+`PRISM_PUBLIC_DATABASE_URL` or `PRISM_PEER_DATABASE_URL`. No configuration
+in this repository uses `verify-ca`. A 3.1.1 binary refuses such a URL:
+- **without `sslrootcert`,** before the TLS handshake, with
+  `sslmode=verify-ca requires sslrootcert`;
+- **when `sslrootcert` does not anchor the server's chain,** with
+  `invalid peer certificate: UnknownIssuer`. For example, the database's
+  certificate is publicly issued and 3.1.0 accepted it through the public
+  roots, while `sslrootcert` names another CA.
+
+Change each such URL in one of two ways:
+- **To keep 3.1.0's check, switch the URL to `sslmode=verify-full`.**
+  3.1.0 checked a `verify-ca` connection as `verify-full` does, against the
+  public roots and `sslrootcert`, and against the host name. `verify-full`
+  behaves the same in 3.1.0, so the change survives a rollback.
+- **To keep `verify-ca`,** set `sslrootcert` to the CA that actually signs
+  the server's certificate, at a path the binary can read. 3.1.0's
+  `verify-ca` also checks the name, so a URL whose certificate does not
+  name the host works only on 3.1.1.
 
 ## Rolling back
 
@@ -406,12 +497,16 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
 ## Verification
 
 Each fix's tests are in its pull request. For this release:
-- CI runs on the version-bump pull request, including the required
-  `prism-dual-writer` lane and its R1 pre-migrate scenario, and is
-  dispatched on the tag;
-- the L3 production-window matrix runs on the version-bump pull request,
-  which the tag promotes on a tree match (#608). It is the first `l3-full` on
-  a tree with #788 ([#779](#known-issues));
+- CI runs on the version-bump and promotion pull requests, including the
+  required `prism-dual-writer` lane and its R1 pre-migrate scenario, and on
+  the push of the promoted `main` commit the tag points at;
+- the L3 production-window matrix runs `l3-full` on each pull request that
+  changes `VERSION`, the version bump and the promotion, and the tag
+  promotes the run whose tree it matches (#608). The first `l3-full` runs on
+  a tree with #788, on #810 and on #811's first head, passed all 33 planned
+  runs, including the three repeats of
+  `throughput-400k-window-2fe-async-3-blocks` that failed on 3.0.0's tree
+  ([#779](#known-issues));
 - `cargo deny --locked check` passes, and CI also checks that every
   sqlx-core RustSec advisory is reviewed (#794).
 
@@ -422,9 +517,9 @@ changes.
 
 **Fixed in 3.1.1:**
 - #716 by #788, and with it #724's last intermittent answer;
-- #771 by #794, and #713 by #807;
+- #771 by #794, and #713 by #807 and #818;
 - #762 by #797, and #630 by #798;
-- #757 by #793, and #758 by #800;
+- #757 by #793, and #758 by #800 and #820;
 - #752 by #795;
 - #738 by #801, and #711 by #802;
 - #709 and #731 by #809;
@@ -432,16 +527,18 @@ changes.
 - the block-proof acknowledgement bound's dropped pooled connection, by
   main's #781 through #786.
 
-3.1.1 also fixes #733 (#806), #735 (#796), #785 (#799) and #789 (#791).
+3.1.1 also fixes #733 (#806), #735 (#796), #785 (#799) and #789 (#791,
+#821).
 
 **Still open:**
 - **#779, the L3 matrix on 3.0.0's tree:** the
   `throughput-400k-window-2fe-async-3-blocks` preset failed its gate in four
   of six repeats, each with one valid share refused, #716's commit-gate
-  class. #788 removes that refusal, but no `l3-full` has yet run on a tree
-  with it. #779 also records a steady-state shortfall in one repeat of
-  `throughput-400k-window-2fe-sync`, not yet traced to the code or the
-  runner.
+  class. #788 removes that refusal: the first `l3-full` runs on a tree with
+  it, on #810 and on #811's first head, passed all three repeats. #779 stays
+  open for `3.0.x`, which doesn't have #788, and for a steady-state
+  shortfall it records in one repeat of `throughput-400k-window-2fe-sync`,
+  not yet traced to the code or the runner; that preset passed in both runs.
 - **#739:** `backfill-ctv` refuses every legacy CTV set. The cutover skips
   it.
 - **#737's open part:** fatal-state clear asks the node one call at a time

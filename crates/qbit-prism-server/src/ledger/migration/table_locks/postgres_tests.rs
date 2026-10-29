@@ -2,11 +2,17 @@
 //! schema rc.6 serves (26, without 27, 28, 31 and 32): what the migration
 //! transaction holds while it waits for them, that the files wait for no
 //! other lock once it has them, and what a migrate that cannot take them by
-//! its deadline leaves and says. The cycle with a serving frontend itself
-//! is `ledger_postgres`'s `premigrate_lock_order`.
+//! its deadline leaves and says, and what it does about an autovacuum pass
+//! holding one of the tables, on a cluster of the test's own. The cycle
+//! with a serving frontend itself is `ledger_postgres`'s
+//! `premigrate_lock_order`.
 use super::*;
+use crate::coordinator::miner_tests::SharedLog;
 use qbit_prism_test_gate as gate;
 use sqlx::{Connection, PgConnection};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use tracing::instrument::WithSubscriber;
 
 struct Database {
     admin: PgPool,
@@ -22,16 +28,18 @@ impl Database {
         let Some(raw) = gate::database_url(gate::site!())? else {
             return Ok(None);
         };
-        let admin = PgPool::connect(&raw).await?;
+        Ok(Some(Self::open_at(&raw).await?))
+    }
+
+    /// The same at `raw`, whose role creates the schema and owns the ledger.
+    async fn open_at(raw: &str) -> Result<Self> {
+        let admin = PgPool::connect(raw).await?;
         let schema = format!("prism_table_locks_{}", uuid::Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE SCHEMA {schema}"))
             .execute(&admin)
             .await?;
-        let mut url = url::Url::parse(&raw)?;
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
-        let ledger =
-            crate::ledger::Ledger::connect(url.as_str(), "table-locks".into(), 2, true).await?;
+        let url = in_schema(raw, &schema)?;
+        let ledger = crate::ledger::Ledger::connect(&url, "table-locks".into(), 2, true).await?;
         let mut undo = String::from(
             "DELETE FROM qbit_prism_schema_migrations WHERE version IN (27,28,31,32); \
              DROP FUNCTION qbit_prism_append_share, qbit_prism_ledger_clock; \
@@ -51,12 +59,12 @@ impl Database {
             undo.push_str(&format!(" ALTER TABLE {table} DROP COLUMN origin_node;"));
         }
         sqlx::raw_sql(&undo).execute(&ledger.pool).await?;
-        Ok(Some(Self {
+        Ok(Self {
             admin,
             schema,
-            url: url.into(),
+            url,
             ledger,
-        }))
+        })
     }
 
     async fn versions(&self) -> Result<Vec<i32>> {
@@ -75,6 +83,14 @@ impl Database {
         self.admin.close().await;
         Ok(())
     }
+}
+
+/// `raw` with `schema` as its search path.
+fn in_schema(raw: &str, schema: &str) -> Result<String> {
+    let mut url = url::Url::parse(raw)?;
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    Ok(url.into())
 }
 
 /// Drop the schema after a test's `result`, keeping both errors.
@@ -474,11 +490,126 @@ async fn a_deadlock_abort_of_the_up_front_request_is_contention() -> Result<()> 
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let result = deadlock_is_contention(&db).await;
+    let result = deadlock_is_contention(&db, false).await;
     finish(db, result).await
 }
 
-async fn deadlock_is_contention(db: &Database) -> Result<()> {
+/// Where the run lowers `deadlock_timeout` but this role may not, after all
+/// (its grant revoked mid-run, a `SET ROLE`), the refused `SET` is
+/// `CannotLower`, which `committed_within` runs again without lowering, not
+/// a failure of the migrate; without lowering the same role sets its other
+/// timeouts as before, and only the table is refused it.
+#[tokio::test]
+async fn a_lowered_deadlock_timeout_refused_to_the_role_is_cannot_lower() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = refused_lowering(&db).await;
+    finish(db, result).await
+}
+
+async fn refused_lowering(db: &Database) -> Result<()> {
+    let role = format!("prism_cannot_lower_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {role} NOLOGIN"))
+        .execute(&db.admin)
+        .await?;
+    let tried = async {
+        let mut connection = PgConnection::connect(&db.url).await?;
+        let mut outcomes = Vec::new();
+        for lower in [true, false] {
+            let mut tx = connection.begin().await?;
+            sqlx::query(&format!("SET LOCAL ROLE {role}"))
+                .execute(&mut *tx)
+                .await?;
+            let error = LOWER_DEADLOCK_TIMEOUT
+                .scope(
+                    lower,
+                    lock_within_attempt(
+                        &mut tx,
+                        "LOCK TABLE qbit_prism_templates IN ACCESS EXCLUSIVE MODE",
+                        Locking::Migrations(vec![27]),
+                        vec!["qbit_prism_templates"],
+                        "the test's request".to_owned(),
+                    ),
+                )
+                .await
+                .err()
+                .context("the role locked a table it has no privilege on")?;
+            tx.rollback().await?;
+            outcomes.push(error);
+        }
+        connection.close().await?;
+        Ok::<_, anyhow::Error>(outcomes)
+    }
+    .await;
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&db.admin)
+        .await?;
+    let outcomes = tried?;
+    ensure!(
+        outcomes[0].downcast_ref::<CannotLower>().is_some(),
+        "a refused lowered SET was not CannotLower: {:#}",
+        outcomes[0]
+    );
+    ensure!(
+        outcomes[1].downcast_ref::<CannotLower>().is_none()
+            && outcomes[1].downcast_ref::<LockContention>().is_none()
+            && format!("{:#}", outcomes[1]).starts_with("the test's request: "),
+        "{:#}",
+        outcomes[1]
+    );
+    Ok(())
+}
+
+/// Where the run lowers `deadlock_timeout` (`LOWER_DEADLOCK_TIMEOUT`), the
+/// request itself is checked for a deadlock after `DEADLOCK_CHECK`, with no
+/// lowering of its own, so the same cycle is broken within the attempt by
+/// aborting it, which is contention. A request that takes its tables
+/// leaves the transaction's `deadlock_timeout` as it found it, so nothing
+/// after the up-front locks runs under the lowered one.
+#[tokio::test]
+async fn a_lowered_deadlock_timeout_holds_for_the_lock_request_only() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = lowered_for_the_request(&db).await;
+    finish(db, result).await
+}
+
+async fn lowered_for_the_request(db: &Database) -> Result<()> {
+    deadlock_is_contention(db, true).await?;
+    let mut migrate = PgConnection::connect(&db.url).await?;
+    let mut tx = migrate.begin().await?;
+    let before: String = sqlx::query_scalar("SELECT current_setting('deadlock_timeout')")
+        .fetch_one(&mut *tx)
+        .await?;
+    LOWER_DEADLOCK_TIMEOUT
+        .scope(
+            true,
+            lock_within_attempt(
+                &mut tx,
+                "LOCK TABLE deadlock_first, deadlock_second IN ACCESS EXCLUSIVE MODE",
+                Locking::Migrations(vec![27]),
+                vec!["deadlock_first", "deadlock_second"],
+                "the test's request".to_owned(),
+            ),
+        )
+        .await?;
+    let after: String = sqlx::query_scalar("SELECT current_setting('deadlock_timeout')")
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.rollback().await?;
+    migrate.close().await?;
+    ensure!(
+        before == after && after != format!("{}ms", DEADLOCK_CHECK.as_millis()),
+        "deadlock_timeout {before} before the request, {after} after it"
+    );
+    Ok(())
+}
+
+/// The cycle above, the request's deadlock check due after 80 ms of its
+/// own, or after `DEADLOCK_CHECK` where the run lowers it (`lowered`).
+async fn deadlock_is_contention(db: &Database, lowered: bool) -> Result<()> {
     sqlx::raw_sql("CREATE TABLE deadlock_first(x int); CREATE TABLE deadlock_second(x int)")
         .execute(&db.ledger.pool)
         .await?;
@@ -493,15 +624,20 @@ async fn deadlock_is_contention(db: &Database) -> Result<()> {
         .await?;
     let mut migrate = PgConnection::connect(&db.url).await?;
     let mut tx = migrate.begin().await?;
-    sqlx::query("SET LOCAL deadlock_timeout = '80ms'")
-        .execute(&mut *tx)
-        .await?;
-    let request = lock_within_attempt(
-        &mut tx,
-        "LOCK TABLE deadlock_first, deadlock_second IN ACCESS EXCLUSIVE MODE",
-        Locking::Migrations(vec![27]),
-        vec!["deadlock_first", "deadlock_second"],
-        "the test's request".to_owned(),
+    if !lowered {
+        sqlx::query("SET LOCAL deadlock_timeout = '80ms'")
+            .execute(&mut *tx)
+            .await?;
+    }
+    let request = LOWER_DEADLOCK_TIMEOUT.scope(
+        lowered,
+        lock_within_attempt(
+            &mut tx,
+            "LOCK TABLE deadlock_first, deadlock_second IN ACCESS EXCLUSIVE MODE",
+            Locking::Migrations(vec![27]),
+            vec!["deadlock_first", "deadlock_second"],
+            "the test's request".to_owned(),
+        ),
     );
     let reader_side = async {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -541,4 +677,346 @@ async fn deadlock_is_contention(db: &Database) -> Result<()> {
     migrate.close().await?;
     reader.close().await?;
     Ok(())
+}
+
+/// A PostgreSQL of the test's own, from `PRISM_TEST_PG_BIN_DIR`, whose
+/// autovacuum visits the database every second but, by its thresholds,
+/// processes no table that does not lower them itself: so the one pass a
+/// test starts is the only one. (`autovacuum = off` would not do: a table's
+/// own `autovacuum_enabled` can only turn it off.) Like `cutover_rehearsal`'s cluster it listens on
+/// loopback TCP only, with no Unix socket, and every role logs in with a
+/// random password, so a shared host's other users cannot reach it;
+/// stopped when dropped, even after a start that failed half way.
+struct Cluster {
+    bin: PathBuf,
+    dir: tempfile::TempDir,
+    port: u16,
+    password: String,
+    running: bool,
+}
+
+impl Cluster {
+    /// The bootstrap superuser.
+    const SUPERUSER: &'static str = "prism";
+
+    fn start(bin: String) -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        let password = uuid::Uuid::new_v4().simple().to_string();
+        let password_file = dir.path().join("password");
+        std::fs::write(&password_file, &password)?;
+        // Held until `pg_ctl start`, so initdb's run cannot lose it (#639).
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut cluster = Self {
+            bin: bin.into(),
+            port: reservation.local_addr()?.port(),
+            dir,
+            password,
+            running: false,
+        };
+        let status = Command::new(cluster.bin.join("initdb"))
+            .args(["-U", Self::SUPERUSER, "--auth=scram-sha-256", "-E", "UTF8"])
+            .arg(format!("--pwfile={}", password_file.display()))
+            .arg("-D")
+            .arg(cluster.dir.path().join("data"))
+            .stdout(Stdio::null())
+            .status()?;
+        std::fs::remove_file(&password_file)?;
+        ensure!(status.success(), "initdb failed");
+        // Marked first, so a start that fails half way is still stopped.
+        cluster.running = true;
+        drop(reservation);
+        let status = Command::new(cluster.bin.join("pg_ctl"))
+            .arg("-D")
+            .arg(cluster.dir.path().join("data"))
+            .arg("-l")
+            .arg(cluster.dir.path().join("postgres.log"))
+            .arg("-o")
+            .arg(format!(
+                "-p {} -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c autovacuum_naptime=1s \
+                 -c autovacuum_vacuum_threshold=2000000000 -c autovacuum_vacuum_insert_threshold=2000000000 \
+                 -c autovacuum_analyze_threshold=2000000000",
+                cluster.port
+            ))
+            .args(["-w", "start"])
+            .stdout(Stdio::null())
+            .status()?;
+        ensure!(
+            status.success(),
+            "pg_ctl start on 127.0.0.1:{} failed: {}",
+            cluster.port,
+            cluster.server_log().unwrap_or_default()
+        );
+        Ok(cluster)
+    }
+
+    /// `role`'s URL; every role this test creates has the cluster's password.
+    fn url(&self, role: &str) -> String {
+        format!(
+            "postgresql://{role}:{}@127.0.0.1:{}/postgres",
+            self.password, self.port
+        )
+    }
+
+    fn server_log(&self) -> Result<String> {
+        Ok(std::fs::read_to_string(
+            self.dir.path().join("postgres.log"),
+        )?)
+    }
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        if self.running {
+            let _ = Command::new(self.bin.join("pg_ctl"))
+                .arg("-D")
+                .arg(self.dir.path().join("data"))
+                .args(["-m", "immediate", "-w", "stop"])
+                .stdout(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// An autovacuum pass holding a share ledger partition, on a ledger in
+/// rc.6's schema that `migrator` owns: no superuser, no reader of other
+/// roles' activity, and no `SET` on `deadlock_timeout`. The worker's pid and
+/// the partition.
+struct Pass {
+    db: Database,
+    /// The cluster's superuser, in the ledger's schema.
+    superuser: PgPool,
+    pid: i32,
+    partition: String,
+    oid: sqlx::postgres::types::Oid,
+}
+
+impl Pass {
+    /// Rows go into a share ledger partition, which is then, alone in the
+    /// cluster, vacuumed after any insert, one page per 100 ms, so the pass
+    /// lasts minutes, idle nearly all of it. Once its worker holds the
+    /// partition, autovacuum is turned off: that pass runs on, and no other
+    /// starts.
+    async fn start(cluster: &Cluster) -> Result<Self> {
+        let root = PgPool::connect(&cluster.url(Cluster::SUPERUSER)).await?;
+        sqlx::raw_sql(&format!(
+            "CREATE ROLE migrator LOGIN PASSWORD '{}'; GRANT CREATE ON DATABASE postgres TO migrator",
+            cluster.password
+        ))
+        .execute(&root)
+        .await?;
+        let db = Database::open_at(&cluster.url("migrator")).await?;
+        sqlx::query(
+            "INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,accepted,writer_id,writer_epoch) \
+             SELECT 'autovacuum:'||g,'miner','miner',decode(repeat('11',32),'hex'),1,1,1,'job',to_timestamp(1),1,to_timestamp(2),true,'fixture',0 \
+             FROM generate_series(1,20000) g",
+        )
+        .execute(&db.ledger.pool)
+        .await?;
+        let partitions: Vec<(sqlx::postgres::types::Oid, String)> = sqlx::query_as(
+            "SELECT DISTINCT tableoid,tableoid::regclass::text FROM qbit_share_ledger",
+        )
+        .fetch_all(&db.ledger.pool)
+        .await?;
+        let [(oid, partition)] = &partitions[..] else {
+            bail!("the rows went into {partitions:?}, not one partition");
+        };
+        let (oid, partition) = (*oid, partition.clone());
+        sqlx::query(&format!(
+            "ALTER TABLE {partition} SET (autovacuum_vacuum_insert_threshold = 1, autovacuum_vacuum_insert_scale_factor = 0, \
+                 autovacuum_vacuum_cost_delay = 100, autovacuum_vacuum_cost_limit = 1)"
+        ))
+        .execute(&db.ledger.pool)
+        .await?;
+        let pid = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let found: Option<i32> = sqlx::query_scalar(
+                    "SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid \
+                     WHERE a.backend_type='autovacuum worker' AND l.locktype='relation' AND l.granted AND l.relation=$1",
+                )
+                .bind(oid)
+                .fetch_optional(&root)
+                .await?;
+                if let Some(found) = found {
+                    break Ok::<_, anyhow::Error>(found);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("no autovacuum worker took {partition} within 60 s"))??;
+        sqlx::query("ALTER SYSTEM SET autovacuum = off")
+            .execute(&root)
+            .await?;
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&root)
+            .await?;
+        root.close().await;
+        let superuser =
+            PgPool::connect(&in_schema(&cluster.url(Cluster::SUPERUSER), &db.schema)?).await?;
+        Ok(Self {
+            db,
+            superuser,
+            pid,
+            partition,
+            oid,
+        })
+    }
+
+    /// Whether the worker still holds the partition: a cancelled pass
+    /// leaves it, though the worker goes on with the rest of its list.
+    async fn holding(&self) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='relation' AND relation=$2 AND granted)",
+        )
+        .bind(self.pid)
+        .bind(self.oid)
+        .fetch_one(&self.superuser)
+        .await?)
+    }
+
+    /// The migrate on `pool`, its deadline `budget`, logged to `log`.
+    async fn migrate(pool: &PgPool, budget: Duration, log: &SharedLog) -> Result<()> {
+        committed_within(
+            pool,
+            "table-locks-autovacuum",
+            ShareHashBackfill::Initialize,
+            None,
+            budget,
+        )
+        .with_subscriber(log.dispatch())
+        .await
+        .map(drop)
+    }
+
+    /// After a migrate that took the tables: the worker no longer holds the
+    /// partition, PostgreSQL logged the cancel it sent from the migrate's
+    /// deadlock check, and 27 and 28 are recorded.
+    async fn cancelled(&self, cluster: &Cluster) -> Result<()> {
+        ensure!(!self.holding().await?, "the pass outlived the migrate");
+        let server = cluster.server_log()?;
+        ensure!(
+            server.contains("canceling autovacuum task"),
+            "PostgreSQL logged no cancelled autovacuum task: {server}"
+        );
+        let versions = self.db.versions().await?;
+        ensure!(
+            versions.contains(&27) && versions.contains(&28),
+            "{versions:?}"
+        );
+        Ok(())
+    }
+
+    /// The cluster goes with the schema, so nothing is dropped.
+    async fn close(self) {
+        self.superuser.close().await;
+        self.db.ledger.pool.close().await;
+        self.db.admin.close().await;
+    }
+}
+
+/// An autovacuum pass holding a share ledger partition, which no 100 ms
+/// attempt waits long enough for PostgreSQL's 1 s deadlock check to cancel,
+/// so every attempt used to give up on it until the deadline: a superuser's
+/// migrate lowers its own `deadlock_timeout`, PostgreSQL cancels the pass
+/// from the second attempt's deadlock check, and 27 and 28 are applied.
+#[tokio::test]
+async fn the_migrate_cancels_an_autovacuum_pass_holding_a_share_ledger_partition() -> Result<()> {
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    let cluster = Cluster::start(bin)?;
+    let pass = Pass::start(&cluster).await?;
+    let result = cancelled_by_the_migrate(&cluster, &pass).await;
+    pass.close().await;
+    result
+}
+
+async fn cancelled_by_the_migrate(cluster: &Cluster, pass: &Pass) -> Result<()> {
+    ensure!(pass.holding().await?, "the pass ended before the migrate");
+    let log = SharedLog::default();
+    Pass::migrate(&pass.superuser, Duration::from_secs(20), &log)
+        .await
+        .with_context(|| format!("the migrate as a superuser: {}", log.text()))?;
+    ensure!(
+        !log.text().contains("may not lower its deadlock_timeout"),
+        "{}",
+        log.text()
+    );
+    pass.cancelled(cluster).await
+}
+
+/// A role that may not lower `deadlock_timeout` waits the pass out: it is
+/// warned once, naming the worker, keeps trying until its deadline, and is
+/// then refused, with the worker named first, on its partition, though its
+/// query is hidden from the role, and the remedies, the grant first. Nothing is recorded and the
+/// pass runs on. Once the role is granted `SET` on the parameter, the
+/// migrate takes the tables as a superuser's does.
+#[tokio::test]
+async fn an_autovacuum_pass_the_role_may_not_cancel_is_named_in_the_refusal() -> Result<()> {
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    let cluster = Cluster::start(bin)?;
+    let pass = Pass::start(&cluster).await?;
+    let result = named_then_granted(&cluster, &pass).await;
+    pass.close().await;
+    result
+}
+
+async fn named_then_granted(cluster: &Cluster, pass: &Pass) -> Result<()> {
+    let log = SharedLog::default();
+    let error = Pass::migrate(&pass.db.ledger.pool, Duration::from_secs(1), &log)
+        .await
+        .err()
+        .context("the migrate took the tables while the pass held a partition")?;
+    let message = format!("{error:#}");
+    let worker = format!(
+        "autovacuum worker pid {} on {}, its query hidden from this role, so whether it is an anti-wraparound vacuum is unknown",
+        pass.pid, pass.partition
+    );
+    ensure!(
+        message.contains("refusing to wait any longer for the table locks of migration 27, 28")
+            && message.contains(
+                "Nothing was changed: they are not recorded. Holding them now: autovacuum worker pid "
+            )
+            && message.contains(&worker)
+            && message.ends_with(&format!(
+                ". {LOWER_REMEDY}. {AUTOVACUUM_REMEDY}, and migrate again"
+            )),
+        "{message}"
+    );
+    let logs = log.text();
+    ensure!(
+        logs.matches("an autovacuum worker holds a table the migration must lock")
+            .count()
+            == 1
+            && logs.contains(&format!("{LOWER_REMEDY}. {AUTOVACUUM_REMEDY}"))
+            && logs.contains(&worker),
+        "{message}\n{logs}"
+    );
+    ensure!(pass.holding().await?, "the pass ended: {message}");
+    ensure!(
+        !pass.db.versions().await?.contains(&27),
+        "a refused migrate recorded 27"
+    );
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&pass.superuser)
+        .await?;
+    if version < 150_000 {
+        // No `SET` privilege on a parameter before PostgreSQL 15.
+        return Ok(());
+    }
+    sqlx::query("GRANT SET ON PARAMETER deadlock_timeout TO migrator")
+        .execute(&pass.superuser)
+        .await?;
+    let log = SharedLog::default();
+    Pass::migrate(&pass.db.ledger.pool, Duration::from_secs(20), &log)
+        .await
+        .with_context(|| {
+            format!(
+                "the migrate granted SET on deadlock_timeout: {}",
+                log.text()
+            )
+        })?;
+    pass.cancelled(cluster).await
 }

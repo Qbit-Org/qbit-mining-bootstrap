@@ -2955,10 +2955,12 @@ matching the [3.0.0 release notes](../doc/release-notes-3.0.0.md#migration-and-r
    Nothing else runs against the isolated restore, so `--offline-indexes`
    builds 013's, 024's and 031's indexes with a plain `CREATE INDEX`
    ([migration 013](prism-rust-migration.md#migration-013-the-share-ledger-index-trim-applied-online)).
-   If import stops on a legacy body with `audit body ref hash mismatch`
-   because a range's shares carry non-ASCII text,
+   With a release before 3.1.1, if import stops on a legacy body with
+   `audit body ref hash mismatch` because a range's shares carry non-ASCII
+   text,
    [prove it and write its sidecar](prism-rust-migration.md#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709),
-   then rerun import. Repeat the export as
+   then rerun import; 3.1.1's import verifies such a body as it is. Repeat
+   the export as
    `migrated.rows.jsonl`/`migrated.summary.json` and require
    `cmp source.summary.json migrated.summary.json` to pass. Both import
    completeness counts must be zero. Native snapshot-backed audits count as

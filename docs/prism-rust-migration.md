@@ -714,13 +714,26 @@ it runs, as they do during the 3.1 pre-migrate, so `migrate` first locks every
 table 027 and 028 alter, the share ledger's partitions included, in one
 statement that waits at most 100 ms in all, and only then runs the two files:
 catalog changes, three small index builds and 028's check, then the commit.
+From 3.1.1 the same transaction also creates 032's two functions. On a
+database already at 028, `migrate` takes only the migration history's lock up
+front, within the same 100 ms bound, and applies 032 alone.
 The statement takes the tables in order and keeps those it has while it waits
-for the next, but for those 100 ms at most, so a frontend statement waits
-behind it at most that long, well under PostgreSQL's 1 s `deadlock_timeout`
-and the 500 ms lock timeout of rc.6's metrics collector, and the migration
-gives up any lock cycle with a frontend within it, long before PostgreSQL
-would break the cycle by aborting one side (#789). That holds only while the
-bound stays well under `deadlock_timeout` and every frontend lock timeout. The migration history's lock, which every migration transaction takes
+for the next, but for those 100 ms at most, so a frontend statement on the
+primary waits behind it at most that long, well under PostgreSQL's 1 s
+`deadlock_timeout` and the 500 ms lock timeout of rc.6's metrics collector,
+and the migration gives up any lock cycle with a frontend within it, long
+before PostgreSQL would break the cycle by aborting one side (#789). That
+holds only while the bound stays well under `deadlock_timeout` and every
+frontend lock timeout, and only on the primary. Each attempt that takes some
+of its ACCESS EXCLUSIVE locks before it gives up writes them to the WAL, and
+a hot standby replays them: while a contended pre-migrate retries, a reader
+on a hot standby, the public-read replica `prism-public-api` reads included,
+can stall for up to that standby's `max_standby_streaming_delay` at each
+retry, not 100 ms, or be cancelled with `canceling statement due to conflict
+with recovery`, and a primary that waits for a standby's apply
+(`synchronous_commit = remote_apply`) waits for that replay too. Run the
+pre-migrate while public traffic is low, or point the public API at the
+primary for the window. The migration history's lock, which every migration transaction takes
 first and a starting frontend's read waits for, is taken within the same
 100 ms. Because every table is locked first, the share ledger and
 `qbit_prism_share_hashes`, which 027 alters last, are held from the start of
@@ -734,11 +747,50 @@ runs of the R1 pre-migrate scenario 027 and 028 committed 372 and 558 ms after
 answer. If a transaction holds the history or one of the tables past those
 100 ms, or
 PostgreSQL aborts the request as a deadlock (possible only with a
-`deadlock_timeout` below 100 ms), the attempt gives up, the whole migration
+`deadlock_timeout` below 100 ms, as the migrate's own is where it may lower
+it, below), the attempt gives up, the whole migration
 transaction rolls back, holding nothing, and `migrate` tries again from the
 start after a backoff of 100 ms doubling to 2 s, for up to ten minutes.
 Nothing is recorded before the commit, so each attempt plans afresh from what
-it finds. Every connect that migrates goes through this, a start with
+it finds. Autovacuum may hold one of the tables too, and stopping the frontends doesn't
+stop it: a pass over a share ledger partition, `qbit_prism_share_hashes` or
+`qbit_prism_jobs` can last minutes. PostgreSQL cancels an autovacuum worker
+that blocks a lock request, unless it prevents wraparound, from the waiter's
+deadlock check, which runs once the waiter has waited `deadlock_timeout`
+(1 s): 3.1.0's 027 waited that long and so had the pass cancelled, but no
+100 ms attempt does. So from its second attempt on, `migrate` lowers its
+own `deadlock_timeout` to 50 ms for its two lock requests only, the
+history's and the tables', with their 100 ms timeouts, and restores it
+after each; 027's, 028's and 032's statements run under the session's own.
+PostgreSQL then cancels the worker blocking the request within the attempt,
+logging `canceling autovacuum task` in the server log, and the attempt, or
+else the next, takes the lock. PostgreSQL picks the worker, the one directly
+blocking the request, and never cancels an anti-wraparound vacuum; it needs
+no permission to do so, and the migrate role need not see the worker. The
+setting is the migrate's own, so every frontend keeps its
+`deadlock_timeout`, the 100 ms bound above stays as it is, and no frontend
+is checked for a deadlock, let alone aborted, for a wait on the migrate. A
+real deadlock that the earlier check finds aborts the migrate's own
+request, which is retried like a timeout. With `log_lock_waits` on, each
+request that waits past 50 ms logs the wait. Lowering `deadlock_timeout`
+takes a superuser, or from PostgreSQL 15 a role granted `SET` on it
+(`GRANT SET ON PARAMETER deadlock_timeout TO <role>`). `migrate` asks
+which, in one query, only once its first attempt has met contention, so a
+migrate that takes its locks at once, every frontend start on a migrated
+schema included, asks nothing. If the question fails, `migrate` does not
+lower the timeout and asks again after the next attempt that meets
+contention; if the setting is refused after all (a grant revoked mid-run),
+it runs that attempt again at once without it and lowers it no more. A
+role that may not waits a blocking pass out, attempt by attempt, as
+before, and warns `an autovacuum worker holds a table the migration must
+lock. This role may not lower its deadlock_timeout`, naming the worker,
+only once it sees one among the holders (`Whether this role may lower its
+deadlock_timeout could not be checked` where it could not ask); contention
+with client transactions alone warns nothing about the privilege. To check
+the migrate role beforehand, run `SELECT rolsuper FROM pg_roles WHERE
+rolname = current_user` or, from PostgreSQL 15, `SELECT
+has_parameter_privilege('deadlock_timeout', 'SET')` as that role.
+Every connect that migrates goes through this, a start with
 `PRISM_POSTGRES_INIT_SCHEMA=1` included, and on a fully migrated database too,
 since each takes the history's lock: a start that could not take it used to
 fail after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s), and now tries again for up
@@ -752,7 +804,19 @@ transactions from `pg_locks` and `pg_stat_activity`, longest open first, each
 once with the tables it holds (a partition's lock counted as its table's), or
 with `the table locks of the migration history` and
 `qbit_prism_schema_migrations` when the history was held: end those
-transactions, or stop the frontends, and migrate again. Its three indexes are
+transactions, or stop the frontends, and migrate again. It names
+autovacuum workers first, each as `autovacuum worker pid <pid> on <table>:
+<query>`, the partition by its own name, or with `its query hidden from this
+role, so whether it is an anti-wraparound vacuum is unknown` where the role
+lacks `pg_read_all_stats`. For a worker, grant the migrate role `SET` on
+`deadlock_timeout` or migrate as a superuser, if the refusal says the role
+may not lower it; or an administrator runs `SELECT pg_cancel_backend(<pid>)`,
+which takes a superuser since CVE-2023-5870's fix in 16.1, 15.5 and 14.10
+(`pg_signal_backend` sufficed before it), or from PostgreSQL 18 a member of
+`pg_signal_autovacuum_worker`; or keeps autovacuum off that table with `ALTER
+TABLE <table> SET (autovacuum_enabled = off)` until the migrate is done, then
+`ALTER TABLE <table> RESET (autovacuum_enabled)`. An anti-wraparound vacuum
+comes back however it is stopped, so let it finish, and migrate again. Its three indexes are
 small: two are partial, over rows written after 027 only, and the third is
 `qbit_prism_jobs (origin_node, expires_at)` for the dual-mode expiry prune,
 built in the transaction over a table the expiry prune keeps to its unexpired
@@ -827,9 +891,10 @@ without a shared filesystem.
 it does **not** rewrite an absolute URI to a different root. Mount old absolute
 paths at their recorded locations. Keep referenced segment paths readable as
 well. Import failure is a reason to repair the missing/corrupt artifact before
-continuing; a matching hash without recoverable bytes is insufficient. A legacy
-body that fails only because a range digest was written as escaped JSON is
-intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
+continuing; a matching hash without recoverable bytes is insufficient. From
+3.1.1, import verifies the two kinds of legacy body below as they are (#709,
+#731). With an earlier release, a legacy body that fails only because a range
+digest was written as escaped JSON is intact; [prove it and write its sidecar](#legacy-bodies-whose-range-digests-use-pythons-escaped-json-709).
 So is a 2.x v2 body that fails with `window proof share_parts_digest_hex
 mismatch`; [list those rows and write their sidecars](#2x-v2-bodies-whose-window-proof-parts-digest-3x-recomputes-differently-731).
 
@@ -845,6 +910,10 @@ and never overwrites a running frontend's row. `self-check` and `broadcast-ctv`
 behave the same way.
 
 ### Legacy bodies whose range digests use Python's escaped JSON (#709)
+
+**From 3.1.1 this procedure isn't needed:** 3.1.1's `import-audits`
+verifies these bodies as they are. It describes import with an earlier
+release.
 
 `1.x` and `2.x` hashed each `segment_range` and `segment_prefix` share part
 over Python's `json.dumps`, which writes non-ASCII text as `\uXXXX` escapes;
@@ -910,6 +979,14 @@ form is still refused.
 
 ### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
 
+**From 3.1.1 this procedure isn't needed:** 3.1.1's `import-audits`
+verifies these bodies as they are, so run it directly. The checker still
+reports for a release without the fix: with 3.1.1 it counts a
+`2x-order-only` row in `import_refuses`, and exits 3, although import accepts
+the row. If you run it anyway, read its `totals`: any other status that
+stops it still needs the action below. The procedure describes import with an
+earlier release.
+
 2.x wrote each audit-bundle.v2 body's `share_parts_digest_hex` over its share
 parts in insertion order; 3.x recomputes it with sorted keys. 3.x therefore
 refuses every such body, and `import-audits` stops on the first one with
@@ -951,7 +1028,8 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   `body-missing`, `body-unreadable` or `body-digest-differs` evidence instead.
   It checks nothing else: a body-ref or plain bundle is `no-window-proof`, and
   rows that import refuses for other reasons, such as the escaped range
-  digests above, need the previous section's classification run.
+  digests above with a release before 3.1.1, need the previous section's
+  classification run.
 - The runner splits the rows round robin into shards, each with its own CSV,
   work directory and report, and runs the tool with `--write` on each. Its
   last argument is the number of shards, 8 by default. The output directory
@@ -2660,7 +2738,7 @@ the commands' own sessions (`application_name=prism-cutover-rehearsal`). A
 hold is continuous: a lock released and taken again counts as two holds. A
 hold shorter than one interval shows as 0 ms, and a very short one can be
 missed. `migrate` is split by what it was running: the migration transaction
-(`001` and native `002` to `023`, and `025` to `028`), 002's share-hash backfill, 013's, 024's
+(`001` and native `002` to `023`, `025` to `028`, and `032`), 002's share-hash backfill, 013's, 024's
 and 031's concurrent index builds, 031's parent index and leaf attachments, and 017's prepare,
 validate and swap. The transaction holds the
 cutover locks, ACCESS EXCLUSIVE on `qbit_share_ledger` among them, for its
