@@ -1,7 +1,7 @@
 # qbit-mining-bootstrap 3.1.1 Release Notes
 
-Release date: not yet set. The tag will be `v3.1.1`, cut from the `3.x.x`
-branch.
+Release date: 2026-10-29. Prepared on `3.x.x` (#810, then #818 to #821)
+and tagged `v3.1.1` on its promotion into `main`.
 
 3.1.1 is a patch release of [3.1.0](release-notes-3.1.0.md): fixes only, with
 no new feature. Its one new setting is for a `self-check` run, not a frontend
@@ -97,7 +97,7 @@ changes below.
 
 ### Migration runner
 
-- **#791 (#789):** 3.1's `migrate` can no longer deadlock with frontends that
+- **#791 and #821 (#789):** 3.1's `migrate` can no longer deadlock with frontends that
   serve the database while 027 and 028 run, as rc.6 frontends do during the
   pre-migrate from 3.0. It locks every table 027 and 028 alter in one
   statement that waits at most 100 ms, and on a timeout or deadlock rolls the
@@ -132,7 +132,7 @@ changes below.
   directory, and `lab/prism/Dockerfile` copies it, so a build from the tag
   needs `vendor/`. CI checks that both lockfiles build the vendored crate
   and that every sqlx-core RustSec advisory is reviewed.
-- **#807 (#713):** `sslmode=verify-ca` behaves as libpq's `verify-ca` does.
+- **#807 and #818 (#713):** `sslmode=verify-ca` behaves as libpq's `verify-ca` does.
   It checks the server's certificate chain against the root certificates in
   `sslrootcert` (or `PGSSLROOTCERT`) only, never against the public roots,
   and it does not check the host name. So it accepts a certificate your CA
@@ -197,7 +197,7 @@ changes below.
 - **#793 (#757):** five native alert rule UIDs are shortened to Grafana's
   40-character limit ([Alert rules](#alert-rules)). CI rejects any UID that
   is too long, has other characters or is duplicated.
-- **#800 (#758):** `PrismAcceptedRevisionWorkPending` and
+- **#800 and #820 (#758):** `PrismAcceptedRevisionWorkPending` and
   `PrismAcceptedRevisionWorkTrackingUnknown` count only on a frontend that
   had an authorized miner in the last 15 minutes, so an idle backup frontend
   no longer warns after every pool block. On the server, a frontend no
@@ -517,9 +517,9 @@ changes.
 
 **Fixed in 3.1.1:**
 - #716 by #788, and with it #724's last intermittent answer;
-- #771 by #794, and #713 by #807;
+- #771 by #794, and #713 by #807 and #818;
 - #762 by #797, and #630 by #798;
-- #757 by #793, and #758 by #800;
+- #757 by #793, and #758 by #800 and #820;
 - #752 by #795;
 - #738 by #801, and #711 by #802;
 - #709 and #731 by #809;
@@ -527,7 +527,8 @@ changes.
 - the block-proof acknowledgement bound's dropped pooled connection, by
   main's #781 through #786.
 
-3.1.1 also fixes #733 (#806), #735 (#796), #785 (#799) and #789 (#791).
+3.1.1 also fixes #733 (#806), #735 (#796), #785 (#799) and #789 (#791,
+#821).
 
 **Still open:**
 - **#779, the L3 matrix on 3.0.0's tree:** the

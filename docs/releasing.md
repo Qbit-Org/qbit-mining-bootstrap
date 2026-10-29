@@ -47,6 +47,15 @@ itself (#782) but not the poll change, since it changed no runtime code after
 its release candidate. It adds no tag. #779 records the 400k two-frontend L3
 failures on 3.0.0's tree; 3.1.0 doesn't fix their cause, #716.
 
+3.1.1, a patch release of 3.1.0, was prepared on `3.x.x` (#810, `60309f95`)
+and is tagged on the promoted `main` commit, as this guide's default is: its
+notes were undated at #810's squash. The promotion's review led to #818 to
+#821 on `3.x.x`, and the promotion takes `3.x.x` after them (`987027fe`) as
+its cutoff. `3.x.x` already carried everything `main` had, since #786
+merged 3.1.0's promotion back, so the promotion gives `main` `3.x.x`'s tree
+at `987027fe` plus the release date, the fix PRs' numbers in the notes and
+this record.
+
 Merge the intended development cutoff into the promotion branch and retain
 fixes already made during promotion review. The repository allows only squash
 and rebase merges, so the promotion lands on `main` as one squashed commit. Check package versions together,
@@ -113,6 +122,11 @@ not take the 3.1 dual writer. Both branches gain this guide, the README banner
 and #781's disposition-poll change. `3.0.x` also gains #781's tokio update,
 and `3.x.x` the released 3.0.0 notes in place of its pre-release copy. The
 next release from either branch must not drop them.
+
+For 3.1.1 this step merges the released `main` back into `3.x.x`. It brings
+only the promotion's edits: the release date and the fix PRs' numbers in the
+3.1.1 notes, and this guide's 3.1.1 record. `3.0.x` takes nothing from it, since 3.1.1 is a 3.1
+release.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization
