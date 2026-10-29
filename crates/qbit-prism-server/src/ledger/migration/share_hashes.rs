@@ -658,13 +658,6 @@ fn next_batch(rows: i64, took: Duration) -> i64 {
     }
 }
 
-/// Whether a statement was cancelled by the statement timeout. An
-/// operator's cancel request carries the same SQLSTATE and another message,
-/// and still stops the run.
-fn statement_timed_out(error: &dyn sqlx::error::DatabaseError) -> bool {
-    error.code().as_deref() == Some("57014") && error.message().contains("statement timeout")
-}
-
 /// What a run of batches maps, and whether it moves the cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pass {

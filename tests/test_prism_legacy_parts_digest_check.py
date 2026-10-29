@@ -42,11 +42,12 @@ CANONICALIZE_BIN = os.environ.get("PRISM_AUDIT_CANONICALIZE_BIN", "")
 GNU_COREUTILS = shutil.which("split") is not None and subprocess.run(
     ["split", "--version"], capture_output=True).returncode == 0
 
-# The 3.x canonicalizer's contract, for the shapes these tests write: refuse a
-# v2 body whose parts digest is not the sorted-key form 3.x recomputes, resolve
-# the share parts, check each range digest as serde_json writes it, require
-# sha256(canonical bundle) == audit_bundle_sha256, and print the canonical
-# bytes. Its canonical form is the bundle as compact JSON.
+# The contract of a 3.x canonicalizer without #731's fix, for the shapes these
+# tests write: refuse a v2 body whose parts digest is not the sorted-key form
+# it recomputes, resolve the share parts, check each range digest as
+# serde_json writes it, require sha256(canonical bundle) ==
+# audit_bundle_sha256, and print the canonical bytes. Its canonical form is
+# the bundle as compact JSON.
 STUB = textwrap.dedent("""\
     import hashlib, json, sys
     from pathlib import Path
@@ -409,7 +410,7 @@ class PartsDigestCheckTests(unittest.TestCase):
 @unittest.skipUnless(GNU_COREUTILS, "the sharded runner needs GNU coreutils")
 class ShardedRunnerTests(unittest.TestCase):
     """prism_legacy_range_sidecars_sharded.sh over the sidecar tool, with a
-    canonicalizer stub that refuses 2.x's parts digest as 3.x does."""
+    canonicalizer stub that refuses 2.x's parts digest as 3.x did before #731."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -483,8 +484,9 @@ class ShardedRunnerTests(unittest.TestCase):
 @unittest.skipUnless(CANONICALIZE_BIN, "set PRISM_AUDIT_CANONICALIZE_BIN, as "
                      "`make test-prism-legacy-range-sidecars` does")
 class RealCanonicalizerTests(unittest.TestCase):
-    """The real 3.x canonicalizer against a body 2.x's own writer produced
-    (tests/fixtures/prism-legacy-v2-audit-body)."""
+    """The real 3.x canonicalizer, which has #731's fix, against a body 2.x's
+    own writer produced (tests/fixtures/prism-legacy-v2-audit-body). The
+    checker's statuses are those of a release without the fix."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -497,24 +499,28 @@ class RealCanonicalizerTests(unittest.TestCase):
     def canonicalize(self, path):
         return subprocess.run([CANONICALIZE_BIN, "--input", str(path)], capture_output=True)
 
-    def test_the_canonicalizer_refuses_exactly_what_the_checker_lists(self):
+    def test_the_canonicalizer_accepts_the_parts_digest_2x_wrote(self):
         proof = self.body["share_window_proof"]
         # The checker's 2.x form reproduces the digest 2.x's writer stored.
         self.assertEqual(module.digest_2x(proof["share_parts"]), proof["share_parts_digest_hex"])
         code, [row], _ = run_checker([self.fixture_body])
         self.assertEqual((code, row["status"]), (3, "2x-order-only"))
-        refused = self.canonicalize(self.fixture_body)
-        self.assertNotEqual(refused.returncode, 0)
-        self.assertIn(b"window proof share_parts_digest_hex mismatch", refused.stderr)
+        # The canonicalizer passes the parts digest and goes on to read the
+        # slots, which the body names by production paths absent here.
+        unresolved = self.canonicalize(self.fixture_body)
+        self.assertNotEqual(unresolved.returncode, 0)
+        self.assertIn(b"failed to read audit artifact", unresolved.stderr)
 
-        # With the slots beside the body, the digest's form alone decides.
+        # With the slots beside the body, the digest's form alone decides:
+        # 2.x's is accepted, and the sorted-key form, which no writer produced,
+        # is refused.
         for path in FIXTURE.glob("prism-audit-share-segment-*.json"):
             shutil.copy(path, self.dir / path.name)
         for part in proof["share_parts"]:
             part["body_uri"] = Path(part["body_uri"]).name
         body = self.dir / "body.json"
-        for digest, status, accepted in ((module.digest_2x, "2x-order-only", False),
-                                         (module.digest_3x, "ok-in-3x", True)):
+        for digest, status, accepted in ((module.digest_2x, "2x-order-only", True),
+                                         (module.digest_3x, "ok-in-3x", False)):
             with self.subTest(status=status):
                 proof["share_parts_digest_hex"] = digest(proof["share_parts"])
                 body.write_bytes(compact(self.body))

@@ -265,7 +265,8 @@ lanes do.
   frontend restarts with 31 unrecorded and the index invalid, and warns of
   27 and 28. Once the reader ends: 31 ready and the index valid on the writer
   and on the standby; B restarts at 31; a last landing; rc.6's rows take 027's
-  defaults; no frontend statement cancelled; the checker's invariants.
+  defaults; from the migrate's start, no frontend statement cancelled or
+  aborted as a deadlock (#789); the checker's invariants.
 - **p0** (`r01_the_premigrate_never_rewrites_…`, `src/premigrate.rs`): no
   frontend, one cluster that logs every statement with autovacuum off. rc.6
   migrates it, 300,000 synthetic rows fill p0, and an appender appends as a

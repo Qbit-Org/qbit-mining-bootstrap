@@ -98,6 +98,7 @@ async fn late_commit_observer_uses_actual_delivery_clock_and_event_order() {
         let m = Metrics::default();
         let hash = "11".repeat(32);
         m.accepted_block(&hash, 1);
+        let settlement = m.revision_work_settlement(&hash);
         tick().await;
         if delivered_first {
             m.revision_work_delivered(1);
@@ -108,7 +109,7 @@ async fn late_commit_observer_uses_actual_delivery_clock_and_event_order() {
         if !delivered_first {
             m.revision_work_delivered(2);
         }
-        m.landed_block(&hash, 1);
+        settlement.committed(true, 0, 1);
         assert_eq!(count(&m, "published"), f64::from(delivered_first));
         assert_eq!(count(&m, "superseded"), f64::from(!delivered_first));
         assert_eq!(age(&m), 0.);
@@ -270,11 +271,11 @@ async fn concurrent_reconciliation_cannot_steal_inflight_settlement_identity() {
     m.accepted_block(&hash, 1);
     let settlement = m.revision_work_settlement(&hash);
     tick().await;
-    m.revision_work_settlement(&hash).committed(false, 2);
+    m.revision_work_settlement(&hash).committed(false, 2, 2);
     m.revision_work_delivered(2);
     assert_eq!(count(&m, "published"), 0.);
     assert_eq!(count(&m, "superseded"), 0.);
-    settlement.committed(true, 1);
+    settlement.committed(true, 0, 1);
     assert_eq!(count(&m, "superseded"), 1.);
     assert_eq!(age(&m), 0.);
 }
@@ -285,7 +286,7 @@ async fn first_confirmation_wins_even_when_its_observer_started_second() {
     let hash = "11".repeat(32);
     m.accepted_block(&hash, 1);
     let reconciliation = m.revision_work_settlement(&hash);
-    m.revision_work_settlement(&hash).committed(true, 7);
+    m.revision_work_settlement(&hash).committed(true, 6, 7);
     drop(reconciliation);
     tick().await;
     m.revision_work_delivered(7);
@@ -298,14 +299,17 @@ async fn exhausted_revision_history_cannot_publish_an_obsolete_write() {
     for overflow in [false, true] {
         let m = Metrics::default();
         let hash = "11".repeat(32);
+        // Only an observer still out keeps the history its revision may
+        // need, so only it can exhaust that history (#758).
         m.accepted_block(&hash, 1);
-        m.landed_block(&hash, 1);
-        for revision in 2..=LIMIT as i64 {
+        let settlement = m.revision_work_settlement(&hash);
+        for revision in 1..=LIMIT as i64 {
             m.revision_work_observed(revision);
         }
         if overflow {
             m.revision_work_observed(LIMIT as i64 + 1);
         }
+        settlement.committed(true, 0, 1);
         tick().await;
         m.revision_work_delivered(LIMIT as i64);
         assert_eq!(count(&m, "superseded"), f64::from(!overflow));
@@ -384,8 +388,8 @@ async fn proven_orphan_closes_without_delivery_and_keeps_its_deduplication_horiz
 }
 
 #[tokio::test(start_paused = true)]
-async fn lost_settlement_revision_is_unknown_and_only_a_proven_first_confirmation_recovers() {
-    for first in [true, false] {
+async fn lost_settlement_revision_is_unknown_until_a_first_confirmation_or_a_covering_write() {
+    for (first, revision) in [(true, 3), (false, 3), (false, 4)] {
         let m = Metrics::default();
         let hash = "11".repeat(32);
         m.accepted_block(&hash, 1);
@@ -395,9 +399,19 @@ async fn lost_settlement_revision_is_unknown_and_only_a_proven_first_confirmatio
         m.revision_work_delivered(3);
         assert_eq!(age(&m), -1.);
         assert_eq!(count(&m, "published"), 0.);
-        m.revision_work_settlement(&hash).committed(first, 3);
-        assert_eq!(age(&m), if first { 0. } else { -1. });
+        m.revision_work_settlement(&hash)
+            .committed(first, revision - i64::from(first), revision);
+        // Only a proven first confirmation restores the original revision
+        // and its sample. A non-first one proves `revision` covers the
+        // landing, so a write at or above it ends the wait unmeasured (#758).
         assert_eq!(count(&m, "published"), f64::from(first));
+        if revision == 4 {
+            assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+            m.revision_work_delivered(4);
+        }
+        assert_eq!((age(&m), unknown(&m)), (0., 0.));
+        assert_eq!(count(&m, "published"), f64::from(first));
+        assert_eq!(count(&m, "superseded"), 0.);
     }
 }
 
@@ -492,7 +506,7 @@ async fn lost_settlement_reply_does_not_attribute_later_timeouts_to_revision_wor
     assert_eq!(unknown(&m), 1.);
     // A proven first confirmation recovers the attempt. The timed-out build
     // never knew this wait, so the recovered delivery is not degraded either.
-    m.revision_work_settlement(&hash).committed(true, 3);
+    m.revision_work_settlement(&hash).committed(true, 2, 3);
     assert_eq!(age(&m), 1.);
     tick().await;
     m.revision_work_delivered(3);
@@ -551,13 +565,16 @@ async fn unsettled_orphan_saturation_and_lost_ordering_do_not_attribute_timeouts
     build.deadline_hit();
     assert_eq!(timeouts(&m), 0.);
     assert_eq!(age(&m), -1.);
-    // Lost ordering history: the known wait can no longer be resolved.
+    // Lost ordering history: the known wait can no longer be resolved. Only
+    // an observer still out keeps the history that can run out (#758).
     let m = Metrics::default();
     m.accepted_block(&hash, 1);
-    m.landed_block(&hash, 1);
-    for revision in 2..=LIMIT as i64 + 1 {
+    let settlement = m.revision_work_settlement(&hash);
+    for revision in 1..=LIMIT as i64 + 1 {
         m.revision_work_observed(revision);
     }
+    settlement.committed(true, 0, 1);
+    assert!(m.landing.lock().unwrap().ordering_lost);
     assert_eq!(age(&m), -1.);
     let build = m.revision_work_build();
     tick().await;
@@ -579,7 +596,7 @@ async fn recovery_from_unknown_before_the_deadline_attributes_the_timeout() {
     assert_eq!(age(&m), -1.);
     let build = m.revision_work_build(); // Only unknown tracking at the start.
     tick().await;
-    m.revision_work_settlement(&hash).committed(true, 3); // Recovery mid-build.
+    m.revision_work_settlement(&hash).committed(true, 2, 3); // Recovery mid-build.
     assert_eq!(age(&m), 1., "wait is known and open again");
     tick().await;
     build.deadline_hit();
@@ -688,7 +705,7 @@ async fn active_chain_observation_lands_an_accepted_offer_on_its_acceptance_cloc
             assert_eq!(age(&m), -1.);
             assert_eq!(unknown(&m), 1.);
         } else {
-            settlement.committed(true, 3);
+            settlement.committed(true, 2, 3);
             assert_eq!(age(&m), 1.);
             m.revision_work_delivered(3);
             assert_eq!(count(&m, "published"), 1.);
@@ -767,4 +784,397 @@ async fn deadline_attributed_to_a_known_wait_does_not_degrade_an_unlanded_block(
         "the unlanded block was degraded by a deadline that fired before it landed"
     );
     assert_eq!(age(&m), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn waits_no_write_closes_cannot_exhaust_revision_history_and_hide_a_stall() {
+    // An idle backup (#758): a block it lost to a peer, or one it won, stays
+    // open with no miner to write to while the payout revision keeps moving.
+    for lost in [true, false] {
+        let m = Metrics::default();
+        let pinned = "11".repeat(32);
+        m.accepted_block(&pinned, 1);
+        m.revision_work_settlement(&pinned)
+            .committed(!lost, 2 - i64::from(!lost), 2);
+        assert_eq!(unknown(&m), f64::from(lost));
+        for revision in 3..=LIMIT as i64 + 10 {
+            m.revision_work_observed(revision);
+        }
+        let stall = "22".repeat(32);
+        m.accepted_block(&stall, 2);
+        m.revision_work_settlement(&stall).committed(
+            true,
+            LIMIT as i64 + 11 - 1,
+            LIMIT as i64 + 11,
+        );
+        tokio::time::advance(Duration::from_secs(308)).await;
+        assert_eq!(age(&m), 308., "a real stall must still reach the page");
+        let state = m.landing.lock().unwrap();
+        assert!(!state.saturated && !state.ordering_lost);
+        assert_eq!(state.revisions.len(), 1);
+        drop(state);
+        // The first write once a miner connects ends every wait.
+        m.revision_work_delivered(LIMIT as i64 + 11);
+        assert_eq!((age(&m), unknown(&m)), (0., 0.));
+        assert_eq!(count(&m, "published"), 1.);
+        assert_eq!(count(&m, "superseded"), f64::from(!lost));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_frontend_that_loses_every_settlement_race_clears_unknown_at_its_next_write() {
+    // Active-active (#758): a peer settles each block first; this frontend's
+    // own COMMIT follows, and its miners keep receiving work.
+    let m = Metrics::default();
+    for block in 0..20_i64 {
+        let hash = format!("{block:064x}");
+        let covering = 2 * block + 2;
+        m.accepted_block(&hash, block as u64 + 1);
+        tick().await;
+        if block % 2 == 1 {
+            // The write can precede this frontend's COMMIT reply.
+            m.revision_work_delivered(covering);
+            m.revision_work_settlement(&hash)
+                .committed(false, covering, covering);
+        } else {
+            m.revision_work_settlement(&hash)
+                .committed(false, covering, covering);
+            assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+            m.revision_work_observed(covering + 1);
+            m.revision_work_delivered(covering + 1);
+        }
+        assert_eq!((age(&m), unknown(&m)), (0., 0.), "block {block}");
+    }
+    for result in ["published", "degraded", "superseded"] {
+        assert_eq!(
+            count(&m, result),
+            0.,
+            "an unknown first revision was measured"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_covering_revision_waits_for_a_local_first_confirmation_still_in_flight() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    let cancelled = m.revision_work_settlement(&hash);
+    let first = m.revision_work_settlement(&hash);
+    drop(cancelled);
+    m.revision_work_settlement(&hash).committed(false, 5, 5);
+    tick().await;
+    m.revision_work_delivered(5);
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+    // The delayed observer of the first COMMIT restores the exact revision.
+    first.committed(true, 3, 4);
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    assert_eq!(count(&m, "superseded"), 1.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_an_eligible_write_at_the_covering_revision_ends_the_unknown_wait() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    m.revision_work_settlement(&hash).committed(false, 5, 5);
+    tick().await;
+    m.revision_work_delivered(4);
+    m.revision_work_observed(6);
+    tick().await;
+    m.revision_work_delivered(5);
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.), "below or obsolete");
+    {
+        let _orphan = m.revision_work_orphan_settlement(&hash);
+    } // Lost/cancelled orphan COMMIT reply.
+    m.revision_work_delivered(6);
+    assert_eq!(
+        (age(&m), unknown(&m)),
+        (-1., 1.),
+        "orphan verdict unsettled"
+    );
+    m.revision_work_orphaned(&hash);
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    for result in ["published", "degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0.);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_non_owner_settlement_covers_once_the_owner_reply_is_lost() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    let owner = m.revision_work_settlement(&hash);
+    let other = m.revision_work_settlement(&hash);
+    drop(owner);
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+    other.committed(false, 5, 5);
+    tick().await;
+    m.revision_work_delivered(5);
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    for result in ["published", "degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0.);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_confirmed_block_whose_reply_is_lost_is_covered_too() {
+    // A restart first observes the block already confirmed (#493).
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_landed_block(&hash, 1, false);
+    drop(m.revision_work_settlement(&hash));
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+    m.revision_work_settlement(&hash).committed(false, 5, 5);
+    tick().await;
+    m.revision_work_delivered(5);
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    assert_eq!(count(&m, "published"), 0.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_first_confirmation_without_a_bump_is_covered_only_by_a_later_revision() {
+    // The fatal early return commits the landing at revision 5 unbumped, so
+    // work built at 5 may predate it.
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    m.revision_work_observed(5);
+    let fatal = m.revision_work_settlement(&hash);
+    tick().await;
+    m.revision_work_delivered(5);
+    fatal.committed(true, 5, 5);
+    assert_eq!(
+        (age(&m), unknown(&m)),
+        (-1., 1.),
+        "an unbumped revision was measured"
+    );
+    // Not even a later proof at that revision can cover it.
+    m.revision_work_settlement(&hash).committed(false, 5, 5);
+    tick().await;
+    m.revision_work_delivered(5);
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+    m.revision_work_observed(6);
+    m.revision_work_delivered(6);
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    for result in ["published", "degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0.);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unlanded_or_unbound_wait_cannot_exhaust_revision_history() {
+    // An idle frontend whose wait is unlanded (a lost tip race until its
+    // orphan proof) or landed but not yet settled, while tips move (#758).
+    for unlanded in [true, false] {
+        let m = Metrics::default();
+        let pinned = "11".repeat(32);
+        if unlanded {
+            m.accepted_unlanded_block(&pinned, 1);
+        } else {
+            m.accepted_block(&pinned, 1);
+        }
+        for revision in 1..=LIMIT as i64 + 10 {
+            m.revision_work_observed(revision);
+        }
+        {
+            let state = m.landing.lock().unwrap();
+            assert!(!state.saturated && !state.ordering_lost);
+            assert_eq!(state.revisions.len(), 1);
+        }
+        let stall = "22".repeat(32);
+        m.accepted_block(&stall, 2);
+        tokio::time::advance(Duration::from_secs(308)).await;
+        m.revision_work_settlement(&stall)
+            .committed(true, LIMIT as i64 + 10, LIMIT as i64 + 11);
+        assert_eq!(age(&m), 308., "a real stall must still reach the page");
+        m.revision_work_delivered(LIMIT as i64 + 11);
+        assert_eq!(count(&m, "published"), 1.);
+        // The landed wait still awaits its own settlement.
+        assert_eq!(age(&m), if unlanded { 0. } else { 308. });
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_binding_below_released_history_is_covered_not_measured() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    tick().await;
+    m.revision_work_delivered(1);
+    m.revision_work_observed(2);
+    // A first revision bound with no observer out, below released history:
+    // its first write may be gone, so it must not be measured.
+    m.landed_block(&hash, 1);
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+    tick().await;
+    m.revision_work_delivered(2);
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    for result in ["published", "degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0., "a released write was guessed");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_last_observer_out_ends_a_covered_wait_whose_write_was_seen() {
+    let m = Metrics::default();
+    let hash = "11".repeat(32);
+    m.accepted_block(&hash, 1);
+    let owner = m.revision_work_settlement(&hash);
+    let other = m.revision_work_settlement(&hash);
+    owner.committed(false, 5, 5);
+    tick().await;
+    m.revision_work_delivered(5);
+    assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+    drop(other);
+    assert_eq!(
+        (age(&m), unknown(&m)),
+        (0., 0.),
+        "no later event should be needed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_frontend_cannot_exhaust_identities_and_hide_a_stall_after_failover() {
+    // An idle backup (#758) reconciles every pool block with no miner to
+    // write to; each wait stays open until the block is mature. After a
+    // failover the same frontend serves every miner, so its stall must page.
+    const MATURITY: u64 = 100;
+    for miner in [false, true] {
+        let m = Metrics::default();
+        m.revision_work_sessions_tracked();
+        if miner {
+            m.revision_work_session_authorized();
+        }
+        for height in 1..=LIMIT as u64 + 1 {
+            // A peer settled it first; this frontend's settlement binds its
+            // own committed revision (#493).
+            let hash = format!("{height:064x}");
+            let revision = height as i64;
+            m.accepted_landed_block(&hash, height, false);
+            m.revision_work_settlement(&hash)
+                .committed(false, revision, revision);
+            m.revision_work_matured(height.saturating_sub(MATURITY));
+        }
+        {
+            let state = m.landing.lock().unwrap();
+            assert_eq!(state.saturated, miner);
+            let tracked = if miner { LIMIT } else { MATURITY as usize };
+            assert_eq!(state.blocks.len(), tracked);
+        }
+        if !miner {
+            m.revision_work_session_authorized();
+        }
+        m.revision_work_delivered(LIMIT as i64 + 1);
+        let stall = format!("{:064x}", LIMIT + 2);
+        m.accepted_landed_block(&stall, LIMIT as u64 + 2, false);
+        m.revision_work_settlement(&stall)
+            .committed(false, LIMIT as i64 + 2, LIMIT as i64 + 2);
+        tokio::time::advance(Duration::from_secs(308)).await;
+        if miner {
+            // A real stall with a miner connected still saturates, unknown
+            // until restart, as before.
+            assert_eq!((age(&m), unknown(&m)), (-1., 1.));
+        } else {
+            assert_eq!(
+                (age(&m), unknown(&m)),
+                (308., 0.),
+                "idle waits latched saturation and hid the stall from the page"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_mature_checkpoint_retires_only_waits_no_miner_could_have_received() {
+    let m = Metrics::default();
+    // Accepted before the listener tracked sessions: a miner may have been
+    // there.
+    let untracked = "11".repeat(32);
+    m.accepted_block(&untracked, 1);
+    m.landed_block(&untracked, 1);
+    m.revision_work_sessions_tracked();
+    // A miner connected after it and left without its work.
+    let left = "22".repeat(32);
+    m.accepted_block(&left, 1);
+    m.landed_block(&left, 1);
+    m.revision_work_session_authorized();
+    m.revision_work_session_ended();
+    // No miner since: a known wait, a lost settlement reply and an unlanded
+    // acceptance, which no write ends anyway.
+    let idle = "33".repeat(32);
+    m.accepted_block(&idle, 1);
+    m.landed_block(&idle, 1);
+    let lost = "44".repeat(32);
+    m.accepted_block(&lost, 1);
+    drop(m.revision_work_settlement(&lost));
+    let not_landed = "55".repeat(32);
+    m.accepted_unlanded_block(&not_landed, 1);
+    let immature = "66".repeat(32);
+    m.accepted_block(&immature, 2);
+    m.landed_block(&immature, 1);
+    tick().await;
+    assert_eq!((age(&m), unknown(&m)), (1., 1.));
+    m.revision_work_matured(1);
+    assert_eq!((age(&m), unknown(&m)), (1., 0.));
+    assert_eq!(unlanded(&m), 1.);
+    assert_eq!(m.landing.lock().unwrap().blocks.len(), 4);
+    // A retired identity is never recounted, and retirement measured nothing.
+    m.accepted_block(&idle, 1);
+    m.landed_block(&idle, 1);
+    m.revision_work_session_authorized();
+    m.revision_work_delivered(1);
+    assert_eq!(count(&m, "published"), 3.);
+    for result in ["degraded", "superseded"] {
+        assert_eq!(count(&m, result), 0.);
+    }
+    assert_eq!((age(&m), unknown(&m)), (0., 0.));
+    assert_eq!(unlanded(&m), 1.);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_whose_settlement_is_in_flight_retires_only_after_it_reports() {
+    for lost in [false, true] {
+        let m = Metrics::default();
+        m.revision_work_sessions_tracked();
+        let settling = "11".repeat(32);
+        m.accepted_block(&settling, 1);
+        m.revision_work_observed(5);
+        let observer = m.revision_work_settlement(&settling);
+        m.revision_work_observed(6);
+        let open = "22".repeat(32);
+        m.accepted_block(&open, 2);
+        m.landed_block(&open, 7);
+        // The checkpoint passes the block while its COMMIT is in flight.
+        m.revision_work_matured(1);
+        {
+            let state = m.landing.lock().unwrap();
+            assert_eq!(state.blocks.len(), 2, "a settling wait was retired");
+            let history: Vec<_> = state.revisions.keys().copied().collect();
+            assert_eq!(history, [5, 6, 7]);
+        }
+        // Its report still finds the wait, so its evidence counts.
+        if lost {
+            drop(observer);
+        } else {
+            observer.committed(true, 4, 5);
+        }
+        assert_eq!(unknown(&m), f64::from(lost));
+        m.revision_work_matured(1);
+        {
+            // Retired at the next checkpoint; the history it alone needed was
+            // already released, so only what the open wait needs remains.
+            let state = m.landing.lock().unwrap();
+            assert_eq!(state.blocks.len(), 1);
+            let history: Vec<_> = state.revisions.keys().copied().collect();
+            assert_eq!(history, [7]);
+        }
+        assert_eq!(unknown(&m), 0.);
+        m.revision_work_session_authorized();
+        m.revision_work_delivered(7);
+        assert_eq!(count(&m, "published"), 1.);
+        assert_eq!(count(&m, "superseded"), 0.);
+        assert_eq!(age(&m), 0.);
+    }
 }

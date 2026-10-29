@@ -2,8 +2,10 @@
 # The go-live gate for a frontend that admits traffic while `qbit-prism-server import-audits` is
 # still storing legacy audit bodies.
 #
-# In production, `self-check` stops at legacy audit completeness and skips its local checks until
-# the import has finished (#734). This script checks every fact `self-check` checks
+# Through 3.1.0, production `self-check` stops at legacy audit completeness and skips its local
+# checks until the import has finished (#734). Later builds run them first, and with
+# PRISM_SELF_CHECK_LEGACY_IMPORT_PENDING=1 report legacy completeness as pending rather than
+# failing; this script stays for the earlier builds. It checks every fact `self-check` checks
 # (`self_check()` and `self_check_local()` in crates/qbit-prism-server/src/tools.rs), with one
 # exception: legacy completeness, which it reports as pending, together with whether an
 # import-audits session can be seen. It still fails on any native audit row that self-check would

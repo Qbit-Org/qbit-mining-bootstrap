@@ -18,13 +18,14 @@ use uuid::Uuid;
 
 mod append_admission;
 mod blocks;
-pub use blocks::{BlockObservation, FanoutClaim, PoolBlock};
+pub use blocks::{BlockObservation, FanoutClaim, PoolBlock, VerifiedLanding};
 /// Share ledger retention: the operator commands behind `share-archive`.
 pub mod archive;
 mod audit;
 pub use audit::{
     audit_canonical_bytes, audit_canonical_bytes_admitted, audit_completeness,
-    decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReader,
+    decode_canonical_audit_body, materialize_audit_row, AuditCompleteness, AuditReaddressed,
+    AuditReader,
 };
 mod candidates;
 #[cfg(test)]
@@ -45,7 +46,7 @@ use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
 mod connect;
 pub(crate) use connect::shielded_begin;
 use connect::{check_writable, require_revision, writable, writable_unless_held, WRITABLE_COLUMNS};
-pub use connect::{MigrateOptions, SessionAllocationExhausted, SessionId};
+pub use connect::{MigrateOptions, ObservedRevisionChanged, SessionAllocationExhausted, SessionId};
 mod difficulty;
 mod divergence;
 pub use divergence::{

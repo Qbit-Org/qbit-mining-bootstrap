@@ -117,7 +117,7 @@ The D1 plan is `--plan d1`. Every phase length and rate is overridable.
 | `--allow-unverified-server-revision` | off | Run a server binary that cannot be tied to this checkout's HEAD (no Cargo dep-info beside it, or a source or manifest newer than it); forces `artifact_kind: example` |
 | `--example-artifact` | off | Emit `artifact_kind: example` from a clean tree |
 | `--pg-bin-dir` | `QBIT_PRISM_LOAD_PG_BIN_DIR`, then `pg_config --bindir` | PostgreSQL server binaries. The harness keeps its own variable rather than reading one of the shared test-gate variables, which belong to the gate crate (#322) |
-| `--database-url` | none | Use an existing database; no standby is managed, and the replication mode is detected, never assumed: it must be the one `--replication` declares, at entry and again after the load, or the run exits 8. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block. The libpq-style `host`, `hostaddr` and `port` parameters are honoured for the proxy's upstream and dropped from the URL the frontends receive, because SQLx applies them over the authority and they would otherwise route every frontend around the proxy; every other option is kept |
+| `--database-url` | none | Use an existing database; no standby is managed, and the replication mode is detected, never assumed: it must be the one `--replication` declares, at entry and again after the load, or the run exits 8. The host may be a name: the delay proxy resolves it once at entry and records the addresses in the side report's `delay_proxy` block. The libpq-style `host`, `hostaddr` and `port` parameters are honoured for the proxy's upstream and dropped from the URL the frontends receive, because SQLx applies them over the authority and they would otherwise route every frontend around the proxy; every other option is kept, `sslmode` included. The frontends dial the proxy as `127.0.0.1`, so `sslmode=verify-full` refuses the database's certificate for its name there; `verify-ca` checks the certificate's chain and not its name, so it passes through the proxy (#713). As with libpq, `verify-ca` trusts only the root certificates in `sslrootcert` (or `PGSSLROOTCERT`), never the public roots, and refuses to connect without one, so a `verify-ca` URL needs `sslrootcert` set to the database's CA, at a path the frontends can read |
 | `--replication` | `async` | `async`, `sync` or `none`: the replication mode the run declares. A managed cluster is built to it; an external database is checked against it |
 | `--frontends` | 1 | 1, 2 or 4 |
 | `--sessions` | 100 | Stratum sessions, round-robin across the frontends |
@@ -791,7 +791,11 @@ exactly the keys it always wrote.
 preset on every PR in the `prism-native-postgres` shards: one debug
 frontend, 50 sessions, a 20k window at 20 shares/s, 3 external tips and 1
 scheduled own block in a tips-only plan. About 70 s of run (half of it the
-ramp) plus the debug server build `load_smoke` also pays for. The bridging
+ramp) plus the debug server build `load_smoke` also pays for. A failed run
+prints the gate table, the nodes' logs, a per-tip timeline (mint, the pool
+node's sighting, first/median/slowest session's first usable job per
+frontend, replacement) and each frontend's warnings and log tail (#790),
+since CI keeps no run directory. The bridging
 pair `short-plan-real-node` and `short-plan-fake-node` is the short plan on
 either node with nothing else different, run nightly beside each other on
 the same runner class (#552).
@@ -895,7 +899,8 @@ the command line, where clap refuses any of them given again, and the side
 report's `preset` block records its name, path, SHA-256 and gates.
 
 A preset also names the runner it needs, its timeout, when it runs, and its
-`gates`, every key stated (`null` where it does not gate):
+`gates`, every key stated (`null` where it does not gate) except the optional
+`tip_last_notify_median_budget_ms`, which is absent where it does not gate:
 
 | Gate | Meaning |
 |---|---|
@@ -904,6 +909,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `max_shortfall` | offers no session could take, per gated phase |
 | `max_rejected_valid_shares`, `max_unanswered_submits` | #473's D1 rule, per gated phase |
 | `tip_last_notify_p99_budget_ms` | per external tip, the slowest session's time to usable work (`time_to_usable_work.tips[].all_sessions_milliseconds`); the p99 over the tips, nearest rank. A tip some session never got work on fails |
+| `tip_last_notify_median_budget_ms` | optional (#790): the same per-tip figure, its median over the tips, nearest rank. The p99 of a few tips is their slowest, so one slow tip on a busy runner fails it; the median holds most tips to the budget while the p99 key, given headroom, still fails a stalled tip. Only `real-node-smoke` sets it: median <= 5000 ms, p99 <= 10000 ms over its 3 tips |
 | `d1_verdict_table` | print #473's D1 verdict table, in its columns, for `steady_state` and `burst` |
 | `churn_tip_last_notify_p99_budget_ms` | per churn tip, the slowest served session of those connected at the tip; the p99 over the tips. A tip with a connected session never served fails |
 | `new_session_first_job_p99_budget_ms` | the churn phase's new connections' time to first job, p99 |

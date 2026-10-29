@@ -21,6 +21,10 @@ const APPEND_LOCK_TIMEOUT_MS: u64 = 5_000;
 /// What a frontend's log says when one of its statements was cancelled, by
 /// its lock timeout or its statement timeout.
 const CANCELLED: &str = "canceling statement due to";
+/// What a frontend's log says when PostgreSQL aborted one of its
+/// statements to break a lock cycle (#789: an rc.6 CTV broadcaster's, with
+/// 027 on the other side).
+const DEADLOCK: &str = "deadlock detected";
 /// rc.6's warning for a migration it does not know.
 const UNKNOWN_MIGRATIONS: &str = "database has schema migrations this server does not know";
 
@@ -63,10 +67,39 @@ where
 
 /// The lines of `node`'s frontend log that name `needle`.
 fn log_lines(sim: &Sim, node: Node, needle: &str) -> Vec<String> {
+    log_lines_since(sim, node, needle, None)
+}
+
+/// The lines of `node`'s frontend log that name `needle`, logged at or
+/// after `since` when given: each line leads with its RFC 3339 time, after
+/// the terminal colour codes.
+fn log_lines_since(
+    sim: &Sim,
+    node: Node,
+    needle: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<String> {
+    let at = |line: &str| {
+        // Only what follows an escape is a colour code's remainder: a line
+        // logged without colour keeps its leading time.
+        let mut parts = line.split('\u{1b}');
+        let plain: String = parts
+            .next()
+            .into_iter()
+            .chain(parts.map(|part| part.split_once('m').map_or(part, |(_, rest)| rest)))
+            .collect();
+        plain
+            .split_whitespace()
+            .next()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .map(|stamp| stamp.with_timezone(&chrono::Utc))
+    };
     std::fs::read_to_string(sim.frontend(node).log())
         .unwrap_or_default()
         .lines()
         .filter(|line| line.contains(needle))
+        // A line without a time is kept: it cannot be shown to be earlier.
+        .filter(|line| since.is_none_or(|since| at(line).is_none_or(|at| at >= since)))
         .map(str::to_owned)
         .collect()
 }
@@ -117,7 +150,8 @@ async fn restart(sim: &mut Sim, node: Node) -> Result<Restart> {
 /// index invalid. The reader ends, 031 completes and is recorded, the index
 /// is valid on the primary and on the standby, B's frontend restarts and
 /// serves at 31, and A lands a block on the migrated schema, its rows taking
-/// 027's defaults. No frontend statement is cancelled throughout.
+/// 027's defaults. From the migrate's start, no frontend statement is
+/// cancelled or aborted as a deadlock.
 pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result<()> {
     sim.load()?.resume();
     steady(sim, 6).await;
@@ -147,6 +181,7 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     let mut command = tokio::process::Command::from(spec.command(&["migrate"]));
     command.kill_on_drop(true);
     let migrate_from_ms = sim.clock.now_ms();
+    let migrate_from = chrono::Utc::now();
     sim.mark("3.1 migrate started against A's database");
     // Aborted, and the migrate killed, if a step below fails first.
     let migrate = crate::premigrate::AbortOnDrop::spawn(async move {
@@ -169,13 +204,19 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
         || {
             let pool = pool.clone();
             async move {
-                Ok(sqlx::query_scalar(
+                // p0's leaf exists, not yet valid, and its CREATE INDEX
+                // CONCURRENTLY is still running: the build is caught
+                // part-way. The statement alone shows before its catalog
+                // entry has committed.
+                let (_, leaf) = origin_index(&pool).await?;
+                let running: bool = sqlx::query_scalar(
                     "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-                 WHERE datname = current_database() AND state = 'active' \
-                   AND query ILIKE 'CREATE INDEX CONCURRENTLY%')",
+                     WHERE datname = current_database() AND state = 'active' \
+                       AND query ILIKE 'CREATE INDEX CONCURRENTLY%')",
                 )
                 .fetch_one(&pool)
-                .await?)
+                .await?;
+                Ok(leaf == Some(false) && running)
             }
         },
     )
@@ -285,8 +326,8 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     )?;
     sim.mark("3.1 migrate finished");
     body.expect(
-        "3.1's migrate succeeds and reports 31 ready",
-        output.status.success() && stdout.contains("26, 27, 28, 31 ready"),
+        "3.1's migrate succeeds and reports 31 and 32 ready",
+        output.status.success() && stdout.contains("26, 27, 28, 31, 32 ready"),
         format!("{}: {}", output.status, stdout.trim()),
     );
     let after = versions(&pool).await?;
@@ -304,8 +345,8 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
     ));
     let warned = log_lines(sim, Node::B, UNKNOWN_MIGRATIONS);
     body.expect(
-        "rc.6 stops gracefully, restarts and serves at 31, warning of 27, 28 and 31",
-        restarted.graceful && warned.iter().any(|line| line.contains("27, 28, 31")),
+        "rc.6 stops gracefully, restarts and serves at 31, warning of 27, 28, 31 and 32",
+        restarted.graceful && warned.iter().any(|line| line.contains("27, 28, 31, 32")),
         format!(
             "stopped gracefully {}; B's warnings {warned:?}",
             restarted.graceful
@@ -363,9 +404,14 @@ pub(super) async fn r01_rc6_premigrate(sim: &mut Sim, body: &mut Body) -> Result
         format!("standby recorded {replayed:?}; parent valid {parent:?}, p0's leaf valid {leaf:?}"),
     );
     for node in Node::BOTH {
-        let cancelled = log_lines(sim, node, CANCELLED);
+        // From the migrate's start: what a frontend meets on its own before
+        // it (a start beside the other's) is not the migrate's doing.
+        let mut cancelled = log_lines_since(sim, node, CANCELLED, Some(migrate_from));
+        cancelled.extend(log_lines_since(sim, node, DEADLOCK, Some(migrate_from)));
         body.expect(
-            &format!("no statement of node {node:?}'s frontend was cancelled"),
+            &format!(
+                "no statement of node {node:?}'s frontend was cancelled or aborted as a deadlock from the migrate's start"
+            ),
             cancelled.is_empty(),
             format!("{cancelled:?}"),
         );

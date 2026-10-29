@@ -29,10 +29,11 @@ BODY_REF = "qbit.prism.audit-body-ref.v1"
 V2 = "qbit.prism.audit-bundle.v2"
 CANONICALIZE_BIN = os.environ.get("PRISM_AUDIT_CANONICALIZE_BIN", "")
 
-# The 3.x canonicalizer's contract, for the shapes these tests write: resolve
-# the share parts, check each range digest as serde_json writes it (raw
-# UTF-8), require sha256(canonical bundle) == audit_bundle_sha256, and print
-# the canonical bytes. Its canonical form is the bundle as compact JSON.
+# The contract of a 3.x canonicalizer without #709's fix, for the shapes these
+# tests write: resolve the share parts, check each range digest as serde_json
+# writes it (raw UTF-8), require sha256(canonical bundle) ==
+# audit_bundle_sha256, and print the canonical bytes. Its canonical form is
+# the bundle as compact JSON.
 STUB = textwrap.dedent("""\
     import hashlib, json, sys
     from pathlib import Path
@@ -361,8 +362,9 @@ class LegacyRangeSidecarTests(unittest.TestCase):
 @unittest.skipUnless(CANONICALIZE_BIN, "set PRISM_AUDIT_CANONICALIZE_BIN, as "
                      "`make test-prism-legacy-range-sidecars` does")
 class RealCanonicalizerTests(unittest.TestCase):
-    """The real 3.x canonicalizer refuses a 1.x-style body whose range digest
-    is escaped JSON, and proves the tool's rewrite. The bundle comes from the
+    """The real 3.x canonicalizer accepts a 1.x-style body whose range digest
+    is escaped JSON (#709), refuses one whose digest is neither form, and
+    proves the tool's rewrite of that one. The bundle comes from the
     qbit-prism-build-audit-bundle beside it, with non-ASCII worker names."""
 
     def real_bundle(self, tmp):
@@ -383,7 +385,7 @@ class RealCanonicalizerTests(unittest.TestCase):
              "--ledger-signing-key-seed-hex", "43" * 32, "--canonical-output"],
             capture_output=True, check=True).stdout
 
-    def test_real_canonicalizer_refuses_the_body_and_proves_the_rewrite(self):
+    def test_real_canonicalizer_accepts_escaped_digests_and_the_tool_proves_the_rest(self):
         for schema in (BODY_REF, V2):
             with self.subTest(schema=schema), tempfile.TemporaryDirectory() as tmp:
                 canonical = self.real_bundle(tmp)
@@ -395,20 +397,30 @@ class RealCanonicalizerTests(unittest.TestCase):
                 slot = {"schema": SEGMENT, "first_share_seq": 1, "last_share_seq": len(shares),
                         "share_count": len(shares), "shares": shares}
                 (root / "segments/slot.json").write_bytes(compact(slot, True))
-                # The ASCII prefix is kept and checked by the real binary; the
-                # range holds the non-ASCII workers and is inlined.
+                # The ASCII prefix's digest is the same in either form; the
+                # range holds the non-ASCII workers, so only its escaped
+                # digest matches.
                 parts = [escaped_part("segment_prefix", 1, 1, shares[:1], "segments/slot.json"),
                          escaped_part("segment_range", 2, len(shares), shares[1:],
                                       "segments/slot.json")]
+                self.assertNotEqual(parts[1]["range_sha256"],
+                                    range_digest(2, len(shares), shares[1:], False))
                 body = parted_body(schema, digest, bundle, len(shares), parts)
                 (root / "body.json").write_bytes(compact(body, True))
-                refused, error = module.canonicalize(CANONICALIZE_BIN, root / "body.json")
+                accepted, error = module.canonicalize(CANONICALIZE_BIN, root / "body.json")
+                self.assertEqual(accepted, canonical, error)
+                # A range digest of neither form is refused. The tool inlines
+                # that range from the slot and proves the rewritten body.
+                parts[1]["range_sha256"] = "0" * 64
+                (root / "neither.json").write_bytes(compact(body, True))
+                refused, error = module.canonicalize(CANONICALIZE_BIN, root / "neither.json")
                 self.assertIsNone(refused)
                 self.assertIn("hash mismatch", error)
 
                 rows = Path(tmp) / "rows.csv"
                 rows.write_text("block_hash,body_uri,audit_bundle_sha256\n"
-                                f"{'cd' * 32},{PREFIX}/body.json,{digest}\n")
+                                f"{'cd' * 32},{PREFIX}/body.json,{digest}\n"
+                                f"{'ef' * 32},{PREFIX}/neither.json,{digest}\n")
                 sidecars = Path(tmp) / "sidecars"
                 sidecars.mkdir()
                 report = Path(tmp) / "report.jsonl"
@@ -418,11 +430,13 @@ class RealCanonicalizerTests(unittest.TestCase):
                                         "--sidecar-dir", str(sidecars),
                                         "--work-dir", str(Path(tmp) / "work"),
                                         "--report", str(report), "--write"])
-                [row] = [json.loads(line) for line in report.read_text().splitlines()]
-                self.assertEqual((code, row["status"]), (0, "sidecar-written"))
-                self.assertEqual([part["status"] for part in row["parts"]],
-                                 ["ok-in-3x", "python-escaped"])
+                verifies, proven = [json.loads(line) for line in report.read_text().splitlines()]
+                self.assertEqual((code, verifies["status"], proven["status"]),
+                                 (0, "ok-in-3x", "sidecar-written"))
+                self.assertEqual([part["status"] for part in proven["parts"]],
+                                 ["ok-in-3x", "unexplained"])
                 [sidecar] = sidecars.iterdir()
+                self.assertEqual(sidecar, module.sidecar_path(sidecars, "ef" * 32, digest))
                 self.assertEqual(gzip.decompress(sidecar.read_bytes()), canonical)
 
 

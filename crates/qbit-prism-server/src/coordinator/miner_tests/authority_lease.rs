@@ -928,63 +928,151 @@ async fn aged_tip_observation_after_return_is_not_a_proven_stale_commit() {
     );
 }
 
-#[tokio::test]
-async fn commit_gate_contention_or_unknown_readiness_is_not_stale() {
-    for changed in [
-        "prepared-lock",
-        "readiness-lock",
-        "tip-lock",
-        "readiness-unknown",
-    ] {
-        let f = Fixture::new(Duration::from_secs(10)).await;
-        f.coordinator.refresh_once().await.unwrap();
-        let job = issued(&f).await;
-        prepare_replacement_lease(&f).await;
-        let gate = Arc::new(Gate::default());
-        *f.store.append_gate.lock().unwrap() = Some(gate.clone());
-        let proof = f.proof(&job, 0);
-        let coordinator = f.coordinator.clone();
-        let pending = tokio::spawn(async move {
+/// A lease's submission parked before its pre-COMMIT hook, with the hook's
+/// refusal held at a slow ROLLBACK, so a test can act between the two.
+struct HookedSubmission {
+    pending: tokio::task::JoinHandle<Result<(), StratumError>>,
+    append: Arc<Gate>,
+    rollback: Arc<Gate>,
+    log: SharedLog,
+}
+
+async fn submit_at_the_hook(f: &Fixture) -> (HookedSubmission, i64) {
+    use tracing::instrument::WithSubscriber;
+    f.coordinator.refresh_once().await.unwrap();
+    let job = issued(f).await;
+    let revision = prepare_replacement_lease(f).await;
+    let append = Arc::new(Gate::default());
+    let rollback = Arc::new(Gate::default());
+    *f.store.append_gate.lock().unwrap() = Some(append.clone());
+    *f.store.rollback_gate.lock().unwrap() = Some(rollback.clone());
+    let proof = f.proof(&job, 0);
+    let coordinator = f.coordinator.clone();
+    let log = SharedLog::default();
+    let pending = tokio::spawn(
+        async move {
             coordinator
                 .submit(&job.context.worker, &job, proof, false.into())
                 .await
-        });
-        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-            .await
-            .unwrap();
-        if changed == "readiness-unknown" {
-            f.coordinator.invalidate_readiness().await;
         }
-        let prepared = if changed == "prepared-lock" {
+        .with_subscriber(log.dispatch_at(tracing::Level::INFO)),
+    );
+    tokio::time::timeout(Duration::from_secs(5), append.entered.notified())
+        .await
+        .unwrap();
+    let submission = HookedSubmission {
+        pending,
+        append,
+        rollback,
+        log,
+    };
+    (submission, revision)
+}
+
+/// #716: a tip poll, a fee or readiness write, or the publication holding
+/// one of the authority's locks at the pre-COMMIT hook proves nothing about
+/// the lease. The append rolls back, waits for the authority outside
+/// ORDER_LOCK, and runs again, so the share keeps its credit.
+#[tokio::test]
+async fn commit_gate_contention_waits_for_the_authority_and_keeps_the_credit() {
+    for held in ["prepared-lock", "readiness-lock", "tip-lock"] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        let (submission, revision) = submit_at_the_hook(&f).await;
+        let prepared = if held == "prepared-lock" {
             Some(f.coordinator.prepared.write().await)
         } else {
             None
         };
-        let readiness = if changed == "readiness-lock" {
+        let readiness = if held == "readiness-lock" {
             Some(f.coordinator.readiness.write().await)
         } else {
             None
         };
-        let tip = if changed == "tip-lock" {
+        let tip = if held == "tip-lock" {
             Some(f.coordinator.observed_tip.write().await)
         } else {
             None
         };
-        gate.release.notify_one();
-        let error = tokio::time::timeout(Duration::from_secs(5), pending)
+        submission.append.release.notify_one();
+        // The hook found the authority contended and refused, writing nothing.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            submission.rollback.entered.notified(),
+        )
+        .await
+        .unwrap();
+        submission.rollback.release.notify_one();
+        // Its append now waits for the authority: no answer while the writer
+        // holds it, and no record.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!submission.pending.is_finished(), "{held}");
+        assert!(f.store.records.lock().unwrap().is_empty(), "{held}");
+        drop((prepared, readiness, tip));
+        tokio::time::timeout(Duration::from_secs(5), submission.pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{held}: {error:?}"));
+        let records = f.store.records.lock().unwrap();
+        assert_eq!(records.len(), 1, "{held}");
+        assert_eq!(records[0].2, revision, "{held}");
+        assert_eq!(records[0].0.credit_policy, None, "{held}");
+        assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 1, "{held}");
+    }
+}
+
+/// #716: once the append has waited out contention, the lease is checked
+/// against the authority as the hook checks it. A publication that replaced
+/// the work meanwhile is a stale race; a readiness epoch that changed
+/// meanwhile is authority it cannot prove. Neither credits the share.
+#[tokio::test]
+async fn commit_gate_contention_then_a_revoked_lease_keeps_the_revocations_answer() {
+    for changed in ["publication", "epoch"] {
+        let f = Fixture::new(Duration::from_secs(10)).await;
+        let (submission, _) = submit_at_the_hook(&f).await;
+        let tip = f.coordinator.observed_tip.write().await;
+        submission.append.release.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            submission.rollback.entered.notified(),
+        )
+        .await
+        .unwrap();
+        drop(tip);
+        // The authority changes before the refused append reads it again.
+        if changed == "publication" {
+            tokio::time::timeout(Duration::from_secs(5), f.coordinator.refresh_once())
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            f.coordinator.invalidate_readiness().await;
+            f.detect(2).await;
+            f.coordinator.readiness.write().await.last_poll = Some(Instant::now());
+        }
+        submission.rollback.release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(5), submission.pending)
             .await
             .unwrap()
             .unwrap()
             .unwrap_err();
-        drop((prepared, readiness, tip));
-        // #716: answered as admission answers authority it cannot prove,
-        // not as `ledger-confirmation-failed`, which feeds the share-append
-        // failure warning.
-        assert_error(
-            error,
-            "backend-rpc-unavailable",
-            "current chain state is unavailable",
-        );
+        if changed == "publication" {
+            stale_causes::assert_stale_wire(error, "stale job");
+        } else {
+            assert_error(
+                error,
+                "backend-rpc-unavailable",
+                "current chain state is unavailable",
+            );
+            assert!(
+                submission
+                    .log
+                    .text()
+                    .contains("closure=\"authority-unavailable\""),
+                "{}",
+                submission.log.text()
+            );
+        }
         assert!(f.store.records.lock().unwrap().is_empty(), "{changed}");
         assert_eq!(
             f.coordinator.accepted.load(Ordering::SeqCst),
@@ -992,6 +1080,83 @@ async fn commit_gate_contention_or_unknown_readiness_is_not_stale() {
             "{changed}"
         );
     }
+}
+
+/// #716: the acknowledgement deadline still bounds an append that waits out
+/// contention. It closes the contended gate, so the append never commits
+/// after that answer. The authority held the share back, not the ledger, so
+/// it is answered as authority the gate cannot prove, never as a ledger
+/// failure.
+#[tokio::test]
+async fn commit_gate_contention_past_the_deadline_is_unavailable_authority_and_never_commits() {
+    let f = Fixture::build(
+        Duration::from_secs(10),
+        |config| config.share_commit_timeout = Duration::from_millis(300),
+        None,
+    )
+    .await;
+    let started = tokio::time::Instant::now();
+    let (submission, _) = submit_at_the_hook(&f).await;
+    let tip = f.coordinator.observed_tip.write().await;
+    submission.append.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        submission.rollback.entered.notified(),
+    )
+    .await
+    .unwrap();
+    submission.rollback.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), submission.pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_error(
+        error,
+        "backend-rpc-unavailable",
+        "current chain state is unavailable",
+    );
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    let text = submission.log.text();
+    assert!(text.contains("closure=\"authority-contended\""), "{text}");
+    assert!(!text.contains("share persistence failed"), "{text}");
+    drop(tip);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.store.records.lock().unwrap().is_empty());
+    assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn commit_gate_unknown_readiness_is_not_stale() {
+    let f = Fixture::new(Duration::from_secs(10)).await;
+    let (submission, _) = submit_at_the_hook(&f).await;
+    f.coordinator.invalidate_readiness().await;
+    submission.append.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        submission.rollback.entered.notified(),
+    )
+    .await
+    .unwrap();
+    submission.rollback.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), submission.pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    // #716: answered as admission answers authority it cannot prove, not as
+    // `ledger-confirmation-failed`, which feeds the share-append failure
+    // warning. Unknown readiness is not contention, so the hook's refusal
+    // closes the gate and nothing is retried.
+    assert_error(
+        error,
+        "backend-rpc-unavailable",
+        "current chain state is unavailable",
+    );
+    let text = submission.log.text();
+    assert!(text.contains("closure=\"authority-unavailable\""), "{text}");
+    assert!(f.store.records.lock().unwrap().is_empty());
+    assert_eq!(f.coordinator.accepted.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

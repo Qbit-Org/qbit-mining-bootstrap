@@ -49,3 +49,12 @@ bench = false
 
 [profile.release]
 debug = 1
+
+# The repository workspace's sqlx-core patch: sqlx-core 0.8.6 with
+# launchbadge/sqlx#4251's TLS readiness fix (#771) and #3861's verify-ca fix
+# (#713) backported, plus a local verify-ca change (it trusts only
+# sslrootcert); vendor/sqlx-core/README.md says what changed. This workspace
+# resolves on its own, so it needs the same entry to build what the server
+# ships.
+[patch.crates-io]
+sqlx-core = { path = "../../../vendor/sqlx-core" }

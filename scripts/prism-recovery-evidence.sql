@@ -59,7 +59,7 @@ DO $metadata$
 DECLARE
     history regclass := to_regclass('qbit_prism_schema_migrations');
     hint constant text := 'Startup refuses this database. Restore the full backup, including the metadata tables of the current schema, then export again.';
-    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31];
+    required_versions constant integer[] := ARRAY[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32];
     applied integer[];
     missing integer[];
     metadata text;
@@ -643,7 +643,8 @@ FROM qbit_prism_cluster c WHERE config_fingerprint IS NOT NULL ORDER BY singleto
 SELECT jsonb_build_object('kind', 'payout_revision', 'row', jsonb_build_object(
     'payout_revision', payout_revision))
 FROM qbit_prism_cluster c WHERE payout_revision <> 0 ORDER BY singleton;
--- append and snapshot advance this monotonic barrier so share timestamps and
+-- the snapshot anchor advances this monotonic barrier, and every share append
+-- stamps at least it and the newest own share (#738), so share timestamps and
 -- window anchors never depend on host clock sync; a rewound clock can stamp
 -- new shares below existing anchors. Only the migration default of zero is omitted.
 SELECT jsonb_build_object('kind', 'ledger_clock', 'row', jsonb_build_object(

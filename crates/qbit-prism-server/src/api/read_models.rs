@@ -152,6 +152,203 @@ pub(super) async fn audit_payouts(state: &ApiState, hash: &str) -> ApiResult<Val
     )
 }
 pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiResult<Value> {
+    bundle_with(state, id, commitment, BodyReader::Audit)
+        .await
+        .map_err(BundleError::into_api)
+}
+/// The message of a legacy body that is not at its recorded location.
+const BODY_NOT_RETRIEVABLE: &str = "audit bundle body is not retrievable";
+/// The message of an address no audit row answers, including one whose row
+/// was re-imported under another digest between the lookup and the read.
+const UNKNOWN_ARTIFACT: &str = "unknown public PRISM artifact";
+/// Why a legacy body could not be served from its recorded `body_uri`.
+enum LegacyBodyError {
+    /// The body, or a share segment it names, is not at its recorded location.
+    Absent,
+    /// A body is there but could not be read, parsed or proven.
+    Fault {
+        message: &'static str,
+        error: String,
+    },
+    Internal,
+}
+impl LegacyBodyError {
+    fn io(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Self::Absent
+        } else {
+            Self::fault(BODY_NOT_RETRIEVABLE, error)
+        }
+    }
+    /// A share segment named by a v2 or body-ref envelope is absent the same
+    /// way; every other envelope failure is a fault.
+    fn parse(error: qbit_prism::AuditBodyRefError) -> Self {
+        match error {
+            qbit_prism::AuditBodyRefError::Io(error) => Self::io(error),
+            error => Self::fault(BODY_NOT_RETRIEVABLE, error),
+        }
+    }
+    fn fault(message: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Fault {
+            message,
+            error: error.to_string(),
+        }
+    }
+}
+/// A bundle read's failure. On the artifact routes only `Absent`, a proven
+/// absence, answers 404; a read timeout keeps its 503 and anything else is a
+/// 500, whatever its code.
+enum BundleError {
+    /// The row went away, or stopped answering the address it was found by,
+    /// between the artifact lookup and this read; or its legacy body is not at
+    /// its recorded location.
+    Absent(ApiError),
+    Other(ApiError),
+}
+impl BundleError {
+    fn into_api(self) -> ApiError {
+        match self {
+            Self::Absent(error) | Self::Other(error) => error,
+        }
+    }
+}
+impl From<ApiError> for BundleError {
+    fn from(error: ApiError) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<sqlx::Error> for BundleError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+/// Who reads a legacy body, which decides what its failure answers and logs.
+#[derive(Clone, Copy)]
+enum BodyReader<'a> {
+    /// The audit views answer 404 for any legacy body they cannot serve.
+    Audit,
+    /// `/public/v1/artifacts/<sha>`, for that address, answers 404 only for a
+    /// body that is not there, as before `import-audits` stores the row
+    /// (#735), and that includes a 2.x v2 body whose share segments are
+    /// missing. A body that is there but cannot be read or proven is a server
+    /// fault, and so is a 2.x v2 body this build cannot verify yet (#731):
+    /// each 500 it serves is logged at warn.
+    Artifact(&'a str),
+    /// `artifact()` answers the same for the same address, logged at debug
+    /// only: its live caller, the settlement-artifacts link check, serves none
+    /// of these answers.
+    LinkCheck(&'a str),
+}
+impl<'a> BodyReader<'a> {
+    /// The address an artifact read found its row by.
+    fn address(self) -> Option<&'a str> {
+        match self {
+            Self::Audit => None,
+            Self::Artifact(address) | Self::LinkCheck(address) => Some(address),
+        }
+    }
+    /// The block, the artifact and the body's recorded location go to the
+    /// server log only, never into a response.
+    fn body_failure(
+        self,
+        error: LegacyBodyError,
+        block_hash: &str,
+        artifact_sha256: &str,
+        body_uri: &str,
+    ) -> BundleError {
+        match (self, error) {
+            (_, LegacyBodyError::Internal) => ApiError::internal().into(),
+            // The audit views log nothing, as before.
+            (Self::Audit, LegacyBodyError::Absent) => {
+                BundleError::Absent(ApiError::missing(BODY_NOT_RETRIEVABLE))
+            }
+            (Self::Audit, LegacyBodyError::Fault { message, .. }) => {
+                ApiError::missing(message).into()
+            }
+            (_, LegacyBodyError::Absent) => {
+                tracing::debug!(
+                    block_hash,
+                    artifact_sha256,
+                    body_uri,
+                    "legacy audit body is not at its recorded location"
+                );
+                BundleError::Absent(ApiError::missing(BODY_NOT_RETRIEVABLE))
+            }
+            (reader, LegacyBodyError::Fault { message, error }) => {
+                if matches!(reader, Self::Artifact(_)) {
+                    tracing::warn!(
+                        block_hash,
+                        artifact_sha256,
+                        body_uri,
+                        reason = message,
+                        %error,
+                        "legacy audit body cannot be served"
+                    );
+                } else {
+                    tracing::debug!(
+                        block_hash,
+                        artifact_sha256,
+                        body_uri,
+                        reason = message,
+                        %error,
+                        "legacy audit body cannot be served"
+                    );
+                }
+                ApiError::internal().into()
+            }
+        }
+    }
+}
+/// Reads a legacy body from its recorded `body_uri` and proves it against the
+/// row's advertised digest.
+fn read_legacy_body(uri: &str, expected: &str) -> Result<Value, LegacyBodyError> {
+    // A local path, or a `file://` URI for one. Any other scheme names a store
+    // this server does not read, so no wait makes that body retrievable here.
+    let path = match uri.strip_prefix("file://") {
+        Some(path) => path,
+        None if uri.contains("://") => {
+            return Err(LegacyBodyError::fault(
+                BODY_NOT_RETRIEVABLE,
+                "unsupported body URI scheme",
+            ))
+        }
+        None => uri,
+    };
+    let path = std::path::Path::new(path);
+    let bytes = std::fs::read(path).map_err(LegacyBodyError::io)?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| LegacyBodyError::fault("audit bundle body is not valid JSON", error))?;
+    if matches!(
+        body["schema"].as_str(),
+        Some(qbit_prism::AUDIT_BODY_REF_SCHEMA | qbit_prism::AUDIT_BUNDLE_V2_SCHEMA)
+    ) {
+        let parsed = qbit_prism::parse_audit_bundle_value(body, path.parent())
+            .map_err(LegacyBodyError::parse)?;
+        let canonical = qbit_prism::canonical_audit_bundle_bytes(&parsed)
+            .map_err(|_| LegacyBodyError::Internal)?;
+        if hex::encode(Sha256::digest(&canonical)) != expected {
+            return Err(LegacyBodyError::fault(
+                "audit bundle body hash mismatch",
+                "canonical bytes differ from audit_bundle_sha256",
+            ));
+        }
+        serde_json::to_value(parsed).map_err(|_| LegacyBodyError::Internal)
+    } else {
+        if hex::encode(Sha256::digest(&bytes)) != expected {
+            return Err(LegacyBodyError::fault(
+                "audit bundle body hash mismatch",
+                "body bytes differ from audit_bundle_sha256",
+            ));
+        }
+        Ok(body)
+    }
+}
+async fn bundle_with(
+    state: &ApiState,
+    id: &str,
+    commitment: bool,
+    reader: BodyReader<'_>,
+) -> Result<Value, BundleError> {
     let sql = if commitment {
         include_str!("queries/audit_bundle_by_commitment.sql")
     } else {
@@ -162,11 +359,19 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         .fetch_one(&state.pool)
         .await?;
     if value.is_null() {
-        return Err(ApiError::missing(if commitment {
+        return Err(BundleError::Absent(ApiError::missing(if commitment {
             "unknown PRISM audit commitment"
         } else {
             "unknown PRISM block"
-        }));
+        })));
+    }
+    // An artifact read found this row by its address. A row re-imported since
+    // then answers another address, and its body is not this artifact.
+    if reader
+        .address()
+        .is_some_and(|address| value["audit_bundle_sha256"] != address)
+    {
+        return Err(BundleError::Absent(ApiError::missing(UNKNOWN_ARTIFACT)));
     }
     if value["has_canonical_audit_bytes"] == true {
         // Stored canonical bytes are authoritative over any inline or
@@ -187,8 +392,9 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
             .acquire_owned()
             .await
             .map_err(|_| ApiError::internal())?;
-        let canonical: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT canonical_audit_bytes FROM qbit_pool_audit_bundles WHERE block_hash=$1",
+        let row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT audit_bundle_sha256,canonical_audit_bytes FROM qbit_pool_audit_bundles \
+             WHERE block_hash=$1",
         )
         .bind(
             value["block_hash"]
@@ -196,8 +402,15 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
                 .ok_or_else(ApiError::internal)?,
         )
         .fetch_optional(&state.pool)
-        .await?
-        .flatten();
+        .await?;
+        // The address was checked against the first read; a row re-imported
+        // since is another audit, not a corrupt one.
+        if let (Some(address), Some((advertised, _))) = (reader.address(), &row) {
+            if advertised != address {
+                return Err(BundleError::Absent(ApiError::missing(UNKNOWN_ARTIFACT)));
+            }
+        }
+        let canonical = row.and_then(|(_, bytes)| bytes);
         if let Some(bytes) = canonical {
             let expected = value["audit_bundle_sha256"]
                 .as_str()
@@ -239,7 +452,7 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
         // the query above always projects that column, so a native row that
         // reached here has proven its canonical bytes.
         if value["audit_bundle_sha256"].as_str().is_none() {
-            return Err(ApiError::internal());
+            return Err(ApiError::internal().into());
         }
     }
     if value["audit_bundle"].is_null() {
@@ -251,33 +464,13 @@ pub(super) async fn bundle(state: &ApiState, id: &str, commitment: bool) -> ApiR
             .as_str()
             .ok_or_else(ApiError::internal)?
             .to_string();
-        value["audit_bundle"] = tokio::task::spawn_blocking(move || -> ApiResult<Value> {
-            let path = std::path::Path::new(uri.strip_prefix("file://").unwrap_or(&uri));
-            let bytes = std::fs::read(path)
-                .map_err(|_| ApiError::missing("audit bundle body is not retrievable"))?;
-            let body: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| ApiError::missing("audit bundle body is not valid JSON"))?;
-            if matches!(
-                body["schema"].as_str(),
-                Some(qbit_prism::AUDIT_BODY_REF_SCHEMA | qbit_prism::AUDIT_BUNDLE_V2_SCHEMA)
-            ) {
-                let parsed = qbit_prism::parse_audit_bundle_value(body, path.parent())
-                    .map_err(|_| ApiError::missing("audit bundle body is not retrievable"))?;
-                let canonical = qbit_prism::canonical_audit_bundle_bytes(&parsed)
-                    .map_err(|_| ApiError::internal())?;
-                if hex::encode(Sha256::digest(&canonical)) != expected {
-                    return Err(ApiError::missing("audit bundle body hash mismatch"));
-                }
-                serde_json::to_value(parsed).map_err(|_| ApiError::internal())
-            } else {
-                if hex::encode(Sha256::digest(&bytes)) != expected {
-                    return Err(ApiError::missing("audit bundle body hash mismatch"));
-                }
-                Ok(body)
-            }
-        })
-        .await
-        .map_err(|_| ApiError::internal())??;
+        let (read, uri, expected) =
+            tokio::task::spawn_blocking(move || (read_legacy_body(&uri, &expected), uri, expected))
+                .await
+                .map_err(|_| ApiError::internal())?;
+        let block_hash = value["block_hash"].as_str().unwrap_or_default();
+        let read = read.map_err(|error| reader.body_failure(error, block_hash, &expected, &uri));
+        value["audit_bundle"] = read?;
     }
     let object = value.as_object_mut().unwrap();
     for internal in [
@@ -326,15 +519,13 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
         }
         return Ok(Payload::addressed(canonical.into_bytes(), hash));
     }
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT block_hash,audit_bundle_sha256 FROM qbit_pool_audit_bundles \
-         WHERE audit_bundle_sha256=$1 LIMIT 1",
+    let block_hash: Option<String> = sqlx::query_scalar(
+        "SELECT block_hash FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1",
     )
     .bind(hash)
     .fetch_optional(&state.pool)
     .await?;
-    let (block_hash, advertised) =
-        row.ok_or_else(|| ApiError::missing("unknown public PRISM artifact"))?;
+    let block_hash = block_hash.ok_or_else(|| ApiError::missing(UNKNOWN_ARTIFACT))?;
     // Only audit artifacts are admitted here: the manifests above are served
     // from their stored JSON and never wait behind a rebuild. Past the cap a
     // request is refused at once, after the two point lookups above and
@@ -364,23 +555,30 @@ pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult
         .acquire_owned()
         .await
         .map_err(|_| ApiError::internal())?;
-    let canonical =
-        crate::ledger::audit_canonical_bytes_admitted(&state.pool, &block_hash, Some(permit))
-            .await
-            .map_err(audit_read_error)?;
+    let canonical = crate::ledger::audit_canonical_bytes_admitted(
+        &state.pool,
+        &block_hash,
+        Some(hash),
+        Some(permit),
+    )
+    .await
+    .map_err(|error| {
+        if error.is::<crate::ledger::AuditReaddressed>() {
+            ApiError::missing(UNKNOWN_ARTIFACT)
+        } else {
+            audit_read_error(error)
+        }
+    })?;
     if let Some(canonical) = canonical {
         // The bytes were digested against `audit_bundle_sha256` inside the
-        // blocking job, under the permit, and that is the column this row was
-        // found by: an audit artifact is never hashed a second time on a
-        // runtime thread, where a window-sized pass would stall every other
-        // task. What remains is that the row answers the address asked for.
-        if advertised != hash {
-            return Err(ApiError::internal());
-        }
+        // blocking job, under the permit, after the read checked that the row
+        // still advertises this address: an audit artifact is never hashed a
+        // second time on a runtime thread, where a window-sized pass would
+        // stall every other task.
         return Ok(Payload::addressed(canonical, hash));
     }
     let mut payload = Payload::json(
-        bundle(state, &block_hash, false)
+        bundle_with(state, &block_hash, false, BodyReader::Artifact(hash))
             .await
             .map_err(artifact_fallback_error)?["audit_bundle"]
             .take(),
@@ -394,19 +592,21 @@ pub(super) async fn artifact(state: &ApiState, hash: &str) -> ApiResult<Value> {
     if let Some(value) = v {
         return Ok(value);
     }
-    let hash: Option<String> = sqlx::query_scalar(
+    let block: Option<String> = sqlx::query_scalar(
         "SELECT block_hash FROM qbit_pool_audit_bundles WHERE audit_bundle_sha256=$1 LIMIT 1",
     )
     .bind(hash)
     .fetch_optional(&state.pool)
     .await?;
-    if let Some(hash) = hash {
-        return Ok(bundle(state, &hash, false)
-            .await
-            .map_err(artifact_fallback_error)?["audit_bundle"]
-            .take());
+    if let Some(block) = block {
+        return Ok(
+            bundle_with(state, &block, false, BodyReader::LinkCheck(hash))
+                .await
+                .map_err(artifact_fallback_error)?["audit_bundle"]
+                .take(),
+        );
     }
-    Err(ApiError::missing("unknown public PRISM artifact"))
+    Err(ApiError::missing(UNKNOWN_ARTIFACT))
 }
 fn audit_read_error(error: anyhow::Error) -> ApiError {
     match error.downcast::<sqlx::Error>() {
@@ -414,11 +614,11 @@ fn audit_read_error(error: anyhow::Error) -> ApiError {
         Err(_) => ApiError::internal(),
     }
 }
-fn artifact_fallback_error(error: ApiError) -> ApiError {
-    if error.code == "read_timeout" {
-        error
-    } else {
-        ApiError::internal()
+fn artifact_fallback_error(error: BundleError) -> ApiError {
+    match error {
+        BundleError::Absent(error) => error,
+        BundleError::Other(error) if error.code == "read_timeout" => error,
+        BundleError::Other(_) => ApiError::internal(),
     }
 }
 pub(super) async fn blocks(
@@ -626,4 +826,72 @@ pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
     Ok(
         json!({"schema":"qbit.prism.live-stratum-evidence.v1","block_hash":hash,"block_height":body["block_height"],"coinbase_tx_hex":body["coinbase_tx_hex"],"audit_bundle_path":format!("/audit/blocks/{hash}/bundle"),"audit_report":{"audit_bundle_sha256":body["audit_bundle_sha256"],"payout_manifest_sha256":body["payout_manifest_sha256"]},"ledger_backend":"postgres-native","persistence":{"backend":"postgres-native","payout_entry_count":payout_count},"confirmation":{"block_hash":hash,"chain_state":"confirmed"},"ctv_persistence":null,"accepted_share_count":counts["accepted_share_count"],"distinct_miner_count":counts["distinct_miner_count"],"job_share_count":body["audit_bundle"]["shares"].as_array().map_or(0,Vec::len)}),
     )
+}
+
+#[cfg(test)]
+mod artifact_fallback_tests {
+    use super::*;
+
+    fn answer(error: BundleError) -> (StatusCode, &'static str, String) {
+        let error = artifact_fallback_error(error);
+        (error.status, error.code, error.message)
+    }
+
+    /// #735: only a proven absence is a 404 for an artifact. A not_found from
+    /// anywhere else in a bundle read is a server fault, and a read timeout
+    /// keeps its 503.
+    #[test]
+    fn only_a_proven_absence_answers_404_for_an_artifact() {
+        for message in [BODY_NOT_RETRIEVABLE, "unknown PRISM block"] {
+            assert_eq!(
+                answer(BundleError::Absent(ApiError::missing(message))),
+                (StatusCode::NOT_FOUND, "not_found", message.to_string())
+            );
+        }
+        assert_eq!(
+            answer(ApiError::missing("unknown PRISM audit commitment").into()).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(answer(ApiError::read_timeout().into()).1, "read_timeout");
+        assert_eq!(
+            answer(ApiError::bad("bad").into()).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let reader = BodyReader::Artifact("sha");
+        let failure = |error| reader.body_failure(error, "block", "sha", "file:///body.json");
+        assert!(matches!(
+            failure(LegacyBodyError::Absent),
+            BundleError::Absent(_)
+        ));
+        assert_eq!(
+            answer(failure(LegacyBodyError::fault(
+                BODY_NOT_RETRIEVABLE,
+                "unreadable"
+            )))
+            .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// A body recorded under a scheme other than `file://` is not absent: no
+    /// wait makes it retrievable here.
+    #[test]
+    fn a_body_uri_with_another_scheme_is_a_fault_not_an_absence() {
+        for uri in [
+            "s3://bucket/audit.json",
+            "https://example.invalid/audit.json",
+        ] {
+            assert!(
+                matches!(
+                    read_legacy_body(uri, "sha"),
+                    Err(LegacyBodyError::Fault { .. })
+                ),
+                "{uri}"
+            );
+        }
+        assert!(matches!(
+            read_legacy_body("file:///nonexistent/prism/audit.json", "sha"),
+            Err(LegacyBodyError::Absent)
+        ));
+    }
 }

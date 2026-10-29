@@ -121,6 +121,44 @@ impl Ledger {
         ledger_public_key: &str,
         fence: LandingFence,
     ) -> Result<AuditVerificationReport> {
+        let verified = self.verify_landing(claim, ledger_public_key).await?;
+        self.commit_landing(claim, &verified, fence).await
+    }
+
+    /// Commit a landing [`Self::verify_landing`] verified for this claim's
+    /// block, fenced on the claim and on `expected_revision`, as
+    /// [`Self::land_candidate_at_revision`] does. Only this transaction runs
+    /// again when a caller retries a landing the revision fence refused
+    /// (#630): the fence is read before the transaction's first write, so a
+    /// refused commit wrote nothing, and an audit that landed meanwhile is
+    /// compared by digest, never written again.
+    pub async fn land_verified_at_revision(
+        &self,
+        claim: &CandidateClaim,
+        verified: &VerifiedLanding,
+        expected_revision: i64,
+    ) -> Result<AuditVerificationReport> {
+        self.commit_landing(
+            claim,
+            verified,
+            LandingFence::Claim {
+                expected_revision: Some(expected_revision),
+            },
+        )
+        .await
+    }
+
+    /// Everything a landing proves before its transaction, once: the
+    /// verification of the claim's rebuilt parts and the block's coinbase,
+    /// the stored body, leaves and accounts, and, unless the block's audit
+    /// has landed already, the proof that the window is the ledger's own
+    /// history. Nothing here reads the payout revision or writes, so the
+    /// result stays valid for every commit of the same claim's block.
+    pub async fn verify_landing(
+        &self,
+        claim: &CandidateClaim,
+        ledger_public_key: &str,
+    ) -> Result<VerifiedLanding> {
         let parts = claim.parts.clone().context(
             "candidate claim carries no rebuilt audit parts; rebuild its window before landing",
         )?;
@@ -139,8 +177,8 @@ impl Ledger {
         // Every step that walks the window runs in this one blocking task,
         // before the transaction opens: verification, the stored body, the
         // canonical byte count, the serialized leaves and accounts, and the
-        // share snapshot's ordering check and digest. The transaction below
-        // binds only what it produced.
+        // share snapshot's ordering check and digest. The commit's
+        // transaction binds only what it produced.
         let landing = tokio_util::task::AbortOnDropHandle::new(tokio::task::spawn_blocking({
             let parts = parts.clone();
             let public_key = ledger_public_key.to_owned();
@@ -160,9 +198,9 @@ impl Ledger {
         // whole range, so it runs before the settlement lock; under the lock
         // the range is only counted. It is needed exactly where the snapshot
         // is persisted: audit rows are never deleted, so a block that already
-        // has one takes the existing-row digest path below instead. A row
-        // that appears between this probe and the transaction lands on that
-        // same path. The read is paged and each page is compared on the
+        // has one takes the commit's existing-row digest path instead. A row
+        // that appears between this probe and a commit lands on that same
+        // path. The read is paged and each page is compared on the
         // blocking thread that mapped it, so it is off the runtime as well as
         // outside the lock.
         let landed: bool = sqlx::query_scalar(
@@ -174,6 +212,36 @@ impl Ledger {
         if !landed {
             verify_durable_range(&self.pool, &landing.snapshot, self.metrics.as_deref()).await?;
         }
+        Ok(VerifiedLanding {
+            block_hash: candidate.block_hash.clone(),
+            parts,
+            landing,
+            bits,
+            parent_hash,
+        })
+    }
+
+    async fn commit_landing(
+        &self,
+        claim: &CandidateClaim,
+        verified: &VerifiedLanding,
+        fence: LandingFence,
+    ) -> Result<AuditVerificationReport> {
+        let candidate = &claim.candidate;
+        ensure!(
+            verified.block_hash == candidate.block_hash,
+            "a verified landing for block {} cannot commit block {}",
+            verified.block_hash,
+            candidate.block_hash
+        );
+        let VerifiedLanding {
+            parts,
+            landing,
+            bits,
+            parent_hash,
+            ..
+        } = verified;
+        let report = &landing.report;
         let mut tx = self.begin().await?;
         self.lock(&mut tx, SETTLEMENT_LOCK).await?;
         writable(&mut tx).await?;
@@ -202,17 +270,17 @@ impl Ledger {
             );
             if let Some(stored_bits) = stored_bits {
                 ensure!(
-                    stored_bits.eq_ignore_ascii_case(&bits),
+                    stored_bits.eq_ignore_ascii_case(bits),
                     "existing block bits differ from candidate header"
                 );
             } else {
                 // Older prepared rows can be recovered with their original
                 // durable block even though no extra bits field existed.
                 sqlx::query("UPDATE qbit_pool_audit_bundles SET found_block_bits=$2 WHERE block_hash=$1 AND found_block_bits IS NULL")
-                    .bind(&candidate.block_hash).bind(&bits).execute(&mut *tx).await?;
+                    .bind(&candidate.block_hash).bind(bits).execute(&mut *tx).await?;
             }
             tx.commit().await?;
-            return Ok(landing.report);
+            return Ok(landing.report.clone());
         }
         if matches!(fence, LandingFence::Claim { .. }) {
             let revision: i64 = sqlx::query_scalar(
@@ -293,13 +361,13 @@ impl Ledger {
         // the proof is not a credited share) lands with the four columns NULL,
         // which is what the readers' LATERAL fallback covers.
         sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,as_issued_audit_sha256,solver_miner_id,solver_share_id,solver_share_difficulty,solver_network_difficulty) SELECT $1,$2,$3,$4,$5,$6,solver.miner_id,solver.share_id,solver.share_difficulty,solver.network_difficulty FROM (VALUES (1)) AS block_row(one) LEFT JOIN LATERAL (SELECT share.miner_id,share.share_id,share.share_difficulty,share.network_difficulty FROM qbit_share_ledger share WHERE share.accepted AND length(share.share_id)>=65 AND lower(right(share.share_id,64))=$1 ORDER BY share.accepted_at DESC,share.share_seq DESC LIMIT 1) solver ON true")
-            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).bind(&report.audit_bundle_sha256_hex).execute(&mut *tx).await?;
+            .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(parent_hash.as_str()).bind(&report.coinbase_txid).bind(&report.coinbase_manifest_sha256_hex).bind(&report.audit_bundle_sha256_hex).execute(&mut *tx).await?;
         let snapshot_digest = persist_audit_snapshot(&mut tx, &landing.snapshot).await?;
         sqlx::query("INSERT INTO qbit_pool_audit_bundles(block_hash,audit_bundle,audit_bundle_sha256,coinbase_tx_hex,audit_body_byte_len,schema_version,found_block_network_difficulty,found_block_coinbase_value_sats,audit_commitment_leaves_hex,witness_merkle_leaves_hex,share_snapshot_sha256,found_block_bits) VALUES($1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12)")
             .bind(&candidate.block_hash).bind(sqlx::types::Json(&*landing.body)).bind(&report.audit_bundle_sha256_hex).bind(&report.coinbase_tx_hex)
             .bind(landing.audit_body_byte_len).bind(&parts.body.schema)
             .bind(parts.body.found_block.network_difficulty.to_string()).bind(i64::try_from(report.coinbase_value_sats)?)
-            .bind(&landing.audit_commitment_leaves).bind(&landing.witness_merkle_leaves).bind(snapshot_digest).bind(&bits).execute(&mut *tx).await?;
+            .bind(&landing.audit_commitment_leaves).bind(&landing.witness_merkle_leaves).bind(snapshot_digest).bind(bits.as_str()).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO qbit_pool_payout_entries(block_hash,block_height,miner_id,payout_order_key,p2mr_program,onchain_amount_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'onchain_amount_sats')::bigint,(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a")
             .bind(&candidate.block_hash).bind(i64::try_from(report.block_height)?).bind(&landing.accounts).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO qbit_payout_carry_forward(block_hash,block_height,miner_id,payout_order_key,p2mr_program,gross_amount_sats,prior_balance_sats,candidate_balance_sats,onchain_amount_sats,settlement_fee_sats,carry_forward_balance_sats,action) SELECT $1,$2,a->>'recipient_id',a->>'order_key',decode(a->>'p2mr_program_hex','hex'),(a->>'gross_amount_sats')::bigint,(a->>'prior_balance_sats')::numeric,(a->>'candidate_balance_sats')::numeric,(a->>'onchain_amount_sats')::bigint,COALESCE((a->>'settlement_fee_sats')::bigint,0),(a->>'carry_forward_balance_sats')::numeric,a->>'action' FROM jsonb_array_elements($3::jsonb) a WHERE COALESCE(a->>'account_type','miner')='miner'")
@@ -308,7 +376,7 @@ impl Ledger {
             persist_fanouts(&mut tx, &candidate.block_hash, set).await?;
         }
         tx.commit().await?;
-        Ok(landing.report)
+        Ok(landing.report.clone())
     }
 
     /// `submitted` means the caller proved this block is on the active chain.
@@ -436,7 +504,7 @@ impl Ledger {
         tx.commit().await?;
         drop(order);
         if let Some(landing) = landing {
-            landing.committed(first_confirmation, committed_revision);
+            landing.committed(first_confirmation, expected_revision, committed_revision);
         }
         self.record_debt_metrics(divergence.iter(), debt);
         Ok((first_confirmation, committed_revision))
@@ -613,14 +681,14 @@ impl Ledger {
         drop(order);
         self.record_debt_metrics(effects.divergences.iter(), effects.debt);
         for (hash, observation) in landing {
-            let first = effects.first_confirmations.contains(hash);
             // A fatal early return can commit a first confirmation before the
-            // usual revision bump. It proves no eligible post-landing revision:
-            // retain unknown instead of matching pre-existing work at this R.
-            if first && effects.revision_bumps == 0 {
-                continue;
-            }
-            observation.committed(first, expected_revision + effects.revision_bumps);
+            // usual revision bump; the tracker then treats only later
+            // revisions as including it, never `expected_revision` (#758).
+            observation.committed(
+                effects.first_confirmations.contains(hash),
+                expected_revision,
+                expected_revision + effects.revision_bumps,
+            );
         }
         if let Some(message) = fatal {
             bail!(message);
@@ -872,6 +940,17 @@ enum LandingFence {
     Adopted,
 }
 
+/// A landing [`Ledger::verify_landing`] proved for one claim's block, ready
+/// to commit with [`Ledger::land_verified_at_revision`] as often as the
+/// revision fence refuses it (#630).
+pub struct VerifiedLanding {
+    block_hash: String,
+    parts: ClaimParts,
+    landing: Landing,
+    bits: String,
+    parent_hash: String,
+}
+
 /// What one landing binds, produced off the runtime from the claim's parts.
 struct Landing {
     report: AuditVerificationReport,
@@ -1072,9 +1151,12 @@ async fn deactivate_pool_block(
 /// check, because these settlement transactions bump only on some paths, and
 /// holding the row `FOR UPDATE` from the start would make every job cohort's
 /// `KEY SHARE` fence wait for the whole landing.
+///
+/// Every bump here keeps the tip, so it is announced to every frontend's
+/// refresh once it commits (#752, `coordinator::revision_wake`).
 async fn bump_revision(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     super::connect::lock_cluster_authority(tx).await?;
-    sqlx::query("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton").execute(&mut **tx).await?;
+    sqlx::query(&format!("UPDATE qbit_prism_cluster SET payout_revision=payout_revision+1,updated_at=clock_timestamp() WHERE singleton RETURNING {}", crate::coordinator::revision_wake::ANNOUNCE)).execute(&mut **tx).await?;
     Ok(())
 }
 

@@ -172,7 +172,8 @@ async fn commit_reconcile_append_before_commit_is_refused_and_aborted_at_the_dea
 
 /// #716: a refused gate is answered by the closure that won it.
 /// - Only a proven stale lease is a stale race.
-/// - Authority the lease's fence could not read is answered as admission
+/// - Authority the lease's fence could not prove, or could not read before
+///   the deadline closed its contended gate, is answered as admission
 ///   answers readiness it cannot prove, naming the ledger database when the
 ///   refresh failed on it, not as a ledger failure.
 /// - A deadline closure and a refusal that records no closure stay strict.
@@ -205,6 +206,13 @@ async fn commit_reconcile_each_gate_closure_keeps_its_own_answer() {
             "backend-database-unavailable",
             "current chain state is unavailable",
             Some("closure=\"authority-unavailable\""),
+        ),
+        (
+            Some(GateClosure::AuthorityContended),
+            false,
+            "backend-rpc-unavailable",
+            "current chain state is unavailable",
+            Some("closure=\"authority-contended\""),
         ),
         (
             Some(GateClosure::DeadlineOrCancelled),

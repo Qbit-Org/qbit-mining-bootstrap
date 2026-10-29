@@ -1419,7 +1419,7 @@ async fn busy_lock_command(fixture: &Fixture) -> Result<()> {
     );
     ensure!(
         stdout.contains(
-            r#"Audit completeness: {"missing_stored_bodies":1,"missing_canonical_bytes":1}"#
+            r#"Audit completeness: {"missing_stored_bodies":1,"missing_canonical_bytes":1,"pending_legacy_rows":1,"incomplete_native_rows":0}"#
         ),
         "{stdout}"
     );

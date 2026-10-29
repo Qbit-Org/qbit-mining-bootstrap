@@ -1,6 +1,7 @@
 //! The cluster singleton row's lock matrix after #479: a job-persistence
-//! fence held `FOR KEY SHARE` does not block the share append's non-key
-//! `ledger_clock_ms` `UPDATE`, and still blocks every authority writer's
+//! fence held `FOR KEY SHARE` does not block a non-key `ledger_clock_ms`
+//! `UPDATE` (the share append's until #738, the snapshot anchor's since),
+//! and still blocks every authority writer's
 //! `SELECT … FOR UPDATE` (`lock_cluster_authority`) until it commits.
 //! PRISM_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55483/postgres cargo test -p qbit-prism-server --test cluster_row_fences
 use anyhow::{ensure, Context, Result};

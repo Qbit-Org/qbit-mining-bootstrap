@@ -1,8 +1,8 @@
-> **Version 3.1.0: the Rust PRISM server
+> **Version 3.1.1: the Rust PRISM server
 > ([#244](https://github.com/Qbit-Org/qbit-mining-bootstrap/pull/244)), with
-> the 3.1 dual writer, off by default.** Deploy it from the `v3.1.0` tag, and
+> the 3.1 dual writer, off by default.** Deploy it from the `v3.1.1` tag, and
 > upgrade only as the
-> [3.1.0 release notes](doc/release-notes-3.1.0.md#upgrading) describe:
+> [3.1.1 release notes](doc/release-notes-3.1.1.md#upgrading) describe:
 > native migration is one-way. 3.0.0 is on the `3.0.x` branch.
 
 # qbit-mining-bootstrap

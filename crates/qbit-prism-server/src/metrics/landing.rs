@@ -7,6 +7,11 @@
 //! checkpoint; a watermark rejects late proofs. Saturation is unknown until
 //! restart, rather than silently recounting a delayed duplicate. A restart
 //! begins a new local knowledge horizon; no peer acceptance clock is inferred.
+//! Revisions no open wait can still need are released, so waits left open on
+//! a frontend that writes nothing cannot exhaust that history (#758). Behind
+//! the same checkpoint, a wait only a write could close retires unmeasured
+//! when no authorized session existed since its acceptance, so such waits
+//! cannot exhaust the identities either and leave a later stall at -1.
 use super::{Family, Labels, Metrics, Registry, RevisionWorkResult};
 use std::collections::{BTreeMap, HashMap};
 use tokio::time::Instant;
@@ -19,7 +24,6 @@ struct Acceptance {
     revision: Option<i64>,
     closed: bool,
     degraded: Option<Instant>,
-    awaiting_settlement: bool,
     unknown_revision: bool,
     orphan_uncertain: bool,
     existing_revision: bool,
@@ -30,6 +34,33 @@ struct Acceptance {
     /// deliver. An active-chain observation lands it on this same acceptance
     /// clock; a proven orphan closes it. Reported by `unlanded_age`.
     unlanded: bool,
+    /// The lowest committed revision proven to include this block's landing
+    /// when its first revision is unknown (#758): the revision of a settlement
+    /// that found the block already confirmed, or the one after a first
+    /// confirmation that committed without a bump. It cannot start a known
+    /// wait, whose age would only be an upper bound, but an eligible write at
+    /// or above it proves this frontend delivered the landing and closes the
+    /// unknown wait without a sample.
+    covering_revision: Option<i64>,
+    /// A revision assigned before the landing: its first confirmation
+    /// committed without a bump (the fatal early return), so no revision at
+    /// or below this one may cover it.
+    landed_after: Option<i64>,
+    /// Local settlement observers of this identity still to report. The one
+    /// that took it from zero owns the outcome. While any is out, a delayed
+    /// first confirmation may yet bind the exact revision, so a covering
+    /// revision closes nothing.
+    settling: u32,
+    /// The newest revision observed when the earliest observer still out
+    /// started, or MIN if none was: its revision is at least that, so the
+    /// history from there on stays while one is out (#758).
+    settling_from: i64,
+    /// Revisions below this were released while the wait was open: a first
+    /// revision below it can no longer find its first write.
+    history_from: i64,
+    /// This acceptance's place in `acceptance_epoch`, compared with
+    /// `Landing::attended_through`.
+    epoch: u64,
 }
 
 impl Acceptance {
@@ -39,6 +70,49 @@ impl Acceptance {
     /// deadlines; an unlanded block never has a revision to resolve.
     fn known(&self) -> bool {
         !self.closed && !self.unlanded && !self.unknown_revision && !self.orphan_uncertain
+    }
+
+    /// An unknown wait that a write at or above this revision may close: no
+    /// orphan verdict is pending and no local first confirmation can still
+    /// arrive to bind the exact revision (#758).
+    fn covered(&self) -> Option<i64> {
+        self.covering_revision.filter(|_| {
+            !self.closed
+                && self.unknown_revision
+                && !self.orphan_uncertain
+                && !self.unlanded
+                && self.settling == 0
+        })
+    }
+
+    /// Bind the first revision that includes the landing. If writes that
+    /// could have delivered it were released, measuring would miss them, so
+    /// the wait is covered by it instead, unknown until a later write (#758).
+    fn bind(&mut self, revision: i64) {
+        if self.revision.is_some() {
+            return;
+        }
+        if revision < self.history_from {
+            self.unknown_revision = true;
+            self.cover(revision);
+        } else {
+            self.revision = Some(revision);
+        }
+    }
+
+    fn cover(&mut self, revision: i64) {
+        let floor = self.landed_after.map_or(i64::MIN, |before| before + 1);
+        let lowest = self
+            .covering_revision
+            .map_or(revision, |known| known.min(revision));
+        self.covering_revision = Some(lowest.max(floor));
+    }
+
+    fn observer_done(&mut self) {
+        self.settling = self.settling.saturating_sub(1);
+        if self.settling == 0 {
+            self.settling_from = i64::MAX;
+        }
     }
 }
 
@@ -89,6 +163,15 @@ pub(super) struct Landing {
     terminal_observation: u64,
     terminal_completed: u64,
     terminal_failed: bool,
+    /// Whether the Stratum listener reports its authorized sessions. Until
+    /// it does, any acceptance may have had a miner to write to.
+    sessions_tracked: bool,
+    /// Authorized Stratum sessions, as their observations report them: the
+    /// sessions `qbit_prism_authorized_clients` counts.
+    sessions: usize,
+    /// Acceptances up to this `acceptance_epoch` had an authorized session,
+    /// or untracked sessions, at some instant after them.
+    attended_through: u64,
 }
 
 impl Landing {
@@ -156,13 +239,90 @@ impl Landing {
                 block.closed = true;
                 block.unknown_revision = false;
                 block.orphan_uncertain = false;
-                block.awaiting_settlement = false;
                 self.pending_count -= 1;
             }
         }
         if !self.pending() {
             self.revisions.clear();
             self.delivery_count = 0;
+        }
+    }
+
+    fn open_block(&mut self, hash: &str) -> Option<&mut Acceptance> {
+        let mut identity = [0; 32];
+        hex::decode_to_slice(hash, &mut identity).ok()?;
+        self.blocks.get_mut(&identity).filter(|block| !block.closed)
+    }
+
+    /// What a committed settlement proves about the landing's revision.
+    /// `required` is the revision the transaction ran at and `committed` the
+    /// one it left. Only a first confirmation that bumped the revision names
+    /// the first revision including the landing. One that did not (the fatal
+    /// early return) proves only the revisions after `required`, which the
+    /// next settlement-lock holder assigns. A settlement that found the block
+    /// already confirmed proves `committed`: a first confirmation either
+    /// bumps or halts the cluster in its own transaction, every settlement
+    /// requires the cluster writable, and clearing a halt bumps (#758).
+    fn settle(
+        &mut self,
+        hash: &str,
+        first: bool,
+        required: i64,
+        committed: i64,
+        owner: bool,
+        counted: bool,
+    ) {
+        if let Some(block) = self.open_block(hash) {
+            if counted {
+                block.observer_done();
+            }
+            if first && committed > required {
+                // A proven first confirmation restores the exact revision.
+                if block.unknown_revision {
+                    block.unknown_revision = false;
+                    block.revision = None;
+                }
+                block.bind(committed);
+            } else {
+                if first {
+                    block.landed_after =
+                        Some(block.landed_after.map_or(required, |r| r.max(required)));
+                }
+                block.cover(if first { required + 1 } else { committed });
+                // The owner's outcome decides the wait; another observer only
+                // adds proof. A newly observed already-confirmed block may
+                // begin at its current proof revision (#493).
+                if block.revision.is_none() && (owner || first) {
+                    if block.existing_revision && !first && !block.unknown_revision {
+                        block.bind(committed);
+                    } else {
+                        block.unknown_revision = true;
+                    }
+                }
+            }
+        }
+        if self.pending() {
+            self.observe(committed);
+        }
+    }
+
+    /// An active-chain observation that is not a settlement: it binds only
+    /// while no settlement observer is out.
+    #[cfg(test)]
+    fn observe_landing(&mut self, hash: &str, revision: i64) {
+        if let Some(block) = self.open_block(hash) {
+            if !block.unknown_revision && block.settling == 0 {
+                block.bind(revision);
+            }
+        }
+        if self.pending() {
+            self.observe(revision);
+        }
+    }
+
+    fn observe(&mut self, revision: i64) {
+        if let Some(event) = self.revision(revision) {
+            event.observed.get_or_insert_with(Instant::now);
         }
     }
 
@@ -194,37 +354,137 @@ impl Landing {
             );
             newer_at = newer_at.into_iter().chain(event.first()).min();
         }
-        for block in self.blocks.values_mut().filter(|block| block.known()) {
-            let Some(target) = block.revision else {
-                continue;
-            };
-            // Keep actual event clocks: binding a COMMIT's revision can run
-            // after a concurrent successful socket write or newer refresh.
-            let delivery = deliveries
-                .iter()
-                .copied()
-                .filter(|(revision, at)| *revision >= target && *at >= block.at)
-                .min_by_key(|(_, at)| *at);
-            // Every result ends at a successful delivery. Supersession only
-            // chooses its label; it must not stop the landing clock early.
-            if let Some((revision, at)) = delivery {
-                let result = if revision != target {
-                    RevisionWorkResult::Superseded
-                } else if block.degraded.is_some_and(|deadline| deadline <= at) {
-                    RevisionWorkResult::Degraded
-                } else {
-                    RevisionWorkResult::Published
-                };
-                registry.observe(
-                    Family::RevisionWork,
-                    Labels::One(("result", result.as_str())),
-                    at.saturating_duration_since(block.at).as_secs_f64(),
-                );
+        // One pass closes what the writes prove and finds the lowest revision
+        // an open wait may still need. A bound or covered wait has already
+        // been matched against every recorded write, and a later write below
+        // the newest observed revision is obsolete, so it needs only what is
+        // still to come. A settlement observer still out needs the history
+        // from the newest revision it saw; a binding still to come is at or
+        // above the newest observed revision (#758).
+        let mut keep_from = self
+            .revisions
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(i64::MAX);
+        for block in self.blocks.values_mut().filter(|block| !block.closed) {
+            if let Some(target) = block.revision.filter(|_| block.known()) {
+                // Keep actual event clocks: binding a COMMIT's revision can run
+                // after a concurrent successful socket write or newer refresh.
+                let delivery = deliveries
+                    .iter()
+                    .copied()
+                    .filter(|(revision, at)| *revision >= target && *at >= block.at)
+                    .min_by_key(|(_, at)| *at);
+                // Every result ends at a successful delivery. Supersession only
+                // chooses its label; it must not stop the landing clock early.
+                if let Some((revision, at)) = delivery {
+                    let result = if revision != target {
+                        RevisionWorkResult::Superseded
+                    } else if block.degraded.is_some_and(|deadline| deadline <= at) {
+                        RevisionWorkResult::Degraded
+                    } else {
+                        RevisionWorkResult::Published
+                    };
+                    registry.observe(
+                        Family::RevisionWork,
+                        Labels::One(("result", result.as_str())),
+                        at.saturating_duration_since(block.at).as_secs_f64(),
+                    );
+                    // An obsolete write after supersession cannot settle
+                    // pending age. Replacement work must reach a socket.
+                    block.closed = true;
+                    self.pending_count -= 1;
+                    continue;
+                }
+            } else if let Some(covering) = block.covered() {
+                // A covered unknown wait ends at an eligible write of its
+                // covering revision or later, with no sample: its first
+                // revision, and so its true end, stays unknown (#758).
+                if deliveries
+                    .iter()
+                    .any(|(revision, at)| *revision >= covering && *at >= block.at)
+                {
+                    block.closed = true;
+                    block.unknown_revision = false;
+                    self.pending_count -= 1;
+                    continue;
+                }
             }
-            // An obsolete write after supersession cannot settle pending age.
-            // Replacement work must reach a socket.
-            block.closed = delivery.is_some();
-            self.pending_count -= usize::from(block.closed);
+            if block.settling > 0 {
+                keep_from = keep_from.min(block.settling_from);
+            }
+            // A target bound before its block can match: only test-only
+            // observations bind an unlanded block (#493).
+            if let Some(target) = block
+                .revision
+                .filter(|_| !block.known() && !block.orphan_uncertain)
+            {
+                keep_from = keep_from.min(target);
+            }
+        }
+        if !self.pending() {
+            self.revisions.clear();
+            self.delivery_count = 0;
+        } else {
+            self.release(keep_from);
+        }
+    }
+
+    /// Release the revisions below `keep_from`, which no open wait can still
+    /// match: waits that stay open on a frontend that writes nothing, such as
+    /// an idle backup, can then never exhaust revision history and leave its
+    /// later known waits at -1 (#758). A wait that later binds below what was
+    /// released is covered instead of measured, see [`Acceptance::bind`].
+    fn release(&mut self, keep_from: i64) {
+        if self
+            .revisions
+            .keys()
+            .next()
+            .is_none_or(|&oldest| oldest >= keep_from)
+        {
+            return;
+        }
+        self.revisions = self.revisions.split_off(&keep_from);
+        self.delivery_count = self
+            .revisions
+            .values()
+            .map(|event| event.deliveries.len())
+            .sum();
+        for block in self.blocks.values_mut().filter(|block| !block.closed) {
+            block.history_from = block.history_from.max(keep_from);
+        }
+    }
+
+    /// Close, without a sample, the open waits at or below `floor` that only
+    /// a write could close but that no authorized session existed to receive
+    /// since their acceptance, as on an idle backup: no delivery was due, so
+    /// there is nothing to measure. Left open, they would hold identities
+    /// until saturation hid every later wait at -1. A wait a miner may have
+    /// needed stays, so a real stall still saturates; an unlanded acceptance
+    /// or an unsettled orphan verdict ends without a write either way. A wait
+    /// with a settlement observer still out stays until it reports, which
+    /// must find it open, and retires at a later checkpoint.
+    ///
+    /// Nothing is left to release: a retired wait pins no revision history.
+    /// With no observer out it keeps no `settling_from`, and a landed wait
+    /// with an unknown first revision has no target (see `resolve`).
+    fn retire_unattended(&mut self, floor: u64) {
+        if !self.sessions_tracked || self.sessions > 0 {
+            return;
+        }
+        let attended_through = self.attended_through;
+        for block in self.blocks.values_mut().filter(|block| {
+            !block.closed
+                && !block.unlanded
+                && !block.orphan_uncertain
+                && block.settling == 0
+                && block.height <= floor
+                && block.epoch > attended_through
+        }) {
+            block.closed = true;
+            block.unknown_revision = false;
+            self.pending_count -= 1;
         }
         if !self.pending() {
             self.revisions.clear();
@@ -343,6 +603,7 @@ impl Metrics {
                 state.saturated = true;
                 return;
             }
+            let epoch = state.acceptance_epoch.saturating_add(1);
             state.blocks.insert(
                 identity,
                 Acceptance {
@@ -351,60 +612,38 @@ impl Metrics {
                     revision: None,
                     closed: false,
                     degraded: None,
-                    awaiting_settlement: false,
                     unknown_revision: false,
                     orphan_uncertain: false,
                     existing_revision: observation == Observation::Confirmed,
                     unlanded: observation == Observation::Unlanded,
+                    covering_revision: None,
+                    landed_after: None,
+                    settling: 0,
+                    settling_from: i64::MAX,
+                    history_from: i64::MIN,
+                    epoch,
                 },
             );
             state.pending_count += 1;
-            state.acceptance_epoch = state.acceptance_epoch.saturating_add(1);
+            state.acceptance_epoch = epoch;
         });
     }
 
-    /// The caller proved this committed revision includes the block. A later
-    /// proof cannot move the original target or restart its acceptance clock.
+    /// The caller proved this committed revision is the first to include the
+    /// block. A later proof cannot move the original target or restart its
+    /// acceptance clock.
     #[cfg(test)]
     pub(crate) fn landed_block(&self, hash: &str, revision: i64) {
-        self.bind_landing(hash, revision, true, true);
+        self.landing_event(|state, registry| {
+            state.settle(hash, true, revision - 1, revision, false, false);
+            state.resolve(registry);
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn observed_landed_block(&self, hash: &str, revision: i64) {
-        self.bind_landing(hash, revision, false, false);
-    }
-
-    fn bind_landing(&self, hash: &str, revision: i64, settled: bool, first: bool) {
         self.landing_event(|state, registry| {
-            let mut identity = [0; 32];
-            if hex::decode_to_slice(hash, &mut identity).is_err() {
-                return;
-            }
-            if let Some(block) = state
-                .blocks
-                .get_mut(&identity)
-                .filter(|block| !block.closed)
-            {
-                if settled && !first && block.revision.is_none() && !block.existing_revision {
-                    block.unknown_revision = true;
-                }
-                if first && block.unknown_revision {
-                    block.unknown_revision = false;
-                    block.revision = None;
-                }
-                if !block.unknown_revision && (settled || !block.awaiting_settlement) {
-                    block.revision.get_or_insert(revision);
-                }
-                if settled {
-                    block.awaiting_settlement = false;
-                }
-            }
-            if state.pending() {
-                if let Some(event) = state.revision(revision) {
-                    event.observed.get_or_insert_with(Instant::now);
-                }
-            }
+            state.observe_landing(hash, revision);
             state.resolve(registry);
         });
     }
@@ -412,24 +651,48 @@ impl Metrics {
     pub(crate) fn revision_work_observed(&self, revision: i64) {
         self.landing_event(|state, registry| {
             if state.pending() {
-                if let Some(event) = state.revision(revision) {
-                    event.observed.get_or_insert_with(Instant::now);
-                }
+                state.observe(revision);
                 state.resolve(registry);
             }
         });
     }
 
     /// The existing coherent mature checkpoint ends the history horizon.
-    /// Retain unresolved intervals; reject delayed proofs below the watermark
-    /// even after their completed identity has been released.
+    /// Retain unresolved intervals a miner may have needed, and retire the
+    /// rest unmeasured (#758); reject delayed proofs below the watermark even
+    /// after their identity has been released.
     pub(crate) fn revision_work_matured(&self, height: u64) {
         let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
         state.retired_height = state.retired_height.max(height);
         let floor = state.retired_height;
+        state.retire_unattended(floor);
         state
             .blocks
             .retain(|_, block| !block.closed || block.height > floor);
+    }
+
+    /// The Stratum listener reports its authorized sessions from now on; an
+    /// acceptance before this may have had a miner (#758).
+    pub(crate) fn revision_work_sessions_tracked(&self) {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.sessions_tracked {
+            state.attended_through = state.acceptance_epoch;
+            state.sessions_tracked = true;
+        }
+    }
+
+    /// A Stratum session authorized, as `qbit_prism_authorized_clients`
+    /// counts it: every wait open while it stays may need its write.
+    pub(crate) fn revision_work_session_authorized(&self) {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        state.sessions += 1;
+    }
+
+    /// An authorized session ended. It existed after every acceptance so far.
+    pub(crate) fn revision_work_session_ended(&self) {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        state.attended_through = state.acceptance_epoch;
+        state.sessions = state.sessions.saturating_sub(1);
     }
 
     /// Called immediately after write_all of the complete mining.notify frame
@@ -479,28 +742,27 @@ impl Metrics {
     }
 
     pub(crate) fn revision_work_settlement<'a>(&'a self, hash: &'a str) -> Settlement<'a> {
-        let owns = self.landing_event(|state, _| {
-            let mut identity = [0; 32];
-            if hex::decode_to_slice(hash, &mut identity).is_ok() {
-                if let Some(block) = state.blocks.get_mut(&identity) {
-                    // Only an active-chain observation reaches a settlement
-                    // COMMIT: whatever its reply, the block is landed (#493).
-                    if !block.closed {
-                        block.unlanded = false;
-                    }
-                    if !block.awaiting_settlement {
-                        block.awaiting_settlement = true;
-                        return true;
-                    }
-                }
-            }
-            false
+        let (owner, counted) = self.landing_event(|state, _| {
+            let newest = state.revisions.keys().next_back().copied();
+            let Some(block) = state.open_block(hash) else {
+                return (false, false);
+            };
+            // Only an active-chain observation reaches a settlement COMMIT:
+            // whatever its reply, the block is landed (#493).
+            block.unlanded = false;
+            let owner = block.settling == 0;
+            block.settling += 1;
+            // Its transaction runs under the settlement lock at a revision no
+            // older than any observed so far, so it can need nothing older.
+            block.settling_from = block.settling_from.min(newest.unwrap_or(i64::MIN));
+            (owner, true)
         });
         Settlement {
             metrics: self,
             hash,
             completed: false,
-            owns,
+            owner,
+            counted,
         }
     }
 }
@@ -560,39 +822,53 @@ impl Drop for TerminalProbe<'_> {
 /// A lost/cancelled COMMIT reply cannot be replaced with a guess at the current
 /// revision. A later first confirmation proves that earlier attempt did not
 /// commit; otherwise the original revision remains unknown in this horizon.
+/// A later non-first confirmation proves only a covering revision, which
+/// closes the wait at a write without restoring its original revision (#758).
 pub(crate) struct Settlement<'a> {
     metrics: &'a Metrics,
     hash: &'a str,
     completed: bool,
-    owns: bool,
+    /// The observer that took the identity's `settling` from zero: its
+    /// outcome decides the wait, and its lost reply makes it unknown.
+    owner: bool,
+    /// Counted in the identity's `settling` until it reports or drops.
+    counted: bool,
 }
 impl Settlement<'_> {
-    pub(crate) fn committed(mut self, first: bool, revision: i64) {
-        // Arrival order is not commit order: a competing transaction can
-        // prove the first confirmation while the owning observer is delayed.
-        if self.owns || first {
-            self.metrics.bind_landing(self.hash, revision, true, first);
-        } else {
-            self.metrics.revision_work_observed(revision);
-        }
+    /// `required` is the revision the transaction required and `committed`
+    /// the one it committed; the tracker decides what they prove (#758).
+    pub(crate) fn committed(mut self, first: bool, required: i64, committed: i64) {
+        self.metrics.landing_event(|state, registry| {
+            // Arrival order is not commit order: a competing transaction can
+            // prove the first confirmation while the owning observer is delayed.
+            state.settle(
+                self.hash,
+                first,
+                required,
+                committed,
+                self.owner,
+                self.counted,
+            );
+            state.resolve(registry);
+        });
         self.completed = true;
     }
 }
 impl Drop for Settlement<'_> {
     fn drop(&mut self) {
-        if self.completed || !self.owns {
+        if self.completed || !self.counted {
             return;
         }
-        self.metrics.landing_event(|state, _| {
-            let mut identity = [0; 32];
-            if hex::decode_to_slice(self.hash, &mut identity).is_ok() {
-                if let Some(block) = state.blocks.get_mut(&identity) {
-                    block.awaiting_settlement = false;
-                    if !block.closed && block.revision.is_none() {
-                        block.unknown_revision = true;
-                    }
+        self.metrics.landing_event(|state, registry| {
+            if let Some(block) = state.open_block(self.hash) {
+                block.observer_done();
+                if self.owner && block.revision.is_none() {
+                    block.unknown_revision = true;
                 }
             }
+            // The last observer out may release a covered wait whose write
+            // was already seen (#758).
+            state.resolve(registry);
         });
     }
 }

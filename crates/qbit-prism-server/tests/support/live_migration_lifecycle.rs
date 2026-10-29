@@ -385,7 +385,13 @@ async fn mine_and_reconcile(
     let self_check: Value = serde_json::from_str(&self_check)?;
     ensure!(
         self_check["audit_completeness"]
-            == json!({"missing_stored_bodies": 0, "missing_canonical_bytes": 0}),
+            == json!({
+                "status": "complete",
+                "missing_stored_bodies": 0,
+                "missing_canonical_bytes": 0,
+                "pending_legacy_rows": 0,
+                "incomplete_native_rows": 0,
+            }),
         "self-check reports incomplete history: {self_check}"
     );
 

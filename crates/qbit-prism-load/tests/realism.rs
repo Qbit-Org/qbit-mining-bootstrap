@@ -837,6 +837,7 @@ fn the_gate_passes_a_clean_run_and_fails_each_way_a_run_can_fall_short() {
         max_rejected_valid_shares: None,
         max_unanswered_submits: None,
         tip_last_notify_p99_ms: Some(5000.0),
+        tip_last_notify_median_ms: None,
         d1_verdict_table: false,
         churn_tip_last_notify_p99_ms: None,
         new_session_first_job_p99_ms: None,
@@ -911,6 +912,177 @@ fn nearest_rank_percentiles_are_observed_values() {
     assert_eq!(gate::nearest_rank(&[5.0, 1.0, 9.0], 0.99), Some(9.0));
 }
 
+/// #790: the p99 of 3 tips is their slowest, so one slow tip on a busy
+/// runner failed the real-node smoke. Its median holds most tips to 5 s, and
+/// the p99 with headroom still fails a stalled or unserved tip.
+#[test]
+fn a_few_tips_are_gated_on_their_median_and_a_stall_on_the_p99_with_headroom() {
+    let budgets = gate::Budgets {
+        tip_last_notify_p99_ms: Some(10_000.0),
+        tip_last_notify_median_ms: Some(5000.0),
+        ..gate_budgets()
+    };
+    let with_tips = |times: &[f64]| {
+        let mut report = passing_report();
+        report["time_to_usable_work"]["tips"] = times
+            .iter()
+            .map(|ms| json!({"all_sessions_milliseconds": ms}))
+            .collect();
+        report
+    };
+    let row = |checks: &[gate::Check], statistic: &str| {
+        checks
+            .iter()
+            .find(|c| c.name == format!("tip to last session's notify, {statistic} over tips"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {statistic} row"))
+    };
+    // The two flaky failures' slowest tips beside passing runs' others.
+    for slowest in [6665.0, 5315.0] {
+        let checks = gate::evaluate(&with_tips(&[1500.0, slowest, 2600.0]), Some(0), &budgets);
+        assert!(gate::passed(&checks), "{}", gate::markdown("x", &checks));
+        assert_eq!(
+            row(&checks, "median").observed,
+            format!("2600 ms over 3 tips (max {slowest:.0} ms)")
+        );
+        assert_eq!(row(&checks, "median").budget, "<= 5000 ms");
+    }
+    // A frontend that stalls one tip past the headroom still fails.
+    let stalled = gate::evaluate(&with_tips(&[1500.0, 10_001.0, 2600.0]), Some(0), &budgets);
+    assert!(!gate::passed(&stalled));
+    assert_eq!(row(&stalled, "p99").pass, Some(false));
+    assert_eq!(row(&stalled, "median").pass, Some(true));
+    // One slow on most tips fails the median, inside the p99's headroom.
+    let slow = gate::evaluate(&with_tips(&[5200.0, 1500.0, 6000.0]), Some(0), &budgets);
+    assert!(!gate::passed(&slow));
+    assert_eq!(row(&slow, "median").pass, Some(false));
+    assert_eq!(row(&slow, "p99").pass, Some(true));
+    // A tip some session never got work on fails both rows, unmeasured.
+    let mut unserved = with_tips(&[1500.0, 1600.0, 1700.0]);
+    unserved["time_to_usable_work"]["tips"][2] = json!({"all_sessions_milliseconds": null,
+        "all_sessions_unavailable_reason": "3 of 50 sessions got no usable work"});
+    let checks = gate::evaluate(&unserved, Some(0), &budgets);
+    for statistic in ["p99", "median"] {
+        let row = row(&checks, statistic);
+        assert_eq!(row.pass, Some(false), "{statistic}");
+        assert!(
+            row.observed.starts_with("unmeasured: tip 2: 3 of 50"),
+            "{row:?}"
+        );
+    }
+    // Absent, the median is neither gated nor reported, and the p99 alone
+    // gates as before.
+    let p99_only = gate::Budgets {
+        tip_last_notify_p99_ms: Some(5000.0),
+        ..gate_budgets()
+    };
+    let checks = gate::evaluate(&with_tips(&[1500.0, 6665.0, 2600.0]), Some(0), &p99_only);
+    assert!(!checks.iter().any(|c| c.name.contains("median")));
+    assert_eq!(row(&checks, "p99").pass, Some(false));
+}
+
+fn gate_budgets() -> gate::Budgets {
+    gate::Budgets {
+        phases: None,
+        max_shortfall: 0,
+        max_rejected_valid_shares: None,
+        max_unanswered_submits: None,
+        tip_last_notify_p99_ms: None,
+        tip_last_notify_median_ms: None,
+        d1_verdict_table: false,
+        churn_tip_last_notify_p99_ms: None,
+        new_session_first_job_p99_ms: None,
+    }
+}
+
+/// Only the real-node smoke sets the optional median key (#790); every
+/// other preset leaves it absent, which loads as not gated, and a budget
+/// that is not finite and positive is refused like the others.
+#[test]
+fn only_the_real_node_smoke_gates_the_tip_median() -> Result<()> {
+    for loaded in preset::load_all(&preset::presets_dir())? {
+        let budgets = gate::Budgets::from(&loaded.gates);
+        if loaded.name == "real-node-smoke" {
+            assert_eq!(budgets.tip_last_notify_median_ms, Some(5000.0));
+            assert_eq!(budgets.tip_last_notify_p99_ms, Some(10_000.0));
+        } else {
+            assert_eq!(budgets.tip_last_notify_median_ms, None, "{}", loaded.name);
+        }
+    }
+    let source = preset::presets_dir().join("real-node-smoke.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&source)?)?;
+    let dir = std::env::temp_dir().join(format!("prism-load-median-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let copy = dir.join("real-node-smoke.json");
+    let mut refused = Vec::new();
+    for budget in [json!(0), json!(-1.0)] {
+        file["gates"]["tip_last_notify_median_budget_ms"] = budget;
+        std::fs::write(&copy, serde_json::to_vec(&file)?)?;
+        refused.push(preset::Preset::load(&copy).map(|_| ()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    for result in refused {
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("tip_last_notify_median_budget_ms must be finite and positive"),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+/// A failed smoke prints where each tip's time went (#790): the slowest tip
+/// marked, its mint and the pool node's sighting, each frontend's figures,
+/// an unserved tip's reason, and the node's RPC latencies.
+#[test]
+fn the_tip_timeline_names_the_slowest_tip_and_where_its_time_went() {
+    let mut report = passing_report();
+    let tip = |hash: &str, slowest: f64, replaced: Value| {
+        json!({"tip": hash, "height": 120, "origin": "external",
+            "minted_at": "2026-10-26T10:00:00+00:00", "replaced_after_milliseconds": replaced,
+            "sessions_with_work": 50, "sessions_total": 50,
+            "latency_milliseconds": {"samples": 50, "min": 900.0, "p50": 1200.0, "max": slowest},
+            "all_sessions_milliseconds": slowest,
+            "by_frontend": [{"frontend": 0, "latency_milliseconds":
+                {"samples": 50, "min": 900.0, "p50": 1200.0, "max": slowest}}]})
+    };
+    report["time_to_usable_work"]["tips"] = json!([
+        tip("aa", 1500.0, json!(30_000.0)),
+        tip("bb", 6665.0, Value::Null)
+    ]);
+    report["node"] = json!({
+        "mints": [{"hash": "bb", "requested_at": "2026-10-26T09:59:59+00:00",
+                   "mint_milliseconds": 40.0, "seen_on_pool_node_milliseconds": 310.0}],
+        "relay": {"rpc_latency_milliseconds": {
+            "getblocktemplate": {"count": 12, "p50": 8.0, "p99": 4100.0, "max": 4100.0}}},
+    });
+    let text = gate::tip_timeline(&report);
+    for needle in [
+        "tip 0: height 120 (external) aa",
+        "replaced by the next tip: after 30000 ms",
+        "tip 1 (slowest): height 120 (external) bb",
+        "mint: requested 2026-10-26T09:59:59+00:00, took 40 ms, seen on the pool node 310 ms",
+        "first session 900 ms, median 1200 ms, slowest 6665 ms; 50 of 50 sessions",
+        "frontend 0: 50 sessions, first 900 ms, median 1200 ms, slowest 6665 ms",
+        "replaced by the next tip: never",
+        "getblocktemplate: 12, 8.0 / 4100.0 / 4100.0",
+    ] {
+        assert!(text.contains(needle), "{needle}:\n{text}");
+    }
+    assert_eq!(text.matches("mint:").count(), 1, "{text}");
+    // An unserved tip has no slowest figure: its reason, and no tip marked.
+    report["time_to_usable_work"]["tips"][1]["all_sessions_milliseconds"] = Value::Null;
+    report["time_to_usable_work"]["tips"][1]["all_sessions_unavailable_reason"] =
+        json!("2 of 50 sessions got no usable work");
+    let text = gate::tip_timeline(&report);
+    assert!(
+        text.contains("slowest unmeasured (2 of 50 sessions got no usable work)"),
+        "{text}"
+    );
+    assert!(!text.contains("(slowest)"), "{text}");
+    assert!(gate::tip_timeline(&json!({})).contains("no time_to_usable_work.tips"));
+}
+
 #[test]
 fn the_473_rule_gates_only_the_named_phases_and_each_of_its_three_figures() {
     let mut report = passing_report();
@@ -926,6 +1098,7 @@ fn the_473_rule_gates_only_the_named_phases_and_each_of_its_three_figures() {
         max_rejected_valid_shares: Some(0),
         max_unanswered_submits: Some(0),
         tip_last_notify_p99_ms: None,
+        tip_last_notify_median_ms: None,
         d1_verdict_table: true,
         churn_tip_last_notify_p99_ms: None,
         new_session_first_job_p99_ms: None,
