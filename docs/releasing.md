@@ -73,10 +73,19 @@ git fetch origin main --tags
 git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
 git verify-tag v<version>
 git push origin refs/tags/v<version>
-git show v<version>:doc/release-notes-<version>.md > /tmp/qbit-release-notes.md
+git show v<version>:doc/release-notes-<version>.md | sed -E \
+  -e 's#\]\(\.\./#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/#g' \
+  -e 's#\]\(([^)#/:][^):]*)\)#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/doc/\1)#g' \
+  > /tmp/qbit-release-notes.md
 gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
   --notes-file /tmp/qbit-release-notes.md
 ```
+
+The `sed` points each inline relative link in the notes, `](path)`, at the
+tagged file, since a GitHub release body can't resolve one relative to the
+notes; `](#...)` anchors, absolute `](/...)` paths and URLs stay as they are.
+It doesn't handle reference-style links or link titles, so keep release
+notes to inline links without titles.
 
 Pushing a `v*` tag also runs the L3 production-window matrix
 (`prism-load-l3.yml`), which promotes the promotion PR's run on the same tree
