@@ -397,10 +397,11 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
     beforehand with `SELECT has_parameter_privilege('deadlock_timeout',
     'SET')` or `rolsuper`. A migrate role without either waits the pass out
     attempt by attempt, warns `an autovacuum worker holds a table the
-    migration must lock, and this role may not lower its deadlock_timeout`
-    once it sees one, and if it is refused, the refusal names the worker:
-    grant the parameter, or an
-    administrator runs `SELECT pg_cancel_backend(<pid>)` (a superuser since
+    migration must lock. This role may not lower its deadlock_timeout` once
+    it sees one (`Whether this role may lower its deadlock_timeout could not
+    be checked` where `migrate` could not ask, which it then asks again at
+    the next contention), and if it is refused, the refusal names the
+    worker: grant the parameter, or an administrator runs `SELECT pg_cancel_backend(<pid>)` (a superuser since
     CVE-2023-5870's fix in 16.1, 15.5 and 14.10, and from PostgreSQL 18 a
     member of `pg_signal_autovacuum_worker`), or keeps autovacuum off its
     table (the partition, for the share ledger) with `ALTER TABLE <table>
