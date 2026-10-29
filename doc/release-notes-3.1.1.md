@@ -104,11 +104,23 @@ changes below.
   whole migration transaction back and tries again, backing off from 100 ms
   to 2 s, for up to ten minutes. 027's and 028's SQL is unchanged. Past ten
   minutes it stops, records nothing, and names up to five holding
-  transactions. Every connect that migrates takes the migration history's
-  lock the same way, so a start with `PRISM_POSTGRES_INIT_SCHEMA=1` that
-  can't take it now retries for up to ten minutes, warning on the first
-  attempt and every tenth, where it failed after
-  `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
+  transactions. PostgreSQL cancels an autovacuum pass that blocks a lock
+  request only from the waiter's deadlock check after `deadlock_timeout`
+  (1 s), which no 100 ms attempt reaches, so from its second attempt on
+  `migrate` lowers its own `deadlock_timeout` to 50 ms for its lock
+  requests only: PostgreSQL then cancels the worker blocking them, unless
+  the pass prevents wraparound, as it did for 3.1.0's 027. The rest of the
+  transaction, and every frontend, keeps its own `deadlock_timeout`.
+  Lowering it takes a superuser, or from PostgreSQL 15 `SET` on the
+  parameter, which `migrate` asks only after contention; a role without
+  either waits a blocking pass out, warns once it sees an autovacuum
+  worker, and its refusal names the worker and the remedies. The 100 ms
+  bound holds for frontends on the primary only: a hot standby replays the
+  locks each attempt took. Every connect that migrates takes the migration
+  history's lock the same way, so a start with
+  `PRISM_POSTGRES_INIT_SCHEMA=1` that can't take it now retries for up to
+  ten minutes, warning on the first attempt and every tenth, where it failed
+  after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
   ([the migration guide](../docs/prism-rust-migration.md#supported-2xx-source-schemas)).
 
 ### Database TLS: the vendored sqlx-core
@@ -393,12 +405,45 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
     027 and 028 committed 372 and 558 ms after `migrate` started, and no
     share waited over 39 ms for its answer;
   - while another transaction holds one of the tables for long, each retry
-    queues the frontends behind its request for up to 100 ms, so they see
-    repeated short queues rather than one long one or a deadlock;
+    queues the frontends on the primary behind its request for up to
+    100 ms, so they see repeated short queues rather than one long one or a
+    deadlock;
+  - while an autovacuum pass holds one of the tables or a share ledger
+    partition, PostgreSQL cancels it from the next attempt it blocks
+    (`canceling autovacuum task` in the server log), because from the
+    second attempt on the migrate's lock requests lower its own
+    `deadlock_timeout` to 50 ms; it never cancels an anti-wraparound
+    vacuum. With `log_lock_waits` on, each request that waits past 50 ms
+    logs the wait. Lowering it takes a superuser, or from PostgreSQL 15
+    `GRANT SET ON PARAMETER deadlock_timeout TO <role>`; check the role
+    beforehand with `SELECT has_parameter_privilege('deadlock_timeout',
+    'SET')` or `rolsuper`. A migrate role without either waits the pass out
+    attempt by attempt, warns `an autovacuum worker holds a table the
+    migration must lock. This role may not lower its deadlock_timeout` once
+    it sees one (`Whether this role may lower its deadlock_timeout could not
+    be checked` where `migrate` could not ask, which it then asks again at
+    the next contention), and if it is refused, the refusal names the
+    worker: grant the parameter, or an administrator runs `SELECT pg_cancel_backend(<pid>)` (a superuser since
+    CVE-2023-5870's fix in 16.1, 15.5 and 14.10, and from PostgreSQL 18 a
+    member of `pg_signal_autovacuum_worker`), or keeps autovacuum off its
+    table (the partition, for the share ledger) with `ALTER TABLE <table>
+    SET (autovacuum_enabled = off)` until the migrate is done, then `ALTER
+    TABLE <table> RESET (autovacuum_enabled)`; let an anti-wraparound
+    vacuum finish;
+  - the 100 ms bound is for the primary. Each attempt that took some of its
+    locks before giving up is replayed on every hot standby, so a reader
+    there, the public-read replica `prism-public-api` reads included, can
+    stall for up to that standby's `max_standby_streaming_delay` at each
+    retry, or be cancelled with `canceling statement due to conflict with
+    recovery`, and a primary that waits for a standby's apply
+    (`synchronous_commit = remote_apply`) waits for that replay too. Run
+    the pre-migrate while public traffic is low, or point the public API at
+    the primary for the window;
   - if the locks can't be taken for ten minutes, `migrate` stops with
     `refusing to wait any longer for the table locks of migration 27, 28`,
-    changes nothing, and names the holding transactions: end them, or stop
-    the frontends, and migrate again.
+    changes nothing, and names the holding transactions and autovacuum
+    workers: end the transactions, or stop the frontends, deal with the
+    workers as above, and migrate again.
 
   3.0.0 and rc.6 append with the same statement as 3.1.0, so while 3.0 and
   3.1.1 frontends serve one database, the clock caveat above applies to them
