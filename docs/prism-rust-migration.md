@@ -715,12 +715,22 @@ table 027 and 028 alter, the share ledger's partitions included, in one
 statement that waits at most 100 ms in all, and only then runs the two files:
 catalog changes, three small index builds and 028's check, then the commit.
 The statement takes the tables in order and keeps those it has while it waits
-for the next, but for those 100 ms at most, so a frontend statement waits
-behind it at most that long, well under PostgreSQL's 1 s `deadlock_timeout`
-and the 500 ms lock timeout of rc.6's metrics collector, and the migration
-gives up any lock cycle with a frontend within it, long before PostgreSQL
-would break the cycle by aborting one side (#789). That holds only while the
-bound stays well under `deadlock_timeout` and every frontend lock timeout. The migration history's lock, which every migration transaction takes
+for the next, but for those 100 ms at most, so a frontend statement on the
+primary waits behind it at most that long, well under PostgreSQL's 1 s
+`deadlock_timeout` and the 500 ms lock timeout of rc.6's metrics collector,
+and the migration gives up any lock cycle with a frontend within it, long
+before PostgreSQL would break the cycle by aborting one side (#789). That
+holds only while the bound stays well under `deadlock_timeout` and every
+frontend lock timeout, and only on the primary. Each attempt that takes some
+of its ACCESS EXCLUSIVE locks before it gives up writes them to the WAL, and
+a hot standby replays them: while a contended pre-migrate retries, a reader
+on a hot standby, the public-read replica `prism-public-api` reads included,
+can stall for up to that standby's `max_standby_streaming_delay` at each
+retry, not 100 ms, or be cancelled with `canceling statement due to conflict
+with recovery`, and a primary that waits for a standby's apply
+(`synchronous_commit = remote_apply`) waits for that replay too. Run the
+pre-migrate while public traffic is low, or point the public API at the
+primary for the window. The migration history's lock, which every migration transaction takes
 first and a starting frontend's read waits for, is taken within the same
 100 ms. Because every table is locked first, the share ledger and
 `qbit_prism_share_hashes`, which 027 alters last, are held from the start of
@@ -738,7 +748,25 @@ PostgreSQL aborts the request as a deadlock (possible only with a
 transaction rolls back, holding nothing, and `migrate` tries again from the
 start after a backoff of 100 ms doubling to 2 s, for up to ten minutes.
 Nothing is recorded before the commit, so each attempt plans afresh from what
-it finds. Every connect that migrates goes through this, a start with
+it finds. Autovacuum may hold one of the tables too, and stopping the frontends doesn't
+stop it: a pass over a share ledger partition, `qbit_prism_share_hashes` or
+`qbit_prism_jobs` can last minutes, and PostgreSQL cancels an autovacuum
+worker that blocks a lock request only after `deadlock_timeout`, which no
+100 ms attempt reaches. So after each attempt that gives up, `migrate` cancels
+with `pg_cancel_backend` every autovacuum worker that holds one of those
+tables or partitions, and logs `cancelled autovacuum worker pid <pid> on
+<table>` at WARN, as PostgreSQL itself cancelled such a worker when 3.1.0's
+027 waited past `deadlock_timeout`. It never cancels a client backend, an
+anti-wraparound vacuum (`(to prevent wraparound)` in its query), or a worker
+whose query the migrate role can't see (seeing it takes a superuser or
+`pg_read_all_stats`). Before PostgreSQL 18 only a superuser may cancel an
+autovacuum worker, and from 18 a member of `pg_signal_autovacuum_worker` too;
+where PostgreSQL refuses, `migrate` warns once and keeps trying the locks.
+The cancel locks none of the tables and runs within the backoff. While a client
+transaction holds one of the tables as well, each autovacuum pass on them,
+about one `autovacuum_naptime` (1 min by default) apart, is cancelled in turn
+until `migrate` gets the locks or stops; autovacuum resumes on them after.
+Every connect that migrates goes through this, a start with
 `PRISM_POSTGRES_INIT_SCHEMA=1` included, and on a fully migrated database too,
 since each takes the history's lock: a start that could not take it used to
 fail after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s), and now tries again for up
@@ -752,7 +780,16 @@ transactions from `pg_locks` and `pg_stat_activity`, longest open first, each
 once with the tables it holds (a partition's lock counted as its table's), or
 with `the table locks of the migration history` and
 `qbit_prism_schema_migrations` when the history was held: end those
-transactions, or stop the frontends, and migrate again. Its three indexes are
+transactions, or stop the frontends, and migrate again. It names an
+autovacuum worker as `autovacuum worker pid <pid> on <table>: <query>`, the
+partition by its own name, or with `its query hidden from this role, so
+whether it is an anti-wraparound vacuum is unknown`, and then says how many
+passes `migrate` cancelled and, where PostgreSQL refused, why. For a worker,
+an administrator runs `SELECT pg_cancel_backend(<pid>)`, or keeps autovacuum
+off that table with `ALTER TABLE <table> SET (autovacuum_enabled = off)` until
+the migrate is done, then `ALTER TABLE <table> RESET (autovacuum_enabled)`;
+an anti-wraparound vacuum comes back however it is stopped, so let it finish,
+and migrate again. Its three indexes are
 small: two are partial, over rows written after 027 only, and the third is
 `qbit_prism_jobs (origin_node, expires_at)` for the dual-mode expiry prune,
 built in the transaction over a table the expiry prune keeps to its unexpired

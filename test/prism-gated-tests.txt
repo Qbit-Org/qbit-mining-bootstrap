@@ -867,7 +867,9 @@ qbit-prism-server::qbit_prism_server::ledger::migration::share_hashes::postgres_
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_deadlock_abort_of_the_up_front_request_is_contention
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_history_read_held_past_the_deadline_is_refused_like_the_tables
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::a_migrate_that_cannot_lock_027s_tables_by_its_deadline_names_the_holder_and_changes_nothing
+qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::an_autovacuum_pass_the_role_may_not_cancel_is_named_in_the_refusal
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::once_it_holds_their_tables_027_and_028_wait_for_no_other_lock
+qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::the_migrate_cancels_an_autovacuum_pass_holding_a_share_ledger_partition
 qbit-prism-server::qbit_prism_server::ledger::migration::table_locks::postgres_tests::while_it_waits_for_their_tables_the_migrate_holds_nothing_else_a_frontend_needs
 qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::a_dual_writer_snapshot_refuses_without_the_origin_index
 qbit-prism-server::qbit_prism_server::ledger::window::cut::dual_writer_tests::a_peer_clock_running_ahead_only_delays_its_newest_rows
