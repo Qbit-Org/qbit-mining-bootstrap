@@ -105,19 +105,19 @@ changes below.
   to 2 s, for up to ten minutes. 027's and 028's SQL is unchanged. Past ten
   minutes it stops, records nothing, and names up to five holding
   transactions. PostgreSQL cancels an autovacuum pass that blocks a lock
-  request only after its 1 s `deadlock_timeout`, which no 100 ms attempt
-  reaches, so after each attempt that gives up `migrate` cancels every
-  autovacuum worker holding one of those tables or a share ledger
-  partition, logging each at WARN, as PostgreSQL did for 3.1.0's 027. It
-  never cancels a client backend, an anti-wraparound vacuum, or a worker
-  whose query its role can't see; where PostgreSQL refuses the cancel it
-  keeps trying, and the refusal names the worker and how to stop it. The
-  100 ms bound holds for frontends on the primary only: a hot standby
-  replays the locks each attempt took. Every connect that migrates takes
-  the migration history's lock the same way, so a start with
-  `PRISM_POSTGRES_INIT_SCHEMA=1` that can't take it now retries for up to
-  ten minutes, warning on the first attempt and every tenth, where it failed
-  after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
+  request only from the waiter's deadlock check after `deadlock_timeout`
+  (1 s), which no 100 ms attempt reaches, so each attempt lowers its own
+  `deadlock_timeout` to 50 ms: PostgreSQL then cancels the worker blocking
+  it, unless the pass prevents wraparound, as it did for 3.1.0's 027.
+  Frontends keep their own `deadlock_timeout`. Lowering it takes a
+  superuser, or from PostgreSQL 15 `SET` on the parameter; a role without
+  either warns once, waits a blocking pass out, and its refusal names the
+  worker and the remedies. The 100 ms bound holds for frontends on the
+  primary only: a hot standby replays the locks each attempt took. Every
+  connect that migrates takes the migration history's lock the same way, so
+  a start with `PRISM_POSTGRES_INIT_SCHEMA=1` that can't take it now retries
+  for up to ten minutes, warning on the first attempt and every tenth, where
+  it failed after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
   ([the migration guide](../docs/prism-rust-migration.md#supported-2xx-source-schemas)).
 
 ### Database TLS: the vendored sqlx-core
@@ -384,20 +384,22 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
     100 ms, so they see repeated short queues rather than one long one or a
     deadlock;
   - while an autovacuum pass holds one of the tables or a share ledger
-    partition, `migrate` cancels it after the attempt it blocked and logs
-    `cancelled autovacuum worker pid <pid> on <table>`; while something
-    else holds the tables too, autovacuum on them is cancelled about once
-    per `autovacuum_naptime` (1 min by default) until `migrate` gets them
-    or stops. It never cancels an anti-wraparound vacuum. Before
-    PostgreSQL 18 only a superuser may cancel an autovacuum worker (from
-    18, a member of `pg_signal_autovacuum_worker` too), and telling an
-    anti-wraparound vacuum apart takes a superuser or `pg_read_all_stats`.
-    A migrate role without them keeps trying, and the refusal names the
-    worker: an administrator runs `SELECT pg_cancel_backend(<pid>)`, or
-    keeps autovacuum off its table (the partition, for the share ledger)
-    with `ALTER TABLE <table> SET (autovacuum_enabled = off)` until the
-    migrate is done, then `ALTER TABLE <table> RESET (autovacuum_enabled)`;
-    let an anti-wraparound vacuum finish;
+    partition, PostgreSQL cancels it from the attempt it blocks
+    (`canceling autovacuum task` in the server log), because each attempt
+    lowers the migrate's own `deadlock_timeout` to 50 ms; it never cancels
+    an anti-wraparound vacuum. With `log_lock_waits` on, each attempt that
+    waits past 50 ms logs the wait. Lowering it takes a superuser, or from
+    PostgreSQL 15 `GRANT SET ON PARAMETER deadlock_timeout TO <role>`. A
+    migrate role without either warns `this role may not lower its
+    deadlock_timeout`, waits the pass out attempt by attempt, and if it is
+    refused, the refusal names the worker: grant the parameter, or an
+    administrator runs `SELECT pg_cancel_backend(<pid>)` (a superuser since
+    CVE-2023-5870's fix in 16.1, 15.5 and 14.10, and from PostgreSQL 18 a
+    member of `pg_signal_autovacuum_worker`), or keeps autovacuum off its
+    table (the partition, for the share ledger) with `ALTER TABLE <table>
+    SET (autovacuum_enabled = off)` until the migrate is done, then `ALTER
+    TABLE <table> RESET (autovacuum_enabled)`; let an anti-wraparound
+    vacuum finish;
   - the 100 ms bound is for the primary. Each attempt that took some of its
     locks before giving up is replayed on every hot standby, so a reader
     there, the public-read replica `prism-public-api` reads included, can
