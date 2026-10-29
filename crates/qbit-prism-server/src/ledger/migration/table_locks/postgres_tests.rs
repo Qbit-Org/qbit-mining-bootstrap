@@ -494,6 +494,73 @@ async fn a_deadlock_abort_of_the_up_front_request_is_contention() -> Result<()> 
     finish(db, result).await
 }
 
+/// Where the run lowers `deadlock_timeout` but this role may not, after all
+/// (its grant revoked mid-run, a `SET ROLE`), the refused `SET` is
+/// `CannotLower`, which `committed_within` runs again without lowering, not
+/// a failure of the migrate; without lowering the same role sets its other
+/// timeouts as before, and only the table is refused it.
+#[tokio::test]
+async fn a_lowered_deadlock_timeout_refused_to_the_role_is_cannot_lower() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = refused_lowering(&db).await;
+    finish(db, result).await
+}
+
+async fn refused_lowering(db: &Database) -> Result<()> {
+    let role = format!("prism_cannot_lower_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {role} NOLOGIN"))
+        .execute(&db.admin)
+        .await?;
+    let tried = async {
+        let mut connection = PgConnection::connect(&db.url).await?;
+        let mut outcomes = Vec::new();
+        for lower in [true, false] {
+            let mut tx = connection.begin().await?;
+            sqlx::query(&format!("SET LOCAL ROLE {role}"))
+                .execute(&mut *tx)
+                .await?;
+            let error = LOWER_DEADLOCK_TIMEOUT
+                .scope(
+                    lower,
+                    lock_within_attempt(
+                        &mut tx,
+                        "LOCK TABLE qbit_prism_templates IN ACCESS EXCLUSIVE MODE",
+                        Locking::Migrations(vec![27]),
+                        vec!["qbit_prism_templates"],
+                        "the test's request".to_owned(),
+                    ),
+                )
+                .await
+                .err()
+                .context("the role locked a table it has no privilege on")?;
+            tx.rollback().await?;
+            outcomes.push(error);
+        }
+        connection.close().await?;
+        Ok::<_, anyhow::Error>(outcomes)
+    }
+    .await;
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&db.admin)
+        .await?;
+    let outcomes = tried?;
+    ensure!(
+        outcomes[0].downcast_ref::<CannotLower>().is_some(),
+        "a refused lowered SET was not CannotLower: {:#}",
+        outcomes[0]
+    );
+    ensure!(
+        outcomes[1].downcast_ref::<CannotLower>().is_none()
+            && outcomes[1].downcast_ref::<LockContention>().is_none()
+            && format!("{:#}", outcomes[1]).starts_with("the test's request: "),
+        "{:#}",
+        outcomes[1]
+    );
+    Ok(())
+}
+
 /// Where the run lowers `deadlock_timeout` (`LOWER_DEADLOCK_TIMEOUT`), the
 /// request itself is checked for a deadlock after `DEADLOCK_CHECK`, with no
 /// lowering of its own, so the same cycle is broken within the attempt by
@@ -851,7 +918,7 @@ impl Pass {
 /// attempt waits long enough for PostgreSQL's 1 s deadlock check to cancel,
 /// so every attempt used to give up on it until the deadline: a superuser's
 /// migrate lowers its own `deadlock_timeout`, PostgreSQL cancels the pass
-/// from the first attempt's deadlock check, and 27 and 28 are applied.
+/// from the second attempt's deadlock check, and 27 and 28 are applied.
 #[tokio::test]
 async fn the_migrate_cancels_an_autovacuum_pass_holding_a_share_ledger_partition() -> Result<()> {
     let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
@@ -920,9 +987,10 @@ async fn named_then_granted(cluster: &Cluster, pass: &Pass) -> Result<()> {
     );
     let logs = log.text();
     ensure!(
-        logs.matches("this role may not lower its deadlock_timeout")
+        logs.matches("an autovacuum worker holds a table the migration must lock")
             .count()
             == 1
+            && logs.contains(&format!("{LOWER_REMEDY}. {AUTOVACUUM_REMEDY}"))
             && logs.contains(&worker),
         "{message}\n{logs}"
     );

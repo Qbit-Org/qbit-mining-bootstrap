@@ -774,11 +774,15 @@ takes a superuser, or from PostgreSQL 15 a role granted `SET` on it
 (`GRANT SET ON PARAMETER deadlock_timeout TO <role>`). `migrate` asks
 which, in one query, only once its first attempt has met contention, so a
 migrate that takes its locks at once, every frontend start on a migrated
-schema included, asks nothing; if the question fails, it does not lower
-the timeout. A role that may not waits a blocking pass out, attempt by
-attempt, as before, and warns `an autovacuum worker holds a table the
-migration must lock, and this role may not lower its deadlock_timeout`,
-naming the worker, only once it sees one among the holders; contention
+schema included, asks nothing. If the question fails, `migrate` does not
+lower the timeout and asks again after the next attempt that meets
+contention; if the setting is refused after all (a grant revoked mid-run),
+it runs that attempt again at once without it and lowers it no more. A
+role that may not waits a blocking pass out, attempt by attempt, as
+before, and warns `an autovacuum worker holds a table the migration must
+lock. This role may not lower its deadlock_timeout`, naming the worker,
+only once it sees one among the holders (`Whether this role may lower its
+deadlock_timeout could not be checked` where it could not ask); contention
 with client transactions alone warns nothing about the privilege. To check
 the migrate role beforehand, run `SELECT rolsuper FROM pg_roles WHERE
 rolname = current_user` or, from PostgreSQL 15, `SELECT
