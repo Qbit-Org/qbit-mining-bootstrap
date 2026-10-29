@@ -461,7 +461,19 @@ arrives, preserving the first eligible write for each acceptance. Completed iden
 are retained as deduplication tombstones until a coherent mature accounting
 checkpoint retires their height. A monotonic height watermark then rejects
 delayed proofs even after the identity is released; unresolved intervals are
-never retired by that checkpoint. Revision events are released when all known
+never retired by that checkpoint, except an open wait that only a write could
+close (a landed wait, known or with an unknown first revision) when no
+authorized Stratum session, the sessions `qbit_prism_authorized_clients`
+counts, existed at any instant since its acceptance (#758). No delivery was
+due, so that checkpoint closes it without a sample and releases its identity.
+An idle backup's waits therefore stay open only until their blocks mature: they
+cannot exhaust identity tracking, latch the tracking-unknown gauge and leave a
+later stall's pending age at -1 once the frontend serves miners after a
+failover. A wait accepted while a miner was connected, or before the Stratum
+listener started, is kept as before, so a real stall still saturates; an
+unlanded acceptance and an unsettled orphan verdict keep their own terminal
+evidence, and a wait whose settlement reply is still out retires only at a
+checkpoint after that reply. Revision events are released when all known
 deliveries resolve. While waits are open, revisions below the lowest one an
 open wait may still need are released (#758): a bound or covered wait has
 been matched against every recorded write, and a later write below the newest
@@ -497,7 +509,8 @@ confirmation that commits without a bump (the fatal early return) covers it
 only from the next revision, because work at its own revision may predate the
 landing. A delayed local first confirmation still in flight takes precedence
 and measures the exact revision. A frontend with no miners writes nothing, so
-it keeps such a wait unknown until a miner receives work. Only
+it keeps such a wait unknown until a miner receives work, or, if none was
+connected since its acceptance, until the mature checkpoint retires it. Only
 a newly observed already-confirmed peer block may begin at its current local
 proof revision; a later proof cannot upgrade an earlier unresolved acceptance.
 Universal exactly-once reporting beyond these knowledge/capacity boundaries

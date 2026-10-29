@@ -192,7 +192,13 @@ changes below.
   longer keeps a block's wait unknown until restart when another settlement
   confirmed the block first (a peer's, or its own attempt whose reply was
   lost): its own later settlement proves a covering revision, and its next
-  write at or above it ends the wait without a sample.
+  write at or above it ends the wait without a sample. Nor can an idle
+  frontend's waits exhaust its 4,096 tracked block identities any longer:
+  once a block matures, a wait that no authorized miner was connected to
+  receive since its acceptance ends without a sample. Before, an idle
+  backup latched tracking unknown after about 4,096 pool blocks, and after
+  a failover `PrismAcceptedRevisionWorkPendingCritical` could not page on
+  it until it restarted.
 
 ### Tests and CI only
 

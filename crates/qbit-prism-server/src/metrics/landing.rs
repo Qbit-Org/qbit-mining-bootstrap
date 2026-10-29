@@ -8,7 +8,10 @@
 //! restart, rather than silently recounting a delayed duplicate. A restart
 //! begins a new local knowledge horizon; no peer acceptance clock is inferred.
 //! Revisions no open wait can still need are released, so waits left open on
-//! a frontend that writes nothing cannot exhaust that history (#758).
+//! a frontend that writes nothing cannot exhaust that history (#758). Behind
+//! the same checkpoint, a wait only a write could close retires unmeasured
+//! when no authorized session existed since its acceptance, so such waits
+//! cannot exhaust the identities either and leave a later stall at -1.
 use super::{Family, Labels, Metrics, Registry, RevisionWorkResult};
 use std::collections::{BTreeMap, HashMap};
 use tokio::time::Instant;
@@ -55,6 +58,9 @@ struct Acceptance {
     /// Revisions below this were released while the wait was open: a first
     /// revision below it can no longer find its first write.
     history_from: i64,
+    /// This acceptance's place in `acceptance_epoch`, compared with
+    /// `Landing::attended_through`.
+    epoch: u64,
 }
 
 impl Acceptance {
@@ -157,6 +163,15 @@ pub(super) struct Landing {
     terminal_observation: u64,
     terminal_completed: u64,
     terminal_failed: bool,
+    /// Whether the Stratum listener reports its authorized sessions. Until
+    /// it does, any acceptance may have had a miner to write to.
+    sessions_tracked: bool,
+    /// Authorized Stratum sessions, as their observations report them: the
+    /// sessions `qbit_prism_authorized_clients` counts.
+    sessions: usize,
+    /// Acceptances up to this `acceptance_epoch` had an authorized session,
+    /// or untracked sessions, at some instant after them.
+    attended_through: u64,
 }
 
 impl Landing {
@@ -440,6 +455,42 @@ impl Landing {
             block.history_from = block.history_from.max(keep_from);
         }
     }
+
+    /// Close, without a sample, the open waits at or below `floor` that only
+    /// a write could close but that no authorized session existed to receive
+    /// since their acceptance, as on an idle backup: no delivery was due, so
+    /// there is nothing to measure. Left open, they would hold identities
+    /// until saturation hid every later wait at -1. A wait a miner may have
+    /// needed stays, so a real stall still saturates; an unlanded acceptance
+    /// or an unsettled orphan verdict ends without a write either way. A wait
+    /// with a settlement observer still out stays until it reports, which
+    /// must find it open, and retires at a later checkpoint.
+    ///
+    /// Nothing is left to release: a retired wait pins no revision history.
+    /// With no observer out it keeps no `settling_from`, and a landed wait
+    /// with an unknown first revision has no target (see `resolve`).
+    fn retire_unattended(&mut self, floor: u64) {
+        if !self.sessions_tracked || self.sessions > 0 {
+            return;
+        }
+        let attended_through = self.attended_through;
+        for block in self.blocks.values_mut().filter(|block| {
+            !block.closed
+                && !block.unlanded
+                && !block.orphan_uncertain
+                && block.settling == 0
+                && block.height <= floor
+                && block.epoch > attended_through
+        }) {
+            block.closed = true;
+            block.unknown_revision = false;
+            self.pending_count -= 1;
+        }
+        if !self.pending() {
+            self.revisions.clear();
+            self.delivery_count = 0;
+        }
+    }
 }
 
 impl Metrics {
@@ -552,6 +603,7 @@ impl Metrics {
                 state.saturated = true;
                 return;
             }
+            let epoch = state.acceptance_epoch.saturating_add(1);
             state.blocks.insert(
                 identity,
                 Acceptance {
@@ -569,10 +621,11 @@ impl Metrics {
                     settling: 0,
                     settling_from: i64::MAX,
                     history_from: i64::MIN,
+                    epoch,
                 },
             );
             state.pending_count += 1;
-            state.acceptance_epoch = state.acceptance_epoch.saturating_add(1);
+            state.acceptance_epoch = epoch;
         });
     }
 
@@ -605,15 +658,41 @@ impl Metrics {
     }
 
     /// The existing coherent mature checkpoint ends the history horizon.
-    /// Retain unresolved intervals; reject delayed proofs below the watermark
-    /// even after their completed identity has been released.
+    /// Retain unresolved intervals a miner may have needed, and retire the
+    /// rest unmeasured (#758); reject delayed proofs below the watermark even
+    /// after their identity has been released.
     pub(crate) fn revision_work_matured(&self, height: u64) {
         let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
         state.retired_height = state.retired_height.max(height);
         let floor = state.retired_height;
+        state.retire_unattended(floor);
         state
             .blocks
             .retain(|_, block| !block.closed || block.height > floor);
+    }
+
+    /// The Stratum listener reports its authorized sessions from now on; an
+    /// acceptance before this may have had a miner (#758).
+    pub(crate) fn revision_work_sessions_tracked(&self) {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.sessions_tracked {
+            state.attended_through = state.acceptance_epoch;
+            state.sessions_tracked = true;
+        }
+    }
+
+    /// A Stratum session authorized, as `qbit_prism_authorized_clients`
+    /// counts it: every wait open while it stays may need its write.
+    pub(crate) fn revision_work_session_authorized(&self) {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        state.sessions += 1;
+    }
+
+    /// An authorized session ended. It existed after every acceptance so far.
+    pub(crate) fn revision_work_session_ended(&self) {
+        let mut state = self.landing.lock().unwrap_or_else(|e| e.into_inner());
+        state.attended_through = state.acceptance_epoch;
+        state.sessions = state.sessions.saturating_sub(1);
     }
 
     /// Called immediately after write_all of the complete mining.notify frame
