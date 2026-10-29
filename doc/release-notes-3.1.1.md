@@ -104,11 +104,20 @@ changes below.
   whole migration transaction back and tries again, backing off from 100 ms
   to 2 s, for up to ten minutes. 027's and 028's SQL is unchanged. Past ten
   minutes it stops, records nothing, and names up to five holding
-  transactions. Every connect that migrates takes the migration history's
-  lock the same way, so a start with `PRISM_POSTGRES_INIT_SCHEMA=1` that
-  can't take it now retries for up to ten minutes, warning on the first
-  attempt and every tenth, where it failed after
-  `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
+  transactions. PostgreSQL cancels an autovacuum pass that blocks a lock
+  request only after its 1 s `deadlock_timeout`, which no 100 ms attempt
+  reaches, so after each attempt that gives up `migrate` cancels every
+  autovacuum worker holding one of those tables or a share ledger
+  partition, logging each at WARN, as PostgreSQL did for 3.1.0's 027. It
+  never cancels a client backend, an anti-wraparound vacuum, or a worker
+  whose query its role can't see; where PostgreSQL refuses the cancel it
+  keeps trying, and the refusal names the worker and how to stop it. The
+  100 ms bound holds for frontends on the primary only: a hot standby
+  replays the locks each attempt took. Every connect that migrates takes
+  the migration history's lock the same way, so a start with
+  `PRISM_POSTGRES_INIT_SCHEMA=1` that can't take it now retries for up to
+  ten minutes, warning on the first attempt and every tenth, where it failed
+  after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s)
   ([the migration guide](../docs/prism-rust-migration.md#supported-2xx-source-schemas)).
 
 ### Database TLS: the vendored sqlx-core
@@ -371,12 +380,38 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
     027 and 028 committed 372 and 558 ms after `migrate` started, and no
     share waited over 39 ms for its answer;
   - while another transaction holds one of the tables for long, each retry
-    queues the frontends behind its request for up to 100 ms, so they see
-    repeated short queues rather than one long one or a deadlock;
+    queues the frontends on the primary behind its request for up to
+    100 ms, so they see repeated short queues rather than one long one or a
+    deadlock;
+  - while an autovacuum pass holds one of the tables or a share ledger
+    partition, `migrate` cancels it after the attempt it blocked and logs
+    `cancelled autovacuum worker pid <pid> on <table>`; while something
+    else holds the tables too, autovacuum on them is cancelled about once
+    per `autovacuum_naptime` (1 min by default) until `migrate` gets them
+    or stops. It never cancels an anti-wraparound vacuum. Before
+    PostgreSQL 18 only a superuser may cancel an autovacuum worker (from
+    18, a member of `pg_signal_autovacuum_worker` too), and telling an
+    anti-wraparound vacuum apart takes a superuser or `pg_read_all_stats`.
+    A migrate role without them keeps trying, and the refusal names the
+    worker: an administrator runs `SELECT pg_cancel_backend(<pid>)`, or
+    keeps autovacuum off its table (the partition, for the share ledger)
+    with `ALTER TABLE <table> SET (autovacuum_enabled = off)` until the
+    migrate is done, then `ALTER TABLE <table> RESET (autovacuum_enabled)`;
+    let an anti-wraparound vacuum finish;
+  - the 100 ms bound is for the primary. Each attempt that took some of its
+    locks before giving up is replayed on every hot standby, so a reader
+    there, the public-read replica `prism-public-api` reads included, can
+    stall for up to that standby's `max_standby_streaming_delay` at each
+    retry, or be cancelled with `canceling statement due to conflict with
+    recovery`, and a primary that waits for a standby's apply
+    (`synchronous_commit = remote_apply`) waits for that replay too. Run
+    the pre-migrate while public traffic is low, or point the public API at
+    the primary for the window;
   - if the locks can't be taken for ten minutes, `migrate` stops with
     `refusing to wait any longer for the table locks of migration 27, 28`,
-    changes nothing, and names the holding transactions: end them, or stop
-    the frontends, and migrate again.
+    changes nothing, and names the holding transactions and autovacuum
+    workers: end the transactions, or stop the frontends, deal with the
+    workers as above, and migrate again.
 
   3.0.0 and rc.6 append with the same statement as 3.1.0, so while 3.0 and
   3.1.1 frontends serve one database, the clock caveat above applies to them
