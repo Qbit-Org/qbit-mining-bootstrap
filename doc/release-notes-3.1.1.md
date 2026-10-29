@@ -120,11 +120,20 @@ changes below.
   directory, and `lab/prism/Dockerfile` copies it, so a build from the tag
   needs `vendor/`. CI checks that both lockfiles build the vendored crate
   and that every sqlx-core RustSec advisory is reviewed.
-- **#807 (#713):** `sslmode=verify-ca` accepts a CA-signed certificate issued
-  for another host name, as libpq's `verify-ca` does: it checks the chain,
-  not the name. Before, it refused one, as `verify-full` does. `verify-full`
-  still checks the name. This backports launchbadge/sqlx#3861 into the same
-  vendored crate.
+- **#807 (#713):** `sslmode=verify-ca` behaves as libpq's `verify-ca` does.
+  It checks the server's certificate chain against the root certificates in
+  `sslrootcert` (or `PGSSLROOTCERT`) only, never against the public roots,
+  and it does not check the host name. So it accepts a certificate your CA
+  issued for another host name; before, it refused one, as `verify-full`
+  does. `verify-ca` without `sslrootcert`, or with an `sslrootcert` that
+  holds no certificate, is refused before the TLS handshake, with
+  `sslmode=verify-ca requires sslrootcert` or `holds no certificate`
+  ([Upgrading](#upgrading)). Use `verify-full` wherever the certificate's
+  names match the host you connect to: it is unchanged, and checks the name
+  as well. This backports launchbadge/sqlx#3861 into the same vendored
+  crate, with a local change that is not upstream's: sqlx-core trusts the
+  public roots beside `sslrootcert`, so #3861 alone would have let
+  `verify-ca` accept any publicly issued certificate, for any name.
 
 ### Dual writer
 
@@ -384,6 +393,20 @@ answering 500 for the 2.x audit-bundle.v2 bodies of #731.
   from 3.1.0.
 - **From 2.0.x, or from a 3.0.0 candidate before rc.6:** as the 3.1.0 notes
   say, with 3.1.1 in 3.1.0's place. Its `migrate` applies 032 with the rest.
+
+**If a database URL uses `sslmode=verify-ca` without `sslrootcert`** (or
+`PGSSLROOTCERT`), a 3.1.1 binary refuses to connect with it. This covers
+any URL a 3.1.1 binary or tool connects with, such as `PRISM_DATABASE_URL`,
+`PRISM_PUBLIC_DATABASE_URL` or `PRISM_PEER_DATABASE_URL`. No configuration
+in this repository uses `verify-ca`.
+- **To keep 3.1.0's check, switch the URL to `sslmode=verify-full`** before
+  you replace the binaries. 3.1.0 checked such a connection as `verify-full`
+  does, against the public roots and the host name (#713). `verify-full`
+  behaves the same in 3.1.0, so the change survives a rollback.
+- **To keep `verify-ca`,** for a certificate that does not name the host,
+  set `sslrootcert` to the CA that signs it, at a path the binary can read.
+  3.1.0's `verify-ca` also checks the name, so such a URL works only on
+  3.1.1.
 
 ## Rolling back
 
