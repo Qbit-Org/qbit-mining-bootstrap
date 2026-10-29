@@ -7,11 +7,11 @@
 //! with a serving frontend itself is `ledger_postgres`'s
 //! `premigrate_lock_order`.
 use super::*;
+use crate::coordinator::miner_tests::SharedLog;
 use qbit_prism_test_gate as gate;
 use sqlx::{Connection, PgConnection};
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
 use tracing::instrument::WithSubscriber;
 
 struct Database {
@@ -561,123 +561,102 @@ async fn deadlock_is_contention(db: &Database) -> Result<()> {
 
 /// A PostgreSQL of the test's own, from `PRISM_TEST_PG_BIN_DIR`, whose
 /// autovacuum visits the database every second, which the shared test
-/// database's does not; stopped when dropped.
+/// database's does not. Like `cutover_rehearsal`'s cluster it listens on
+/// loopback TCP only, with no Unix socket, and every role logs in with a
+/// random password, so a shared host's other users cannot reach it;
+/// stopped when dropped, even after a start that failed half way.
 struct Cluster {
     bin: PathBuf,
     dir: tempfile::TempDir,
     port: u16,
-    superuser: String,
+    password: String,
+    running: bool,
 }
 
 impl Cluster {
+    /// The bootstrap superuser.
+    const SUPERUSER: &'static str = "prism";
+
     fn start(bin: String) -> Result<Self> {
-        let superuser = String::from_utf8(Command::new("id").arg("-un").output()?.stdout)?
-            .trim()
-            .to_owned();
-        let cluster = Self {
+        let dir = tempfile::tempdir()?;
+        let password = uuid::Uuid::new_v4().simple().to_string();
+        let password_file = dir.path().join("password");
+        std::fs::write(&password_file, &password)?;
+        // Held until `pg_ctl start`, so initdb's run cannot lose it (#639).
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut cluster = Self {
             bin: bin.into(),
-            dir: tempfile::tempdir()?,
-            port: std::net::TcpListener::bind("127.0.0.1:0")?
-                .local_addr()?
-                .port(),
-            superuser,
+            port: reservation.local_addr()?.port(),
+            dir,
+            password,
+            running: false,
         };
-        let data = cluster.path("data")?;
-        cluster.command(
-            "initdb",
-            &["-D", &data, "-A", "trust", "--no-locale", "-E", "UTF8"],
-        )?;
-        cluster.command(
-            "pg_ctl",
-            &[
-                "-D",
-                &data,
-                "-l",
-                &cluster.path("postgres.log")?,
-                "-o",
-                &format!(
-                    "-h 127.0.0.1 -p {} -k {} -c autovacuum_naptime=1s",
-                    cluster.port,
-                    cluster.path("")?
-                ),
-                "-w",
-                "start",
-            ],
-        )?;
+        let status = Command::new(cluster.bin.join("initdb"))
+            .args(["-U", Self::SUPERUSER, "--auth=scram-sha-256", "-E", "UTF8"])
+            .arg(format!("--pwfile={}", password_file.display()))
+            .arg("-D")
+            .arg(cluster.dir.path().join("data"))
+            .stdout(Stdio::null())
+            .status()?;
+        std::fs::remove_file(&password_file)?;
+        ensure!(status.success(), "initdb failed");
+        // Marked first, so a start that fails half way is still stopped.
+        cluster.running = true;
+        drop(reservation);
+        let status = Command::new(cluster.bin.join("pg_ctl"))
+            .arg("-D")
+            .arg(cluster.dir.path().join("data"))
+            .arg("-l")
+            .arg(cluster.dir.path().join("postgres.log"))
+            .arg("-o")
+            .arg(format!(
+                "-p {} -c listen_addresses=127.0.0.1 -c unix_socket_directories= -c autovacuum_naptime=1s",
+                cluster.port
+            ))
+            .args(["-w", "start"])
+            .stdout(Stdio::null())
+            .status()?;
+        ensure!(
+            status.success(),
+            "pg_ctl start on 127.0.0.1:{} failed: {}",
+            cluster.port,
+            cluster.server_log().unwrap_or_default()
+        );
         Ok(cluster)
     }
 
-    fn path(&self, name: &str) -> Result<String> {
-        Ok(self
-            .dir
-            .path()
-            .join(name)
-            .to_str()
-            .context("a test path that is not UTF-8")?
-            .to_owned())
-    }
-
-    fn command(&self, binary: &str, args: &[&str]) -> Result<()> {
-        let output = Command::new(self.bin.join(binary)).args(args).output()?;
-        ensure!(
-            output.status.success(),
-            "{binary} failed: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
-    }
-
+    /// `role`'s URL; every role this test creates has the cluster's password.
     fn url(&self, role: &str) -> String {
-        format!("postgresql://{role}@127.0.0.1:{}/postgres", self.port)
+        format!(
+            "postgresql://{role}:{}@127.0.0.1:{}/postgres",
+            self.password, self.port
+        )
     }
 
     fn server_log(&self) -> Result<String> {
-        Ok(std::fs::read_to_string(self.path("postgres.log")?)?)
+        Ok(std::fs::read_to_string(
+            self.dir.path().join("postgres.log"),
+        )?)
     }
 }
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        if let Ok(data) = self.path("data") {
-            let _ = self.command("pg_ctl", &["-D", &data, "-m", "immediate", "-w", "stop"]);
+        if self.running {
+            let _ = Command::new(self.bin.join("pg_ctl"))
+                .arg("-D")
+                .arg(self.dir.path().join("data"))
+                .args(["-m", "immediate", "-w", "stop"])
+                .stdout(Stdio::null())
+                .status();
         }
     }
 }
 
-/// What a test logs, read back.
-#[derive(Clone, Default)]
-struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogCapture {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl LogCapture {
-    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
-        let writer = self.clone();
-        tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish()
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
 /// An autovacuum pass holding a share ledger partition, on a ledger in
-/// rc.6's schema that `migrator`, no superuser and no reader of other
-/// roles' activity, owns: the worker's pid and the partition.
+/// rc.6's schema that `migrator` owns: no superuser, no reader of other
+/// roles' activity, and no `SET` on `deadlock_timeout`. The worker's pid and
+/// the partition.
 struct Pass {
     db: Database,
     /// The cluster's superuser, in the ledger's schema.
@@ -692,10 +671,13 @@ impl Pass {
     /// minutes, idle nearly all of it. Once a worker holds a partition,
     /// autovacuum is turned off: that pass runs on, and no other starts.
     async fn start(cluster: &Cluster) -> Result<Self> {
-        let root = PgPool::connect(&cluster.url(&cluster.superuser)).await?;
-        sqlx::raw_sql("CREATE ROLE migrator LOGIN; GRANT CREATE ON DATABASE postgres TO migrator")
-            .execute(&root)
-            .await?;
+        let root = PgPool::connect(&cluster.url(Cluster::SUPERUSER)).await?;
+        sqlx::raw_sql(&format!(
+            "CREATE ROLE migrator LOGIN PASSWORD '{}'; GRANT CREATE ON DATABASE postgres TO migrator",
+            cluster.password
+        ))
+        .execute(&root)
+        .await?;
         let db = Database::open_at(&cluster.url("migrator")).await?;
         let partitions: Vec<(sqlx::postgres::types::Oid, String)> = sqlx::query_as(
             "SELECT relid::oid,relid::regclass::text FROM pg_partition_tree('qbit_share_ledger') WHERE isleaf",
@@ -749,7 +731,7 @@ impl Pass {
             .find_map(|(partition_oid, name)| (partition_oid == oid).then_some(name))
             .context("the worker's partition")?;
         let superuser =
-            PgPool::connect(&in_schema(&cluster.url(&cluster.superuser), &db.schema)?).await?;
+            PgPool::connect(&in_schema(&cluster.url(Cluster::SUPERUSER), &db.schema)?).await?;
         Ok(Self {
             db,
             superuser,
@@ -767,6 +749,38 @@ impl Pass {
         .await?)
     }
 
+    /// The migrate on `pool`, its deadline `budget`, logged to `log`.
+    async fn migrate(pool: &PgPool, budget: Duration, log: &SharedLog) -> Result<()> {
+        committed_within(
+            pool,
+            "table-locks-autovacuum",
+            ShareHashBackfill::Initialize,
+            None,
+            budget,
+        )
+        .with_subscriber(log.dispatch())
+        .await
+        .map(drop)
+    }
+
+    /// After a migrate that took the tables: the pass is gone, PostgreSQL
+    /// logged the cancel it sent from the migrate's deadlock check, and 27
+    /// and 28 are recorded.
+    async fn cancelled(&self, cluster: &Cluster) -> Result<()> {
+        ensure!(!self.running().await?, "the pass outlived the migrate");
+        let server = cluster.server_log()?;
+        ensure!(
+            server.contains("canceling autovacuum task"),
+            "PostgreSQL logged no cancelled autovacuum task: {server}"
+        );
+        let versions = self.db.versions().await?;
+        ensure!(
+            versions.contains(&27) && versions.contains(&28),
+            "{versions:?}"
+        );
+        Ok(())
+    }
+
     /// The cluster goes with the schema, so nothing is dropped.
     async fn close(self) {
         self.superuser.close().await;
@@ -776,10 +790,10 @@ impl Pass {
 }
 
 /// An autovacuum pass holding a share ledger partition, which no 100 ms
-/// attempt waits long enough for PostgreSQL to cancel, so every attempt
-/// gave up on it until the deadline: the migrate, as a superuser, cancels
-/// the pass once an attempt has given up, logs the worker and its
-/// partition, and then applies 27 and 28.
+/// attempt waits long enough for PostgreSQL's 1 s deadlock check to cancel,
+/// so every attempt used to give up on it until the deadline: a superuser's
+/// migrate lowers its own `deadlock_timeout`, PostgreSQL cancels the pass
+/// from the first attempt's deadlock check, and 27 and 28 are applied.
 #[tokio::test]
 async fn the_migrate_cancels_an_autovacuum_pass_holding_a_share_ledger_partition() -> Result<()> {
     let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
@@ -794,43 +808,24 @@ async fn the_migrate_cancels_an_autovacuum_pass_holding_a_share_ledger_partition
 
 async fn cancelled_by_the_migrate(cluster: &Cluster, pass: &Pass) -> Result<()> {
     ensure!(pass.running().await?, "the pass ended before the migrate");
-    let logs = LogCapture::default();
-    committed_within(
-        &pass.superuser,
-        "table-locks-autovacuum",
-        ShareHashBackfill::Initialize,
-        None,
-        Duration::from_secs(20),
-    )
-    .with_subscriber(logs.subscriber())
-    .await
-    .with_context(|| format!("the migrate as a superuser: {}", logs.text()))?;
-    let logs = logs.text();
+    let log = SharedLog::default();
+    Pass::migrate(&pass.superuser, Duration::from_secs(20), &log)
+        .await
+        .with_context(|| format!("the migrate as a superuser: {}", log.text()))?;
     ensure!(
-        logs.contains(&format!(
-            "cancelled autovacuum worker pid {} on {}: it held a table the migration must lock",
-            pass.pid, pass.partition
-        )),
-        "{logs}"
+        !log.text().contains("may not lower its deadlock_timeout"),
+        "{}",
+        log.text()
     );
-    let versions = pass.db.versions().await?;
-    ensure!(
-        versions.contains(&27) && versions.contains(&28),
-        "{versions:?}"
-    );
-    let server = cluster.server_log()?;
-    ensure!(
-        server.contains("canceling autovacuum task"),
-        "the server logged no cancelled autovacuum task: {server}"
-    );
-    Ok(())
+    pass.cancelled(cluster).await
 }
 
-/// Where the role may not cancel the autovacuum pass, or cannot even see
-/// its query, the migrate leaves it alone and keeps trying until its
-/// deadline, then names it as an autovacuum worker on its partition, with
-/// what an administrator can do and how many passes it cancelled: none.
-/// The pass runs on, and nothing is recorded.
+/// A role that may not lower `deadlock_timeout` waits the pass out: it is
+/// warned once, keeps trying until its deadline, and is then refused, with
+/// the worker named on its partition, though its query is hidden from the
+/// role, and the remedies, the grant first. Nothing is recorded and the
+/// pass runs on. Once the role is granted `SET` on the parameter, the
+/// migrate takes the tables as a superuser's does.
 #[tokio::test]
 async fn an_autovacuum_pass_the_role_may_not_cancel_is_named_in_the_refusal() -> Result<()> {
     let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
@@ -838,68 +833,56 @@ async fn an_autovacuum_pass_the_role_may_not_cancel_is_named_in_the_refusal() ->
     };
     let cluster = Cluster::start(bin)?;
     let pass = Pass::start(&cluster).await?;
-    let result = named_not_cancelled(&pass).await;
+    let result = named_then_granted(&cluster, &pass).await;
     pass.close().await;
     result
 }
 
-async fn named_not_cancelled(pass: &Pass) -> Result<()> {
-    let refused = |pool: PgPool, logs: LogCapture| async move {
-        let error = committed_within(
-            &pool,
-            "table-locks-autovacuum",
-            ShareHashBackfill::Initialize,
-            None,
-            Duration::from_secs(1),
-        )
-        .with_subscriber(logs.subscriber())
+async fn named_then_granted(cluster: &Cluster, pass: &Pass) -> Result<()> {
+    let log = SharedLog::default();
+    let error = Pass::migrate(&pass.db.ledger.pool, Duration::from_secs(1), &log)
         .await
         .err()
         .context("the migrate took the tables while the pass held a partition")?;
-        pool.close().await;
-        Ok::<_, anyhow::Error>(format!("{error:#}"))
-    };
-    // `migrator` sees neither the worker's backend type nor its query.
-    let hidden = refused(PgPool::connect(&pass.db.url).await?, LogCapture::default()).await?;
+    let message = format!("{error:#}");
     ensure!(
-        hidden.contains("refusing to wait any longer for the table locks of migration 27, 28")
-            && hidden.contains(&format!(
-                "Nothing was changed: they are not recorded. The migrate cancelled 0 autovacuum passes on them meanwhile. Holding them now: autovacuum worker pid {} on {}, its query hidden from this role, so whether it is an anti-wraparound vacuum is unknown. {AUTOVACUUM_REMEDY}, and migrate again",
+        message.contains("refusing to wait any longer for the table locks of migration 27, 28")
+            && message.contains(&format!(
+                "Nothing was changed: they are not recorded. Holding them now: autovacuum worker pid {} on {}, its query hidden from this role, so whether it is an anti-wraparound vacuum is unknown. {LOWER_REMEDY}. {AUTOVACUUM_REMEDY}, and migrate again",
                 pass.pid, pass.partition
             )),
-        "{hidden}"
+        "{message}"
     );
-    ensure!(pass.running().await?, "the pass ended: {hidden}");
-    // With pg_read_all_stats it sees the query, but before PostgreSQL 18
-    // only a superuser may cancel an autovacuum worker, and from 18 a
-    // member of pg_signal_autovacuum_worker.
-    sqlx::query("GRANT pg_read_all_stats TO migrator")
-        .execute(&pass.superuser)
-        .await?;
-    let logs = LogCapture::default();
-    let seen = refused(PgPool::connect(&pass.db.url).await?, logs.clone()).await?;
-    let logs = logs.text();
+    let logs = log.text();
     ensure!(
-        seen.contains(
-            "The migrate cancelled 0 autovacuum passes on them meanwhile: this role may not cancel an autovacuum worker (permission denied to cancel query"
-        ) && seen.contains(&format!(
-            "Holding them now: autovacuum worker pid {} on {}: autovacuum: ",
-            pass.pid, pass.partition
-        )) && seen.ends_with(&format!(". {AUTOVACUUM_REMEDY}, and migrate again"))
-            && !seen.contains("End those transactions"),
-        "{seen}"
-    );
-    ensure!(
-        logs.matches("PostgreSQL does not let this role cancel the autovacuum worker")
+        logs.matches("this role may not lower its deadlock_timeout")
             .count()
-            == 1
-            && !logs.contains("cancelled autovacuum worker"),
-        "{logs}"
+            == 1,
+        "{message}\n{logs}"
     );
-    ensure!(pass.running().await?, "the pass ended: {seen}");
+    ensure!(pass.running().await?, "the pass ended: {message}");
     ensure!(
         !pass.db.versions().await?.contains(&27),
         "a refused migrate recorded 27"
     );
-    Ok(())
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&pass.superuser)
+        .await?;
+    if version < 150_000 {
+        // No `SET` privilege on a parameter before PostgreSQL 15.
+        return Ok(());
+    }
+    sqlx::query("GRANT SET ON PARAMETER deadlock_timeout TO migrator")
+        .execute(&pass.superuser)
+        .await?;
+    let log = SharedLog::default();
+    Pass::migrate(&pass.db.ledger.pool, Duration::from_secs(20), &log)
+        .await
+        .with_context(|| {
+            format!(
+                "the migrate granted SET on deadlock_timeout: {}",
+                log.text()
+            )
+        })?;
+    pass.cancelled(cluster).await
 }

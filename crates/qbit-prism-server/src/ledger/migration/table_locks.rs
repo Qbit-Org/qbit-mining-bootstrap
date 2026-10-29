@@ -23,8 +23,9 @@
 //! ACCESS EXCLUSIVE lock, the first table lock of every migration
 //! transaction, which a starting frontend's read queues behind, is taken
 //! with the same bound. If either cannot be taken, or PostgreSQL picks the
-//! request as a deadlock victim (possible where `deadlock_timeout` is set
-//! below `ATTEMPT`), the attempt is given up (`LockContention`), and
+//! request as a deadlock victim (possible where `deadlock_timeout` is below
+//! `ATTEMPT`, as the migrate's own is where it may lower it, below), the
+//! attempt is given up (`LockContention`), and
 //! `migrate_schema_committed` rolls the whole migration transaction back,
 //! which releases every lock it took (each is transaction-scoped,
 //! MIGRATION_LOCK included), and runs it again from the start after a
@@ -51,27 +52,33 @@
 //!
 //! Autovacuum holds SHARE UPDATE EXCLUSIVE on the table it processes, a
 //! share ledger partition included, which every attempt's request conflicts
-//! with. PostgreSQL cancels a blocking autovacuum worker that does not
-//! prevent wraparound only from the waiter's deadlock check, after
-//! `deadlock_timeout`, which no attempt reaches, so one long pass would hold
-//! off every attempt until `BUDGET`; before #791, 027's `ALTER TABLE` waited
-//! that second and PostgreSQL cancelled the pass. So after an attempt gives
-//! up, `committed_within` cancels with `pg_cancel_backend` every autovacuum
-//! worker holding one of the tables the attempt could not take, or one of
-//! their partitions, whose query, as the role sees it, is not an
-//! anti-wraparound vacuum, and logs each cancel. That is PostgreSQL's own
-//! rule, which cancels such a worker whatever else holds the table, as a
-//! serving frontend's brief share insert nearly always does. It never
-//! cancels a client backend, an anti-wraparound vacuum, or a worker whose
-//! query the role cannot see. Before PostgreSQL 18 only a superuser may
-//! cancel an autovacuum worker, and from 18 a member of
-//! `pg_signal_autovacuum_worker` too; where PostgreSQL refuses, the migrate
-//! tries no further cancel and keeps trying the locks, and its refusal names
-//! the workers and what an administrator can do. The cancel runs within the
-//! backoff, under `ATTEMPT`'s timeouts, and locks no table, so neither the
-//! bound nor the schedule changes. While a client transaction holds one of
-//! the tables too, each autovacuum pass on them, about one
-//! `autovacuum_naptime` apart, is cancelled in turn until the refusal.
+//! with. PostgreSQL cancels an autovacuum worker that blocks a lock request,
+//! unless the worker prevents wraparound, from the waiter's own deadlock
+//! check, which runs once the waiter has waited its `deadlock_timeout`:
+//! before #791, 027's `ALTER TABLE` waited that second and PostgreSQL
+//! cancelled the pass, but no attempt waits that long. So each attempt's
+//! transaction lowers its own `deadlock_timeout` to `DEADLOCK_CHECK`, half of
+//! `ATTEMPT`: the check then runs within the attempt and cancels the worker
+//! blocking the request it waits on, whose lock is then usually granted
+//! within the attempt, or else in the next. PostgreSQL itself picks that
+//! worker, the one directly blocking the request, and tells an
+//! anti-wraparound one by its flags, with no permission check and whatever
+//! this role can see. The setting is the migrate's own: every frontend keeps
+//! its `deadlock_timeout`, so the frontend waits above stay as they are, and
+//! no frontend is checked, let alone aborted, for a wait on the migrate.
+//! Where the early check finds a real deadlock, PostgreSQL aborts the
+//! migrate's request, which is contention as a timeout is (`gave_up`). With
+//! `log_lock_waits` on, each attempt that waits past `DEADLOCK_CHECK` logs
+//! the wait.
+//!
+//! Only a superuser may lower `deadlock_timeout`, or from PostgreSQL 15 a
+//! role granted `SET` on it, which `committed_within` reads once per run,
+//! so no attempt fails on the `SET`. A role without either waits a blocking
+//! pass out as before, warned once, and its refusal names the worker and
+//! the remedies: the grant, or an administrator's `pg_cancel_backend`
+//! (a superuser's, since CVE-2023-5870's fix in 16.1, 15.5 and 14.10, and
+//! from PostgreSQL 18 a member of `pg_signal_autovacuum_worker`'s too), or
+//! autovacuum turned off on the table until the migrate is done.
 //!
 //! Every connect that migrates goes through `migrate_schema_committed`, a
 //! frontend's start with `PRISM_POSTGRES_INIT_SCHEMA=1` included, also on a
@@ -114,23 +121,19 @@ const WARN_EVERY: u32 = 10;
 const HOLDERS_NAMED: i64 = 5;
 /// The migration history, locked before anything else is read.
 const HISTORY: &str = "qbit_prism_schema_migrations";
-/// The tables `$1` names, each with its place there, and by OID each and
-/// every partition or child under it, which `LOCK TABLE` takes with it:
-/// read from `pg_inherits`, which locks none of them, as
-/// `pg_partition_tree` would. Then `held`: the granted locks of every other
-/// backend of this database on them.
-const HELD: &str = "WITH RECURSIVE tree(name,at,relid) AS (SELECT t.name,t.at,t.name::regclass::oid FROM unnest($1::text[]) WITH ORDINALITY t(name,at) \
-                        UNION SELECT tree.name,tree.at,i.inhrelid FROM tree JOIN pg_inherits i ON i.inhparent=tree.relid), \
-                    held AS (SELECT tree.name,tree.at,l.pid,l.relation FROM pg_locks l JOIN tree ON tree.relid=l.relation \
-                        WHERE l.locktype='relation' AND l.granted AND l.pid<>pg_backend_pid() \
-                          AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database()))";
-/// How an autovacuum worker's query, `autovacuum: VACUUM ...` and the like,
-/// begins.
-const AUTOVACUUM_QUERY: &str = "autovacuum: ";
-/// How an anti-wraparound autovacuum's query ends, which is never cancelled.
+/// How long an attempt's requests wait before PostgreSQL checks them for a
+/// deadlock, and cancels an autovacuum worker blocking one, where the role
+/// may lower its `deadlock_timeout`: well within `ATTEMPT` (see the module
+/// docs).
+const DEADLOCK_CHECK: Duration = Duration::from_millis(50);
+/// How an anti-wraparound autovacuum's query ends: PostgreSQL does not
+/// cancel one for a lock request.
 const ANTI_WRAPAROUND: &str = " (to prevent wraparound)";
+/// What lets PostgreSQL cancel an autovacuum worker within an attempt, in a
+/// refusal that names one where the role could not lower `deadlock_timeout`.
+const LOWER_REMEDY: &str = "This role may not lower its deadlock_timeout, so PostgreSQL could not cancel an autovacuum pass within an attempt: grant it SET ON PARAMETER deadlock_timeout (PostgreSQL 15 and later), or migrate as a superuser";
 /// What ends an autovacuum worker's hold, in a refusal that names one.
-const AUTOVACUUM_REMEDY: &str = "Stopping the frontends does not stop an autovacuum worker: an administrator can end its pass with SELECT pg_cancel_backend(<pid>), or keep autovacuum off its table with ALTER TABLE <table> SET (autovacuum_enabled = off) until the migrate is done and then RESET (autovacuum_enabled), but should let an anti-wraparound vacuum finish";
+const AUTOVACUUM_REMEDY: &str = "Stopping the frontends does not stop an autovacuum worker: an administrator can end its pass with SELECT pg_cancel_backend(<pid>) as a superuser (from PostgreSQL 18 also as a member of pg_signal_autovacuum_worker), or keep autovacuum off its table with ALTER TABLE <table> SET (autovacuum_enabled = off) until the migrate is done and then RESET (autovacuum_enabled), but should let an anti-wraparound vacuum finish";
 
 /// The tables each migration applied in the transaction while frontends
 /// may serve alters, in its file's order. Exactly the targets of the file's
@@ -336,11 +339,11 @@ pub(super) async fn lock_altered_tables(
 
 /// `migrate_schema` in a transaction of its own, committed. An attempt
 /// that could not take the migration history's lock or the tables of
-/// `ALTERED` is rolled back, holding nothing through the backoff, the
-/// autovacuum workers holding those tables are cancelled where they may be,
-/// and the whole transaction runs again from the start, until `BUDGET` has
-/// passed; then the refusal names who holds the tables. Any other failure
-/// is returned as it was, its transaction rolled back.
+/// `ALTERED` is rolled back, holding nothing through the backoff, and the
+/// whole transaction runs again from the start, until `BUDGET` has passed;
+/// then the refusal names who holds the tables. Each attempt lowers its own
+/// `deadlock_timeout` where the role may (see the module docs). Any other
+/// failure is returned as it was, its transaction rolled back.
 pub(in crate::ledger) async fn migrate_schema_committed(
     pool: &PgPool,
     instance_id: &str,
@@ -361,9 +364,22 @@ async fn committed_within(
     let deadline = started + budget;
     let mut backoff = BACKOFF;
     let mut attempt: u32 = 1;
-    let mut autovacuum = Autovacuum::default();
+    // Whether this run's role may lower its `deadlock_timeout`, read once,
+    // in the first attempt, so that no attempt fails on the `SET`.
+    let mut lowers = None;
     loop {
         let mut tx = begin(pool, metrics).await?;
+        let lower = match lowers {
+            Some(lower) => lower,
+            None => *lowers.insert(may_lower_deadlock_timeout(&mut tx).await?),
+        };
+        if lower {
+            // Its own only: every frontend keeps its `deadlock_timeout`.
+            sqlx::query("SELECT set_config('deadlock_timeout',$1,true)")
+                .bind(DEADLOCK_CHECK.as_millis().to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
         let error = match migrate_schema(&mut tx, instance_id, backfill_mode, metrics).await {
             Ok(online) => {
                 tx.commit().await?;
@@ -387,9 +403,15 @@ async fn committed_within(
             tables,
             reason,
         } = contention;
+        // Once per run, at its first contention, refused or not.
+        if attempt == 1 && !lower {
+            tracing::warn!(
+                "this role may not lower its deadlock_timeout, so PostgreSQL cannot cancel an autovacuum pass that blocks the migration's locks within an attempt, and such a pass holds every attempt off until it ends. Grant the role SET ON PARAMETER deadlock_timeout (PostgreSQL 15 and later), or migrate as a superuser"
+            );
+        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            let held = refusal_tail(&holders(pool, &tables).await, &autovacuum);
+            let held = refusal_tail(&holders(pool, &tables).await, lower);
             bail!(
                 "refusing to wait any longer for the table locks of {}: {attempt} attempts over {} s each waited {} ms for {} and gave up, so that no serving frontend waits on the migrate longer than that. Nothing was changed{}.{held}",
                 locking.subject(),
@@ -399,12 +421,9 @@ async fn committed_within(
                 locking.unrecorded()
             );
         }
-        let loud = attempt == 1 || attempt.is_multiple_of(WARN_EVERY);
-        // Within the backoff, which still runs from `now`.
-        autovacuum.cancel_passes(pool, metrics, &tables, loud).await;
         let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
         let waited_s = started.elapsed().as_secs();
-        if loud {
+        if attempt == 1 || attempt.is_multiple_of(WARN_EVERY) {
             tracing::warn!(
                 locking = %locking.subject(),
                 attempt,
@@ -424,150 +443,29 @@ async fn committed_within(
                 "the migration could not lock its tables; trying again"
             );
         }
-        tokio::time::sleep_until(now + backoff.min(deadline - now)).await;
+        tokio::time::sleep(backoff.min(deadline - now)).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
         attempt += 1;
     }
 }
 
-/// What a run did about the autovacuum workers holding the tables its
-/// attempts could not lock.
-#[derive(Debug, Default)]
-struct Autovacuum {
-    /// The passes it cancelled.
-    cancelled: u32,
-    /// Why PostgreSQL refused this role a cancel, after which none is tried.
-    refused: Option<String>,
-}
-
-impl Autovacuum {
-    /// After an attempt gave up on `tables`, cancel every autovacuum worker
-    /// that holds one of them or a partition, unless its query, as this role
-    /// sees it, is hidden or an anti-wraparound vacuum's, and log each
-    /// cancel (see the module docs). Reading and cancelling are one
-    /// statement, so a worker is cancelled for what it held as it was read;
-    /// PostgreSQL's own cancel has the same window between reading the
-    /// worker and signalling it. A failure changes nothing but what the
-    /// refusal says: the next attempt runs as it would have.
-    async fn cancel_passes(
-        &mut self,
-        pool: &PgPool,
-        metrics: Option<&Metrics>,
-        tables: &[&'static str],
-        loud: bool,
-    ) {
-        if self.refused.is_some() {
-            return;
-        }
-        let workers = match cancel_autovacuum(pool, metrics, tables).await {
-            Ok(workers) => workers,
-            Err(error) => {
-                match refused_cancel(&error) {
-                    Some(why) => {
-                        tracing::warn!(
-                            tables = %tables.join(", "),
-                            %why,
-                            "PostgreSQL does not let this role cancel the autovacuum worker holding a table the migration must lock, so it tries no further cancel and keeps trying the locks until its deadline. An administrator can end the pass with pg_cancel_backend on the worker's pid (backend_type 'autovacuum worker' in pg_stat_activity), or keep autovacuum off that table until the migrate is done"
-                        );
-                        self.refused = Some(why);
-                    }
-                    None if loud => tracing::warn!(
-                        error = %error,
-                        "could not cancel the autovacuum workers holding the tables the migration must lock; trying the locks again"
-                    ),
-                    None => tracing::debug!(
-                        error = %error,
-                        "could not cancel the autovacuum workers holding the migration's tables"
-                    ),
-                }
-                return;
-            }
-        };
-        for (pid, relations, query, signalled) in workers {
-            if signalled {
-                self.cancelled += 1;
-                tracing::warn!(
-                    pid,
-                    %relations,
-                    %query,
-                    "cancelled autovacuum worker pid {pid} on {relations}: it held a table the migration must lock, and PostgreSQL cancels such a worker only after deadlock_timeout, which no {} ms attempt reaches",
-                    ATTEMPT.as_millis()
-                );
-            } else {
-                tracing::debug!(pid, %relations, "the autovacuum worker ended before its cancel");
-            }
-        }
-    }
-
-    /// What a refusal says the run did about autovacuum, once it names a
-    /// worker (`workers`) or did something about one.
-    fn summary(&self, workers: bool) -> Option<String> {
-        if !workers && self.cancelled == 0 && self.refused.is_none() {
-            return None;
-        }
-        let passes = if self.cancelled == 1 {
-            "pass"
-        } else {
-            "passes"
-        };
-        let mut summary = format!(
-            "The migrate cancelled {} autovacuum {passes} on them meanwhile",
-            self.cancelled
-        );
-        if let Some(why) = &self.refused {
-            summary.push_str(&format!(
-                ": this role may not cancel an autovacuum worker ({why})"
-            ));
-        }
-        Some(summary)
-    }
-}
-
-/// Cancel, in one statement under `ATTEMPT`'s timeouts, every autovacuum
-/// worker holding `tables` or their partitions whose visible query is not
-/// an anti-wraparound vacuum's: for each, its pid, the relations it held
-/// and its query, and whether it was still there to signal.
-async fn cancel_autovacuum(
-    pool: &PgPool,
-    metrics: Option<&Metrics>,
-    tables: &[&'static str],
-) -> Result<Vec<(i32, String, String, bool)>, sqlx::Error> {
-    let mut tx = begin(pool, metrics).await?;
-    sqlx::query(
-        "SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$1,true)",
+/// Whether this transaction's role may lower its `deadlock_timeout`, which
+/// only a superuser may set, or from PostgreSQL 15 a role granted `SET` on
+/// it.
+async fn may_lower_deadlock_timeout(
+    connection: &mut sqlx::PgConnection,
+) -> Result<bool, sqlx::Error> {
+    let (version, superuser): (i32, bool) = sqlx::query_as(
+        "SELECT current_setting('server_version_num')::int,current_setting('is_superuser')='on'",
     )
-    .bind(ATTEMPT.as_millis().to_string())
-    .execute(&mut *tx)
+    .fetch_one(&mut *connection)
     .await?;
-    let workers = sqlx::query_as(&format!(
-        "{HELD} SELECT w.pid,w.relations,w.query,pg_cancel_backend(w.pid) FROM \
-             (SELECT a.pid,string_agg(DISTINCT held.relation::regclass::text,', ') AS relations,a.query \
-              FROM held JOIN pg_stat_activity a ON a.pid=held.pid \
-              WHERE a.backend_type='autovacuum worker' AND starts_with(a.query,$2) AND strpos(a.query,$3)=0 \
-              GROUP BY a.pid,a.query) w"
-    ))
-    .bind(tables)
-    .bind(AUTOVACUUM_QUERY)
-    .bind(ANTI_WRAPAROUND)
-    .fetch_all(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(workers)
-}
-
-/// PostgreSQL's reason when `error` is its refusal to let this role cancel
-/// an autovacuum worker.
-fn refused_cancel(error: &sqlx::Error) -> Option<String> {
-    let error = error
-        .as_database_error()
-        .filter(|error| error.code().as_deref() == Some("42501"))?;
-    let detail = error
-        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
-        .and_then(|error| error.detail());
-    Some(match detail {
-        Some(detail) => format!("{}: {detail}", error.message()),
-        None => error.message().to_owned(),
-    })
+    if superuser || version < 150_000 {
+        return Ok(superuser);
+    }
+    sqlx::query_scalar("SELECT has_parameter_privilege(current_user,'deadlock_timeout','SET')")
+        .fetch_one(&mut *connection)
+        .await
 }
 
 /// A backend holding a lock on the tables an attempt could not take, as a
@@ -602,7 +500,7 @@ impl std::fmt::Display for Holder {
                 ),
                 Some(query) if query.contains(ANTI_WRAPAROUND) => write!(
                     f,
-                    "autovacuum worker pid {pid} on {relations}, an anti-wraparound vacuum, which the migrate never cancels: {query}"
+                    "autovacuum worker pid {pid} on {relations}, an anti-wraparound vacuum, which PostgreSQL does not cancel for a lock request: {query}"
                 ),
                 Some(query) => write!(f, "autovacuum worker pid {pid} on {relations}: {query}"),
             };
@@ -627,25 +525,33 @@ impl std::fmt::Display for Holder {
 type HolderRow = (i32, bool, bool, String, f64, String, String, String);
 
 /// The backends that hold a lock on `tables` or their partitions now, one
-/// each, longest open first, at most `HOLDERS_NAMED`.
+/// each, at most `HOLDERS_NAMED`: autovacuum workers first, since stopping
+/// the frontends does not stop one, then the longest open. The partitions
+/// come from `pg_inherits`, which locks none of them, as
+/// `pg_partition_tree` would.
 async fn holders(pool: &PgPool, tables: &[&str]) -> Result<Vec<Holder>> {
-    let rows: Vec<HolderRow> =
-        sqlx::query_as(&format!(
-            "{HELD} SELECT a.pid, \
-                    COALESCE(a.backend_type='autovacuum worker',a.usesysid IS NULL \
-                        AND (a.pid IN (SELECT pid FROM pg_stat_progress_vacuum) OR a.pid IN (SELECT pid FROM pg_stat_progress_analyze))), \
-                    a.backend_type IS NOT NULL,COALESCE(a.state,''), \
-                    COALESCE(extract(epoch FROM clock_timestamp()-a.xact_start),0)::float8, \
-                    COALESCE((SELECT string_agg(t.name,', ' ORDER BY t.at) FROM (SELECT DISTINCT name,at FROM held WHERE held.pid=a.pid) t),''), \
-                    COALESCE((SELECT string_agg(DISTINCT held.relation::regclass::text,', ') FROM held WHERE held.pid=a.pid),''), \
-                    left(COALESCE(a.query,''),200) \
-             FROM pg_stat_activity a WHERE a.pid IN (SELECT pid FROM held) \
-             ORDER BY a.xact_start NULLS LAST,a.pid LIMIT $2"
-        ))
-        .bind(tables)
-        .bind(HOLDERS_NAMED)
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<HolderRow> = sqlx::query_as(
+        "WITH RECURSIVE tree(name,at,relid) AS (SELECT t.name,t.at,t.name::regclass::oid FROM unnest($1::text[]) WITH ORDINALITY t(name,at) \
+                         UNION SELECT tree.name,tree.at,i.inhrelid FROM tree JOIN pg_inherits i ON i.inhparent=tree.relid), \
+              held AS (SELECT tree.name,tree.at,l.pid,l.relation FROM pg_locks l JOIN tree ON tree.relid=l.relation \
+                       WHERE l.locktype='relation' AND l.granted AND l.pid<>pg_backend_pid() \
+                         AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())) \
+         SELECT pid,autovacuum,visible,state,age,tables,relations,query FROM \
+             (SELECT a.pid,a.xact_start, \
+                     COALESCE(a.backend_type='autovacuum worker',a.usesysid IS NULL \
+                         AND (a.pid IN (SELECT pid FROM pg_stat_progress_vacuum) OR a.pid IN (SELECT pid FROM pg_stat_progress_analyze))) AS autovacuum, \
+                     a.backend_type IS NOT NULL AS visible,COALESCE(a.state,'') AS state, \
+                     COALESCE(extract(epoch FROM clock_timestamp()-a.xact_start),0)::float8 AS age, \
+                     COALESCE((SELECT string_agg(t.name,', ' ORDER BY t.at) FROM (SELECT DISTINCT name,at FROM held WHERE held.pid=a.pid) t),'') AS tables, \
+                     COALESCE((SELECT string_agg(DISTINCT held.relation::regclass::text,', ') FROM held WHERE held.pid=a.pid),'') AS relations, \
+                     left(COALESCE(a.query,''),200) AS query \
+              FROM pg_stat_activity a WHERE a.pid IN (SELECT pid FROM held)) h \
+         ORDER BY autovacuum DESC,xact_start NULLS LAST,pid LIMIT $2",
+    )
+    .bind(tables)
+    .bind(HOLDERS_NAMED)
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         .map(
@@ -661,41 +567,35 @@ async fn holders(pool: &PgPool, tables: &[&str]) -> Result<Vec<Holder>> {
         .collect())
 }
 
-/// The end of a refusal, after "Nothing was changed": what the run did
-/// about autovacuum, who holds the tables now, and what ends each hold.
-fn refusal_tail(held: &Result<Vec<Holder>>, autovacuum: &Autovacuum) -> String {
-    let workers = held
-        .as_ref()
-        .is_ok_and(|held| held.iter().any(|holder| holder.autovacuum));
-    let mut tail = autovacuum
-        .summary(workers)
-        .map(|summary| format!(" {summary}."))
-        .unwrap_or_default();
-    tail.push(' ');
+/// The end of a refusal, after "Nothing was changed": who holds the tables
+/// now and what ends each hold, with, for an autovacuum worker where this
+/// run's role could not lower `deadlock_timeout` (`lowered`), what lets
+/// PostgreSQL cancel it.
+fn refusal_tail(held: &Result<Vec<Holder>>, lowered: bool) -> String {
     match held {
-        Ok(held) if held.is_empty() => {
-            tail.push_str("No transaction holds them now; migrate again");
-        }
+        Ok(held) if held.is_empty() => " No transaction holds them now; migrate again".to_owned(),
         Ok(held) => {
             let mut ends = Vec::new();
             if held.iter().any(|holder| !holder.autovacuum) {
                 ends.push("End those transactions, or stop the frontends");
             }
-            if workers {
+            if held.iter().any(|holder| holder.autovacuum) {
+                if !lowered {
+                    ends.push(LOWER_REMEDY);
+                }
                 ends.push(AUTOVACUUM_REMEDY);
             }
             let held: Vec<String> = held.iter().map(Holder::to_string).collect();
-            tail.push_str(&format!(
-                "Holding them now: {}. {}, and migrate again",
+            format!(
+                " Holding them now: {}. {}, and migrate again",
                 held.join("; "),
                 ends.join(". ")
-            ));
+            )
         }
-        Err(read) => tail.push_str(&format!(
-            "Who holds them could not be read ({read:#}). Look in pg_locks and pg_stat_activity for transactions or autovacuum workers on those tables, end them, or stop the frontends, and migrate again"
-        )),
+        Err(read) => format!(
+            " Who holds them could not be read ({read:#}). Look in pg_locks and pg_stat_activity for transactions or autovacuum workers on those tables, end them, or stop the frontends, and migrate again"
+        ),
     }
-    tail
 }
 
 #[cfg(test)]
@@ -825,6 +725,9 @@ mod tests {
         // rc.6's metrics collector (`metrics/collectors.rs`).
         assert!(ATTEMPT * 5 <= Duration::from_millis(500));
         assert!(BACKOFF_MAX < BUDGET);
+        // The migrate's own deadlock check, and its cancel of a blocking
+        // autovacuum worker, run well within an attempt.
+        assert!(DEADLOCK_CHECK * 2 <= ATTEMPT);
     }
 
     fn worker(query: Option<&str>) -> Holder {
@@ -850,9 +753,9 @@ mod tests {
     }
 
     /// An autovacuum worker is named as one, on the partition it holds,
-    /// with what decides whether the migrate cancels it: its query, an
-    /// anti-wraparound vacuum's, or hidden from the role, when that is
-    /// unknown. A client keeps its row, and says when its activity is
+    /// with what decides whether PostgreSQL cancels it for the migrate: its
+    /// query, an anti-wraparound vacuum's, or hidden from the role, when
+    /// that is unknown. A client keeps its row, and says when its activity is
     /// hidden.
     #[test]
     fn an_autovacuum_holder_is_named_as_a_worker_on_its_partition() {
@@ -863,7 +766,7 @@ mod tests {
         assert_eq!(
             worker(Some("autovacuum: VACUUM prism.qbit_share_ledger_p0 (to prevent wraparound)"))
                 .to_string(),
-            "autovacuum worker pid 4242 on qbit_share_ledger_p0, an anti-wraparound vacuum, which the migrate never cancels: autovacuum: VACUUM prism.qbit_share_ledger_p0 (to prevent wraparound)"
+            "autovacuum worker pid 4242 on qbit_share_ledger_p0, an anti-wraparound vacuum, which PostgreSQL does not cancel for a lock request: autovacuum: VACUUM prism.qbit_share_ledger_p0 (to prevent wraparound)"
         );
         assert_eq!(
             worker(None).to_string(),
@@ -879,63 +782,46 @@ mod tests {
         );
     }
 
-    /// A refusal says what ends each kind of hold, and, once autovacuum
-    /// is involved, how many passes the run cancelled and why PostgreSQL
-    /// refused it a cancel. A refusal without autovacuum reads as before.
+    /// A refusal says what ends each kind of hold: for an autovacuum
+    /// worker, an administrator's cancel or autovacuum turned off on its
+    /// table, and where the role could not lower `deadlock_timeout`, the
+    /// grant that lets PostgreSQL cancel it. A refusal without autovacuum
+    /// reads as before.
     #[test]
-    fn a_refusal_names_the_remedy_for_each_kind_of_holder_and_the_cancels() {
-        let none = Autovacuum::default();
+    fn a_refusal_names_the_remedy_for_each_kind_of_holder() {
+        for lowered in [true, false] {
+            assert_eq!(
+                refusal_tail(&Ok(vec![client(true)]), lowered),
+                format!(
+                    " Holding them now: {}. End those transactions, or stop the frontends, and migrate again",
+                    client(true)
+                )
+            );
+            assert_eq!(
+                refusal_tail(&Ok(Vec::new()), lowered),
+                " No transaction holds them now; migrate again"
+            );
+        }
         assert_eq!(
-            refusal_tail(&Ok(vec![client(true)]), &none),
+            refusal_tail(&Ok(vec![worker(Some("autovacuum: VACUUM t"))]), false),
             format!(
-                " Holding them now: {}. End those transactions, or stop the frontends, and migrate again",
-                client(true)
+                " Holding them now: autovacuum worker pid 4242 on qbit_share_ledger_p0: autovacuum: VACUUM t. {LOWER_REMEDY}. {AUTOVACUUM_REMEDY}, and migrate again"
             )
         );
         assert_eq!(
-            refusal_tail(&Ok(Vec::new()), &none),
-            " No transaction holds them now; migrate again"
-        );
-        let refused = Autovacuum {
-            cancelled: 0,
-            refused: Some("permission denied to cancel query: Only roles with the SUPERUSER attribute may cancel queries of roles with the SUPERUSER attribute.".to_owned()),
-        };
-        let tail = refusal_tail(&Ok(vec![worker(Some("autovacuum: VACUUM t"))]), &refused);
-        assert!(
-            tail.starts_with(" The migrate cancelled 0 autovacuum passes on them meanwhile: this role may not cancel an autovacuum worker (permission denied to cancel query: Only roles with the SUPERUSER attribute"),
-            "{tail}"
+            refusal_tail(&Ok(vec![worker(None), client(true)]), true),
+            format!(
+                " Holding them now: {}; {}. End those transactions, or stop the frontends. {AUTOVACUUM_REMEDY}, and migrate again",
+                worker(None),
+                client(true)
+            )
         );
         assert!(
-            tail.ends_with(&format!(
-                ". Holding them now: autovacuum worker pid 4242 on qbit_share_ledger_p0: autovacuum: VACUUM t. {AUTOVACUUM_REMEDY}, and migrate again"
-            )),
-            "{tail}"
-        );
-        assert!(!tail.contains("End those transactions"), "{tail}");
-        let cancelled = Autovacuum {
-            cancelled: 1,
-            refused: None,
-        };
-        let tail = refusal_tail(&Ok(vec![client(true), worker(None)]), &cancelled);
-        assert!(
-            tail.starts_with(" The migrate cancelled 1 autovacuum pass on them meanwhile. Holding them now: pid 77 ("),
-            "{tail}"
-        );
-        assert!(
-            tail.ends_with(&format!(
-                "is unknown. End those transactions, or stop the frontends. {AUTOVACUUM_REMEDY}, and migrate again"
-            )),
-            "{tail}"
-        );
-        assert!(
-            AUTOVACUUM_REMEDY.contains("SELECT pg_cancel_backend(<pid>)")
+            LOWER_REMEDY.contains("SET ON PARAMETER deadlock_timeout")
+                && AUTOVACUUM_REMEDY.contains("SELECT pg_cancel_backend(<pid>)")
                 && AUTOVACUUM_REMEDY.contains("SET (autovacuum_enabled = off)")
         );
-        // The count stays when the holders cannot be read.
-        let tail = refusal_tail(&Err(anyhow::anyhow!("gone")), &cancelled);
-        assert!(
-            tail.starts_with(" The migrate cancelled 1 autovacuum pass on them meanwhile. Who holds them could not be read (gone)"),
-            "{tail}"
-        );
+        assert!(refusal_tail(&Err(anyhow::anyhow!("gone")), false)
+            .starts_with(" Who holds them could not be read (gone)"));
     }
 }
