@@ -2,7 +2,8 @@
 """Fail unless every build still uses vendor/sqlx-core, and its advisories are reviewed.
 
 vendor/sqlx-core is sqlx-core with launchbadge/sqlx#4251 (#771) and #3861
-(#713) backported, and two workspaces patch it in: the repository's
+(#713) backported, plus a local verify-ca change (it trusts only
+sslrootcert), and two workspaces patch it in: the repository's
 (`Cargo.toml`) and the Stratum fuzz targets'
 (`crates/qbit-prism-server/fuzz/Cargo.toml`). sqlx pins its sqlx-core with
 `=`, so moving sqlx to another version leaves the patch unused: Cargo only
