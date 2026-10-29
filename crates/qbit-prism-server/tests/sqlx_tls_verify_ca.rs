@@ -497,8 +497,10 @@ fn verify_ca_with_an_sslrootcert_holding_no_certificate_is_refused() {
 /// root sqlx-core loads, as its issuer, signed with the test's own Ed25519
 /// key. verify-full, which keeps the public roots, finds that root as the
 /// issuer and refuses the signature, as the root's RSA key can't verify an
-/// Ed25519 one; that control shows the name matches a loaded root. verify-ca
-/// has no such anchor, so the issuer is unknown.
+/// Ed25519 one; that control shows the name matches a loaded root. It checks
+/// only that the issuer was not unknown, since which signature error rustls
+/// reports depends on how webpki ranks its errors. verify-ca has no such
+/// anchor, so the issuer is unknown.
 #[test]
 fn verify_ca_does_not_trust_the_public_roots() {
     let claims_public_root = || vec![server_certificate((&isrg_root_x1(), SERVER_SEED))];
@@ -512,13 +514,13 @@ fn verify_ca_does_not_trust_the_public_roots() {
     .expect_err("verify-full accepted a certificate signed by the wrong key");
     let refusal_under_full = refusal(error);
     assert!(
-        matches!(
+        !matches!(
             refusal_under_full,
-            rustls::Error::InvalidCertificate(
-                CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. }
-            )
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
         ),
-        "verify-full did not take ISRG Root X1 as the issuer: {refusal_under_full:?}"
+        "verify-full did not take ISRG Root X1 as the issuer, so this test no longer \
+         shows verify-ca ignoring a loaded public root: has webpki-roots dropped ISRG \
+         Root X1, or changed how it encodes its subject? {refusal_under_full:?}"
     );
 
     let error = handshake(
