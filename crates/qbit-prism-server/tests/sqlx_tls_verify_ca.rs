@@ -2,6 +2,14 @@
 //! CAs but not against the host name; `verify-full` checks both (#713): the
 //! launchbadge/sqlx#3861 backport in vendor/sqlx-core.
 //!
+//! As libpq does, verify-ca trusts only the root certificates `sslrootcert`
+//! names, and refuses to connect without one: a local change in
+//! vendor/sqlx-core. With no name check, every root it trusts vouches for the
+//! server under any name. sqlx-core trusts Mozilla's public roots beside
+//! `sslrootcert`, so with #3861 alone verify-ca accepted any publicly issued
+//! certificate, for an attacker's own domain too. verify-full keeps the
+//! public roots.
+//!
 //! sqlx-postgres 0.8.6 runs both modes through sqlx-core's rustls client
 //! with `accept_invalid_certs: false`, and verify-ca adds
 //! `accept_invalid_hostnames: true`. That verifier runs rustls's WebPKI
@@ -19,7 +27,11 @@
 //! certificate it signs for `db.internal` only, and the same server
 //! certificate from an issuer the client does not trust. The keys are Ed25519
 //! from fixed seeds. Against the unpatched crate the first test fails with
-//! the name error the second expects.
+//! the name error the second expects. Without the local change, verify-ca
+//! without `sslrootcert`, or with one that holds no certificate, reports an
+//! unknown issuer instead of the configuration error, and the public-roots
+//! test sees verify-ca take the public root as the issuer, as verify-full
+//! does.
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::sign::SigningKey;
 use rustls::{CertificateError, ServerConfig, ServerConnection, SignatureScheme};
@@ -43,6 +55,8 @@ const PROXY_HOST: &str = "127.0.0.1";
 struct Wire {
     to_server: Vec<u8>,
     to_client: VecDeque<u8>,
+    /// Every byte the client has written.
+    client_sent: usize,
 }
 
 /// The client's end of the wire. Writes always fit; a read with nothing to
@@ -62,7 +76,9 @@ impl Socket for ClientSocket {
     }
 
     fn try_write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().to_server.extend_from_slice(buf);
+        let mut wire = self.0.lock().unwrap();
+        wire.to_server.extend_from_slice(buf);
+        wire.client_sent += buf.len();
         Ok(buf.len())
     }
 
@@ -125,14 +141,15 @@ enum SslMode {
     VerifyFull,
 }
 
-/// Connects to a server presenting `chain`, trusting `ca` beside the roots
-/// sqlx-core always loads, with `hostname` as the URL's host.
-fn handshake(
+/// Connects to a server presenting `chain`, with `hostname` as the URL's
+/// host and `ca` as `sslrootcert`. Returns the outcome and how many bytes
+/// the client sent.
+fn connect(
     mode: SslMode,
     hostname: &str,
-    ca: &CertificateInput,
+    ca: Option<&CertificateInput>,
     chain: Vec<CertificateDer<'static>>,
-) -> Result<(), sqlx_core::Error> {
+) -> (Result<(), sqlx_core::Error>, usize) {
     let config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -146,12 +163,34 @@ fn handshake(
         accept_invalid_certs: false,
         accept_invalid_hostnames: matches!(mode, SslMode::VerifyCa),
         hostname,
-        root_cert_path: Some(ca),
+        root_cert_path: ca,
         client_cert_path: None,
         client_key_path: None,
     };
     let handshake = tls::handshake(ClientSocket(wire.clone()), config, SocketIntoBox);
-    drive(handshake, &mut server, &wire).map(drop)
+    let result = drive(handshake, &mut server, &wire).map(drop);
+    let client_sent = wire.lock().unwrap().client_sent;
+    (result, client_sent)
+}
+
+/// `connect` with `ca` as `sslrootcert`, for the outcome alone.
+fn handshake(
+    mode: SslMode,
+    hostname: &str,
+    ca: &CertificateInput,
+    chain: Vec<CertificateDer<'static>>,
+) -> Result<(), sqlx_core::Error> {
+    connect(mode, hostname, Some(ca), chain).0
+}
+
+/// The configuration error that refused to connect, before any TLS.
+fn configuration_error(result: Result<(), sqlx_core::Error>, sent: usize) -> String {
+    let error = result.expect_err("verify-ca connected");
+    let sqlx_core::Error::Configuration(message) = &error else {
+        panic!("verify-ca failed with something other than a configuration error: {error}");
+    };
+    assert_eq!(sent, 0, "the client started the TLS handshake");
+    message.to_string()
 }
 
 /// The TLS error that refused the server's certificate.
@@ -218,11 +257,33 @@ fn name(common_name: &str) -> Vec<u8> {
     der(0x30, &[&der(0x31, &[&der(0x30, &[&attribute, &value])])])
 }
 
-/// A v3 certificate for `subject`'s key, issued and signed by `issuer`. The
-/// validity runs from 2000 to 9999-12-31, RFC 5280's "no expiry".
+/// ISRG Root X1's subject, byte for byte as webpki-roots holds it: C, O and
+/// CN as PrintableStrings, each in its own RDN. sqlx-core loads that root
+/// among Mozilla's public roots.
+fn isrg_root_x1() -> Vec<u8> {
+    let rdn = |attribute: u8, value: &str| {
+        let attribute = der(0x06, &[&[0x55, 0x04, attribute]]);
+        der(
+            0x31,
+            &[&der(0x30, &[&attribute, &der(0x13, &[value.as_bytes()])])],
+        )
+    };
+    der(
+        0x30,
+        &[
+            &rdn(0x06, "US"),
+            &rdn(0x0a, "Internet Security Research Group"),
+            &rdn(0x03, "ISRG Root X1"),
+        ],
+    )
+}
+
+/// A v3 certificate for `subject`'s key, issued by the distinguished name
+/// `issuer` and signed by `issuer_seed`'s key. The validity runs from 2000 to
+/// 9999-12-31, RFC 5280's "no expiry".
 fn certificate(
     serial: u8,
-    (issuer, issuer_seed): (&str, u8),
+    (issuer, issuer_seed): (&[u8], u8),
     (subject, subject_seed): (&str, u8),
     extension: &[u8],
 ) -> CertificateDer<'static> {
@@ -241,7 +302,7 @@ fn certificate(
             &der(0xa0, &[&der(0x02, &[&[2]])]),
             &der(0x02, &[&[serial]]),
             &ed25519(),
-            &name(issuer),
+            issuer,
             &validity,
             &name(subject),
             spki.as_ref(),
@@ -271,7 +332,7 @@ fn ca_certificate(common_name: &str, seed: u8) -> CertificateDer<'static> {
     );
     certificate(
         1,
-        (common_name, seed),
+        (&name(common_name), seed),
         (common_name, seed),
         &basic_constraints,
     )
@@ -279,7 +340,7 @@ fn ca_certificate(common_name: &str, seed: u8) -> CertificateDer<'static> {
 
 /// The server certificate `issuer` signs: subjectAltName holds one DNS name,
 /// SERVER_NAME, and no IP address.
-fn server_certificate(issuer: (&str, u8)) -> CertificateDer<'static> {
+fn server_certificate(issuer: (&[u8], u8)) -> CertificateDer<'static> {
     let subject_alt_name = der(
         0x30,
         &[
@@ -323,7 +384,7 @@ fn trusted_ca() -> CertificateInput {
 }
 
 fn trusted_server() -> Vec<CertificateDer<'static>> {
-    vec![server_certificate(("trusted CA", CA_SEED))]
+    vec![server_certificate((&name("trusted CA"), CA_SEED))]
 }
 
 /// The delay proxy's case: the database's CA-signed certificate, reached as
@@ -377,7 +438,10 @@ fn both_modes_accept_a_trusted_certificate_for_its_own_name() {
 /// does not trust is refused as such, though its name does not match either.
 #[test]
 fn verify_ca_refuses_a_certificate_from_an_untrusted_issuer() {
-    let untrusted = vec![server_certificate(("untrusted CA", UNTRUSTED_CA_SEED))];
+    let untrusted = vec![server_certificate((
+        &name("untrusted CA"),
+        UNTRUSTED_CA_SEED,
+    ))];
 
     let error = handshake(SslMode::VerifyCa, PROXY_HOST, &trusted_ca(), untrusted)
         .expect_err("verify-ca accepted a certificate from an untrusted issuer");
@@ -389,5 +453,87 @@ fn verify_ca_refuses_a_certificate_from_an_untrusted_issuer() {
             rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
         ),
         "verify-ca refused the certificate for something else: {refusal:?}"
+    );
+}
+
+/// verify-ca trusts only `sslrootcert`, so without one it has nothing to
+/// check the chain against. As libpq does, it refuses to connect, naming
+/// `sslrootcert`, and before the TLS handshake starts. sqlx-core 0.8.6 fell
+/// back to the public roots instead.
+#[test]
+fn verify_ca_without_sslrootcert_is_refused_before_the_handshake() {
+    let (result, sent) = connect(SslMode::VerifyCa, SERVER_NAME, None, trusted_server());
+
+    let message = configuration_error(result, sent);
+    assert!(
+        message.contains("sslrootcert"),
+        "the error does not name sslrootcert: {message}"
+    );
+}
+
+/// An `sslrootcert` that holds no certificate leaves verify-ca nothing to
+/// trust either, and is refused the same way.
+#[test]
+fn verify_ca_with_an_sslrootcert_holding_no_certificate_is_refused() {
+    let empty = CertificateInput::Inline(b"no certificate here\n".to_vec());
+
+    let (result, sent) = connect(
+        SslMode::VerifyCa,
+        SERVER_NAME,
+        Some(&empty),
+        trusted_server(),
+    );
+
+    let message = configuration_error(result, sent);
+    assert!(
+        message.contains("sslrootcert") && message.contains("no certificate"),
+        "the error does not say sslrootcert holds no certificate: {message}"
+    );
+}
+
+/// verify-ca's trust anchors are `sslrootcert`'s certificates and nothing
+/// else. No public CA's key is at hand to show that a certificate it signs
+/// is refused, so the server presents one that names ISRG Root X1, a public
+/// root sqlx-core loads, as its issuer, signed with the test's own Ed25519
+/// key. verify-full, which keeps the public roots, finds that root as the
+/// issuer and refuses the signature, as the root's RSA key can't verify an
+/// Ed25519 one; that control shows the name matches a loaded root. verify-ca
+/// has no such anchor, so the issuer is unknown.
+#[test]
+fn verify_ca_does_not_trust_the_public_roots() {
+    let claims_public_root = || vec![server_certificate((&isrg_root_x1(), SERVER_SEED))];
+
+    let error = handshake(
+        SslMode::VerifyFull,
+        SERVER_NAME,
+        &trusted_ca(),
+        claims_public_root(),
+    )
+    .expect_err("verify-full accepted a certificate signed by the wrong key");
+    let refusal_under_full = refusal(error);
+    assert!(
+        matches!(
+            refusal_under_full,
+            rustls::Error::InvalidCertificate(
+                CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. }
+            )
+        ),
+        "verify-full did not take ISRG Root X1 as the issuer: {refusal_under_full:?}"
+    );
+
+    let error = handshake(
+        SslMode::VerifyCa,
+        SERVER_NAME,
+        &trusted_ca(),
+        claims_public_root(),
+    )
+    .expect_err("verify-ca accepted a certificate signed by the wrong key");
+    let refusal_under_ca = refusal(error);
+    assert!(
+        matches!(
+            refusal_under_ca,
+            rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)
+        ),
+        "verify-ca took a public root as the issuer: {refusal_under_ca:?}"
     );
 }

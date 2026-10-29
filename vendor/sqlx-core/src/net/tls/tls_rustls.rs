@@ -19,7 +19,7 @@ use rustls::{
 use crate::error::Error;
 use crate::io::ReadBuf;
 use crate::net::tls::util::StdSocket;
-use crate::net::tls::TlsConfig;
+use crate::net::tls::{CertificateInput, TlsConfig};
 use crate::net::Socket;
 
 pub struct RustlsSocket<S: Socket> {
@@ -138,9 +138,22 @@ where
         }
     } else {
         #[cfg(any(feature = "_tls-rustls-aws-lc-rs", feature = "_tls-rustls-ring-webpki"))]
-        let mut cert_store = certs_from_webpki();
+        let public_roots = certs_from_webpki;
         #[cfg(feature = "_tls-rustls-ring-native-roots")]
-        let mut cert_store = certs_from_native_store();
+        let public_roots = certs_from_native_store;
+
+        // Local change, not upstream's: verify-ca (certificates checked, host
+        // names not) trusts only the configured root certificates, as libpq
+        // does. With no name check, every root in the store vouches for the
+        // server under any name, so the public roots would accept any
+        // publicly issued certificate. verify-full adds them to the public
+        // roots, as upstream does.
+        let verify_ca = tls_config.accept_invalid_hostnames;
+        let mut cert_store = if verify_ca {
+            RootCertStore::empty()
+        } else {
+            public_roots()
+        };
 
         if let Some(ca) = tls_config.root_cert_path {
             let data = ca.data().await?;
@@ -152,6 +165,28 @@ where
 
                 cert_store.add(cert).map_err(|err| Error::Tls(err.into()))?;
             }
+
+            if verify_ca && cert_store.is_empty() {
+                // Named by path only: inline PEM could hold a private key.
+                let source = match ca {
+                    CertificateInput::File(path) => path.display().to_string(),
+                    CertificateInput::Inline(_) => "inline PEM".to_owned(),
+                };
+                return Err(Error::Configuration(
+                    format!(
+                        "sslmode=verify-ca: sslrootcert ({source}) holds no certificate, \
+                         and verify-ca trusts only the root certificates it holds"
+                    )
+                    .into(),
+                ));
+            }
+        } else if verify_ca {
+            return Err(Error::Configuration(
+                "sslmode=verify-ca requires sslrootcert: verify-ca does not check the \
+                 server's host name, so it trusts only the root certificates in sslrootcert, \
+                 never the public roots; set sslrootcert, or use sslmode=verify-full"
+                    .into(),
+            ));
         }
 
         if tls_config.accept_invalid_hostnames {
