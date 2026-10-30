@@ -144,8 +144,6 @@ pub enum PrismError {
     InvalidMinOutputFloor,
     #[error("pool fee bps {fee_bps} exceeds 10000")]
     PoolFeeBpsTooHigh { fee_bps: u16 },
-    #[error("pool fee account duplicates a miner payout account")]
-    DuplicatePoolFeeAccount,
     #[error("pool-fee-first coinbase output policy requires a configured pool fee policy")]
     PoolFeeFirstRequiresPoolFee,
     #[error("no eligible shares at or before job issue time {anchor_job_issued_at_ms}")]
@@ -359,6 +357,8 @@ pub struct PayoutPolicyAccount {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PoolFeeManifest {
     pub fee_bps: u16,
+    /// The `fee_bps` share of the coinbase, plus the gross of any window work
+    /// credited to the fee recipient's own program.
     #[serde(default)]
     pub earned_pool_fee_sats: u64,
     #[serde(default)]
@@ -1477,8 +1477,9 @@ pub fn apply_payout_policy(
     let min_output_sats = policy.min_output_sats()?;
     let mut pool_fee = pool_fee_manifest(reward_manifest.coinbase_value_sats, policy)?;
     // A configured zero-bps fee stays valid (its output only appears when dust
-    // sweeps make it positive); a missing fee policy must fail instead of
-    // committing pool-fee-first on an artifact that cannot honor it.
+    // sweeps or window work on the fee program make it positive); a missing
+    // fee policy must fail instead of committing pool-fee-first on an artifact
+    // that cannot honor it.
     if policy.coinbase_output_policy == CoinbaseOutputPolicy::PoolFeeFirst && pool_fee.is_none() {
         return Err(PrismError::PoolFeeFirstRequiresPoolFee);
     }
@@ -1502,6 +1503,34 @@ pub fn apply_payout_policy(
     let gross_amounts =
         allocate_weighted_amounts(miner_reward_value_sats, &settlement_entitlements)?;
     let prior_by_program = carry_forward_by_payout_program(prior_balances)?;
+    // Work credited to the pool fee's own program is the fee recipient's
+    // income: its gross joins the fee output rather than opening a second
+    // account for one payout script, and a carry that program accrued before
+    // it became the fee recipient is held as it stands. Every audit bundle
+    // publishes the fee program and a miner may name it, so it is settled
+    // here instead of failing each build while its work is in the window.
+    let fee_key = pool_fee
+        .as_ref()
+        .map(|pool_fee| payout_program_key(&pool_fee.p2mr_program_hex));
+    let is_fee_program = |p2mr_program_hex: &str| {
+        fee_key
+            .as_deref()
+            .is_some_and(|fee_key| fee_key == payout_program_key(p2mr_program_hex))
+    };
+    let (fee_program_gross, gross_amounts): (Vec<_>, Vec<_>) = gross_amounts
+        .into_iter()
+        .partition(|(entitlement, _)| is_fee_program(&entitlement.p2mr_program_hex));
+    let fee_program_gross_sats =
+        fee_program_gross
+            .iter()
+            .try_fold(0_u64, |sum, (_entitlement, gross_amount_sats)| {
+                sum.checked_add(*gross_amount_sats)
+                    .ok_or(PrismError::PayoutPolicyOverflow)
+            })?;
+    add_fee_program_gross_to_pool_fee(&mut pool_fee, fee_program_gross_sats)?;
+    let miner_payout_value_sats = miner_reward_value_sats
+        .checked_sub(fee_program_gross_sats)
+        .ok_or(PrismError::PayoutPolicyOverflow)?;
     let mut seen_accounts = BTreeSet::new();
     let mut account_seeds = gross_amounts
         .into_iter()
@@ -1524,7 +1553,7 @@ pub fn apply_payout_policy(
 
     for balance in prior_by_program.values() {
         let key = payout_program_key(&balance.p2mr_program_hex);
-        if seen_accounts.contains(&key) {
+        if seen_accounts.contains(&key) || is_fee_program(&balance.p2mr_program_hex) {
             continue;
         }
         account_seeds.push(PolicyAccountSeed {
@@ -1562,54 +1591,59 @@ pub fn apply_payout_policy(
 
     let mut onchain_amounts = Vec::new();
     let eligible_indices = eligible_onchain_accounts(&accounts, min_output_sats);
-    if eligible_indices.is_empty() {
+    // The miner value is at least the floor (checked above) until work on the
+    // fee program takes its share. Below the floor no miner output can be
+    // emitted, so the pool fee sweeps it as when no balance reaches the floor.
+    if eligible_indices.is_empty() || miner_payout_value_sats < min_output_sats {
         if pool_fee.is_none() {
             return Err(PrismError::NoOnchainRecipients);
         }
-        add_swept_dust_to_pool_fee(&mut pool_fee, miner_reward_value_sats)?;
+        add_swept_dust_to_pool_fee(&mut pool_fee, miner_payout_value_sats)?;
     } else {
         let eligible_candidate_sum = selected_candidate_balance_sum(&accounts, &eligible_indices)?;
-        if eligible_candidate_sum < u128::from(miner_reward_value_sats) {
+        if eligible_candidate_sum < u128::from(miner_payout_value_sats) {
             if pool_fee.is_none() {
                 return Err(PrismError::PayoutExceedsCandidateBalance {
-                    coinbase_value_sats: miner_reward_value_sats,
+                    coinbase_value_sats: miner_payout_value_sats,
                     selected_candidate_balance_sats: eligible_candidate_sum,
                 });
             }
-            let swept_dust_sats = miner_reward_value_sats
-                .checked_sub(
-                    u64::try_from(eligible_candidate_sum)
-                        .map_err(|_| PrismError::PayoutPolicyOverflow)?,
-                )
-                .ok_or(PrismError::PayoutPolicyOverflow)?;
-            add_swept_dust_to_pool_fee(&mut pool_fee, swept_dust_sats)?;
-            for index in eligible_indices {
-                let account = &accounts[index];
-                let amount_sats = u64::try_from(account.candidate_balance_sats)
-                    .map_err(|_| PrismError::PayoutPolicyOverflow)?;
-                onchain_amounts.push((
-                    WeightedEntitlement {
-                        recipient_id: account.recipient_id.clone(),
-                        order_key: account.order_key.clone(),
-                        p2mr_program_hex: account.p2mr_program_hex.clone(),
-                        weight: u128::from(amount_sats),
-                    },
-                    amount_sats,
-                ));
-            }
+            onchain_amounts = pay_in_full_and_sweep(
+                &accounts,
+                eligible_indices,
+                miner_payout_value_sats,
+                &mut pool_fee,
+            )?;
         } else {
-            let emitted_indices =
-                select_onchain_accounts(&accounts, miner_reward_value_sats, min_output_sats)?;
-            let policy_weights = emitted_indices
-                .iter()
-                .map(|index| WeightedEntitlement {
-                    recipient_id: accounts[*index].recipient_id.clone(),
-                    order_key: accounts[*index].order_key.clone(),
-                    p2mr_program_hex: accounts[*index].p2mr_program_hex.clone(),
-                    weight: accounts[*index].candidate_balance_sats as u128,
-                })
-                .collect::<Vec<_>>();
-            onchain_amounts = allocate_weighted_amounts(miner_reward_value_sats, &policy_weights)?;
+            match select_onchain_accounts(&accounts, miner_payout_value_sats, min_output_sats)? {
+                // Work on the fee program leaves a small miner value beside
+                // unchanged carries, so dropping the accounts whose share fell
+                // below the floor can leave too little to carry it. That is
+                // settled as when the eligible balances fall short, instead
+                // of failing each build while the work is in the window.
+                OnchainSelection::Short(standing) if fee_program_gross_sats > 0 => {
+                    onchain_amounts = pay_in_full_and_sweep(
+                        &accounts,
+                        standing,
+                        miner_payout_value_sats,
+                        &mut pool_fee,
+                    )?;
+                }
+                selection => {
+                    let emitted_indices = selection.covering(&accounts, miner_payout_value_sats)?;
+                    let policy_weights = emitted_indices
+                        .iter()
+                        .map(|index| WeightedEntitlement {
+                            recipient_id: accounts[*index].recipient_id.clone(),
+                            order_key: accounts[*index].order_key.clone(),
+                            p2mr_program_hex: accounts[*index].p2mr_program_hex.clone(),
+                            weight: accounts[*index].candidate_balance_sats as u128,
+                        })
+                        .collect::<Vec<_>>();
+                    onchain_amounts =
+                        allocate_weighted_amounts(miner_payout_value_sats, &policy_weights)?;
+                }
+            }
         }
     }
 
@@ -1645,10 +1679,6 @@ pub fn apply_payout_policy(
     }
 
     if let Some(pool_fee) = &pool_fee {
-        let fee_key = payout_program_key(&pool_fee.p2mr_program_hex);
-        if seen_accounts.contains(&fee_key) {
-            return Err(PrismError::DuplicatePoolFeeAccount);
-        }
         accounts.push(PayoutPolicyAccount {
             account_type: PayoutPolicyAccountType::PoolFee,
             recipient_id: pool_fee.recipient_id.clone(),
@@ -3327,6 +3357,25 @@ fn add_swept_dust_to_pool_fee(
     Ok(())
 }
 
+fn add_fee_program_gross_to_pool_fee(
+    pool_fee: &mut Option<PoolFeeManifest>,
+    fee_program_gross_sats: u64,
+) -> Result<(), PrismError> {
+    if fee_program_gross_sats == 0 {
+        return Ok(());
+    }
+    let pool_fee = pool_fee.as_mut().ok_or(PrismError::PayoutPolicyOverflow)?;
+    pool_fee.earned_pool_fee_sats = pool_fee
+        .earned_pool_fee_sats
+        .checked_add(fee_program_gross_sats)
+        .ok_or(PrismError::PayoutPolicyOverflow)?;
+    pool_fee.amount_sats = pool_fee
+        .earned_pool_fee_sats
+        .checked_add(pool_fee.swept_dust_liability_sats)
+        .ok_or(PrismError::PayoutPolicyOverflow)?;
+    Ok(())
+}
+
 fn eligible_onchain_accounts(accounts: &[PayoutPolicyAccount], min_output_sats: u64) -> Vec<usize> {
     accounts
         .iter()
@@ -3349,22 +3398,81 @@ fn selected_candidate_balance_sum(
     })
 }
 
+/// Pays each of `indices` its whole candidate balance and sweeps the rest of
+/// `value_sats` into the pool fee, as dust the accounts not paid accrue: the
+/// settlement when the payable balances fall short of the value.
+fn pay_in_full_and_sweep(
+    accounts: &[PayoutPolicyAccount],
+    indices: Vec<usize>,
+    value_sats: u64,
+    pool_fee: &mut Option<PoolFeeManifest>,
+) -> Result<Vec<(WeightedEntitlement, u64)>, PrismError> {
+    let paid_sats = selected_candidate_balance_sum(accounts, &indices)?;
+    let swept_dust_sats = value_sats
+        .checked_sub(u64::try_from(paid_sats).map_err(|_| PrismError::PayoutPolicyOverflow)?)
+        .ok_or(PrismError::PayoutPolicyOverflow)?;
+    add_swept_dust_to_pool_fee(pool_fee, swept_dust_sats)?;
+    indices
+        .into_iter()
+        .map(|index| {
+            let account = &accounts[index];
+            let amount_sats = u64::try_from(account.candidate_balance_sats)
+                .map_err(|_| PrismError::PayoutPolicyOverflow)?;
+            Ok((
+                WeightedEntitlement {
+                    recipient_id: account.recipient_id.clone(),
+                    order_key: account.order_key.clone(),
+                    p2mr_program_hex: account.p2mr_program_hex.clone(),
+                    weight: u128::from(amount_sats),
+                },
+                amount_sats,
+            ))
+        })
+        .collect()
+}
+
+/// The accounts [`select_onchain_accounts`] found for a value: all of it,
+/// each share at or above the floor, or, when dropping the accounts whose
+/// share fell below the floor left too little to carry it, the accounts
+/// still standing, possibly none.
+enum OnchainSelection {
+    Covering(Vec<usize>),
+    Short(Vec<usize>),
+}
+
+impl OnchainSelection {
+    /// The covering accounts, or the refusal a shortfall otherwise is.
+    fn covering(
+        self,
+        accounts: &[PayoutPolicyAccount],
+        coinbase_value_sats: u64,
+    ) -> Result<Vec<usize>, PrismError> {
+        match self {
+            Self::Covering(selected) => Ok(selected),
+            Self::Short(standing) if standing.is_empty() => Err(PrismError::NoOnchainRecipients),
+            Self::Short(standing) => Err(PrismError::PayoutExceedsCandidateBalance {
+                coinbase_value_sats,
+                selected_candidate_balance_sats: selected_candidate_balance_sum(
+                    accounts, &standing,
+                )?,
+            }),
+        }
+    }
+}
+
 fn select_onchain_accounts(
     accounts: &[PayoutPolicyAccount],
     coinbase_value_sats: u64,
     min_output_sats: u64,
-) -> Result<Vec<usize>, PrismError> {
+) -> Result<OnchainSelection, PrismError> {
     let mut selected = eligible_onchain_accounts(accounts, min_output_sats);
     loop {
         if selected.is_empty() {
-            return Err(PrismError::NoOnchainRecipients);
+            return Ok(OnchainSelection::Short(selected));
         }
         let selected_candidate_balance_sats = selected_candidate_balance_sum(accounts, &selected)?;
         if selected_candidate_balance_sats < u128::from(coinbase_value_sats) {
-            return Err(PrismError::PayoutExceedsCandidateBalance {
-                coinbase_value_sats,
-                selected_candidate_balance_sats,
-            });
+            return Ok(OnchainSelection::Short(selected));
         }
         let weights = selected
             .iter()
@@ -3388,7 +3496,7 @@ fn select_onchain_accounts(
             })
             .collect::<Vec<_>>();
         if under_floor.is_empty() {
-            return Ok(selected);
+            return Ok(OnchainSelection::Covering(selected));
         }
         selected.retain(|index| {
             let key = account_key(
@@ -4478,7 +4586,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_fee_account_cannot_duplicate_miner_account() {
+    fn pool_fee_program_work_joins_the_pool_fee_output() {
         let reward_manifest = PrismRewardManifest {
             schema: "qbit.prism.reward-manifest.v1".to_string(),
             block_height: 10,
@@ -4510,10 +4618,386 @@ mod tests {
             p2mr_program_hex: p2mr_program(1),
         });
 
-        assert!(matches!(
-            apply_payout_policy(&reward_manifest, &[], &policy),
-            Err(PrismError::DuplicatePoolFeeAccount)
-        ));
+        // The fee recipient's own work is its income: one output, no miner
+        // account beside the fee account.
+        let (request, policy_manifest) =
+            build_policy_coinbase_request(&reward_manifest, &[], &policy).unwrap();
+        let pool_fee = policy_manifest.pool_fee.as_ref().unwrap();
+        assert_eq!(
+            (
+                pool_fee.earned_pool_fee_sats,
+                pool_fee.swept_dust_liability_sats,
+                pool_fee.amount_sats
+            ),
+            (100_000, 0, 100_000)
+        );
+        assert_eq!(
+            policy_manifest
+                .accounts
+                .iter()
+                .map(|account| (account.account_type.clone(), account.onchain_amount_sats))
+                .collect::<Vec<_>>(),
+            vec![(PayoutPolicyAccountType::PoolFee, 100_000)]
+        );
+        let coinbase_manifest = build_manifest(request).unwrap();
+        assert_eq!(
+            coinbase_manifest
+                .outputs
+                .iter()
+                .map(|output| (output.recipient_id.as_str(), output.amount_sats))
+                .collect::<Vec<_>>(),
+            vec![("miner-a", 100_000)]
+        );
+    }
+
+    fn pool_fee_policy_for(p2mr_byte: u8) -> PayoutPolicy {
+        let mut policy = PayoutPolicy::day_one_default();
+        policy.pool_fee_policy = Some(PoolFeePolicy {
+            fee_bps: 125,
+            recipient_id: "pool-fee".to_string(),
+            order_key: "99".to_string(),
+            p2mr_program_hex: p2mr_program(p2mr_byte),
+        });
+        policy
+    }
+
+    #[test]
+    fn a_window_holding_pool_fee_program_work_builds_and_verifies() {
+        let shares = |fee_share_program: u8| {
+            vec![
+                share(1, "miner-a", "01", 1, 6, 1000),
+                share(2, "miner-b", "02", 2, 3, 1000),
+                share(3, "miner-f", "03", fee_share_program, 1, 1000),
+            ]
+        };
+        let bundle = build_audit_bundle(
+            shares(99),
+            found_block(10, 1000),
+            vec![],
+            pool_fee_policy_for(99),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+
+        // Every other miner is paid exactly what it would be paid if that
+        // work were an ordinary miner's; the fee output takes the rest.
+        let ordinary = apply_payout_policy(
+            &build_prism_reward_manifest(&shares(3), &found_block(10, 1000)).unwrap(),
+            &[],
+            &pool_fee_policy_for(99),
+        )
+        .unwrap();
+        let gross = |manifest: &PayoutPolicyManifest, recipient: &str| {
+            manifest
+                .accounts
+                .iter()
+                .find(|account| account.recipient_id == recipient)
+                .map(|account| account.gross_amount_sats)
+        };
+        let policy_manifest = &bundle.payout_policy_manifest;
+        for recipient in ["miner-a", "miner-b"] {
+            assert_eq!(
+                gross(policy_manifest, recipient),
+                gross(&ordinary, recipient)
+            );
+        }
+        let earned_fee = 500_000_000 * 125 / 10_000;
+        let fee_program_gross = gross(&ordinary, "miner-f").unwrap();
+        let pool_fee = policy_manifest.pool_fee.as_ref().unwrap();
+        assert_eq!(
+            (pool_fee.earned_pool_fee_sats, pool_fee.amount_sats),
+            (
+                earned_fee + fee_program_gross,
+                earned_fee + fee_program_gross
+            )
+        );
+        assert!(policy_manifest.accounts.iter().all(|account| {
+            account.account_type == PayoutPolicyAccountType::PoolFee
+                || account.p2mr_program_hex != p2mr_program(99)
+        }));
+        let outputs = &bundle.signed_coinbase_manifest.manifest.outputs;
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| output.p2mr_program_hex == p2mr_program(99))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outputs.iter().map(|output| output.amount_sats).sum::<u64>(),
+            500_000_000
+        );
+
+        let mut fee_first = pool_fee_policy_for(99);
+        fee_first.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+        let hybrid = build_audit_bundle_with_ctv_settlement_options(
+            shares(99),
+            found_block(10, 1000),
+            Vec::new(),
+            fee_first,
+            50_000,
+            SettlementModeConfig {
+                max_coinbase_settlement_outputs: 16,
+                max_direct_coinbase_outputs: 2,
+                max_fanout_recipients_per_transaction: 10,
+                reserved_coinbase_outputs: 0,
+            },
+            None,
+            Some("aaaaaaaa".to_string()),
+            Vec::new(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        verify_audit_bundle(&hybrid, &ledger_public_key_hex()).unwrap();
+        let first = &hybrid.signed_coinbase_manifest.manifest.outputs[0];
+        assert_eq!(
+            (first.p2mr_program_hex.as_str(), first.amount_sats),
+            (p2mr_program(99).as_str(), earned_fee + fee_program_gross)
+        );
+    }
+
+    #[test]
+    fn pool_fee_program_carry_is_held_and_a_sub_floor_miner_remainder_is_swept() {
+        let reward_manifest = PrismRewardManifest {
+            schema: "qbit.prism.reward-manifest.v1".to_string(),
+            block_height: 10,
+            coinbase_value_sats: 100_000,
+            network_difficulty: 1,
+            window_multiplier: PRISM_WINDOW_MULTIPLIER,
+            requested_window_weight: 8,
+            counted_window_weight: 100,
+            anchor_job_issued_at_ms: 1,
+            anchor_share_seq: 2,
+            newest_share_seq: 2,
+            oldest_share_seq: 1,
+            cut: None,
+            included_share_count: 2,
+            share_slice_digest_hex: "00".repeat(32),
+            shares: Vec::new(),
+            entitlements: vec![
+                WeightedEntitlement {
+                    recipient_id: "miner-a".to_string(),
+                    order_key: "01".to_string(),
+                    p2mr_program_hex: p2mr_program(1),
+                    weight: 1,
+                },
+                WeightedEntitlement {
+                    recipient_id: "miner-f".to_string(),
+                    order_key: "03".to_string(),
+                    p2mr_program_hex: p2mr_program(99),
+                    weight: 99,
+                },
+            ],
+        };
+        // A carry the fee program accrued before it became the fee
+        // recipient, and another miner's carry above the floor.
+        let prior_balances = vec![
+            CarryForwardBalance {
+                recipient_id: "miner-f".to_string(),
+                order_key: "03".to_string(),
+                p2mr_program_hex: p2mr_program(99).to_ascii_uppercase(),
+                balance_sats: 5_000,
+            },
+            CarryForwardBalance {
+                recipient_id: "miner-b".to_string(),
+                order_key: "02".to_string(),
+                p2mr_program_hex: p2mr_program(2),
+                balance_sats: 20_000,
+            },
+        ];
+
+        let manifest =
+            apply_payout_policy(&reward_manifest, &prior_balances, &pool_fee_policy_for(99))
+                .unwrap();
+
+        // 98,750 sats of miner reward: 97,762 for the fee program's work and
+        // 988 for miner-a, below the 14,720 floor, so the pool fee sweeps it
+        // and miner-a accrues it.
+        let pool_fee = manifest.pool_fee.as_ref().unwrap();
+        assert_eq!(
+            (
+                pool_fee.earned_pool_fee_sats,
+                pool_fee.swept_dust_liability_sats,
+                pool_fee.amount_sats
+            ),
+            (1_250 + 97_762, 988, 100_000)
+        );
+        assert_eq!(
+            manifest
+                .accounts
+                .iter()
+                .map(|account| (
+                    account.recipient_id.as_str(),
+                    account.gross_amount_sats,
+                    account.onchain_amount_sats,
+                    account.carry_forward_balance_sats,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("miner-a", 988, 0, 988),
+                ("miner-b", 0, 0, 20_000),
+                ("pool-fee", 100_000, 100_000, 0),
+            ]
+        );
+        assert_eq!(
+            manifest.onchain_entitlements,
+            vec![WeightedEntitlement {
+                recipient_id: "pool-fee".to_string(),
+                order_key: "99".to_string(),
+                p2mr_program_hex: p2mr_program(99),
+                weight: 100_000,
+            }]
+        );
+    }
+
+    /// Fee-program work holding most of the window leaves a small miner value
+    /// beside carries it does not shrink. Selection may then drop every
+    /// account below the floor and leave too little, or nothing, to carry the
+    /// value; the build settles it in the fee output instead of failing.
+    #[test]
+    fn a_window_dominated_by_pool_fee_program_work_builds_when_selection_falls_short() {
+        let gross = |manifest: &PayoutPolicyManifest, recipient: &str| {
+            manifest
+                .accounts
+                .iter()
+                .find(|account| account.recipient_id == recipient)
+                .map(|account| {
+                    (
+                        account.gross_amount_sats,
+                        account.onchain_amount_sats,
+                        account.carry_forward_balance_sats,
+                    )
+                })
+                .unwrap()
+        };
+
+        // 90% of the window on the fee program, three larger miners and a
+        // hundred small ones whose carries sit just above the 14,720 floor.
+        let shares = |fee_share_program: u8| {
+            let mut shares = vec![share(1, "operator", "00", fee_share_program, 900_000, 1)];
+            for index in 0..3_u8 {
+                let order_key = format!("b{index}");
+                shares.push(share(
+                    2 + u64::from(index),
+                    &order_key,
+                    &order_key,
+                    101 + index,
+                    33_300,
+                    1,
+                ));
+            }
+            for index in 0..100_u8 {
+                let order_key = format!("s{index:03}");
+                shares.push(share(
+                    5 + u64::from(index),
+                    &order_key,
+                    &order_key,
+                    1 + index,
+                    1,
+                    1,
+                ));
+            }
+            shares
+        };
+        let prior_balances = (0..100_u8)
+            .map(|index| CarryForwardBalance {
+                recipient_id: format!("s{index:03}"),
+                order_key: format!("s{index:03}"),
+                p2mr_program_hex: p2mr_program(1 + index),
+                balance_sats: 14_406,
+            })
+            .collect::<Vec<_>>();
+        let bundle = build_audit_bundle(
+            shares(250),
+            found_block(1_000_000, 1000),
+            prior_balances.clone(),
+            pool_fee_policy_for(250),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+        let manifest = &bundle.payout_policy_manifest;
+        // 493,750,000 sats of miner reward: 444,375,000 for the fee program's
+        // work leaves 49,375,000. Each small miner's share of it falls below
+        // the floor, and the larger miners' 49,325,625 cannot carry it alone,
+        // so they are paid in full and the pool fee sweeps 49,375.
+        let pool_fee = manifest.pool_fee.as_ref().unwrap();
+        assert_eq!(
+            (
+                pool_fee.earned_pool_fee_sats,
+                pool_fee.swept_dust_liability_sats,
+                pool_fee.amount_sats
+            ),
+            (6_250_000 + 444_375_000, 49_375, 450_674_375)
+        );
+        for index in 0..3 {
+            assert_eq!(
+                gross(manifest, &format!("b{index}")),
+                (16_441_875, 16_441_875, 0)
+            );
+        }
+        for index in 0..100 {
+            let (gross_sats, onchain_sats, carry_sats) = gross(manifest, &format!("s{index:03}"));
+            assert!(gross_sats == 493 || gross_sats == 494, "{gross_sats}");
+            assert_eq!(
+                (onchain_sats, carry_sats),
+                (0, 14_406 + i128::from(gross_sats))
+            );
+        }
+        let outputs = &bundle.signed_coinbase_manifest.manifest.outputs;
+        assert_eq!(outputs.len(), 4);
+        assert_eq!(
+            outputs.iter().map(|output| output.amount_sats).sum::<u64>(),
+            500_000_000
+        );
+        // The same work as an ordinary miner's keeps the larger value to
+        // allocate, and selection covers it.
+        let ordinary = apply_payout_policy(
+            &build_prism_reward_manifest(&shares(249), &found_block(1_000_000, 1000)).unwrap(),
+            &prior_balances,
+            &pool_fee_policy_for(250),
+        )
+        .unwrap();
+        assert_eq!(ordinary.pool_fee.unwrap().swept_dust_liability_sats, 0);
+
+        // Selection drops every account: two miners hold 15,000 each, but
+        // the 20,000 left after the fee program's work gives each 10,000.
+        let shares = vec![
+            share(1, "operator", "00", 250, 49_373, 1),
+            share(2, "miner-a", "01", 1, 1, 1),
+            share(3, "miner-b", "02", 2, 1, 1),
+        ];
+        let prior_balances = [1_u8, 2]
+            .into_iter()
+            .map(|byte| CarryForwardBalance {
+                recipient_id: format!("miner-{}", if byte == 1 { "a" } else { "b" }),
+                order_key: format!("{byte:02}"),
+                p2mr_program_hex: p2mr_program(byte),
+                balance_sats: 5_000,
+            })
+            .collect::<Vec<_>>();
+        let bundle = build_audit_bundle(
+            shares,
+            found_block(1_000_000, 1000),
+            prior_balances,
+            pool_fee_policy_for(250),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+        let manifest = &bundle.payout_policy_manifest;
+        let pool_fee = manifest.pool_fee.as_ref().unwrap();
+        assert_eq!(
+            (pool_fee.swept_dust_liability_sats, pool_fee.amount_sats),
+            (20_000, 500_000_000)
+        );
+        assert_eq!(gross(manifest, "miner-a"), (10_000, 0, 15_000));
+        assert_eq!(gross(manifest, "miner-b"), (10_000, 0, 15_000));
     }
 
     #[test]
