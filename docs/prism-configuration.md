@@ -170,8 +170,10 @@ and a frontend runs at most four validations at once, so authorization cannot
 fill the node's RPC work queue ahead of templates and block submission; a
 session that has waited five seconds, behind another session's validation of
 its address and then for one of the four, is refused with
-`backend-rpc-unavailable` and may retry. Share submission, `getblocktemplate`
-and `submitblock` never wait on that bound. When the cache is full, the
+`backend-rpc-unavailable` and may retry. `getblocktemplate`, `submitblock` and
+other sessions' share submission never wait on that bound. A session handles
+its requests in order, so shares it sends while its own `mining.authorize`
+waits are answered after it. When the cache is full, the
 entries of addresses the node refused, which resolved to the configured
 fallback (`PRISM_USERNAME_FALLBACK_ADDRESS`), are dropped before the others.
 
