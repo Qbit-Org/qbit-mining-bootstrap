@@ -7,8 +7,8 @@
 //! new address read the first one's result, and at most
 //! [`MAX_CONCURRENT_VALIDATIONS`] across the frontend, so authorization cannot
 //! fill the node's RPC work queue ahead of templates and block submission.
-//! Nothing but authorization waits on these: share submission,
-//! `getblocktemplate` and `submitblock` never do.
+//! Nothing but authorization waits on these: `getblocktemplate`,
+//! `submitblock` and other sessions' share submission never do.
 use super::*;
 use std::sync::{Mutex as StdMutex, Weak};
 
@@ -21,7 +21,7 @@ pub(super) const MAX_CONCURRENT_VALIDATIONS: usize = 4;
 /// retryable backend error, well inside the session's own deadline
 /// (`PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS`, 30 s by default).
 pub(super) const VALIDATION_WAIT: Duration = Duration::from_secs(5);
-const IDENTITY_TTL: Duration = Duration::from_secs(3600);
+pub(super) const IDENTITY_TTL: Duration = Duration::from_secs(3600);
 pub(super) const CACHE_CAPACITY: usize = 4096;
 
 /// What an address resolved to: the payout address recorded for its shares
@@ -59,20 +59,30 @@ impl PayoutIdentities {
     /// Caches a definitive resolution only; a failed validation is never
     /// remembered, so it can neither redirect nor block a later attempt.
     pub fn remember(&self, address: &str, identity: PayoutIdentity) {
+        self.remember_at(address, identity, Instant::now());
+    }
+
+    /// [`Self::remember`] as of `now`, which tests move forward.
+    pub(super) fn remember_at(&self, address: &str, identity: PayoutIdentity, now: Instant) {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let age = |at: &Instant| now.saturating_duration_since(*at);
         if cache.len() >= CACHE_CAPACITY {
-            // Entries that resolved to the configured fallback go first: any
+            // Expired entries go first: `cached` already reads them as misses.
+            cache.retain(|_, (_, at)| age(at) < IDENTITY_TTL);
+        }
+        if cache.len() >= CACHE_CAPACITY {
+            // Then the entries that resolved to the configured fallback: any
             // text the node refuses lands there, so a run of it cannot push
             // out the addresses that pay as typed.
             cache.retain(|address, (identity, _)| identity.payout_address == *address);
         }
         if cache.len() >= CACHE_CAPACITY {
-            cache.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(300));
+            cache.retain(|_, (_, at)| age(at) < Duration::from_secs(300));
             if cache.len() >= CACHE_CAPACITY {
                 cache.clear();
             }
         }
-        cache.insert(address.to_owned(), (identity, Instant::now()));
+        cache.insert(address.to_owned(), (identity, now));
     }
 
     /// The lock every validation of `address` holds. The registry keeps weak
@@ -89,8 +99,8 @@ impl PayoutIdentities {
         flight
     }
 
-    /// One of the frontend's validation slots, held for one node call, if
-    /// one frees before `deadline`.
+    /// One of the frontend's validation slots, held for one authorization's
+    /// node calls, if one frees before `deadline`.
     pub async fn validation_slot(
         &self,
         deadline: tokio::time::Instant,

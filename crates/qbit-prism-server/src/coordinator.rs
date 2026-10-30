@@ -4191,12 +4191,16 @@ impl MiningBackend for Coordinator {
         if let Some(identity) = self.identities.cached(address) {
             return Ok(worker(identity));
         }
+        // One slot covers the address and, when the node refuses it, the
+        // fallback, so a definitive refusal is never lost to a second wait
+        // under the spent bound.
+        let slot = self.identities.validation_slot(deadline).await?;
         let resolve = |address: String| async move {
-            let validation = {
-                let _slot = self.identities.validation_slot(deadline).await?;
-                self.rpc.call("validateaddress", json!([address])).await
-            }
-            .map_err(|_| StratumError::backend("payout address validation unavailable"))?;
+            let validation = self
+                .rpc
+                .call("validateaddress", json!([address]))
+                .await
+                .map_err(|_| StratumError::backend("payout address validation unavailable"))?;
             match validation["isvalid"].as_bool() {
                 Some(false) => return Ok(None),
                 Some(true) => {}
@@ -4248,6 +4252,7 @@ impl MiningBackend for Coordinator {
                 }
             },
         };
+        drop(slot);
         let identity = payout_identity::PayoutIdentity {
             payout_address,
             p2mr_program_hex,

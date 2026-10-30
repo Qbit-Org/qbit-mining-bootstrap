@@ -395,6 +395,8 @@ pub(crate) struct Node {
     pub calls: Vec<String>,
     pub fail: Option<String>,
     pub gate: Option<(String, Arc<Gate>)>,
+    /// Addresses `validateaddress` answers `isvalid: false` for.
+    pub refused: Vec<String>,
 }
 
 async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Value>) -> Json<Value> {
@@ -427,7 +429,12 @@ async fn reply(State(node): State<Arc<StdMutex<Node>>>, Json(request): Json<Valu
             }
             "estimatesmartfee" => json!({"feerate":0.001,"blocks":2}),
             "validateaddress" => {
-                json!({"isvalid":true,"scriptPubKey":format!("5220{}", hash(0xcd))})
+                let address = request["params"][0].as_str().unwrap();
+                if node.refused.iter().any(|refused| refused == address) {
+                    json!({"isvalid":false})
+                } else {
+                    json!({"isvalid":true,"scriptPubKey":format!("5220{}", hash(0xcd))})
+                }
             }
             "getmempoolinfo" => node
                 .mempool
@@ -501,6 +508,7 @@ impl Fixture {
             calls: vec![],
             fail: None,
             gate: None,
+            refused: vec![],
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());

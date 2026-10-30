@@ -164,6 +164,69 @@ async fn a_session_behind_another_validation_waits_within_the_same_bound() {
     assert_eq!(validations(&f), 1);
 }
 
+#[tokio::test]
+async fn a_refused_address_resolves_to_the_fallback_in_the_same_slot() {
+    let f = Fixture::build(
+        Duration::from_secs(10),
+        |config| config.username_fallback = Some("qbfallback".into()),
+        None,
+    )
+    .await;
+    f.node.lock().unwrap().refused = vec!["qbrefused".into()];
+    let mut slots = Vec::new();
+    for _ in 0..payout_identity::MAX_CONCURRENT_VALIDATIONS {
+        slots.push(
+            f.coordinator
+                .identities
+                .validation_slot(tokio::time::Instant::now() + payout_identity::VALIDATION_WAIT)
+                .await
+                .unwrap(),
+        );
+    }
+    // The session queues for a slot, and another validation queues behind
+    // it, so a slot the session frees between its two node calls is taken
+    // and its fallback call would wait out the spent bound as busy.
+    let session = {
+        let coordinator = f.coordinator.clone();
+        tokio::spawn(async move { coordinator.authorize("qbrefused.rig").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (acquired, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let queued = {
+        let coordinator = f.coordinator.clone();
+        let (acquired, release) = (acquired.clone(), release.clone());
+        tokio::spawn(async move {
+            let _slot = coordinator
+                .identities
+                .validation_slot(tokio::time::Instant::now() + Duration::from_secs(60))
+                .await
+                .unwrap();
+            acquired.notify_one();
+            release.notified().await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    slots.pop();
+    let worker = session.await.unwrap().unwrap();
+    assert_eq!(
+        (worker.payout_address.as_str(), worker.p2mr_program_hex),
+        ("qbfallback", hash(0xcd))
+    );
+    assert_eq!(validations(&f), 2);
+    // The session's slot went to the validation queued behind it.
+    tokio::time::timeout(Duration::from_secs(5), acquired.notified())
+        .await
+        .expect("the session released its slot");
+    release.notify_one();
+    queued.await.unwrap();
+
+    // The node's refusal was cached, so the address costs no further call.
+    drop(slots);
+    let worker = f.coordinator.authorize("qbrefused.rig2").await.unwrap();
+    assert_eq!(worker.payout_address, "qbfallback");
+    assert_eq!(validations(&f), 2);
+}
+
 #[test]
 fn a_full_cache_drops_fallback_entries_before_addresses() {
     let identities = payout_identity::PayoutIdentities::new();
@@ -179,4 +242,28 @@ fn a_full_cache_drops_fallback_entries_before_addresses() {
     assert_eq!(identities.cached("qbkeep"), Some(identity("qbkeep")));
     assert_eq!(identities.cached("qbnext"), Some(identity("qbnext")));
     assert_eq!(identities.cached("junk1"), None);
+}
+
+#[test]
+fn a_full_cache_drops_expired_entries_before_fallback_entries() {
+    let identities = payout_identity::PayoutIdentities::new();
+    let identity = |payout_address: &str| payout_identity::PayoutIdentity {
+        payout_address: payout_address.into(),
+        p2mr_program_hex: hash(0xcd),
+    };
+    let start = Instant::now();
+    for index in 2..payout_identity::CACHE_CAPACITY {
+        let address = format!("qbold{index}");
+        identities.remember_at(&address, identity(&address), start);
+    }
+    // Past the TTL every address entry has expired, and two refused
+    // addresses then fill the cache with fallback entries.
+    let later = start + payout_identity::IDENTITY_TTL + Duration::from_secs(1);
+    identities.remember_at("junk0", identity("qbfallback"), later);
+    identities.remember_at("junk1", identity("qbfallback"), later);
+    identities.remember_at("qbnext", identity("qbnext"), later);
+    assert_eq!(identities.cached("junk0"), Some(identity("qbfallback")));
+    assert_eq!(identities.cached("junk1"), Some(identity("qbfallback")));
+    assert_eq!(identities.cached("qbnext"), Some(identity("qbnext")));
+    assert_eq!(identities.cached("qbold2"), None);
 }

@@ -173,9 +173,10 @@ its address and then for one of the four, is refused with
 `backend-rpc-unavailable` and may retry. `getblocktemplate`, `submitblock` and
 other sessions' share submission never wait on that bound. A session handles
 its requests in order, so shares it sends while its own `mining.authorize`
-waits are answered after it. When the cache is full, the
-entries of addresses the node refused, which resolved to the configured
-fallback (`PRISM_USERNAME_FALLBACK_ADDRESS`), are dropped before the others.
+waits are answered after it. When the cache is full, entries older than the
+hour are dropped first, then the entries of addresses the node refused, which
+resolved to the configured fallback (`PRISM_USERNAME_FALLBACK_ADDRESS`), and
+only then the others.
 
 The per-source cap keys on the address this listener observed, which is the
 last hop. Leave it at 0 unless the deployment preserves miner source addresses.
