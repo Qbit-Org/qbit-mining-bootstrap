@@ -88,8 +88,8 @@ authorization budget are the second slice, below.
 # Second slice: per-source cap and per-session budgets
 
 This slice adds one admission cap keyed on the observed peer address and three
-per-session rate budgets. Every one of them defaults to disabled, so a default
-deployment behaves exactly as the first slice did. Valid `mining.submit`
+per-session rate budgets. The authorization budget has defaulted to 32 since
+#823; the others default to disabled. Valid `mining.submit`
 traffic is never charged against any budget, and no share acceptance, landing
 or refresh behavior changes.
 
@@ -136,7 +136,11 @@ request and then closes the connection, recording the reason on
   attempts, charged before the address validation RPC, which is what bounds the
   `validateaddress` calls one connection can drive by cycling usernames.
   Re-authorizing to switch usernames stays supported: within the budget it
-  behaves exactly as before.
+  behaves exactly as before. It is on by default (32, #823). Validated
+  identities are cached by address, so cycling worker suffixes on one address
+  costs no call, and a frontend runs at most four validations at once, with
+  one five-second bound on a session's wait for them, which bounds what many
+  connections from one source can drive without keying on its address ([configuration](prism-configuration.md#stratum-per-source-cap-and-per-session-budgets)).
 
 ## Recommended starting values
 
@@ -150,7 +154,7 @@ is set below an honest rate.
 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS` | 60 | Long enough that a burst is averaged out, short enough that a spent budget recovers within a miner's patience. |
 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL` | 64 | An honest miner sends none. 64 tolerates a broken proxy or a firmware bug without ejecting the rig on the first bad frame. |
 | `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` | 256 | Must sit well above an honest miner's in-flight submits per interval, because in the worst case every one of them misses: after a tip or payout-revision change, or through a run of transient resume races, all work a rig still holds arrives as unknown. At the default 15-second vardiff target a connection submits about 4 shares a minute, and a connection holds at most 64 retained jobs (`PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION`); 256 covers several whole-retention flushes in one window. |
-| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 32 | Normal sessions authorize once or twice. 32 leaves room for a client that re-authorizes on every reconnect attempt inside one connection. |
+| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 32 (the default) | Normal sessions authorize once or twice. 32 leaves room for a client that re-authorizes on every reconnect attempt inside one connection. |
 | `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP` | 0 | See the runbook rule below. |
 
 ## Runbook rule for the per-source cap
