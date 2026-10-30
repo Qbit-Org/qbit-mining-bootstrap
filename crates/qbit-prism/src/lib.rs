@@ -1477,8 +1477,9 @@ pub fn apply_payout_policy(
     let min_output_sats = policy.min_output_sats()?;
     let mut pool_fee = pool_fee_manifest(reward_manifest.coinbase_value_sats, policy)?;
     // A configured zero-bps fee stays valid (its output only appears when dust
-    // sweeps make it positive); a missing fee policy must fail instead of
-    // committing pool-fee-first on an artifact that cannot honor it.
+    // sweeps or window work on the fee program make it positive); a missing
+    // fee policy must fail instead of committing pool-fee-first on an artifact
+    // that cannot honor it.
     if policy.coinbase_output_policy == CoinbaseOutputPolicy::PoolFeeFirst && pool_fee.is_none() {
         return Err(PrismError::PoolFeeFirstRequiresPoolFee);
     }
