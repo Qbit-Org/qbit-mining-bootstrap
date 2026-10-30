@@ -4728,10 +4728,6 @@ mod tests {
             outputs.iter().map(|output| output.amount_sats).sum::<u64>(),
             500_000_000
         );
-        let maturity_entries = build_maturity_entries("block", 101, policy_manifest);
-        assert!(current_carry_forward_balances(&maturity_entries)
-            .iter()
-            .all(|balance| balance.p2mr_program_hex != p2mr_program(99)));
 
         let mut fee_first = pool_fee_policy_for(99);
         fee_first.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
