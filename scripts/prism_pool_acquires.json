@@ -211,6 +211,7 @@
     "coordinator/issued_batcher.rs::with_dwell#1::run(ledger , receiver , shutdown . clone ( ) , dwell)": [1,"non-database"],
     "coordinator/miner_submit.rs::deferred_share_disposition#1::ledger .acquire()": [1,"ledger"],
     "coordinator/miner_submit.rs::persist_block_only#1::ledger .acquire()": [1,"ledger"],
+    "coordinator/payout_identity.rs::validation_slot#1::self . validations .acquire()": [1,"non-database"],
     "coordinator/refresh_window.rs::capture_refresh_window#1::prepare(std :: mem :: take ( & mut snapshot . snapshot . prior_balances ) , & admission ,)": [1,"non-database"],
     "coordinator/revision_wake.rs::subscribe#1::connect_with(& pool)": [1,"revision-listener"],
     "coordinator/work_ledger.rs::clocked_payout_revision#1::self .acquire()": [1,"ledger"],

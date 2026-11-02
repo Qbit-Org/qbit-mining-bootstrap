@@ -262,7 +262,7 @@ impl Default for StratumConfig {
             session_budget_interval_seconds: 60.0,
             max_malformed_frames_per_interval: 0,
             max_unknown_jobs_per_interval: 0,
-            max_authorize_attempts_per_interval: 0,
+            max_authorize_attempts_per_interval: DEFAULT_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL,
             stats: Arc::new(StratumStats::default()),
         }
     }
@@ -315,11 +315,19 @@ impl ConnectionLimit {
 /// far above any honest per-interval rate.
 const MAX_SESSION_BUDGET: u32 = 1_000_000;
 
+/// `mining.authorize` attempts one session may make per interval unless
+/// `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` says otherwise (#823).
+/// A username is unauthenticated and a new address costs a node validation,
+/// so the budget is on by default. An honest session authorizes once or
+/// twice; 32 leaves room for a client that re-authorizes on every reconnect
+/// attempt inside one connection.
+pub const DEFAULT_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL: u32 = 32;
+
 /// The per-source admission limit was already spent for this address.
 struct IpLimitExceeded;
 
-/// A per-session rate budget over a fixed window. Zero disables it, which is
-/// the default and today's behavior. A budget is a rate, never a session
+/// A per-session rate budget over a fixed window. Zero disables it; only the
+/// authorization budget is on by default. A budget is a rate, never a session
 /// lifetime total: a whole window's worth of burst is always admitted and the
 /// allowance refills in full at the next window.
 #[derive(Debug)]
@@ -709,8 +717,10 @@ impl StratumConfig {
             value("PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL", 0u32)?;
         config.max_unknown_jobs_per_interval =
             value("PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL", 0u32)?;
-        config.max_authorize_attempts_per_interval =
-            value("PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL", 0u32)?;
+        config.max_authorize_attempts_per_interval = value(
+            "PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL",
+            config.max_authorize_attempts_per_interval,
+        )?;
         if let Ok(mask) = std::env::var("PRISM_VERSION_ROLLING_MASK") {
             config.version_rolling_mask = codec::version_mask_from_template(
                 &json!({"versionrollingmask":mask}),
@@ -976,7 +986,7 @@ impl<C> Session<C> {
 
     /// Charge one budgeted event and name the breach for the request loop, the
     /// refusal counter and the operator's log. A disabled budget never
-    /// breaches, so the default configuration keeps today's behavior.
+    /// breaches.
     fn charge(
         &mut self,
         reason: crate::metrics::ConnectionRefusalReason,
