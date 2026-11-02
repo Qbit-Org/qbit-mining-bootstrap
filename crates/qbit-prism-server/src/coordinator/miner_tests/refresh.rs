@@ -484,3 +484,65 @@ async fn a_new_template_does_not_reuse_a_window_with_a_peer_row_pending() {
         assert_eq!(published.template["previousblockhash"], hash(tip));
     }
 }
+
+/// Work credited to the pool fee's own program, which every audit bundle
+/// publishes, stays in the window without failing the build: the fee output
+/// takes its gross, and every other account is built as before (#822).
+#[tokio::test]
+async fn a_window_holding_pool_fee_program_work_still_publishes_work() {
+    for ctv in [false, true] {
+        let f = Fixture::build(
+            Duration::from_secs(10),
+            |config| {
+                config.ctv_enabled = ctv;
+                config.ctv_fee = Some(FanoutFeeRatePolicy::new(1000, 12000));
+                config.payout_policy.pool_fee_policy = Some(qbit_prism::PoolFeePolicy {
+                    fee_bps: 100,
+                    recipient_id: "pool-fee".into(),
+                    order_key: "pool-fee".into(),
+                    p2mr_program_hex: hash(0xfe),
+                });
+            },
+            None,
+        )
+        .await;
+        {
+            let mut slot = f.store.snapshot.lock().unwrap();
+            let snapshot = slot.as_mut().unwrap();
+            let mut fee_program_work = snapshot.shares[0].clone();
+            fee_program_work.share_seq = snapshot.share_seq + 1;
+            fee_program_work.share_id = "fee-program-work".into();
+            fee_program_work.miner_id = "fee-program-miner".into();
+            fee_program_work.order_key = "fee-program-miner".into();
+            fee_program_work.p2mr_program_hex = hash(0xfe);
+            snapshot.shares.push(fee_program_work);
+            snapshot.share_seq += 1;
+        }
+        f.coordinator.refresh_once().await.unwrap();
+        let prepared = f.coordinator.prepared.read().await.clone().unwrap();
+        assert!(prepared.bundle.is_some(), "ctv {ctv}");
+        let bundle = f.original(&prepared).bundle.clone().unwrap();
+        let ledger_key = ManifestSigningKey::from_seed_hex(&f.coordinator.config.ledger_seed)
+            .unwrap()
+            .public_key_hex();
+        qbit_prism::verify_audit_bundle(&bundle, &ledger_key).unwrap();
+        let policy = &bundle.payout_policy_manifest;
+        let pool_fee = policy.pool_fee.as_ref().unwrap();
+        // 1% of 500,000,000 plus half of the remaining 495,000,000.
+        assert_eq!(
+            (pool_fee.earned_pool_fee_sats, pool_fee.amount_sats),
+            (252_500_000, 252_500_000),
+            "ctv {ctv}"
+        );
+        assert_eq!(
+            policy
+                .accounts
+                .iter()
+                .filter(|account| account.p2mr_program_hex == hash(0xfe))
+                .map(|account| account.account_type.clone())
+                .collect::<Vec<_>>(),
+            vec![qbit_prism::PayoutPolicyAccountType::PoolFee],
+            "ctv {ctv}"
+        );
+    }
+}

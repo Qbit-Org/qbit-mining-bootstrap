@@ -3776,8 +3776,10 @@ remains deferred.
    PRISM_POOL_FEE_ADDRESS=<reviewed P2MR fee address>
    ```
 
-   then set the same values in the frontends' environment. A 0-bps fee pays
-   nothing and adds no coinbase output until dust must be swept.
+   then set the same values in the frontends' environment. A 0-bps fee takes
+   no share of the coinbase. It adds a coinbase output only when dust must be
+   swept or when window work pays out to the fee address itself (#822): that
+   work's gross is paid in the fee output.
 
 2. Disable automatic restarts and stop every frontend and standalone candidate
    or CTV worker. Graceful SIGTERM closes miner admission and drains workers;
