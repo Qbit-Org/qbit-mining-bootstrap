@@ -61,6 +61,28 @@ this also prevents dumps piped to a host collector, for which
 [Linux ignores `RLIMIT_CORE`](https://man7.org/linux/man-pages/man5/core.5.html).
 The key rotation rehearsal required before cutover is tracked by #291.
 
+## Database TLS and verify-ca
+
+`sslmode=verify-ca` checks the database certificate's chain but not its host
+name. So it trusts only the root certificates in `sslrootcert`, or
+`PGSSLROOTCERT`, never the public roots, and since 3.1.1 (#818) every
+connect without one is refused. Startup refuses such a URL first, naming the
+setting, with the connect's message,
+`sslmode=verify-ca requires sslrootcert`. That covers `PRISM_DATABASE_URL`,
+`PRISM_PEER_DATABASE_URL` and `PRISM_PEER_DATABASE_URL_FALLBACK`, in
+`check-config`, `check-public-database-config`, the frontend, the public
+reader, and the database commands that check `PRISM_DATABASE_URL` as the
+server does.
+
+Startup resolves the mode and the certificate as the connect does: the URL's
+`sslmode` and `sslrootcert` win over `PGSSLMODE` and `PGSSLROOTCERT`. An
+empty `sslrootcert` names no file, so startup refuses it with the same
+message (the connect would fail to read it). Startup doesn't read the file,
+so a certificate file that is missing or holds no certificate is still
+refused only at connect. `verify-full`, `require` and the other modes are unchanged. A
+`PRISM_DATABASE_URL` the PostgreSQL client can't parse, such as one with
+`sslmode=sometimes`, is refused at startup too, as a peer URL already was.
+
 ## Database-only commands and audit import
 
 `migrate`, `import-audits`, and `backfill-ctv` load database configuration
@@ -263,7 +285,9 @@ Each error names its setting and never prints a value: the peer DSNs carry the
 sync role's credentials. A peer DSN must use `postgres` or `postgresql`, name
 a host, and not name this node's own database (`PRISM_DATABASE_URL`'s host,
 port and database). The fallback must differ from the first DSN. In production
-neither may carry the shipped `change-this` credential. These settings are per
+neither may carry the shipped `change-this` credential. Neither may use
+`sslmode=verify-ca` without a root certificate
+([database TLS](#database-tls-and-verify-ca)). These settings are per
 node and not part of the cluster fingerprint: each node's database is its own
 cluster, and the two nodes' identities differ by design. Migration 027 adds
 the columns and tables the dual writer needs, and

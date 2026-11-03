@@ -192,10 +192,9 @@ fn peer_url(
     );
     // The sync and the found-block wait connect with these options, so a
     // URL they cannot use fails here, by name, never at the first offer.
-    ensure!(
-        <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&raw).is_ok(),
-        "{name} is not a connection URL the PostgreSQL client accepts"
-    );
+    let options = super::database::client_options(&parsed)
+        .with_context(|| format!("{name} is not a connection URL the PostgreSQL client accepts"))?;
+    super::database::verify_ca_has_root_cert(name, &options)?;
     ensure!(
         !same_database(&parsed, database_url),
         "{name} names this node's own database (PRISM_DATABASE_URL); it must name the peer's"
@@ -290,6 +289,12 @@ mod tests {
                 "postgresql://sync:secret@db-b/prism?sslmode=sometimes",
                 "is not a connection URL the PostgreSQL client accepts",
             ),
+            // The URL's own (empty) sslrootcert wins over PGSSLROOTCERT, so
+            // this holds whatever the test's environment.
+            (
+                "postgresql://sync:secret@db-b/prism?sslmode=verify-ca&sslrootcert=",
+                "sslmode=verify-ca requires sslrootcert",
+            ),
         ] {
             let error = peer_url(name, Some(bad.into()), OWN, false)
                 .unwrap_err()
@@ -298,10 +303,14 @@ mod tests {
             assert!(error.contains(name), "{bad:?}: {error}");
             assert!(!error.contains("secret"), "a value leaked: {error}");
         }
-        // Same host, another database or port: a second cluster on the host.
+        // Same host, another database or port: a second cluster on the host;
+        // and the TLS modes that verify-ca's root certificate check leaves alone.
         for other in [
             "postgresql://u:secret@db-a:5432/prism_b",
             "postgresql://u:secret@db-a:5433/prism",
+            "postgresql://u:secret@db-b/prism?sslmode=verify-ca&sslrootcert=/etc/prism/peer-ca.pem",
+            "postgresql://u:secret@db-b/prism?sslmode=verify-full",
+            "postgresql://u:secret@db-b/prism?sslmode=require",
         ] {
             assert!(peer_url(name, Some(other.into()), OWN, false).is_ok());
         }
