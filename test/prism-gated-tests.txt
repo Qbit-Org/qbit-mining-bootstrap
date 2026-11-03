@@ -23,6 +23,7 @@ qbit-prism-server::api_2x::fixture_migrations_do_not_share_advisory_locks
 qbit-prism-server::api_2x::legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_500
 qbit-prism-server::api_2x::public_service_is_read_only_and_bounds_http_database_work
 qbit-prism-server::api_database::accepted_public_blocks_and_earnings_follow_confirmed_chain_state
+qbit-prism-server::api_database::integrity_routes_run_one_report_at_a_time_under_their_own_timeout
 qbit-prism-server::api_database::shared_database_serves_all_contracts_and_global_reward_ranks
 qbit-prism-server::append_admission::a_fenced_append_rereads_its_probe_after_waiting_on_a_cluster_row_writer
 qbit-prism-server::append_admission::a_fenced_append_waits_out_a_revision_writer_and_compares_what_it_commits
@@ -452,6 +453,7 @@ qbit-prism-server::ledger_postgres::fanout_lane_plan::migration_024_builds_the_l
 qbit-prism-server::ledger_postgres::fatal_state::chain_change_rpc_timeout_and_cancellation_keep_the_halt
 qbit-prism-server::ledger_postgres::fatal_state::clear_accepts_a_tip_extended_during_the_run
 qbit-prism-server::ledger_postgres::fatal_state::clear_and_self_check_run_the_report_under_their_own_timeout
+qbit-prism-server::ledger_postgres::fatal_state::clear_asks_the_node_once_per_height
 qbit-prism-server::ledger_postgres::fatal_state::clear_preserves_halt_on_integrity_failure_and_audit_insert_failure
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_a_chain_that_flapped_to_a_fork_during_its_observations
 qbit-prism-server::ledger_postgres::fatal_state::clear_refuses_a_closing_tip_walk_that_would_run_into_the_commit
