@@ -565,12 +565,15 @@ pub fn carry_free_rows(rows: &[CarryRow]) -> bool {
 /// `F` of work issued against the current balances, `sum over m of
 /// max(0, balance(m))` (the owed balances), which the ceiling must cover for
 /// a capture to be offered. One statement, so the float and the debt fields
-/// are read from one snapshot.
-pub async fn payout_divergence_line(pool: &PgPool) -> sqlx::Result<Value> {
+/// are read from one snapshot. Self-check reads it on its pool, the integrity
+/// routes in their run's read-only transaction (#737).
+pub async fn payout_divergence_line<'e>(
+    executor: impl sqlx::Executor<'e, Database = Postgres>,
+) -> sqlx::Result<Value> {
     sqlx::query_scalar(
         "SELECT qbit_prism_payout_divergence_report() || jsonb_build_object('positive_float_sats',(SELECT COALESCE(sum(owed_balance_sats),0)::text FROM qbit_current_owed_balances()))",
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 

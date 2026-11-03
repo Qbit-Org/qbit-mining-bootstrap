@@ -422,7 +422,14 @@ impl ApiState {
     /// their 300 s each, for the tests.
     #[doc(hidden)]
     pub fn with_integrity_report_timing(mut self, timeout: Duration, reuse: Duration) -> Self {
-        self.integrity = Arc::new(integrity::IntegrityReports::new(timeout, reuse));
+        self.integrity = Arc::new(self.integrity.with_timing(timeout, reuse));
+        self
+    }
+    /// The frontend's stop signal, `true` once it is stopping: the integrity
+    /// routes then abandon their report run in flight and start none, so a
+    /// stop never waits on a report (#737).
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.integrity = Arc::new(self.integrity.stopping_on(shutdown));
         self
     }
     #[cfg(test)]

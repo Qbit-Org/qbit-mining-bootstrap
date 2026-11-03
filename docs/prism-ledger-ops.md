@@ -1322,26 +1322,40 @@ raised (#737).
 
 The `/audit/carry-forward-integrity` and `/audit/ledger-integrity` routes on a
 frontend's operator listener run it the same way: in a read-only transaction
-under a statement timeout of its own, 300 s, and at most one run at a time per
-frontend (#737). A request that arrives during a run waits for that run, up
-to its 300 s, and gets its outcome; a client that gives up sooner leaves the
-run going, and its outcome answers the next request. A report is then served
-for 5 minutes after its run ends; only the first request after that starts
-another run. So polling the routes, however often, runs the report at most
-once per run time plus 5 minutes on each frontend, and a frontend nobody asks
-runs none. Each report served carries three fields more than before:
+under a statement timeout of its own, the time left to the run's 300 s
+deadline, and at most one run at a time per frontend (#737). A run reads the
+`payout_divergence` line in that transaction first, under the session's
+statement timeout as before, then the report, and closes its connection when
+it ends. A
+request that arrives during a run waits for that run, up to its 300 s, and
+gets its outcome; a client that gives up sooner leaves the run going, and its
+outcome answers the next request. Each report served carries three fields
+more than before:
 
 - `computed_at`: when its run started (RFC 3339). Its figures were read from
   then until the run ended.
 - `age_seconds`: how long before this response its run started.
-- `run_seconds`: how long its run took, the report's time at this ledger's
-  size.
+- `run_seconds`: how long its run took. That bounds the report's own time
+  from above: the run also waits for its connection and reads the divergence
+  line.
 
-A run that fails or times out answers 503 with the reason, when that run
-started and when the next may start, never a report. The routes answer the
-same for as long as that run took, at most 5 minutes, so a brief failure, a
-moment without a free connection say, is retried soon. For a report on demand,
-run `self-check`.
+A report is served for 5 minutes after its run ends; only the first request
+after that starts another run. A run that fails or times out answers 503 with
+the reason (the step that failed and how), when that run started and when the
+next may start, never a report. The routes answer the same for as long as
+that run took, at most 5 minutes, so a brief failure, a moment without a free
+connection say, is retried soon. So polling the routes, however often, starts
+a run on each frontend at most once per run time plus 5 minutes after a
+report, and after a failure at most once per twice the failed run's time: a
+run that keeps failing holds its connection at most about half the time. A
+frontend nobody asks runs none. For a report on demand, run `self-check`.
+
+A stopping frontend abandons its run in flight and starts no other: the
+waiting requests answer 503 at once, the run's connection closes, and
+PostgreSQL ends the report within about a second
+(`client_connection_check_interval`, set for the run's connection where the
+server supports it, PostgreSQL 14 and later), so a stop never waits on a
+report.
 
 The report holds one snapshot for its whole run, about a minute at production
 size today. On a primary serving miners every share updates the cluster row, so
@@ -1551,8 +1565,9 @@ shows:
   captured. See [Sizing the ceiling](#sizing-the-ceiling).
 
 The line is read in one statement, so the float and the debt fields come from
-the same snapshot. The routes read it in the same run as the report, just
-before it, and serve it with that report, as old as its `computed_at`. Sats amounts are decimal strings. `positive_float_sats` is
+the same snapshot. The routes read it in the report's run and read-only
+transaction, just before the report, and serve it with that report, as old
+as its `computed_at`. Sats amounts are decimal strings. `positive_float_sats` is
 added by the frontend, not by migration 020, so a line served by a frontend
 without #506 does not have it. A missing field means that frontend cannot
 report the float; it does not mean the float is zero.

@@ -124,18 +124,21 @@ async fn an_outcome_is_reused_until_its_window_ends() {
     assert_eq!(next["age_seconds"], 0.0, "{next}");
 }
 
+/// Sets its flag when dropped: a run's future, and the connection it holds.
+struct Held(Arc<AtomicBool>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.store(true, SeqCst);
+    }
+}
+
 /// A run that outlasts its timeout answers as unavailable, never as a report,
 /// and is dropped, and with it whatever connection it held. Its failure is
 /// served as such for the reuse window, and the first request after that
 /// starts a run that can succeed: nothing is left in flight.
 #[tokio::test(start_paused = true)]
 async fn a_run_past_its_timeout_fails_and_leaves_nothing_in_flight() {
-    struct Held(Arc<AtomicBool>);
-    impl Drop for Held {
-        fn drop(&mut self) {
-            self.0.store(true, SeqCst);
-        }
-    }
     let reports = reports(300, 60);
     let released = Arc::new(AtomicBool::new(false));
     let held = Held(released.clone());
@@ -149,7 +152,7 @@ async fn a_run_past_its_timeout_fails_and_leaves_nothing_in_flight() {
         .unwrap_err();
     // The bound and the grace the server's own cancellation has.
     assert!(
-        (Duration::from_secs(301)..Duration::from_secs(302)).contains(&started.elapsed()),
+        (Duration::from_secs(305)..Duration::from_secs(306)).contains(&started.elapsed()),
         "{:?}",
         started.elapsed()
     );
@@ -157,7 +160,7 @@ async fn a_run_past_its_timeout_fails_and_leaves_nothing_in_flight() {
     assert!(
         error
             .message
-            .starts_with("the carry-forward integrity report did not finish within its 300 s; that run started at ")
+            .starts_with("the carry-forward integrity report run did not finish within its 300 s; that run started at ")
             && error.message.contains("no report is current; the first request in 60 s starts another run"),
         "{}",
         error.message
@@ -195,7 +198,7 @@ async fn a_failed_run_answers_why_for_as_long_as_it_ran() {
     assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         error.message.starts_with(
-            "the carry-forward integrity report failed after 20.0 s of its 300 s (see the frontend's log); "
+            "the carry-forward integrity report run failed: an error (see the frontend's log) after 20.0 s of its 300 s; "
         ) && error.message.ends_with("; the first request in 20 s starts another run"),
         "{}",
         error.message
@@ -294,4 +297,82 @@ async fn a_run_that_panics_leaves_nothing_in_flight() {
         .unwrap();
     assert_eq!(report["mismatch_count"], 0);
     assert_eq!(runs.load(SeqCst), 1);
+}
+
+/// A stopping frontend abandons its run in flight: the run's future, and so
+/// its connection, is dropped at once, the waiting request answers that the
+/// frontend stopped, and nothing is left in flight. It starts no run after.
+#[tokio::test]
+async fn a_stop_abandons_the_run_in_flight_and_starts_none() {
+    let (stop, stopping) = watch::channel(false);
+    let reports = Arc::new(reports(60, 60).stopping_on(stopping));
+    let released = Arc::new(AtomicBool::new(false));
+    let held = Held(released.clone());
+    let request = tokio::spawn({
+        let reports = reports.clone();
+        async move {
+            reports
+                .answer_request_with(move |_| async move {
+                    let _held = held;
+                    std::future::pending::<anyhow::Result<Value>>().await
+                })
+                .await
+        }
+    });
+    until(|| running(&reports)).await;
+    stop.send_replace(true);
+    let error = tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, "integrity_report_unavailable");
+    assert!(
+        error
+            .message
+            .starts_with("the frontend stopped during the carry-forward integrity report run; ")
+            && error
+                .message
+                .ends_with("; the frontend is stopping and starts no other run"),
+        "{}",
+        error.message
+    );
+    assert!(
+        released.load(SeqCst),
+        "the run's resources were not released"
+    );
+    assert!(!running(&reports));
+    // The abandoned run's failure, while it is reused, and after that the
+    // refusal to start one: either way no run starts.
+    let refused = reports.answer_request_with(unstarted).await.unwrap_err();
+    assert_eq!(refused.code, "integrity_report_unavailable");
+    // Longer than the abandoned run took, so its failure is no longer reused.
+    let run = reports.lock().latest.clone().unwrap();
+    tokio::time::sleep(run.ended - run.started + Duration::from_millis(10)).await;
+    let refused = reports.answer_request_with(unstarted).await.unwrap_err();
+    assert!(
+        refused.message.starts_with("the frontend is stopping"),
+        "{}",
+        refused.message
+    );
+}
+
+/// The failure names the step of the run that failed.
+#[test]
+fn a_failure_names_its_step() {
+    let failed = |step| {
+        failure(
+            &anyhow::Error::from(sqlx::Error::PoolTimedOut).context(step),
+            Duration::from_millis(15_000),
+            Duration::from_secs(300),
+        )
+    };
+    assert_eq!(
+        failed(Step::Divergence),
+        "the carry-forward integrity report run failed at the payout divergence line: no free ledger connection after 15.0 s of its 300 s"
+    );
+    assert_eq!(
+        failed(Step::Connection),
+        "the carry-forward integrity report run failed at its connection: no free ledger connection after 15.0 s of its 300 s"
+    );
 }

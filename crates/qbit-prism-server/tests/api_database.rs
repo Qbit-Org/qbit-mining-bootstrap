@@ -646,11 +646,14 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
 }
 
 /// #737: the integrity routes run one report at a time, in a read-only
-/// transaction under a statement timeout of their own, here longer than every
-/// session's 1 s, and serve its outcome with when it was computed. Requests
-/// during a run share it, and one inside the reuse window starts no run. A
-/// run past its own timeout is cancelled in the server and answers 503, never
-/// a report, and leaves nothing in flight: the next request runs again.
+/// transaction under a statement timeout of their own, the time left to the
+/// run's deadline, here longer than every session's 1 s, and serve its
+/// outcome with when it was computed. Requests during a run share it, and one
+/// inside the reuse window starts no run. A run past its own timeout is
+/// cancelled in the server and answers 503, never a report, and leaves
+/// nothing in flight: the next request runs again. A stopping frontend
+/// abandons its run: the request answers at once, the server ends the report
+/// within seconds, and the pool closes without waiting for it.
 #[tokio::test]
 async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
     let Some(url) = gate::database_url(gate::site!()).expect("integration gate") else {
@@ -687,7 +690,7 @@ async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
     };
     sqlx::raw_sql(&format!(
         "CREATE FUNCTION qbit_prism_payout_divergence_report() RETURNS jsonb LANGUAGE sql AS $$ \
-           SELECT jsonb_build_object('divergent_landings',0) $$; \
+           SELECT jsonb_build_object('divergent_landings',0) FROM pg_sleep(0.5) $$; \
          CREATE FUNCTION qbit_current_owed_balances() RETURNS TABLE(owed_balance_sats numeric) \
            LANGUAGE sql AS $$ SELECT 100::numeric $$; {}",
         report("1.5")
@@ -695,6 +698,7 @@ async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
     .execute(&pool)
     .await
     .unwrap();
+    let (stop, stopping) = tokio::sync::watch::channel(false);
     let app = |timeout, reuse| {
         router(
             ApiState::new(
@@ -705,7 +709,8 @@ async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
             .with_integrity_report_timing(
                 std::time::Duration::from_secs(timeout),
                 std::time::Duration::from_secs(reuse),
-            ),
+            )
+            .with_shutdown(stopping.clone()),
         )
     };
     let routes = app(10, 60);
@@ -722,8 +727,9 @@ async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
         assert_eq!(body["ran_at"], report_body["ran_at"], "one run answers all");
         assert_eq!(body["computed_at"], report_body["computed_at"]);
     }
+    // The 10 s deadline less at least the divergence line's 0.5 s.
     let timeout_ms = report_body["statement_timeout_ms"].as_i64().unwrap();
-    assert!((5_000..=10_000).contains(&timeout_ms), "{report_body}");
+    assert!((5_000..=9_500).contains(&timeout_ms), "{report_body}");
     assert_eq!(report_body["read_only"], "on", "{report_body}");
     assert_eq!(report_body["mismatch_count"], 0);
     assert_eq!(
@@ -755,25 +761,67 @@ async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
     let message = failed["error"].as_str().unwrap();
     assert!(
         message.starts_with(
-            "the carry-forward integrity report was cancelled (canceling statement due to statement timeout) after "
+            "the carry-forward integrity report run failed at the report: cancelled (canceling statement due to statement timeout) after "
         ) && message.contains("no report is current"),
         "{message}"
     );
     assert!(failed.get("mismatch_count").is_none(), "{failed}");
-    let running: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND state='active' \
-         AND query LIKE '%qbit_carry_forward_integrity_report%'",
-    )
-    .bind(&schema)
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    assert_eq!(running, 0, "the report outlived its run");
+    let reports_running = || {
+        let (schema, admin) = (&schema, &admin);
+        async move {
+            sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND state='active' \
+             AND query LIKE '%qbit_carry_forward_integrity_report%'",
+        )
+            .bind(schema)
+            .fetch_one(admin)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(reports_running().await, 0, "the report outlived its run");
     sqlx::raw_sql(&report("0")).execute(&pool).await.unwrap();
     let (status, rerun) = get(&routes, "/audit/carry-forward-integrity").await;
     assert_eq!(status, StatusCode::OK, "{rerun}");
     assert_ne!(rerun["ran_at"], report_body["ran_at"]);
-    pool.close().await;
+
+    sqlx::raw_sql(&report("60")).execute(&pool).await.unwrap();
+    let routes = app(120, 0);
+    let request = tokio::spawn(async move { get(&routes, "/audit/carry-forward-integrity").await });
+    let started = std::time::Instant::now();
+    while reports_running().await == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "no report started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    stop.send_replace(true);
+    let (status, stopped) = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("the request answers at the stop")
+        .unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{stopped}");
+    assert!(
+        stopped["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the frontend stopped during the carry-forward integrity report run; "),
+        "{stopped}"
+    );
+    // The run's connection is closed, not waiting in the pool for the
+    // server, which ends the report once it notices.
+    tokio::time::timeout(std::time::Duration::from_secs(5), pool.close())
+        .await
+        .expect("the pool closes without waiting for the report");
+    let stopped_at = std::time::Instant::now();
+    while reports_running().await > 0 {
+        assert!(
+            stopped_at.elapsed() < std::time::Duration::from_secs(10),
+            "the server kept running the abandoned report"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
         .await
