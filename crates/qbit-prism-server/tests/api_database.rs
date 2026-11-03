@@ -644,3 +644,139 @@ async fn accepted_public_blocks_and_earnings_follow_confirmed_chain_state() {
         .unwrap();
     admin.close().await;
 }
+
+/// #737: the integrity routes run one report at a time, in a read-only
+/// transaction under a statement timeout of their own, here longer than every
+/// session's 1 s, and serve its outcome with when it was computed. Requests
+/// during a run share it, and one inside the reuse window starts no run. A
+/// run past its own timeout is cancelled in the server and answers 503, never
+/// a report, and leaves nothing in flight: the next request runs again.
+#[tokio::test]
+async fn integrity_routes_run_one_report_at_a_time_under_their_own_timeout() {
+    let Some(url) = gate::database_url(gate::site!()).expect("integration gate") else {
+        return;
+    };
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("api_integrity_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let options = PgConnectOptions::from_str(&url)
+        .unwrap()
+        .application_name(&schema)
+        .options([
+            ("search_path", schema.as_str()),
+            ("statement_timeout", "1000"),
+        ]);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .unwrap();
+    // The report says what it ran under, and when, after `sleep` seconds.
+    let report = |sleep: &str| {
+        format!(
+            "CREATE OR REPLACE FUNCTION qbit_carry_forward_integrity_report() RETURNS jsonb LANGUAGE sql AS $$ \
+               SELECT jsonb_build_object('schema','qbit.prism.carry-forward-integrity.v1', \
+                 'mismatch_count',0,'current_drift_count',0, \
+                 'statement_timeout_ms',(SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'), \
+                 'read_only',current_setting('transaction_read_only'),'ran_at',clock_timestamp()) \
+               FROM pg_sleep({sleep}) $$"
+        )
+    };
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION qbit_prism_payout_divergence_report() RETURNS jsonb LANGUAGE sql AS $$ \
+           SELECT jsonb_build_object('divergent_landings',0) $$; \
+         CREATE FUNCTION qbit_current_owed_balances() RETURNS TABLE(owed_balance_sats numeric) \
+           LANGUAGE sql AS $$ SELECT 100::numeric $$; {}",
+        report("1.5")
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = |timeout, reuse| {
+        router(
+            ApiState::new(
+                pool.clone(),
+                ApiConfig::default(),
+                std::sync::Arc::new(qbit_prism_server::metrics::Metrics::default()),
+            )
+            .with_integrity_report_timing(
+                std::time::Duration::from_secs(timeout),
+                std::time::Duration::from_secs(reuse),
+            ),
+        )
+    };
+    let routes = app(10, 60);
+    let (first, second, third) = tokio::join!(
+        get(&routes, "/audit/carry-forward-integrity"),
+        get(&routes, "/audit/ledger-integrity"),
+        get(&routes, "/audit/carry-forward-integrity"),
+    );
+    for (status, body) in [&first, &second, &third] {
+        assert_eq!(*status, StatusCode::OK, "{body}");
+    }
+    let report_body = &first.1;
+    for (_, body) in [&second, &third] {
+        assert_eq!(body["ran_at"], report_body["ran_at"], "one run answers all");
+        assert_eq!(body["computed_at"], report_body["computed_at"]);
+    }
+    let timeout_ms = report_body["statement_timeout_ms"].as_i64().unwrap();
+    assert!((5_000..=10_000).contains(&timeout_ms), "{report_body}");
+    assert_eq!(report_body["read_only"], "on", "{report_body}");
+    assert_eq!(report_body["mismatch_count"], 0);
+    assert_eq!(
+        report_body["payout_divergence"]["positive_float_sats"], "100",
+        "{report_body}"
+    );
+    assert_eq!(report_body["ledger_backend"], "postgres-native");
+    chrono::DateTime::parse_from_rfc3339(report_body["computed_at"].as_str().unwrap()).unwrap();
+    for field in ["run_seconds", "age_seconds"] {
+        assert!(
+            report_body[field].as_f64().unwrap() >= 1.5,
+            "{field}: {report_body}"
+        );
+    }
+    let started = std::time::Instant::now();
+    let (status, reused) = get(&routes, "/audit/ledger-integrity").await;
+    assert_eq!(status, StatusCode::OK, "{reused}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(reused["ran_at"], report_body["ran_at"], "no second run");
+    assert!(
+        reused["age_seconds"].as_f64() > report_body["age_seconds"].as_f64(),
+        "{reused}"
+    );
+
+    sqlx::raw_sql(&report("30")).execute(&pool).await.unwrap();
+    let routes = app(2, 0);
+    let (status, failed) = get(&routes, "/audit/carry-forward-integrity").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failed}");
+    let message = failed["error"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "the carry-forward integrity report was cancelled (canceling statement due to statement timeout) after "
+        ) && message.contains("no report is current"),
+        "{message}"
+    );
+    assert!(failed.get("mismatch_count").is_none(), "{failed}");
+    let running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND state='active' \
+         AND query LIKE '%qbit_carry_forward_integrity_report%'",
+    )
+    .bind(&schema)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(running, 0, "the report outlived its run");
+    sqlx::raw_sql(&report("0")).execute(&pool).await.unwrap();
+    let (status, rerun) = get(&routes, "/audit/carry-forward-integrity").await;
+    assert_eq!(status, StatusCode::OK, "{rerun}");
+    assert_ne!(rerun["ran_at"], report_body["ran_at"]);
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}

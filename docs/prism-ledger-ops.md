@@ -1318,8 +1318,30 @@ At production size the report takes about a minute, longer than the 15 s
 `self-check` runs it in a read-only transaction under a statement timeout of its
 own, 300 s, and `fatal-state clear` under the time its bound leaves it
 ([fatal-state recovery](#recovery-commands)), so neither needs that setting
-raised (#737). The `/audit/carry-forward-integrity` and `/audit/ledger-integrity`
-routes still run it under the setting.
+raised (#737).
+
+The `/audit/carry-forward-integrity` and `/audit/ledger-integrity` routes on a
+frontend's operator listener run it the same way: in a read-only transaction
+under a statement timeout of its own, 300 s, and at most one run at a time per
+frontend (#737). A request that arrives during a run waits for that run, up
+to its 300 s, and gets its outcome; a client that gives up sooner leaves the
+run going, and its outcome answers the next request. A report is then served
+for 5 minutes after its run ends; only the first request after that starts
+another run. So polling the routes, however often, runs the report at most
+once per run time plus 5 minutes on each frontend, and a frontend nobody asks
+runs none. Each report served carries three fields more than before:
+
+- `computed_at`: when its run started (RFC 3339). Its figures were read from
+  then until the run ended.
+- `age_seconds`: how long before this response its run started.
+- `run_seconds`: how long its run took, the report's time at this ledger's
+  size.
+
+A run that fails or times out answers 503 with the reason, when that run
+started and when the next may start, never a report. The routes answer the
+same for as long as that run took, at most 5 minutes, so a brief failure, a
+moment without a free connection say, is retried soon. For a report on demand,
+run `self-check`.
 
 The report holds one snapshot for its whole run, about a minute at production
 size today. On a primary serving miners every share updates the cluster row, so
@@ -1529,7 +1551,8 @@ shows:
   captured. See [Sizing the ceiling](#sizing-the-ceiling).
 
 The line is read in one statement, so the float and the debt fields come from
-the same snapshot. Sats amounts are decimal strings. `positive_float_sats` is
+the same snapshot. The routes read it in the same run as the report, just
+before it, and serve it with that report, as old as its `computed_at`. Sats amounts are decimal strings. `positive_float_sats` is
 added by the frontend, not by migration 020, so a line served by a frontend
 without #506 does not have it. A missing field means that frontend cannot
 report the float; it does not mean the float is zero.
@@ -3998,6 +4021,10 @@ the settlement, ordering, and instance locks it refuses unless:
 - normal block reconciliation leaves no unresolved disconnection and the
   carry-forward integrity report passes.
 
+It asks the node for the active chain's block at each height it checks only
+once (#690), however many pool blocks and deep confirmed fanouts share that
+height, one call at a time while it holds those locks.
+
 Every check is made against the tip the command captures from the node when it
 starts. The chain may grow during the run, which takes about a minute at
 production size: blocks on top of the captured tip leave every block at or
@@ -4005,7 +4032,8 @@ below its height as it was, so every observation stands, and the command goes
 on and records the new tip (#737). It accepts a moved tip only when the node's
 new best block leads back, header by header, to the captured tip at the
 captured height. When the tip has already moved by the time the block and
-fanout checks end, the command first repeats each of their node queries, since
+fanout checks end, the command first repeats their node queries, once per
+height again, since
 a chain that went over to a fork during them and came back onto a longer chain
 would leave answers read on the fork. It refuses, clearing nothing:
 

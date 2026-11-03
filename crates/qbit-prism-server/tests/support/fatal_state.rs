@@ -777,6 +777,8 @@ struct ProxyState {
     captured: std::sync::Mutex<Option<(String, u64)>>,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    /// Every call's method and params, in order (#690).
+    calls: std::sync::Mutex<Vec<(String, Value)>>,
 }
 
 impl ProxyState {
@@ -880,6 +882,7 @@ impl RpcProxy {
             captured: Default::default(),
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            calls: Default::default(),
         });
         let app = Router::new()
             .route(
@@ -888,6 +891,11 @@ impl RpcProxy {
                     |State(state): State<std::sync::Arc<ProxyState>>,
                      Json(request): Json<Value>| async move {
                         let method = request["method"].as_str().unwrap_or_default();
+                        state
+                            .calls
+                            .lock()
+                            .unwrap()
+                            .push((method.to_owned(), request["params"].clone()));
                         if state.pause && method == "getblockchaininfo" {
                             state.entered.notify_one();
                             state.release.notified().await;
@@ -931,6 +939,71 @@ impl RpcProxy {
         });
         Ok(Self { url, state, task })
     }
+
+    /// How many times the node was asked `getblockhash` at each height.
+    fn heights_asked(&self) -> std::collections::BTreeMap<u64, usize> {
+        let mut asked = std::collections::BTreeMap::new();
+        for (method, params) in self.state.calls.lock().unwrap().iter() {
+            if method == "getblockhash" {
+                *asked.entry(params[0].as_u64().unwrap()).or_default() += 1;
+            }
+        }
+        asked
+    }
+}
+
+/// #690: the clear asks the node about each height once, however many pool
+/// blocks and deep confirmed fanouts share it: two pool blocks at 90, a mature
+/// one and two of the fanouts' confirmations at 10, and the third at 20. A tip
+/// that moves before the first tip check has every observation asked again,
+/// again once per height. The event still counts every block and fanout.
+#[tokio::test]
+async fn clear_asks_the_node_once_per_height() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let (ledger, node, mut config) = setup(&db).await?;
+    // The node answers its tip, `ab..`, at every height but 90.
+    let parent = "ab".repeat(32);
+    block(&ledger, &parent, 10, true).await?;
+    let (held, forked) = ("ac".repeat(32), "ad".repeat(32));
+    block(&ledger, &held, 90, false).await?;
+    block(&ledger, &forked, 90, false).await?;
+    node.set_reply("getblockhash", json!([90]), json!(held));
+    sqlx::query("INSERT INTO qbit_ctv_fanout_sets(block_hash,manifest_set_json,manifest_set,manifest_set_sha256,settlement_mode,parent_coinbase_txid,parent_coinbase_tx_hex,fanout_count,fanout_output_sum_sats,covenant_output_value_sats) VALUES($1,'{}','{}','set','ctv_fanout','coinbase','00',3,3,3)")
+        .bind(&parent).execute(&ledger.pool).await?;
+    for (chunk, (txid, at)) in [("e1", 10), ("e2", 10), ("e3", 20)].into_iter().enumerate() {
+        sqlx::query("INSERT INTO qbit_ctv_fanout_artifacts(fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,covenant_output_value_sats,fanout_output_sum_sats,settlement_status,confirmed_depth,confirmed_block_hash,confirmed_block_height) VALUES($1,$2,'set','{}','{}','manifest','precommit','ctv','00',$3,3,'coinbase',0,'00','00',1,1,'confirmed',1000,$2,$4)")
+            .bind(txid.repeat(32)).bind(&parent).bind(chunk as i32).bind(at).execute(&ledger.pool).await?;
+    }
+    stopped(&ledger).await?;
+    for (tip_move, per_height) in [(TipMove::Still, 1), (TipMove::Extend, 2)] {
+        halt(&ledger, "test halt").await?;
+        let proxy = RpcProxy::moving(&node, tip_move, 0).await?;
+        config.rpc_url = proxy.url.clone();
+        let event = ledger.clear_fatal_state(&config, "reviewed").await?;
+        let reconciliation = &event["reconciliation"];
+        assert_eq!(reconciliation["blocks_checked"], 3, "{event}");
+        assert_eq!(reconciliation["deep_fanouts_checked"], 3, "{event}");
+        assert_eq!(
+            reconciliation["tip_extended"],
+            tip_move == TipMove::Extend,
+            "{event}"
+        );
+        // Height 0 is the genesis check.
+        assert_eq!(
+            proxy.heights_asked(),
+            std::collections::BTreeMap::from([
+                (0, 1),
+                (10, per_height),
+                (20, per_height),
+                (90, per_height)
+            ]),
+        );
+    }
+    assert_eq!(chain_state(&ledger, &held).await?, "confirmed");
+    assert_eq!(chain_state(&ledger, &forked).await?, "prepared");
+    db.close(vec![ledger]).await
 }
 
 #[tokio::test]
