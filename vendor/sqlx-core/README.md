@@ -69,7 +69,7 @@ the same file sees verify-ca without a usable `sslrootcert` report an
 unknown issuer rather than the configuration error, and take a public root,
 ISRG Root X1, as a certificate's issuer, as verify-full does.
 
-`scripts/check_vendored_sqlx_core.py` guards both in CI:
+`scripts/check_vendored_sqlx_core.py` guards this copy in CI:
 
 - **The patch.** sqlx pins its sqlx-core with `=`, so moving sqlx to another
   version leaves the patch unused, and Cargo only warns. The script fails
@@ -79,6 +79,20 @@ ISRG Root X1, as a certificate's issuer, as verify-full does.
   `cargo deny check`, the script lists every advisory the database it fetched
   holds for sqlx-core. It fails on any advisory that is not withdrawn and
   that `reviewed-advisories.toml` does not name.
+- **The source.** cargo-deny doesn't check a path crate's files either, so
+  `vendor/sqlx-core.sha256` lists every file here but
+  `reviewed-advisories.toml`, with its SHA-256 and whether it is upstream's,
+  patched from upstream's (with upstream's SHA-256) or added. The script
+  fails on any file whose content differs, any file the manifest doesn't
+  list and any it lists that is missing. It also fails unless this README
+  names, in backticks, every file the manifest records as patched or added,
+  and records the same upstream `.crate` SHA-256 as the manifest. An edit
+  here therefore fails CI until the manifest records it, which "Changing
+  this copy" below does only once this README records it too. Offline, CI
+  can check the files against the manifest, but not whether the manifest
+  calls each file upstream's, patched or added truly. So review any change
+  to `vendor/sqlx-core.sha256` with `--upstream-crate`, which checks that
+  against upstream's `.crate`.
 
 When an advisory appears, check it against this copy and fix or track it.
 Then add its ID to `reviewed-advisories.toml` with a one-line reason.
@@ -93,10 +107,37 @@ first check that release's verify-ca trust store in
 release still adds the public roots under verify-ca, carry the change
 forward (for example in a vendored copy of that release) rather than drop
 it. Only when it is no longer needed, remove these together:
-- this directory;
+- this directory and `vendor/sqlx-core.sha256`;
 - both `[patch.crates-io]` entries;
 - the Dockerfile `COPY`;
 - the script, its tests and its two CI steps.
 
 Keep both regression test files, with their sqlx-core dev-dependency moved to
 the new version: `sqlx_tls_verify_ca.rs` fails if the local change is lost.
+
+## Changing this copy
+
+1. Make the change, and record it in the change list above: what it
+   changes, why, and each file it touches by its path in backticks.
+2. Regenerate the manifest from upstream's `.crate`, which works offline
+   once the crate is at hand:
+
+   ```sh
+   curl -sSfL -o /tmp/sqlx-core-0.8.6.crate \
+     https://static.crates.io/crates/sqlx-core/sqlx-core-0.8.6.crate
+   python3 scripts/check_vendored_sqlx_core.py --write-manifest \
+     --upstream-crate /tmp/sqlx-core-0.8.6.crate
+   ```
+
+   Cargo's cache, `~/.cargo/registry/cache/*/sqlx-core-0.8.6.crate`, holds
+   the same file where a build has fetched it. The script refuses a `.crate`
+   whose SHA-256 is not the one this README records, a tree that lacks one
+   of upstream's files, a patched or added file this README does not name,
+   and a change to any file while this README is unchanged.
+3. Commit the change, this README and the manifest together.
+
+`--upstream-crate` without `--write-manifest` checks the committed manifest
+against the `.crate` instead: that every file it records as upstream's is
+upstream's, and that every other one is patched or added as it says. A
+reviewer runs it to see that this directory is 0.8.6 plus exactly the files
+the change list names.

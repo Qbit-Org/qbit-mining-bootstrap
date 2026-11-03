@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail unless every build still uses vendor/sqlx-core, and its advisories are reviewed.
+"""Fail unless every build still uses vendor/sqlx-core, its files are the recorded ones, and its advisories are reviewed.
 
 vendor/sqlx-core is sqlx-core with launchbadge/sqlx#4251 (#771) and #3861
 (#713) backported, plus a local verify-ca change (it trusts only
@@ -17,6 +17,23 @@ this requires that
   its sqlx-core dependency names no other copy;
 - Cargo did not record the sqlx-core patch under `[[patch.unused]]`.
 
+cargo-deny doesn't check a path crate's files either, so an unreviewed edit
+to the vendored copy, for example one that trusts the public roots under
+verify-ca again, would build. vendor/sqlx-core.sha256 lists every file in
+vendor/sqlx-core but reviewed-advisories.toml, with its SHA-256 and whether
+it is upstream's, patched from upstream's or added. This fails on a file
+whose content differs, one the manifest doesn't list and one it lists that
+is missing, on anything there that is not a regular file, and unless the
+README names every patched or added file and records the upstream .crate
+SHA-256 the manifest was generated from. It reads nothing but the checkout.
+
+`--write-manifest --upstream-crate CRATE` regenerates the manifest from the
+tree and upstream's .crate, whose SHA-256 must be the one the README records.
+It refuses a change to any file while the README is unchanged, and a patched
+or added file the README doesn't name. `--upstream-crate` alone checks the
+committed manifest's record of what differs from upstream against the .crate.
+The README's "Changing this copy" gives the procedure.
+
 cargo-deny matches RustSec advisories only against registry crates, so it no
 longer checks sqlx-core. When a RustSec advisory-db checkout is present, this
 lists every advisory the database holds for sqlx-core and fails unless each
@@ -27,7 +44,9 @@ when unset), or `--advisory-db` / RUSTSEC_ADVISORY_DB. Without a checkout the
 advisory part is skipped, unless `--require-advisory-db` makes that a failure.
 
 Usage: python3 scripts/check_vendored_sqlx_core.py [--root DIR]
-       [--advisory-db PATH] [--require-advisory-db]
+       [--advisory-db PATH] [--require-advisory-db] [--upstream-crate CRATE]
+       python3 scripts/check_vendored_sqlx_core.py [--root DIR]
+       --write-manifest --upstream-crate CRATE
 
 Exits 0 when everything holds and 1 otherwise, naming each problem.
 """
@@ -35,10 +54,14 @@ Exits 0 when everything holds and 1 otherwise, naming each problem.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import hashlib
+import io
 import os
 from pathlib import Path
 import re
 import sys
+import tarfile
 import tomllib
 
 
@@ -53,6 +76,16 @@ WORKSPACES = (Path("."), Path("crates") / "qbit-prism-server" / "fuzz")
 ADVISORY_DB_ENV = "RUSTSEC_ADVISORY_DB"
 ADVISORY_ID = re.compile(r"^RUSTSEC-[0-9]{4}-[0-9]{4}$")
 FRONT_MATTER = re.compile(r"\A```toml\n(?P<toml>.*?)\n```", re.DOTALL)
+MANIFEST = Path("vendor") / f"{CRATE}.sha256"
+README = VENDORED / "README.md"
+# The advisory review reads it; adding a reviewed advisory changes no code.
+UNHASHED = frozenset({"reviewed-advisories.toml"})
+SHA256 = re.compile(r"[0-9a-f]{64}")
+RECORDED_CRATE = re.compile(r"SHA-256 is\s+`(?P<sha256>[0-9a-f]{64})`")
+REGENERATE = (
+    f"record an intended change in {README.as_posix()}'s change list, then regenerate "
+    f"{MANIFEST.as_posix()} as that README's \"Changing this copy\" says"
+)
 
 
 class CheckError(Exception):
@@ -156,6 +189,243 @@ def lock_problems(root: Path, workspace: Path, version: str) -> list[str]:
                 f"{label}: Cargo recorded the {CRATE} {entry.get('version')} patch as unused"
             )
     return problems
+
+
+def workspace_problems(root: Path, version: str) -> list[str]:
+    problems = []
+    for workspace in WORKSPACES:
+        problems += manifest_problems(root, workspace)
+        problems += lock_problems(root, workspace, version)
+    return problems
+
+
+@dataclass
+class Manifest:
+    version: str
+    crate_sha256: str
+    # Each file by its path in vendor/sqlx-core: its SHA-256, and `upstream`
+    # (upstream's file), `patched:<upstream's SHA-256>` or `added`.
+    files: dict[str, tuple[str, str]]
+
+
+def sha256_of(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_readme(root: Path) -> tuple[str, str]:
+    """README.md's text, and the upstream .crate SHA-256 it records."""
+    try:
+        text = (root / README).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise CheckError(f"{README.as_posix()} is missing") from None
+    recorded = RECORDED_CRATE.search(text)
+    if recorded is None:
+        raise CheckError(
+            f"{README.as_posix()} does not record upstream's .crate as `SHA-256 is `<hex>``"
+        )
+    return text, recorded["sha256"]
+
+
+def vendored_files(root: Path) -> dict[str, str]:
+    """Every file in vendor/sqlx-core but UNHASHED, by path, with its SHA-256."""
+    base = root / VENDORED
+    if not base.is_dir():
+        raise CheckError(f"{VENDORED.as_posix()} is missing")
+    files, problems = {}, []
+    for directory, dirnames, filenames in os.walk(base):
+        for name in sorted(dirnames + filenames):
+            path = Path(directory) / name
+            relative = path.relative_to(base).as_posix()
+            if path.is_symlink():
+                problems.append(f"{VENDORED.as_posix()}/{relative} is a symbolic link")
+            elif name in filenames and not path.is_file():
+                problems.append(f"{VENDORED.as_posix()}/{relative} is not a regular file")
+            elif name in filenames and relative not in UNHASHED:
+                files[relative] = sha256_of(path.read_bytes())
+    if problems:
+        raise CheckError(f"{'; '.join(problems)}: the vendored copy holds regular files only")
+    return files
+
+
+def origins(files: dict[str, str], upstream: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """Each file with what it is relative to upstream's crate."""
+    entries = {}
+    for path, digest in files.items():
+        if path not in upstream:
+            origin = "added"
+        elif upstream[path] == digest:
+            origin = "upstream"
+        else:
+            origin = f"patched:{upstream[path]}"
+        entries[path] = (digest, origin)
+    return entries
+
+
+def read_manifest(root: Path) -> Manifest:
+    label = MANIFEST.as_posix()
+    try:
+        text = (root / MANIFEST).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise CheckError(f"{label} is missing") from None
+    upstream, files = None, {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(" ")
+        if fields[0] == "upstream":
+            if (
+                upstream is not None
+                or len(fields) != 4
+                or fields[1] != CRATE
+                or not SHA256.fullmatch(fields[3])
+            ):
+                raise CheckError(
+                    f"{label}:{number}: expected one `upstream {CRATE} <version> <sha256>` line"
+                )
+            upstream = (fields[2], fields[3])
+            continue
+        digest, origin, path = (line.split(" ", 2) + ["", ""])[:3]
+        valid_origin = origin in ("upstream", "added") or (
+            origin.startswith("patched:") and SHA256.fullmatch(origin[len("patched:") :])
+        )
+        if not SHA256.fullmatch(digest) or not valid_origin or not path or path in files:
+            raise CheckError(
+                f"{label}:{number}: expected `<sha256> upstream|added|patched:<sha256> <path>`, "
+                "each path once"
+            )
+        files[path] = (digest, origin)
+    if upstream is None:
+        raise CheckError(f"{label} has no `upstream {CRATE} <version> <sha256>` line")
+    return Manifest(version=upstream[0], crate_sha256=upstream[1], files=files)
+
+
+def unrecorded_changes(entries: dict[str, tuple[str, str]], readme: str) -> list[str]:
+    """Files that differ from upstream's but that README.md does not name."""
+    return [
+        f"{VENDORED.as_posix()}/{path} differs from upstream's ({origin.split(':')[0]}), but "
+        f"{README.as_posix()} does not name `{path}`"
+        for path, (_, origin) in sorted(entries.items())
+        if origin != "upstream" and path != "README.md" and f"`{path}`" not in readme
+    ]
+
+
+def source_problems(root: Path, version: str) -> tuple[list[str], list[str]]:
+    """Problems, and a line that reports what was checked."""
+    label = MANIFEST.as_posix()
+    manifest = read_manifest(root)
+    readme, recorded = read_readme(root)
+    files = vendored_files(root)
+    problems = []
+    if manifest.version != version:
+        problems.append(f"{label} records {CRATE} {manifest.version}, but {VENDORED.as_posix()} is {version}")
+    if manifest.crate_sha256 != recorded:
+        problems.append(
+            f"{label} records upstream's .crate as {manifest.crate_sha256}, but "
+            f"{README.as_posix()} records {recorded}"
+        )
+    for path in sorted(set(manifest.files) - set(files)):
+        problems.append(f"{VENDORED.as_posix()}/{path} is missing: {label} lists it")
+    for path in sorted(set(files) - set(manifest.files)):
+        problems.append(f"{VENDORED.as_posix()}/{path} is not in {label}")
+    for path in sorted(set(files) & set(manifest.files)):
+        if files[path] != manifest.files[path][0]:
+            problems.append(f"{VENDORED.as_posix()}/{path} does not match its SHA-256 in {label}")
+    problems += unrecorded_changes(manifest.files, readme)
+    if problems:
+        return problems + [REGENERATE], []
+    kinds = [origin.split(":")[0] for _, origin in manifest.files.values()]
+    return [], [
+        f"{VENDORED.as_posix()} holds the {len(files)} files {label} records: upstream "
+        f"{CRATE} {manifest.version} with {kinds.count('patched')} patched and "
+        f"{kinds.count('added')} added"
+    ]
+
+
+def crate_files(crate: Path, version: str, recorded: str) -> dict[str, str]:
+    """Each file in upstream's .crate, by path, with its SHA-256. Read in memory, never extracted."""
+    try:
+        data = crate.read_bytes()
+    except OSError as error:
+        raise CheckError(f"cannot read {crate}: {error.strerror}") from None
+    if sha256_of(data) != recorded:
+        raise CheckError(
+            f"{crate} has SHA-256 {sha256_of(data)}, not the {recorded} {README.as_posix()} records"
+        )
+    prefix = f"{CRATE}-{version}/"
+    files = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                if not member.isfile() or not member.name.startswith(prefix):
+                    raise CheckError(f"{crate}: unexpected entry {member.name!r}")
+                files[member.name[len(prefix) :]] = sha256_of(archive.extractfile(member).read())
+    except (tarfile.TarError, EOFError, OSError) as error:
+        raise CheckError(f"{crate} is not a readable .crate: {error}") from None
+    return files
+
+
+def upstream_problems(root: Path, crate: Path, version: str) -> tuple[list[str], list[str]]:
+    """The manifest's record of what differs from upstream, checked against the .crate."""
+    label = MANIFEST.as_posix()
+    manifest = read_manifest(root)
+    _, recorded = read_readme(root)
+    upstream = crate_files(crate, version, recorded)
+    found = origins({path: digest for path, (digest, _) in manifest.files.items()}, upstream)
+    problems = [
+        f"{label} records {path} as {manifest.files[path][1]}, but against {crate} it is {origin}"
+        for path, (_, origin) in sorted(found.items())
+        if manifest.files[path][1] != origin
+    ]
+    problems += [
+        f"{label} does not list upstream's {path}" for path in sorted(set(upstream) - set(found))
+    ]
+    return problems, [f"{label} matches {crate}: every file it calls upstream's is upstream's"]
+
+
+def write_manifest(root: Path, crate: Path) -> str:
+    """Regenerate the manifest from the tree and upstream's .crate; what it wrote."""
+    version = vendored_version(root)
+    readme, recorded = read_readme(root)
+    upstream = crate_files(crate, version, recorded)
+    files = vendored_files(root)
+    problems = [
+        f"{VENDORED.as_posix()} lacks upstream's {path}: the manifest records no removals"
+        for path in sorted(set(upstream) - set(files))
+    ]
+    entries = origins(files, upstream)
+    problems += unrecorded_changes(entries, readme)
+    if (root / MANIFEST).exists():
+        old = read_manifest(root).files
+        changed = sorted(
+            path
+            for path in set(old) | set(entries)
+            if path != "README.md" and old.get(path, ("",))[0] != entries.get(path, ("",))[0]
+        )
+        if changed and old.get("README.md", ("",))[0] == entries["README.md"][0]:
+            problems.append(
+                f"{', '.join(changed)} changed, but {README.as_posix()} did not: record the "
+                "change in its change list first"
+            )
+    if problems:
+        raise CheckError("; ".join(problems))
+    lines = [
+        f"# Every file in {VENDORED.as_posix()} but {', '.join(sorted(UNHASHED))}, by SHA-256,",
+        "# and whether it is upstream's, patched from upstream's (its SHA-256) or added.",
+        "# scripts/check_vendored_sqlx_core.py fails CI on any other file or content.",
+        f"# Regenerate it only as {README.as_posix()}'s \"Changing this copy\" says.",
+        f"upstream {CRATE} {version} {recorded}",
+    ]
+    lines += [f"{digest} {origin} {path}" for path, (digest, origin) in sorted(entries.items())]
+    temporary = (root / MANIFEST).with_name(f"{MANIFEST.name}.tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(root / MANIFEST)
+    kinds = [origin.split(":")[0] for _, origin in entries.values()]
+    return (
+        f"wrote {MANIFEST.as_posix()}: {len(entries)} files, upstream {CRATE} {version} with "
+        f"{kinds.count('patched')} patched and {kinds.count('added')} added"
+    )
 
 
 def reviewed_advisories(root: Path) -> dict[str, str]:
@@ -286,20 +556,54 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail, rather than skip the advisory review, when no database is found",
     )
+    parser.add_argument(
+        "--upstream-crate",
+        type=Path,
+        help=f"upstream's {CRATE} .crate, whose SHA-256 must be the one {README.as_posix()} "
+        f"records: check {MANIFEST.as_posix()}'s record of what differs from it",
+    )
+    parser.add_argument(
+        "--write-manifest",
+        action="store_true",
+        help=f"regenerate {MANIFEST.as_posix()} from the tree and --upstream-crate, and check "
+        "nothing else",
+    )
     args = parser.parse_args(argv)
     root = args.root.resolve()
 
+    if args.write_manifest:
+        if args.upstream_crate is None:
+            parser.error("--write-manifest needs --upstream-crate")
+        try:
+            print(f"{PREFIX}: {write_manifest(root, args.upstream_crate)}")
+        except CheckError as error:
+            print(f"{PREFIX}: {error}", file=sys.stderr)
+            print(f"{PREFIX}: {MANIFEST.as_posix()} is unchanged", file=sys.stderr)
+            return 1
+        return 0
+
     problems: list[str] = []
     report: list[str] = []
+    parts = []
     try:
         version = vendored_version(root)
-        for workspace in WORKSPACES:
-            problems += manifest_problems(root, workspace)
-            problems += lock_problems(root, workspace, version)
-        found, report = advisory_problems(root, args.advisory_db, args.require_advisory_db)
-        problems += found
     except CheckError as error:
         problems.append(str(error))
+    else:
+        parts.append(lambda: (workspace_problems(root, version), []))
+        parts.append(lambda: source_problems(root, version))
+        if args.upstream_crate is not None:
+            parts.append(lambda: upstream_problems(root, args.upstream_crate, version))
+    parts.append(lambda: advisory_problems(root, args.advisory_db, args.require_advisory_db))
+    # Each part reports on its own, so one that cannot run hides no other's problems.
+    for part in parts:
+        try:
+            found, lines = part()
+        except CheckError as error:
+            problems.append(str(error))
+            continue
+        problems += found
+        report += lines
     for line in report:
         print(f"{PREFIX}: {line}")
     for problem in problems:
