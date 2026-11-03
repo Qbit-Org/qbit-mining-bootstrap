@@ -148,6 +148,8 @@ families! {
     DualWriterNodeIndex: Gauge, "dual_writer_node_index", "Dual-writer mode (3.1): this node's configured PRISM_NODE_INDEX, 0 for A and 1 for B.";
     DualWriterCarryOwner: Gauge, "dual_writer_carry_owner", "Dual-writer mode (3.1): this node's PRISM_CARRY_OWNER as configured, 1 on the node configured to pay down carried balances.";
     ReadinessRequests: Counter, "readiness_requests_total", "Requests to the readiness endpoint (PRISM_READINESS_PORT, 3.1) by answer: ready (200), not_ready (503), unauthorized (401, a missing, repeated or wrong token) or not_found (404, another path or method); no samples while the endpoint is off.";
+    PayoutRevisionListenerUp: Gauge, "payout_revision_listener_up", "Whether this frontend's payout-revision listener (#752, #816) holds its LISTEN on the qbit_prism_payout_revision channel: 1 from a successful LISTEN until its connection is lost or its probe, run after 30 s without an announcement, fails; 0 before the first LISTEN, while it reconnects and once the refresh loop stops. While 0 this frontend republishes after another frontend's block only on its blockpoll tick. A LISTEN through a transaction-pooling proxy reads 1 and hears nothing: read qbit_prism_payout_revision_announcements_heard_total beside it.";
+    PayoutRevisionAnnouncements: Counter, "payout_revision_announcements_heard_total", "Notifications this frontend's payout-revision listener received on the qbit_prism_payout_revision channel since process start (#816): one per announced payout revision bump (a block's confirmation or settlement, a carry gate change, a fatal-state clear) that any frontend, this one included, committed while it listened; one committed while it was down is never counted.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -211,6 +213,10 @@ impl Family {
                     // runs moves it, and PrismBlockSubmissionHeld reads it on
                     // a successful scrape rather than a fresh snapshot.
                     | Self::BlockSubmission
+                    // #816: the listener goes down with the database, which
+                    // can stall the health publisher behind it.
+                    | Self::PayoutRevisionListenerUp
+                    | Self::PayoutRevisionAnnouncements
             )
     }
 

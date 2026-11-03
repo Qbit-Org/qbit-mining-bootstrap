@@ -40,6 +40,11 @@ privacy assertion is `landing_metrics::lost_offer_reply_starts_at_active_proof_a
 the `qbit_prism_landing_malloc_trim_resident_bytes` gauge (-1 at startup) and
 the `qbit_prism_landing_malloc_trim_seconds` histogram, declared at startup and
 sampled from the first trim: 2 startup series and 16 populated ones.
+#816's payout-revision listener adds two unlabeled families present from
+startup: the `qbit_prism_payout_revision_listener_up` gauge (0 at startup) and
+the `qbit_prism_payout_revision_announcements_heard_total` counter (zero at
+startup), 2 startup and 2 populated series. The announcement's payload, a
+payout revision, never enters the exposition.
 Adjacent node/rollup additions are outside this branch's census and must be
 combined explicitly when integrating another metrics change.
 

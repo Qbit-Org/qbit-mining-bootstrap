@@ -22,7 +22,9 @@
 //! revision republishes nothing older. The third has a dual-writer node's
 //! carry gate change, fenced by `ledger::bump_payout_revision`, wake B. The
 //! fourth commits a bump between the refresh loop's first refresh and its
-//! listener's first LISTEN, which must still wake the refresh.
+//! listener's first LISTEN, which must still wake the refresh. The second and
+//! fourth also read each listener's gauge and B's announcement counter
+//! (#816).
 //!
 //! Run through: test/prism-native-tests.sh cargo-args --locked -p
 //! qbit-prism-server --test revision_wake -- --nocapture
@@ -408,6 +410,40 @@ async fn until_listeners(
     }
 }
 
+const LISTENER_UP: &str = "qbit_prism_payout_revision_listener_up";
+const HEARD: &str = "qbit_prism_payout_revision_announcements_heard_total";
+
+/// `name`'s sample, without labels, in `coordinator`'s metrics.
+fn sample(coordinator: &Coordinator, name: &str) -> Result<f64> {
+    coordinator
+        .metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .with_context(|| format!("no {name} sample"))
+}
+
+/// Until `coordinator`'s `name` reads `value`, within `bound`.
+async fn until_sample(
+    coordinator: &Coordinator,
+    name: &str,
+    value: f64,
+    bound: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let now = sample(coordinator, name)?;
+        if now == value {
+            return Ok(());
+        }
+        ensure!(
+            started.elapsed() < bound,
+            "{name} read {now} after {bound:?}, not {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// A same-tip bump with its announcement, as `ledger/blocks.rs` runs it.
 async fn bump(connection: &mut PgConnection) -> Result<i64> {
     Ok(sqlx::query_scalar(&format!(
@@ -425,9 +461,23 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
     let mut bumper = PgConnection::connect(&db.url).await?;
     let first = durable_revision(&mut bumper).await?;
     let (stop, _) = watch::channel(false);
+    let started = Instant::now();
     let loops = vec![refresh_loop(&f.a, &stop), refresh_loop(&f.b, &stop)];
     let result = async {
         until_listeners(db, 2, Duration::from_secs(10)).await?;
+        // Each loop's first refresh has read the revision, so none can read
+        // the bump below: B can then republish only when woken.
+        for frontend in [&f.a, &f.b] {
+            while frontend.work_refresh_age() >= started.elapsed() {
+                ensure!(
+                    started.elapsed() < WAKE_BOUND,
+                    "a refresh loop did not refresh at its start"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            until_sample(frontend, LISTENER_UP, 1., WAKE_BOUND).await?;
+        }
+        let heard = sample(&f.b, HEARD)?;
         // Both listeners are cut off, and cannot reconnect.
         sqlx::query(&format!(
             "ALTER DATABASE \"{}\" WITH ALLOW_CONNECTIONS false",
@@ -444,6 +494,12 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
         .await?;
         ensure!(ended == 2, "{ended} listener session(s) ended, not 2");
         until_listeners(db, 0, Duration::from_secs(10)).await?;
+        // Each frontend sees its listener lost (#816).
+        for frontend in [&f.a, &f.b] {
+            until_sample(frontend, LISTENER_UP, 0., WAKE_BOUND)
+                .await
+                .context("a lost listener still reads up")?;
+        }
 
         // An announcement nobody hears. A keeps its tick: the refresh is
         // never held up by its listener. No listener session exists until
@@ -480,14 +536,24 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
             .context("B's reconnected listener did not wake its refresh for the announcement it missed")?;
         eprintln!("B caught up {took:?} after the database took connections again");
         until_listeners(db, 2, revision_wake::RETRY_LONGEST + WAKE_BOUND).await?;
+        for frontend in [&f.a, &f.b] {
+            until_sample(frontend, LISTENER_UP, 1., WAKE_BOUND)
+                .await
+                .context("a reconnected listener still reads down")?;
+        }
+        ensure!(
+            sample(&f.b, HEARD)? == heard,
+            "B counted the announcement made while its listener was down"
+        );
 
-        // And the next announcement wakes it again.
-        let heard = bump(&mut bumper).await?;
+        // And the next announcement wakes it again, counted once heard.
+        let next = bump(&mut bumper).await?;
         let bumped = Instant::now();
-        let took = republished(&f.b, heard, bumped, WAKE_BOUND)
+        let took = republished(&f.b, next, bumped, WAKE_BOUND)
             .await
             .context("B's reconnected listener did not wake its refresh")?;
         eprintln!("B, reconnected, republished {took:?} after the next announcement");
+        until_sample(&f.b, HEARD, heard + 1., WAKE_BOUND).await?;
 
         // A late announcement of an older revision is only a wake: the
         // refresh it causes reads the durable revision and publishes
@@ -510,14 +576,26 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
         }
         let (now, _) = published(&f.b).await?;
         ensure!(
-            now == heard,
-            "a late announcement of revision {first} left B publishing {now}, not {heard}"
+            now == next,
+            "a late announcement of revision {first} left B publishing {now}, not {next}"
         );
+        // It is still an announcement heard.
+        until_sample(&f.b, HEARD, heard + 2., WAKE_BOUND).await?;
         Ok(())
     }
     .await;
     let stopped = stop_loops(stop, loops).await;
-    result.and(stopped)
+    // A listener whose loop stopped reads down.
+    let down = async {
+        for frontend in [&f.a, &f.b] {
+            until_sample(frontend, LISTENER_UP, 0., WAKE_BOUND)
+                .await
+                .context("a stopped listener still reads up")?;
+        }
+        Ok(())
+    }
+    .await;
+    result.and(stopped).and(down)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -644,6 +722,10 @@ async fn first_listen(db: &ledger_database::FixtureDatabase, f: &Frontends) -> R
             listeners(db).await? == 0,
             "a listener connected while the database refused connections"
         );
+        ensure!(
+            sample(&f.b, LISTENER_UP)? == 0.,
+            "B's listener reads up before its first LISTEN (#816)"
+        );
         let missed = bump(&mut bumper).await?;
         ensure!(missed == first + 1);
         let (now, _) = published(&f.b).await?;
@@ -667,6 +749,9 @@ async fn first_listen(db: &ledger_database::FixtureDatabase, f: &Frontends) -> R
         .await
         .context("B's first LISTEN, after its first refresh, did not wake the refresh for the bump in between")?;
         eprintln!("B's first LISTEN woke its refresh {took:?} after the database took connections");
+        until_sample(&f.b, LISTENER_UP, 1., WAKE_BOUND)
+            .await
+            .context("B's first LISTEN does not read up (#816)")?;
         Ok(())
     }
     .await;
