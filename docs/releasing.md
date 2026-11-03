@@ -77,24 +77,49 @@ commit in place of `<release-main-sha>`, and the version in place of
 `<version>` (as `v2.0.0` was; `v3.0.0` and `v3.1.0` are signed annotated
 tags on their branches' commits, with their own messages):
 
-```sh
-git fetch origin main --tags
-git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
-git verify-tag v<version>
-git push origin refs/tags/v<version>
-git show v<version>:doc/release-notes-<version>.md | sed -E \
-  -e 's#\]\(\.\./#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/#g' \
-  -e 's#\]\(([^)#/:][^):]*)\)#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/doc/\1)#g' \
-  > /tmp/qbit-release-notes.md
-gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
-  --notes-file /tmp/qbit-release-notes.md
+```bash
+(
+  set -e -o pipefail
+  notes=$(mktemp)
+  trap 'rm -f "$notes"' EXIT
+  git fetch origin main --tags
+  git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
+  git verify-tag v<version>
+  git show v<version>:doc/release-notes-<version>.md | sed -E \
+    -e 's|\]\(\.\./|](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/|g' \
+    -e 's|\]\(([^)#/:][^):]*)\)|](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/doc/\1)|g' \
+    > "$notes"
+  grep -q '[^[:space:]]' "$notes" || { echo 'the release notes are empty; not publishing' >&2; exit 1; }
+  git push origin refs/tags/v<version>
+  gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
+    --notes-file "$notes"
+)
 ```
 
 The `sed` points each inline relative link in the notes, `](path)`, at the
 tagged file, since a GitHub release body can't resolve one relative to the
 notes; `](#...)` anchors, absolute `](/...)` paths and URLs stay as they are.
 It doesn't handle reference-style links or link titles, so keep release
-notes to inline links without titles.
+notes to inline links without titles. Its expressions are delimited by `|`,
+which neither the patterns nor the replacements contain, so no `sed` has to
+tell a delimiter from a `#` in a bracket expression; keep `|` out of them.
+
+The block runs in a subshell, in bash or zsh, that stops at the first
+failing command, `git show` or `sed` alike (`pipefail`), and refuses notes
+that are empty or blank. Creating the tag is part of it, so a tag that
+already exists stops it too. The notes are rewritten from the local tag
+before it is pushed, so missing or empty notes stop it before anything is
+public.
+
+When it stops, first check whether the tag is public:
+`git ls-remote --tags origin refs/tags/v<version>`.
+- **Not public:** delete the local tag (`git tag -d v<version>`), fix the
+  cause, and run the block again. Notes are fixed on `main` through a
+  reviewed PR, and the resulting commit is identified and verified as above
+  before it is tagged.
+- **Public:** the tag is never recreated. Check `gh release view v<version>`;
+  if there is no release, run the block again without its `git tag -s` and
+  `git push` lines, so the notes are still rewritten and checked.
 
 Pushing a `v*` tag also runs the L3 production-window matrix
 (`prism-load-l3.yml`), which promotes the promotion PR's run on the same tree
