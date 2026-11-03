@@ -1000,7 +1000,69 @@ pub struct MetricsScrape {
     pub ack_buckets: BTreeMap<String, BTreeMap<String, f64>>,
     pub ack_counts: BTreeMap<String, f64>,
     pub ack_sums: BTreeMap<String, f64>,
+    /// `_count` and `_sum` of each [`ACCOUNTED_SERIES`], keyed by
+    /// [`AccountedSeries::key`]; see [`SeriesSample`] for when a missing
+    /// series is a zero and when it is unknown.
+    pub series: BTreeMap<String, SeriesSample>,
 }
+
+/// One histogram series' `_count` and `_sum` in one scrape; either is `None`
+/// when that line was not exported. `declared` is whether the scrape carried
+/// the family's `# TYPE` line: the server declares the lock families at start
+/// and samples a series only once it observes it, so a declared family with
+/// no line for the series is a real zero for that process, while an
+/// undeclared one (a server without the family) is unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct SeriesSample {
+    pub declared: bool,
+    pub count: Option<f64>,
+    pub sum: Option<f64>,
+}
+
+impl SeriesSample {
+    /// `(count, sum)`, zeros for a declared series not yet observed, `None`
+    /// when unknown.
+    fn values(&self) -> Option<(f64, f64)> {
+        match (self.count, self.sum) {
+            (Some(count), Some(sum)) => Some((count, sum)),
+            (None, None) if self.declared => Some((0.0, 0.0)),
+            _ => None,
+        }
+    }
+}
+
+/// A frontend histogram series the share-ack accounting reads (#829): its
+/// family and the labels that select the series.
+#[derive(Clone, Copy, Debug)]
+pub struct AccountedSeries {
+    pub key: &'static str,
+    pub family: &'static str,
+    pub labels: &'static [(&'static str, &'static str)],
+}
+
+pub const ORDER_LOCK_HOLD_APPEND: &str = "order_lock_hold_append";
+pub const ORDER_LOCK_WAIT_GRANTED: &str = "order_lock_wait_granted";
+pub const POOL_ACQUIRE_SUCCEEDED: &str = "pool_acquire_succeeded";
+
+/// The server's existing histograms the accounting reads; the harness adds
+/// no server metric (#829).
+pub const ACCOUNTED_SERIES: [AccountedSeries; 3] = [
+    AccountedSeries {
+        key: ORDER_LOCK_HOLD_APPEND,
+        family: "qbit_prism_database_order_lock_hold_seconds",
+        labels: &[("holder", "append")],
+    },
+    AccountedSeries {
+        key: ORDER_LOCK_WAIT_GRANTED,
+        family: "qbit_prism_database_advisory_lock_wait_seconds",
+        labels: &[("lock", "order"), ("result", "success")],
+    },
+    AccountedSeries {
+        key: POOL_ACQUIRE_SUCCEEDED,
+        family: "qbit_prism_database_pool_acquire_seconds",
+        labels: &[("result", "success")],
+    },
+];
 
 pub async fn scrape_metrics(instance_id: &str, url: &str) -> MetricsScrape {
     let mut scrape = MetricsScrape {
@@ -1031,8 +1093,56 @@ pub async fn scrape_metrics(instance_id: &str, url: &str) -> MetricsScrape {
         }
     };
     parse_share_ack(&body, &mut scrape);
+    parse_accounted_series(&body, &mut scrape);
     scrape.ok = true;
     scrape
+}
+
+/// Read each [`ACCOUNTED_SERIES`]' `_count` and `_sum` lines from a
+/// `/metrics` body into `scrape.series`.
+pub fn parse_accounted_series(body: &str, scrape: &mut MetricsScrape) {
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(declaration) = line.strip_prefix("# TYPE ") {
+            let family = declaration.split_whitespace().next().unwrap_or_default();
+            for series in ACCOUNTED_SERIES
+                .iter()
+                .filter(|series| series.family == family)
+            {
+                scrape
+                    .series
+                    .entry(series.key.to_owned())
+                    .or_default()
+                    .declared = true;
+            }
+            continue;
+        }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let Some(value) = sample_value(line) else {
+            continue;
+        };
+        let name = line.split(['{', ' ']).next().unwrap_or_default();
+        for series in &ACCOUNTED_SERIES {
+            let Some(suffix) = name.strip_prefix(series.family) else {
+                continue;
+            };
+            if !series
+                .labels
+                .iter()
+                .all(|(key, wanted)| label(line, key).as_deref() == Some(*wanted))
+            {
+                continue;
+            }
+            let sample = scrape.series.entry(series.key.to_owned()).or_default();
+            match suffix {
+                "_count" => sample.count = Some(value),
+                "_sum" => sample.sum = Some(value),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn label(line: &str, name: &str) -> Option<String> {
@@ -1200,6 +1310,32 @@ fn segment(from: &MetricsScrape, to: &MetricsScrape) -> std::result::Result<Segm
     })
 }
 
+/// The `(from, to)` scrapes of each process that ran during a phase: the
+/// phase's first scrape to the first restart's last, and so on to the
+/// phase's last. `Err` when a restart has no scrape on each side.
+fn segment_pairs<'a>(
+    before: &'a MetricsScrape,
+    splits: &[&'a AckSplit],
+    after: &'a MetricsScrape,
+    restarts: usize,
+) -> std::result::Result<Vec<(&'a MetricsScrape, &'a MetricsScrape)>, String> {
+    if splits.len() != restarts {
+        return Err(format!(
+            "the frontend restarted {restarts} time(s) during the phase and its counters reset \
+             each time; {} of those restarts have a scrape on each side",
+            splits.len()
+        ));
+    }
+    let mut starts: Vec<&MetricsScrape> = vec![before];
+    let mut ends: Vec<&MetricsScrape> = Vec::new();
+    for split in splits {
+        ends.push(&split.end_of_previous);
+        starts.push(&split.start_of_next);
+    }
+    ends.push(after);
+    Ok(starts.into_iter().zip(ends).collect())
+}
+
 /// The phase delta for a frontend that was not restarted.
 pub fn ack_delta(before: &MetricsScrape, after: &MetricsScrape) -> ServerAckDelta {
     ack_delta_across_restarts(before, &[], after, 0)
@@ -1215,23 +1351,16 @@ pub fn ack_delta_across_restarts(
     restarts: usize,
 ) -> ServerAckDelta {
     let mut delta = ServerAckDelta::empty(&after.instance_id, restarts);
-    if splits.len() != restarts {
-        delta.unavailable_reason = Some(format!(
-            "the frontend restarted {restarts} time(s) during the phase and its counters reset \
-             each time; {} of those restarts have a scrape on each side, so the delta cannot be \
-             assembled and is unknown",
-            splits.len()
-        ));
-        return delta;
-    }
-    let mut starts: Vec<&MetricsScrape> = vec![before];
-    let mut ends: Vec<&MetricsScrape> = Vec::new();
-    for split in splits {
-        ends.push(&split.end_of_previous);
-        starts.push(&split.start_of_next);
-    }
-    ends.push(after);
-    for (from, to) in starts.iter().zip(ends.iter()) {
+    let pairs = match segment_pairs(before, splits, after, restarts) {
+        Ok(pairs) => pairs,
+        Err(reason) => {
+            delta.unavailable_reason = Some(format!(
+                "{reason}, so the delta cannot be assembled and is unknown"
+            ));
+            return delta;
+        }
+    };
+    for (from, to) in pairs {
         match segment(from, to) {
             Ok(part) => {
                 for (result, value) in part.counts {
@@ -1266,6 +1395,627 @@ pub fn ack_delta_across_restarts(
         ));
     }
     delta
+}
+
+/// One [`AccountedSeries`]' observations and seconds over a phase on one
+/// frontend; both `None`, with the reason, when they cannot be assembled.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SeriesDelta {
+    pub count: Option<f64>,
+    pub seconds: Option<f64>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl SeriesDelta {
+    fn unknown(reason: String) -> Self {
+        Self {
+            count: None,
+            seconds: None,
+            unavailable_reason: Some(reason),
+        }
+    }
+}
+
+/// [`ack_delta_across_restarts`] for one accounted series: one segment per
+/// process, each bracketed by its own scrapes. A failed scrape, a series a
+/// scrape lacks, a counter that went backwards or an unbracketed restart
+/// leaves it unknown, never zero (EP-OBSERVABILITY).
+pub fn series_delta_across_restarts(
+    key: &str,
+    before: &MetricsScrape,
+    splits: &[&AckSplit],
+    after: &MetricsScrape,
+    restarts: usize,
+) -> SeriesDelta {
+    let pairs = match segment_pairs(before, splits, after, restarts) {
+        Ok(pairs) => pairs,
+        Err(reason) => return SeriesDelta::unknown(reason),
+    };
+    let (mut count, mut seconds) = (0.0, 0.0);
+    for (from, to) in pairs {
+        if !from.ok || !to.ok {
+            return SeriesDelta::unknown(
+                to.error
+                    .clone()
+                    .or_else(|| from.error.clone())
+                    .unwrap_or_else(|| "a boundary scrape failed".into()),
+            );
+        }
+        let read = |scrape: &MetricsScrape| scrape.series.get(key).and_then(SeriesSample::values);
+        let (Some((from_count, from_sum)), Some((to_count, to_sum))) = (read(from), read(to))
+        else {
+            return SeriesDelta::unknown(format!(
+                "{key}: the frontend's /metrics did not export this series"
+            ));
+        };
+        if to_count < from_count || to_sum < from_sum {
+            return SeriesDelta::unknown(format!(
+                "{key}: the counters went backwards between two scrapes without a recorded \
+                 restart"
+            ));
+        }
+        count += to_count - from_count;
+        seconds += to_sum - from_sum;
+    }
+    SeriesDelta {
+        count: Some(count),
+        seconds: Some(seconds),
+        unavailable_reason: None,
+    }
+}
+
+/// `pg_stat_statements` for the share append's one server-side call
+/// (migration 032's `qbit_prism_append_share`, #711) over a phase.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AppendCallStats {
+    pub calls: i64,
+    pub total_seconds: f64,
+    /// `None` when the phase made no call.
+    pub max_seconds: Option<f64>,
+}
+
+/// The append call's `pg_stat_statements` row since the phase's reset. No
+/// row at all is a real zero: the extension answered and nothing called it.
+pub async fn append_call_statement(pool: &PgPool) -> std::result::Result<AppendCallStats, String> {
+    let row = sqlx::query(
+        "SELECT coalesce(sum(calls), 0)::bigint AS calls, \
+                coalesce(sum(total_exec_time), 0)::double precision AS total, \
+                max(max_exec_time)::double precision AS max \
+         FROM pg_stat_statements WHERE query LIKE '%qbit_prism_append_share(%'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("pg_stat_statements could not be read: {error}"))?;
+    let read = |error: sqlx::Error| format!("pg_stat_statements row unreadable: {error}");
+    let calls: i64 = row.try_get("calls").map_err(read)?;
+    let total: f64 = row.try_get("total").map_err(read)?;
+    let max: Option<f64> = row.try_get("max").map_err(read)?;
+    Ok(AppendCallStats {
+        calls,
+        total_seconds: total / 1000.0,
+        max_seconds: max.map(|max| max / 1000.0),
+    })
+}
+
+/// `pg_stat_wal` and the checkpointer's counters at one instant.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct WalCounters {
+    pub wal_records: i64,
+    pub wal_fpi: i64,
+    pub wal_bytes: f64,
+    pub wal_write: i64,
+    pub wal_sync: i64,
+    pub wal_write_time_ms: f64,
+    pub wal_sync_time_ms: f64,
+    /// `track_wal_io_timing` as the server had it; the two times are
+    /// zeros it never measured when this is off.
+    pub io_timing: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CheckpointCounters {
+    pub timed: i64,
+    pub requested: i64,
+    pub write_time_ms: f64,
+    pub sync_time_ms: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DatabaseCounters {
+    /// `pg_postmaster_start_time()`: counters read from a server that
+    /// restarted, or from a promoted standby, are not one server's delta.
+    pub server_started: std::result::Result<String, String>,
+    pub wal: std::result::Result<WalCounters, String>,
+    pub checkpoints: std::result::Result<CheckpointCounters, String>,
+}
+
+/// Read [`DatabaseCounters`]. PostgreSQL 16 keeps the checkpoint counters in
+/// `pg_stat_bgwriter`, 17 in `pg_stat_checkpointer`, chosen by the server's
+/// version; either half failing leaves it unknown with the error (18 moved
+/// pg_stat_wal's write and sync columns to pg_stat_io, so its WAL half reads
+/// unknown).
+pub async fn database_counters(pool: &PgPool) -> DatabaseCounters {
+    let server = sqlx::query(
+        "SELECT pg_postmaster_start_time()::text AS started, \
+                current_setting('server_version_num')::int AS version",
+    )
+    .fetch_one(pool)
+    .await
+    .and_then(|row| {
+        Ok((
+            row.try_get::<String, _>("started")?,
+            row.try_get::<i32, _>("version")?,
+        ))
+    })
+    .map_err(|error| format!("the server's start time could not be read: {error}"));
+    let wal = async {
+        let row = sqlx::query(
+            "SELECT wal_records, wal_fpi, wal_bytes::double precision AS wal_bytes, wal_write, \
+                    wal_sync, wal_write_time, wal_sync_time, \
+                    current_setting('track_wal_io_timing')::bool AS io_timing \
+             FROM pg_stat_wal",
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok::<_, sqlx::Error>(WalCounters {
+            wal_records: row.try_get("wal_records")?,
+            wal_fpi: row.try_get("wal_fpi")?,
+            wal_bytes: row.try_get("wal_bytes")?,
+            wal_write: row.try_get("wal_write")?,
+            wal_sync: row.try_get("wal_sync")?,
+            wal_write_time_ms: row.try_get("wal_write_time")?,
+            wal_sync_time_ms: row.try_get("wal_sync_time")?,
+            io_timing: row.try_get("io_timing")?,
+        })
+    };
+    // PostgreSQL 17 moved the checkpoint counters to pg_stat_checkpointer.
+    let checkpoint_query = match &server {
+        Ok((_, version)) if *version >= 170_000 => {
+            "SELECT num_timed AS timed, num_requested AS requested, write_time, sync_time \
+             FROM pg_stat_checkpointer"
+        }
+        _ => {
+            "SELECT checkpoints_timed AS timed, checkpoints_req AS requested, \
+                    checkpoint_write_time AS write_time, checkpoint_sync_time AS sync_time \
+             FROM pg_stat_bgwriter"
+        }
+    };
+    let checkpoints = async {
+        let row = sqlx::query(checkpoint_query).fetch_one(pool).await?;
+        Ok::<_, sqlx::Error>(CheckpointCounters {
+            timed: row.try_get("timed")?,
+            requested: row.try_get("requested")?,
+            write_time_ms: row.try_get("write_time")?,
+            sync_time_ms: row.try_get("sync_time")?,
+        })
+    };
+    let (wal, checkpoints) = tokio::join!(wal, checkpoints);
+    DatabaseCounters {
+        server_started: server.map(|(started, _)| started),
+        wal: wal.map_err(|error| format!("pg_stat_wal could not be read: {error}")),
+        checkpoints: checkpoints
+            .map_err(|error| format!("the checkpoint counters could not be read: {error}")),
+    }
+}
+
+/// [`WalCounters`] over a phase. The times are `None` unless
+/// `track_wal_io_timing` was on at both ends.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct WalDelta {
+    pub records: Option<i64>,
+    pub full_page_images: Option<i64>,
+    pub bytes: Option<f64>,
+    pub writes: Option<i64>,
+    pub syncs: Option<i64>,
+    pub write_seconds: Option<f64>,
+    pub sync_seconds: Option<f64>,
+    pub sync_mean_milliseconds: Option<f64>,
+    pub unavailable_reason: Option<String>,
+    pub timing_unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CheckpointDelta {
+    /// Checkpoints the checkpointer counted during the phase. Timed ones
+    /// include any it skipped for want of WAL activity (PostgreSQL 16 and 17
+    /// count those too), and a checkpoint is counted when the checkpointer
+    /// reports its statistics, so the log lines time them exactly.
+    pub timed: Option<i64>,
+    pub requested: Option<i64>,
+    pub write_seconds: Option<f64>,
+    pub sync_seconds: Option<f64>,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct DatabaseDelta {
+    pub definition: &'static str,
+    pub wal: WalDelta,
+    pub checkpoints: CheckpointDelta,
+}
+
+pub const DATABASE_COUNTERS_DEFINITION: &str =
+    "pg_stat_wal and the checkpointer's counters, read on the primary at the phase's start and \
+     end; times are PostgreSQL's. These are cumulative statistics that backends publish at most \
+     about once a second, so each boundary blurs by about that much";
+
+const COUNTERS_WENT_BACKWARDS: &str =
+    "the counters went backwards: the statistics were reset or the primary was replaced \
+     during the phase";
+
+/// Why two reads of `pg_postmaster_start_time()` are not one server's, or
+/// `None` when they are: the primary restarted or a failover replaced it
+/// between them, or either read failed.
+pub fn server_replaced(
+    before: &std::result::Result<String, String>,
+    after: &std::result::Result<String, String>,
+) -> Option<String> {
+    match (before, after) {
+        (Ok(from), Ok(to)) if from == to => None,
+        (Ok(_), Ok(_)) => Some(
+            "the primary restarted or was replaced during the phase, so its statistics are not \
+             one server's"
+                .to_owned(),
+        ),
+        (Err(error), _) | (_, Err(error)) => Some(error.clone()),
+    }
+}
+
+pub fn database_delta(before: &DatabaseCounters, after: &DatabaseCounters) -> DatabaseDelta {
+    if let Some(reason) = server_replaced(&before.server_started, &after.server_started) {
+        return DatabaseDelta {
+            definition: DATABASE_COUNTERS_DEFINITION,
+            wal: WalDelta {
+                unavailable_reason: Some(reason.clone()),
+                ..Default::default()
+            },
+            checkpoints: CheckpointDelta {
+                unavailable_reason: Some(reason),
+                ..Default::default()
+            },
+        };
+    }
+    let wal = match (&before.wal, &after.wal) {
+        (Err(error), _) | (_, Err(error)) => WalDelta {
+            unavailable_reason: Some(error.clone()),
+            ..Default::default()
+        },
+        (Ok(from), Ok(to))
+            if to.wal_records < from.wal_records
+                || to.wal_fpi < from.wal_fpi
+                || to.wal_bytes < from.wal_bytes
+                || to.wal_write < from.wal_write
+                || to.wal_sync < from.wal_sync
+                || to.wal_write_time_ms < from.wal_write_time_ms
+                || to.wal_sync_time_ms < from.wal_sync_time_ms =>
+        {
+            WalDelta {
+                unavailable_reason: Some(COUNTERS_WENT_BACKWARDS.into()),
+                ..Default::default()
+            }
+        }
+        (Ok(from), Ok(to)) => {
+            let syncs = to.wal_sync - from.wal_sync;
+            let timed = from.io_timing && to.io_timing;
+            let sync_seconds =
+                timed.then(|| (to.wal_sync_time_ms - from.wal_sync_time_ms) / 1000.0);
+            WalDelta {
+                records: Some(to.wal_records - from.wal_records),
+                full_page_images: Some(to.wal_fpi - from.wal_fpi),
+                bytes: Some(to.wal_bytes - from.wal_bytes),
+                writes: Some(to.wal_write - from.wal_write),
+                syncs: Some(syncs),
+                write_seconds: timed
+                    .then(|| (to.wal_write_time_ms - from.wal_write_time_ms) / 1000.0),
+                sync_seconds,
+                sync_mean_milliseconds: sync_seconds
+                    .filter(|_| syncs > 0)
+                    .map(|seconds| seconds * 1000.0 / syncs as f64),
+                unavailable_reason: None,
+                timing_unavailable_reason: (!timed).then(|| {
+                    "track_wal_io_timing was off on the database, so PostgreSQL did not time \
+                     WAL writes or syncs"
+                        .into()
+                }),
+            }
+        }
+    };
+    let checkpoints = match (&before.checkpoints, &after.checkpoints) {
+        (Err(error), _) | (_, Err(error)) => CheckpointDelta {
+            unavailable_reason: Some(error.clone()),
+            ..Default::default()
+        },
+        (Ok(from), Ok(to))
+            if to.timed < from.timed
+                || to.requested < from.requested
+                || to.write_time_ms < from.write_time_ms
+                || to.sync_time_ms < from.sync_time_ms =>
+        {
+            CheckpointDelta {
+                unavailable_reason: Some(COUNTERS_WENT_BACKWARDS.into()),
+                ..Default::default()
+            }
+        }
+        (Ok(from), Ok(to)) => CheckpointDelta {
+            timed: Some(to.timed - from.timed),
+            requested: Some(to.requested - from.requested),
+            write_seconds: Some((to.write_time_ms - from.write_time_ms) / 1000.0),
+            sync_seconds: Some((to.sync_time_ms - from.sync_time_ms) / 1000.0),
+            unavailable_reason: None,
+        },
+    };
+    DatabaseDelta {
+        definition: DATABASE_COUNTERS_DEFINITION,
+        wal,
+        checkpoints,
+    }
+}
+
+/// One number of the share-ack accounting: its value, or why it is unknown.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Accounted {
+    pub seconds: Option<f64>,
+    pub count: Option<f64>,
+    /// `measured`, or `derived` by [`Self::formula`] from measured inputs.
+    pub kind: &'static str,
+    pub clock: &'static str,
+    pub source: &'static str,
+    pub formula: Option<&'static str>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl Accounted {
+    fn measured(clock: &'static str, source: &'static str) -> Self {
+        Self {
+            seconds: None,
+            count: None,
+            kind: "measured",
+            clock,
+            source,
+            formula: None,
+            unavailable_reason: None,
+        }
+    }
+}
+
+/// Where a phase's accepted share acknowledgements spent their time (#829),
+/// summed over every frontend. Measured numbers come from the frontends'
+/// histograms and `pg_stat_statements`; the derived ones are named by their
+/// formula and are unknown when any input is.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ShareAckAccounting {
+    pub definition: &'static str,
+    pub accepted_acks: Accounted,
+    pub order_lock_wait: Accounted,
+    pub order_lock_hold_append: Accounted,
+    pub append_call: Accounted,
+    pub append_call_max_seconds: Option<f64>,
+    pub pool_acquire: Accounted,
+    pub in_call_after_grant: Accounted,
+    pub after_call: Accounted,
+    pub before_lock_and_response: Accounted,
+    pub commit_not_in_pg_stat_statements: &'static str,
+}
+
+pub const ACCOUNTING_DEFINITION: &str =
+    "accepted share acknowledgements' summed seconds, split at ORDER_LOCK. Every frontend's \
+     histogram deltas are summed; pg_stat_statements covers every frontend of the cluster. The \
+     populations differ slightly (holds and waits include appends that were refused, waits \
+     include the rebuild paths' few), so compare the counts beside each figure.";
+
+/// `pg_stat_statements` cannot time a share's COMMIT: PostgreSQL commits the
+/// transaction, and flushes its WAL, in `finish_xact_command` after the
+/// extension's utility hook has stopped timing the `COMMIT` statement, so its
+/// row reads about zero however long the flush took. The flush is read from
+/// `pg_stat_wal` instead.
+pub const COMMIT_NOT_IN_PG_STAT_STATEMENTS: &str =
+    "COMMIT is deliberately not read from pg_stat_statements: PostgreSQL commits and flushes \
+     WAL in finish_xact_command, after the extension stops timing the COMMIT statement, so its \
+     row reads about zero whatever the flush took; the phase's database_counters.wal times \
+     the flush instead";
+
+fn sum_over_frontends(deltas: &[&SeriesDelta]) -> (Option<f64>, Option<f64>, Option<String>) {
+    let mut count = 0.0;
+    let mut seconds = 0.0;
+    for delta in deltas {
+        match (delta.count, delta.seconds) {
+            (Some(c), Some(s)) => {
+                count += c;
+                seconds += s;
+            }
+            _ => {
+                return (
+                    None,
+                    None,
+                    delta
+                        .unavailable_reason
+                        .clone()
+                        .or_else(|| Some("a frontend's delta is unknown".into())),
+                )
+            }
+        }
+    }
+    if deltas.is_empty() {
+        return (None, None, Some("no frontend was scraped".into()));
+    }
+    (Some(count), Some(seconds), None)
+}
+
+/// `minuend - subtrahends` when every input is known, else unknown, naming
+/// the first unknown input and its reason.
+fn derived(
+    minuend: (&str, &Accounted),
+    subtrahends: &[(&str, &Accounted)],
+    formula: &'static str,
+    meaning: &'static str,
+) -> Accounted {
+    let unknown = |(name, part): (&str, &Accounted)| {
+        part.seconds.is_none().then(|| {
+            format!(
+                "{name} is unknown: {}",
+                part.unavailable_reason
+                    .as_deref()
+                    .unwrap_or("no reason was given")
+            )
+        })
+    };
+    let mut seconds = minuend.1.seconds;
+    let mut reason = unknown(minuend);
+    for part in subtrahends {
+        seconds = seconds.zip(part.1.seconds).map(|(a, b)| a - b);
+        if reason.is_none() {
+            reason = unknown(*part);
+        }
+    }
+    // The inputs come from different populations (holds and waits include
+    // refused appends, waits the rebuild paths') and different clocks. A
+    // difference below zero is their disagreement, not a time.
+    if let Some(negative) = seconds.filter(|value| *value < 0.0) {
+        seconds = None;
+        reason = Some(format!(
+            "the inputs disagree: the formula gives {negative:.3} s; their populations or clocks \
+             differ more than this part's own time"
+        ));
+    }
+    Accounted {
+        seconds,
+        count: None,
+        kind: "derived",
+        clock: "mixed; each input's clock is named in the formula",
+        source: meaning,
+        formula: Some(formula),
+        unavailable_reason: if seconds.is_some() {
+            None
+        } else {
+            reason.or_else(|| Some("an input is unknown".into()))
+        },
+    }
+}
+
+/// Build a phase's [`ShareAckAccounting`] from each frontend's accepted-ack
+/// delta and series deltas, and the phase's append-call statement.
+pub fn share_ack_accounting(
+    acks: &[ServerAckDelta],
+    series: &[BTreeMap<String, SeriesDelta>],
+    append_call: &std::result::Result<AppendCallStats, String>,
+) -> ShareAckAccounting {
+    let mut accepted_acks = Accounted::measured(
+        "frontend monotonic",
+        "qbit_prism_share_ack_seconds{result=\"accepted\"}: complete submit frame to completed \
+         response write",
+    );
+    let accepted: Vec<SeriesDelta> = acks
+        .iter()
+        .map(|delta| {
+            match (
+                delta.counts.get("accepted"),
+                delta.sums.get("accepted"),
+                &delta.unavailable_reason,
+            ) {
+                (Some(count), Some(sum), None) => SeriesDelta {
+                    count: Some(*count),
+                    seconds: Some(*sum),
+                    unavailable_reason: None,
+                },
+                (_, _, unavailable) => SeriesDelta::unknown(
+                    unavailable
+                        .clone()
+                        .unwrap_or_else(|| "no accepted acknowledgement series".into()),
+                ),
+            }
+        })
+        .collect();
+    (
+        accepted_acks.count,
+        accepted_acks.seconds,
+        accepted_acks.unavailable_reason,
+    ) = sum_over_frontends(&accepted.iter().collect::<Vec<_>>());
+    let series_of = |key: &str, clock: &'static str, source: &'static str| {
+        let missing = SeriesDelta::unknown(format!("{key}: no delta was recorded"));
+        let deltas: Vec<&SeriesDelta> = series
+            .iter()
+            .map(|frontend| frontend.get(key).unwrap_or(&missing))
+            .collect();
+        let (count, seconds, unavailable_reason) = sum_over_frontends(&deltas);
+        Accounted {
+            seconds,
+            count,
+            unavailable_reason,
+            ..Accounted::measured(clock, source)
+        }
+    };
+    let order_lock_wait = series_of(
+        ORDER_LOCK_WAIT_GRANTED,
+        "PostgreSQL clock_timestamp() for share appends (the call's lock_waited_us); frontend \
+         monotonic for the rebuild paths' lock statement",
+        "qbit_prism_database_advisory_lock_wait_seconds{lock=\"order\",result=\"success\"}",
+    );
+    let order_lock_hold_append = series_of(
+        ORDER_LOCK_HOLD_APPEND,
+        "frontend monotonic, from the grant (the call's lock_held_us back-dated from its reply) \
+         to the end of COMMIT",
+        "qbit_prism_database_order_lock_hold_seconds{holder=\"append\"}",
+    );
+    let pool_acquire = series_of(
+        POOL_ACQUIRE_SUCCEEDED,
+        "frontend monotonic",
+        "qbit_prism_database_pool_acquire_seconds{result=\"success\"}: every caller of the \
+         ledger pool, each share's payout-revision read included; context only, not subtracted \
+         below",
+    );
+    let mut append_call_seconds = Accounted::measured(
+        "PostgreSQL executor (pg_stat_statements total_exec_time)",
+        "pg_stat_statements, SELECT * FROM qbit_prism_append_share(...): the one-call append, \
+         its ORDER_LOCK wait included",
+    );
+    let mut append_call_max_seconds = None;
+    match append_call {
+        Ok(stats) => {
+            append_call_seconds.seconds = Some(stats.total_seconds);
+            append_call_seconds.count = Some(stats.calls as f64);
+            append_call_max_seconds = stats.max_seconds;
+        }
+        Err(reason) => append_call_seconds.unavailable_reason = Some(reason.clone()),
+    }
+    let in_call_after_grant = derived(
+        ("append_call", &append_call_seconds),
+        &[("order_lock_wait", &order_lock_wait)],
+        "append_call (PostgreSQL executor) - order_lock_wait (PostgreSQL clock for appends)",
+        "the call's time holding ORDER_LOCK",
+    );
+    let after_call = derived(
+        ("order_lock_hold_append", &order_lock_hold_append),
+        &[("in_call_after_grant", &in_call_after_grant)],
+        "order_lock_hold_append (frontend monotonic) - in_call_after_grant (PostgreSQL)",
+        "the call's reply in transit, the frontend runtime's turnaround to COMMIT, and the \
+         COMMIT round trip with its WAL flush; the phase's database_counters.wal times the \
+         flush itself",
+    );
+    let before_lock_and_response = derived(
+        ("accepted_acks", &accepted_acks),
+        &[
+            ("order_lock_wait", &order_lock_wait),
+            ("order_lock_hold_append", &order_lock_hold_append),
+        ],
+        "accepted_acks (frontend monotonic) - order_lock_wait (PostgreSQL clock for appends) - \
+         order_lock_hold_append (frontend monotonic)",
+        "not measured separately: the stratum's request handling, the submit checks (the \
+         payout-revision read and its pool checkout among them), the append-admission queue, \
+         the append's pool checkout and BEGIN, and the response write",
+    );
+    ShareAckAccounting {
+        definition: ACCOUNTING_DEFINITION,
+        accepted_acks,
+        order_lock_wait,
+        order_lock_hold_append,
+        append_call: append_call_seconds,
+        append_call_max_seconds,
+        pool_acquire,
+        in_call_after_grant,
+        after_call,
+        before_lock_and_response,
+        commit_not_in_pg_stat_statements: COMMIT_NOT_IN_PG_STAT_STATEMENTS,
+    }
 }
 
 /// Where `MemAvailable` is read from. Linux only: macOS has no `/proc`.

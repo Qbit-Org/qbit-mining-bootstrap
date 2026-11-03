@@ -298,6 +298,68 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             assert!(summary["samples"].as_u64() > Some(0), "{}", plan.name);
             assert!(summary["unavailable_reason"].is_null(), "{}", plan.name);
         }
+        // #829: where the acknowledgements' time went is measured against a
+        // real server and PostgreSQL, from histograms the server exports
+        // today and the managed cluster's statistics.
+        let accounting = &phase["share_ack_accounting"];
+        eprintln!(
+            "{}: {}",
+            plan.name,
+            gate::ack_accounting(phase).unwrap_or_default()
+        );
+        let acks_known = phase["server_share_ack_seconds"]
+            .as_array()
+            .context("server acks")?
+            .iter()
+            .all(|delta| delta["unavailable_reason"].is_null());
+        // A derived part whose inputs disagree (their populations differ),
+        // or that is derived from such a part, is unknown on purpose, but
+        // every measured input was there.
+        let known = |part: &str| {
+            accounting[part]["seconds"].as_f64().is_some()
+                || accounting[part]["unavailable_reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("the inputs disagree"))
+        };
+        if acks_known {
+            for part in [
+                "accepted_acks",
+                "order_lock_wait",
+                "order_lock_hold_append",
+                "before_lock_and_response",
+            ] {
+                assert!(known(part), "{}: {part}: {accounting}", plan.name);
+            }
+            if report["database"]["pg_stat_statements"] == "loaded" {
+                for part in ["append_call", "in_call_after_grant", "after_call"] {
+                    assert!(known(part), "{}: {part}: {accounting}", plan.name);
+                }
+                if accounting["accepted_acks"]["count"].as_f64() > Some(0.0) {
+                    assert!(
+                        accounting["append_call"]["count"].as_f64() > Some(0.0),
+                        "{}: accepted shares were appended by the call: {accounting}",
+                        plan.name
+                    );
+                }
+            }
+        }
+        let wal = &phase["database_counters"]["wal"];
+        // A phase across a primary's restart or promotion is unknown on
+        // purpose; the smoke preset has neither.
+        assert!(wal["syncs"].as_i64().is_some(), "{}: {wal}", plan.name);
+        assert!(
+            wal["sync_seconds"].as_f64().is_some(),
+            "{}: the managed primary times WAL syncs: {wal}",
+            plan.name
+        );
+        assert!(
+            phase["database_counters"]["checkpoints"]["timed"]
+                .as_i64()
+                .is_some(),
+            "{}: {}",
+            plan.name,
+            phase["database_counters"]
+        );
         // A delayed phase's delay was seen to be paid.
         if plan.database_delay_ms > 0 {
             let observed = phase["database_delay_observed_select1_median_milliseconds"]
@@ -567,6 +629,27 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         "the 60% whale's share of accepted work: {whale}"
     );
     assert_eq!(report["validator"]["artifact_written"], false);
+    // #829: the managed primary's checkpoint lines were read, and its WAL
+    // timing is reported as the harness's own setting.
+    let database = &report["database"];
+    let logs = database["checkpoint_log"]
+        .as_array()
+        .context("checkpoint logs")?;
+    assert!(
+        logs.iter().any(|log| log["source"]
+            .as_str()
+            .is_some_and(|source| source.ends_with("primary.log"))),
+        "{database}"
+    );
+    for log in logs {
+        assert!(log["unavailable_reason"].is_null(), "{log}");
+    }
+    assert!(
+        database["track_wal_io_timing"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("requested on:")),
+        "{database}"
+    );
 
     // The churn phase drove what the preset planned, and every abandoned
     // submit is accounted for as the churn's, never as a divergence.

@@ -427,6 +427,7 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
     }
     for phase in &gated {
         let figures = phase_figures(report, phase);
+        let before = checks.len();
         count_check(
             &mut checks,
             format!("{}: shortfall (offers no session could take)", figures.name),
@@ -448,6 +449,22 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
                 figures.unanswered,
                 budget,
             );
+        }
+        // A failed gated phase says where its acknowledgements' time went
+        // (#829), as a slow tip's timeline does (#790). Informational only.
+        if checks[before..]
+            .iter()
+            .any(|check| check.pass == Some(false))
+        {
+            if let Some(observed) = ack_accounting(phase) {
+                checks.push(Check::info(
+                    format!(
+                        "{}: where the accepted acknowledgements' time went",
+                        figures.name
+                    ),
+                    observed,
+                ));
+            }
         }
     }
     for phase in &phases {
@@ -685,6 +702,57 @@ fn churn_section_checks(churn: &Value, label: &str, budgets: &Budgets, checks: &
             ),
         ));
     }
+}
+
+/// One line from a phase's `share_ack_accounting` and `database_counters`
+/// (#829): the accepted acknowledgements' summed seconds split at
+/// ORDER_LOCK, then the WAL syncs and checkpoints behind them. `None` for a
+/// report written before the accounting existed; an unknown part reads
+/// "unknown", never 0.
+pub fn ack_accounting(phase: &Value) -> Option<String> {
+    let accounting = phase.get("share_ack_accounting")?;
+    let total = accounting["accepted_acks"]["seconds"].as_f64();
+    let part = |key: &str| {
+        let seconds = accounting[key]["seconds"].as_f64();
+        let derived = if accounting[key]["kind"] == "derived" {
+            ", derived"
+        } else {
+            ""
+        };
+        match (seconds, total) {
+            (Some(seconds), Some(total)) if total > 0.0 => {
+                format!("{seconds:.1} s ({:.0}%{derived})", 100.0 * seconds / total)
+            }
+            (Some(seconds), _) => format!("{seconds:.1} s{derived}"),
+            (None, _) => "unknown".into(),
+        }
+    };
+    let count = |value: &Value| {
+        value
+            .as_f64()
+            .map_or("unknown".into(), |n| format!("{n:.0}"))
+    };
+    let wal = &phase["database_counters"]["wal"];
+    let checkpoints = &phase["database_counters"]["checkpoints"];
+    Some(format!(
+        "{} acks, {}: before ORDER_LOCK and the response {}; ORDER_LOCK wait {}; held in the \
+         call {}; after the call (COMMIT, its WAL flush, the runtime's turnaround) {}. WAL: {} \
+         syncs, mean {}, {} full-page images; checkpoints counted: {} timed (skipped ones \
+         included), {} requested",
+        count(&accounting["accepted_acks"]["count"]),
+        total.map_or("unknown".into(), |t| format!("{t:.1} s")),
+        part("before_lock_and_response"),
+        part("order_lock_wait"),
+        part("in_call_after_grant"),
+        part("after_call"),
+        count(&wal["syncs"]),
+        wal["sync_mean_milliseconds"]
+            .as_f64()
+            .map_or("unknown".into(), |ms| format!("{ms:.3} ms")),
+        count(&wal["full_page_images"]),
+        count(&checkpoints["timed"]),
+        count(&checkpoints["requested"]),
+    ))
 }
 
 fn opt(value: Option<u64>) -> String {

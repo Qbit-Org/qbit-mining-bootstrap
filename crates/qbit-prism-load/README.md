@@ -1419,6 +1419,45 @@ leaves `counts` empty with `unavailable_reason` set: unknown, which is not
 zero. A counter that went backwards between two scrapes with no recorded
 restart is reported the same way rather than as a negative number.
 
+Each phase's `share_ack_accounting` (#829) says where the accepted
+acknowledgements' summed seconds went, split at ORDER_LOCK, from histograms
+the server already exports and `pg_stat_statements`:
+
+- **Measured:**
+  - `accepted_acks`: the sum above, frontend clock.
+  - `order_lock_wait`: granted ORDER_LOCK waits, on PostgreSQL's clock for share
+    appends; the rebuild paths' few are included.
+  - `order_lock_hold_append`: the append's hold from grant to the end of COMMIT,
+    frontend clock.
+  - `append_call`: the one-call append's `pg_stat_statements` time, including its
+    lock wait.
+  - `pool_acquire`: every ledger checkout; context only.
+- **Derived**, each with its `formula`:
+  - `in_call_after_grant` = call − wait;
+  - `after_call` = hold − in-call: COMMIT, its WAL flush and the frontend
+    runtime's turnaround;
+  - `before_lock_and_response` = acks − wait − hold: the append-admission queue,
+    the submit checks, the pool checkouts, BEGIN and the response write, which
+    nothing measures separately.
+
+A derived part is unknown when an input is, and also when its inputs disagree
+(a negative difference: the holds and waits include refused appends and the
+rebuild paths' waits, which `accepted_acks` does not). COMMIT is not read from
+`pg_stat_statements` at all: PostgreSQL commits and flushes after the extension
+stops timing the statement.
+
+Each phase's `database_counters` has the primary's `pg_stat_wal` deltas (syncs,
+sync time and mean, full-page images, bytes) and its checkpoint counters.
+- The times are reported only when `track_wal_io_timing` was on at both reads;
+  the harness turns it on for its managed primary and standby, which
+  `database.track_wal_io_timing` records.
+- A primary that restarted or was replaced during the phase leaves the block
+  unknown.
+- `database.checkpoint_log` carries each managed server log's checkpoint and
+  restartpoint lines, with their own timestamps, to place a stall against them.
+- A gated phase that fails gets one informational gate row built from both
+  blocks.
+
 The frontend environment is printed redacted, here and in
 `database-profile.json`: the RPC password and the signing seeds are replaced
 outright, and any URL-valued variable loses the password in its userinfo and
