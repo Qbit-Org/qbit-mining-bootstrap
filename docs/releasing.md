@@ -115,6 +115,32 @@ will take patch releases. Preserve subsequent development and resolve metadata
 and notes deliberately; do not reset or force-push the shared branch. Run its
 checks before merging.
 
+Land the synchronization PR by fast-forward, not with the merge button. The
+button can only squash or rebase here, and either one drops `main` from the
+branch's history. The next merge between them then falls back to the old merge
+base and conflicts on changes only one side has made since this
+synchronization, and GitHub keeps counting each `main` commit as one the
+branch is behind. No rule guards the release branches, so the push checks
+nothing for you: the PR's commits land as they are and must be signed, and
+the commit pushed must be the PR's reviewed head. Once its checks and review
+pass:
+
+```sh
+gh pr checks <pr>
+git push origin "$(gh pr view <pr> --json headRefOid --jq .headRefOid)":<branch>
+```
+
+A plain push succeeds only as a fast-forward, and GitHub marks the PR merged.
+If it is rejected as non-fast-forward, the branch has moved: merge it into the
+synchronization branch and run the checks again. Other PRs into the branch
+still use the button, and a promotion still lands on `main` as one squashed
+commit. So the branch reads one commit behind `main` from each promotion until
+its synchronization lands, and its ahead count keeps growing.
+`git diff origin/main origin/<branch>` shows what really differs. A kept merge
+base doesn't make every synchronization clean: a line the branch changed
+again after the promotion's cutoff still conflicts with the promotion's copy.
+Keep the branch's side unless the promotion edited that line.
+
 For 3.1.0 and 3.0.0 this step merges the released `main` (`b9187551`, #783)
 into `3.x.x`, and `main` at `b9579c67` into `3.0.x`. That commit is 3.0.0's
 promotion (#778) plus #781, before 3.1.0's, because a 3.0 patch branch must
@@ -127,6 +153,18 @@ For 3.1.1 this step merges the released `main` back into `3.x.x`. It brings
 only the promotion's edits: the release date and the fix PRs' numbers in the
 3.1.1 notes, and this guide's 3.1.1 record. `3.0.x` takes nothing from it, since 3.1.1 is a 3.1
 release.
+
+#826, the 3.1.1 synchronization, was squashed like the earlier ones, so
+`3.x.x`'s merge base with `main` stayed at `v1.1.0`. Merge commit
+`b51ac732`, landed by fast-forward like a synchronization, corrects that: it
+has `main` at `60467262` as a parent and changes no file. It takes its tree
+from `3.x.x`, as `git merge -s ours` does, because #826's `d0c649b4` already
+had `60467262`'s exact tree. Use `-s ours` only when a commit on the branch
+has the `main` commit's exact tree, so that
+`git diff <main-commit> <that-commit>` prints nothing. Otherwise it marks
+`main`'s changes as merged without taking them, as it would on `3.0.x`, which
+doesn't hold 3.1. `3.0.x` and `2.x.x` keep `v1.1.0` as their merge base with
+`main` for now.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization
