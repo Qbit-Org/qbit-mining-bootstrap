@@ -444,6 +444,20 @@ async fn until_sample(
     }
 }
 
+/// Open `coordinator`'s ledger pool to its size and give every connection
+/// back, so that no refresh needs a new one while the database refuses them:
+/// a refresh may hold more than one at a time, and how many depends on
+/// timing. A refresh that needed one would wait out its acquire timeout
+/// (15 s) instead of refreshing.
+async fn fill_ledger_pool(coordinator: &Coordinator) -> Result<()> {
+    let pool = &coordinator.ledger.pool;
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await?);
+    }
+    Ok(())
+}
+
 /// A same-tip bump with its announcement, as `ledger/blocks.rs` runs it.
 async fn bump(connection: &mut PgConnection) -> Result<i64> {
     Ok(sqlx::query_scalar(&format!(
@@ -476,6 +490,7 @@ async fn lost_listener(db: &ledger_database::FixtureDatabase, f: &Frontends) -> 
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             until_sample(frontend, LISTENER_UP, 1., WAKE_BOUND).await?;
+            fill_ledger_pool(frontend).await?;
         }
         let heard = sample(&f.b, HEARD)?;
         // Both listeners are cut off, and cannot reconnect.
@@ -697,7 +712,8 @@ async fn a_bump_before_the_first_listen_still_wakes_the_refresh() -> Result<()> 
 async fn first_listen(db: &ledger_database::FixtureDatabase, f: &Frontends) -> Result<()> {
     f.b.refresh_once().await?;
     // Opened while the database still takes connections; B's ledger pool
-    // keeps the ones its refreshes opened.
+    // keeps them.
+    fill_ledger_pool(&f.b).await?;
     let mut bumper = PgConnection::connect(&db.url).await?;
     let first = durable_revision(&mut bumper).await?;
     sqlx::query(&format!(
