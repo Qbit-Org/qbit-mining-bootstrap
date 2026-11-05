@@ -37,11 +37,20 @@
 //! attempt, so normally the first refresh already runs under LISTEN. A probe
 //! every [`PROBE_INTERVAL`] finds a connection that died without closing.
 //!
+//! #816: `qbit_prism_payout_revision_listener_up` reads 1 from each LISTEN
+//! until its connection is lost, and 0 before the first, while reconnecting
+//! and once the listener ends, and
+//! `qbit_prism_payout_revision_announcements_heard_total` counts every
+//! announcement it received. A LISTEN that holds but hears nothing, as through
+//! a transaction-pooling proxy, reads 1 with a counter that stays flat while
+//! other frontends' counters move.
+//!
 //! In dual-writer mode (3.1) each node's frontends listen on their own
 //! database. The peer sync never copies the payout revision: a peer's block
 //! counts here only once this node's reconciler confirms it, and that
 //! confirmation's bump is announced on this node's database.
 use super::{refresh_window::AlertEveryMinute, Coordinator};
+use crate::metrics::Metrics;
 use anyhow::{anyhow, Result};
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use std::{
@@ -111,6 +120,7 @@ pub(super) async fn start(
             listen(
                 &coordinator.config.database_url,
                 &coordinator.wake,
+                &coordinator.metrics,
                 &startup,
                 shutdown,
             )
@@ -125,13 +135,16 @@ pub(super) async fn start(
 /// Wake `wake` on every announcement on [`CHANNEL`] at `database_url`, and
 /// once after every LISTEN that `startup`'s first refresh did not follow,
 /// until `shutdown` changes. Never returns before that: a failure only delays
-/// the next attempt.
+/// the next attempt. `metrics` reads whether a LISTEN holds, and counts the
+/// announcements heard (#816).
 async fn listen(
     database_url: &str,
     wake: &Notify,
+    metrics: &Metrics,
     startup: &Startup,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut up = ListenerUp::new(metrics);
     let mut retry = RETRY_FIRST;
     let mut wakes = Wakes::default();
     let mut alert = AlertEveryMinute::default();
@@ -156,6 +169,7 @@ async fn listen(
         }
         let error = match subscribed {
             Ok(listener) => {
+                up.set(true);
                 // A bump may have committed after the refresh read the
                 // revision and before this LISTEN: while the listener was
                 // down or connecting, or before its first attempt.
@@ -169,10 +183,11 @@ async fn listen(
                     );
                 }
                 let started = Instant::now();
-                let error = match serve(listener, wake, &mut wakes, &mut shutdown).await {
+                let error = match serve(listener, wake, metrics, &mut wakes, &mut shutdown).await {
                     Some(error) => error,
                     None => return,
                 };
+                up.set(false);
                 if started.elapsed() >= PROBE_INTERVAL {
                     retry = RETRY_FIRST;
                     alert.clear();
@@ -197,6 +212,38 @@ async fn listen(
             _ = sleep(retry) => {}
         }
         retry = (retry * 2).min(RETRY_LONGEST);
+    }
+}
+
+/// `qbit_prism_payout_revision_listener_up` for one [`listen`] (#816): 0
+/// until [`ListenerUp::set`] raises it, and 0 again once the listener ends,
+/// however it ends, its task aborted included. Each frontend runs one
+/// listener; `Metrics` counts the ones that hold, so one ending after a newer
+/// one began on the same `Metrics` leaves the gauge at 1.
+struct ListenerUp<'a> {
+    metrics: &'a Metrics,
+    holds: bool,
+}
+
+impl<'a> ListenerUp<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        Self {
+            metrics,
+            holds: false,
+        }
+    }
+
+    fn set(&mut self, holds: bool) {
+        if holds != self.holds {
+            self.holds = holds;
+            self.metrics.record_payout_revision_listener(holds);
+        }
+    }
+}
+
+impl Drop for ListenerUp<'_> {
+    fn drop(&mut self) {
+        self.set(false);
     }
 }
 
@@ -249,11 +296,12 @@ impl Wakes {
     }
 }
 
-/// Wake on announcements until the connection is lost, returning why, or
-/// until `shutdown` changes, returning `None`.
+/// Wake on announcements, counting each in `metrics`, until the connection is
+/// lost, returning why, or until `shutdown` changes, returning `None`.
 async fn serve(
     mut listener: PgListener,
     wake: &Notify,
+    metrics: &Metrics,
     wakes: &mut Wakes,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Option<anyhow::Error> {
@@ -269,6 +317,7 @@ async fn serve(
             received = listener.try_recv() => match received {
                 Ok(Some(notification)) => {
                     tracing::debug!(revision = notification.payload(), "payout revision announced");
+                    metrics.record_payout_revision_announcement();
                     let now = Instant::now();
                     wakes.heard(now);
                     probe_at = now + PROBE_INTERVAL;
@@ -319,5 +368,45 @@ mod tests {
         // After a quiet spell the next one is due at once again.
         wakes.heard(at(900));
         assert_eq!(wakes.due, Some(at(900)));
+    }
+
+    fn sample(metrics: &Metrics, name: &str) -> f64 {
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} sample"))
+    }
+
+    /// #816: the gauge reads 0 until a LISTEN holds and 0 again once the
+    /// listener ends, however it ends, but never while another holds; the
+    /// counter starts at 0.
+    #[test]
+    fn the_listener_gauge_is_down_until_a_listen_holds_and_once_the_listener_ends() {
+        const UP: &str = "qbit_prism_payout_revision_listener_up";
+        const HEARD: &str = "qbit_prism_payout_revision_announcements_heard_total";
+        let metrics = Metrics::default();
+        assert_eq!(sample(&metrics, UP), 0.);
+        assert_eq!(sample(&metrics, HEARD), 0.);
+        let mut up = ListenerUp::new(&metrics);
+        up.set(true);
+        assert_eq!(sample(&metrics, UP), 1.);
+        up.set(false);
+        assert_eq!(sample(&metrics, UP), 0.);
+        up.set(true);
+        drop(up);
+        assert_eq!(sample(&metrics, UP), 0.);
+        // A listener that ends after a newer one began leaves it up.
+        let mut old = ListenerUp::new(&metrics);
+        old.set(true);
+        let mut new = ListenerUp::new(&metrics);
+        new.set(true);
+        drop(old);
+        assert_eq!(sample(&metrics, UP), 1.);
+        new.set(false);
+        assert_eq!(sample(&metrics, UP), 0.);
+        metrics.record_payout_revision_announcement();
+        metrics.record_payout_revision_announcement();
+        assert_eq!(sample(&metrics, HEARD), 2.);
     }
 }

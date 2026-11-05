@@ -125,6 +125,7 @@ pub fn expected(populated: bool) -> Census {
         "divergent_landings_total",
         "divergent_landing_overpay_sats_total",
         "landing_malloc_trim_released_bytes_total",
+        "payout_revision_announcements_heard_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -164,6 +165,7 @@ pub fn expected(populated: bool) -> Census {
         "work_refresh_stalled_seconds",
         "landing_malloc_trim_resident_bytes",
         "tip_poll_age_seconds",
+        "payout_revision_listener_up",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }

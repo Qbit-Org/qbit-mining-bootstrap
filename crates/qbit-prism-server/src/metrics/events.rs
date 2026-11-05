@@ -387,6 +387,35 @@ impl Metrics {
             elapsed,
         );
     }
+    /// #816: a payout-revision listener's LISTEN began to hold (`true`) or
+    /// stopped holding (`false`), each `false` after one `true`. The gauge
+    /// reads 1 while any holds, so a listener that ends after a newer one
+    /// began cannot clear it.
+    pub fn record_payout_revision_listener(&self, holds: bool) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let held = self
+            .revision_listeners
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let holding = if holds {
+            held + 1
+        } else {
+            held.saturating_sub(1)
+        };
+        self.revision_listeners
+            .store(holding, std::sync::atomic::Ordering::Relaxed);
+        registry.set(
+            Family::PayoutRevisionListenerUp,
+            Labels::Empty,
+            f64::from(u8::from(holding > 0)),
+        );
+    }
+    /// #816: one announcement this frontend's payout-revision listener heard.
+    pub fn record_payout_revision_announcement(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::PayoutRevisionAnnouncements, Labels::Empty);
+    }
     /// 3.1 dual writer (D2): whether this frontend's latest window snapshot
     /// found the `(origin_node, share_seq)` index its cut reads need.
     pub fn record_origin_index(&self, indexed: bool) {

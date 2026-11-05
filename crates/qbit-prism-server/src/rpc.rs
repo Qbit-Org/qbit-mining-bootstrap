@@ -48,36 +48,78 @@ impl RpcReplyError {
     }
 }
 
-/// A call that provably never reached the node: the client failed to
+/// A call that provably never reached the node, so not one byte of the
+/// request left this process for the node (#522). Either the client failed to
 /// establish the connection the request would have been written to (the
 /// connection was refused, the name did not resolve, no route, the connect
 /// timeout, a relaying call's connect deadline (#762), or a TLS or proxy
-/// handshake failure), so not one byte of the request left this process for
-/// the node (#522).
+/// handshake failure), or hyper handed the request back unwritten because the
+/// connection it was given closed first (#816).
 ///
-/// The boundary is reqwest's `is_connect()`, which holds exactly when hyper's
-/// client reports its `Connect` error kind. hyper raises that kind only while
-/// obtaining a connection, from the connector or the pool checkout, and a
-/// request is handed to a connection only after one was obtained. hyper
-/// retries on another connection only a request its dispatcher returned
-/// unwritten, so a connect error after such a retry still proves that no
-/// attempt wrote the request. A failure on an established connection, a reset
-/// or a closed connection after the write, a lost reply, the request timeout
-/// and every HTTP or JSON-RPC error are not this type: the request may have
-/// reached the node. That includes a request timeout that expires while
-/// connecting, which only a call without a connect deadline can meet: the
-/// timeout cannot tell a connect from a request written to a pooled
-/// connection. The message keeps the transport-failure wording every caller
-/// already matched on.
+/// The first boundary is reqwest's `is_connect()`, which holds exactly when
+/// hyper's client reports its `Connect` error kind. hyper raises that kind
+/// only while obtaining a connection, from the connector or the pool
+/// checkout, and a request is handed to a connection only after one was
+/// obtained. hyper retries on another connection only a request its
+/// dispatcher returned unwritten, so a connect error after such a retry still
+/// proves that no attempt wrote the request.
+///
+/// The second is hyper-util's `Canceled` error directly over a canceled
+/// `hyper::Error` (`is_canceled()`) in the send error's chain (#816). hyper's
+/// client builds a canceled error only with the request in hand, never
+/// written: the connection refused it as not ready, or the request was still
+/// queued for the connection when its dispatcher stopped, on a close or an
+/// error it read before it took the request. Its dispatcher takes a request
+/// out of that queue only to write it, and a failure after that is the
+/// connection's own error, never canceled. hyper-util wraps it in its
+/// `Canceled` kind only with the request it got back, and retries it only on
+/// a reused connection, which the spare is not; so the call fails with it,
+/// as when the node closes the spare after the kernel's check of it. That
+/// holds for the audited sources, hyper 1.11.1 over HTTP/1
+/// only (no `h2` in the build), hyper-util 0.1.20 and reqwest 0.12.28;
+/// `tests/rpc_not_sent.rs` fails on any other version until they are read
+/// again.
+///
+/// A failure on an established connection, a reset or a closed connection
+/// after the write, a lost reply, the request timeout and every HTTP or
+/// JSON-RPC error are not this type: the request may have reached the node.
+/// That includes a request timeout that expires while connecting, which only
+/// a call without a connect deadline can meet: the timeout cannot tell a
+/// connect from a request written to a pooled connection. It also includes a
+/// connection that closed before hyper-util handed it the request at all:
+/// hyper-util reports that close as it would one after a write. The message
+/// keeps the transport-failure wording every caller already matched on.
 #[derive(Clone, Debug, thiserror::Error)]
-#[error("qbit RPC {method} transport failed before the request was sent: the connection could not be established ({cause})")]
+#[error("qbit RPC {method} transport failed before the request was sent: {} ({cause})", .stage.not_sent_wording())]
 pub struct RpcNotSentError {
     pub method: String,
+    /// How far the call got.
+    pub stage: NotSentStage,
     /// The operating system's reason, when the failure carries one (such as
     /// "connection refused"); for a connect cut at its call's connect
-    /// deadline, that budget and the call's deadline (#762); else "connect
-    /// failed". Never the URL.
+    /// deadline, that budget and the call's deadline (#762); for a request
+    /// hyper handed back, hyper's reason (such as "connection closed before
+    /// message completed"); else "connect failed". Never the URL.
     pub cause: String,
+}
+
+/// Where a call that never reached the node stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotSentStage {
+    /// No connection was established for it (#522).
+    Connect,
+    /// The connection it was given closed before hyper wrote it, and hyper
+    /// handed it back (#816).
+    Returned,
+}
+
+impl NotSentStage {
+    fn not_sent_wording(self) -> &'static str {
+        match self {
+            Self::Connect => "the connection could not be established",
+            Self::Returned => "the connection closed before the request was written",
+        }
+    }
 }
 
 impl RpcNotSentError {
@@ -96,8 +138,35 @@ impl RpcNotSentError {
         }
         Self {
             method: method.to_owned(),
+            stage: NotSentStage::Connect,
             cause: cause.unwrap_or_else(|| "connect failed".to_owned()),
         }
+    }
+
+    /// The call, if hyper handed its request back unwritten (#816): the
+    /// hyper-util error in `error`'s chain is its `Canceled` kind, directly
+    /// over a canceled `hyper::Error`. hyper-util's kinds are private, and
+    /// only its `Display` names one; any other kind, source or text may follow
+    /// a write.
+    fn from_returned(method: &str, error: &reqwest::Error) -> Option<Self> {
+        let client =
+            std::iter::successors(std::error::Error::source(error), |error| error.source())
+                .find_map(|error| error.downcast_ref::<hyper_util::client::legacy::Error>())
+                .filter(|client| client.to_string() == "client error (Canceled)")?;
+        let hyper = std::error::Error::source(client)?
+            .downcast_ref::<hyper::Error>()
+            .filter(|hyper| hyper.is_canceled())?;
+        let reason = std::error::Error::source(hyper);
+        let cause = std::iter::successors(reason, |error| error.source())
+            .find_map(|error| error.downcast_ref::<std::io::Error>())
+            .map(|io| io.kind().to_string())
+            .or_else(|| reason.map(ToString::to_string))
+            .unwrap_or_else(|| "canceled".to_owned());
+        Some(Self {
+            method: method.to_owned(),
+            stage: NotSentStage::Returned,
+            cause,
+        })
     }
 }
 
@@ -210,20 +279,21 @@ struct ConnectCut {
 /// take the spare.
 ///
 /// The node can still close the spare between that check and the request's
-/// write, as it can a pooled connection. A request written into the close
-/// fails after the write, and its outcome is unknown: hyper-util knows that
-/// such a request on a new connection came back unwritten, but it does not
-/// say so (its error kind for it, `Canceled`, is private), so the call cannot
-/// prove it unsent.
+/// write, as it can a pooled connection. A request hyper hands back unwritten
+/// then fails as [`RpcNotSentError`] (#816), since hyper-util does not retry
+/// it on a new connection; a request written into the close fails after the
+/// write, and its outcome is unknown.
 struct ConnectBoundLayer<Target> {
     idle_timeout: Duration,
+    observer: SpareObservers,
     target: std::marker::PhantomData<fn(Target)>,
 }
 
 impl<Target> ConnectBoundLayer<Target> {
-    fn new(idle_timeout: Duration) -> Self {
+    fn new(idle_timeout: Duration, observer: SpareObservers) -> Self {
         Self {
             idle_timeout,
+            observer,
             target: std::marker::PhantomData,
         }
     }
@@ -231,9 +301,23 @@ impl<Target> ConnectBoundLayer<Target> {
 
 impl<Target> Clone for ConnectBoundLayer<Target> {
     fn clone(&self) -> Self {
-        Self::new(self.idle_timeout)
+        Self::new(self.idle_timeout, self.observer.clone())
     }
 }
+
+/// What a test sees of an [`Rpc`] client's spare connection, through
+/// [`Rpc::observe_spare`] (#816). Nothing observes it otherwise.
+#[doc(hidden)]
+pub trait SpareObserver: Send + Sync {
+    /// A connection was kept as the spare.
+    fn parked(&self);
+    /// The spare passed its checks and is being handed out, before hyper has
+    /// the request for it. `idle_and_open` asks the kernel again.
+    fn taken(&self, idle_and_open: &dyn Fn() -> bool);
+}
+
+/// Shared by an [`Rpc`] and its connector.
+type SpareObservers = Arc<std::sync::OnceLock<Arc<dyn SpareObserver>>>;
 
 impl<S, Target> tower::Layer<S> for ConnectBoundLayer<Target>
 where
@@ -246,6 +330,7 @@ where
             inner,
             idle_timeout: self.idle_timeout,
             spare: Arc::new(Mutex::new(None)),
+            observer: self.observer.clone(),
         }
     }
 }
@@ -262,6 +347,7 @@ struct ConnectBound<S, C> {
     idle_timeout: Duration,
     /// Shared by every clone: hyper clones the connector for each connect.
     spare: Arc<Mutex<Option<Spare<C>>>>,
+    observer: SpareObservers,
 }
 
 impl<S: Clone, C> Clone for ConnectBound<S, C> {
@@ -270,6 +356,7 @@ impl<S: Clone, C> Clone for ConnectBound<S, C> {
             inner: self.inner.clone(),
             idle_timeout: self.idle_timeout,
             spare: self.spare.clone(),
+            observer: self.observer.clone(),
         }
     }
 }
@@ -284,13 +371,18 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        (spare.parked_at.elapsed() < self.idle_timeout && spare.socket.idle_and_open())
-            .then_some(spare.conn)
+        if spare.parked_at.elapsed() >= self.idle_timeout || !spare.socket.idle_and_open() {
+            return None;
+        }
+        if let Some(observer) = self.observer.get() {
+            observer.taken(&|| spare.socket.idle_and_open());
+        }
+        Some(spare.conn)
     }
 
     /// Keep `conn` as the spare, in place of an older one. A connection whose
     /// socket the kernel cannot be asked about is not kept.
-    fn park(spare: &Mutex<Option<Spare<C>>>, conn: C) {
+    fn park(spare: &Mutex<Option<Spare<C>>>, observer: &SpareObservers, conn: C) {
         let mut extras = hyper::http::Extensions::new();
         conn.connected().get_extras(&mut extras);
         let Some(socket) = extras
@@ -308,6 +400,9 @@ where
                 parked_at: tokio::time::Instant::now(),
             });
         drop(older);
+        if let Some(observer) = observer.get() {
+            observer.parked();
+        }
     }
 }
 
@@ -476,8 +571,10 @@ where
         };
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
         let spare = self.spare.clone();
+        let observer = self.observer.clone();
         tokio::spawn({
             let spare = spare.clone();
+            let observer = observer.clone();
             async move {
                 // The budget ends first (`CONNECT_BUDGET_MARGIN`): this bound
                 // only ends a connect nothing waits for any more.
@@ -485,7 +582,7 @@ where
                     .await
                     .unwrap_or_else(|_| Err(tower::timeout::error::Elapsed::new().into()));
                 if let Err(Ok(conn)) = sender.send(connected) {
-                    Self::park(&spare, conn);
+                    Self::park(&spare, &observer, conn);
                 }
             }
         });
@@ -497,7 +594,7 @@ where
                     // A connect that finished at the deadline is kept too.
                     receiver.close();
                     if let Ok(Ok(conn)) = receiver.try_recv() {
-                        Self::park(&spare, conn);
+                        Self::park(&spare, &observer, conn);
                     }
                     Err(ConnectCut {
                         budget: relay_connect_budget(bound.deadline),
@@ -528,6 +625,8 @@ pub struct Rpc {
     next_id: Arc<AtomicU64>,
     /// Whether [`RELAY_METHODS`] calls are sent; inherited by wallet clients.
     relay: bool,
+    /// Its connector's, for [`Rpc::observe_spare`].
+    spare_observer: SpareObservers,
 }
 
 impl Rpc {
@@ -579,11 +678,15 @@ impl Rpc {
             matches!(parsed.scheme(), "http" | "https"),
             "QBIT RPC URL must use http(s)"
         );
+        let spare_observer = SpareObservers::default();
         let client = node_client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(timeout)
             .pool_idle_timeout(pool_idle_timeout)
-            .connector_layer(ConnectBoundLayer::new(pool_idle_timeout))
+            .connector_layer(ConnectBoundLayer::new(
+                pool_idle_timeout,
+                spare_observer.clone(),
+            ))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
@@ -593,6 +696,7 @@ impl Rpc {
             password,
             next_id: Arc::new(AtomicU64::new(1)),
             relay: true,
+            spare_observer,
         })
     }
 
@@ -602,6 +706,13 @@ impl Rpc {
     pub fn without_relay(mut self) -> Self {
         self.relay = false;
         self
+    }
+
+    /// For tests (#816): report this client's spare connection, shared by its
+    /// wallet clients, to `observer`. The first observer stays.
+    #[doc(hidden)]
+    pub fn observe_spare(&self, observer: Arc<dyn SpareObserver>) {
+        let _ = self.spare_observer.set(observer);
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -654,6 +765,8 @@ impl Rpc {
         let response = sent.map_err(|error| {
             if error.is_connect() {
                 RpcNotSentError::from_connect(method, &error).into()
+            } else if let Some(returned) = RpcNotSentError::from_returned(method, &error) {
+                returned.into()
             } else {
                 anyhow::anyhow!("qbit RPC {method} transport failed")
             }
