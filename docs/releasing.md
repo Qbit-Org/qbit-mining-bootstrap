@@ -57,8 +57,11 @@ at `987027fe` plus the release date, the fix PRs' numbers in the notes and
 this record.
 
 Merge the intended development cutoff into the promotion branch and retain
-fixes already made during promotion review. The repository allows only squash
-and rebase merges, so the promotion lands on `main` as one squashed commit. Check package versions together,
+fixes already made during promotion review. The repository allows only merge
+commits, and every commit on `main` needs a verified signature. A maintainer
+squashes the promotion into one commit, signs it and merges it, so the
+promotion lands on `main` as that one signed commit under GitHub's merge
+commit. The rulesets are in [`.github/rulesets/`](../.github/rulesets/). Check package versions together,
 run Docker lint and the relevant test gates, and review upgrade and rollback
 instructions. Leave the release date out while publication is unscheduled;
 set the actual release date in a reviewed commit before the final merge.
@@ -68,8 +71,9 @@ set the actual release date in a reviewed commit before the final merge.
 Tag the promoted `main` commit unless the release was already tagged on its
 release or development branch, as 3.0.0 and 3.1.0 were. After the promotion PR
 passes required checks and is merged, identify the exact resulting commit on
-`main`. A squash or rebase merge produces a different commit from the
-promotion branch head. Verify the resulting commit's checks, version metadata
+`main`: GitHub's merge commit. The maintainer's signed squash is a different
+commit from the promotion branch's earlier head, and the merge commit is
+another. Verify the resulting commit's checks, version metadata
 and dated release notes before tagging it.
 
 After confirming that the tag doesn't already exist, use the reviewed main
@@ -107,6 +111,10 @@ same tag. Keep the upstream qbit binary pin separate from this repository's
 release version.
 
 ## Reconcile the development branch
+
+A synchronization PR lands as it is, and the version lines accept only
+commits with a verified signature. Sign the merge commit you make for it
+(`git merge -S`), and never squash it.
 
 After promotion, open a synchronization PR from a branch that merges the
 released `main` commit into the latest development branch (`3.x.x` after a 3.x
