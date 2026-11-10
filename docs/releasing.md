@@ -57,8 +57,11 @@ at `987027fe` plus the release date, the fix PRs' numbers in the notes and
 this record.
 
 Merge the intended development cutoff into the promotion branch and retain
-fixes already made during promotion review. The repository allows only squash
-and rebase merges, so the promotion lands on `main` as one squashed commit. Check package versions together,
+fixes already made during promotion review. The repository allows only merge
+commits, and every commit on `main` needs a verified signature. A maintainer
+squashes the promotion into one commit, signs it and merges it, so the
+promotion lands on `main` as that one signed commit under GitHub's merge
+commit. The rulesets are in [`.github/rulesets/`](../.github/rulesets/). Check package versions together,
 run Docker lint and the relevant test gates, and review upgrade and rollback
 instructions. Leave the release date out while publication is unscheduled;
 set the actual release date in a reviewed commit before the final merge.
@@ -68,8 +71,9 @@ set the actual release date in a reviewed commit before the final merge.
 Tag the promoted `main` commit unless the release was already tagged on its
 release or development branch, as 3.0.0 and 3.1.0 were. After the promotion PR
 passes required checks and is merged, identify the exact resulting commit on
-`main`. A squash or rebase merge produces a different commit from the
-promotion branch head. Verify the resulting commit's checks, version metadata
+`main`: GitHub's merge commit. The maintainer's signed squash is a different
+commit from the promotion branch's earlier head, and the merge commit is
+another. Verify the resulting commit's checks, version metadata
 and dated release notes before tagging it.
 
 After confirming that the tag doesn't already exist, use the reviewed main
@@ -115,15 +119,20 @@ will take patch releases. Preserve subsequent development and resolve metadata
 and notes deliberately; do not reset or force-push the shared branch. Run its
 checks before merging.
 
-Land the synchronization PR by fast-forward, not with the merge button. The
-button can only squash or rebase here, and either one drops `main` from the
+Land the synchronization PR by fast-forward, or with the merge button, which
+has made a merge commit since squash and rebase merges were turned off on
+2026-11-10. Never squash it into one commit: that drops `main` from the
 branch's history. The next merge between them then falls back to the old merge
 base and conflicts on changes only one side has made since this
 synchronization, and GitHub keeps counting each `main` commit as one the
-branch is behind. No rule guards the release branches, so the push checks
-nothing for you: the PR's commits land as they are and must be signed, and
-the commit pushed must be the PR's reviewed head. Once its checks and review
-pass:
+branch is behind. One rule guards the version lines: every commit added to
+them needs a verified signature, and the rule has no bypass list
+([`.github/rulesets/`](../.github/rulesets/)). So the PR's commits land as
+they are and must be signed, the merge of `main` included. The rule also
+refuses an old unsigned commit that the branch doesn't have yet, so a
+synchronization can't bring one in. A fast-forward push checks nothing else
+for you, so the commit pushed must be the PR's reviewed head. Once its checks
+and review pass:
 
 ```sh
 gh pr checks <pr>
@@ -133,9 +142,13 @@ git push origin "$(gh pr view <pr> --json headRefOid --jq .headRefOid)":<branch>
 A plain push succeeds only as a fast-forward, and GitHub marks the PR merged.
 If it is rejected as non-fast-forward, the branch has moved: merge it into the
 synchronization branch and run the checks again. Other PRs into the branch
-still use the button, and a promotion still lands on `main` as one squashed
-commit. So the branch reads one commit behind `main` from each promotion until
-its synchronization lands, and its ahead count keeps growing.
+are squashed into one signed commit by a maintainer and merged with the
+button, and a promotion still lands on `main` as one squashed commit, signed
+by a maintainer, under GitHub's merge commit. A promotion from `3.x.x` or
+`3.0.x` can't be merged as it is: they hold three unsigned commits from
+September 2026 (`1bcd61e1`, `72e099bc`, `6ed2250b`), which `main` would
+refuse. So the branch reads behind `main` from each promotion until its
+synchronization lands, and its ahead count keeps growing.
 `git diff origin/main origin/<branch>` shows what really differs. A kept merge
 base doesn't make every synchronization clean: a line the branch changed
 again after the promotion's cutoff still conflicts with the promotion's copy.
