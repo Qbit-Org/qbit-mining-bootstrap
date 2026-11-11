@@ -1,9 +1,10 @@
 //! #526: which `submitblock` results prove that the node never ran the call.
-//! Only a connection that was never established (#522) and a warmup answer
-//! to `submitblock` itself do; every other result stays with
+//! Only a connection that was never established (#522), a request hyper
+//! handed back unwritten (#816) and a warmup answer to `submitblock` itself
+//! do; every other result stays with
 //! [`classify_offer`], where a failure is an unknown outcome.
 use super::*;
-use crate::rpc::{RpcNotSentError, RpcRelayRefused, RpcReplyError, RPC_IN_WARMUP};
+use crate::rpc::{NotSentStage, RpcNotSentError, RpcRelayRefused, RpcReplyError, RPC_IN_WARMUP};
 
 /// The node's error object, as qbitd writes it into a JSON-RPC 1.0 reply.
 fn reply(method: &str, error: Value) -> Result<Value> {
@@ -35,11 +36,30 @@ fn a_warmup_answer_to_submitblock_was_not_executed() {
 fn a_refused_connection_is_still_not_executed() {
     let result: Result<Value> = Err(RpcNotSentError {
         method: "submitblock".into(),
+        stage: NotSentStage::Connect,
         cause: "connection refused".into(),
     }
     .into());
     let reason = offer_not_executed(&result).expect("a refused connection is not executed");
     assert!(reason.contains("connection refused"), "{reason}");
+}
+
+/// #816: a request hyper handed back unwritten, because the connection it was
+/// given closed first, never reached the node either: the reservation goes
+/// back to `pending` and the block is offered again.
+#[test]
+fn a_request_returned_unwritten_is_not_executed() {
+    let result: Result<Value> = Err(RpcNotSentError {
+        method: "submitblock".into(),
+        stage: NotSentStage::Returned,
+        cause: "connection closed".into(),
+    }
+    .into());
+    let reason = offer_not_executed(&result).expect("a request returned unwritten is not executed");
+    assert!(
+        reason.contains("the connection closed before the request was written (connection closed)"),
+        "{reason}"
+    );
 }
 
 /// #291: a held frontend's client refuses `submitblock` before it is sent,
