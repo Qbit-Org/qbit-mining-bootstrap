@@ -376,6 +376,73 @@ pub fn log_tail(path: &Path, lines: usize) -> Option<String> {
     (!kept.is_empty()).then(|| kept[kept.len().saturating_sub(lines)..].join("\n"))
 }
 
+/// The most checkpoint lines [`checkpoint_log_lines`] keeps per log: the
+/// latest.
+pub const CHECKPOINT_LOG_LINES: usize = 1000;
+
+/// One managed server's checkpoint and restartpoint lines, in its own
+/// timestamps (`log_checkpoints` is on by default), so a stall can be placed
+/// against when a checkpoint started and how long its sync took (#829).
+#[derive(Clone, Debug, Serialize)]
+pub struct CheckpointLog {
+    pub source: String,
+    pub lines: Vec<String>,
+    /// Matching lines dropped because only the latest are kept.
+    pub dropped: usize,
+    pub unavailable_reason: Option<String>,
+}
+
+/// Read `path` a line at a time, keeping the latest
+/// [`CHECKPOINT_LOG_LINES`] checkpoint and restartpoint lines.
+pub fn checkpoint_log_lines(path: &Path) -> CheckpointLog {
+    use std::io::BufRead;
+    let source = path.display().to_string();
+    let unavailable = |source: String, error: std::io::Error| CheckpointLog {
+        source,
+        lines: Vec::new(),
+        dropped: 0,
+        unavailable_reason: Some(format!("the log could not be read: {error}")),
+    };
+    let mut reader = match std::fs::File::open(path) {
+        Ok(file) => std::io::BufReader::new(file),
+        Err(error) => return unavailable(source, error),
+    };
+    let mut lines = std::collections::VecDeque::with_capacity(CHECKPOINT_LOG_LINES);
+    let mut dropped = 0;
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return unavailable(source, error),
+        }
+        let line = String::from_utf8_lossy(&buffer);
+        let line = line.trim_end();
+        if [
+            "checkpoint starting",
+            "checkpoint complete",
+            "restartpoint starting",
+            "restartpoint complete",
+        ]
+        .iter()
+        .any(|needle| line.contains(needle))
+        {
+            if lines.len() == CHECKPOINT_LOG_LINES {
+                lines.pop_front();
+                dropped += 1;
+            }
+            lines.push_back(line.to_owned());
+        }
+    }
+    CheckpointLog {
+        source,
+        lines: lines.into(),
+        dropped,
+        unavailable_reason: None,
+    }
+}
+
 /// The longest Unix-domain socket path PostgreSQL accepts: one less than
 /// `sizeof(sun_path)`, which is 108 on Linux and 104 on macOS and the BSDs.
 #[cfg(target_os = "linux")]
@@ -699,10 +766,13 @@ impl ManagedPostgres {
             .map(|_| "pg_stat_statements".to_owned());
         // `synchronous_standby_names` is deliberately absent: a command-line
         // value shadows the `ALTER SYSTEM` flip the synchronous mode needs.
+        // `track_wal_io_timing` makes `pg_stat_wal` time WAL writes and syncs,
+        // which the share-ack accounting reads per phase (#829); it costs two
+        // clock reads per WAL write or sync.
         let mut options = format!(
             "-h 127.0.0.1 -p {primary_port} -k {root} -c fsync=on -c full_page_writes=on \
              -c wal_level=replica -c max_wal_senders=10 -c max_replication_slots=10 \
-             -c max_connections={max_connections}",
+             -c max_connections={max_connections} -c track_wal_io_timing=on",
             root = root.path().display()
         );
         if preload.is_some() {
@@ -860,7 +930,8 @@ impl ManagedPostgres {
     fn standby_options(&self, port: u16) -> String {
         format!(
             "-h 127.0.0.1 -p {port} -k {root} -c hot_standby=on -c fsync=on \
-             -c full_page_writes=on -c max_connections={} -c max_wal_senders=10",
+             -c full_page_writes=on -c max_connections={} -c max_wal_senders=10 \
+             -c track_wal_io_timing=on",
             self.max_connections,
             root = self.root.path().display()
         )
@@ -1052,6 +1123,37 @@ impl ManagedPostgres {
     /// The primary's log file.
     pub fn primary_log_path(&self) -> PathBuf {
         self.primary.log.clone()
+    }
+
+    /// Every server log the managed cluster wrote, in the order it wrote
+    /// them: the first primary's, the standby's, then each rebuilt standby's
+    /// by rebuild, so a promoted standby's checkpoints are read from its own
+    /// log (#829).
+    pub fn log_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(self.root.path())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // primary.log, standby.log, then standby-1.log, standby-2.log, ...
+        paths.sort_by_key(|path| {
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match stem.as_str() {
+                "primary" => (0, 0, stem),
+                "standby" => (1, 0, stem),
+                _ => match stem.strip_prefix("standby-").map(str::parse::<u64>) {
+                    Some(Ok(rebuild)) => (2, rebuild, stem),
+                    _ => (3, 0, stem),
+                },
+            }
+        });
+        paths
     }
 
     /// The last lines of the primary's log, for a failure's reason.

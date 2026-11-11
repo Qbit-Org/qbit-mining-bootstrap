@@ -5524,6 +5524,489 @@ fn a_counter_reset_between_boundary_scrapes_is_reported_not_subtracted() {
     assert!(delta.note.is_none());
 }
 
+// --- the share-ack accounting (#829) --------------------------------------
+
+/// The three existing server histograms the accounting reads, as a
+/// frontend's `/metrics` body: `hold` and `wait` are (count, sum).
+fn accounted_body(hold: (f64, f64), wait: (f64, f64), pool: (f64, f64)) -> String {
+    format!(
+        "qbit_prism_database_order_lock_hold_seconds_bucket{{holder=\"append\",le=\"0.001\"}} 1\n\
+         qbit_prism_database_order_lock_hold_seconds_sum{{holder=\"append\"}} {}\n\
+         qbit_prism_database_order_lock_hold_seconds_count{{holder=\"append\"}} {}\n\
+         qbit_prism_database_order_lock_hold_seconds_sum{{holder=\"rebuild\"}} 99\n\
+         qbit_prism_database_order_lock_hold_seconds_count{{holder=\"rebuild\"}} 99\n\
+         qbit_prism_database_advisory_lock_wait_seconds_sum{{lock=\"order\",result=\"success\"}} {}\n\
+         qbit_prism_database_advisory_lock_wait_seconds_count{{lock=\"order\",result=\"success\"}} {}\n\
+         qbit_prism_database_advisory_lock_wait_seconds_sum{{lock=\"order\",result=\"failure\"}} 77\n\
+         qbit_prism_database_advisory_lock_wait_seconds_sum{{lock=\"settlement\",result=\"success\"}} 55\n\
+         qbit_prism_database_pool_acquire_seconds_sum{{result=\"success\"}} {}\n\
+         qbit_prism_database_pool_acquire_seconds_count{{result=\"success\"}} {}\n",
+        hold.1, hold.0, wait.1, wait.0, pool.1, pool.0
+    )
+}
+
+fn accounted_scrape(body: &str, accepted: (f64, f64)) -> measure::MetricsScrape {
+    let mut scrape = measure::MetricsScrape {
+        instance_id: "load-fe-0".into(),
+        ok: true,
+        ..Default::default()
+    };
+    measure::parse_share_ack(
+        &format!(
+            "qbit_prism_share_ack_seconds_sum{{result=\"accepted\"}} {}\n\
+             qbit_prism_share_ack_seconds_count{{result=\"accepted\"}} {}\n",
+            accepted.1, accepted.0
+        ),
+        &mut scrape,
+    );
+    measure::parse_accounted_series(body, &mut scrape);
+    scrape
+}
+
+fn series_deltas(
+    before: &measure::MetricsScrape,
+    splits: &[&measure::AckSplit],
+    after: &measure::MetricsScrape,
+    restarts: usize,
+) -> BTreeMap<String, measure::SeriesDelta> {
+    measure::ACCOUNTED_SERIES
+        .iter()
+        .map(|series| {
+            (
+                series.key.to_owned(),
+                measure::series_delta_across_restarts(series.key, before, splits, after, restarts),
+            )
+        })
+        .collect()
+}
+
+/// Each series is read by its exact labels: the append's hold, not the
+/// rebuild's; the order lock's granted waits, not its failed ones or another
+/// lock's. Its delta follows a restart's two segments, and a failed scrape,
+/// an unbracketed restart or a series the frontend did not export is
+/// unknown, never zero (EP-OBSERVABILITY).
+#[test]
+fn accounted_series_are_read_by_their_labels_and_unknown_is_not_zero() {
+    let before = accounted_scrape(
+        &accounted_body((100.0, 0.05), (40.0, 0.01), (200.0, 0.02)),
+        (100.0, 0.2),
+    );
+    assert_eq!(
+        before.series[measure::ORDER_LOCK_HOLD_APPEND],
+        measure::SeriesSample {
+            declared: false,
+            count: Some(100.0),
+            sum: Some(0.05)
+        }
+    );
+    assert_eq!(
+        before.series[measure::ORDER_LOCK_WAIT_GRANTED].sum,
+        Some(0.01)
+    );
+    let after = accounted_scrape(
+        &accounted_body((1100.0, 2.05), (540.0, 1.01), (2200.0, 0.52)),
+        (1100.0, 9.2),
+    );
+    let deltas = series_deltas(&before, &[], &after, 0);
+    let hold = &deltas[measure::ORDER_LOCK_HOLD_APPEND];
+    assert_eq!(hold.count, Some(1000.0));
+    assert!((hold.seconds.unwrap() - 2.0).abs() < 1e-9);
+    assert!(hold.unavailable_reason.is_none());
+
+    // A restart bracketed by scrapes sums its two segments.
+    let split = measure::AckSplit {
+        end_of_previous: accounted_scrape(
+            &accounted_body((600.0, 1.05), (240.0, 0.51), (1200.0, 0.22)),
+            (600.0, 4.2),
+        ),
+        start_of_next: accounted_scrape(
+            &accounted_body((0.0, 0.0), (0.0, 0.0), (0.0, 0.0)),
+            (0.0, 0.0),
+        ),
+    };
+    let deltas = series_deltas(&before, &[&split], &after, 1);
+    assert_eq!(deltas[measure::ORDER_LOCK_HOLD_APPEND].count, Some(1600.0));
+
+    // The server declares the lock families at start and samples a series
+    // only once it observes it: declared and not yet observed is a real
+    // zero for that process, so the first phase's delta is known.
+    let declared = "# HELP qbit_prism_database_order_lock_hold_seconds ORDER_LOCK hold.\n\
+                    # TYPE qbit_prism_database_order_lock_hold_seconds histogram\n\
+                    # TYPE qbit_prism_database_advisory_lock_wait_seconds histogram\n\
+                    # TYPE qbit_prism_database_pool_acquire_seconds histogram\n";
+    let fresh = accounted_scrape(declared, (0.0, 0.0));
+    let deltas = series_deltas(&fresh, &[], &after, 0);
+    assert_eq!(deltas[measure::ORDER_LOCK_HOLD_APPEND].count, Some(1100.0));
+    assert!((deltas[measure::ORDER_LOCK_HOLD_APPEND].seconds.unwrap() - 2.05).abs() < 1e-9);
+    let deltas = series_deltas(&fresh, &[], &fresh, 0);
+    assert_eq!(deltas[measure::ORDER_LOCK_WAIT_GRANTED].count, Some(0.0));
+
+    // The same restart without its scrapes, a failed scrape, or a frontend
+    // that does not export the series: unknown, with the reason.
+    for (from, splits, to, restarts) in [
+        (before.clone(), vec![], after.clone(), 1),
+        (
+            before.clone(),
+            vec![],
+            measure::MetricsScrape {
+                instance_id: "load-fe-0".into(),
+                ok: false,
+                error: Some("connection refused".into()),
+                ..Default::default()
+            },
+            0,
+        ),
+        (
+            before.clone(),
+            vec![],
+            accounted_scrape("", (1100.0, 9.2)),
+            0,
+        ),
+        // Counters that went backwards without a recorded restart.
+        (after.clone(), vec![], before.clone(), 0),
+    ] {
+        let split_refs: Vec<&measure::AckSplit> = splits.iter().collect();
+        let deltas = series_deltas(&from, &split_refs, &to, restarts);
+        for delta in deltas.values() {
+            assert_eq!(delta.count, None, "{delta:?}");
+            assert_eq!(delta.seconds, None, "{delta:?}");
+            assert!(delta.unavailable_reason.is_some(), "{delta:?}");
+        }
+    }
+}
+
+/// The accounting splits accepted acks' seconds at ORDER_LOCK. The measured
+/// parts come from the frontends and pg_stat_statements; the derived parts
+/// name their formula, and one unknown input makes exactly the parts derived
+/// from it unknown.
+#[test]
+fn share_ack_accounting_derives_only_from_known_inputs() {
+    let before = accounted_scrape(
+        &accounted_body((0.0, 0.0), (0.0, 0.0), (0.0, 0.0)),
+        (0.0, 0.0),
+    );
+    // 1,000 accepted acks over 30 s; the append held ORDER_LOCK for 4 s, of
+    // which the call itself held 1 s (pg_stat_statements' 1.5 s minus the
+    // 0.5 s wait inside it), so 3 s came after the call.
+    let after = accounted_scrape(
+        &accounted_body((1000.0, 4.0), (1000.0, 0.5), (2000.0, 0.2)),
+        (1000.0, 30.0),
+    );
+    let acks = vec![measure::ack_delta(&before, &after)];
+    let series = vec![series_deltas(&before, &[], &after, 0)];
+    let call = Ok(measure::AppendCallStats {
+        calls: 1000,
+        total_seconds: 1.5,
+        max_seconds: Some(0.2),
+    });
+    let accounting = measure::share_ack_accounting(&acks, &series, &call);
+    let close = |value: Option<f64>, expected: f64| {
+        assert!(
+            value.is_some_and(|v| (v - expected).abs() < 1e-9),
+            "{value:?} != {expected}"
+        )
+    };
+    close(accounting.accepted_acks.seconds, 30.0);
+    close(accounting.in_call_after_grant.seconds, 1.0);
+    close(accounting.after_call.seconds, 3.0);
+    close(accounting.before_lock_and_response.seconds, 25.5);
+    assert_eq!(accounting.accepted_acks.kind, "measured");
+    assert_eq!(accounting.after_call.kind, "derived");
+    assert!(accounting.after_call.formula.is_some_and(|formula| formula
+        .contains("frontend monotonic")
+        && formula.contains("PostgreSQL")));
+    assert!(accounting
+        .commit_not_in_pg_stat_statements
+        .contains("finish_xact_command"));
+
+    // pg_stat_statements unknown: the call's split is unknown, the remainder
+    // before the lock is still measured from the frontends alone.
+    let unknown_call = Err("pg_stat_statements could not be read".to_owned());
+    let accounting = measure::share_ack_accounting(&acks, &series, &unknown_call);
+    assert_eq!(accounting.append_call.seconds, None);
+    assert_eq!(accounting.in_call_after_grant.seconds, None);
+    assert_eq!(accounting.after_call.seconds, None);
+    assert!(accounting
+        .after_call
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("pg_stat_statements")));
+    close(accounting.before_lock_and_response.seconds, 25.5);
+
+    // A second frontend that did not export the hold: everything summed over
+    // frontends that needs it is unknown, never the first frontend's alone.
+    let bare = accounted_scrape("", (500.0, 10.0));
+    let acks = vec![
+        measure::ack_delta(&before, &after),
+        measure::ack_delta(&before, &bare),
+    ];
+    let series = vec![
+        series_deltas(&before, &[], &after, 0),
+        series_deltas(&before, &[], &bare, 0),
+    ];
+    let accounting = measure::share_ack_accounting(&acks, &series, &call);
+    close(accounting.accepted_acks.seconds, 40.0);
+    assert_eq!(accounting.order_lock_hold_append.seconds, None);
+    assert_eq!(accounting.after_call.seconds, None);
+    assert_eq!(accounting.before_lock_and_response.seconds, None);
+
+    // Inputs whose populations disagree (here more granted waits than the
+    // calls' own time) give a negative difference: that is reported as the
+    // disagreement it is, never printed as a time.
+    let short_call = Ok(measure::AppendCallStats {
+        calls: 1000,
+        total_seconds: 0.3,
+        max_seconds: Some(0.01),
+    });
+    let acks = vec![measure::ack_delta(&before, &after)];
+    let series = vec![series_deltas(&before, &[], &after, 0)];
+    let accounting = measure::share_ack_accounting(&acks, &series, &short_call);
+    assert_eq!(accounting.in_call_after_grant.seconds, None);
+    assert!(accounting
+        .in_call_after_grant
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("disagree") && reason.contains("-0.200 s")));
+    assert_eq!(accounting.after_call.seconds, None);
+    // after_call's own formula was never computed: its reason names the input.
+    assert!(accounting
+        .after_call
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("in_call_after_grant is unknown: ")));
+
+    // No frontend at all is unknown, not an empty zero.
+    let accounting = measure::share_ack_accounting(&[], &[], &call);
+    assert_eq!(accounting.accepted_acks.seconds, None);
+    assert!(accounting.accepted_acks.unavailable_reason.is_some());
+}
+
+/// WAL counters over a phase: counts are known whenever both reads were,
+/// the times only when track_wal_io_timing was on at both ends, and a reset
+/// or a replaced primary (counters going backwards) is unknown, not a
+/// negative.
+#[test]
+fn wal_and_checkpoint_deltas_keep_untimed_and_reset_distinct_from_zero() {
+    let counters = |records: i64, syncs: i64, sync_ms: f64, io_timing: bool, timed: i64| {
+        measure::DatabaseCounters {
+            server_started: Ok("2026-10-30 08:44:12.5+00".into()),
+            wal: Ok(measure::WalCounters {
+                wal_records: records,
+                wal_fpi: records / 10,
+                wal_bytes: records as f64 * 100.0,
+                wal_write: syncs,
+                wal_sync: syncs,
+                wal_write_time_ms: sync_ms / 10.0,
+                wal_sync_time_ms: sync_ms,
+                io_timing,
+            }),
+            checkpoints: Ok(measure::CheckpointCounters {
+                timed,
+                requested: 0,
+                write_time_ms: 0.0,
+                sync_time_ms: 0.0,
+            }),
+        }
+    };
+    let delta = measure::database_delta(
+        &counters(1000, 100, 50.0, true, 1),
+        &counters(3000, 600, 1050.0, true, 2),
+    );
+    assert_eq!(delta.wal.syncs, Some(500));
+    assert_eq!(delta.wal.full_page_images, Some(200));
+    assert_eq!(delta.wal.sync_seconds, Some(1.0));
+    assert_eq!(delta.wal.sync_mean_milliseconds, Some(2.0));
+    assert!(delta.wal.timing_unavailable_reason.is_none());
+    assert_eq!(delta.checkpoints.timed, Some(1));
+
+    // Timing off at either end: the syncs are counted, their time unknown.
+    let delta = measure::database_delta(
+        &counters(1000, 100, 0.0, false, 1),
+        &counters(3000, 600, 0.0, false, 1),
+    );
+    assert_eq!(delta.wal.syncs, Some(500));
+    assert_eq!(delta.wal.sync_seconds, None);
+    assert_eq!(delta.wal.sync_mean_milliseconds, None);
+    assert!(delta
+        .wal
+        .timing_unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("track_wal_io_timing")));
+
+    // Counters that went backwards: unknown with the reason.
+    let delta = measure::database_delta(
+        &counters(3000, 600, 1050.0, true, 2),
+        &counters(10, 1, 1.0, true, 0),
+    );
+    assert_eq!(delta.wal.syncs, None);
+    assert!(delta.wal.unavailable_reason.is_some());
+    assert_eq!(delta.checkpoints.timed, None);
+    assert!(delta.checkpoints.unavailable_reason.is_some());
+
+    // A primary that restarted or was replaced (a failover's promoted
+    // standby) between the reads: not one server's delta, even when its
+    // counters happen to be higher.
+    let mut promoted = counters(3000, 600, 1050.0, true, 2);
+    promoted.server_started = Ok("2026-10-30 08:51:02.1+00".into());
+    let delta = measure::database_delta(&counters(1000, 100, 50.0, true, 1), &promoted);
+    assert_eq!(delta.wal.syncs, None);
+    assert_eq!(delta.checkpoints.timed, None);
+    assert!(delta
+        .wal
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("restarted or was replaced")));
+
+    assert_eq!(
+        measure::server_replaced(&Ok("a".into()), &Ok("a".into())),
+        None
+    );
+    assert!(measure::server_replaced(&Ok("a".into()), &Err("lost".into())).is_some());
+
+    // A failed read (an external database without the view, a lost
+    // connection) is unknown with its error.
+    let mut failed = counters(3000, 600, 1050.0, true, 2);
+    failed.wal = Err("pg_stat_wal could not be read: permission denied".into());
+    let delta = measure::database_delta(&counters(1000, 100, 50.0, true, 1), &failed);
+    assert_eq!(delta.wal.syncs, None);
+    assert_eq!(
+        delta.wal.unavailable_reason.as_deref(),
+        Some("pg_stat_wal could not be read: permission denied")
+    );
+    assert_eq!(delta.checkpoints.timed, Some(1));
+}
+
+/// A failed gated phase prints where its acknowledgements' time went, as an
+/// informational row; a passing phase, and a report from before the
+/// accounting existed, print none, and the row never changes the verdict.
+#[test]
+fn a_failed_gated_phase_prints_its_ack_accounting_without_gating_on_it() {
+    use qbit_prism_load::gate;
+    let report = |shortfall: u64, accounting: Option<Value>| {
+        let mut phase = json!({"name": "steady_state", "shortfall": shortfall,
+            "rejected_valid_shares": 0, "reconciliation": {"missing": 0, "unexpected": 0}});
+        if let Some(accounting) = accounting {
+            phase["share_ack_accounting"] = accounting;
+            phase["database_counters"] = json!({
+                "wal": {"syncs": 148000, "sync_mean_milliseconds": 1.5, "full_page_images": 9000},
+                "checkpoints": {"timed": 1, "requested": null},
+            });
+        }
+        json!({
+            "aborted": null, "durability_findings": [],
+            "phases": [phase],
+            "rejections": {"no_response_by_phase": {}, "by_phase_reason_and_message": []},
+            "time_to_usable_work": {"tips": [{"all_sessions_milliseconds": 100.0}]},
+        })
+    };
+    let accounting = json!({
+        "accepted_acks": {"seconds": 35368.0, "count": 148974.0, "kind": "measured"},
+        "before_lock_and_response": {"seconds": 33000.0, "kind": "derived"},
+        "order_lock_wait": {"seconds": 574.0, "kind": "measured"},
+        "in_call_after_grant": {"seconds": null, "kind": "derived"},
+        "after_call": {"seconds": 1794.0, "kind": "derived"},
+    });
+    let budgets = gate::Budgets {
+        phases: Some(vec!["steady_state".into()]),
+        max_shortfall: 0,
+        max_rejected_valid_shares: None,
+        max_unanswered_submits: None,
+        tip_last_notify_p99_ms: None,
+        tip_last_notify_median_ms: None,
+        d1_verdict_table: false,
+        churn_tip_last_notify_p99_ms: None,
+        new_session_first_job_p99_ms: None,
+    };
+    let row = |checks: &[gate::Check]| {
+        checks
+            .iter()
+            .find(|check| {
+                check
+                    .name
+                    .contains("where the accepted acknowledgements' time went")
+            })
+            .cloned()
+    };
+    let failed = gate::evaluate(&report(1022, Some(accounting.clone())), Some(0), &budgets);
+    assert!(!gate::passed(&failed));
+    let printed = row(&failed).expect("a failed gated phase prints its accounting");
+    assert_eq!(printed.pass, None, "the row is informational");
+    assert!(
+        printed.observed.contains("148974 acks, 35368.0 s"),
+        "{}",
+        printed.observed
+    );
+    assert!(
+        printed.observed.contains("33000.0 s (93%, derived)"),
+        "{}",
+        printed.observed
+    );
+    assert!(
+        printed.observed.contains("held in the call unknown"),
+        "{}",
+        printed.observed
+    );
+    assert!(
+        printed.observed.contains("mean 1.500 ms"),
+        "{}",
+        printed.observed
+    );
+    assert!(
+        printed
+            .observed
+            .contains("1 timed (skipped ones included), unknown requested"),
+        "{}",
+        printed.observed
+    );
+
+    let clean = gate::evaluate(&report(0, Some(accounting)), Some(0), &budgets);
+    assert!(gate::passed(&clean));
+    assert!(row(&clean).is_none());
+
+    let old = gate::evaluate(&report(1022, None), Some(0), &budgets);
+    assert!(
+        row(&old).is_none(),
+        "a report without the accounting prints no row"
+    );
+    assert_eq!(
+        old.iter().filter(|check| check.pass == Some(false)).count(),
+        failed
+            .iter()
+            .filter(|check| check.pass == Some(false))
+            .count(),
+        "the row changes no verdict"
+    );
+}
+
+#[test]
+fn the_primary_log_keeps_only_its_checkpoint_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("primary.log");
+    std::fs::write(
+        &path,
+        "2026-10-30 08:44:20.001 UTC [10] LOG:  database system is ready to accept connections\n\
+         2026-10-30 08:49:20.002 UTC [11] LOG:  checkpoint starting: time\n\
+         2026-10-30 08:53:50.003 UTC [11] LOG:  checkpoint complete: wrote 9000 buffers (55.0%); \
+         sync files=40, longest=1.200 s, average=0.030 s\n\
+         2026-10-30 08:54:10.004 UTC [12] LOG:  restartpoint starting: time\n",
+    )
+    .unwrap();
+    let log = qbit_prism_load::cluster::checkpoint_log_lines(&path);
+    assert_eq!(log.lines.len(), 3, "{:?}", log.lines);
+    assert!(log.lines[2].contains("restartpoint starting"));
+    assert!(log.lines[0].contains("checkpoint starting: time"));
+    assert!(log.lines[1].contains("longest=1.200 s"));
+    assert_eq!(log.dropped, 0);
+    assert!(log.unavailable_reason.is_none());
+
+    let missing = qbit_prism_load::cluster::checkpoint_log_lines(&dir.path().join("absent.log"));
+    assert!(missing.lines.is_empty());
+    assert!(
+        missing.unavailable_reason.is_some(),
+        "an unreadable log is not an empty one"
+    );
+}
+
 // --- the drained restart --------------------------------------------------
 
 /// The smallest HTTP server the restart driver's readiness probe and metrics

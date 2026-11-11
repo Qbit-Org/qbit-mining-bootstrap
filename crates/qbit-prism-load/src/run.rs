@@ -601,6 +601,14 @@ struct PhaseRun {
     locks: measure::PhaseLocks,
     processes: Vec<measure::ProcessSummary>,
     ack_deltas: Vec<measure::ServerAckDelta>,
+    /// Each frontend's [`measure::ACCOUNTED_SERIES`] deltas, in frontend
+    /// order, for the share-ack accounting (#829).
+    series_deltas: Vec<BTreeMap<String, measure::SeriesDelta>>,
+    /// The share append call's `pg_stat_statements` over the phase, or why
+    /// it is unknown.
+    append_call: std::result::Result<measure::AppendCallStats, String>,
+    /// `pg_stat_wal` and checkpoint counters over the phase.
+    database_counters: measure::DatabaseDelta,
     replication_start: cluster::ReplicationObservation,
     replication_end: cluster::ReplicationObservation,
     proxy_delay_configured_ms: u64,
@@ -1149,6 +1157,7 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
                 .clone()
         })
         .unwrap_or_else(|| "unknown (external database)".into());
+    let managed_cluster = managed.clone();
     let result = run_inner(
         &args,
         RunContext {
@@ -1178,6 +1187,7 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
             declared_replication: replication,
             managed_standby,
             pg_stat_statements,
+            managed_cluster,
             soak,
             failover: failover.clone(),
         },
@@ -1279,6 +1289,9 @@ struct RunContext {
     declared_replication: Replication,
     managed_standby: Option<String>,
     pg_stat_statements: String,
+    /// The managed cluster, for its servers' checkpoint lines (#829); `None`
+    /// against `--database-url`.
+    managed_cluster: Option<crate::fault::failover::Cluster>,
     /// `--plan soak`'s phases and spec (#575).
     soak: Option<crate::soak_driver::SoakPlan>,
     /// The managed cluster and the writer endpoint, for the database faults
@@ -1779,7 +1792,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             }
         }
         let replication_start = cluster::observe_replication(&side, &plan.name).await?;
-        measure::reset_statement_stats(&side).await;
+        let statements_reset = measure::reset_statement_stats(&side).await;
+        let counters_before = measure::database_counters(&side).await;
         let mut before_scrapes = Vec::new();
         for child in &frontends {
             before_scrapes
@@ -1951,6 +1965,23 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             after_scrapes
                 .push(measure::scrape_metrics(&child.spec.instance_id, &child.metrics_url()).await);
         }
+        let counters_after = measure::database_counters(&side).await;
+        // Its totals are the phase's only if the phase's reset took, on the
+        // server that is still the primary.
+        let append_call = if !statements_reset {
+            Err(
+                "pg_stat_statements could not be reset at the phase's start (not loaded, or \
+                 not permitted), so its totals would not be the phase's"
+                    .to_owned(),
+            )
+        } else if let Some(reason) = measure::server_replaced(
+            &counters_before.server_started,
+            &counters_after.server_started,
+        ) {
+            Err(reason)
+        } else {
+            measure::append_call_statement(&side).await
+        };
         let replication_end = cluster::observe_replication(&side, &plan.name).await?;
         let mut locks = lock_sampler.summarize(started, ended);
         // All three PRISM locks share one normalized query text, so the same
@@ -1973,6 +2004,25 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 tier.finish().await;
             }
         }
+        // A frontend restarted during the phase reset its counters; its
+        // deltas are assembled from the scrapes on each side of every
+        // restart, and a restart no scrape bracketed (a mid-flight kill)
+        // leaves them unknown rather than negative or zero.
+        let frontend_segments: Vec<_> = frontends
+            .iter()
+            .enumerate()
+            .zip(before_scrapes.iter().zip(after_scrapes.iter()))
+            .map(|((index, child), (before, after))| {
+                let splits: Vec<&measure::AckSplit> = outcome
+                    .restart_records
+                    .iter()
+                    .filter(|record| record.index == index)
+                    .map(|record| &record.split)
+                    .collect();
+                let restarts = child.restarts.saturating_sub(restarts_before[index]);
+                (before, splits, after, restarts)
+            })
+            .collect();
         runs.push(PhaseRun {
             plan: plan.clone(),
             completed: outcome.aborted.is_none(),
@@ -1984,25 +2034,30 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             shortfall: outcome.shortfall,
             locks,
             processes,
-            // A frontend restarted during the phase reset its counters; the
-            // delta is assembled from the scrapes on each side of every
-            // restart, and a restart no scrape bracketed (a mid-flight kill)
-            // leaves it unknown rather than negative or zero.
-            ack_deltas: frontends
+            ack_deltas: frontend_segments
                 .iter()
-                .enumerate()
-                .zip(before_scrapes.iter().zip(after_scrapes.iter()))
-                .map(|((index, child), (before, after))| {
-                    let splits: Vec<&measure::AckSplit> = outcome
-                        .restart_records
-                        .iter()
-                        .filter(|record| record.index == index)
-                        .map(|record| &record.split)
-                        .collect();
-                    let restarts = child.restarts.saturating_sub(restarts_before[index]);
-                    measure::ack_delta_across_restarts(before, &splits, after, restarts)
+                .map(|(before, splits, after, restarts)| {
+                    measure::ack_delta_across_restarts(before, splits, after, *restarts)
                 })
                 .collect(),
+            series_deltas: frontend_segments
+                .iter()
+                .map(|(before, splits, after, restarts)| {
+                    measure::ACCOUNTED_SERIES
+                        .iter()
+                        .map(|series| {
+                            (
+                                series.key.to_owned(),
+                                measure::series_delta_across_restarts(
+                                    series.key, before, splits, after, *restarts,
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .collect(),
+            append_call,
+            database_counters: measure::database_delta(&counters_before, &counters_after),
             replication_start,
             replication_end,
             proxy_delay_configured_ms: plan.database_delay_ms,
@@ -2595,6 +2650,27 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             committed.len(),
         )?,
     };
+    // Every managed server's checkpoint lines (#829). The paths are copied
+    // out of the cluster's lock, and the logs read off the runtime.
+    let checkpoint_log = match &ctx.managed_cluster {
+        Some(managed) => {
+            let paths = managed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .log_paths();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    paths
+                        .iter()
+                        .map(|path| cluster::checkpoint_log_lines(path))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .context("reading the managed servers' checkpoint lines")?,
+            )
+        }
+        None => None,
+    };
     let mut side_report = json!({
         "schema": report::SCHEMA,
         "run_id": ctx.run_id.to_string(),
@@ -2667,6 +2743,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "durability": durability,
             "replication": replication_rows,
             "pg_stat_statements": ctx.pg_stat_statements,
+            "track_wal_io_timing": if ctx.managed_cluster.is_some() {
+                "requested on: the harness starts its managed primary and standby with it, so \
+                 pg_stat_wal times WAL writes and syncs (#829); each phase's \
+                 database_counters.wal says when the server read had it off"
+            } else {
+                "as the external database has it; each phase's database_counters.wal says when \
+                 it was off"
+            },
+            "checkpoint_log": checkpoint_log,
             "delay_proxy": proxy_block,
             "database_profile_sha256": profile_digest,
             "database_profile_path": profile_path.display().to_string(),
@@ -4968,6 +5053,12 @@ fn phase_report(
                                           client_rejection_latency",
         "client_rejection_latency": rejection_latency(&collected.submits, &phase.plan.name),
         "server_share_ack_seconds": phase.ack_deltas,
+        "share_ack_accounting": measure::share_ack_accounting(
+            &phase.ack_deltas,
+            &phase.series_deltas,
+            &phase.append_call,
+        ),
+        "database_counters": phase.database_counters,
         "order_lock": phase.locks.order,
         "settlement_lock": phase.locks.settlement,
         "processes": phase.processes,
