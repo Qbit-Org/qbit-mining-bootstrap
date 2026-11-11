@@ -215,7 +215,8 @@ pub async fn run(config: Config) -> Result<()> {
         coordinator.ledger.pool.clone(),
         api_config,
         registry.clone(),
-    );
+    )
+    .with_shutdown(shutdown_rx.clone());
     let metrics = api_state.metrics();
     let runtime = metrics.runtime();
     // 3.1: admission is decided only where something reads it, so a single

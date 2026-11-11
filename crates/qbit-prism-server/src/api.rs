@@ -1,5 +1,6 @@
 //! Compatibility HTTP API. Every accounting read uses the shared PostgreSQL ledger.
 mod charts;
+mod integrity;
 mod metrics_snapshot;
 mod operator_auth;
 mod public;
@@ -323,6 +324,8 @@ pub struct ApiState {
     audit_rebuilds: Arc<Semaphore>,
     /// Audit artifact requests admitted to wait for, or run, a rebuild.
     audit_artifacts: Arc<Semaphore>,
+    /// The `/audit` integrity routes' report run and newest outcome (#737).
+    integrity: Arc<integrity::IntegrityReports>,
     public_service: Option<Arc<public_service::ServiceState>>,
 }
 #[derive(Clone, Debug)]
@@ -370,6 +373,10 @@ impl ApiState {
             audit_decodes,
             audit_rebuilds,
             audit_artifacts: Arc::new(Semaphore::new(config.audit_artifact_max_in_flight as usize)),
+            integrity: Arc::new(integrity::IntegrityReports::new(
+                integrity::RUN_TIMEOUT,
+                integrity::REUSE,
+            )),
             public_service: None,
             config: Arc::new(config),
             health: Arc::new(RwLock::new(
@@ -410,6 +417,20 @@ impl ApiState {
     #[doc(hidden)]
     pub fn audit_artifact_admission(&self) -> Arc<Semaphore> {
         self.audit_artifacts.clone()
+    }
+    /// The integrity routes with another run bound and reuse window than
+    /// their 300 s each, for the tests.
+    #[doc(hidden)]
+    pub fn with_integrity_report_timing(mut self, timeout: Duration, reuse: Duration) -> Self {
+        self.integrity = Arc::new(self.integrity.with_timing(timeout, reuse));
+        self
+    }
+    /// The frontend's stop signal, `true` once it is stopping: the integrity
+    /// routes then abandon their report run in flight and start none, so a
+    /// stop never waits on a report (#737).
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.integrity = Arc::new(self.integrity.stopping_on(shutdown));
+        self
     }
     #[cfg(test)]
     pub(crate) fn health_published_at_for_test(&self) -> &RwLock<Instant> {
@@ -526,6 +547,15 @@ impl ApiError {
             message:
                 "too many audit artifacts are being rebuilt; retry after the Retry-After delay"
                     .into(),
+        }
+    }
+    /// The integrity routes have no current report: its run failed, or
+    /// ended without an outcome (#737).
+    fn integrity_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "integrity_report_unavailable",
+            message: message.into(),
         }
     }
     /// The `Retry-After` delay an error carries, in seconds.
@@ -978,15 +1008,9 @@ async fn audit(state: &ApiState, path: &str, q: &Query) -> ApiResult<Value> {
             )
         }
         "/audit/carry-forward-integrity" | "/audit/ledger-integrity" => {
-            let mut value: Value =
-                sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
-                    .fetch_one(&state.pool)
-                    .await?;
-            // #478: debt from divergent landings is exact accounting, so the
-            // report's mismatch count never shows it; this line does.
-            value["payout_divergence"] = crate::ledger::payout_divergence_line(&state.pool).await?;
-            value["ledger_backend"] = json!("postgres-native");
-            return Ok(value);
+            // #737: one run at a time under its own timeout, its outcome
+            // served with when it was computed.
+            return state.integrity.answer_request(&state.pool).await;
         }
         "/audit/latest" => {
             let row = state
