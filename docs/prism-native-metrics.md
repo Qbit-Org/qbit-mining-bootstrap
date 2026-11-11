@@ -113,6 +113,8 @@ rendering the startup registry does not create a publication timestamp.
 | `qbit_prism_node_initial_block_download` | gauge | none | run | Whether the node reported initial block download in the latest answered getblockchaininfo, or -1 when unknown. Recorded whenever the latest getblockchaininfo answered with the boolean, including the 1 that then makes readiness fail. -1 means startup, a failed call, or a field that was not a boolean. | none |
 | `qbit_prism_node_observation_age_seconds` | gauge | none | run | Monotonic age of the last answered getblockchaininfo, or -1 before one; it grows while the node is unreachable. Stamped when the call answered, not when the whole readiness check passed, so a reachable but unready node is distinguishable from an unreachable one. Computed from a monotonic clock at scrape time. Peers and the sync flag come from the latest attempt to start, so a slower older attempt landing late cannot roll them back, while the age keeps the latest answer any attempt received. | none |
 | `qbit_prism_node_peers` | gauge | none | run | Node peer connections from the latest node observation, or -1 when unknown. Recorded only when the readiness attempt reached getnetworkinfo and it answered, which is never on regtest, during initial block download, or while blocks and headers disagree; observation adds no RPC call. -1 means the latest attempt did not learn the count, including RPC failure; the gauge never keeps an earlier reading. An answered zero is a real zero, and it is below every configured PRISM_MIN_PEERS floor. | none |
+| `qbit_prism_payout_revision_announcements_heard_total` | counter | none | run | Notifications this frontend's payout-revision listener received on the qbit_prism_payout_revision channel since process start (#816): one per announced payout revision bump (a block's confirmation or settlement, a carry gate change, a fatal-state clear) that any frontend, this one included, committed while it listened; one committed while it was down is never counted. | none |
+| `qbit_prism_payout_revision_listener_up` | gauge | none | run | Whether this frontend's payout-revision listener (#752, #816) holds its LISTEN on the qbit_prism_payout_revision channel: 1 from a successful LISTEN until its connection is lost or its probe, run after 30 s without an announcement, fails; 0 before the first LISTEN, while it reconnects and once the refresh loop stops. While 0 this frontend republishes after another frontend's block only on its blockpoll tick. A LISTEN through a transaction-pooling proxy reads 1 and hears nothing: read qbit_prism_payout_revision_announcements_heard_total beside it. | none |
 | `qbit_prism_peer_sync_conflicts_total` | counter | `table=qbit_share_ledger,qbit_prism_share_hashes,qbit_pool_blocks,qbit_prism_audit_snapshots,qbit_pool_audit_bundles,qbit_pool_payout_entries,qbit_payout_carry_forward,qbit_ctv_fanout_sets,qbit_ctv_fanout_artifacts,qbit_prism_templates,qbit_prism_balance_snapshots,qbit_prism_jobs,qbit_prism_node_roles` | run | 3.1 dual writer: rows the peer sync found under an identity this node holds with other content, or could not insert, by copied table; each is kept out, recorded in qbit_prism_peer_sync_conflicts and alerted. | none |
 | `qbit_prism_peer_sync_failures_total` | counter | `path=primary,fallback` | run | 3.1 dual writer: peer sync passes that failed, by the path they used; the next pass tries the other path. | none |
 | `qbit_prism_peer_sync_lag_rows` | gauge | `stream=shares,blocks,prepared,roles` | run | 3.1 dual writer: peer rows of each stream the latest pass saw on the peer and this node does not hold yet, in the stream's root rows (shares, landed blocks, prepared jobs, journal rows), counted up to a million. No sample on a single writer. | none |
@@ -779,3 +781,43 @@ alert on the minimum across instances, never on a single one. The series reads
 -1 from loop start until its first caught-up pass, and while
 `PRISM_HASHRATE_ROLLUP_ENABLED=0` the family is declared without any sample,
 because a frontend that never runs the rollup has no lag to report.
+
+## Reading the payout-revision listener (#816)
+
+Each running frontend's refresh loop keeps one `LISTEN` session on the
+`qbit_prism_payout_revision` channel (#752, `coordinator/revision_wake.rs`), so
+that another frontend's same-tip payout revision bump, such as a block's
+confirmation, wakes its refresh at once. `qbit_prism_payout_revision_listener_up`
+reads 1 from a successful `LISTEN` until that connection is lost, and 0 before
+the first `LISTEN`, while the listener reconnects with backoff (up to 5 s
+between attempts) and once the refresh loop stops. A connection that dies
+without closing reads 1 until the listener's probe finds it: the probe runs
+after 30 s without an announcement and gives up after 5 s. Both families are
+overlaid on the cached body at every scrape, so a database outage that also
+stalls the health publisher still shows the listener down.
+
+While the gauge reads 0 the frontend works as before #752: after another
+frontend's block it republishes only on its `PRISM_BLOCKPOLL_SECONDS` tick (2 s
+by default), and until then shares on its new-tip work are refused `stale-job`,
+counted as `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`. A
+frontend that cannot open the extra connection at all, for example because
+`max_connections` was not raised by one per frontend, reads 0 for good. It
+also logs `payout-revision listener unavailable` at WARN at most once a minute.
+
+`qbit_prism_payout_revision_announcements_heard_total` counts every notification
+the listener received, its own frontend's included, and never one made while
+it was down. Each announced bump sends one: a block's confirmation or other
+settlement, a carry gate change, or a fatal-state clear, so the counter is not
+a block count. Every frontend listening on one database hears the same
+announcements, so their counters move together. A `LISTEN` that succeeds but
+never hears anything, as through a transaction-pooling proxy in front of
+`PRISM_DATABASE_URL`, reads 1 with a counter that stays flat while the other
+frontends' counters grow. In dual-writer mode each node's frontends listen on
+their own database, so compare the counters within a node.
+
+No alert rule reads these families yet. A frontend without its listener loses
+no block, share credit or payout: each pool block costs it at most one tick of
+`stale-job` refusals on new-tip work. The gauge also drops to 0 on every
+reconnect, so a rule needs a dwell chosen from fleet data. A warning such as
+`qbit_prism_payout_revision_listener_up == 0` for 10 minutes is a candidate for
+a later change through `scripts/generate_prism_alerts.py`.
