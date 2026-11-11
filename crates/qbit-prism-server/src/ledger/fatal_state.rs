@@ -5,7 +5,10 @@ use crate::{
     rpc::{Rpc, RpcReplyError},
 };
 use serde_json::json;
-use std::time::Duration;
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    time::Duration,
+};
 
 /// `fatal-state clear`'s bound when the operator gives no `--timeout-seconds`.
 pub const FATAL_STATE_CLEAR_BOUND: Duration = Duration::from_secs(120);
@@ -264,6 +267,9 @@ impl Ledger {
         let pool_block_above: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM qbit_pool_blocks WHERE block_height>$1 AND chain_state IN ('prepared','confirmed','inactive'))")
             .bind(i64::try_from(height)?)
             .fetch_one(&mut *tx).await?;
+        // #690: one getblockhash per height. Pool blocks share heights with
+        // each other and with the blocks that confirm deep fanouts.
+        let mut asked = HashMap::new();
         let mut observations = Vec::with_capacity(blocks.len());
         let mut observed_heights = Vec::with_capacity(blocks.len());
         for block in &blocks {
@@ -275,7 +281,11 @@ impl Ledger {
                 "node is behind mature pool block {hash} at height {block_height}"
             );
             let active = block_height <= height
-                && rpc.call("getblockhash", json!([block_height])).await? == json!(hash);
+                && *once_per_height(&mut asked, block_height, || {
+                    rpc.call("getblockhash", json!([block_height]))
+                })
+                .await?
+                    == json!(hash);
             observed_heights.push(block_height);
             observations.push(BlockObservation {
                 block_hash: hash,
@@ -299,7 +309,7 @@ impl Ledger {
                 at <= height,
                 "node is behind deep confirmed fanout {txid} at height {at}"
             );
-            ensure!(rpc.call("getblockhash", json!([at])).await? == json!(hash),
+            ensure!(*once_per_height(&mut asked, at, || rpc.call("getblockhash", json!([at]))).await? == json!(hash),
                 "deep confirmed CTV fanout remains disconnected: {txid} at height {at}; reconcile before clearing");
             deep_fanouts.push((txid, hash, at));
         }
@@ -487,12 +497,17 @@ struct Observed<'a> {
 }
 
 impl Observed<'_> {
-    /// Ask the node for every observation again. An answer that differs
-    /// means the chain moved under the loop, and refuses as a reorganization.
+    /// Ask the node for every observation again, once per height (#690). An
+    /// answer that differs means the chain moved under the loop, and refuses
+    /// as a reorganization.
     async fn still_hold(&self, rpc: &Rpc) -> Result<()> {
         let state = |active| if active { "active" } else { "inactive" };
+        let mut asked = HashMap::new();
         for (block, at) in self.blocks.iter().zip(self.heights) {
-            let active = block_at(rpc, *at).await?.as_deref() == Some(block.block_hash.as_str());
+            let active = once_per_height(&mut asked, *at, || block_at(rpc, *at))
+                .await?
+                .as_deref()
+                == Some(block.block_hash.as_str());
             ensure!(
                 active == block.active,
                 "the chain reorganized during fatal-state recovery: pool block {} at height {at} was {} when observed and is {} now; retry fatal-state clear",
@@ -503,12 +518,32 @@ impl Observed<'_> {
         }
         for (txid, hash, at) in self.fanouts {
             ensure!(
-                block_at(rpc, *at).await?.as_deref() == Some(hash.as_str()),
+                once_per_height(&mut asked, *at, || block_at(rpc, *at))
+                    .await?
+                    .as_deref()
+                    == Some(hash.as_str()),
                 "the chain reorganized during fatal-state recovery: deep confirmed CTV fanout {txid} at height {at} is no longer connected; retry fatal-state clear"
             );
         }
         Ok(())
     }
+}
+
+/// What `ask` answers for `height`, asked only the first time and kept in
+/// `asked` (#690). Each pass over the chain, the clear's loop and the re-read
+/// once the tip has moved, keeps its own answers, so the re-read asks afresh.
+async fn once_per_height<T, F>(
+    asked: &mut HashMap<u64, T>,
+    height: u64,
+    ask: impl FnOnce() -> F,
+) -> Result<&T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    Ok(match asked.entry(height) {
+        Entry::Occupied(answer) => answer.into_mut(),
+        Entry::Vacant(unasked) => unasked.insert(ask().await?),
+    })
 }
 
 /// The active chain's block at `height`, or `None` beyond its tip

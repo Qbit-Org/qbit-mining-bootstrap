@@ -1318,8 +1318,44 @@ At production size the report takes about a minute, longer than the 15 s
 `self-check` runs it in a read-only transaction under a statement timeout of its
 own, 300 s, and `fatal-state clear` under the time its bound leaves it
 ([fatal-state recovery](#recovery-commands)), so neither needs that setting
-raised (#737). The `/audit/carry-forward-integrity` and `/audit/ledger-integrity`
-routes still run it under the setting.
+raised (#737).
+
+The `/audit/carry-forward-integrity` and `/audit/ledger-integrity` routes on a
+frontend's operator listener run it the same way: in a read-only transaction
+under a statement timeout of its own, the time left to the run's 300 s
+deadline, and at most one run at a time per frontend (#737). A run reads the
+`payout_divergence` line in that transaction first, under the session's
+statement timeout as before, then the report, and closes its connection when
+it ends. A
+request that arrives during a run waits for that run, up to its 300 s, and
+gets its outcome; a client that gives up sooner leaves the run going, and its
+outcome answers the next request. Each report served carries three fields
+more than before:
+
+- `computed_at`: when its run started (RFC 3339). Its figures were read from
+  then until the run ended.
+- `age_seconds`: how long before this response its run started.
+- `run_seconds`: how long its run took. That bounds the report's own time
+  from above: the run also waits for its connection and reads the divergence
+  line.
+
+A report is served for 5 minutes after its run ends; only the first request
+after that starts another run. A run that fails or times out answers 503 with
+the reason (the step that failed and how), when that run started and when the
+next may start, never a report. The routes answer the same for as long as
+that run took, at most 5 minutes, so a brief failure, a moment without a free
+connection say, is retried soon. So polling the routes, however often, starts
+a run on each frontend at most once per run time plus 5 minutes after a
+report, and after a failure at most once per twice the failed run's time: a
+run that keeps failing holds its connection at most about half the time. A
+frontend nobody asks runs none. For a report on demand, run `self-check`.
+
+A stopping frontend abandons its run in flight and starts no other: the
+waiting requests answer 503 at once, the run's connection closes, and
+PostgreSQL ends the report within about a second
+(`client_connection_check_interval`, set for the run's connection where the
+server supports it, PostgreSQL 14 and later), so a stop never waits on a
+report.
 
 The report holds one snapshot for its whole run, about a minute at production
 size today. On a primary serving miners every share updates the cluster row, so
@@ -1529,7 +1565,9 @@ shows:
   captured. See [Sizing the ceiling](#sizing-the-ceiling).
 
 The line is read in one statement, so the float and the debt fields come from
-the same snapshot. Sats amounts are decimal strings. `positive_float_sats` is
+the same snapshot. The routes read it in the report's run and read-only
+transaction, just before the report, and serve it with that report, as old
+as its `computed_at`. Sats amounts are decimal strings. `positive_float_sats` is
 added by the frontend, not by migration 020, so a line served by a frontend
 without #506 does not have it. A missing field means that frontend cannot
 report the float; it does not mean the float is zero.
@@ -3998,6 +4036,10 @@ the settlement, ordering, and instance locks it refuses unless:
 - normal block reconciliation leaves no unresolved disconnection and the
   carry-forward integrity report passes.
 
+It asks the node for the active chain's block at each height it checks only
+once (#690), however many pool blocks and deep confirmed fanouts share that
+height, one call at a time while it holds those locks.
+
 Every check is made against the tip the command captures from the node when it
 starts. The chain may grow during the run, which takes about a minute at
 production size: blocks on top of the captured tip leave every block at or
@@ -4005,7 +4047,8 @@ below its height as it was, so every observation stands, and the command goes
 on and records the new tip (#737). It accepts a moved tip only when the node's
 new best block leads back, header by header, to the captured tip at the
 captured height. When the tip has already moved by the time the block and
-fanout checks end, the command first repeats each of their node queries, since
+fanout checks end, the command first repeats their node queries, once per
+height again, since
 a chain that went over to a fork during them and came back onto a longer chain
 would leave answers read on the fork. It refuses, clearing nothing:
 
