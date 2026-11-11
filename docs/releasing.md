@@ -114,7 +114,12 @@ release version.
 
 A synchronization PR lands as it is, and the version lines accept only
 commits with a verified signature. Sign the merge commit you make for it
-(`git merge -S`), and never squash it.
+(`git merge -S`), and never squash it. Name its branch `sync-…`, in this
+repository, with nothing before `sync-` and no `/` (`sync-main-into-3.x.x`,
+not `yourname/3.x.x-sync-main` or `sync-3.1.1/main`): the required
+`signed-landing` check lets a branch with such a name merge as it is, and
+expects every other pull request to be one signed commit. The same goes for any pull request that merges one version
+line into another.
 
 After promotion, open a synchronization PR from a branch that merges the
 released `main` commit into the latest development branch (`3.x.x` after a 3.x
