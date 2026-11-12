@@ -57,13 +57,15 @@ Compact issued-job hot writes use a per-Coordinator collector: at most 192
 admitted children (pending plus active), 64 children per transaction, and at
 most two batches in flight, each holding its ledger connection and its flight
 through its cancellation cleanup (#860). Batches start in waves: a second
-batch may start while the first is in flight, but once a batch of the wave
-finishes, the next waits until all have. PostgreSQL grants a new `FOR KEY
-SHARE` past a queued `FOR UPDATE`, so without that gap overlapping batches
-could hold the cluster row through a whole fan-out while an authority writer
-or blob GC waits there holding `ORDER_LOCK`. A new batch is collected only
-when a flight is free; collection then dwells for up to 1 ms from the oldest
-admission, flushing earlier when full or a deadline requires it. Time behind
+batch may join the first while it is in flight, but once a batch of the wave
+finishes, the next batch waits until all have. PostgreSQL grants a new `FOR
+KEY SHARE` past a queued `FOR UPDATE`, so without that gap one frontend's
+overlapping batches could hold the cluster row through a whole fan-out while
+an authority writer or blob GC waits there holding `ORDER_LOCK`. The bound of
+one wave is per frontend: batches of other frontends on the same ledger, and
+single-child repairs, overlapped one frontend's batches before #860 too.
+Collection dwells for up to 1 ms from the oldest admission, flushing earlier
+when full or a deadline requires it. Time behind
 other batches and admission backpressure remain inside the original
 persistence deadline. A batch's result goes only to its own children, and each
 caller revalidates its publication after its own batch, so batches may
