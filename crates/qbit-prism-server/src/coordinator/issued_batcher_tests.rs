@@ -69,7 +69,7 @@ async fn hold_flights(
 
 async fn settled(batcher: &IssuedBatcher) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while batcher.slots.available_permits() != ADMITTED {
+        while batcher.slots.available_permits() != batcher.admitted {
             tokio::task::yield_now().await;
         }
     })
@@ -109,7 +109,7 @@ async fn real_coordinator_fan_in_and_singleton_keep_durable_children() {
             assert!(rows[&prepared.storage_key].expires_at_ms >= child.expires_at_ms);
         }
     }
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     assert_eq!(
         enqueue(batcher.clone(), prepared, "singleton", 300_000)
             .await
@@ -124,10 +124,10 @@ async fn real_coordinator_fan_in_and_singleton_keep_durable_children() {
 #[tokio::test]
 async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let mut held = hold_flights(&f, &batcher, &prepared).await;
     let mut requests = Vec::new();
-    for i in 0..ADMITTED - IN_FLIGHT {
+    for i in 0..batcher.admitted - IN_FLIGHT {
         requests.push(enqueue(
             batcher.clone(),
             prepared.clone(),
@@ -183,7 +183,7 @@ async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
 #[tokio::test]
 async fn active_member_cancellation_preserves_live_peers_and_exact_expiry() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let gate = Arc::new(Gate::default());
     *f.store.save_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::pause();
@@ -225,7 +225,7 @@ async fn active_member_cancellation_preserves_live_peers_and_exact_expiry() {
 #[tokio::test]
 async fn all_active_members_canceled_before_commit_leave_no_rows_or_retry() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let gate = Arc::new(Gate::default());
     *f.store.save_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::pause();
@@ -259,7 +259,7 @@ async fn all_active_members_canceled_before_commit_leave_no_rows_or_retry() {
 #[tokio::test]
 async fn canceled_member_original_deadline_still_bounds_live_peers() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let gate = Arc::new(Gate::default());
     *f.store.save_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::pause();
@@ -303,7 +303,7 @@ async fn canceled_member_original_deadline_still_bounds_live_peers() {
 #[tokio::test]
 async fn canceled_member_during_commit_does_not_hide_live_peers_acknowledgement() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let gate = Arc::new(Gate::default());
     *f.store.compact.batch_commit_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::pause();
@@ -330,7 +330,7 @@ async fn canceled_member_during_commit_does_not_hide_live_peers_acknowledgement(
 #[tokio::test]
 async fn all_members_canceled_during_commit_leave_exact_identity_for_reconciliation() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let gate = Arc::new(Gate::default());
     *f.store.compact.batch_commit_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::pause();
@@ -384,7 +384,7 @@ async fn all_members_canceled_during_commit_leave_exact_identity_for_reconciliat
 #[tokio::test]
 async fn lost_commit_acknowledgement_is_uncertain_and_exact_retry_is_idempotent() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let gate = Arc::new(Gate::default());
     *f.store.compact.batch_commit_gate.lock().unwrap() = Some(gate.clone());
     tokio::time::pause();
@@ -403,7 +403,7 @@ async fn lost_commit_acknowledgement_is_uncertain_and_exact_retry_is_idempotent(
     settled(&batcher).await;
     let count = f.store.jobs.lock().unwrap().len();
     assert!(f.store.jobs.lock().unwrap().contains_key("committed-peer"));
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     assert_eq!(
         enqueue(batcher.clone(), prepared, "committed", 300_000)
             .await
@@ -422,7 +422,7 @@ async fn lost_commit_acknowledgement_is_uncertain_and_exact_retry_is_idempotent(
 #[tokio::test]
 async fn shutdown_closes_active_and_queued_waiters_without_a_self_owned_worker() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let held = hold_flights(&f, &batcher, &prepared).await;
     let pending = enqueue(batcher.clone(), prepared, "pending", 300_000);
     tokio::task::yield_now().await;
@@ -450,7 +450,7 @@ async fn shutdown_closes_active_and_queued_waiters_without_a_self_owned_worker()
 async fn original_deadline_includes_queue_and_revocation_after_commit_suppresses_delivery() {
     use crate::stratum::MiningBackend;
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     let held = hold_flights(&f, &batcher, &prepared).await;
     let expired = batcher
         .save(
@@ -498,7 +498,7 @@ async fn original_deadline_includes_queue_and_revocation_after_commit_suppresses
 #[tokio::test]
 async fn full_immutable_identity_and_current_revision_partition_groups() {
     let (f, prepared) = fixture().await;
-    let batcher = IssuedBatcher::new(f.store.clone());
+    let batcher = IssuedBatcher::new(f.store.clone(), IN_FLIGHT);
     tokio::time::pause();
     let base = prepared.reservation.dependency(&prepared.storage_key);
     let mut dependencies = vec![base; 8];
@@ -546,7 +546,7 @@ async fn full_immutable_identity_and_current_revision_partition_groups() {
 #[tokio::test]
 async fn failed_group_does_not_poison_later_compatible_children() {
     let (f, prepared) = fixture().await;
-    let batcher = IssuedBatcher::new(f.store.clone());
+    let batcher = IssuedBatcher::new(f.store.clone(), IN_FLIGHT);
     tokio::time::pause();
     let inputs: Vec<_> = (0..4)
         .map(|i| {
@@ -688,7 +688,7 @@ async fn overlapping_batch_for_a_superseded_group_cannot_deliver_old_work() {
 #[tokio::test]
 async fn failed_batch_answers_only_its_own_entries_beside_a_committing_one() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     tokio::time::pause();
     let gate = Arc::new(Gate::default());
     *f.store.save_gate.lock().unwrap() = Some(gate.clone());
@@ -744,7 +744,7 @@ async fn failed_batch_answers_only_its_own_entries_beside_a_committing_one() {
 #[tokio::test]
 async fn entry_deadline_passing_while_every_flight_is_held_is_answered_and_never_saved() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     tokio::time::pause();
     let held = hold_flights(&f, &batcher, &prepared).await;
     let started = Instant::now();
@@ -791,7 +791,7 @@ async fn entry_deadline_passing_while_every_flight_is_held_is_answered_and_never
 #[tokio::test]
 async fn a_finished_batch_closes_its_wave_until_the_others_finish() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     tokio::time::pause();
     let mut held = hold_flights(&f, &batcher, &prepared).await;
     let (first, gate) = held.remove(0);
@@ -823,7 +823,7 @@ async fn a_finished_batch_closes_its_wave_until_the_others_finish() {
 #[tokio::test]
 async fn a_burst_after_a_lone_batch_starts_a_fresh_wave() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
     tokio::time::pause();
     assert_eq!(
         enqueue(batcher.clone(), prepared.clone(), "lone", 300_000)
@@ -856,4 +856,77 @@ async fn a_burst_after_a_lone_batch_starts_a_fresh_wave() {
         f.store.compact.batch_calls.lock().unwrap().as_slice(),
         &[1, 1, 1]
     );
+}
+
+/// #860: where the pool cannot spare a second batch connection, the
+/// Coordinator passes one flight and batches run one at a time, as before.
+#[tokio::test]
+async fn one_flight_runs_batches_one_at_a_time() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), 1));
+    assert_eq!(batcher.admitted, 2 * BATCH);
+    tokio::time::pause();
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    let first = enqueue(batcher.clone(), prepared.clone(), "single-0", 300_000);
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    let second = enqueue(batcher.clone(), prepared, "single-1", 300_000);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[1]);
+    assert!(!second.is_finished());
+    gate.release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    assert_eq!(second.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    settled(&batcher).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1, 1]
+    );
+}
+
+/// #860: the connections a pool leaves over beside window reads and batch
+/// flights, for a share append and the candidate-lease heartbeat. A second
+/// flight never takes that below two; where one flight already leaves fewer,
+/// the batcher keeps one, so those pools are as before.
+#[test]
+fn issued_batch_flights_leave_two_connections_beside_window_reads() {
+    use crate::coordinator::{issued_batch_flights, window_read_permits};
+    // (connections, build_workers, window reads, flights, left over)
+    let expected = [
+        (4, 1, 1, 1, 2),
+        (5, 1, 1, 2, 2),
+        (6, 1, 1, 2, 3),
+        (7, 1, 1, 2, 4),
+        (8, 1, 1, 2, 5),
+        (4, 2, 2, 1, 1),
+        (5, 2, 2, 1, 2),
+        (6, 2, 2, 2, 2),
+        (7, 2, 2, 2, 3),
+        (8, 2, 2, 2, 4),
+        (4, 4, 2, 1, 1),
+        (5, 4, 3, 1, 1),
+        (6, 4, 4, 1, 1),
+        (7, 4, 4, 1, 2),
+        (8, 4, 4, 2, 2),
+    ];
+    for (connections, workers, reads, flights, left) in expected {
+        let actual_reads = window_read_permits(connections, workers);
+        let actual_flights = issued_batch_flights(connections, workers);
+        assert_eq!(
+            (
+                actual_reads,
+                actual_flights,
+                connections as usize - actual_reads - actual_flights
+            ),
+            (reads, flights, left),
+            "{connections} connections, {workers} build workers"
+        );
+        if actual_flights > 1 {
+            assert!(left >= 2);
+        }
+    }
+    // The default pool of 16 gets two flights at any build-worker count.
+    assert!((1..=12).all(|workers| issued_batch_flights(16, workers) == 2));
 }
