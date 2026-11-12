@@ -553,6 +553,25 @@ impl Metrics {
             elapsed,
         );
     }
+    /// #829: one stage of a share's path to its append, recorded once the
+    /// stage has ended and never while the append holds ORDER_LOCK. `outcome`
+    /// is one of [`AppendStage::outcomes`], whose keys are reserved at start.
+    pub fn observe_append_stage(
+        &self,
+        stage: AppendStage,
+        outcome: AppendStageOutcome,
+        elapsed: Duration,
+    ) {
+        debug_assert!(
+            stage.outcomes().contains(&outcome),
+            "{stage:?} records no {outcome:?}"
+        );
+        self.observe(
+            Family::ShareAppendStage,
+            Labels::Two(("stage", stage.as_str()), ("outcome", outcome.as_str())),
+            elapsed,
+        );
+    }
     /// Exactly once per post-landing `malloc_trim` (#600): its duration, the
     /// resident bytes it returned, and the resident set it left.
     pub fn observe_landing_trim(&self, trim: &crate::memory::Trim) {

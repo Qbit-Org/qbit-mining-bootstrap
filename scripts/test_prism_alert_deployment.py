@@ -101,7 +101,7 @@ def main():
         assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
-            assert len(before) == 78 and len(after) == 79
+            assert len(before) == 78 and len(after) == 80
             assert len(deletions) == 26
             assert after["qbit-prism-candidate-oldest-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
@@ -185,6 +185,14 @@ def main():
                 assert uid not in paging and after[uid]["labels"].get("page") is None, uid
                 assert after[uid]["labels"]["severity"] == severity and after[uid]["for"] == dwell, uid
                 assert after[uid]["noDataState"] == after[uid]["execErrState"] == "OK", uid
+            # #844: the append-slot queue warns after twice its window, never
+            # pages, and is quiet where the stage histogram is absent.
+            admission = after["qbit-prism-share-append-admission-wait"]
+            assert "qbit-prism-share-append-admission-wait" not in paging
+            assert admission["labels"]["severity"] == "warning" and admission["labels"].get("page") is None
+            assert admission["for"] == "10m"
+            assert admission["noDataState"] == admission["execErrState"] == "OK"
+            assert 'stage=\\"admission\\"' in json.dumps(admission), json.dumps(admission)
         if index == 1:
             assert len(new["groups"]) == 1 and len(after) == 2
         for rule in load("docs/prism-postgres-alert-rules.json")["rules"]:
@@ -201,7 +209,7 @@ def main():
     assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 79 proposed rules; 34 external definitions preserved; "
+          "78 original / 80 proposed rules; 34 external definitions preserved; "
           "26 baseline deletions plus every native UID disabled by its gate")
 
 

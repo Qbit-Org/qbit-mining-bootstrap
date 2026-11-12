@@ -2,8 +2,8 @@
 //! rendering, and test/thread setup. Run with `cargo test --release --locked
 //! -p qbit-prism-server --test metrics_allocation` as well as the debug suite.
 use qbit_prism_server::metrics::{
-    AckResult, ConnectionRefusalReason, LockKind, Metrics, NodeObservation, OrderLockHolder,
-    Outcome, RejectReason, StaleJobCause,
+    AckResult, AppendStage, ConnectionRefusalReason, LockKind, Metrics, NodeObservation,
+    OrderLockHolder, Outcome, RejectReason, StaleJobCause,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -77,13 +77,19 @@ fn observe_all(metrics: &Metrics, elapsed: Duration) {
 }
 
 /// #602's hooks: the Stratum ACK path, which outside a landing window adds
-/// one atomic load to the ACK, and every ORDER_LOCK holder's hold.
+/// one atomic load to the ACK, and every ORDER_LOCK holder's hold; and
+/// #829's share append stages, each outcome a stage records.
 fn observe_602(metrics: &Metrics, elapsed: Duration) {
     for result in AckResult::ALL {
         metrics.observe_share_ack_received(*result, tokio::time::Instant::now());
     }
     for holder in OrderLockHolder::ALL {
         metrics.observe_order_lock_hold(*holder, elapsed);
+    }
+    for stage in AppendStage::ALL {
+        for outcome in stage.outcomes() {
+            metrics.observe_append_stage(*stage, *outcome, elapsed);
+        }
     }
 }
 

@@ -4044,5 +4044,497 @@
         }
       ]
     }
+  },
+  {
+    "name": "append-slot queue: a queue that persists for ten minutes warns",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+25x900"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 1
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "append-slot queue: a queue that persists is still pending before ten minutes",
+    "eval_time": "14m50s",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+25x900"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 1
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: one landing's ten-second queue lifts the p99 but stays pending",
+    "eval_time": "10m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+0x9 7500+27x0 7527+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+0x9 7500+40x0 7540+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+0x9 7500+77x0 7577+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+0x9 7500+140x0 7640+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+0x9 7500+250x0 7750+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+0x9 7500+250x0 7750+25x889",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+0x9 7500+250x0 7750+25x889"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 1
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: one landing's queue leaves the window without warning",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+0x9 7500+15x0 7515+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+0x9 7500+27x0 7527+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+0x9 7500+40x0 7540+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+0x9 7500+77x0 7577+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+0x9 7500+140x0 7640+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+0x9 7500+250x0 7750+25x889",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+0x9 7500+250x0 7750+25x889",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+0x9 7500+250x0 7750+25x889"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 0
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: landings every minute with two-second settlement holds stay quiet",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x56 1425+0x1 1425+15x0 1440+25x56 2865+0x1 2865+15x0 2880+25x56 4305+0x1 4305+15x0 4320+25x56 5745+0x1 5745+15x0 5760+25x56 7185+0x1 7185+15x0 7200+25x56 8625+0x1 8625+15x0 8640+25x56 10065+0x1 10065+15x0 10080+25x56 11505+0x1 11505+15x0 11520+25x56 12945+0x1 12945+15x0 12960+25x56 14385+0x1 14385+15x0 14400+25x56 15825+0x1 15825+15x0 15840+25x56 17265+0x1 17265+15x0 17280+25x56 18705+0x1 18705+15x0 18720+25x56 20145+0x1 20145+15x0 20160+25x56 21585+0x1 21585+15x0 21600+25x56 23025+0x1 23025+15x0 23040+25x56 24465+0x1 24465+15x0 24480+25x56 25905+0x1 25905+15x0 25920+25x56 27345+0x1 27345+15x0 27360+25x56 28785+0x1 28785+15x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x56 1425+0x1 1425+28x0 1453+25x56 2878+0x1 2878+28x0 2906+25x56 4331+0x1 4331+28x0 4359+25x56 5784+0x1 5784+28x0 5812+25x56 7237+0x1 7237+28x0 7265+25x56 8690+0x1 8690+28x0 8718+25x56 10143+0x1 10143+28x0 10171+25x56 11596+0x1 11596+28x0 11624+25x56 13049+0x1 13049+28x0 13077+25x56 14502+0x1 14502+28x0 14530+25x56 15955+0x1 15955+28x0 15983+25x56 17408+0x1 17408+28x0 17436+25x56 18861+0x1 18861+28x0 18889+25x56 20314+0x1 20314+28x0 20342+25x56 21767+0x1 21767+28x0 21795+25x56 23220+0x1 23220+28x0 23248+25x56 24673+0x1 24673+28x0 24701+25x56 26126+0x1 26126+28x0 26154+25x56 27579+0x1 27579+28x0 27607+25x56 29032+0x1 29032+28x0 29060+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x56 1425+0x1 1425+40x0 1465+25x56 2890+0x1 2890+40x0 2930+25x56 4355+0x1 4355+40x0 4395+25x56 5820+0x1 5820+40x0 5860+25x56 7285+0x1 7285+40x0 7325+25x56 8750+0x1 8750+40x0 8790+25x56 10215+0x1 10215+40x0 10255+25x56 11680+0x1 11680+40x0 11720+25x56 13145+0x1 13145+40x0 13185+25x56 14610+0x1 14610+40x0 14650+25x56 16075+0x1 16075+40x0 16115+25x56 17540+0x1 17540+40x0 17580+25x56 19005+0x1 19005+40x0 19045+25x56 20470+0x1 20470+40x0 20510+25x56 21935+0x1 21935+40x0 21975+25x56 23400+0x1 23400+40x0 23440+25x56 24865+0x1 24865+40x0 24905+25x56 26330+0x1 26330+40x0 26370+25x56 27795+0x1 27795+40x0 27835+25x56 29260+0x1 29260+40x0 29300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x56 1425+0x1 1425+50x0 1475+25x56 2900+0x1 2900+50x0 2950+25x56 4375+0x1 4375+50x0 4425+25x56 5850+0x1 5850+50x0 5900+25x56 7325+0x1 7325+50x0 7375+25x56 8800+0x1 8800+50x0 8850+25x56 10275+0x1 10275+50x0 10325+25x56 11750+0x1 11750+50x0 11800+25x56 13225+0x1 13225+50x0 13275+25x56 14700+0x1 14700+50x0 14750+25x56 16175+0x1 16175+50x0 16225+25x56 17650+0x1 17650+50x0 17700+25x56 19125+0x1 19125+50x0 19175+25x56 20600+0x1 20600+50x0 20650+25x56 22075+0x1 22075+50x0 22125+25x56 23550+0x1 23550+50x0 23600+25x56 25025+0x1 25025+50x0 25075+25x56 26500+0x1 26500+50x0 26550+25x56 27975+0x1 27975+50x0 28025+25x56 29450+0x1 29450+50x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x56 1425+0x1 1425+50x0 1475+25x56 2900+0x1 2900+50x0 2950+25x56 4375+0x1 4375+50x0 4425+25x56 5850+0x1 5850+50x0 5900+25x56 7325+0x1 7325+50x0 7375+25x56 8800+0x1 8800+50x0 8850+25x56 10275+0x1 10275+50x0 10325+25x56 11750+0x1 11750+50x0 11800+25x56 13225+0x1 13225+50x0 13275+25x56 14700+0x1 14700+50x0 14750+25x56 16175+0x1 16175+50x0 16225+25x56 17650+0x1 17650+50x0 17700+25x56 19125+0x1 19125+50x0 19175+25x56 20600+0x1 20600+50x0 20650+25x56 22075+0x1 22075+50x0 22125+25x56 23550+0x1 23550+50x0 23600+25x56 25025+0x1 25025+50x0 25075+25x56 26500+0x1 26500+50x0 26550+25x56 27975+0x1 27975+50x0 28025+25x56 29450+0x1 29450+50x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x56 1425+0x1 1425+50x0 1475+25x56 2900+0x1 2900+50x0 2950+25x56 4375+0x1 4375+50x0 4425+25x56 5850+0x1 5850+50x0 5900+25x56 7325+0x1 7325+50x0 7375+25x56 8800+0x1 8800+50x0 8850+25x56 10275+0x1 10275+50x0 10325+25x56 11750+0x1 11750+50x0 11800+25x56 13225+0x1 13225+50x0 13275+25x56 14700+0x1 14700+50x0 14750+25x56 16175+0x1 16175+50x0 16225+25x56 17650+0x1 17650+50x0 17700+25x56 19125+0x1 19125+50x0 19175+25x56 20600+0x1 20600+50x0 20650+25x56 22075+0x1 22075+50x0 22125+25x56 23550+0x1 23550+50x0 23600+25x56 25025+0x1 25025+50x0 25075+25x56 26500+0x1 26500+50x0 26550+25x56 27975+0x1 27975+50x0 28025+25x56 29450+0x1 29450+50x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x56 1425+0x1 1425+50x0 1475+25x56 2900+0x1 2900+50x0 2950+25x56 4375+0x1 4375+50x0 4425+25x56 5850+0x1 5850+50x0 5900+25x56 7325+0x1 7325+50x0 7375+25x56 8800+0x1 8800+50x0 8850+25x56 10275+0x1 10275+50x0 10325+25x56 11750+0x1 11750+50x0 11800+25x56 13225+0x1 13225+50x0 13275+25x56 14700+0x1 14700+50x0 14750+25x56 16175+0x1 16175+50x0 16225+25x56 17650+0x1 17650+50x0 17700+25x56 19125+0x1 19125+50x0 19175+25x56 20600+0x1 20600+50x0 20650+25x56 22075+0x1 22075+50x0 22125+25x56 23550+0x1 23550+50x0 23600+25x56 25025+0x1 25025+50x0 25075+25x56 26500+0x1 26500+50x0 26550+25x56 27975+0x1 27975+50x0 28025+25x56 29450+0x1 29450+50x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x56 1425+0x1 1425+50x0 1475+25x56 2900+0x1 2900+50x0 2950+25x56 4375+0x1 4375+50x0 4425+25x56 5850+0x1 5850+50x0 5900+25x56 7325+0x1 7325+50x0 7375+25x56 8800+0x1 8800+50x0 8850+25x56 10275+0x1 10275+50x0 10325+25x56 11750+0x1 11750+50x0 11800+25x56 13225+0x1 13225+50x0 13275+25x56 14700+0x1 14700+50x0 14750+25x56 16175+0x1 16175+50x0 16225+25x56 17650+0x1 17650+50x0 17700+25x56 19125+0x1 19125+50x0 19175+25x56 20600+0x1 20600+50x0 20650+25x56 22075+0x1 22075+50x0 22125+25x56 23550+0x1 23550+50x0 23600+25x56 25025+0x1 25025+50x0 25075+25x56 26500+0x1 26500+50x0 26550+25x56 27975+0x1 27975+50x0 28025+25x56 29450+0x1 29450+50x0 29500+25x0"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 0
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: landings every minute with three-second settlement holds warn",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x55 1400+0x2 1400+15x0 1415+25x55 2815+0x2 2815+15x0 2830+25x55 4230+0x2 4230+15x0 4245+25x55 5645+0x2 5645+15x0 5660+25x55 7060+0x2 7060+15x0 7075+25x55 8475+0x2 8475+15x0 8490+25x55 9890+0x2 9890+15x0 9905+25x55 11305+0x2 11305+15x0 11320+25x55 12720+0x2 12720+15x0 12735+25x55 14135+0x2 14135+15x0 14150+25x55 15550+0x2 15550+15x0 15565+25x55 16965+0x2 16965+15x0 16980+25x55 18380+0x2 18380+15x0 18395+25x55 19795+0x2 19795+15x0 19810+25x55 21210+0x2 21210+15x0 21225+25x55 22625+0x2 22625+15x0 22640+25x55 24040+0x2 24040+15x0 24055+25x55 25455+0x2 25455+15x0 25470+25x55 26870+0x2 26870+15x0 26885+25x55 28285+0x2 28285+15x0 28300+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x55 1400+0x2 1400+28x0 1428+25x55 2828+0x2 2828+28x0 2856+25x55 4256+0x2 4256+28x0 4284+25x55 5684+0x2 5684+28x0 5712+25x55 7112+0x2 7112+28x0 7140+25x55 8540+0x2 8540+28x0 8568+25x55 9968+0x2 9968+28x0 9996+25x55 11396+0x2 11396+28x0 11424+25x55 12824+0x2 12824+28x0 12852+25x55 14252+0x2 14252+28x0 14280+25x55 15680+0x2 15680+28x0 15708+25x55 17108+0x2 17108+28x0 17136+25x55 18536+0x2 18536+28x0 18564+25x55 19964+0x2 19964+28x0 19992+25x55 21392+0x2 21392+28x0 21420+25x55 22820+0x2 22820+28x0 22848+25x55 24248+0x2 24248+28x0 24276+25x55 25676+0x2 25676+28x0 25704+25x55 27104+0x2 27104+28x0 27132+25x55 28532+0x2 28532+28x0 28560+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x55 1400+0x2 1400+40x0 1440+25x55 2840+0x2 2840+40x0 2880+25x55 4280+0x2 4280+40x0 4320+25x55 5720+0x2 5720+40x0 5760+25x55 7160+0x2 7160+40x0 7200+25x55 8600+0x2 8600+40x0 8640+25x55 10040+0x2 10040+40x0 10080+25x55 11480+0x2 11480+40x0 11520+25x55 12920+0x2 12920+40x0 12960+25x55 14360+0x2 14360+40x0 14400+25x55 15800+0x2 15800+40x0 15840+25x55 17240+0x2 17240+40x0 17280+25x55 18680+0x2 18680+40x0 18720+25x55 20120+0x2 20120+40x0 20160+25x55 21560+0x2 21560+40x0 21600+25x55 23000+0x2 23000+40x0 23040+25x55 24440+0x2 24440+40x0 24480+25x55 25880+0x2 25880+40x0 25920+25x55 27320+0x2 27320+40x0 27360+25x55 28760+0x2 28760+40x0 28800+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x55 1400+0x2 1400+75x0 1475+25x55 2875+0x2 2875+75x0 2950+25x55 4350+0x2 4350+75x0 4425+25x55 5825+0x2 5825+75x0 5900+25x55 7300+0x2 7300+75x0 7375+25x55 8775+0x2 8775+75x0 8850+25x55 10250+0x2 10250+75x0 10325+25x55 11725+0x2 11725+75x0 11800+25x55 13200+0x2 13200+75x0 13275+25x55 14675+0x2 14675+75x0 14750+25x55 16150+0x2 16150+75x0 16225+25x55 17625+0x2 17625+75x0 17700+25x55 19100+0x2 19100+75x0 19175+25x55 20575+0x2 20575+75x0 20650+25x55 22050+0x2 22050+75x0 22125+25x55 23525+0x2 23525+75x0 23600+25x55 25000+0x2 25000+75x0 25075+25x55 26475+0x2 26475+75x0 26550+25x55 27950+0x2 27950+75x0 28025+25x55 29425+0x2 29425+75x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x55 1400+0x2 1400+75x0 1475+25x55 2875+0x2 2875+75x0 2950+25x55 4350+0x2 4350+75x0 4425+25x55 5825+0x2 5825+75x0 5900+25x55 7300+0x2 7300+75x0 7375+25x55 8775+0x2 8775+75x0 8850+25x55 10250+0x2 10250+75x0 10325+25x55 11725+0x2 11725+75x0 11800+25x55 13200+0x2 13200+75x0 13275+25x55 14675+0x2 14675+75x0 14750+25x55 16150+0x2 16150+75x0 16225+25x55 17625+0x2 17625+75x0 17700+25x55 19100+0x2 19100+75x0 19175+25x55 20575+0x2 20575+75x0 20650+25x55 22050+0x2 22050+75x0 22125+25x55 23525+0x2 23525+75x0 23600+25x55 25000+0x2 25000+75x0 25075+25x55 26475+0x2 26475+75x0 26550+25x55 27950+0x2 27950+75x0 28025+25x55 29425+0x2 29425+75x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x55 1400+0x2 1400+75x0 1475+25x55 2875+0x2 2875+75x0 2950+25x55 4350+0x2 4350+75x0 4425+25x55 5825+0x2 5825+75x0 5900+25x55 7300+0x2 7300+75x0 7375+25x55 8775+0x2 8775+75x0 8850+25x55 10250+0x2 10250+75x0 10325+25x55 11725+0x2 11725+75x0 11800+25x55 13200+0x2 13200+75x0 13275+25x55 14675+0x2 14675+75x0 14750+25x55 16150+0x2 16150+75x0 16225+25x55 17625+0x2 17625+75x0 17700+25x55 19100+0x2 19100+75x0 19175+25x55 20575+0x2 20575+75x0 20650+25x55 22050+0x2 22050+75x0 22125+25x55 23525+0x2 23525+75x0 23600+25x55 25000+0x2 25000+75x0 25075+25x55 26475+0x2 26475+75x0 26550+25x55 27950+0x2 27950+75x0 28025+25x55 29425+0x2 29425+75x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x55 1400+0x2 1400+75x0 1475+25x55 2875+0x2 2875+75x0 2950+25x55 4350+0x2 4350+75x0 4425+25x55 5825+0x2 5825+75x0 5900+25x55 7300+0x2 7300+75x0 7375+25x55 8775+0x2 8775+75x0 8850+25x55 10250+0x2 10250+75x0 10325+25x55 11725+0x2 11725+75x0 11800+25x55 13200+0x2 13200+75x0 13275+25x55 14675+0x2 14675+75x0 14750+25x55 16150+0x2 16150+75x0 16225+25x55 17625+0x2 17625+75x0 17700+25x55 19100+0x2 19100+75x0 19175+25x55 20575+0x2 20575+75x0 20650+25x55 22050+0x2 22050+75x0 22125+25x55 23525+0x2 23525+75x0 23600+25x55 25000+0x2 25000+75x0 25075+25x55 26475+0x2 26475+75x0 26550+25x55 27950+0x2 27950+75x0 28025+25x55 29425+0x2 29425+75x0 29500+25x0",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x55 1400+0x2 1400+75x0 1475+25x55 2875+0x2 2875+75x0 2950+25x55 4350+0x2 4350+75x0 4425+25x55 5825+0x2 5825+75x0 5900+25x55 7300+0x2 7300+75x0 7375+25x55 8775+0x2 8775+75x0 8850+25x55 10250+0x2 10250+75x0 10325+25x55 11725+0x2 11725+75x0 11800+25x55 13200+0x2 13200+75x0 13275+25x55 14675+0x2 14675+75x0 14750+25x55 16150+0x2 16150+75x0 16225+25x55 17625+0x2 17625+75x0 17700+25x55 19100+0x2 19100+75x0 19175+25x55 20575+0x2 20575+75x0 20650+25x55 22050+0x2 22050+75x0 22125+25x55 23525+0x2 23525+75x0 23600+25x55 25000+0x2 25000+75x0 25075+25x55 26475+0x2 26475+75x0 26550+25x55 27950+0x2 27950+75x0 28025+25x55 29425+0x2 29425+75x0 29500+25x0"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 1
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "append-slot queue: fast admissions stay quiet",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x1200"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 0
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: a hard stall's cancelled waits warn",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.001\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.0025\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.005\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.01\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.025\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.05\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.1\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.25\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"0.5\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"1\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"2.5\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"5\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"10\"}": "0+0x299 0+0x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\",le=\"+Inf\"}": "0+0x299 0+25x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"cancelled\"}": "0+0x299 0+25x900"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 1
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "append-slot queue: a trickle of queued shares is too few to judge",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+0.3x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+0.3x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+0.3x1200",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+0.3x1200"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": null
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: slow later stages alone do not warn",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.001\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.0025\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.005\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.01\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.025\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.05\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.1\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.25\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"0.5\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"1\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"2.5\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"10\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\",le=\"+Inf\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"locked_call\",outcome=\"replied\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.001\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.0025\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.005\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.01\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.025\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.05\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.1\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.25\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"0.5\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"1\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"2.5\"}": "0+0x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"10\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\",le=\"+Inf\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"commit\",outcome=\"committed\"}": "0+25x1200"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 0
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: a stale snapshot body suppresses a queue",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+25x900"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": null
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: an unpublished snapshot body suppresses a queue",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+25x900"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": null
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: a frontend without the stage histogram stays quiet",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": null
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": []
+    }
+  },
+  {
+    "name": "append-slot queue: each frontend is judged on its own queue",
+    "eval_time": "20m",
+    "series": {
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1201",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x1201",
+      "qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "0x1201",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x299 7500+23x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x299 7500+25x900",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.001\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.0025\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.005\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.01\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.025\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.05\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.1\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.25\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"0.5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"1\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"2.5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"5\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"10\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\",le=\"+Inf\"}": "0+25x1200",
+      "qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\",stage=\"admission\",outcome=\"admitted\"}": "0+25x1200"
+    },
+    "expect": {
+      "PrismShareAppendAdmissionWaitHigh": 1
+    },
+    "alerts": {
+      "PrismShareAppendAdmissionWaitHigh": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
   }
 ]

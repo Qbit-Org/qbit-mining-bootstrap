@@ -706,9 +706,10 @@ fn churn_section_checks(churn: &Value, label: &str, budgets: &Budgets, checks: &
 
 /// One line from a phase's `share_ack_accounting` and `database_counters`
 /// (#829): the accepted acknowledgements' summed seconds split at
-/// ORDER_LOCK, then the WAL syncs and checkpoints behind them. `None` for a
-/// report written before the accounting existed; an unknown part reads
-/// "unknown", never 0.
+/// ORDER_LOCK, and by the server's append stages in a report that has them,
+/// then the WAL syncs and checkpoints behind them. `None` for a report
+/// written before the accounting existed; an unknown part reads "unknown",
+/// never 0.
 pub fn ack_accounting(phase: &Value) -> Option<String> {
     let accounting = phase.get("share_ack_accounting")?;
     let total = accounting["accepted_acks"]["seconds"].as_f64();
@@ -732,16 +733,39 @@ pub fn ack_accounting(phase: &Value) -> Option<String> {
             .as_f64()
             .map_or("unknown".into(), |n| format!("{n:.0}"))
     };
+    // The server's own stages split the remainder before the lock, and the
+    // append's whole hold; a report from before them has neither.
+    let (before, stages) = if accounting.get("submit_checks").is_some() {
+        (
+            format!(
+                "{}, of it submit checks {}, the admission queue {} and the rest {}",
+                part("before_lock_and_response"),
+                part("submit_checks"),
+                part("admission"),
+                part("before_lock_unattributed"),
+            ),
+            format!(
+                " The append's hold, {}: the call's reported hold {}, COMMIT {} and the rest \
+                 {}.",
+                part("order_lock_hold_append"),
+                part("locked_call"),
+                part("commit"),
+                part("hold_unattributed"),
+            ),
+        )
+    } else {
+        (part("before_lock_and_response"), String::new())
+    };
     let wal = &phase["database_counters"]["wal"];
     let checkpoints = &phase["database_counters"]["checkpoints"];
     Some(format!(
-        "{} acks, {}: before ORDER_LOCK and the response {}; ORDER_LOCK wait {}; held in the \
-         call {}; after the call (COMMIT, its WAL flush, the runtime's turnaround) {}. WAL: {} \
-         syncs, mean {}, {} full-page images; checkpoints counted: {} timed (skipped ones \
-         included), {} requested",
+        "{} acks, {}: before ORDER_LOCK, the call's reply back and the response {before}; \
+         ORDER_LOCK wait {}; held in the call {}; after the call (COMMIT, its WAL flush and \
+         holds the call's statistics miss) {}.\
+         {stages} WAL: {} syncs, mean {}, {} full-page images; checkpoints counted: {} timed \
+         (skipped ones included), {} requested",
         count(&accounting["accepted_acks"]["count"]),
         total.map_or("unknown".into(), |t| format!("{t:.1} s")),
-        part("before_lock_and_response"),
         part("order_lock_wait"),
         part("in_call_after_grant"),
         part("after_call"),

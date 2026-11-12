@@ -1420,29 +1420,61 @@ zero. A counter that went backwards between two scrapes with no recorded
 restart is reported the same way rather than as a negative number.
 
 Each phase's `share_ack_accounting` (#829) says where the accepted
-acknowledgements' summed seconds went, split at ORDER_LOCK, from histograms
-the server already exports and `pg_stat_statements`:
+acknowledgements' summed seconds went, split at ORDER_LOCK, from the server's
+histograms and `pg_stat_statements`:
 
 - **Measured:**
   - `accepted_acks`: the sum above, frontend clock.
   - `order_lock_wait`: granted ORDER_LOCK waits, on PostgreSQL's clock for share
     appends; the rebuild paths' few are included.
-  - `order_lock_hold_append`: the append's hold from grant to the end of COMMIT,
-    frontend clock.
+  - `order_lock_hold_append`: the append's hold from the grant the call reports
+    to its COMMIT or ROLLBACK, frontend clock. An append abandoned by an error
+    ends its hold as it unwinds, before its queued ROLLBACK runs.
   - `append_call`: the one-call append's `pg_stat_statements` time, including its
     lock wait.
   - `pool_acquire`: every ledger checkout; context only.
 - **Derived**, each with its `formula`:
   - `in_call_after_grant` = call − wait;
-  - `after_call` = hold − in-call: COMMIT, its WAL flush and the frontend
-    runtime's turnaround;
+  - `after_call` = hold − in-call: COMMIT with its WAL flush and the runtime's
+    wake to its reply, plus the holds the call's `pg_stat_statements` row does
+    not time (block-bearing appends on the statement path, refused calls,
+    rolled-back gates);
   - `before_lock_and_response` = acks − wait − hold: the append-admission queue,
-    the submit checks, the pool checkouts, BEGIN and the response write, which
-    nothing measures separately.
+    the submit checks, the pool checkouts, BEGIN, the call's trip to its lock,
+    its reply's trip back and the runtime's wake to it, and the response write.
+    The hold starts at the grant the call reports, counted back from when the
+    frontend processes the reply. PostgreSQL still holds the lock while the
+    reply travels and the runtime wakes to it, but that time is here, not in
+    the hold.
+- **The server's own stages** (`qbit_prism_share_append_stage_seconds`, #829),
+  unknown against a server from before them:
+  - measured: `submit_checks` (the coordinator's checks, for every submission
+    that passed them, block-only work included),
+    `admission` (the wait for one of the frontend's `max_connections - 1`
+    append permits), `locked_call` (the call's own hold, on PostgreSQL's clock)
+    and `commit` (the COMMIT round trip), all but `locked_call` on the frontend
+    clock;
+  - derived: `hold_unattributed` = hold − `locked_call` − `commit`. For a
+    committed one-call append it is only microseconds: nothing awaits between
+    the reply and COMMIT, and the runtime's wake to COMMIT's reply is inside
+    `commit`. Anything more is appends without both a `locked_call` and a
+    committed `commit`: block-bearing ones (less any COMMIT), and refused,
+    rolled back or failed ones.
+  - derived: `before_lock_unattributed` =
+    `before_lock_and_response` − `submit_checks` − `admission`: the Stratum
+    handling, the append task's start, the block-only and candidate work after
+    the checks, the append's pool checkout and BEGIN, the call's trip to its
+    lock, its reply's trip back and the runtime's wake to it, and the response
+    write.
 
 A derived part is unknown when an input is, and also when its inputs disagree
 (a negative difference: the holds and waits include refused appends and the
-rebuild paths' waits, which `accepted_acks` does not). COMMIT is not read from
+rebuild paths' waits, and the submit checks and admissions include refused and
+block-only submissions, which `accepted_acks` does not). The windows differ
+slightly as well. The frontend serves its histograms (pool acquire excepted)
+from a metrics snapshot published every couple of seconds, while
+`pg_stat_statements` is read live, so the call's figures can cover up to a
+snapshot's age more of the phase's tail. COMMIT is not read from
 `pg_stat_statements` at all: PostgreSQL commits and flushes after the extension
 stops timing the statement.
 

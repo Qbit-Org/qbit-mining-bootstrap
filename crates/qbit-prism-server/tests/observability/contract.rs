@@ -339,6 +339,25 @@ pub fn expected(populated: bool) -> Census {
         if populated { &holders } else { &[] },
         HOLD_SECONDS,
     );
+    // #829: each stage records only its own outcomes.
+    let stages: Vec<_> = [
+        ("submit_checks", "passed"),
+        ("admission", "admitted"),
+        ("admission", "cancelled"),
+        ("admission", "closed"),
+        ("locked_call", "replied"),
+        ("commit", "committed"),
+        ("commit", "failed"),
+    ]
+    .into_iter()
+    .map(|(stage, outcome)| format!("stage=\"{stage}\",outcome=\"{outcome}\""))
+    .collect();
+    result.family(
+        "share_append_stage_seconds",
+        "histogram",
+        if populated { &stages } else { &[] },
+        HOLD_SECONDS,
+    );
     let refreshes: Vec<_> = [
         "initial",
         "tip",

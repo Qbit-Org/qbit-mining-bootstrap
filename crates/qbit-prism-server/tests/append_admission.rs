@@ -760,6 +760,26 @@ fn order_lock_counts(metrics: &Metrics) -> (f64, f64, f64) {
     )
 }
 
+/// #829: the share append stages these appends record, as `_count`s: the
+/// admitted admission waits, the calls' own holds, the COMMITs, and the
+/// admission waits cancelled or COMMITs failed, which none of them should be.
+fn stage_counts(metrics: &Metrics) -> (f64, f64, f64, f64) {
+    let count = |stage: &str, outcome: &str| {
+        sample(
+            metrics,
+            &format!(
+                "qbit_prism_share_append_stage_seconds_count{{stage=\"{stage}\",outcome=\"{outcome}\"}}"
+            ),
+        )
+    };
+    (
+        count("admission", "admitted"),
+        count("locked_call", "replied"),
+        count("commit", "committed"),
+        count("admission", "cancelled") + count("commit", "failed"),
+    )
+}
+
 /// The backend of the one append call waiting on a lock of `kind`.
 async fn waiting_call(pool: &PgPool, advisory: bool) -> Result<i32> {
     timeout(WAIT, async {
@@ -792,7 +812,10 @@ async fn waiting_call(pool: &PgPool, advisory: bool) -> Result<i32> {
 ///   a cluster-row writer, records neither, as it cannot know them.
 /// A cancelled call rolls back whole: nothing is written and the commit gate
 /// is never asked, so its answer stays a failure, never an unknown outcome,
-/// and the next append goes through.
+/// and the next append goes through. #829: every one of them was admitted;
+/// only the appends that committed record their call's own hold
+/// (`locked_call`) and their COMMIT, and the append's ORDER_LOCK hold covers
+/// both.
 #[tokio::test]
 async fn an_append_call_reports_its_lock_and_a_cancelled_one_rolls_back_whole() -> Result<()> {
     let Some(raw) = gate::database_url(gate::site!())? else {
@@ -833,6 +856,7 @@ async fn an_append_call_reports_its_lock_and_a_cancelled_one_rolls_back_whole() 
         };
         let revision = ledger.payout_revision().await?;
         let (success, failure, holds) = order_lock_counts(&metrics);
+        let (admitted, called, committed, abnormal) = stage_counts(&metrics);
         ensure!(timeout(WAIT, &mut gated(1, revision).0).await???.inserted);
         let refused = ledger
             .append_at_revision(share(2), None, revision + 1)
@@ -852,6 +876,31 @@ async fn an_append_call_reports_its_lock_and_a_cancelled_one_rolls_back_whole() 
             (success, failure, holds)
         );
         ensure!(asked.load(Ordering::SeqCst) == 1);
+        ensure!(
+            stage_counts(&metrics) == (admitted + 2., called + 1., committed + 1., abnormal),
+            "an append and a refusal recorded stages {:?} after {:?}",
+            stage_counts(&metrics),
+            (admitted, called, committed, abnormal)
+        );
+        let held = sample(
+            &metrics,
+            "qbit_prism_database_order_lock_hold_seconds_sum{holder=\"append\"}",
+        );
+        let parts = [("locked_call", "replied"), ("commit", "committed")]
+            .iter()
+            .map(|(stage, outcome)| {
+                sample(
+                    &metrics,
+                    &format!(
+                        "qbit_prism_share_append_stage_seconds_sum{{stage=\"{stage}\",outcome=\"{outcome}\"}}"
+                    ),
+                )
+            })
+            .sum::<f64>();
+        ensure!(
+            parts > 0. && held >= parts,
+            "the appends held ORDER_LOCK {held} s against their calls' holds and COMMITs {parts} s"
+        );
 
         // Cancelled while it waits for ORDER_LOCK.
         let mut holder = control.begin().await?;
@@ -910,12 +959,22 @@ async fn an_append_call_reports_its_lock_and_a_cancelled_one_rolls_back_whole() 
             asked.load(Ordering::SeqCst) == 1,
             "a cancelled append asked its gate"
         );
+        ensure!(
+            stage_counts(&metrics) == (admitted + 4., called + 1., committed + 1., abnormal),
+            "the cancelled calls recorded stages {:?}",
+            stage_counts(&metrics)
+        );
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT share_id FROM qbit_share_ledger ORDER BY share_id")
                 .fetch_all(&control)
                 .await?;
         ensure!(ids == vec![share(1).share_id], "{ids:?}");
         ensure!(timeout(WAIT, &mut gated(5, revision).0).await???.inserted);
+        ensure!(
+            stage_counts(&metrics) == (admitted + 5., called + 2., committed + 2., abnormal),
+            "the next append recorded stages {:?}",
+            stage_counts(&metrics)
+        );
         Ok(())
     }
     .await;

@@ -1,6 +1,6 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
 use super::{
-    CarryOwnerState, Labels, LockKind, OrderLockHolder, Outcome, PeerCheckResult,
+    AppendStage, CarryOwnerState, Labels, LockKind, OrderLockHolder, Outcome, PeerCheckResult,
     RefreshAcquisition, RefreshTrigger,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -121,6 +121,7 @@ families! {
     TipPollAge: Gauge, "tip_poll_age_seconds", "Monotonic age of this frontend's readiness proof, the node's tip as its last refresh or refresh-grade poll on the published tip found it, which job, share and block admission require within the health timeout; -1 while readiness is unavailable or before the coordinator publishes it.";
     JobPreparationDeferrals: Counter, "job_preparation_deferrals_total", "Job preparations this frontend deferred (each logged as job preparation deferred), by the first check that refused them.";
     OrderLockHold: Histogram, "database_order_lock_hold_seconds", "ORDER_LOCK hold from the grant of the lock to the end of the transaction holding it, by holder, in seconds (#602).";
+    ShareAppendStage: Histogram, "share_append_stage_seconds", "Stages of a share's path to its ledger append, each timed from its start to its end, by stage and how it ended, in seconds (#829).";
     ShareAckLandingWindow: Histogram, "share_ack_landing_window_seconds", "The share_ack_seconds observations whose submission arrived within 30 seconds after a pool block acceptance this frontend observed, by outcome (#602); steady state is share_ack_seconds minus this family.";
     SlowLandingWindows: Gauge, "share_ack_slow_landing_windows", "Consecutive most recent closed landing windows on this frontend whose share acknowledgement p99 exceeded the bound in seconds (#602); -1 before a landing window holding an acknowledgement has closed.";
     LandingTrimSeconds: Histogram, "landing_malloc_trim_seconds", "Duration of each malloc_trim(0) this frontend ran after a block landing released its rebuilt window (#600), in seconds; glibc builds only, none while PRISM_LANDING_MALLOC_TRIM_ENABLED=0.";
@@ -164,6 +165,7 @@ const REVISION_WORK_BUCKETS: &[f64] = &[
 ];
 // #602: an append holds ORDER_LOCK for milliseconds and #602's R2 budget for
 // every other holder is 250 ms, so the ladder starts at one millisecond.
+// #829's share append stages are parts of the append's path, on the same one.
 const ORDER_LOCK_HOLD_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10.,
 ];
@@ -184,7 +186,7 @@ impl Family {
             Self::CtvChunkRows => &[1.],
             // The same ladder as ShareAck, so steady state is a subtraction.
             Self::ShareAck | Self::ShareAckLandingWindow => SHARE_ACK_BUCKETS,
-            Self::OrderLockHold => ORDER_LOCK_HOLD_BUCKETS,
+            Self::OrderLockHold | Self::ShareAppendStage => ORDER_LOCK_HOLD_BUCKETS,
             Self::RevisionWork => REVISION_WORK_BUCKETS,
             _ => BUCKETS,
         }
@@ -322,6 +324,22 @@ impl Registry {
                         (family, Labels::One(("holder", holder.as_str()))),
                         Sample::Pending,
                     );
+                }
+            }
+            Family::ShareAppendStage => {
+                for stage in AppendStage::ALL {
+                    for outcome in stage.outcomes() {
+                        self.samples.insert(
+                            (
+                                family,
+                                Labels::Two(
+                                    ("stage", stage.as_str()),
+                                    ("outcome", outcome.as_str()),
+                                ),
+                            ),
+                            Sample::Pending,
+                        );
+                    }
                 }
             }
             Family::RefreshSeconds => {
