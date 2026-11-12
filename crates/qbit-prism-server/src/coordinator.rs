@@ -544,6 +544,21 @@ const CANDIDATE_LEASE: CandidateLease = CandidateLease {
     rebuild_deadline: Duration::from_secs(60),
 };
 
+/// `CANDIDATE_LEASE`'s lease, renewal interval and per-renewal bound, for
+/// a harness that models a live holder's renewals from outside the process
+/// (the dual-sim's candidate waits, #841). The server reads
+/// `CANDIDATE_LEASE` itself, never these. From them, and from how
+/// `Coordinator::with_tracked_heartbeat` retries a renewal lost to
+/// contention, the dual-sim models the longest a live holder leaves a
+/// claim's version unchanged (its `RENEWAL_BOUND`): a change to that retry
+/// needs the model revisited.
+#[doc(hidden)]
+pub const CANDIDATE_LEASE_SECONDS: i64 = CANDIDATE_LEASE.seconds;
+#[doc(hidden)]
+pub const CANDIDATE_RENEWAL_INTERVAL: Duration = CANDIDATE_LEASE.interval;
+#[doc(hidden)]
+pub const CANDIDATE_RENEWAL_TIMEOUT: Duration = CANDIDATE_LEASE.timeout;
+
 /// How many times one post-offer write phase writes again after a
 /// payout-revision race, and how long after its first lost race it may still
 /// start one (#630). See [`RevisionRetry`].

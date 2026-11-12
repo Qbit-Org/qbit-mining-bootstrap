@@ -136,6 +136,14 @@ async fn s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_fro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "dual-writer E2E: run explicitly by the nightly matrix"]
+async fn s10_single_writer_peer_takes_over_a_killed_frontends_claim_after_its_lease_and_lands_its_block_once(
+) -> Result<()> {
+    let gated = gated!();
+    run(Scenario::S10ClaimAtKill, gated).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "dual-writer E2E: run explicitly by the fast lane and the nightly matrix"]
 async fn s01_steady_state_copies_a_shares_and_blocks_to_b_within_the_sync_interval() -> Result<()> {
     let gated = gated!();

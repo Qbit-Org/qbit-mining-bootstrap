@@ -26,6 +26,7 @@
 
 use crate::{
     balancer::{BackendTarget, Balancer, BalancerConfig},
+    candidate_wait::{self, CandidateWait, ClaimEnd, Holder, WaitEvent},
     chain::{self, Chain},
     frontend::{DualSettings, Frontend, FrontendSpec, Node, Settlement},
     load::{Load, LoadPlan, RunClock},
@@ -253,6 +254,9 @@ pub struct Sim {
     /// Each frontend's gate to its `qbitd`, with `rpc_gates`.
     pub gates: BTreeMap<Node, RpcGate>,
     timeline: Mutex<Vec<TimelineEvent>>,
+    /// Every claim no one renewed that a candidate wait waited out, once it
+    /// ended (#841).
+    claim_ends: Mutex<Vec<ClaimEnd>>,
     /// Base backups taken during the run, by name.
     pub backups: BTreeMap<String, PathBuf>,
     /// When the pair began writing as two primaries: just before the dual
@@ -556,6 +560,7 @@ impl Sim {
             load: Some(load),
             gates,
             timeline: Mutex::new(Vec::new()),
+            claim_ends: Mutex::new(Vec::new()),
             backups: BTreeMap::new(),
             dual_since,
             cutover_prepared: None,
@@ -618,49 +623,100 @@ impl Sim {
     /// its way to the chain: the state in which a block it finds is built on
     /// current work (`Fixture::settled` in `live_regtest.rs`).
     pub async fn wait_node_settled(&self, node: Node, limit: Duration) -> Result<()> {
-        let pool = self.pool(self.ledger_node(node)).await?;
-        let started = Instant::now();
-        let mut last = String::new();
+        let ledger = self.ledger_node(node);
+        let pool = self.pool(ledger).await?;
+        let mut wait = CandidateWait::new(limit, Instant::now());
         let result = loop {
-            // In flight, or a reconciliation attempt claimed or due (the
-            // live fixtures' quiesce rule): a released attempt scheduled for
-            // later is bookkeeping, and waiting for it can take minutes.
-            let unfinished: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM qbit_block_candidate_outbox \
-                 WHERE state IN ('pending', 'offer_reserved', 'offered') \
-                    OR (state = 'reconciliation' AND (claim_expires_at > clock_timestamp() \
-                        OR next_attempt_at <= clock_timestamp()))",
-            )
-            .fetch_one(&pool)
-            .await?;
+            let rows = candidate_wait::read(&pool).await?;
+            let read_at = Instant::now();
+            self.note_wait(wait.observe(ledger, &rows, read_at, |id| self.claim_holder(id)));
+            let unfinished = candidate_wait::unfinished(&rows);
             let revision: i64 = sqlx::query_scalar(
                 "SELECT payout_revision FROM qbit_prism_cluster WHERE singleton",
             )
             .fetch_one(&pool)
             .await?;
             let tip = self.chain.node(qbitd_of(node)).best().await?;
-            if let Ok((_, health)) = self.frontend(node).health().await {
-                if unfinished == 0
+            let health = self.frontend(node).health().await;
+            if let Ok((_, health)) = &health {
+                if unfinished.is_empty()
                     && health["ok"] == true
                     && health["observed_tip"] == tip.as_str()
                     && health["payout_state_generation"] == revision
                 {
                     break Ok(());
                 }
-                last = format!(
-                    "{unfinished} unfinished candidates; health ok {}, observed tip {}, generation {} (database revision {revision}, node tip {tip})",
-                    health["ok"], health["observed_tip"], health["payout_state_generation"]
-                );
             }
-            if started.elapsed() > limit {
+            if wait.expired(Instant::now()) {
+                // Everything the last round read, whether or not the
+                // frontend answered it.
+                let rows = if unfinished.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " [{}]",
+                        wait.describe(ledger, &unfinished, read_at, |id| self.claim_holder(id))
+                    )
+                };
+                let health = match &health {
+                    Ok((_, health)) => format!(
+                        "health ok {}, observed tip {}, generation {}",
+                        health["ok"], health["observed_tip"], health["payout_state_generation"]
+                    ),
+                    Err(error) => format!("health unreadable ({error:#})"),
+                };
                 break Err(anyhow::anyhow!(
-                    "node {node:?} did not settle within {limit:?}: {last}"
+                    "node {node:?} did not settle within {}: {} unfinished candidates{rows}; \
+                     {health} (database revision {revision}, node tip {tip})",
+                    wait.bound(),
+                    unfinished.len()
                 ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         pool.close().await;
         result
+    }
+
+    /// Put a candidate wait's events on the timeline, and keep every claim
+    /// end for the scenario to judge.
+    fn note_wait(&self, events: Vec<WaitEvent>) {
+        for event in events {
+            self.mark(&event.to_string());
+            if let WaitEvent::Ended(end) = event {
+                if let Ok(mut ends) = self.claim_ends.lock() {
+                    ends.push(end);
+                }
+            }
+        }
+    }
+
+    /// Every claim no one renewed that a candidate wait has waited out and
+    /// seen end, in the order they ended.
+    pub fn claim_ends(&self) -> Vec<ClaimEnd> {
+        self.claim_ends
+            .lock()
+            .map(|ends| ends.clone())
+            .unwrap_or_default()
+    }
+
+    /// What the frontend whose instance id is `instance_id` is doing, for a
+    /// candidate wait's description (#841).
+    pub fn claim_holder(&self, instance_id: &str) -> Holder {
+        let Some(node) = Node::BOTH
+            .into_iter()
+            .find(|node| node.instance_id() == instance_id)
+        else {
+            return Holder::Unknown;
+        };
+        let frontend = self.frontend(node);
+        if !frontend.running() {
+            Holder::Stopped
+        } else if frontend.frozen() {
+            Holder::Frozen
+        } else {
+            Holder::Serving
+        }
     }
 
     /// Whether `hash` became a block candidate (or a landed block) in
@@ -703,18 +759,16 @@ impl Sim {
         );
         // An unclaimed row's expiry is NULL, and a parked row's next attempt
         // 'infinity', which PostgreSQL 16 cannot subtract from.
-        let row: Result<Option<Row>, _> = sqlx::query_as(
+        let row: Result<Option<Row>, _> = sqlx::query_as(&format!(
             "SELECT state, offer_outcome, last_error, attempt_count, claim_instance_id, \
                     CASE WHEN claim_expires_at IS NULL THEN NULL \
                       WHEN isfinite(claim_expires_at) \
                       THEN EXTRACT(EPOCH FROM claim_expires_at - clock_timestamp())::float8 \
                       ELSE 'Infinity'::float8 END, \
-                    CASE WHEN next_attempt_at IS NULL THEN NULL \
-                      WHEN isfinite(next_attempt_at) \
-                      THEN EXTRACT(EPOCH FROM next_attempt_at - clock_timestamp())::float8 \
-                      ELSE 'Infinity'::float8 END \
+                    {} \
              FROM qbit_block_candidate_outbox WHERE block_hash = $1",
-        )
+            candidate_wait::NEXT_ATTEMPT_IN_SQL
+        ))
         .bind(hash)
         .fetch_optional(&pool)
         .await;
@@ -772,42 +826,60 @@ impl Sim {
     /// databases agree (the 3.0 standby has replayed the primary; in the 3.1
     /// pair both hold the same shares and blocks).
     pub async fn settle(&self, limit: Duration) -> Result<()> {
-        let started = Instant::now();
+        // One deadline for the whole settle, which a claim no one renews
+        // extends by its lease (#841, `candidate_wait`).
+        let mut wait = CandidateWait::new(limit, Instant::now());
         let load = self.load()?;
         load.pause();
         load.wait_answered(Duration::from_secs(40)).await?;
         self.chain.converged().await?;
+        // Every ledger is read every round, so a claim in one is watched
+        // while another drains.
+        let mut pools = Vec::new();
         for node in self.ledgers() {
-            let pool = self.pool(node).await?;
-            loop {
-                let unfinished: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM qbit_block_candidate_outbox \
-                     WHERE state IN ('pending', 'offer_reserved', 'offered') \
-                        OR (state = 'reconciliation' AND (claim_expires_at > clock_timestamp() \
-                            OR next_attempt_at <= clock_timestamp()))",
-                )
-                .fetch_one(&pool)
-                .await?;
-                if unfinished == 0 {
-                    break;
+            pools.push((node, self.pool(node).await?));
+        }
+        let drained = loop {
+            let mut left = Vec::new();
+            for (node, pool) in &pools {
+                let rows = candidate_wait::read(pool).await?;
+                let read_at = Instant::now();
+                self.note_wait(wait.observe(*node, &rows, read_at, |id| self.claim_holder(id)));
+                if rows.iter().any(|row| row.unfinished) {
+                    left.push((*node, rows, read_at));
                 }
-                ensure!(
-                    started.elapsed() < limit,
-                    "node {node:?} still holds {unfinished} unfinished block candidates after {limit:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
             }
+            if left.is_empty() {
+                break Ok(());
+            }
+            if wait.expired(Instant::now()) {
+                let held: Vec<String> = left
+                    .iter()
+                    .map(|(node, rows, read_at)| {
+                        let unfinished = candidate_wait::unfinished(rows);
+                        format!(
+                            "node {node:?} still holds {} unfinished block candidates: {}",
+                            unfinished.len(),
+                            wait.describe(*node, &unfinished, *read_at, |id| self.claim_holder(id))
+                        )
+                    })
+                    .collect();
+                break Err(anyhow::anyhow!(
+                    "the candidates did not settle within {}: {}",
+                    wait.bound(),
+                    held.join("; ")
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        for (_, pool) in pools {
             pool.close().await;
         }
+        drained?;
+        let left = wait.deadline().saturating_duration_since(Instant::now());
         match self.config.topology {
-            Topology::SingleWriter => {
-                self.wait_standby_replayed(limit - started.elapsed().min(limit))
-                    .await?
-            }
-            Topology::DualWriter => {
-                self.wait_converged(limit - started.elapsed().min(limit))
-                    .await?
-            }
+            Topology::SingleWriter => self.wait_standby_replayed(left).await?,
+            Topology::DualWriter => self.wait_converged(left).await?,
             Topology::Unsynced => {}
         }
         self.mark("settled");

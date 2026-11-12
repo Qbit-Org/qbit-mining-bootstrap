@@ -161,7 +161,8 @@ cannot see an out-of-order landing shorter than its poll interval.
 | S7 | `s07_b_disk_replaced_*`, `s07_a_disk_replaced_*` | nightly | `node-identity repersonalise` (D-16) |
 | S8 | `s08_a_block_lost_*`, `s08_a_block_accepted_*`, `s08_without_the_peer_ingest_wait_*` | nightly | adoption (D-10, D-11) and the D-19 wait |
 | S9 | `s09_a_3_0_ledger_cut_over_*` | nightly | the 3.1 stack |
-| S10 | `s10_single_writer_*` | PR, nightly | today's code |
+| S10 | `s10_single_writer_pair_*` | PR, nightly | today's code |
+| S10, mid-offer | `s10_single_writer_peer_takes_over_*` | nightly | today's code (#841) |
 | S11 | `s11_carry_owner_transfer_*` | nightly | `carry-owner release` and `transfer` |
 
 What each one does:
@@ -243,6 +244,21 @@ What each one does:
   writer's, every pre-cutover row is node 0, B seeds its carry-owner journal
   (D-4) and a single-writer start on its database is then refused (D-12),
   the owner's first block pays from the 3.0 balances.
+- **S10:** the 3.0 pair (A's database the writer, B's its standby, both
+  frontends writing A's): a block on each node, A's frontend killed, miners
+  move to B, B finds a block, A returns, miners fail back, A finds a block.
+  Both frontends claim from A's one outbox, so A may die holding a claim on
+  a candidate it has not finished, B's or its own; B's find then waits that
+  claim's lease out (see "Bounds and retries").
+- **S10, mid-offer** (#841): the same pair, with the kill made to land on
+  that claim. A block found on A's work is offered by whichever frontend
+  claims it, its `submitblock` answer withheld at that frontend's gate (its
+  submit timeout raised to 60 s, so it is still in the call); once its node
+  holds the block on its active chain, the holder is killed. The survivor's
+  next find must wait the claim's whole 120 s lease out, no read may show
+  the claim gone earlier than one lease after the block's share was sent,
+  and the block must land once (submitted with an unknown offer outcome)
+  and be offered exactly once, through the dead holder's gate.
 - **S11:** A releases ownership while B lacks one of A's blocks; B's transfer is
   refused by the chain scan, succeeds once B has landed the block, and B then
   pays carry while A builds carry-free work.
@@ -303,6 +319,35 @@ prescribes (below):
 - **Setup budgets** (a frontend ready in 180 s, a block landed in 60 s, the
   settle in 180 s) are generous on purpose: missing one fails the run with
   what it waited for, and the time taken is reported.
+- **A dead frontend's candidate claim.** Every wait for "no unfinished block
+  candidate" (the settle, and a node's settle before a scheduled block, 60 s
+  for live work) reads each unfinished row's claim. A frontend takes
+  another's claim over only once it has itself watched the claim's version
+  (`claim_token`, `claim_renewals`) go unrenewed for the row's whole
+  `claim_lease_seconds`, 120 s for the submit loop (migration 021, #581;
+  docs/prism-ledger-ops.md), and a restarted frontend times a dead
+  predecessor's claim from its own start. So the wait watches each claim as
+  a frontend does: a live holder renews every 30 s and retries a renewal
+  lost to contention within another 30 s, so a version unrenewed for more
+  than 80 s is one no one renews, whatever its holder's process is doing.
+  The wait times a version from when it was written, as the database records
+  it (`claim_expires_at` less the lease), so it judges a claim before any
+  frontend may take it over, even one that saw the claim long before the
+  wait began. Such a claim gets that lease, timed from the wait's own first
+  sight of it, then the wait's bound for live work (#841); a parked row's
+  claim, which nothing takes over, does not. A claim already there at the
+  wait's first read holds the wait until a read can judge it. Each row is
+  extended once: a later version of its claim that also goes unrenewed that
+  long (a holder that renews too slowly ever to be taken over, and never
+  finishes) gets no more time, so the wait fails one lease plus the live
+  bound after it first saw the first such version, and no wait ever lasts
+  longer than the live bound, the longest lease (600 s) and the live bound
+  again. Both renewal figures and that longest lease are read from
+  qbit-prism-server's own constants. The extension is on the timeline, with
+  the claim's end, and a timeout names every unfinished row: its state, its
+  holder and what its frontend is doing, its renewals and lease, how long it
+  has gone unrenewed, how many of its versions went unrenewed past 80 s,
+  whether it is due or parked, and its last error (`src/candidate_wait.rs`).
 - **Bounds under test** are expectations with their measured values: the
   miner-visible gap after a node dies is at most 30 s, the balancer marks a
   dead node down within 10 s.
