@@ -9,10 +9,12 @@
 //! schema's ledger.
 use super::faults::{self, Fault};
 use super::*;
+use crate::coordinator::miner_tests::SharedLog;
 use crate::ledger::execution_proxy as proxy;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tracing::instrument::WithSubscriber;
 
 struct Database {
     admin: PgPool,
@@ -52,6 +54,18 @@ impl Database {
             .await?;
         self.admin.close().await;
         Ok(())
+    }
+}
+
+/// Drop the schema after a test's `result`, keeping both errors.
+async fn finish_test(db: Database, result: Result<()>) -> Result<()> {
+    let closed = db.close().await;
+    match (result, closed) {
+        (Ok(()), closed) => closed,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(closed)) => {
+            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
+        }
     }
 }
 
@@ -130,14 +144,7 @@ async fn a_record_attempt_that_committed_before_it_failed_finishes_the_backfill(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }
 
 /// An attempt that fails as any other might, here with a lock timeout,
@@ -185,14 +192,157 @@ async fn a_connection_lost_while_checking_a_failed_attempt_keeps_both_errors() -
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
+    finish_test(db, result).await
+}
+
+/// A backfill's batches with nothing serving run under the session's
+/// statement timeout, which `map_batches` reads from the server, so `timed`
+/// tells a batch the timeout cancelled from a cancel request (#824): the
+/// former is tried again at half its size, the latter, a cancel the batch
+/// sends its own backend here, stops the run. A test trigger on the mapping
+/// holds the first two batches for a second under a 300 ms timeout, and
+/// then cancels the next. The batches need only the two tables they read
+/// and write, in a schema of the test's own, so nothing is migrated and the
+/// database's migration lock is never taken.
+#[tokio::test]
+async fn an_unthrottled_batch_past_the_sessions_statement_timeout_is_halved_and_a_cancel_stops_it(
+) -> Result<()> {
+    let Some(raw) = gate::database_url(gate::site!())? else {
+        return Ok(());
+    };
+    let admin = PgPool::connect(&raw).await?;
+    let schema = format!("prism_unthrottled_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await?;
+    let mut url = url::Url::parse(&raw)?;
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    let result = async {
+        let mut connection = PgConnection::connect(url.as_str()).await?;
+        sqlx::raw_sql(
+            "CREATE TABLE qbit_share_ledger(share_seq bigint, share_id text, accepted boolean, template_height bigint); \
+             CREATE TABLE qbit_prism_share_hashes(header_hash text PRIMARY KEY, share_id text NOT NULL); \
+             CREATE SEQUENCE test_slow_batches; \
+             CREATE FUNCTION test_slow_batches() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 IF nextval('test_slow_batches') <= 2 THEN PERFORM pg_sleep(1); END IF; RETURN NULL; END $$; \
+             CREATE TRIGGER test_slow_batches BEFORE INSERT ON qbit_prism_share_hashes \
+                 FOR EACH STATEMENT EXECUTE FUNCTION test_slow_batches(); \
+             SET statement_timeout = '300ms';",
+        )
+        .execute(&mut connection)
+        .await?;
+        let recent = Pass::Recent { min_height: 0 };
+        let log = SharedLog::default();
+        let mapped = map_batches(&mut connection, recent, 0, 4 * BATCH_START, None)
+            .with_subscriber(log.dispatch())
+            .await?;
+        let logs = log.text();
+        ensure!(
+            mapped == 0
+                && logs
+                    .matches("a share-hash backfill batch outlasted the statement timeout; retrying it at half the size")
+                    .count()
+                    == 2
+                && logs.contains("retry_seqs=5000")
+                && logs.contains("retry_seqs=2500"),
+            "mapped {mapped}: {logs}"
+        );
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION test_slow_batches() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM pg_cancel_backend(pg_backend_pid()); PERFORM pg_sleep(1); RETURN NULL; END $$",
+        )
+        .execute(&mut connection)
+        .await?;
+        let cancelled = map_batches(&mut connection, recent, 0, BATCH_START, None)
+            .await
+            .err()
+            .context("a batch that a cancel request cancelled mapped")?;
+        let code = database_error(&cancelled).and_then(|error| error.code().map(|code| code.into_owned()));
+        ensure!(
+            code.as_deref() == Some("57014") && !timed_out(&cancelled),
+            "a cancelled batch was taken for its statement timeout: {cancelled:#}"
+        );
+        connection.close().await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let dropped = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    match (result, dropped) {
+        (Ok(()), dropped) => dropped.map(drop).map_err(Into::into),
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(dropped)) => {
+            Err(error.context(format!("schema cleanup also failed: {dropped:#}")))
         }
     }
+}
+
+/// A record attempt whose wait for a lock its statement timeout cuts, the
+/// throttle's 300 ms under the record's 2 s lock timeout, waited too long
+/// and is tried again (#824): `timed` tells the 57014 from a cancel request
+/// by the time the wait took, never by PostgreSQL's message. An open read of
+/// the cursor holds the record's `DROP TABLE`, in this test's schema alone;
+/// once it ends, a later attempt records 2.
+#[tokio::test]
+async fn a_record_attempt_cut_by_its_statement_timeout_is_tried_again() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let mut connection = PgConnection::connect(&db.url).await?;
+        pending_at_its_end(&mut connection).await?;
+        let throttle = patient(Duration::from_millis(300))?;
+        let reconnect: PgConnectOptions = db.url.parse()?;
+        let mut run_connection = RunConnection::Kept;
+        let mut reader = PgConnection::connect(&db.url).await?;
+        let mut held = reader.begin().await?;
+        sqlx::query("SELECT count(*) FROM qbit_prism_share_hash_backfill")
+            .execute(&mut *held)
+            .await?;
+        let log = SharedLog::default();
+        let run = finish(
+            &mut connection,
+            &reconnect,
+            &throttle,
+            None,
+            &mut run_connection,
+        )
+        .with_subscriber(log.dispatch());
+        let release = async {
+            let seen = tokio::time::timeout(Duration::from_secs(20), async {
+                while !log
+                    .text()
+                    .contains("recording migration 2 waited longer than its lock timeout")
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            held.commit().await?;
+            seen.context("no record attempt gave up on the held read of the cursor")
+        };
+        let (finished, released) = tokio::join!(run, release);
+        let logs = log.text();
+        released?;
+        let finished = finished.with_context(|| logs.clone())?;
+        ensure!(
+            logs.contains("cancelled by its 300 ms statement timeout")
+                && finished.range == Some((0, 0)),
+            "{finished:?}: {logs}"
+        );
+        reader.close().await?;
+        connection.close().await?;
+        let mut check = PgConnection::connect(&db.url).await?;
+        let recorded_2 = recorded(&mut check, VERSION).await?;
+        check.close().await?;
+        ensure!(recorded_2, "2 was not recorded once the lock was released");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    finish_test(db, result).await
 }
 
 /// A cursor dropped after the look-up that found it, as the transaction
@@ -227,14 +377,7 @@ async fn a_cursor_dropped_after_its_look_up_reads_as_nothing_pending() -> Result
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }
 
 /// 2's record, its cursor and its fence, read on a connection of its own.
@@ -585,14 +728,7 @@ async fn a_record_whose_connection_drops_after_its_commit_is_read_on_a_fresh_con
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }
 
 /// As above, but the server restarts meanwhile, as the codes that send the
@@ -630,14 +766,7 @@ async fn a_fresh_read_connects_again_while_the_server_turns_it_away() -> Result<
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }
 
 /// The record's COMMIT is committed, but its reply never comes, the
@@ -678,14 +807,7 @@ async fn a_record_whose_commit_reply_never_comes_is_read_afresh_at_its_deadline(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }
 
 /// The record's connection drops before its COMMIT: the server rolls the
@@ -746,14 +868,7 @@ async fn a_record_whose_connection_drops_before_its_commit_stops_for_a_rerun() -
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }
 
 /// The record's DELETE gets no reply, the connection left half-open before
@@ -823,12 +938,5 @@ async fn a_record_unanswered_before_its_commit_stops_at_once_and_never_closes_it
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let closed = db.close().await;
-    match (result, closed) {
-        (Ok(()), closed) => closed,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(closed)) => {
-            Err(error.context(format!("schema cleanup also failed: {closed:#}")))
-        }
-    }
+    finish_test(db, result).await
 }

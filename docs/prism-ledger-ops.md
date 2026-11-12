@@ -3079,6 +3079,12 @@ unaffected). Finish it once frontends serve, at a time of ordinary load.
    at about 400 shares a second (#738). Each of the backfill's statements,
    its double-credit check's and its record's included, runs in a transaction
    of its own and is cancelled at the statement timeout, which is at most 5 s.
+   A statement the timeout cancelled is told from one an administrator
+   cancelled with `pg_cancel_backend`, which stops the run, by its SQLSTATE,
+   57014, and by having run the timeout, all but a tenth of slack for the
+   server's clock, never by PostgreSQL's message,
+   so a server whose `lc_messages` is not English halves and retries the
+   same way (#824).
    If even the smallest batch times out, rerun with a smaller `--max-batch`
    first, and only then a larger `--statement-timeout-ms`. Lower `--duty-cycle` (down to 0.01) to
    spare the primary more; the run takes longer in proportion.
@@ -4078,7 +4084,10 @@ statements, so that setting needs no override. With less than 6 s plus one RPC
 timeout of the bound left when the report would start (21 s by default), the
 command refuses with `raise --timeout-seconds`. A report that runs out of time
 is cancelled by PostgreSQL before the bound ends, so no statement and no lock
-outlives the failed command. The closing tip check must itself end 5 s before
+outlives the failed command. It is told from an administrator's cancel of the
+report by its SQLSTATE and by having run its timeout, all but a tenth, not by
+PostgreSQL's message, so the advice to raise `--timeout-seconds` comes
+whatever the server's `lc_messages` (#824). The closing tip check must itself end 5 s before
 the bound, however many headers a moved tip makes it walk on a slow node;
 otherwise the command refuses with nothing committed (`the closing tip check
 did not finish 5 s before the fatal-state recovery bound`), so the `UPDATE` and

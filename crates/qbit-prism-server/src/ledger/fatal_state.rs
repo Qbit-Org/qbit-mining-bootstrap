@@ -1,4 +1,5 @@
 //! Explicit operator recovery. The ordinary write guard never ignores a halt.
+use super::migration::{timed, timed_out};
 use super::*;
 use crate::{
     config::Config,
@@ -344,7 +345,7 @@ impl Ledger {
         let integrity = integrity_report_bounded(&mut tx, report_time)
             .await
             .map_err(|error| {
-                if statement_timed_out(&error) {
+                if timed_out(&error) {
                     error.context(format!("the carry-forward integrity report did not finish in the {:.1} s the fatal-state recovery bound left it; raise --timeout-seconds and retry", report_time.as_secs_f64()))
                 } else {
                     error
@@ -592,40 +593,34 @@ fn reply_code(error: &anyhow::Error) -> Option<i64> {
 /// only, and the session's value is put back for the statements after the
 /// report; `RESET` would leave them the server's default instead. A failed
 /// report leaves the transaction aborted, and its rollback restores the value.
+/// The report is `timed`, so a report its timeout cancelled is marked so
+/// (`timed_out`), told from an operator's cancel without PostgreSQL's
+/// message, which the server translates under `lc_messages` (#824).
 pub async fn integrity_report_bounded(
     tx: &mut Transaction<'_, Postgres>,
     timeout: Duration,
 ) -> Result<Value> {
     // A statement_timeout of 0 disables it, so a bound never rounds down to 0.
-    let millis = timeout.as_millis().clamp(1, i32::MAX as u128).to_string();
+    // The clamp keeps it within an i32, so the cast is exact.
+    let millis = timeout.as_millis().clamp(1, i32::MAX as u128) as u64;
     // One round trip: the select list is evaluated in order, so the value
     // read is the session's, from before the set.
     let (saved, _): (String, String) = sqlx::query_as(
         "SELECT current_setting('statement_timeout'),set_config('statement_timeout',$1,true)",
     )
-    .bind(millis)
+    .bind(millis.to_string())
     .fetch_one(&mut **tx)
     .await?;
-    let report = sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
-        .fetch_one(&mut **tx)
-        .await?;
+    let report = timed(
+        Duration::from_millis(millis),
+        sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()").fetch_one(&mut **tx),
+    )
+    .await?;
     sqlx::query("SELECT set_config('statement_timeout',$1,true)")
         .bind(saved)
         .execute(&mut **tx)
         .await?;
     Ok(report)
-}
-
-/// Whether a statement was cancelled by its statement timeout. An operator's
-/// cancel request carries the same SQLSTATE and another message.
-fn statement_timed_out(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<sqlx::Error>()
-        .and_then(sqlx::Error::as_database_error)
-        .is_some_and(|error| {
-            error.code().as_deref() == Some("57014")
-                && error.message().contains("statement timeout")
-        })
 }
 
 fn fatal_subject(message: Option<&str>) -> (Option<String>, Option<String>) {
