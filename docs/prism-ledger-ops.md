@@ -53,13 +53,19 @@ manifest public keys, reward multiplier, payout policy, and CTV policy. A
 mismatched instance fails startup. Coordinators can use different local resource
 limits and synchronized qbit nodes on the same chain.
 
-Compact issued-job hot writes use a per-Coordinator collector: at most 128
-admitted children (pending plus active), 64 children per transaction, and one
-active batch including cancellation cleanup. Collection dwells for up to 1 ms
-from the oldest admission when storage is available, flushing earlier when full
-or a deadline requires it. Time behind another batch and admission backpressure
-remain inside the original persistence deadline. These bounds are initial
-engineering choices, not evidence of a latency target or a speedup.
+Compact issued-job hot writes use a per-Coordinator collector: at most 192
+admitted children (pending plus active), 64 children per transaction, and at
+most two batches in flight, each holding its ledger connection and its flight
+through its cancellation cleanup (#860). A new batch is collected only when a
+flight is free; collection then dwells for up to 1 ms from the oldest
+admission, flushing earlier when full or a deadline requires it. Time behind
+other batches and admission backpressure remain inside the original
+persistence deadline. A batch's result goes only to its own children, and each
+caller revalidates its publication after its own batch, so batches may
+complete in any order. Overlapping batches take the locks below in the same
+order; two that both extend one prepared row's retention serialize on that
+row's update lock until the first commits. These bounds are engineering
+choices, not evidence of a latency target.
 
 Groups share the complete original compact dependency identity and the expected
 current revision and parent; each Coordinator is bound to its own ledger/frontend.
@@ -2695,8 +2701,8 @@ would end legitimate transactions that idle between statements.
 their transactions with a plain `Transaction::begin` on a fresh checkout. The
 former runs inside the persist task on the missing-partition retry path and
 could be aborted mid-`BEGIN` there; it needs a detached partition lead first.
-The issued-job batch writer's `BatchConnection` runs in the batcher task and
-is cancelled only at shutdown.
+The issued-job batch writer's `BatchConnection` runs in a batch task the
+batcher spawns, and is cancelled only at shutdown.
 
 ```sh
 test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server \
