@@ -184,6 +184,17 @@ prints its skip line and passes; nothing there asserts execution, which is
 why both the native matrix and its combined proof are in the required
 `checks` list; `rust-tests` is not the proof.
 
+A pull request run that a pass marker skips ([ci-same-tree-skip.md](ci-same-tree-skip.md))
+proves nothing itself: the shards report success with every step skipped and
+the proof job reports skipped. What stands in for the proof is the earlier run
+the marker names: GitHub's records show it is a run of this workflow in this
+pull request (the only one opened from its head branch, with no base change
+in its timeline or issue events), on the same head tree, that uploaded the artifact named for this
+merge tree's key and whose `Lint, compile, and test` passed. That run took its
+workflow from its merge with this pull request's base branch, so a workflow
+changed on that base branch could have uploaded the artifact without running
+the shards; see that document's "What remains possible".
+
 ## Running locally
 
 The public-reader credential tests require PostgreSQL to reject missing or

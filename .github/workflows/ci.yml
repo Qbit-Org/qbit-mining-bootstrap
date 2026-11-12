@@ -16,9 +16,130 @@ on:
 permissions:
   contents: read
 
+env:
+  # The pass marker's salt (docs/ci-same-tree-skip.md): a repository variable,
+  # so that bumping it (gh variable set TREE_PASS_SALT) makes every pull request
+  # run everything again without a commit. Unset means 1.
+  TREE_PASS_SALT: ${{ vars.TREE_PASS_SALT }}
+
 jobs:
+  # A pull request lands as one signed commit with exactly the tree its review
+  # settled, and GitHub runs this workflow again on that commit. When the tree
+  # under test (the merge result, GITHUB_SHA) already passed every job that
+  # tree-marker-save needs, in this pull request, those jobs skip and every
+  # check still reports success: scripts/tree_pass_marker.py and
+  # docs/ci-same-tree-skip.md. Only a same-repository pull_request run looks a
+  # marker up (this job is skipped otherwise, and everything runs); the
+  # run-full-ci label, a fail marker for the tree, a marker whose run GitHub's
+  # records do not vouch for, a head branch another pull request used, a
+  # pull request whose timeline or issue events show its base retargeted, force-pushed or
+  # deleted, and any lookup that fails all run everything.
+  # GitHub-hosted, like tree-marker-save, so the marker is in GitHub's Actions
+  # cache, whose pull request scoping GitHub documents: Blacksmith runners send
+  # actions/cache to Blacksmith's own cache.
+  tree-marker:
+    name: Look up this tree's pass marker
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      prefix: ${{ steps.lookup.outputs.prefix }}
+      fail_key: ${{ steps.lookup.outputs.fail_key }}
+      save: ${{ steps.lookup.outputs.save }}
+    steps:
+      # Every marker step, this checkout included, continues on error (and has
+      # its own timeout), so a slow or failed step leaves `skip` unset and
+      # everything runs; the marker job itself still succeeds.
+      - name: Check out the marker script
+        id: checkout
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Compute the keys from the tree under test
+        id: lookup
+        if: steps.checkout.outcome == 'success'
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ github.event.action }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR: ${{ github.event.pull_request.number }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+          python3 scripts/tree_pass_marker.py lookup \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" --repository "${GITHUB_REPOSITORY}" \
+            --salt "${TREE_PASS_SALT}" --tree "${tree}" --event "${GITHUB_EVENT_NAME}" \
+            --action "${ACTION}" --head-repository "${HEAD_REPO}" --pr "${PR}" \
+            --labels "${LABELS}" --live-labels
+      # Lookup only, never restored: actions/cache extracts an entry with
+      # `tar -P`, and an entry saved by a workflow changed on the pull request
+      # could then write files into this job. A pass marker's key ends with the
+      # run and attempt that saved it, so the prefix matches the newest one,
+      # and decide reads the run from the matched key.
+      - name: Look the pass marker up
+        id: cache
+        if: steps.lookup.outputs.lookup == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: tree-pass-marker
+          key: ${{ steps.lookup.outputs.prefix }}
+          restore-keys: ${{ steps.lookup.outputs.prefix }}
+          lookup-only: true
+      - name: Look the fail marker up
+        id: fail
+        if: steps.lookup.outputs.lookup == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: tree-fail-marker
+          key: ${{ steps.lookup.outputs.fail_key }}
+          lookup-only: true
+      - name: Decide whether this run skips
+        id: decide
+        timeout-minutes: 3
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOKUP: ${{ steps.lookup.outputs.lookup }}
+          PREFIX: ${{ steps.lookup.outputs.prefix }}
+          OUTCOME: ${{ steps.cache.outcome }}
+          PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          FAIL_KEY: ${{ steps.lookup.outputs.fail_key }}
+          FAIL_OUTCOME: ${{ steps.fail.outcome }}
+          FAIL_HIT: ${{ steps.fail.outputs.cache-hit }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          python3 scripts/tree_pass_marker.py decide --lookup "${LOOKUP}" --prefix "${PREFIX}" \
+            --outcome "${OUTCOME}" --primary-key "${PRIMARY_KEY}" --matched-key "${MATCHED_KEY}" \
+            --fail-key "${FAIL_KEY}" --fail-outcome "${FAIL_OUTCOME}" --fail-hit "${FAIL_HIT}" \
+            --repository "${GITHUB_REPOSITORY}" --run-id "${GITHUB_RUN_ID}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" --head-repository "${HEAD_REPO}" \
+            --head-ref "${HEAD_REF}" --head-sha "${HEAD_SHA}" --pr "${PR}" \
+            --require-job "Record this tree's pass marker" --require-job "Lint, compile, and test" \
+            --latest-job "Lint, compile, and test"
+
   lint-compile-compose:
     name: Lint, compile, and Compose validation
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -127,9 +248,16 @@ jobs:
             )
           done
 
+  # A matrix job skipped by a job-level `if` reports one check under its
+  # unexpanded name, so under a marker skip each shard still runs and skips
+  # every step: each shard's own check reports success. Skipping needs no
+  # Blacksmith runner, so a skipped shard runs on a GitHub-hosted one. Every
+  # skip condition is the aggregate's: the marker job succeeded with skip=true.
   python-tests:
     name: Python unit tests (shard ${{ matrix.shard }})
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: tree-marker
+    if: ${{ !cancelled() }}
+    runs-on: ${{ (needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') && 'ubuntu-24.04' || 'blacksmith-2vcpu-ubuntu-2404' }}
     strategy:
       fail-fast: false
       matrix:
@@ -137,17 +265,21 @@ jobs:
 
     steps:
       - name: Check out repository
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: actions/checkout@v7
 
       - name: Set up Python
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
       - name: Set up Rust
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: ./.github/actions/rust-toolchain
 
       - name: Run Python unit test shard
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_COUNT: ${{ strategy.job-total }}
@@ -155,6 +287,8 @@ jobs:
 
   rust-tests:
     name: Rust tests
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -183,6 +317,8 @@ jobs:
 
   rust-fmt:
     name: Rust formatting
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -197,6 +333,8 @@ jobs:
 
   rust-clippy:
     name: Rust lints
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -211,6 +349,8 @@ jobs:
 
   cargo-deny:
     name: Dependency audit
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -257,6 +397,8 @@ jobs:
 
   dockerfile-lint:
     name: Dockerfile lint
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -297,16 +439,26 @@ jobs:
     # Preserve the existing check name for branch protection and consumers.
     name: Lint, compile, and test
     if: ${{ always() }}
-    needs: [lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-dual-writer, prism-native-postgres, prism-integration-proof]
+    needs: [tree-marker, lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-dual-writer, prism-native-postgres, prism-integration-proof]
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
+      # Every job succeeded, or the marker skipped this run (the marker job
+      # succeeded with skip=true, the test every skip condition uses) and only
+      # the jobs it skips at job level report skipped. A failure, a
+      # cancellation or any other skip fails, as it always has.
       - name: Require every check to pass
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "$RESULTS"
-          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+          echo "$RESULTS" | jq -e '
+            (.["tree-marker"].result == "success" and .["tree-marker"].outputs.skip == "true") as $marked
+            | ["lint-compile-compose", "rust-tests", "rust-fmt", "rust-clippy", "cargo-deny", "dockerfile-lint",
+               "prism-dual-writer", "prism-integration-proof"] as $skippable
+            | all(to_entries[] | select(.key != "tree-marker");
+                .value.result == "success"
+                or ($marked and .value.result == "skipped" and (.key as $job | any($skippable[]; . == $job))))'
 
   deleted-test-map-owner-issues:
     # Deliberately not in `checks`: an issue closing must not block unrelated
@@ -334,6 +486,8 @@ jobs:
 
   ckpool-rejects-observability:
     name: ckpool rejects observability live suite
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 20
 
@@ -371,6 +525,8 @@ jobs:
   # cores; about 4 minutes of build and 2 minutes per scenario.
   prism-dual-writer:
     name: Rust PRISM dual-writer scenarios (fast lane)
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
     env:
@@ -442,9 +598,13 @@ jobs:
             target/dual-sim-reports
           if-no-files-found: error
 
+  # A matrix job, so a marker skip skips its steps and its service, not the
+  # job, on a GitHub-hosted runner (see python-tests).
   prism-native-postgres:
     name: Rust PRISM PostgreSQL and multi-instance contracts (shard ${{ matrix.shard }})
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: tree-marker
+    if: ${{ !cancelled() }}
+    runs-on: ${{ (needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') && 'ubuntu-24.04' || 'blacksmith-2vcpu-ubuntu-2404' }}
     strategy:
       fail-fast: false
       matrix:
@@ -455,7 +615,8 @@ jobs:
     timeout-minutes: 45
     services:
       postgres:
-        image: postgres:16
+        # An empty image starts no service: none under a marker skip.
+        image: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') && 'postgres:16' || '' }}
         env:
           POSTGRES_DB: prism_test
           POSTGRES_USER: prism_test
@@ -495,8 +656,10 @@ jobs:
       PRISM_TEST_REQUIRE_INTEGRATION: "1"
     steps:
       - name: Check out repository
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: actions/checkout@v7
       - name: Name the gate manifest and the test log
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         env:
           SHARD_INDEX: ${{ matrix.shard }}
         run: |
@@ -506,6 +669,7 @@ jobs:
       # settings a statement that nears the timeout, and the lock it waited
       # on, name themselves there. Diagnostics only, so it never fails a shard.
       - name: Log slow statements and lock waits in the PostgreSQL service
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         continue-on-error: true
         env:
           PG_CONTAINER: ${{ job.services.postgres.id }}
@@ -517,8 +681,10 @@ jobs:
             -c "ALTER SYSTEM SET log_line_prefix = '%m [%p] %a '" \
             -c "SELECT pg_reload_conf()"
       - name: Set up Rust
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: ./.github/actions/rust-toolchain
       - name: Install tools for disposable primary and standby failover test
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-16
@@ -530,23 +696,26 @@ jobs:
       # when the first is unavailable. A cache-service error only logs a
       # warning here; it never fails the job.
       - name: Restore the pinned qbit release from the cache
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         id: prism-qbit-cache
         uses: actions/cache/restore@v6
         with:
           path: ~/.cache/prism-qbit
           key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
       - name: Install pinned qbit for native mining and CTV integration
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         run: |
           set -euo pipefail
           PRISM_QBIT_CACHE_DIR="${HOME}/.cache/prism-qbit" \
             bash .github/scripts/install-prism-qbit.sh "${RUNNER_TEMP}/prism-qbit"
       - name: Save the pinned qbit release to the cache
-        if: steps.prism-qbit-cache.outputs.cache-hit != 'true'
+        if: steps.prism-qbit-cache.outputs.cache-hit != 'true' && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true')
         uses: actions/cache/save@v6
         with:
           path: ~/.cache/prism-qbit
           key: prism-qbit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-prism-qbit.sh') }}
       - name: Run workspace test shard in required integration mode
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_COUNT: ${{ strategy.job-total }}
@@ -558,14 +727,14 @@ jobs:
       # The Python shards run the import admission gate's hermetic tests. Its SQL against a
       # schema `qbit-prism-server migrate` made needs this job's PostgreSQL and the server binary.
       - name: Test the import admission gate's SQL against a migrated schema
-        if: matrix.shard == 3
+        if: matrix.shard == 3 && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true')
         run: |
           set -euo pipefail
           cargo build --locked -p qbit-prism-server --bin qbit-prism-server
           PRISM_ADMISSION_GATE_SERVER_BIN="${GITHUB_WORKSPACE}/target/debug/qbit-prism-server" \
             python3 -m unittest -v tests.test_prism_legacy_import_admission_gate.RealSchemaTests
       - name: Upload the shard gate manifest and test log
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: actions/upload-artifact@v7
         with:
           name: prism-gate-shard-${{ matrix.shard }}
@@ -578,7 +747,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload share-append throughput diagnostics
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: actions/upload-artifact@v7
         with:
           name: prism-throughput-shard-${{ matrix.shard }}
@@ -590,10 +759,12 @@ jobs:
           # prevent the owning shard from reaching it.
           if-no-files-found: ignore
 
+  # Skipped at job level under a marker skip: the shards uploaded no manifest
+  # in that run, so this job proves nothing and reports skipped, never a proof.
   prism-integration-proof:
     name: Prove every Rust PRISM gated test executed
-    if: ${{ !cancelled() }}
-    needs: [prism-native-postgres]
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
+    needs: [tree-marker, prism-native-postgres]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check out repository
@@ -628,6 +799,8 @@ jobs:
 
   docker-builds:
     name: Build lightweight Docker images
+    needs: tree-marker
+    if: ${{ !cancelled() && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     steps:
@@ -694,7 +867,8 @@ jobs:
 
   qbit-runtime-image:
     name: Build and smoke real qbitd image
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    needs: tree-marker
+    if: ${{ !cancelled() && (github.event_name != 'push' || github.ref == 'refs/heads/main') && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
@@ -751,3 +925,158 @@ jobs:
 
       - name: Smoke real qbitd runtime
         run: bash .github/scripts/test-qbit-image-runtime.sh
+
+  # Records that this tree passed, for the next run on the same tree (the
+  # maintainer's signed squash). It runs only when every job it needs
+  # succeeded in this run (its `if` has no status function, so GitHub's
+  # implicit success() applies), the marker did not skip this run, and the
+  # lookup allowed a record: a same-repository pull_request run. The script
+  # checks all of that again, and that the prefix is this checkout's tree. The
+  # key ends with this run and attempt, and the artifact named for the key is
+  # what lets a later run's decide trust it. deleted-test-map-owner-issues
+  # reads issue state, not the tree, so the marker does not stand for it and
+  # never skips it.
+  tree-marker-save:
+    name: Record this tree's pass marker
+    needs: [tree-marker, lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-dual-writer, prism-native-postgres, prism-integration-proof, checks, ckpool-rejects-observability, docker-builds, qbit-runtime-image]
+    if: needs.tree-marker.outputs.save == 'true' && needs.tree-marker.outputs.skip == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the marker script
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Check that every marked job passed, and write the marker
+        id: save
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          SKIP: ${{ needs.tree-marker.outputs.skip }}
+          SAVE: ${{ needs.tree-marker.outputs.save }}
+          PREFIX: ${{ needs.tree-marker.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+          python3 scripts/tree_pass_marker.py save --needs "${NEEDS}" --marker-job tree-marker \
+            --skip "${SKIP}" --save "${SAVE}" --prefix "${PREFIX}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" --repository "${GITHUB_REPOSITORY}" \
+            --salt "${TREE_PASS_SALT}" --tree "${tree}" --event "${GITHUB_EVENT_NAME}" \
+            --marker-dir tree-pass-marker --sha "${GITHUB_SHA}" \
+            --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}"
+      # The record a later run's decide asks GitHub for. Without it the marker
+      # is never trusted, so a failed upload saves no marker.
+      - name: Upload the marker's run record
+        id: upload
+        if: steps.save.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.save.outputs.artifact }}
+          path: tree-pass-marker/marker.json
+          retention-days: 30
+          if-no-files-found: error
+      # A marker that cannot be saved only means the next run runs everything.
+      - name: Save the marker
+        if: steps.save.outputs.save == 'true' && steps.upload.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: tree-pass-marker
+          key: ${{ steps.save.outputs.key }}
+
+  # Records that a full run of this tree failed, so no later run of it skips on
+  # an earlier pass (a check that reads live state, such as cargo deny's
+  # advisory database, can fail a tree that once passed). It runs when the
+  # run was not cancelled and the marker did not skip it, and saves only when
+  # one of the jobs listed below reports failure or cancelled; tree-marker is
+  # not among them, since its own failure says nothing about the tree. It
+  # uses the marker job's fail key when that job succeeded with a valid one,
+  # and otherwise computes the key from its own checkout. Under !cancelled()
+  # a job reporting cancelled is one GitHub cancelled at its timeout-minutes.
+  tree-marker-fail:
+    name: Record that this tree failed
+    needs: [tree-marker, lint-compile-compose, python-tests, rust-tests, rust-fmt, rust-clippy, cargo-deny, dockerfile-lint, prism-dual-writer, prism-native-postgres, prism-integration-proof, checks, ckpool-rejects-observability, docker-builds, qbit-runtime-image]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-24.04
+    # Its steps' own timeouts add up to 11 minutes.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # Only the fallback below needs this checkout, so a failed checkout
+      # never stops a failure from being recorded with the marker job's key.
+      - name: Check out the marker script
+        id: checkout
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+      # Which jobs failed is one jq over needs, the counted jobs listed (not
+      # tree-marker). The key is the marker job's when it succeeded and left a
+      # valid one, else computed from this job's own checkout.
+      - name: Check which marked jobs failed, and write the fail marker
+        id: fail
+        timeout-minutes: 2
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          MARKER_RESULT: ${{ needs.tree-marker.result }}
+          MARKER_FAIL_KEY: ${{ needs.tree-marker.outputs.fail_key }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          failed="$(jq -r '
+            ["lint-compile-compose", "python-tests", "rust-tests", "rust-fmt", "rust-clippy", "cargo-deny", "dockerfile-lint", "prism-dual-writer", "prism-native-postgres", "prism-integration-proof", "checks", "ckpool-rejects-observability", "docker-builds", "qbit-runtime-image"] as $counted
+            | [to_entries[] | select(.key as $job | any($counted[]; . == $job))
+               | select(.value.result == "failure" or .value.result == "cancelled")
+               | "\(.key) (\(.value.result))"] | join(", ")' <<<"${NEEDS}")"
+          if [[ -z "${failed}" ]]; then
+            echo "tree-pass-marker fail: save nothing: no job the marker stands for failed"
+            echo "save=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ "${MARKER_RESULT}" == success && "${MARKER_FAIL_KEY}" =~ ^tree-fail-v1-[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml-salt(0|[1-9][0-9]{0,8})-([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            key="${MARKER_FAIL_KEY}"
+          else
+            tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+            key="$(python3 scripts/tree_pass_marker.py fail-key --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+              --repository "${GITHUB_REPOSITORY}" --salt "${TREE_PASS_SALT}" --tree "${tree}" \
+              --event "${GITHUB_EVENT_NAME}" --head-repository "${HEAD_REPO}")"
+          fi
+          artifact="tree-fail-$(printf '%s' "${key}" | sha256sum | cut -d' ' -f1)"
+          mkdir -p tree-fail-marker
+          jq -n --arg key "${key}" --arg failed "${failed}" --arg run "${GITHUB_RUN_ID}" \
+            --arg attempt "${GITHUB_RUN_ATTEMPT}" '{key: $key, failed: $failed, run_id: $run, run_attempt: $attempt}' \
+            > tree-fail-marker/fail.json
+          echo "tree-pass-marker fail: save ${key} and ${artifact}: these jobs failed: ${failed}"
+          { echo "save=true"; echo "key=${key}"; echo "artifact=${artifact}"; } >> "${GITHUB_OUTPUT}"
+      # Two records in two stores, which decide both reads (the artifact by
+      # name and the cache service's list). Each save has its own timeout and
+      # continues on error, so a stalled or failed save never stops the other.
+      # The artifact goes first: actions/cache/save's upload has no timeout of
+      # its own, and must not be able to hold the other record back. It never
+      # overwrites: a re-run whose name is taken fails here, harmlessly, and
+      # leaves the earlier attempt's record in place.
+      - name: Upload the fail record
+        if: steps.fail.outputs.save == 'true'
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.fail.outputs.artifact }}
+          path: tree-fail-marker/fail.json
+          retention-days: 90
+          overwrite: false
+          if-no-files-found: error
+      - name: Save the fail marker
+        if: steps.fail.outputs.save == 'true'
+        timeout-minutes: 3
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: tree-fail-marker
+          key: ${{ steps.fail.outputs.key }}

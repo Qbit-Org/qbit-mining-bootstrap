@@ -139,12 +139,83 @@ class Decide(unittest.TestCase):
 
     def test_this_run_is_never_its_own_source(self) -> None:
         gh = FakeGh([(run(THIS_RUN), verdict(), "2026-09-30T10:00:00Z")])
-        self.assertFalse(promote.decide(gh, REPO, TREE, THIS_RUN)["promote"])
+        decision = promote.decide(gh, REPO, TREE, THIS_RUN)
+        self.assertFalse(decision["promote"])
+        # Listed, never looked up or downloaded.
+        self.assertEqual(decision["considered"],
+                         [{"run": THIS_RUN, "rejected": "is this run (an earlier attempt's verdict)"}])
+        self.assertEqual(gh.downloads, [])
+
+    def test_this_runs_earlier_verdict_leaves_a_tags_promotion_unchanged_but_listed(self) -> None:
+        # A re-run of a tag run, or of a pull request run: an earlier attempt
+        # uploaded a verdict. The tag still promotes the same run as before,
+        # and the earlier attempt is listed under `considered`.
+        for created in ["2026-09-30T18:00:00Z", "2026-09-30T08:00:00Z"]:
+            with self.subTest(this_run_created=created):
+                gh = FakeGh([(run(THIS_RUN), verdict(passed=False), created),
+                             (run(12), verdict(), "2026-09-30T12:00:00Z")])
+                decision = promote.decide(gh, REPO, TREE, THIS_RUN)
+                self.assertEqual((decision["promote"], decision["source_run"]), (True, 12))
+                self.assertEqual(gh.downloads, [12])
+                expected = [{"run": THIS_RUN, "rejected": "is this run (an earlier attempt's verdict)"}]
+                self.assertEqual(decision["considered"], expected if created > "2026-09-30T12" else [])
+
+    def test_malformed_artifacts_are_described_and_change_no_promotion(self) -> None:
+        # Finding 5: described under `malformed`, walked exactly as before.
+        good = FakeGh([(run(12), verdict(), "2026-09-30T12:00:00Z")])
+        listing = json.loads(good(["api", f"repos/{REPO}/actions/artifacts?name=x&per_page=100"]))["artifacts"]
+        bad = [{"workflow_run": {}, "expired": False, "created_at": "2026-09-30T13:00:00Z"},
+               {"workflow_run": {"id": 13}, "expired": "no", "created_at": "2026-09-30T14:00:00Z"},
+               {"workflow_run": {"id": 14}, "expired": False},
+               {"workflow_run": {"id": True}, "expired": False, "created_at": "2026-09-30T15:00:00Z"},
+               "x"]
+
+        def gh(args: list[str]) -> str:
+            if "actions/artifacts" in args[1]:
+                return json.dumps({"artifacts": listing + bad})
+            if args[1].endswith("/14") or args[1].endswith("/1"):
+                raise subprocess.CalledProcessError(1, ["gh", *args], stderr="HTTP 404")
+            return good(args)
+
+        decision = promote.decide(gh, REPO, TREE, THIS_RUN)
+        self.assertEqual((decision["promote"], decision["source_run"]), (True, 12))
+        self.assertEqual(len(decision["malformed"]), 5, decision["malformed"])
+        self.assertEqual(promote.decide(good, REPO, TREE, THIS_RUN)["malformed"], [])
+
+    def test_a_first_attempt_sees_no_artifact_of_its_own(self) -> None:
+        gh = FakeGh([(run(12), verdict(), "2026-09-30T12:00:00Z")])
+        decision = promote.decide(gh, REPO, TREE, THIS_RUN)
+        self.assertEqual((decision["promote"], decision["source_run"], decision["considered"]), (True, 12, []))
 
     def test_a_failed_lookup_reruns_rather_than_promotes(self) -> None:
         decision = promote.decide(FakeGh([], fail_listing=True), REPO, TREE, THIS_RUN)
         self.assertFalse(decision["promote"])
         self.assertIn("lookup failed", decision["reason"])
+
+    def test_a_listing_of_another_shape_reruns_and_is_not_a_crash(self) -> None:
+        for body in ([], None, "x", {"artifacts": None}, {"artifacts": {}}, {}):
+            with self.subTest(body=body):
+                decision = promote.decide(lambda args, body=body: json.dumps(body), REPO, TREE, THIS_RUN)
+                self.assertFalse(decision["promote"])
+                self.assertIn("unexpected shape", decision["reason"])
+                self.assertNotIn("malformed", decision)        # which the pass-marker skip refuses on
+
+    def test_an_artifact_without_a_readable_date_ranks_oldest_and_is_not_a_crash(self) -> None:
+        gh = FakeGh([(run(10), verdict(), "2026-09-30T10:00:00Z"), (run(11), verdict(passed=False), "2026-09-29T10:00:00Z")])
+        listing = gh.__call__
+        for created in (None, 7, ["2026-10-01T00:00:00Z"]):
+            def undated(args: list[str], created: object = created) -> str:
+                out = listing(args)
+                if args[0] == "api" and "actions/artifacts" in args[1]:
+                    body = json.loads(out)
+                    body["artifacts"][1]["created_at"] = created
+                    out = json.dumps(body)
+                return out
+            with self.subTest(created=created):
+                decision = promote.decide(undated, REPO, TREE, THIS_RUN)
+                self.assertTrue(decision["promote"], decision)
+                self.assertEqual(decision["source_run"], 10)          # the dated one is the newest
+                self.assertEqual(len(decision["malformed"]), 1)
 
     def test_an_artifact_naming_no_run_is_skipped_not_a_crash(self) -> None:
         gh = FakeGh([(run(10), verdict(), "2026-09-30T10:00:00Z")])
