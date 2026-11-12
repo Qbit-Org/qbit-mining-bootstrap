@@ -14,11 +14,13 @@ use tokio_util::sync::CancellationToken;
 /// batch costs about fourteen fixed round trips and a COMMIT whatever its
 /// size, so smaller batches would only add transactions to a fan-out.
 const BATCH: usize = 64;
-/// Batch transactions in flight at once (#860). Each holds one connection of
-/// the frontend's ledger pool from checkout through rollback cleanup, the
-/// pool where share appends may hold all but one connection, so the bound is
-/// small and fixed. Overlapping batches take the same row locks in the same
-/// order and no advisory lock; see `save_issued_jobs_compact`.
+/// Batch transactions in flight at once (#860), started in waves. Each holds
+/// one connection of the frontend's ledger pool from checkout through
+/// rollback cleanup, the pool where share appends may hold all but one
+/// connection, so the bound is small and fixed. Overlapping batches take the
+/// same row locks in the same order, and of the advisory locks only migration
+/// 027's sync barrier, shared, through each child's `sync_seq` default; see
+/// `save_issued_jobs_compact`.
 const IN_FLIGHT: usize = 2;
 /// Entries admitted: every in-flight batch plus the one being collected.
 const ADMITTED: usize = (IN_FLIGHT + 1) * BATCH;
@@ -193,15 +195,38 @@ async fn run(
     // a batch's first entry: entries wait only in `pending` or the channel,
     // where their own deadlines and cancellation still apply, never inside
     // a closed batch.
+    //
+    // Batches start in waves. Every batch holds the cluster row FOR KEY
+    // SHARE, and PostgreSQL grants a new KEY SHARE past a queued FOR UPDATE
+    // while only compatible holders remain, so back-to-back overlapping
+    // batches would keep an authority writer or blob GC (which wait there
+    // holding ORDER_LOCK, and so every share append) out for a whole
+    // fan-out. A wave may grow to IN_FLIGHT only while none of its batches
+    // has finished; once one has, the next batch waits until all have, so
+    // such a writer waits for at most one wave, as it waited for one batch
+    // when batches ran one at a time.
     let flights = Arc::new(Semaphore::new(IN_FLIGHT));
+    let mut wave = 0;
     let mut pending = VecDeque::new();
     'collect: loop {
-        let flight = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            flight = flights.clone().acquire_owned() => {
-                flight.expect("issued batch flights are never closed")
-            }
+        // Between batches the collector holds no flight, so `wave` batches
+        // in flight leave exactly IN_FLIGHT - wave free until one finishes.
+        let open = wave > 0 && wave < IN_FLIGHT && flights.available_permits() == IN_FLIGHT - wave;
+        let flight = if open {
+            flights
+                .clone()
+                .try_acquire_owned()
+                .expect("an open wave has a free flight")
+        } else {
+            let mut all = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                all = flights.clone().acquire_many_owned(IN_FLIGHT as u32) => {
+                    all.expect("issued batch flights are never closed")
+                }
+            };
+            wave = 0;
+            all.split(1).expect("a wave holds every flight")
         };
         discard_expired(&mut pending);
         let first = if let Some(first) = pending.pop_front() {
@@ -269,6 +294,7 @@ async fn run(
         if batch.is_empty() {
             continue;
         }
+        wave += 1;
         tokio::spawn(save_issued_batch_in_flight(
             ledger.clone(),
             batch,
@@ -278,12 +304,8 @@ async fn run(
     }
     // Dropping pending entries and receiver resolves their response channels
     // and releases their permits. Each in-flight batch answers its own
-    // entries once shutdown interrupts it and its cleanup ends; wait for
-    // them so the collector outlives every batch it started. No task holds
+    // entries once shutdown interrupts it and its cleanup ends. No task holds
     // the batcher's sender or Coordinator.
-    drop(pending);
-    drop(receiver);
-    let _ = flights.acquire_many(IN_FLIGHT as u32).await;
 }
 
 /// One batch's transaction and its answers. Its result goes only to its own
