@@ -37,7 +37,8 @@ impl CompactBatchAttempt {
         self.commit_started.load(Ordering::Acquire)
     }
 
-    /// Keep the collector's active slot until cancellation drains the transaction.
+    /// Keep the batch's flight in the collector until cancellation drains the
+    /// transaction.
     /// This cleanup interval does not extend a caller's original deadline.
     pub async fn wait_for_cleanup(&self) {
         loop {
@@ -75,8 +76,9 @@ impl BatchCleanup {
 }
 
 // A dropped transaction queues ROLLBACK, but cancellation during BEGIN can
-// precede SQLx's tracked transaction depth. Explicitly roll back before allowing
-// the next batch. A broken network gets bounded cleanup and discards the connection.
+// precede SQLx's tracked transaction depth. Explicitly roll back before the
+// batch's flight is released. A broken network gets bounded cleanup and discards
+// the connection.
 struct BatchConnection {
     connection: Option<PoolConnection<Postgres>>,
     clean: bool,

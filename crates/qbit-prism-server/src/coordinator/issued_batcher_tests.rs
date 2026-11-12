@@ -151,20 +151,20 @@ async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
     assert_eq!(batcher.sender.capacity(), IN_FLIGHT);
     requests[0].abort();
     // The first held batch's only caller leaves before COMMIT: its attempt
-    // ends, which frees one flight for the queue; the other stays held.
+    // ends and closes the wave; the queue starts once the others finish.
     let (first, _) = held.remove(0);
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
+    for (request, gate) in held {
+        gate.release.notify_one();
+        assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    }
     for (i, request) in requests.into_iter().enumerate() {
         if i == 0 {
             assert!(request.await.unwrap_err().is_cancelled());
         } else {
             assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
         }
-    }
-    for (request, gate) in held {
-        gate.release.notify_one();
-        assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
     }
     settled(&batcher).await;
     let rows = f.store.jobs.lock().unwrap();
@@ -738,7 +738,8 @@ async fn failed_batch_answers_only_its_own_entries_beside_a_committing_one() {
 
 /// #860: with every flight held, a queued entry's own deadline still ends its
 /// wait exactly as before the bound: the caller is answered at its deadline,
-/// the entry never reaches SQL, and its admission slot is released.
+/// and the entry never reaches SQL. As before, its admission slot comes back
+/// when the collector next takes a flight and discards it.
 #[tokio::test]
 async fn entry_deadline_passing_while_every_flight_is_held_is_answered_and_never_saved() {
     let (f, prepared) = fixture().await;
@@ -779,4 +780,39 @@ async fn entry_deadline_passing_while_every_flight_is_held_is_answered_and_never
         &[1; IN_FLIGHT]
     );
     assert!(!f.store.jobs.lock().unwrap().contains_key("late"));
+}
+
+/// #860: batches start in waves. Once one batch of a wave has finished, no new
+/// batch starts until the others have, so the frontend's batches release the
+/// cluster row's KEY SHARE together and a queued FOR UPDATE (an authority
+/// writer, blob GC) waits for at most one wave. PostgreSQL would otherwise
+/// grant each new batch's KEY SHARE past that writer for a whole fan-out.
+#[tokio::test]
+async fn a_finished_batch_closes_its_wave_until_the_others_finish() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    tokio::time::pause();
+    let mut held = hold_flights(&f, &batcher, &prepared).await;
+    let (first, gate) = held.remove(0);
+    gate.release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    let next = enqueue(batcher.clone(), prepared.clone(), "next-wave", 300_000);
+    // The paused clock runs the collection dwell and anything it starts, and
+    // stops well inside every deadline.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1; IN_FLIGHT]
+    );
+    assert!(!next.is_finished());
+    for (request, gate) in held {
+        gate.release.notify_one();
+        assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    }
+    assert_eq!(next.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    settled(&batcher).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1; IN_FLIGHT + 1]
+    );
 }
