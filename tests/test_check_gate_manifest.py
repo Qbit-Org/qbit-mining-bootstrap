@@ -197,7 +197,9 @@ class CheckGateManifestTests(unittest.TestCase):
         self.assertIn("fail-fast: false", native)
         self.assertIn("SHARD_COUNT: ${{ strategy.job-total }}", native)
         self.assertIn("name: prism-gate-shard-${{ matrix.shard }}", native)
-        self.assertIn("needs: [prism-native-postgres]", native)
+        # tree-marker: the proof skips with the shards' steps under a pass
+        # marker (scripts/tree_pass_marker.py), never proving an empty run.
+        self.assertIn("needs: [tree-marker, prism-native-postgres]", native)
         self.assertIn('run: test "$SHARD_RESULT" = success', native)
         self.assertIn("actions/download-artifact@", native)
         checks = workflow.split("\n  checks:", 1)[1].split("\n  ckpool-rejects", 1)[0]

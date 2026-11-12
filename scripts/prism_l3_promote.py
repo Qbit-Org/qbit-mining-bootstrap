@@ -20,6 +20,18 @@ This script looks for that run and prints the decision as JSON:
 - otherwise **rerun** the full suite. A lookup that fails for any reason is
   a rerun, never a promotion: promoting needs positive evidence.
 
+It reads one page of up to 100 artifacts, drops expired ones and ones that
+name no run, and walks the rest newest first. Every candidate it passes over
+before the one it promotes (all of them, when it promotes none) is listed
+under `considered`, newest first, with the reason. That includes this run's
+own artifacts (an earlier attempt's verdict, after a re-run): they are never
+promoted, and they are listed rather than dropped, so a pull request's
+pass-marker skip (scripts/tree_pass_marker.py), which refuses whenever
+`considered` lists a run, never lets an older run stand in for this run's own
+newer verdict. Every listed artifact that is not well-formed (no integer run
+id, an `expired` that is not a boolean, no `created_at` string) is described
+under `malformed`; a tag ignores that list, and the skip refuses on it.
+
 The artifact's name carries the tree, so the lookup lists only candidates
 for this tree and downloads the newest first.
 
@@ -96,6 +108,21 @@ def verdict_rejection(verdict: object, tree: str) -> str | None:
     return None
 
 
+def artifact_malformation(artifact: object) -> str | None:
+    """Why a listed artifact is not well-formed, or None."""
+    if not isinstance(artifact, dict):
+        return f"an artifact that is not an object: {artifact!r}"
+    workflow_run = artifact.get("workflow_run")
+    run_id = workflow_run.get("id") if isinstance(workflow_run, dict) else None
+    if not isinstance(run_id, int) or isinstance(run_id, bool):
+        return f"artifact {artifact.get('id')!r} names no run"
+    if not isinstance(artifact.get("expired"), bool):
+        return f"artifact {artifact.get('id')!r} of run {run_id} has expired={artifact.get('expired')!r}"
+    if not isinstance(artifact.get("created_at"), str) or not artifact["created_at"]:
+        return f"artifact {artifact.get('id')!r} of run {run_id} has no created_at"
+    return None
+
+
 def decide(gh: Gh, repo: str, tree: str, run_id: int) -> dict:
     """The decision for `tree`: promote a pull request's run, or rerun."""
     name = VERDICT_ARTIFACT.format(tree=tree)
@@ -107,20 +134,37 @@ def decide(gh: Gh, repo: str, tree: str, run_id: int) -> dict:
     except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired, ValueError) as error:
         decision["reason"] = f"rerun: the artifact lookup failed ({error})"
         return decision
+    # A listing that is not the documented object with a list of artifacts is a
+    # failed lookup too: a rerun, never a crash into a failed tag run.
+    listed = listing.get("artifacts") if isinstance(listing, dict) else None
+    if not isinstance(listed, list):
+        decision["reason"] = "rerun: the artifact listing has an unexpected shape"
+        return decision
     # An artifact that names no run cannot be traced to one, so it is not a
     # candidate (and never crashes the lookup into a failed tag run).
+    # What a tag ignores and the pass-marker skip refuses on: an artifact that
+    # cannot be ranked or traced for certain. The walk below is unchanged.
+    decision["malformed"] = [
+        why for why in (artifact_malformation(a) for a in listed)
+        if why is not None
+    ]
     artifacts = [
-        a for a in listing.get("artifacts", [])
+        a for a in listed
         if isinstance(a, dict)
         and not a.get("expired")
         and isinstance((a.get("workflow_run") or {}).get("id"), int)
-        and a["workflow_run"]["id"] != run_id
     ]
     # Newest first; the API already lists them so, but a stale run must
     # never shadow a newer one whatever order it returns.
-    artifacts.sort(key=lambda a: a.get("created_at", ""), reverse=True)
+    # One without a readable date ranks oldest, as one without the field did.
+    artifacts.sort(key=lambda a: a["created_at"] if isinstance(a.get("created_at"), str) else "", reverse=True)
     for artifact in artifacts:
         source = artifact["workflow_run"]["id"]
+        if source == run_id:
+            # This run is never its own source, but its earlier attempt's
+            # verdict is a newer measurement of the tree: list it.
+            decision["considered"].append({"run": source, "rejected": "is this run (an earlier attempt's verdict)"})
+            continue
         try:
             run = json.loads(gh(["api", f"repos/{repo}/actions/runs/{source}"]))
         except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired, ValueError) as error:

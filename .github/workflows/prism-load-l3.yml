@@ -46,6 +46,25 @@ name: PRISM load harness (L3 production-window matrix)
 # suite 9 jobs (#555 added the session points and the mainnet shapes), about
 # 200 runner-minutes or $13 a week.
 #
+# A pass marker (scripts/tree_pass_marker.py, docs/ci-same-tree-skip.md)
+# skips the build, the preset jobs and the collation when a push to a
+# same-repository pull request tests a tree that already passed the full suite
+# in that pull request, as the maintainer's signed squash of a version bump
+# does. The marker is keyed by the plan's tree, the tree the verdict and a
+# tag's promotion name, and by the run that saved it. A hit skips only when
+# GitHub's records of that run vouch for it (this workflow, this head branch
+# and head tree, its artifact for exactly this key, its save job and
+# collation passed), this pull request is the only one opened from its head
+# branch and its timeline and issue events show no base change, and a tag's
+# promotion would carry exactly that passing run without passing over any other
+# verdict for the tree, this run's earlier attempts included
+# (scripts/prism_l3_promote.py). A run of the tree still in progress when this
+# decides is not seen, and a later tag can promote it once it uploads its
+# verdict; a run that never uploads one is seen by neither
+# (docs/ci-same-tree-skip.md). A label event, the run-full-ci label, a fork,
+# a tag, the weekly run, a dispatch, a merge ref that moved after the event,
+# and any lookup that fails all run the suite.
+#
 # This workflow is never a required check. A per-PR, per-label group lets a
 # new push cancel the older push's run without touching a labelled run, and an
 # unrelated label never cancels anything; a tag has a group per tag, the
@@ -83,6 +102,12 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # The pass marker's salt (docs/ci-same-tree-skip.md): a repository variable,
+  # so that bumping it (gh variable set TREE_PASS_SALT) makes every pull request
+  # run the suite again without a commit. Unset means 1.
+  TREE_PASS_SALT: ${{ vars.TREE_PASS_SALT }}
 
 concurrency:
   group: >-
@@ -182,22 +207,42 @@ jobs:
     name: Plan the suite and pin the commit
     needs: changes
     if: ${{ needs.changes.outputs.run == 'true' }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 15
+    # GitHub-hosted for a pull request, like tree-marker-save, so the pass
+    # marker is in GitHub's Actions cache, whose pull request scoping GitHub
+    # documents: Blacksmith runners send actions/cache to Blacksmith's own
+    # cache. Every other event looks no marker up and keeps Blacksmith's.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'blacksmith-2vcpu-ubuntu-2404' }}
+    # 20, not 15: the marker steps' own timeouts add up to 11 minutes, and a
+    # slow marker step must time out itself, never the plan.
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       sha: ${{ steps.plan.outputs.sha }}
       tree: ${{ steps.plan.outputs.tree }}
       promote: ${{ steps.promote.outputs.promote }}
       source_run: ${{ steps.promote.outputs.source_run }}
+      skip: ${{ steps.marker-decide.outputs.skip }}
+      marker_prefix: ${{ steps.marker-lookup.outputs.prefix }}
+      marker_save: ${{ steps.marker-lookup.outputs.save }}
     steps:
       - name: Check out the ref under test
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.changes.outputs.ref }}
+      # For a pull request, refs/pull/N/merge can have moved since the event.
+      # This runs before any script from the checkout, so code from a moved
+      # merge ref never runs a marker step: the lookup and the decision both
+      # need it to pass. Every other event looks no marker up.
+      - name: Require the pinned commit to be the event's
+        id: marker-pin
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 1
+        continue-on-error: true
+        run: test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
       - name: Select the suite and pin the commit and its tree
         id: plan
         env:
@@ -255,6 +300,86 @@ jobs:
             echo
             jq -r '.considered[] | "- run \(.run): \(.rejected)"' "${RUNNER_TEMP}/plan/promotion.json"
           } >> "${GITHUB_STEP_SUMMARY}"
+      # The pass marker. Every step has its own timeout and continues on
+      # error, so a slow or failed step leaves `skip` unset and the suite
+      # runs; together they stay well inside the plan's 20 minutes. The
+      # lookup and the decision run only if marker-pin, right after the
+      # checkout, found the checkout to be the event's commit.
+      - name: Compute the pass marker's key from the pinned tree
+        id: marker-lookup
+        if: steps.marker-pin.outcome == 'success'
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ github.event.action }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR: ${{ github.event.pull_request.number }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          SHA: ${{ steps.plan.outputs.sha }}
+          TREE: ${{ steps.plan.outputs.tree }}
+        run: |
+          python3 scripts/tree_pass_marker.py lookup \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" --repository "${GITHUB_REPOSITORY}" \
+            --salt "${TREE_PASS_SALT}" --tree "${TREE}" --event "${GITHUB_EVENT_NAME}" \
+            --action "${ACTION}" --head-repository "${HEAD_REPO}" --pr "${PR}" \
+            --labels "${LABELS}" --live-labels --skip-labeled \
+            --tested-sha "${SHA}" --event-sha "${GITHUB_SHA}"
+      # Lookup only, never restored (an entry is extracted with `tar -P`);
+      # the key that matches the prefix names the run that saved it.
+      - name: Look the pass marker up
+        id: marker-cache
+        if: steps.marker-lookup.outputs.lookup == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: tree-pass-marker
+          key: ${{ steps.marker-lookup.outputs.prefix }}
+          restore-keys: ${{ steps.marker-lookup.outputs.prefix }}
+          lookup-only: true
+      # What a v* tag on this tree would promote now: a hit skips only if
+      # that is a passing full-suite run of exactly this tree.
+      - name: Check the tag's promotion for this tree
+        if: steps.marker-cache.outputs.cache-matched-key != ''
+        timeout-minutes: 3
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TREE: ${{ steps.plan.outputs.tree }}
+        run: |
+          python3 scripts/prism_l3_promote.py --repo "${REPO}" --tree "${TREE}" \
+            --run-id "${RUN_ID}" --out "${RUNNER_TEMP}/marker-promotion.json"
+      - name: Decide whether this run skips the suite
+        id: marker-decide
+        if: steps.marker-pin.outcome == 'success'
+        timeout-minutes: 3
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOOKUP: ${{ steps.marker-lookup.outputs.lookup }}
+          PREFIX: ${{ steps.marker-lookup.outputs.prefix }}
+          OUTCOME: ${{ steps.marker-cache.outcome }}
+          PRIMARY_KEY: ${{ steps.marker-cache.outputs.cache-primary-key }}
+          MATCHED_KEY: ${{ steps.marker-cache.outputs.cache-matched-key }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          TREE: ${{ steps.plan.outputs.tree }}
+        # The job names are the ones GitHub reports. The collation job's line
+        # goes on with " #473's tables", which YAML reads as a comment.
+        run: |
+          python3 scripts/tree_pass_marker.py decide --lookup "${LOOKUP}" --prefix "${PREFIX}" \
+            --outcome "${OUTCOME}" --primary-key "${PRIMARY_KEY}" --matched-key "${MATCHED_KEY}" \
+            --repository "${GITHUB_REPOSITORY}" --run-id "${GITHUB_RUN_ID}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" --head-repository "${HEAD_REPO}" \
+            --head-ref "${HEAD_REF}" --head-sha "${HEAD_SHA}" --pr "${PR}" \
+            --require-job "Record this tree's pass marker" --require-job "Collate the suite into" \
+            --latest-job "Collate the suite into" \
+            --promotion "${RUNNER_TEMP}/marker-promotion.json" --tree "${TREE}"
       - name: Upload the plan
         uses: actions/upload-artifact@v7
         with:
@@ -267,7 +392,7 @@ jobs:
   build:
     name: Build the release binaries once
     needs: plan
-    if: ${{ needs.plan.outputs.promote != 'true' }}
+    if: ${{ needs.plan.outputs.promote != 'true' && needs.plan.outputs.skip != 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
@@ -374,9 +499,14 @@ jobs:
   collate:
     name: Collate the suite into #473's tables
     needs: [plan, build, run]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.promote != 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.promote != 'true' && needs.plan.outputs.skip != 'true' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 20
+    # Read by tree-marker-save: a marker needs a complete, passing verdict
+    # uploaded for this tree.
+    outputs:
+      status: ${{ steps.collate.outputs.status }}
+      verdict: ${{ steps.collate.outputs.verdict }}
     steps:
       - name: Check out the pinned commit
         uses: actions/checkout@v7
@@ -534,3 +664,65 @@ jobs:
             echo "the promoted run did not pass every gate; see its tables above" >&2
             exit 1
           fi
+
+  # Records that this tree passed the full suite, for the next push of the
+  # same tree to this pull request (the maintainer's signed squash). It runs
+  # only when the plan, the build, every preset job and the collation
+  # succeeded in this run (its `if` has no status function, so GitHub's
+  # implicit success() applies), the collation uploaded a passing verdict for
+  # this tree (the one a tag's promotion reads), the marker did not skip this
+  # run, and the lookup allowed a record: a same-repository pull_request run
+  # whose pinned commit is the event's. The key ends with this run and
+  # attempt, and the artifact named for the key is what a later run's decide
+  # asks GitHub for.
+  tree-marker-save:
+    name: Record this tree's pass marker
+    needs: [plan, build, run, collate]
+    if: needs.plan.outputs.marker_save == 'true' && needs.plan.outputs.skip == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the marker script
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+      - name: Check that the suite passed, and write the marker
+        id: save
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          SKIP: ${{ needs.plan.outputs.skip }}
+          SAVE: ${{ needs.plan.outputs.marker_save }}
+          PREFIX: ${{ needs.plan.outputs.marker_prefix }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse "${GITHUB_SHA}^{tree}")"
+          python3 scripts/tree_pass_marker.py save --needs "${NEEDS}" --marker-job plan \
+            --skip "${SKIP}" --save "${SAVE}" --prefix "${PREFIX}" \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" --repository "${GITHUB_REPOSITORY}" \
+            --salt "${TREE_PASS_SALT}" --tree "${tree}" --event "${GITHUB_EVENT_NAME}" \
+            --require collate.status=0 --require collate.verdict=true \
+            --marker-dir tree-pass-marker --sha "${GITHUB_SHA}" \
+            --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}"
+      # The record a later run's decide asks GitHub for. Without it the marker
+      # is never trusted, so a failed upload saves no marker.
+      - name: Upload the marker's run record
+        id: upload
+        if: steps.save.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.save.outputs.artifact }}
+          path: tree-pass-marker/marker.json
+          retention-days: 30
+          if-no-files-found: error
+      # A marker that cannot be saved only means the next run runs the suite.
+      - name: Save the marker
+        if: steps.save.outputs.save == 'true' && steps.upload.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: tree-pass-marker
+          key: ${{ steps.save.outputs.key }}

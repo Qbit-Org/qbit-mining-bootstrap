@@ -285,7 +285,10 @@ The runner is the 32 vCPU class until #542 picks one per lane. The triggers:
 
 - **The version bump:** a PR into `3.x.x` or `main` that changes `VERSION`,
   from this repository, on every push. The `changes` job checks the PR's file
-  list. A trigger-level `paths` filter would also swallow the label event.
+  list. A trigger-level `paths` filter would also swallow the label event. A
+  push whose tree already passed the full suite in that PR (the maintainer's
+  signed squash) skips the build, the presets and the collation when a tag
+  would promote that passing run ([ci-same-tree-skip.md](ci-same-tree-skip.md)).
 - **`release-candidate`:** a maintainer applying the label to a PR into
   `3.x.x` or `main`, including a fork's. As with `run-load`, only the
   `labeled` event starts it.
@@ -544,7 +547,9 @@ gh workflow run prism-load-l3.yml -f ref=v3.0.0-rc.1 -f tag_dry_run=true
 ```
 
 To run `l3-full` on a PR, apply `release-candidate`. A PR that changes
-`VERSION` runs it on every push.
+`VERSION` runs it on every push, except a push whose tree already passed it in
+that PR ([ci-same-tree-skip.md](ci-same-tree-skip.md)). To run it anyway,
+apply `run-full-ci`, then push or re-run all jobs.
 
 ## Reading a job summary and `gate.md`
 
