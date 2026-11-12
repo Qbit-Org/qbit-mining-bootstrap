@@ -53,10 +53,14 @@ manifest public keys, reward multiplier, payout policy, and CTV policy. A
 mismatched instance fails startup. Coordinators can use different local resource
 limits and synchronized qbit nodes on the same chain.
 
-Compact issued-job hot writes use a per-Coordinator collector: at most 192
-admitted children (pending plus active), 64 children per transaction, and at
-most two batches in flight, each holding its ledger connection and its flight
-through its cancellation cleanup (#860). Batches start in waves: a second
+Compact issued-job hot writes use a per-Coordinator collector: 64 children
+per transaction and at most two batches in flight, each holding its ledger
+connection and its flight through its cancellation cleanup (#860). A second
+flight is used only when the pool leaves at least four connections beside
+window reads (`PRISM_DATABASE_MAX_CONNECTIONS` minus `clamp(max - 2, 1,
+build workers)`), so a share append and the candidate-lease heartbeat keep
+two; smaller pools keep one flight, as before. Admission holds at most 64
+children per flight plus 64 being collected (192 with two flights). Batches start in waves: a second
 batch may join the first while it is in flight, but once a batch of the wave
 finishes, the next batch waits until all have. PostgreSQL grants a new `FOR
 KEY SHARE` past a queued `FOR UPDATE`, so without that gap one frontend's

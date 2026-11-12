@@ -14,16 +14,16 @@ use tokio_util::sync::CancellationToken;
 /// batch costs about fourteen fixed round trips and a COMMIT whatever its
 /// size, so smaller batches would only add transactions to a fan-out.
 const BATCH: usize = 64;
-/// Batch transactions in flight at once (#860), started in waves. Each holds
-/// one connection of the frontend's ledger pool from checkout through
-/// rollback cleanup, the pool where share appends may hold all but one
-/// connection, so the bound is small and fixed. Overlapping batches take the
-/// same row locks in the same order, and of the advisory locks only migration
+/// The most batch transactions in flight at once (#860), started in waves.
+/// Each holds one connection of the frontend's ledger pool from checkout
+/// through rollback cleanup, the pool where share appends may hold all but
+/// one connection, so the bound is small and fixed; the Coordinator passes
+/// one flight where the pool cannot spare a second
+/// (`coordinator::issued_batch_flights`). Overlapping batches take the same
+/// row locks in the same order, and of the advisory locks only migration
 /// 027's sync barrier, shared, through each child's `sync_seq` default; see
 /// `save_issued_jobs_compact`.
 const IN_FLIGHT: usize = 2;
-/// Entries admitted: every in-flight batch plus the one being collected.
-const ADMITTED: usize = (IN_FLIGHT + 1) * BATCH;
 const DWELL: Duration = Duration::from_millis(1);
 
 #[derive(PartialEq, Eq)]
@@ -63,6 +63,9 @@ struct Entry {
 pub(super) struct IssuedBatcher {
     sender: mpsc::Sender<Entry>,
     slots: Arc<Semaphore>,
+    /// Entries admitted: every in-flight batch plus the one being collected.
+    #[cfg(test)]
+    admitted: usize,
     shutdown: CancellationToken,
 }
 
@@ -74,8 +77,9 @@ impl Drop for IssuedBatcher {
 }
 
 impl IssuedBatcher {
-    pub(super) fn new(ledger: Arc<dyn WorkLedger>) -> Self {
-        Self::with_dwell(ledger, DWELL)
+    /// `flights` batch transactions may be in flight at once, 1 to IN_FLIGHT.
+    pub(super) fn new(ledger: Arc<dyn WorkLedger>, flights: usize) -> Self {
+        Self::with_dwell(ledger, DWELL, flights)
     }
 
     // Existing session fixtures freeze time and deliberately prevent automatic
@@ -83,13 +87,13 @@ impl IssuedBatcher {
     // timer tick; dedicated collector tests exercise the production dwell.
     #[cfg(test)]
     pub(super) fn without_dwell_for_tests(ledger: Arc<dyn WorkLedger>) -> Self {
-        Self::with_dwell(ledger, Duration::ZERO)
+        Self::with_dwell(ledger, Duration::ZERO, IN_FLIGHT)
     }
 
     #[cfg(test)]
     pub(super) async fn wait_for_idle_for_tests(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while self.slots.available_permits() != ADMITTED {
+            while self.slots.available_permits() != self.admitted {
                 tokio::task::yield_now().await;
             }
         })
@@ -97,13 +101,17 @@ impl IssuedBatcher {
         .expect("issued collector did not finish");
     }
 
-    fn with_dwell(ledger: Arc<dyn WorkLedger>, dwell: Duration) -> Self {
-        let (sender, receiver) = mpsc::channel(ADMITTED);
+    fn with_dwell(ledger: Arc<dyn WorkLedger>, dwell: Duration, flights: usize) -> Self {
+        let flights = flights.clamp(1, IN_FLIGHT);
+        let admitted = (flights + 1) * BATCH;
+        let (sender, receiver) = mpsc::channel(admitted);
         let shutdown = CancellationToken::new();
-        tokio::spawn(run(ledger, receiver, shutdown.clone(), dwell));
+        tokio::spawn(run(ledger, receiver, shutdown.clone(), dwell, flights));
         Self {
             sender,
-            slots: Arc::new(Semaphore::new(ADMITTED)),
+            slots: Arc::new(Semaphore::new(admitted)),
+            #[cfg(test)]
+            admitted,
             shutdown,
         }
     }
@@ -188,10 +196,11 @@ async fn run(
     mut receiver: mpsc::Receiver<Entry>,
     shutdown: CancellationToken,
     dwell: Duration,
+    flights: usize,
 ) {
     // Each batch runs in its own task holding one of these flights until it
     // has answered its entries, after any rollback cleanup, so the batcher
-    // never holds more than IN_FLIGHT connections.
+    // never holds more than `flights` connections.
     //
     // Batches start in waves. Every batch holds the cluster row FOR KEY
     // SHARE, and PostgreSQL grants a new KEY SHARE past a queued FOR UPDATE
@@ -203,7 +212,8 @@ async fn run(
     // a new wave, which waits until every batch has finished. This
     // frontend's batches therefore keep such a writer waiting for at most
     // one wave, as one batch did when batches ran one at a time.
-    let flights = Arc::new(Semaphore::new(IN_FLIGHT));
+    let wave_size = flights;
+    let flights = Arc::new(Semaphore::new(wave_size));
     // The current wave's unspent flights. The collector holds every flight
     // not in a batch, so `flights` has one available only once a batch of
     // the wave has finished.
@@ -236,7 +246,7 @@ async fn run(
             reserve = Some(tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
-                all = flights.clone().acquire_many_owned(IN_FLIGHT as u32) => {
+                all = flights.clone().acquire_many_owned(wave_size as u32) => {
                     all.expect("issued batch flights are never closed")
                 }
             });

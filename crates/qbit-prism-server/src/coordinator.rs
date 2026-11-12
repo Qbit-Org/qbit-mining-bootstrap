@@ -1063,16 +1063,38 @@ impl<T: Send + 'static> Drop for OffRuntime<T> {
 /// Two connections are always left over, so a share append and the
 /// candidate-lease heartbeat never wait out the pool's 15 s acquire timeout
 /// behind multi-page window reads; a failed heartbeat drops recoverable claim
-/// work. The ceiling is `build_workers`, because a caller holds its
-/// `build_slots` permit across the read, so no more reads can be in flight
-/// than there are build slots. The floor is 1: one read at a time still makes
-/// progress, and `PRISM_DATABASE_MAX_CONNECTIONS` can be as low as 4 while the
-/// pool itself is opened with at least 2 connections.
+/// work. The issued-job batcher's transactions also draw on what is left
+/// over, one before #860; [`issued_batch_flights`] adds a second only where
+/// two connections still remain beside it. The ceiling is `build_workers`,
+/// because a caller holds its `build_slots` permit across the read, so no
+/// more reads can be in flight than there are build slots. The floor is 1:
+/// one read at a time still makes progress, and
+/// `PRISM_DATABASE_MAX_CONNECTIONS` can be as low as 4 while the pool itself
+/// is opened with at least 2 connections.
 fn window_read_permits(database_connections: u32, build_workers: usize) -> usize {
     usize::try_from(database_connections)
         .unwrap_or(usize::MAX)
         .saturating_sub(2)
         .clamp(1, build_workers.max(1))
+}
+
+/// How many issued-job batch transactions may hold a pool connection at once
+/// (#860): two when the pool leaves at least four connections beside
+/// [`window_read_permits`], otherwise one, as before #860.
+///
+/// The connections left over beside window reads and batches are for a share
+/// append and the candidate-lease heartbeat. A second batch never takes that
+/// leftover below two; where one batch already leaves fewer, the batcher
+/// stays at one, so nothing there changes.
+fn issued_batch_flights(database_connections: u32, build_workers: usize) -> usize {
+    let beside_window_reads = usize::try_from(database_connections)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(window_read_permits(database_connections, build_workers));
+    if beside_window_reads >= 4 {
+        2
+    } else {
+        1
+    }
 }
 
 fn protocol_error(reason: &'static str, message: &str) -> StratumError {
@@ -1389,10 +1411,13 @@ impl Coordinator {
                 config.database_connections,
                 config.build_workers,
             ))),
+            issued_batcher: issued_batcher::IssuedBatcher::new(
+                ledger.clone(),
+                issued_batch_flights(config.database_connections, config.build_workers),
+            ),
             config: Arc::new(config),
             submit_ledger: ledger.clone(),
             work_ledger: ledger.clone(),
-            issued_batcher: issued_batcher::IssuedBatcher::new(ledger.clone()),
             ledger,
             rpc,
             refresh,
