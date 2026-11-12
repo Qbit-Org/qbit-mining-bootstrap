@@ -2,8 +2,8 @@
 use super::work_ledger::WorkLedger;
 use crate::ledger::{CompactBatchAttempt, CompactDependency, CompactIssuedJob, IssuedJobSave};
 use anyhow::{anyhow, Context, Result};
-use futures_util::{stream::FuturesUnordered, StreamExt};
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+use std::{collections::VecDeque, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore},
     time::Instant,
@@ -189,45 +189,27 @@ async fn run(
     shutdown: CancellationToken,
     dwell: Duration,
 ) {
-    // Each batch runs in its own task holding one of these permits until it
+    // Each batch runs in its own task holding one of these flights until it
     // has answered its entries, after any rollback cleanup, so the batcher
-    // never holds more than IN_FLIGHT connections. A permit is taken before
-    // a batch's first entry: entries wait only in `pending` or the channel,
-    // where their own deadlines and cancellation still apply, never inside
-    // a closed batch.
+    // never holds more than IN_FLIGHT connections.
     //
     // Batches start in waves. Every batch holds the cluster row FOR KEY
     // SHARE, and PostgreSQL grants a new KEY SHARE past a queued FOR UPDATE
     // while only compatible holders remain, so back-to-back overlapping
     // batches would keep an authority writer or blob GC (which wait there
     // holding ORDER_LOCK, and so every share append) out for a whole
-    // fan-out. A wave may grow to IN_FLIGHT only while none of its batches
-    // has finished; once one has, the next batch waits until all have, so
-    // such a writer waits for at most one wave, as it waited for one batch
-    // when batches ran one at a time.
+    // fan-out. A batch joins the current wave only while the wave has an
+    // unspent flight and none of its batches has finished; otherwise it opens
+    // a new wave, which waits until every batch has finished. This
+    // frontend's batches therefore keep such a writer waiting for at most
+    // one wave, as one batch did when batches ran one at a time.
     let flights = Arc::new(Semaphore::new(IN_FLIGHT));
-    let mut wave = 0;
+    // The current wave's unspent flights. The collector holds every flight
+    // not in a batch, so `flights` has one available only once a batch of
+    // the wave has finished.
+    let mut reserve: Option<OwnedSemaphorePermit> = None;
     let mut pending = VecDeque::new();
     'collect: loop {
-        // Between batches the collector holds no flight, so `wave` batches
-        // in flight leave exactly IN_FLIGHT - wave free until one finishes.
-        let open = wave > 0 && wave < IN_FLIGHT && flights.available_permits() == IN_FLIGHT - wave;
-        let flight = if open {
-            flights
-                .clone()
-                .try_acquire_owned()
-                .expect("an open wave has a free flight")
-        } else {
-            let mut all = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => break,
-                all = flights.clone().acquire_many_owned(IN_FLIGHT as u32) => {
-                    all.expect("issued batch flights are never closed")
-                }
-            };
-            wave = 0;
-            all.split(1).expect("a wave holds every flight")
-        };
         discard_expired(&mut pending);
         let first = if let Some(first) = pending.pop_front() {
             first
@@ -244,6 +226,29 @@ async fn run(
             )));
             continue;
         }
+        // Decided with the batch's first entry in hand, so a flight left
+        // over from a finished burst never makes the next burst's first
+        // batch run alone. While a wave drains, this entry waits here; its
+        // caller's own deadline still answers it, and the batch is filtered
+        // for live entries before it starts.
+        if reserve.is_none() || flights.available_permits() > 0 {
+            drop(reserve.take());
+            reserve = Some(tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                all = flights.clone().acquire_many_owned(IN_FLIGHT as u32) => {
+                    all.expect("issued batch flights are never closed")
+                }
+            });
+        }
+        let mut unspent = reserve.take().expect("a wave is open");
+        let flight = if unspent.num_permits() > 1 {
+            let flight = unspent.split(1).expect("an open wave has a flight");
+            reserve = Some(unspent);
+            flight
+        } else {
+            unspent
+        };
         let mut flush = (first.admitted + dwell).min(first.deadline);
         let mut batch = vec![first];
         // Select the oldest group first. Other groups retain FIFO order and may
@@ -292,15 +297,26 @@ async fn run(
             })
             .collect();
         if batch.is_empty() {
+            // Not spent after all: the flight goes back to its wave.
+            match reserve.as_mut() {
+                Some(unspent) => unspent.merge(flight),
+                None => reserve = Some(flight),
+            }
             continue;
         }
-        wave += 1;
-        tokio::spawn(save_issued_batch_in_flight(
+        let batch = AssertUnwindSafe(save_issued_batch_in_flight(
             ledger.clone(),
             batch,
             shutdown.clone(),
             flight,
         ));
+        tokio::spawn(async move {
+            // A panic drops the batch's entries, so its callers read the
+            // batcher as shut down although the collector carries on.
+            if batch.catch_unwind().await.is_err() {
+                tracing::error!("compact issued batch task panicked; its callers were refused");
+            }
+        });
     }
     // Dropping pending entries and receiver resolves their response channels
     // and releases their permits. Each in-flight batch answers its own
@@ -326,6 +342,13 @@ async fn save_issued_batch_in_flight(
         .map(|entry| entry.canceled.cancelled())
         .collect();
     let started = Instant::now();
+    // From the oldest child's admission: its wait for a flight, a draining
+    // wave and the collection dwell, on this frontend's monotonic clock.
+    let queued = batch
+        .iter()
+        .map(|entry| started.saturating_duration_since(entry.admitted))
+        .max()
+        .unwrap();
     let result = tokio::select! {
         biased;
         _ = shutdown.cancelled() => Err(interrupted(&attempt, "shutdown")),
@@ -342,6 +365,7 @@ async fn save_issued_batch_in_flight(
     // time estimate.
     tracing::debug!(
         children = batch.len(),
+        queued_ms = queued.as_secs_f64() * 1000.0,
         storage_ms = started.elapsed().as_secs_f64() * 1000.0,
         success = result.is_ok(),
         commit_started = attempt.commit_started(),

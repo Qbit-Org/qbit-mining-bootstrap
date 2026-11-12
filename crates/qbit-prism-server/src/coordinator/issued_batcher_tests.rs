@@ -142,13 +142,14 @@ async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
     })
     .await
     .unwrap();
-    // No batch starts beyond the in-flight bound: every other admitted entry
-    // waits in the channel, and admission refuses more.
+    // No batch starts beyond the in-flight bound: the next batch's first
+    // entry waits in the collector for the wave to drain, every other
+    // admitted entry in the channel, and admission refuses more.
     assert_eq!(
         f.store.compact.batch_calls.lock().unwrap().as_slice(),
         &[1; IN_FLIGHT]
     );
-    assert_eq!(batcher.sender.capacity(), IN_FLIGHT);
+    assert_eq!(batcher.sender.capacity(), IN_FLIGHT + 1);
     requests[0].abort();
     // The first held batch's only caller leaves before COMMIT: its attempt
     // ends and closes the wave; the queue starts once the others finish.
@@ -814,5 +815,45 @@ async fn a_finished_batch_closes_its_wave_until_the_others_finish() {
     assert_eq!(
         f.store.compact.batch_calls.lock().unwrap().as_slice(),
         &[1; IN_FLIGHT + 1]
+    );
+}
+
+/// #860: a burst that ended on a lone batch leaves no half-spent wave behind:
+/// the next burst's first two batches overlap.
+#[tokio::test]
+async fn a_burst_after_a_lone_batch_starts_a_fresh_wave() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    tokio::time::pause();
+    assert_eq!(
+        enqueue(batcher.clone(), prepared.clone(), "lone", 300_000)
+            .await
+            .unwrap()
+            .unwrap(),
+        IssuedJobSave::Saved
+    );
+    settled(&batcher).await;
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    let first = enqueue(batcher.clone(), prepared.clone(), "burst-0", 300_000);
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    let second = enqueue(batcher.clone(), prepared, "burst-1", 300_000);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the burst's second batch waited for its first")
+            .unwrap()
+            .unwrap(),
+        IssuedJobSave::Saved
+    );
+    assert!(!first.is_finished());
+    gate.release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    settled(&batcher).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1, 1, 1]
     );
 }
