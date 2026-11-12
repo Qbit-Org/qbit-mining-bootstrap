@@ -38,6 +38,35 @@ fn enqueue(
     })
 }
 
+/// Occupy every in-flight slot with a one-child batch held inside the fake's
+/// save gate, in order. Later entries wait for a flight in the channel.
+async fn hold_flights(
+    f: &Fixture,
+    batcher: &Arc<IssuedBatcher>,
+    prepared: &Arc<Prepared>,
+) -> Vec<(tokio::task::JoinHandle<Result<IssuedJobSave>>, Arc<Gate>)> {
+    let mut held = Vec::new();
+    for i in 0..IN_FLIGHT {
+        let gate = Arc::new(Gate::default());
+        *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+        let request = enqueue(
+            batcher.clone(),
+            prepared.clone(),
+            &format!("held-{i}"),
+            300_000,
+        );
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("held batch did not reach the save gate");
+        held.push((request, gate));
+    }
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1; IN_FLIGHT]
+    );
+    held
+}
+
 async fn settled(batcher: &IssuedBatcher) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while batcher.slots.available_permits() != ADMITTED {
@@ -96,17 +125,9 @@ async fn real_coordinator_fan_in_and_singleton_keep_durable_children() {
 async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
     let (f, prepared) = fixture().await;
     let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
-    let gate = Arc::new(Gate::default());
-    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
-    let first = enqueue(
-        batcher.clone(),
-        prepared.clone(),
-        "active-canceled",
-        300_000,
-    );
-    gate.entered.notified().await;
+    let mut held = hold_flights(&f, &batcher, &prepared).await;
     let mut requests = Vec::new();
-    for i in 0..ADMITTED {
+    for i in 0..ADMITTED - IN_FLIGHT {
         requests.push(enqueue(
             batcher.clone(),
             prepared.clone(),
@@ -121,9 +142,17 @@ async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
     })
     .await
     .unwrap();
-    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[1]);
-    assert_eq!(batcher.sender.capacity(), 1); // 127 queued plus one active.
+    // No batch starts beyond the in-flight bound: every other admitted entry
+    // waits in the channel, and admission refuses more.
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1; IN_FLIGHT]
+    );
+    assert_eq!(batcher.sender.capacity(), IN_FLIGHT);
     requests[0].abort();
+    // The first held batch's only caller leaves before COMMIT: its attempt
+    // ends, which frees one flight for the queue; the other stays held.
+    let (first, _) = held.remove(0);
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     for (i, request) in requests.into_iter().enumerate() {
@@ -133,9 +162,13 @@ async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
             assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
         }
     }
+    for (request, gate) in held {
+        gate.release.notify_one();
+        assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    }
     settled(&batcher).await;
     let rows = f.store.jobs.lock().unwrap();
-    assert!(!rows.contains_key("active-canceled") && !rows.contains_key("pending-0"));
+    assert!(!rows.contains_key("held-0") && !rows.contains_key("pending-0"));
     assert!(f
         .store
         .compact
@@ -389,17 +422,20 @@ async fn lost_commit_acknowledgement_is_uncertain_and_exact_retry_is_idempotent(
 async fn shutdown_closes_active_and_queued_waiters_without_a_self_owned_worker() {
     let (f, prepared) = fixture().await;
     let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
-    let gate = Arc::new(Gate::default());
-    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
-    let first = enqueue(batcher.clone(), prepared.clone(), "active", 300_000);
-    gate.entered.notified().await;
+    let held = hold_flights(&f, &batcher, &prepared).await;
     let pending = enqueue(batcher.clone(), prepared, "pending", 300_000);
     tokio::task::yield_now().await;
     batcher.shutdown.cancel();
-    assert!(first.await.unwrap().is_err());
+    for (request, _) in held {
+        assert!(request.await.unwrap().is_err());
+    }
     assert!(pending.await.unwrap().is_err());
     settled(&batcher).await;
-    assert!(!f.store.jobs.lock().unwrap().contains_key("active"));
+    {
+        let rows = f.store.jobs.lock().unwrap();
+        assert!((0..IN_FLIGHT).all(|i| !rows.contains_key(&format!("held-{i}"))));
+        assert!(!rows.contains_key("pending"));
+    }
     let weak = Arc::downgrade(&f.store);
     drop(batcher);
     drop(f);
@@ -414,10 +450,7 @@ async fn original_deadline_includes_queue_and_revocation_after_commit_suppresses
     use crate::stratum::MiningBackend;
     let (f, prepared) = fixture().await;
     let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
-    let gate = Arc::new(Gate::default());
-    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
-    let first = enqueue(batcher.clone(), prepared.clone(), "blocked", 300_000);
-    gate.entered.notified().await;
+    let held = hold_flights(&f, &batcher, &prepared).await;
     let expired = batcher
         .save(
             "expired",
@@ -431,8 +464,10 @@ async fn original_deadline_includes_queue_and_revocation_after_commit_suppresses
         .await
         .unwrap_err();
     assert!(expired.to_string().contains("deadline"));
-    first.abort();
-    let _ = first.await;
+    for (request, _) in held {
+        request.abort();
+        let _ = request.await;
+    }
     settled(&batcher).await;
     assert!(!f.store.jobs.lock().unwrap().contains_key("expired"));
 
@@ -545,4 +580,203 @@ async fn failed_group_does_not_poison_later_compatible_children() {
     for (i, (id, _)) in inputs.iter().enumerate() {
         assert_eq!(rows.contains_key(id), i >= 2);
     }
+}
+
+/// #860: a session's batch for the old tip is in flight when a new tip
+/// publishes newer work. The newer work's batch overlaps it, commits, and its
+/// session is answered first. The new tip moved the payout revision, so:
+/// - held before its checks, the old batch fails on the revision as it does
+///   today, and answers only its own entry;
+/// - held with COMMIT in flight (PostgreSQL's cluster-row fence orders the
+///   revision move after such a commit), its immutable row lands, but its
+///   session is refused: each caller revalidates its own publication after
+///   its own batch, whatever order the batches end in.
+#[tokio::test]
+async fn overlapping_batch_for_a_superseded_group_cannot_deliver_old_work() {
+    use crate::coordinator::miner_tests::hash;
+    use crate::stratum::MiningBackend;
+    for commit_in_flight in [false, true] {
+        let (f, old_prepared) = fixture().await;
+        let worker = f.job(1, 0, "original.worker").context.worker.clone();
+        let old = f
+            .coordinator
+            .build_job(&worker, "000000a1", 1e-12, 0.0)
+            .await
+            .unwrap();
+        let old_id = old.wire.job_id.clone();
+        let gate = Arc::new(Gate::default());
+        if commit_in_flight {
+            *f.store.compact.batch_commit_gate.lock().unwrap() = Some(gate.clone());
+        } else {
+            *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+        }
+        let saving = {
+            let coordinator = f.coordinator.clone();
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .save_issued_record(&worker, &old, 0, Duration::from_secs(30))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let revision = f.store.revision.load(Ordering::SeqCst);
+        f.node.lock().unwrap().tip = hash(2);
+        f.coordinator.refresh_once().await.unwrap();
+        assert_eq!(f.store.revision.load(Ordering::SeqCst), revision + 1);
+        let new_prepared = f.coordinator.prepared.read().await.clone().unwrap();
+        assert_ne!(new_prepared.storage_key, old_prepared.storage_key);
+        let new = f
+            .coordinator
+            .build_job(&worker, "000000a2", 1e-12, 0.0)
+            .await
+            .unwrap();
+        // One batch at a time could not start this until the old one ended.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            f.coordinator
+                .save_issued_record(&worker, &new, 0, Duration::from_secs(30)),
+        )
+        .await
+        .expect("the new group's batch waited for the superseded one")
+        .unwrap();
+        assert!(!saving.is_finished());
+        gate.release.notify_one();
+        let refused = tokio::time::timeout(Duration::from_secs(5), saving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        // The batch's own revision check, or the caller's revalidation of
+        // its publication after a commit on superseded work.
+        let refused = format!("{refused:#}");
+        let expected = if commit_in_flight {
+            "payout snapshot stale"
+        } else {
+            "revision changed"
+        };
+        assert!(refused.contains(expected), "{refused}");
+        f.coordinator.issued_batcher.wait_for_idle_for_tests().await;
+        let keys: Vec<_> = f
+            .store
+            .compact
+            .issued_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| (call.id.clone(), call.key.clone()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (old_id.clone(), old_prepared.storage_key.clone()),
+                (new.wire.job_id.clone(), new_prepared.storage_key.clone()),
+            ]
+        );
+        let rows = f.store.jobs.lock().unwrap();
+        assert!(rows.contains_key(&new.wire.job_id));
+        assert_eq!(rows.contains_key(&old_id), commit_in_flight);
+    }
+}
+
+/// #860: a batch that fails answers only its own entries. Its neighbour in
+/// flight, for the same group, commits while it is held and is not failed by
+/// it; every entry of both gets exactly its own batch's answer.
+#[tokio::test]
+async fn failed_batch_answers_only_its_own_entries_beside_a_committing_one() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    tokio::time::pause();
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    let failing: Vec<_> = (0..2)
+        .map(|i| {
+            enqueue(
+                batcher.clone(),
+                prepared.clone(),
+                &format!("fails-{i}"),
+                300_000,
+            )
+        })
+        .collect();
+    gate.entered.notified().await;
+    let committing: Vec<_> = (0..3)
+        .map(|i| {
+            enqueue(
+                batcher.clone(),
+                prepared.clone(),
+                &format!("commits-{i}"),
+                300_000,
+            )
+        })
+        .collect();
+    for request in committing {
+        assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    }
+    assert!(failing.iter().all(|request| !request.is_finished()));
+    f.store.fail_save.store(true, Ordering::SeqCst);
+    gate.release.notify_one();
+    for request in failing {
+        let error = request.await.unwrap().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("controlled persistence failure"),
+            "{error:#}"
+        );
+    }
+    f.store.fail_save.store(false, Ordering::SeqCst);
+    settled(&batcher).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[2, 3]
+    );
+    let rows = f.store.jobs.lock().unwrap();
+    assert!((0..2).all(|i| !rows.contains_key(&format!("fails-{i}"))));
+    assert!((0..3).all(|i| rows.contains_key(&format!("commits-{i}"))));
+}
+
+/// #860: with every flight held, a queued entry's own deadline still ends its
+/// wait exactly as before the bound: the caller is answered at its deadline,
+/// the entry never reaches SQL, and its admission slot is released.
+#[tokio::test]
+async fn entry_deadline_passing_while_every_flight_is_held_is_answered_and_never_saved() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone()));
+    tokio::time::pause();
+    let held = hold_flights(&f, &batcher, &prepared).await;
+    let started = Instant::now();
+    let late = batcher
+        .save(
+            "late",
+            &json!({"prepared_key": prepared.storage_key, "expires_at_ms": 300_000}),
+            0,
+            &prepared.reservation.record.parent_hash,
+            300_000,
+            prepared.reservation.dependency(&prepared.storage_key),
+            started + Duration::from_millis(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() >= Duration::from_millis(5));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(late.to_string().contains("deadline elapsed"), "{late:#}");
+    for (request, gate) in held {
+        gate.release.notify_one();
+        assert_eq!(request.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    }
+    settled(&batcher).await;
+    assert!(f
+        .store
+        .compact
+        .issued_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| call.id != "late"));
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1; IN_FLIGHT]
+    );
+    assert!(!f.store.jobs.lock().unwrap().contains_key("late"));
 }
