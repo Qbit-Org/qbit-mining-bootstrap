@@ -697,7 +697,7 @@ id = "mainnet-shapes-reduced-l3"
 title = "The mainnet-shape presets (130, 650 and 2,600 addresses) and rental churn in the reduced weekly L3"
 owner = "#555"
 lanes = ["nightly", "dispatch", "L3"]
-criteria = "Each preset's gates on the L3 runner class (decision 11)."
+criteria = "Each preset's gates on the L3 runner class (decision 11); mainnet-shape-2600-addresses's are reported, not gated, in the suite (#695)."
 runs = true
 suites = ["l3-reduced"]
 presets = [
@@ -706,7 +706,7 @@ presets = [
   "mainnet-shape-2600-addresses",
   "rental-churn-bursts-and-storms",
 ]
-notes = "l3-reduced runs each once a week on the 32 vCPU class, beside their nightly (8 vCPU) or dispatch (16 vCPU) runs; rates compare only within one class. Not D1 verdicts."
+notes = "l3-reduced runs each once a week on the 32 vCPU class, beside their nightly (8 vCPU) or dispatch (16 vCPU) runs; rates compare only within one class. Not D1 verdicts. The 20x shape (2,600 addresses) is report-only in l3-reduced (#695, #555 decision 5): it runs past the share append's ORDER_LOCK ceiling, so its capacity budgets (shortfall, latency) are collated, labelled not gated, outside the suite verdict, while every other check (harness exit 0, durability, every gated phase run, every tip measured, a gate verdict, refused valid shares and unanswered submits at its budget of 0 bar the refusals its commit deadline answers in a phase short of its rate, #847) still fails the suite; run on its own (dispatch) its gates still fail it."
 
 # ---------------------------------------------------------------------------
 # Faults under load (#554, #487 S16). The load harness's `faults` phase

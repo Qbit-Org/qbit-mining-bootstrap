@@ -7,7 +7,9 @@
 //! `--collate <plan.json>` instead renders one build's L3 suite (#550): every
 //! preset of the plan in #473's document tables, from the run jobs'
 //! artifacts under `--runs-dir`. Exit 0 when every planned run reached its
-//! gate and passed it, 1 when not, 2 when the inputs cannot be read.
+//! gate and every gated run passed it (a report-only run, #695, must hold
+//! every check but its capacity budgets, the harness's exit 0 among them), 1
+//! when not, 2 when the inputs cannot be read.
 
 use clap::Parser;
 use qbit_prism_load::{collate, compare, gate, preset::Preset};

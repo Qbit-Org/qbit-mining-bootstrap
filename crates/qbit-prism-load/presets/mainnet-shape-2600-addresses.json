@@ -15,8 +15,8 @@
       "reconnect"
     ],
     "max_shortfall": 0,
-    "max_rejected_valid_shares": null,
-    "max_unanswered_submits": null,
+    "max_rejected_valid_shares": 0,
+    "max_unanswered_submits": 0,
     "tip_last_notify_p99_budget_ms": 5000,
     "d1_verdict_table": false,
     "churn_tip_last_notify_p99_budget_ms": null,

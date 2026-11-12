@@ -1006,7 +1006,7 @@ it.
 | Suite | Presets | Repeats | Runner |
 |---|---|---|---|
 | `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, the 3-block run, dense cadence at fe1 and fe2, 500k fe1/2/4 | 3 | 32 vCPU |
-| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; the 5,000 and 10,000 session points (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521) | 1 | 32 vCPU |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; the 5,000 and 10,000 session points (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521); `mainnet-shape-2600-addresses` report-only (#695) | 1 | 32 vCPU |
 
 The runner is the 32 vCPU class until #542 picks one per lane.
 `.github/workflows/prism-load-l3.yml` runs `l3-full` on a pull request into
@@ -1020,8 +1020,32 @@ D1 phase a row per preset with its sessions, window, frontends, replication
 and plan, and #511's cells. A planned run whose job left no artifact, or
 whose report names another commit or another preset file, is listed and
 fails the suite; it is never dropped. The collate job writes a verdict,
-`complete` when every run reached its gate and `passed` when every one passed
-it, as the artifact `prism-l3-verdict-<tree>`.
+`complete` when every planned run reached its gate and `passed` when every
+gated run passed it and every report-only run held every check but its
+capacity budgets, as the artifact `prism-l3-verdict-<tree>`.
+
+A suite may name some of its presets in `report_only` (#695): their matrix
+entries carry `gated: false`, their run step is gated by their preset but is
+`continue-on-error` (the job's other steps are not, and a harness failure or
+a gate with no verdict still fails the job), and the collation shows their
+numbers and failed checks labelled `report-only, not gated`. Only their
+capacity budgets (shortfall and the latency budgets) are exempt, and refused
+valid shares answered as a commit deadline in a phase short of its rate are
+set aside: the collation re-evaluates such a run that way and fails the
+suite on any other check, so it must reach its gate with harness exit 0
+(completed, reconciled exactly), no durability finding, every gated phase
+run, every tip measured, unanswered submits within budget, and refused valid
+shares within budget once those answered `share was not confirmed by the
+database` in a phase short of its rate (a commit deadline passing under
+overload) are set aside (#847), and it shows and records how many were. A
+report-only preset must budget both refused valid shares and unanswered
+submits; the matrix and the collation refuse one that does not. A tag never
+promotes a verdict with a report-only run.
+`l3-reduced` runs the 20x growth shape, `mainnet-shape-2600-addresses`, this
+way: it runs past the share append's `ORDER_LOCK` ceiling (#695), a
+capacity-envelope point, not a verdict (#555 decision 5). Outside a suite no
+entry carries `gated`, so a preset run on its own is always held to its
+gates. A plan entry without `gated` is gated.
 
 A tag promotes instead of rerunning when the newest finished pull request
 run of `l3-full` from this repository recorded a complete verdict for the

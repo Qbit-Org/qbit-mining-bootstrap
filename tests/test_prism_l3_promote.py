@@ -137,6 +137,18 @@ class Decide(unittest.TestCase):
         self.assertFalse(decision["verdict"]["passed"])
         self.assertIn("not every run passed", decision["reason"])
 
+    def test_a_verdict_that_counts_gated_runs_is_promoted_only_when_all_are(self) -> None:
+        # #695: the collation's verdict counts the gated runs. A suite with a
+        # report-only run is not release evidence, so it is never promoted.
+        every = verdict(gated_runs=33, planned=33, runs=[{"id": "p-r1", "gated": True}])
+        gh = FakeGh([(run(10), every, "2026-09-30T10:00:00Z")])
+        self.assertTrue(promote.decide(gh, REPO, TREE, THIS_RUN)["promote"])
+        partly = verdict(gated_runs=32, planned=33)
+        gh = FakeGh([(run(10), partly, "2026-09-30T10:00:00Z")])
+        decision = promote.decide(gh, REPO, TREE, THIS_RUN)
+        self.assertFalse(decision["promote"], decision)
+        self.assertIn("report-only", json.dumps(decision))
+
     def test_this_run_is_never_its_own_source(self) -> None:
         gh = FakeGh([(run(THIS_RUN), verdict(), "2026-09-30T10:00:00Z")])
         self.assertFalse(promote.decide(gh, REPO, TREE, THIS_RUN)["promote"])
