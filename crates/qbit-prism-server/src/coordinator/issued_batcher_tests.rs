@@ -638,7 +638,10 @@ async fn overlapping_batch_for_a_superseded_group_cannot_deliver_old_work() {
             .build_job(&worker, "000000a2", 1e-12, 0.0)
             .await
             .unwrap();
-        // One batch at a time could not start this until the old one ended.
+        // The fixture's join window is unlimited, so this batch overlaps the
+        // held one, as a new group's batch queued with an old group's does in
+        // production. Either way, out-of-order completion must not deliver
+        // old work.
         tokio::time::timeout(
             Duration::from_secs(5),
             f.coordinator

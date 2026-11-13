@@ -26,8 +26,12 @@ const BATCH: usize = 64;
 pub(super) const IN_FLIGHT: usize = 2;
 /// How long after a wave's first batch starts another may still join it. A
 /// fan-out's batches are queued already and join within microseconds; a later
-/// batch waits for the wave, so a queued FOR UPDATE on the cluster row waits
-/// for about one batch, as before #860, not for a batch that joined late.
+/// batch waits for the wave, so a FOR UPDATE queued on the cluster row behind
+/// the wave waits for its first batch and a second that started with it.
+/// The window bounds when the second batch starts, not when it takes its
+/// KEY SHARE: one that first waits for a pool connection can still take it
+/// past the queued writer, which then waits for that batch too (on a
+/// saturated pool, up to about two batch durations).
 const JOIN: Duration = Duration::from_millis(2);
 const DWELL: Duration = Duration::from_millis(1);
 
@@ -111,9 +115,10 @@ impl IssuedBatcher {
         Self::with_options(ledger, DWELL, flights, join)
     }
 
-    /// Every admission slot is free again. A batch task releases its flight
-    /// in the same poll that answers its last entry; the collector keeps an
-    /// idle wave's unspent flights, so flights are not a sign of idleness.
+    /// Every admission slot is free again. Unless it panicked, a batch task
+    /// releases its flight in the same poll that answers its last entry; the
+    /// collector keeps an idle wave's unspent flights, so flights are not a
+    /// sign of idleness.
     #[cfg(test)]
     pub(super) async fn wait_for_idle_for_tests(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -253,8 +258,8 @@ async fn run(
     // unspent flight, none of its batches has finished, and its first batch
     // started at most JOIN ago; otherwise it opens a new wave, which waits
     // until every batch has finished. This frontend's batches therefore keep
-    // such a writer waiting for about one batch, as when batches ran one at a
-    // time.
+    // such a writer waiting for one wave: its first batch and a second that
+    // started with it (see JOIN for a second batch's pool wait).
     let Waves {
         flights,
         size: wave_size,
@@ -373,6 +378,7 @@ async fn run(
         let ledger = ledger.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
+            let children = batch.len();
             let deadline = batch.iter().map(|entry| entry.deadline).min().unwrap();
             let attempt = CompactBatchAttempt::new(deadline);
             let saved = AssertUnwindSafe(save_issued_batch_in_flight(
@@ -387,7 +393,11 @@ async fn run(
             attempt.wait_for_cleanup().await;
             drop(flight);
             if saved.is_err() {
-                tracing::error!("compact issued batch task panicked; its callers were refused");
+                tracing::error!(
+                    children,
+                    commit_started = attempt.commit_started(),
+                    "compact issued batch task panicked; its callers were refused as shut down"
+                );
             }
         });
     }
