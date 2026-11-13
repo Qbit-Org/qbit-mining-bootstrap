@@ -258,7 +258,7 @@ The design spike's nine Python consumers reconcile to these native ones:
 - **Block solver attribution** (four dashboard queries): moved onto
   `qbit_pool_blocks` by 016 and written at landing. Unaffected by detach.
 - **`accepted_share_count` and `distinct_miner_count`** in
-  `/audit/latest-evidence`: read from `qbit_hashrate_rollup_pool` and
+  `/audit/latest`: read from `qbit_hashrate_rollup_pool` and
   `qbit_hashrate_rollup_miner` at the daily grain plus the raw tail, which
   the rollup sweep folds before any partition can leave (rule 3 above).
   Unaffected by detach.

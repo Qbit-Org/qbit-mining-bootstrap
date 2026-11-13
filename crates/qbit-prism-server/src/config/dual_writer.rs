@@ -12,7 +12,10 @@ use crate::node_identity::{NodeIdentity, NodeIndex};
 pub const DEFAULT_PEER_SYNC_INTERVAL_MS: u64 = 250;
 const PEER_SYNC_INTERVAL_MS: std::ops::RangeInclusive<u64> = 10..=60_000;
 /// `PRISM_PEER_SYNC_BATCH_ROWS` when unset: the most rows of one stream one
-/// pull reads from the peer and inserts in one local transaction.
+/// pull reads from the peer. A share batch is inserted in one local
+/// transaction; a prepared batch in chunks of at most 1,000 jobs and 2 MiB
+/// (a job whose blobs alone are larger goes alone), each its own
+/// transaction (#785).
 pub const DEFAULT_PEER_SYNC_BATCH_ROWS: u32 = 5000;
 /// At most 20,000: a batch is one statement on the peer, rows and header
 /// mappings built into JSON, which must finish inside its 8 s timeout.
