@@ -1749,7 +1749,7 @@ class CiWorkflowTests(unittest.TestCase):
                         self.assertTrue(condition in ("${{ " + RUN + " }}",) or condition.endswith(" && " + RUN)
                                         or condition.endswith(" && " + RUN + " }}"), condition)
                         self.assertFalse(status_function(condition.replace("!cancelled()", "")), condition)
-        self.assertIn(f"        image: ${{{{ {RUN} && 'postgres:16' || '' }}}}\n", self.jobs["prism-native-postgres"])
+        self.assertIn(f"        image: ${{{{ {RUN} && 'postgres:16.15' || '' }}}}\n", self.jobs["prism-native-postgres"])
 
     def test_the_aggregate_check_needs_no_checkout_and_accepts_only_the_job_level_skips(self) -> None:
         job = self.jobs["checks"]
