@@ -425,6 +425,546 @@ async fn chart_rollups_read_only_the_partial_buckets_under_any_plan() -> Result<
     f.close(result).await
 }
 
+/// The dashboard queries as 3.1.1 shipped them, before #857.
+mod dashboard_3_1_1 {
+    pub(super) const MINER_SHARE_SUMMARY: &str =
+        include_str!("fixtures/dashboard_queries_3_1_1/dashboard_miner_share_summary.sql");
+    pub(super) const REWARD_LEADERBOARD: &str =
+        include_str!("fixtures/dashboard_queries_3_1_1/dashboard_reward_leaderboard.sql");
+    pub(super) const POOL_SNAPSHOT: &str =
+        include_str!("fixtures/dashboard_queries_3_1_1/dashboard_pool_snapshot.sql");
+    pub(super) const BLOCKS: &str =
+        include_str!("fixtures/dashboard_queries_3_1_1/dashboard_blocks.sql");
+}
+const MINER_SHARE_SUMMARY: &str =
+    include_str!("../src/api/queries/dashboard_miner_share_summary.sql");
+const MINER_REWARD_SHARE: &str =
+    include_str!("../src/api/queries/dashboard_miner_reward_share.sql");
+const POOL_SNAPSHOT: &str = include_str!("../src/api/queries/dashboard_pool_snapshot.sql");
+const POOL_HASHRATE: &str = include_str!("../src/api/queries/dashboard_pool_hashrate.sql");
+const POOL_HASHRATE_ROLLUPS: &str =
+    include_str!("../src/api/queries/dashboard_pool_hashrate_rollups.sql");
+const BLOCKS: &str = include_str!("../src/api/queries/dashboard_blocks.sql");
+
+/// Compares the 3.1.1 answer `read` returns with the new one.
+async fn same_answer<F, Fut>(what: &str, read: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(Value, Value)>>,
+{
+    let (old, new) = read().await?;
+    ensure!(old == new, "{what}: 3.1.1 {old} vs now {new}");
+    Ok(())
+}
+
+/// A pool on `pool`'s database whose sessions read `clock_timestamp()` as
+/// `at`, from `qbit_test_clock`, which their `search_path` puts before
+/// `pg_catalog`. The 3.1.1 statements and their rewrites read only that
+/// clock, so on this pool both answer at one instant, every run: a share
+/// placed on a window or bucket edge relative to `at` is on the edge they
+/// read, and none can cross it between the two statements. Its sessions
+/// keep the ledger pool's statement, lock and checkout timeouts.
+async fn pinned_clock_pool(pool: &PgPool, at: i64) -> Result<PgPool> {
+    sqlx::raw_sql(
+        "CREATE SCHEMA qbit_test_clock;\
+         CREATE TABLE qbit_test_clock.pinned(at timestamptz NOT NULL);\
+         CREATE FUNCTION qbit_test_clock.clock_timestamp() RETURNS timestamptz \
+         LANGUAGE sql VOLATILE AS 'SELECT at FROM qbit_test_clock.pinned'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("INSERT INTO qbit_test_clock.pinned VALUES(to_timestamp($1))")
+        .bind(at as f64)
+        .execute(pool)
+        .await?;
+    let (schemas, statement_timeout, lock_timeout): (String, String, String) = sqlx::query_as(
+        "SELECT current_setting('search_path'),current_setting('statement_timeout'),current_setting('lock_timeout')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let path = format!("qbit_test_clock, pg_catalog, {schemas}");
+    let pinned = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(15))
+        .after_connect(move |connection, _| {
+            let settings = (path.clone(), statement_timeout.clone(), lock_timeout.clone());
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path',$1,false),set_config('statement_timeout',$2,false),set_config('lock_timeout',$3,false)")
+                    .bind(settings.0)
+                    .bind(settings.1)
+                    .bind(settings.2)
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await?;
+    let read: f64 = sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::float8")
+        .fetch_one(&pinned)
+        .await?;
+    ensure!(read == at as f64, "the pinned clock reads {read}, not {at}");
+    Ok(pinned)
+}
+
+/// Moves `pinned_clock_pool`'s clock to `at`, in seconds since the epoch.
+async fn pin_clock(pool: &PgPool, at: f64) -> Result<()> {
+    sqlx::query("UPDATE qbit_test_clock.pinned SET at=to_timestamp($1)")
+        .bind(at)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Whether `dashboard_pool_hashrate_rollups.sql` reads the rollups at `at`:
+/// its readiness test, the share at or below the watermark inside the 24
+/// hours.
+async fn rollups_ready_at(pool: &PgPool, at: f64) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE((SELECT ledger.accepted_at >= to_timestamp($1) - interval '24 hours' \
+         FROM qbit_share_ledger ledger \
+         WHERE ledger.share_seq <= (SELECT last_share_seq FROM qbit_hashrate_rollup_progress WHERE singleton) \
+         ORDER BY ledger.share_seq DESC LIMIT 1), false)",
+    )
+    .bind(at)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// [`dashboard_queries_match_3_1_1`] with `pinned`'s clock at each of
+/// `instants`, then back at the first.
+async fn dashboard_queries_match_3_1_1_at(
+    pinned: &PgPool,
+    instants: &[f64],
+    phase: &str,
+) -> Result<()> {
+    for at in instants {
+        pin_clock(pinned, *at).await?;
+        dashboard_queries_match_3_1_1(pinned, &format!("{phase} at {at}")).await?;
+    }
+    pin_clock(pinned, instants[0]).await
+}
+
+/// Every #857 rewrite answers what its 3.1.1 query answers on the same data.
+async fn dashboard_queries_match_3_1_1(pool: &PgPool, phase: &str) -> Result<usize> {
+    let mut cases = 0;
+    for miner in ["alice", "bob", "carol", "eve", "nobody"] {
+        same_answer(&format!("{phase}: miner share summary {miner}"), || async {
+            let mut old: Value = sqlx::query_scalar(dashboard_3_1_1::MINER_SHARE_SUMMARY)
+                .bind(miner)
+                .fetch_one(pool)
+                .await?;
+            // The pool's 3-hour sum nothing read is what #857 dropped.
+            ensure!(old
+                .as_object_mut()
+                .unwrap()
+                .remove("pool_h3_difficulty")
+                .is_some());
+            let new: Value = sqlx::query_scalar(MINER_SHARE_SUMMARY)
+                .bind(miner)
+                .fetch_one(pool)
+                .await?;
+            Ok((old, new))
+        })
+        .await?;
+        cases += 1;
+        for difficulty in ["1000000", "250000", "1000000000"] {
+            same_answer(
+                &format!("{phase}: reward share {miner} at difficulty {difficulty}"),
+                || async {
+                    let board: Value = sqlx::query_scalar(dashboard_3_1_1::REWARD_LEADERBOARD)
+                        .bind(difficulty)
+                        .bind(None::<String>)
+                        .bind(miner)
+                        .bind(1i64)
+                        .bind(0i64)
+                        .fetch_one(pool)
+                        .await?;
+                    let row = &board["rows"][0];
+                    let old = json!({"counted_window_weight":board["counted_window_weight"],"counted_share_difficulty":row["counted_share_difficulty"],"share_percent":row["share_percent"]});
+                    let new: Value = sqlx::query_scalar(MINER_REWARD_SHARE)
+                        .bind(difficulty)
+                        .bind(miner)
+                        .fetch_one(pool)
+                        .await?;
+                    Ok((old, new))
+                },
+            )
+            .await?;
+            cases += 1;
+        }
+    }
+    for difficulty in ["1000000", "1000000000"] {
+        for hashrate_sql in [POOL_HASHRATE, POOL_HASHRATE_ROLLUPS] {
+            let sums = if hashrate_sql == POOL_HASHRATE {
+                "raw"
+            } else {
+                "rollup"
+            };
+            same_answer(
+                &format!("{phase}: pool snapshot with {sums} sums at difficulty {difficulty}"),
+                || async {
+                    let old: Value = sqlx::query_scalar(dashboard_3_1_1::POOL_SNAPSHOT)
+                        .bind(difficulty)
+                        .fetch_one(pool)
+                        .await?;
+                    let mut new: Value = sqlx::query_scalar(POOL_SNAPSHOT)
+                        .bind(difficulty)
+                        .fetch_one(pool)
+                        .await?;
+                    let sums: Value = sqlx::query_scalar(hashrate_sql).fetch_one(pool).await?;
+                    for (key, value) in sums.as_object().unwrap() {
+                        ensure!(new.get(key).is_none(), "{key} is read twice");
+                        new[key] = value.clone();
+                    }
+                    Ok((old, new))
+                },
+            )
+            .await?;
+            cases += 1;
+        }
+    }
+    for filter in ["active", "all", "reversed"] {
+        for (limit, offset) in [(100i64, 0i64), (2, 0), (2, 2), (2, 4), (3, 6), (1, 100)] {
+            let read = |sql: &'static str| {
+                sqlx::query_scalar::<_, Value>(sql)
+                    .bind(limit)
+                    .bind(offset)
+                    .bind(filter)
+                    .fetch_one(pool)
+            };
+            let (old, new) = (read(dashboard_3_1_1::BLOCKS).await?, read(BLOCKS).await?);
+            ensure!(
+                old == new,
+                "{phase}: blocks {filter} limit {limit} offset {offset}: 3.1.1 {old} vs now {new}"
+            );
+            cases += 1;
+        }
+    }
+    Ok(cases)
+}
+
+#[tokio::test]
+async fn dashboard_queries_answer_what_their_3_1_1_queries_answer() -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        // Every comparison reads one clock, pinned at `epoch`, so the shares
+        // placed below sit on the exact window and bucket edges the
+        // statements read, on every run. A fixed instant, mid-bucket: each
+        // window's first bucket is partial, so every slice below is where
+        // its comment says, and a statement that read the real clock, weeks
+        // later, would miss every share and fail.
+        let epoch: i64 = 1_789_999_950;
+        ensure!(epoch.rem_euclid(300) == 150);
+        let pinned = pinned_clock_pool(&f.pool, epoch).await?;
+        let cases = dashboard_queries_match_3_1_1(&pinned, "empty database").await?;
+        ensure!(cases == 42, "{cases} cases");
+        // Shares on each side of every window and 5-minute bucket edge the
+        // pool summary and the miner page read, others spread over 30 hours,
+        // one in the future; carol has a single share, nobody none.
+        let mut at = Vec::new();
+        let current = epoch.div_euclid(300) * 300;
+        at.extend([current - 1, current, current + 1]);
+        for span in [60i64, 300, 600, 3600, 10800, 86400] {
+            let edge = epoch - span;
+            let bucket = edge.div_euclid(300) * 300;
+            at.extend([edge - 1, edge, edge + 1, bucket - 1, bucket, bucket + 300]);
+        }
+        at.extend((0..120i64).map(|n| epoch - n * 800 - n * n));
+        at.push(epoch + 60);
+        for (n, t) in at.iter().enumerate() {
+            f.share(&format!("edge-{n}"), ["alice", "bob"][n % 2], *t, 100_000 + n as i64 * 7)
+                .await?;
+        }
+        f.share("carol-1", "carol", epoch - 1200, 333_333).await?;
+        // Miners that tell the 3-hour participants from the 24-hour ones:
+        // eve only older than 3 hours (in a whole bucket, and in the 3-hour
+        // window's first, partial, bucket just before it starts; a share
+        // past the watermark follows below); frank and grace each only in a
+        // partial slice, the current bucket and the 3-hour window's first
+        // bucket, so the miner rollups alone never count them.
+        f.share("eve-1", "eve", epoch - 5 * 3600, 444_444).await?;
+        f.share("eve-2", "eve", epoch - 10800 - 30, 444_445).await?;
+        f.share("frank-1", "frank", current.max(epoch - 20), 555_555)
+            .await?;
+        f.share("grace-1", "grace", epoch - 10800 + 20, 666_666)
+            .await?;
+        // henry only in the 24-hour window's first, partial, bucket. henry-2,
+        // the last share before the rollups advance, is the watermark's
+        // share: inside the 24 hours at every instant compared below.
+        f.share("henry-1", "henry", epoch - 86400 + 20, 777_777)
+            .await?;
+        f.share(
+            "henry-2",
+            "henry",
+            (epoch - 86400 + 299).div_euclid(300) * 300 - 1,
+            777_778,
+        )
+        .await?;
+        // Blocks in every chain state, a reversed one and a disconnected one
+        // whose publication makes it public as reversed, two at one height.
+        let found = epoch - 3600;
+        for (n, height, state) in [
+            (1u8, 101i64, "confirmed"),
+            (2, 102, "confirmed"),
+            (3, 103, "reversed"),
+            (4, 104, "confirmed"),
+            (5, 105, "prepared"),
+            (6, 106, "rejected"),
+            (7, 107, "inactive"),
+            (8, 108, "inactive"),
+            (9, 109, "confirmed"),
+            (10, 109, "confirmed"),
+        ] {
+            f.block(n, height, state, found + n as i64).await?;
+        }
+        sqlx::query("UPDATE qbit_pool_blocks SET audit_publication_sequence=(SELECT COALESCE(max(audit_publication_sequence),0)+1 FROM qbit_pool_blocks),inactive_since=to_timestamp($2) WHERE block_hash=$1")
+            .bind(format!("{:02x}", 8u8).repeat(32))
+            .bind((found + 100) as f64)
+            .execute(&f.pool)
+            .await?;
+        // The phases the rollups can serve are compared at the pinned
+        // instant and four more: bucket-aligned (every window's leading slice
+        // empty), a second into the bucket, its last second, and a
+        // fractional one.
+        let instants = [0.0, -150.0, -149.0, 149.0, 0.5].map(|offset| epoch as f64 + offset);
+        ensure!(!rollups_ready_at(&f.pool, instants[0]).await?);
+        dashboard_queries_match_3_1_1_at(&pinned, &instants, "no rollup progress").await?;
+        let progress = qbit_prism_server::rollups::advance(&f.pool, 100_000).await?;
+        ensure!(progress.advanced, "{progress:?}");
+        for at in instants {
+            ensure!(rollups_ready_at(&f.pool, at).await?, "the rollups are not read at {at}");
+        }
+        dashboard_queries_match_3_1_1_at(&pinned, &instants, "current watermark").await?;
+        // Shares past the watermark, in the current bucket, in each window's
+        // partial first bucket and in an already rolled one, on each side of
+        // every window's start, at the pinned instant and after it, a miner
+        // the rollups have never seen, eve again older than 3 hours, and
+        // ivan and judy only on either side of the 3-hour start, all placed
+        // by the same pinned clock.
+        for (n, t) in [
+            epoch - 20,
+            epoch - 3590,
+            epoch - 10790,
+            epoch - 86390,
+            epoch - 4900,
+            epoch - 86401,
+            epoch - 86400,
+            epoch - 10801,
+            epoch - 10800,
+            epoch - 3601,
+            epoch - 3600,
+            epoch,
+            epoch + 30,
+        ]
+        .iter()
+        .enumerate()
+        {
+            f.share(&format!("tail-{n}"), ["alice", "dave"][n % 2], *t, 7_000_000 + n as i64)
+                .await?;
+        }
+        f.share("eve-3", "eve", epoch - 4 * 3600, 444_446).await?;
+        f.share("ivan-1", "ivan", epoch - 10800, 888_888).await?;
+        f.share("judy-1", "judy", epoch - 10801, 999_999).await?;
+        dashboard_queries_match_3_1_1_at(&pinned, &instants, "lagging watermark").await?;
+        // A watermark a day behind, its share older than the 24 hours (and,
+        // here, the rollups ahead of it, which the sums must then not read).
+        sqlx::query("UPDATE qbit_hashrate_rollup_progress SET last_share_seq=(SELECT share_seq FROM qbit_share_ledger WHERE accepted_at<to_timestamp($1)-interval '25 hours' ORDER BY share_seq DESC LIMIT 1)")
+            .bind(epoch as f64)
+            .execute(&f.pool)
+            .await?;
+        ensure!(!rollups_ready_at(&f.pool, instants[0]).await?);
+        dashboard_queries_match_3_1_1(&pinned, "watermark a day behind").await?;
+        pinned.close().await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.close(result).await
+}
+
+/// Every plan node, depth first, init plans and CTEs included.
+fn plan_nodes<'a>(node: &'a Value, all: &mut Vec<&'a Value>) {
+    all.push(node);
+    for plan in node["Plans"].as_array().into_iter().flatten() {
+        plan_nodes(plan, all);
+    }
+}
+
+/// #857: an `active` blocks page is an ordered read of
+/// qbit_pool_blocks_public_recent_idx that stops at its page, under custom
+/// and generic plans and PostgreSQL's default and SSD page costs, where
+/// 3.1.1's CASE filter scanned every block.
+#[tokio::test]
+async fn an_active_blocks_page_reads_the_public_recent_index_under_any_plan() -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        // 5,000 blocks, one in fifty reversed, one in a hundred disconnected.
+        let epoch = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO qbit_pool_blocks(block_hash,block_height,parent_hash,coinbase_txid,payout_manifest_sha256,chain_state,found_at,maturity_state,disconnected_at) SELECT lpad(to_hex(g),64,'0'),g,repeat('0',64),repeat('1',64),repeat('2',64),s,to_timestamp($1-(5001-g)*600),CASE WHEN s='reversed' THEN 'reversed' ELSE 'immature' END,CASE WHEN s='reversed' THEN to_timestamp($1) END FROM generate_series(1,5000) g, LATERAL (SELECT CASE WHEN g%50=0 THEN 'reversed' WHEN g%100=1 THEN 'inactive' ELSE 'confirmed' END AS s) state")
+            .bind(epoch as f64)
+            .execute(&f.pool)
+            .await?;
+        sqlx::raw_sql("VACUUM (ANALYZE) qbit_pool_blocks")
+            .execute(&f.pool)
+            .await?;
+        // Its own connection, never returned to the pool, so the settings
+        // below reach no other query.
+        let mut conn = f.pool.acquire().await?.detach();
+        sqlx::raw_sql(&format!(
+            "PREPARE blocks(bigint,bigint,text) AS {}",
+            BLOCKS.trim_end().trim_end_matches(';')
+        ))
+        .execute(&mut conn)
+        .await?;
+        let mut problems = Vec::new();
+        for cost in ["4", "1.1"] {
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                sqlx::raw_sql(&format!(
+                    "SET random_page_cost={cost}; SET plan_cache_mode={mode}"
+                ))
+                .execute(&mut conn)
+                .await?;
+                for (limit, offset) in [(15i64, 0i64), (15, 300), (100, 0)] {
+                    let plan: Value = sqlx::query_scalar(&format!(
+                        "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE blocks({limit},{offset},'active')"
+                    ))
+                    .fetch_one(&mut conn)
+                    .await?;
+                    let mut all = Vec::new();
+                    plan_nodes(&plan[0]["Plan"], &mut all);
+                    let index = all.iter().find(|node| {
+                        node["Index Name"] == "qbit_pool_blocks_public_recent_idx"
+                    });
+                    let case = format!("random_page_cost {cost}, {mode}, page {limit}+{offset}");
+                    match index {
+                        None => problems.push(format!("{case}: no read of the index: {plan}")),
+                        Some(node) => {
+                            let read = (node["Actual Rows"].as_f64().unwrap_or(0.0)
+                                + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0))
+                                * node["Actual Loops"].as_f64().unwrap_or(1.0);
+                            // The page, and the disconnected blocks among it.
+                            if read > (limit + offset) as f64 * 1.1 + 2.0 {
+                                problems.push(format!("{case}: the index read {read} blocks"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ensure!(problems.is_empty(), "{}", problems.join("\n"));
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.close(result).await
+}
+
+/// #857: the pool summary's 24-hour sums read the 5-minute rollups and only
+/// the raw shares of their partial buckets and the rollup lag, under
+/// PostgreSQL's default and SSD page costs, where 3.1.1 read every share of
+/// the last 24 hours; and with a watermark a day behind, or none, that
+/// 24-hour range.
+#[tokio::test]
+async fn pool_hashrate_sums_read_only_the_partial_buckets_and_the_lag() -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        // 20,000 rolled-up shares over 25 hours, one every 4.5 s, from 50
+        // miners; each window's partial buckets hold a few dozen.
+        let epoch = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) SELECT 'sum-'||g,'miner-'||g%50,'miner-'||g%50,decode(repeat('1',64),'hex'),1000000,1000000,100,'job',to_timestamp($1-(20001-g)*4.5),0,to_timestamp($1-(20001-g)*4.5),'test',1 FROM generate_series(1,20000) g")
+            .bind(epoch as f64)
+            .execute(&f.pool)
+            .await?;
+        let progress = qbit_prism_server::rollups::advance(&f.pool, 100_000).await?;
+        ensure!(progress.scanned == 20_000, "{progress:?}");
+        sqlx::raw_sql("VACUUM (ANALYZE) qbit_share_ledger")
+            .execute(&f.pool)
+            .await?;
+        let mut conn = f.pool.acquire().await?.detach();
+        let mut walks = Vec::new();
+        let mut raw_read = 0.0;
+        for (phase, lag) in [("current watermark", 0.0), ("300 shares past the watermark", 300.0)] {
+            if lag > 0.0 {
+                sqlx::query("INSERT INTO qbit_share_ledger(share_id,miner_id,payout_order_key,p2mr_program,share_difficulty,network_difficulty,template_height,job_id,job_issued_at,ntime,accepted_at,writer_id,writer_epoch) SELECT 'lag-'||g,'late-'||g%7,'late-'||g%7,decode(repeat('1',64),'hex'),1000000,1000000,100,'job',to_timestamp($1-g*240),0,to_timestamp($1-g*240),'test',1 FROM generate_series(1,300) g")
+                    .bind(epoch as f64)
+                    .execute(&f.pool)
+                    .await?;
+            }
+            for cost in ["4", "1.1"] {
+                sqlx::raw_sql(&format!("SET random_page_cost={cost}"))
+                    .execute(&mut conn)
+                    .await?;
+                let plan: Value = sqlx::query_scalar(&format!(
+                    "EXPLAIN (ANALYZE, FORMAT JSON) {POOL_HASHRATE_ROLLUPS}"
+                ))
+                .fetch_one(&mut conn)
+                .await?;
+                let read = ledger_tuples(&plan[0]["Plan"]).round();
+                if read > 1_000.0 + lag {
+                    walks.push(format!("{phase}, random_page_cost {cost}: read {read} ledger shares"));
+                }
+                let mut scans = Vec::new();
+                one_sided_ledger_scans(&plan[0]["Plan"], false, &mut scans);
+                walks.extend(
+                    scans
+                        .into_iter()
+                        .map(|scan| format!("{phase}, random_page_cost {cost}: {scan}")),
+                );
+                let raw: Value = sqlx::query_scalar(&format!(
+                    "EXPLAIN (ANALYZE, FORMAT JSON) {POOL_HASHRATE}"
+                ))
+                .fetch_one(&mut conn)
+                .await?;
+                raw_read = ledger_tuples(&raw[0]["Plan"]).round();
+            }
+        }
+        ensure!(
+            raw_read > 19_000.0,
+            "the raw scan this replaces read only {raw_read} shares"
+        );
+        // With a watermark whose share is older than the 24 hours, or none
+        // (rollups disabled, stalled or never run), the sums read the 24
+        // hours' range, as the raw scan does, not every share past the
+        // watermark.
+        for (phase, reset) in [
+            ("a watermark a day behind", "UPDATE qbit_hashrate_rollup_progress SET last_share_seq=1"),
+            ("no rollup progress", "DELETE FROM qbit_hashrate_rollup_progress"),
+        ] {
+        sqlx::query(reset).execute(&f.pool).await?;
+        for cost in ["4", "1.1"] {
+            sqlx::raw_sql(&format!("SET random_page_cost={cost}"))
+                .execute(&mut conn)
+                .await?;
+            let plan: Value = sqlx::query_scalar(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) {POOL_HASHRATE_ROLLUPS}"
+            ))
+            .fetch_one(&mut conn)
+            .await?;
+            let read = ledger_tuples(&plan[0]["Plan"]).round();
+            if read > raw_read + 300.0 {
+                walks.push(format!(
+                    "{phase}, random_page_cost {cost}: read {read} ledger shares, the raw scan {raw_read}"
+                ));
+            }
+            let mut scans = Vec::new();
+            one_sided_ledger_scans(&plan[0]["Plan"], false, &mut scans);
+            walks.extend(scans.into_iter().map(|scan| {
+                format!("{phase}, random_page_cost {cost}: {scan}")
+            }));
+        }
+        }
+        ensure!(walks.is_empty(), "the pool sums walk the ledger:\n{}", walks.join("\n"));
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.close(result).await
+}
+
 #[tokio::test]
 async fn public_service_is_read_only_and_bounds_http_database_work() -> Result<()> {
     let Some(f) = Fixture::open().await? else {

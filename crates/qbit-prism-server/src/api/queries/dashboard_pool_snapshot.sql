@@ -1,4 +1,6 @@
--- Parameterized shared-database read model.
+-- Parameterized shared-database read model. The pool hashrates and 3-hour
+-- participants are read separately, by dashboard_pool_hashrate_rollups.sql
+-- or, without the rollup schema, dashboard_pool_hashrate.sql (#857).
 
 WITH bounds AS (
     SELECT clock_timestamp() AS ended_at
@@ -62,26 +64,19 @@ window_summary AS (
         to_char(max(accepted_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS newest_share_accepted_at
     FROM window_rows
 ),
-rollups AS (
+-- Every block count in one pass over the blocks.
+block_counts AS (
     SELECT
-        COALESCE(sum(share_difficulty) FILTER (WHERE accepted_at >= bounds.ended_at - interval '1 hour'), 0)::text AS h1_difficulty,
-        COALESCE(sum(share_difficulty) FILTER (WHERE accepted_at >= bounds.ended_at - interval '3 hours'), 0)::text AS h3_difficulty,
-        COALESCE(sum(share_difficulty) FILTER (WHERE accepted_at >= bounds.ended_at - interval '24 hours'), 0)::text AS h24_difficulty,
-        count(DISTINCT miner_id) FILTER (WHERE accepted_at >= bounds.ended_at - interval '3 hours') AS participants_3h
-    FROM qbit_share_ledger, bounds
-    WHERE accepted
-      AND accepted_at >= bounds.ended_at - interval '24 hours'
-      AND accepted_at <= bounds.ended_at
+        count(*) FILTER (WHERE chain_state = 'confirmed') AS confirmed,
+        count(*) FILTER (WHERE chain_state = 'reversed' OR (chain_state = 'inactive' AND audit_publication_sequence IS NOT NULL)) AS reversed,
+        count(*) FILTER (WHERE chain_state = 'inactive' AND audit_publication_sequence IS NULL) AS inactive
+    FROM qbit_pool_blocks
 )
 SELECT json_build_object(
-    'h1_difficulty', (SELECT h1_difficulty FROM rollups),
-    'h3_difficulty', (SELECT h3_difficulty FROM rollups),
-    'h24_difficulty', (SELECT h24_difficulty FROM rollups),
-    'participants_3h', (SELECT participants_3h FROM rollups),
-    'blocks_found_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
-    'prism_blocks_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
-    'blocks_reversed_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'reversed' OR (chain_state='inactive' AND audit_publication_sequence IS NOT NULL)),
-    'blocks_inactive_total', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive' AND audit_publication_sequence IS NULL),
+    'blocks_found_total', (SELECT confirmed FROM block_counts),
+    'prism_blocks_total', (SELECT confirmed FROM block_counts),
+    'blocks_reversed_total', (SELECT reversed FROM block_counts),
+    'blocks_inactive_total', (SELECT inactive FROM block_counts),
     'total_mined_bits', COALESCE((
         SELECT sum(carry.gross_amount_sats)
         FROM qbit_payout_carry_forward carry
