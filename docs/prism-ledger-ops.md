@@ -1608,6 +1608,62 @@ replay paused instead, as the admission gate's
 [drain and migrate](prism-rust-migration.md#drain-and-migrate)), or run
 `self-check` while the share rate is low.
 
+`/audit/latest` on the operator listener (the newest confirmed block's
+evidence, with the lifetime `accepted_share_count` and `distinct_miner_count`)
+follows the same one-run-at-a-time pattern since #859, on the ledger pool the
+share writer uses, though not in one read-only transaction: its statements run
+under the pool's statement timeout (`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`,
+15 s by default), and an abandoned one runs on, up to it, holding its writer-pool
+connection until it ends. One run computes it at a time per frontend, bounded
+by 60 s; a request that arrives during a run waits for that run and gets its
+answer, and a client that gives up sooner leaves the run going for the next
+request. An answer is served for 10 s after its run ends, with the same three
+fields as the integrity reports (`computed_at`, `age_seconds`, `run_seconds`),
+added to the keys it always had; only the first request after that starts
+another run. So after an answer, polling the route, however often, starts a
+run on each frontend at most once per run time plus 10 s, and an answer is at
+most that old: its counts can trail the ledger by up to 10 s plus the run's
+own time, and a newly confirmed block shows up after at most as long. A failed
+run is not served again, so while runs fail each request after one starts the
+next.
+
+A run reads the newest confirmed block with an audit bundle, the counts and
+the block's payout entries every time, in that order. Last, it decodes the
+bundle, which counts its shares, but only when the newest block, its bundle
+digest or its payout manifest differs from the previous answer's, so a
+frontend decodes each new piece of evidence once; a run that fails before the
+decode decodes nothing. A failure is never served again: the request that
+waited for it gets its error (404 while no evidence exists, 503 when the run
+timed out or the frontend stopped), and the next request starts a run. A
+stopping frontend abandons its run in flight and starts none.
+
+The 60 s is a fixed bound, as the integrity reports' is, not the run's worst
+case. A run makes up to seven statements (the evidence key, the rollup check,
+the counts, the payout count, then, for new evidence, the bundle row and its
+canonical bytes, or its share snapshot and window), and each may wait up to
+15 s for a connection from the share writer's pool and then run up to the
+statement timeout (`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, 15 s by default).
+So while share appends keep every connection of that pool busy and checkouts
+queue for seconds, each under the 15 s at which one fails, or after the
+statement timeout has been raised, a valid run can pass 60 s every time. Then
+every request waits up to 60 s and gets `503` with error code `read_timeout`
+("the latest evidence run did not finish within its 60 s"), nothing is
+served, and each abandoned run's statement in flight runs on and holds its
+writer-pool connection until it ends, while the next request starts the next
+run. Before #859 the route answered slowly instead. A checkout that waits the
+full 15 s fails the request at once with `503 read_timeout` and "the read
+timed out; try again shortly", the message a statement past its statement
+timeout also gives, as before #859.
+
+The decode can be another cause. It runs last, after a wait for one of the
+`PRISM_POSTGRES_READ_CONCURRENCY` decode permits that the operator listener's
+audit bundle and settlement-artifact reads share (a legacy `body_uri` row
+takes none), with no statement timeout. A run whose reads and decode together pass 60 s fails, and
+its decode runs on, holding its permit and the body, while the next request
+starts another decode of the same bundle; until a run fits, those decodes
+overlap and the bundle reads queue behind them. The route answers again once
+a whole run fits in 60 s, whatever made it slow.
+
 A landing writes the block's payout and carry rows from the immutable payout
 manifest of the audit its coinbase commits to, whatever the canonical balances
 are when it lands, and since migration 011 marks the block with that audit's
@@ -3718,7 +3774,7 @@ Two documented reader changes follow from a detach, and both are intended:
 Everything else that was lifetime-scoped keeps working across a detach. Block
 solver attribution moved onto `qbit_pool_blocks.solver_*` in migration 016,
 written at landing and backfilled for every existing block.
-`accepted_share_count` and `distinct_miner_count` in `/audit/latest-evidence`
+`accepted_share_count` and `distinct_miner_count` in `/audit/latest`
 and `GET /public/v1/hashrate-series?range=all` are served from the permanent
 rollup tables plus the raw tail above the watermark, which condition 3 keeps
 online until the sweep has folded it.
