@@ -68,8 +68,11 @@ the wave has finished, waits until the whole wave has. PostgreSQL grants a
 new `FOR KEY SHARE` past a queued `FOR UPDATE`, so without that gap one
 frontend's overlapping batches could hold the cluster row through a whole
 fan-out while an authority writer or blob GC waits there holding
-`ORDER_LOCK`. With waves such a writer waits for about one batch per
-frontend, as before #860. Batches of other frontends on the same ledger, and
+`ORDER_LOCK`. With waves such a writer waits, per frontend, for the wave's
+first batch and a second that started within 2 ms of it; a second batch
+that first waited for a pool connection can still take its `KEY SHARE` past
+the writer, so on a saturated pool the wait can approach two batch
+durations. Batches of other frontends on the same ledger, and
 single-child repairs, overlapped one frontend's batches before #860 too.
 Collection dwells for up to 1 ms from the oldest admission, flushing earlier
 when full or a deadline requires it. Time behind other batches and admission
