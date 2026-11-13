@@ -712,7 +712,8 @@ Every new column has a constant default or none, so no table is rewritten and
 no constraint is validated by a scan. Earlier frontends may keep serving while
 it runs, as they do during the 3.1 pre-migrate, so `migrate` first locks every
 table 027 and 028 alter, the share ledger's partitions included, in one
-statement that waits at most 100 ms in all, and only then runs the two files:
+statement that waits at most 80 ms for any one table (its `lock_timeout`)
+and 100 ms in all (its `statement_timeout`), and only then runs the two files:
 catalog changes, three small index builds and 028's check, then the commit.
 From 3.1.1 the same transaction also creates 032's two functions. On a
 database already at 028, `migrate` takes only the migration history's lock up
@@ -744,13 +745,29 @@ way; it has a row per landed block, and the expiry prune keeps
 `qbit_prism_jobs` to its unexpired jobs, so both builds are small. In two
 runs of the R1 pre-migrate scenario 027 and 028 committed 372 and 558 ms after
 `migrate` started, and no share sent meanwhile waited over 39 ms for its
-answer. If a transaction holds the history or one of the tables past those
-100 ms, or
+answer. If a transaction holds the history or one of the tables past
+80 ms, or the request waits 100 ms in all, or
 PostgreSQL aborts the request as a deadlock (possible only with a
-`deadlock_timeout` below 100 ms, as the migrate's own is where it may lower
+`deadlock_timeout` below 80 ms, as the migrate's own is where it may lower
 it, below), the attempt gives up, the whole migration
 transaction rolls back, holding nothing, and `migrate` tries again from the
-start after a backoff of 100 ms doubling to 2 s, for up to ten minutes.
+start after a backoff of 100 ms doubling to 2 s, for up to ten minutes,
+about 290 attempts. What ended the request is told by its SQLSTATE, never by
+PostgreSQL's message, which the server translates under `lc_messages`
+(#824): 55P03 (`lock_not_available`) for the 80 ms lock timeout, which ends
+a request blocked on one table, the usual case, since the statement spends
+far less than the 20 ms left over before it waits; 40P01 for the deadlock;
+and 57014 (`query_canceled`) for the 100 ms statement timeout, which a
+request that waited for several tables in turn can reach first. A cancel
+request, an administrator's `pg_cancel_backend` say, carries 57014 too, but
+before the request has run 90 ms of its 100 (a tenth is slack for a server
+clock that runs fast): it is not contention, and stops
+`migrate` at once, nothing changed. Until 3.1.2 both timeouts were 100 ms,
+so nearly every blocked request ended with 57014, and a 57014 counted as
+the timeout only when its message said "statement timeout": on a server
+whose `lc_messages` was not English, `migrate`, and a start with
+`PRISM_POSTGRES_INIT_SCHEMA=1`, stopped at the first contention instead of
+trying again.
 Nothing is recorded before the commit, so each attempt plans afresh from what
 it finds. Autovacuum may hold one of the tables too, and stopping the frontends doesn't
 stop it: a pass over a share ledger partition, `qbit_prism_share_hashes` or
@@ -760,7 +777,7 @@ deadlock check, which runs once the waiter has waited `deadlock_timeout`
 (1 s): 3.1.0's 027 waited that long and so had the pass cancelled, but no
 100 ms attempt does. So from its second attempt on, `migrate` lowers its
 own `deadlock_timeout` to 50 ms for its two lock requests only, the
-history's and the tables', with their 100 ms timeouts, and restores it
+history's and the tables', with their 80 ms and 100 ms timeouts, and restores it
 after each; 027's, 028's and 032's statements run under the session's own.
 PostgreSQL then cancels the worker blocking the request within the attempt,
 logging `canceling autovacuum task` in the server log, and the attempt, or
@@ -796,7 +813,8 @@ since each takes the history's lock: a start that could not take it used to
 fail after `PRISM_DATABASE_LOCK_TIMEOUT_MS` (5 s), and now tries again for up
 to ten minutes, logging a warning on its first attempt and every tenth. Then
 it stops with `refusing to wait any longer for the table locks of migration
-27, 28: <n> attempts over <s> s each waited 100 ms for <tables> and gave up,
+27, 28: <n> attempts over <s> s each waited up to 100 ms for <tables>, 80 ms
+for any one, and gave up,
 so that no serving frontend waits on the migrate longer than that. Nothing was
 changed: they are not recorded. Holding them now: pid <pid> (<state>, its
 transaction open <s> s) holding <tables>: <query>`, naming up to five
