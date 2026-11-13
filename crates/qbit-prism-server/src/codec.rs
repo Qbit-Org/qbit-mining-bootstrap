@@ -5,7 +5,11 @@ use num_traits::{One, ToPrimitive, Zero};
 use qbit_pool_builder::PayoutManifest;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 pub const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 
@@ -636,6 +640,149 @@ pub struct Submission {
     pub ntime: u32,
     pub nonce: u32,
     pub applied_version: u32,
+}
+
+/// `mining.notify` lines for the sessions of one published work, each
+/// rendered from a body shared with every other session of that work (#861).
+///
+/// Within one publication every session's job is a clone of the same shared
+/// work, so only the job ID and `clean_jobs` differ between their notifies;
+/// the rest, the coinbase halves above all, is rendered once and kept here.
+/// A job reuses a kept body only if that body was rendered from the very same
+/// coinbase allocations and equal values of every other field it holds, so a
+/// session is never sent its job ID spliced into another work's body. Bytes
+/// on the wire are exactly [`Job::notify`]'s, serialised, and a newline.
+#[derive(Clone, Default)]
+pub struct NotifyBodies(Arc<Mutex<VecDeque<RenderedBody>>>);
+
+/// Bodies kept: the current publication's and a few earlier ones that
+/// deliveries still in flight may announce.
+const NOTIFY_BODIES_KEPT: usize = 8;
+/// Everything before the job ID, as `serde_json` renders [`Job::notify`].
+const NOTIFY_HEAD: &[u8] = br#"{"id":null,"method":"mining.notify","params":["#;
+/// Everything after `clean_jobs`, the line's end included.
+const NOTIFY_TAIL: &[u8] = b"]}\n";
+
+/// A shared body and the work it was rendered from. The coinbase halves are
+/// held, so their addresses identify that work for as long as it is kept.
+struct RenderedBody {
+    prevhash: String,
+    coinb1: Arc<str>,
+    coinb2: Arc<str>,
+    merkle_branch: Vec<[u8; 32]>,
+    version: u32,
+    nbits: u32,
+    ntime: u32,
+    /// `,prevhash,coinb1,coinb2,[branch],version,nbits,ntime,`
+    body: Arc<[u8]>,
+}
+
+impl RenderedBody {
+    fn of(job: &Job) -> Self {
+        let branch: Vec<String> = job.merkle_branch.iter().map(hex::encode).collect();
+        let fields = (
+            job.prevhash.as_str(),
+            &*job.coinb1,
+            &*job.coinb2,
+            branch,
+            format!("{:08x}", job.version),
+            format!("{:08x}", job.nbits),
+            format!("{:08x}", job.ntime),
+        );
+        // `[a,…,g]` as serde_json renders that part of the params array,
+        // opened and closed by the commas around it there instead.
+        let mut body = serde_json::to_vec(&fields).expect("strings always serialise");
+        body[0] = b',';
+        *body.last_mut().expect("an array is never empty text") = b',';
+        Self {
+            prevhash: job.prevhash.clone(),
+            coinb1: job.coinb1.clone(),
+            coinb2: job.coinb2.clone(),
+            merkle_branch: job.merkle_branch.clone(),
+            version: job.version,
+            nbits: job.nbits,
+            ntime: job.ntime,
+            body: body.into(),
+        }
+    }
+
+    fn renders(&self, job: &Job) -> bool {
+        Arc::ptr_eq(&self.coinb1, &job.coinb1)
+            && Arc::ptr_eq(&self.coinb2, &job.coinb2)
+            && self.prevhash == job.prevhash
+            && self.merkle_branch == job.merkle_branch
+            && (self.version, self.nbits, self.ntime) == (job.version, job.nbits, job.ntime)
+    }
+}
+
+impl NotifyBodies {
+    /// The line [`Job::notify`] serialises to, its newline included.
+    pub fn line(&self, job: &Job) -> Vec<u8> {
+        let body = self.body(job);
+        // A job ID JSON escapes (a `PRISM_INSTANCE_ID` may hold quotes or
+        // backslashes) takes at most six bytes per byte.
+        let escaped = job
+            .job_id
+            .bytes()
+            .any(|byte| byte < 0x20 || byte == b'"' || byte == b'\\');
+        let id = job.job_id.len() * if escaped { 6 } else { 1 } + 2;
+        let mut line =
+            Vec::with_capacity(NOTIFY_HEAD.len() + id + body.len() + 5 + NOTIFY_TAIL.len());
+        line.extend_from_slice(NOTIFY_HEAD);
+        serde_json::to_writer(&mut line, job.job_id.as_str()).expect("strings always serialise");
+        line.extend_from_slice(&body);
+        line.extend_from_slice(if job.clean_jobs { b"true" } else { b"false" });
+        line.extend_from_slice(NOTIFY_TAIL);
+        line
+    }
+
+    fn body(&self, job: &Job) -> Arc<[u8]> {
+        let kept = |bodies: &mut VecDeque<RenderedBody>| {
+            let index = bodies.iter().position(|kept| kept.renders(job))?;
+            if index == 0 {
+                return Some(bodies[0].body.clone());
+            }
+            // Most recently used first, so a publication's sessions keep it.
+            let found = bodies.remove(index)?;
+            let body = found.body.clone();
+            bodies.push_front(found);
+            Some(body)
+        };
+        if let Some(body) = kept(&mut self.bodies()) {
+            return body;
+        }
+        // Rendered unlocked: sessions of other work need not wait for it. The
+        // sessions that miss together at the start of a fan-out each render
+        // it, at most one per runtime worker; the first kept is used.
+        let rendered = RenderedBody::of(job);
+        let mut bodies = self.bodies();
+        if let Some(body) = kept(&mut bodies) {
+            return body;
+        }
+        let body = rendered.body.clone();
+        let evicted = (bodies.len() >= NOTIFY_BODIES_KEPT)
+            .then(|| bodies.pop_back())
+            .flatten();
+        bodies.push_front(rendered);
+        drop(bodies);
+        // A large body is freed after the lock is released.
+        drop(evicted);
+        body
+    }
+
+    fn bodies(&self) -> std::sync::MutexGuard<'_, VecDeque<RenderedBody>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl std::fmt::Debug for NotifyBodies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifyBodies")
+            .field("kept", &self.bodies().len())
+            .finish()
+    }
 }
 
 #[cfg(test)]
