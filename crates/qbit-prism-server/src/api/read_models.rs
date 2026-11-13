@@ -504,8 +504,22 @@ pub(super) async fn fanout(state: &ApiState, hash: &str) -> ApiResult<Value> {
         Ok(v)
     }
 }
+/// One page of the pending CTV fanouts, for `/public/v1/fanouts/pending` and
+/// `/audit/fanouts/pending`: each fanout of a confirmed block still to settle
+/// and due now, in block, chunk and txid order.
+///
+/// Its statement names the pending settlement statuses rather than excluding
+/// the settled ones (#688): `NOT IN` is no index condition, so a cache miss
+/// read every fanout, the settled ones included, where
+/// `qbit_ctv_fanout_artifacts_status_idx` serves the list.
+/// `ledger_postgres::pending_fanouts_plan` checks the list against the
+/// schema's statuses, the plan, and the `NOT IN` statement's output.
 pub(super) async fn pending_fanouts(state: &ApiState, page: i64, limit: i64) -> ApiResult<Value> {
-    let value:Value=sqlx::query_scalar("WITH eligible AS (SELECT a.fanout_txid,a.chunk_index,b.block_height FROM qbit_ctv_fanout_artifacts a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' AND a.settlement_status NOT IN ('confirmed','reorged') AND (a.next_broadcast_attempt_at IS NULL OR a.next_broadcast_attempt_at <= clock_timestamp())), page AS (SELECT * FROM eligible ORDER BY block_height,chunk_index,fanout_txid LIMIT $1 OFFSET $2) SELECT jsonb_build_object('total_count',(SELECT count(*) FROM eligible),'rows',COALESCE((SELECT jsonb_agg(qbit_fanout_status(fanout_txid) ORDER BY block_height,chunk_index,fanout_txid) FROM page),'[]'::jsonb))").bind(limit).bind((page-1)*limit).fetch_one(&state.pool).await?;
+    let value: Value = sqlx::query_scalar(include_str!("queries/pending_fanouts.sql"))
+        .bind(limit)
+        .bind((page - 1) * limit)
+        .fetch_one(&state.pool)
+        .await?;
     Ok(page_payload(value, page, limit))
 }
 pub(super) async fn artifact_document(state: &ApiState, hash: &str) -> ApiResult<Payload> {

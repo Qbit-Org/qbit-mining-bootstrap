@@ -38,7 +38,7 @@ const WATCHED: i64 = 500;
 const LANE_VISITS: f64 = 16.0;
 
 /// Every plan node, depth first, init plans and CTEs included.
-fn nodes<'a>(node: &'a Value, all: &mut Vec<&'a Value>) {
+pub(super) fn nodes<'a>(node: &'a Value, all: &mut Vec<&'a Value>) {
     all.push(node);
     if let Some(children) = node["Plans"].as_array() {
         for child in children {
@@ -113,7 +113,7 @@ async fn explain(conn: &mut PgConnection, execute: &str, bound: f64) -> Result<V
 }
 
 /// Whether a plan reads `index`.
-fn reads(plan: &Value, index: &str) -> bool {
+pub(super) fn reads(plan: &Value, index: &str) -> bool {
     let mut all = Vec::new();
     nodes(&plan[0]["Plan"], &mut all);
     all.iter().any(|node| node["Index Name"] == index)
