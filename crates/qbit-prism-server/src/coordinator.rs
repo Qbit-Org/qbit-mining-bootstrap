@@ -1079,22 +1079,20 @@ fn window_read_permits(database_connections: u32, build_workers: usize) -> usize
 }
 
 /// How many issued-job batch transactions may hold a pool connection at once
-/// (#860): two when the pool leaves at least four connections beside
-/// [`window_read_permits`], otherwise one, as before #860.
+/// (#860): the connections the pool leaves beside [`window_read_permits`],
+/// less two, between 1 and the batcher's `IN_FLIGHT` (2). That is two when at
+/// least four are left beside window reads, otherwise one, as before #860.
 ///
 /// The connections left over beside window reads and batches are for a share
 /// append and the candidate-lease heartbeat. A second batch never takes that
 /// leftover below two; where one batch already leaves fewer, the batcher
 /// stays at one, so nothing there changes.
 fn issued_batch_flights(database_connections: u32, build_workers: usize) -> usize {
-    let beside_window_reads = usize::try_from(database_connections)
+    usize::try_from(database_connections)
         .unwrap_or(usize::MAX)
-        .saturating_sub(window_read_permits(database_connections, build_workers));
-    if beside_window_reads >= 4 {
-        2
-    } else {
-        1
-    }
+        .saturating_sub(window_read_permits(database_connections, build_workers))
+        .saturating_sub(2)
+        .clamp(1, issued_batcher::IN_FLIGHT)
 }
 
 fn protocol_error(reason: &'static str, message: &str) -> StratumError {

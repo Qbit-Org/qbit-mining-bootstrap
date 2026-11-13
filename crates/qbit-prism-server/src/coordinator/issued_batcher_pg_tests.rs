@@ -182,7 +182,13 @@ async fn overlapping_batches_of_one_dependency_commit_without_deadlock() -> Resu
             .append_pair("options", &format!("-csearch_path={schema}"));
         let ledger =
             Arc::new(Ledger::connect(url.as_str(), "batch-overlap".into(), 4, true).await?);
-        let batcher = Arc::new(IssuedBatcher::new(ledger.clone(), IN_FLIGHT));
+        // The second batch arrives once the first is seen held, well after
+        // the production join window.
+        let batcher = Arc::new(IssuedBatcher::with_join_window_for_tests(
+            ledger.clone(),
+            IN_FLIGHT,
+            Duration::MAX,
+        ));
         let result: Result<()> = async {
             let now = ledger.now_ms().await?;
             // A refresh's default prepared retention: ceil(30 s job retention

@@ -38,6 +38,16 @@ fn enqueue(
     })
 }
 
+/// A batcher whose waves stay open to a later batch, for tests that hold a
+/// batch on real time before the next one arrives.
+fn late_joining(f: &Fixture) -> Arc<IssuedBatcher> {
+    Arc::new(IssuedBatcher::with_join_window_for_tests(
+        f.store.clone(),
+        IN_FLIGHT,
+        Duration::MAX,
+    ))
+}
+
 /// Occupy every in-flight slot with a one-child batch held inside the fake's
 /// save gate, in order. Later entries wait for a flight in the channel.
 async fn hold_flights(
@@ -68,13 +78,7 @@ async fn hold_flights(
 }
 
 async fn settled(batcher: &IssuedBatcher) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while batcher.slots.available_permits() != batcher.admitted {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    batcher.wait_for_idle_for_tests().await;
 }
 
 #[tokio::test]
@@ -124,7 +128,7 @@ async fn real_coordinator_fan_in_and_singleton_keep_durable_children() {
 #[tokio::test]
 async fn queue_and_batch_bounds_cancel_enrollment_and_release_every_slot() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
+    let batcher = late_joining(&f);
     let mut held = hold_flights(&f, &batcher, &prepared).await;
     let mut requests = Vec::new();
     for i in 0..batcher.admitted - IN_FLIGHT {
@@ -422,7 +426,7 @@ async fn lost_commit_acknowledgement_is_uncertain_and_exact_retry_is_idempotent(
 #[tokio::test]
 async fn shutdown_closes_active_and_queued_waiters_without_a_self_owned_worker() {
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
+    let batcher = late_joining(&f);
     let held = hold_flights(&f, &batcher, &prepared).await;
     let pending = enqueue(batcher.clone(), prepared, "pending", 300_000);
     tokio::task::yield_now().await;
@@ -450,7 +454,7 @@ async fn shutdown_closes_active_and_queued_waiters_without_a_self_owned_worker()
 async fn original_deadline_includes_queue_and_revocation_after_commit_suppresses_delivery() {
     use crate::stratum::MiningBackend;
     let (f, prepared) = fixture().await;
-    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
+    let batcher = late_joining(&f);
     let held = hold_flights(&f, &batcher, &prepared).await;
     let expired = batcher
         .save(
@@ -927,6 +931,37 @@ fn issued_batch_flights_leave_two_connections_beside_window_reads() {
             assert!(left >= 2);
         }
     }
-    // The default pool of 16 gets two flights at any build-worker count.
+    // The default pool of 16 gets two flights with up to 12 build workers
+    // (the default is at most 4); 13 leave three beside window reads.
     assert!((1..=12).all(|workers| issued_batch_flights(16, workers) == 2));
+    assert_eq!(issued_batch_flights(16, 13), 1);
+}
+
+/// #860: a batch that arrives after the join window waits for the wave to
+/// finish, so a FOR UPDATE queued on the cluster row behind the wave's first
+/// batch waits for about that batch, not for a late second one too.
+#[tokio::test]
+async fn a_batch_after_the_join_window_waits_for_the_wave() {
+    let (f, prepared) = fixture().await;
+    let batcher = Arc::new(IssuedBatcher::new(f.store.clone(), IN_FLIGHT));
+    tokio::time::pause();
+    let gate = Arc::new(Gate::default());
+    *f.store.save_gate.lock().unwrap() = Some(gate.clone());
+    let first = enqueue(batcher.clone(), prepared.clone(), "early", 300_000);
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    tokio::time::advance(JOIN + Duration::from_millis(1)).await;
+    let late = enqueue(batcher.clone(), prepared, "late", 300_000);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.store.compact.batch_calls.lock().unwrap().as_slice(), &[1]);
+    assert!(!late.is_finished());
+    gate.release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    assert_eq!(late.await.unwrap().unwrap(), IssuedJobSave::Saved);
+    settled(&batcher).await;
+    assert_eq!(
+        f.store.compact.batch_calls.lock().unwrap().as_slice(),
+        &[1, 1]
+    );
 }

@@ -23,7 +23,12 @@ const BATCH: usize = 64;
 /// row locks in the same order, and of the advisory locks only migration
 /// 027's sync barrier, shared, through each child's `sync_seq` default; see
 /// `save_issued_jobs_compact`.
-const IN_FLIGHT: usize = 2;
+pub(super) const IN_FLIGHT: usize = 2;
+/// How long after a wave's first batch starts another may still join it. A
+/// fan-out's batches are queued already and join within microseconds; a later
+/// batch waits for the wave, so a queued FOR UPDATE on the cluster row waits
+/// for about one batch, as before #860, not for a batch that joined late.
+const JOIN: Duration = Duration::from_millis(2);
 const DWELL: Duration = Duration::from_millis(1);
 
 #[derive(PartialEq, Eq)]
@@ -79,17 +84,36 @@ impl Drop for IssuedBatcher {
 impl IssuedBatcher {
     /// `flights` batch transactions may be in flight at once, 1 to IN_FLIGHT.
     pub(super) fn new(ledger: Arc<dyn WorkLedger>, flights: usize) -> Self {
-        Self::with_dwell(ledger, DWELL, flights)
+        let batcher = Self::with_options(ledger, DWELL, flights, JOIN);
+        tracing::info!(
+            flights = flights.clamp(1, IN_FLIGHT),
+            "compact issued batches: at most this many transactions in flight"
+        );
+        batcher
     }
 
     // Existing session fixtures freeze time and deliberately prevent automatic
     // clock advancement. Keep their batch execution real without requiring a
-    // timer tick; dedicated collector tests exercise the production dwell.
+    // timer tick; dedicated collector tests exercise the production dwell and
+    // join window.
     #[cfg(test)]
     pub(super) fn without_dwell_for_tests(ledger: Arc<dyn WorkLedger>) -> Self {
-        Self::with_dwell(ledger, Duration::ZERO, IN_FLIGHT)
+        Self::with_options(ledger, Duration::ZERO, IN_FLIGHT, Duration::MAX)
     }
 
+    /// Lets a test that holds a batch on real time join a second one later.
+    #[cfg(test)]
+    pub(super) fn with_join_window_for_tests(
+        ledger: Arc<dyn WorkLedger>,
+        flights: usize,
+        join: Duration,
+    ) -> Self {
+        Self::with_options(ledger, DWELL, flights, join)
+    }
+
+    /// Every admission slot is free again. A batch task releases its flight
+    /// in the same poll that answers its last entry; the collector keeps an
+    /// idle wave's unspent flights, so flights are not a sign of idleness.
     #[cfg(test)]
     pub(super) async fn wait_for_idle_for_tests(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -101,12 +125,22 @@ impl IssuedBatcher {
         .expect("issued collector did not finish");
     }
 
-    fn with_dwell(ledger: Arc<dyn WorkLedger>, dwell: Duration, flights: usize) -> Self {
-        let flights = flights.clamp(1, IN_FLIGHT);
-        let admitted = (flights + 1) * BATCH;
+    fn with_options(
+        ledger: Arc<dyn WorkLedger>,
+        dwell: Duration,
+        flights: usize,
+        join: Duration,
+    ) -> Self {
+        let wave_size = flights.clamp(1, IN_FLIGHT);
+        let admitted = (wave_size + 1) * BATCH;
         let (sender, receiver) = mpsc::channel(admitted);
         let shutdown = CancellationToken::new();
-        tokio::spawn(run(ledger, receiver, shutdown.clone(), dwell, flights));
+        let waves = Waves {
+            flights: Arc::new(Semaphore::new(wave_size)),
+            size: wave_size,
+            join,
+        };
+        tokio::spawn(run(ledger, receiver, shutdown.clone(), dwell, waves));
         Self {
             sender,
             slots: Arc::new(Semaphore::new(admitted)),
@@ -191,12 +225,20 @@ fn discard_expired(pending: &mut VecDeque<Entry>) {
     *pending = retained;
 }
 
+/// The collector's flights: `size` permits, one per batch in flight, and how
+/// long after a wave's first batch starts another may join it.
+struct Waves {
+    flights: Arc<Semaphore>,
+    size: usize,
+    join: Duration,
+}
+
 async fn run(
     ledger: Arc<dyn WorkLedger>,
     mut receiver: mpsc::Receiver<Entry>,
     shutdown: CancellationToken,
     dwell: Duration,
-    flights: usize,
+    waves: Waves,
 ) {
     // Each batch runs in its own task holding one of these flights until it
     // has answered its entries, after any rollback cleanup, so the batcher
@@ -208,16 +250,22 @@ async fn run(
     // batches would keep an authority writer or blob GC (which wait there
     // holding ORDER_LOCK, and so every share append) out for a whole
     // fan-out. A batch joins the current wave only while the wave has an
-    // unspent flight and none of its batches has finished; otherwise it opens
-    // a new wave, which waits until every batch has finished. This
-    // frontend's batches therefore keep such a writer waiting for at most
-    // one wave, as one batch did when batches ran one at a time.
-    let wave_size = flights;
-    let flights = Arc::new(Semaphore::new(wave_size));
+    // unspent flight, none of its batches has finished, and its first batch
+    // started at most JOIN ago; otherwise it opens a new wave, which waits
+    // until every batch has finished. This frontend's batches therefore keep
+    // such a writer waiting for about one batch, as when batches ran one at a
+    // time.
+    let Waves {
+        flights,
+        size: wave_size,
+        join,
+    } = waves;
     // The current wave's unspent flights. The collector holds every flight
     // not in a batch, so `flights` has one available only once a batch of
     // the wave has finished.
     let mut reserve: Option<OwnedSemaphorePermit> = None;
+    // When the current wave's first batch started.
+    let mut wave_started: Option<Instant> = None;
     let mut pending = VecDeque::new();
     'collect: loop {
         discard_expired(&mut pending);
@@ -241,7 +289,10 @@ async fn run(
         // batch run alone. While a wave drains, this entry waits here; its
         // caller's own deadline still answers it, and the batch is filtered
         // for live entries before it starts.
-        if reserve.is_none() || flights.available_permits() > 0 {
+        let joins = reserve.is_some()
+            && flights.available_permits() == 0
+            && wave_started.is_none_or(|started| started.elapsed() <= join);
+        if !joins {
             drop(reserve.take());
             reserve = Some(tokio::select! {
                 biased;
@@ -250,6 +301,7 @@ async fn run(
                     all.expect("issued batch flights are never closed")
                 }
             });
+            wave_started = None;
         }
         let mut unspent = reserve.take().expect("a wave is open");
         let flight = if unspent.num_permits() > 1 {
@@ -314,16 +366,27 @@ async fn run(
             }
             continue;
         }
-        let batch = AssertUnwindSafe(save_issued_batch_in_flight(
-            ledger.clone(),
-            batch,
-            shutdown.clone(),
-            flight,
-        ));
+        if shutdown.is_cancelled() {
+            break;
+        }
+        wave_started.get_or_insert_with(Instant::now);
+        let ledger = ledger.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            // A panic drops the batch's entries, so its callers read the
-            // batcher as shut down although the collector carries on.
-            if batch.catch_unwind().await.is_err() {
+            let deadline = batch.iter().map(|entry| entry.deadline).min().unwrap();
+            let attempt = CompactBatchAttempt::new(deadline);
+            let saved = AssertUnwindSafe(save_issued_batch_in_flight(
+                ledger, batch, shutdown, &attempt,
+            ))
+            .catch_unwind()
+            .await;
+            // Hold this flight through rollback draining, also after a panic,
+            // so a cleanup still holding its connection counts against the
+            // bound. A panic drops the batch's entries: their callers read
+            // the batcher as shut down although the collector carries on.
+            attempt.wait_for_cleanup().await;
+            drop(flight);
+            if saved.is_err() {
                 tracing::error!("compact issued batch task panicked; its callers were refused");
             }
         });
@@ -341,10 +404,9 @@ async fn save_issued_batch_in_flight(
     ledger: Arc<dyn WorkLedger>,
     batch: Vec<Entry>,
     shutdown: CancellationToken,
-    flight: OwnedSemaphorePermit,
+    attempt: &CompactBatchAttempt,
 ) {
-    let deadline = batch.iter().map(|entry| entry.deadline).min().unwrap();
-    let attempt = CompactBatchAttempt::new(deadline);
+    let deadline = attempt.deadline;
     let group = &batch[0].group;
     let jobs: Vec<_> = batch.iter().map(|entry| entry.job.clone()).collect();
     let mut cancellations: FuturesUnordered<_> = batch
@@ -361,13 +423,13 @@ async fn save_issued_batch_in_flight(
         .unwrap();
     let result = tokio::select! {
         biased;
-        _ = shutdown.cancelled() => Err(interrupted(&attempt, "shutdown")),
+        _ = shutdown.cancelled() => Err(interrupted(attempt, "shutdown")),
         // Once SQL owns the immutable children, a caller losing interest
         // must not abort live peers. A canceled child may commit undelivered;
         // its original expiry and the shared minimum deadline still apply.
-        _ = async { while cancellations.next().await.is_some() {} } => Err(interrupted(&attempt, "all callers canceled")),
-        _ = tokio::time::sleep_until(deadline) => Err(interrupted(&attempt, "deadline elapsed")),
-        result = ledger.save_issued_jobs_compact(&jobs, group.revision, &group.parent, group.dependency(), &attempt) => result,
+        _ = async { while cancellations.next().await.is_some() {} } => Err(interrupted(attempt, "all callers canceled")),
+        _ = tokio::time::sleep_until(deadline) => Err(interrupted(attempt, "deadline elapsed")),
+        result = ledger.save_issued_jobs_compact(&jobs, group.revision, &group.parent, group.dependency(), attempt) => result,
     };
     // This measures the actual shared storage attempt, including its pool
     // and lock waits (another in-flight batch's renewal of the same
@@ -381,9 +443,8 @@ async fn save_issued_batch_in_flight(
         commit_started = attempt.commit_started(),
         "compact issued batch completed"
     );
-    // Hold admission and this flight through rollback draining, including on
-    // shutdown, so a cleanup still holding its connection counts against the
-    // in-flight bound.
+    // Hold admission through rollback draining, including on shutdown. The
+    // caller holds the flight until then too.
     attempt.wait_for_cleanup().await;
     drop(cancellations);
     let result = result.map_err(Arc::new);
@@ -394,7 +455,6 @@ async fn save_issued_batch_in_flight(
             .map_err(|error| anyhow::Error::new(SharedFailure(error.clone())));
         let _ = entry.response.send(reply);
     }
-    drop(flight);
 }
 
 fn interrupted(attempt: &CompactBatchAttempt, reason: &str) -> anyhow::Error {

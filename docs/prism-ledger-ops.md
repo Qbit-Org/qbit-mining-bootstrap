@@ -60,23 +60,28 @@ flight is used only when the pool leaves at least four connections beside
 window reads (`PRISM_DATABASE_MAX_CONNECTIONS` minus `clamp(max - 2, 1,
 build workers)`), so a share append and the candidate-lease heartbeat keep
 two; smaller pools keep one flight, as before. Admission holds at most 64
-children per flight plus 64 being collected (192 with two flights). Batches start in waves: a second
-batch may join the first while it is in flight, but once a batch of the wave
-finishes, the next batch waits until all have. PostgreSQL grants a new `FOR
-KEY SHARE` past a queued `FOR UPDATE`, so without that gap one frontend's
-overlapping batches could hold the cluster row through a whole fan-out while
-an authority writer or blob GC waits there holding `ORDER_LOCK`. The bound of
-one wave is per frontend: batches of other frontends on the same ledger, and
+children per flight plus 64 being collected (192 with two flights).
+
+Batches start in waves. A second batch joins the first only within 2 ms of
+its start and while it is in flight; a later batch, or any batch once one of
+the wave has finished, waits until the whole wave has. PostgreSQL grants a
+new `FOR KEY SHARE` past a queued `FOR UPDATE`, so without that gap one
+frontend's overlapping batches could hold the cluster row through a whole
+fan-out while an authority writer or blob GC waits there holding
+`ORDER_LOCK`. With waves such a writer waits for about one batch per
+frontend, as before #860. Batches of other frontends on the same ledger, and
 single-child repairs, overlapped one frontend's batches before #860 too.
 Collection dwells for up to 1 ms from the oldest admission, flushing earlier
-when full or a deadline requires it. Time behind
-other batches and admission backpressure remain inside the original
-persistence deadline. A batch's result goes only to its own children, and each
-caller revalidates its publication after its own batch, so batches may
-complete in any order. Overlapping batches take the locks below in the same
-order; two that both extend one prepared row's retention serialize on that
-row's update lock until the first commits. These bounds are engineering
-choices, not evidence of a latency target.
+when full or a deadline requires it. Time behind other batches and admission
+backpressure remain inside the original persistence deadline. A batch's
+result goes only to its own children, and each caller revalidates its
+publication after its own batch, so batches may complete in any order.
+Overlapping batches take the locks below in the same order. A batch extends
+the prepared row's retention only for work issued more than about 135 s
+after its publication (165 s prepared retention against 30 s per child by
+default); two that both do serialize on that row's update lock until the
+first commits. These bounds are engineering choices, not evidence of a
+latency target.
 
 Groups share the complete original compact dependency identity and the expected
 current revision and parent; each Coordinator is bound to its own ledger/frontend.

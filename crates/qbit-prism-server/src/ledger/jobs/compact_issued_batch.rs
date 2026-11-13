@@ -37,8 +37,8 @@ impl CompactBatchAttempt {
         self.commit_started.load(Ordering::Acquire)
     }
 
-    /// Keep the batch's flight in the collector until cancellation drains the
-    /// transaction.
+    /// Keep the batch's flight, held by its batch task, until cancellation
+    /// drains the transaction.
     /// This cleanup interval does not extend a caller's original deadline.
     pub async fn wait_for_cleanup(&self) {
         loop {
