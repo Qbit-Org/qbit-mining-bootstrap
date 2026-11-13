@@ -2810,15 +2810,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             window::LEGACY_RECIPIENTS,
         ),
         "arrival": args.arrival()?.render(),
-        "preset": ctx.preset.as_ref().map(|preset| json!({
-            "name": preset.name,
-            "path": preset.path.display().to_string(),
-            "sha256": preset.sha256,
-            "description": preset.description,
-            "issues": preset.issues,
-            // Every key the run was held to, the optional medians included.
-            "gates": preset.gates,
-        })),
+        "preset": ctx.preset.as_ref().map(preset_report),
         "time_to_usable_work": time_to_usable_work(
             &external_tips, &tip_changes, &collected, args.sessions,
         ),
@@ -5845,4 +5837,113 @@ pub fn summary_text(
         ));
     }
     text
+}
+
+/// The side report's `preset` block. Its `gates` is the preset's whole
+/// [`crate::preset::Gates`], serialized rather than copied key by key
+/// (#817): a hand-written subset had dropped the median tip gate and both
+/// churn gates, so a report showed only the 10 s p99 budget and read as a
+/// 10 s gate. These are the preset file's gates: a dispatch that overrides
+/// a budget on the gate's command line (prism-load-run.sh's
+/// `PRISM_LOAD_MAX_SHORTFALL`, `PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS`)
+/// changes only what the gate applies, which gate.md's Budget column shows.
+fn preset_report(preset: &crate::preset::Preset) -> Value {
+    json!({
+        "name": preset.name,
+        "path": preset.path.display().to_string(),
+        "sha256": preset.sha256,
+        "description": preset.description,
+        "issues": preset.issues,
+        "gates": preset.gates,
+    })
+}
+
+#[cfg(test)]
+mod preset_report_tests {
+    use super::preset_report;
+    use crate::preset::{Gates, Preset, Schedule};
+    use std::collections::BTreeMap;
+
+    fn preset(gates: Gates) -> Preset {
+        Preset {
+            path: "presets/example.json".into(),
+            sha256: "00".repeat(32),
+            name: "example".to_owned(),
+            description: "example".to_owned(),
+            issues: vec!["#817".to_owned()],
+            schedule: Schedule::Manual,
+            runner: "runner".to_owned(),
+            timeout_minutes: 1,
+            gates,
+            args: BTreeMap::new(),
+            soak: None,
+        }
+    }
+
+    /// Every gate key reaches the report with the value the preset holds the
+    /// run to. The struct literal names every field, so a new gate must be
+    /// added here; the report's block then parses back (unknown keys refused)
+    /// to the same gates, so a key left out or renamed fails. Each value
+    /// differs from its default, so an optional key that went missing and
+    /// parsed back as `None` fails too.
+    /// Every gate set, each to a value other than its default.
+    fn every_gate_set() -> Gates {
+        Gates {
+            phases: Some(vec!["steady".to_owned()]),
+            max_shortfall: 1,
+            max_rejected_valid_shares: Some(2),
+            max_unanswered_submits: Some(3),
+            tip_last_notify_p99_budget_ms: Some(10_000.0),
+            tip_last_notify_median_budget_ms: Some(2_000.0),
+            d1_verdict_table: true,
+            churn_tip_last_notify_p99_budget_ms: Some(4_000.0),
+            churn_tip_last_notify_median_budget_ms: Some(1_500.0),
+            new_session_first_job_p99_budget_ms: Some(5_000.0),
+        }
+    }
+
+    #[test]
+    fn the_side_report_carries_every_gate_key() {
+        let gates = every_gate_set();
+        let report = preset_report(&preset(gates.clone()));
+        let round_trip: Gates =
+            serde_json::from_value(report["gates"].clone()).expect("the report's gates parse");
+        assert_eq!(round_trip, gates);
+    }
+
+    /// A gate the preset leaves ungated is reported as `null`, so the report
+    /// says it is not gated rather than leaving the key out: the report of a
+    /// preset that gates nothing optional has the same keys as one that sets
+    /// every gate, and each optional one is `null`.
+    #[test]
+    fn an_ungated_key_is_reported_as_null() {
+        let gates = Gates {
+            phases: None,
+            max_shortfall: 0,
+            max_rejected_valid_shares: None,
+            max_unanswered_submits: None,
+            tip_last_notify_p99_budget_ms: Some(10_000.0),
+            tip_last_notify_median_budget_ms: None,
+            d1_verdict_table: false,
+            churn_tip_last_notify_p99_budget_ms: None,
+            churn_tip_last_notify_median_budget_ms: None,
+            new_session_first_job_p99_budget_ms: None,
+        };
+        let report = preset_report(&preset(gates));
+        let block = report["gates"].as_object().expect("gates is an object");
+        let every = preset_report(&preset(every_gate_set()));
+        let every = every["gates"].as_object().expect("gates is an object");
+        assert_eq!(
+            block.keys().collect::<Vec<_>>(),
+            every.keys().collect::<Vec<_>>()
+        );
+        let required = [
+            "max_shortfall",
+            "tip_last_notify_p99_budget_ms",
+            "d1_verdict_table",
+        ];
+        for (key, value) in block {
+            assert_eq!(value.is_null(), !required.contains(&key.as_str()), "{key}");
+        }
+    }
 }

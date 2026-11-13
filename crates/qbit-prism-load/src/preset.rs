@@ -70,6 +70,9 @@ pub enum Schedule {
 /// `tip_last_notify_median_budget_ms` (#790) and
 /// `churn_tip_last_notify_median_budget_ms` (#842), are absent from every
 /// preset that does not gate on them, and absent means `null`.
+///
+/// The load harness's side report serializes the whole struct (#817), so a
+/// key added here reaches the report without a second list to update.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gates {
