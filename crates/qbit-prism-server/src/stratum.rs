@@ -229,6 +229,11 @@ pub struct StratumConfig {
     pub max_unknown_jobs_per_interval: u32,
     pub max_authorize_attempts_per_interval: u32,
     pub stats: Arc<StratumStats>,
+    /// The `mining.notify` bodies sessions share (#861): each publication's
+    /// is rendered once for every session of either listener (by each
+    /// runtime worker that misses it at the same moment; before the first
+    /// share, when each worker's coinbase is its own, once per session).
+    pub notify_bodies: codec::NotifyBodies,
 }
 
 impl Default for StratumConfig {
@@ -264,6 +269,7 @@ impl Default for StratumConfig {
             max_unknown_jobs_per_interval: 0,
             max_authorize_attempts_per_interval: DEFAULT_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL,
             stats: Arc::new(StratumStats::default()),
+            notify_bodies: codec::NotifyBodies::default(),
         }
     }
 }
@@ -1148,9 +1154,19 @@ async fn write_json(
 ) -> Result<()> {
     let mut bytes = serde_json::to_vec(&payload)?;
     bytes.push(b'\n');
+    write_line(writer, &bytes, config).await
+}
+
+/// Write one complete message, its newline included, under the session's
+/// send timeout.
+async fn write_line(
+    writer: &mut (impl AsyncWrite + Unpin),
+    line: &[u8],
+    config: &StratumConfig,
+) -> Result<()> {
     timeout(
         Duration::from_secs_f64(config.write_timeout_seconds),
-        writer.write_all(&bytes),
+        writer.write_all(line),
     )
     .await
     .context("Stratum write timeout")??;
@@ -1458,7 +1474,9 @@ async fn announce_job<B: MiningBackend>(
         config,
     )
     .await?;
-    write_json(writer, job.wire.notify(), config).await?;
+    // The body every session of this work shares is rendered once (#861);
+    // the bytes are `notify()`'s, serialised, as before.
+    write_line(writer, &config.notify_bodies.line(&job.wire), config).await?;
     metrics.revision_work_delivered(job.wire.payout_revision);
     session.observation.delivered(job.wire.refresh_generation);
     let hint = session.pending_retarget.take().map(|(previous, _)| {
