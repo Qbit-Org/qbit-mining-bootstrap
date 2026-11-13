@@ -200,8 +200,10 @@ The cluster row's lock matrix (#479):
 |---|---|
 | Authority writers (`payout_revision`, `config_fingerprint`, `fatal_error`) | `FOR UPDATE`, then the `UPDATE` |
 | Job persistence cohorts, repair and prepared storage | `FOR KEY SHARE` |
+| Peer-sync prepared apply, each chunk of at most 1,000 jobs and 2 MiB, or one larger job (#785) | `FOR KEY SHARE` |
 | Blob GC | `FOR UPDATE` |
 | Snapshot anchor (`ledger_clock_ms`; share appends only read it, #738) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
+| Peer-sync own-log floor (raises `ledger_clock_ms`, never lowers it) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
 | Candidate, offer and append revision readers | `FOR SHARE` |
 
 `FOR KEY SHARE` conflicts with `FOR UPDATE`, so a cohort still serialises
@@ -231,11 +233,19 @@ fence. The schema is unchanged.
 proceeds instead of waiting. It leaves a locker-plus-updater MultiXact on the
 singleton row, and the lock is carried to the new row version. On PostgreSQL
 16, 1,000 clock `UPDATE`s used no MultiXact IDs with no locker and 2,000 with
-one `FOR KEY SHARE` holder open. At 500 shares/s with a fraction *f* of
-appends overlapping a cohort, that is about 86 M·*f* a day, which brings the
-anti-wraparound MultiXact vacuum forward to about every 4.6/*f* days at the
-default `autovacuum_multixact_freeze_max_age`. This is far cheaper than the
-wait it replaces, and it is not a correctness issue. To do: in the next D1
+one `FOR KEY SHARE` holder open. While a frontend before 3.1.1 serves the
+database, each share it appends is such a clock `UPDATE`: at 500 shares/s with
+a fraction *f* of appends overlapping a cohort, that is about 86 M·*f* a day,
+which brings the anti-wraparound MultiXact vacuum forward to about every
+4.6/*f* days at the default `autovacuum_multixact_freeze_max_age`. From 3.1.1
+no append writes the row (#801): the clock `UPDATE`s are the snapshot
+anchor's, one per window snapshot, and the peer sync's own-log floor's. A
+fenced append still locks the row `FOR SHARE` (032's
+`qbit_prism_append_share` with an expected revision), though, and a second
+locker on a row a cohort holds `FOR KEY SHARE` needs a MultiXact as well, so
+MultiXact use still grows with the share rate times *f*; it has not been
+measured since #801. Either way it is far cheaper than the wait it replaces,
+and it is not a correctness issue. To do: in the next D1
 run, record `pg_stat_slru` (`MultiXactOffset`, `MultiXactMember`) and
 `mxid_age(datminmxid)` before and after, and note the measured rate here. Coordinator
 readiness, publication generation, epoch and lease checks still run before and
@@ -252,6 +262,8 @@ Job expiry remains a separate statement with its outer renewal recheck.
 | Path | Lock order relevant to compact persistence |
 | --- | --- |
 | Compact prepared / issued / batch | Cluster SHARE → dependency/blob writes or locks → commit; no later advisory acquisition |
+| Peer-sync prepared apply (each chunk its own transaction, #785) | Cluster KEY SHARE → blob inserts → job inserts → the peer cursor, when the jobs are the peer's → commit; no advisory acquisition |
+| Peer-sync own-log floor | SETTLEMENT → ORDER → sequence floors → cluster NO KEY UPDATE (`ledger_clock_ms`) |
 | Blob collector | SETTLEMENT → ORDER → cluster UPDATE → fresh scans/deletes |
 | Candidate enqueue | ORDER → cluster SHARE → balance blob → candidate |
 | Share append without a block | ORDER → cluster SHARE (fenced), both inside `qbit_prism_append_share` (#711) |
@@ -1599,10 +1611,13 @@ server supports it, PostgreSQL 14 and later), so a stop never waits on a
 report.
 
 The report holds one snapshot for its whole run, about a minute at production
-size today. On a primary serving miners every share updates the cluster row, so
-at high share rates that snapshot piles up dead versions of the row and slows
-the share append (#738); below about 200 shares/s it's harmless. At higher
-rates, run the report on a hot standby with `hot_standby_feedback` off and its
+size today. While a frontend before 3.1.1 serves the database, every share it
+appends updates the cluster row, so on a primary serving miners at high share
+rates that snapshot piles up dead versions of the row and slows the share
+append (#738); below about 200 shares/s it's harmless. From 3.1.1 an append
+no longer updates the row (#801), so once every frontend runs 3.1.1 or later this
+reason is gone. While an earlier frontend serves at higher rates, run the
+report on a hot standby with `hot_standby_feedback` off and its
 replay paused instead, as the admission gate's
 `PRISM_INTEGRITY_REPORT_DATABASE_URL` does (#740; see
 [drain and migrate](prism-rust-migration.md#drain-and-migrate)), or run
@@ -2957,14 +2972,19 @@ only documented.
   reply but before the end of the batch retires the connection as well. The
   test proves it by also holding only the batch's closing `ReadyForQuery`.
 
-On the successful path nothing changes: an append is the same ten round
-trips on one connection, followed by SQLx's own release ping. Since #479 they
-carry eleven server statements: the opening simple query is `BEGIN` plus
+On the successful path the guard changed nothing: before #802 an append was
+the same ten round trips on one connection, followed by SQLx's own release
+ping. Since #479 they carried eleven server statements: the opening simple query is `BEGIN` plus
 `SET LOCAL plan_cache_mode = force_generic_plan`, which applies to every
 statement of the append transaction and makes the share_id probe planned once
 per connection, and `pg_stat_statements` shows the `SET`. The test prints the
 trace after the retirement so the count can be compared with the trace
-recorded before the guard.
+recorded before the guard. Since #802 a share without a block takes three
+round trips instead, four server statements: the same opening
+`BEGIN; SET LOCAL` query, one call of 032's `qbit_prism_append_share`, and
+`COMMIT`, then the release ping. A share that carries a block keeps the ten
+round trips; one whose own fields fail the checks takes the statements too,
+and is refused after the first read.
 
 **Rejected alternative.** A pool-level `after_release` hook in the ledger's
 pool builder that rolls back any open transaction would cover every
@@ -2974,8 +2994,9 @@ transaction status: `PgConnection::in_transaction` is crate-private, and
 the number that is wrong here. Detection therefore needs a statement round
 trip on every release, in addition to the release ping, and an unconditional
 `ROLLBACK` would warn in the server log on every release. That is roughly one
-extra round trip per checkout on a path that costs ten statements and a ping
-today, paid as connection occupancy in the pool-bound `slow_database` phase,
+extra round trip per checkout on a path that, for a share without a block,
+costs `BEGIN`, `SET LOCAL`, one call and `COMMIT` and a ping since #802
+(eleven statements in ten round trips and a ping before), paid as connection occupancy in the pool-bound `slow_database` phase,
 with the `ORDER_LOCK` hold time unchanged. `idle_in_transaction_session_timeout`
 was rejected too: it reaps an idle leftover only after its timeout, does
 nothing under load, where the leftover is reused within milliseconds, and
@@ -3366,12 +3387,15 @@ unaffected). Finish it once frontends serve, at a time of ordinary load.
 2. **Choose the throttle.** The defaults suit a primary taking up to a few
    hundred shares a second: batches of at most 5,000 `share_seq`, each
    statement cancelled after 2 s and retried at half its size, and a rest as
-   long as each batch took. Every native share updates the cluster row inside
+   long as each batch took. While a frontend before 3.1.1 serves the
+   database, every native share it appends updates the cluster row inside
    `ORDER_LOCK`, and a snapshot held on the primary keeps that row's dead
    versions, so `ORDER_LOCK` saturates after 18 to 20 seconds of held horizon
-   at about 400 shares a second (#738). Each of the backfill's statements,
-   its double-credit check's and its record's included, runs in a transaction
-   of its own and is cancelled at the statement timeout, which is at most 5 s.
+   at about 400 shares a second (#738). From 3.1.1 an append no longer updates
+   the row (#801), but the backfill can't tell which releases serve, so it keeps
+   the bound as a conservative choice: each of its statements, its
+   double-credit check's and its record's included, runs in a transaction of
+   its own and is cancelled at the statement timeout, which is at most 5 s.
    A statement the timeout cancelled is told from one an administrator
    cancelled with `pg_cancel_backend`, which stops the run, by its SQLSTATE,
    57014, and by having run the timeout, all but a tenth of slack for the
@@ -4708,7 +4732,11 @@ and sets `qbit_prism_peer_sync_refused{reason}`. Then it pulls, in this order:
    its own landing or an adoption, is skipped whole, and its facts are
    compared. A block waits until the share mark covers its window.
 4. **Prepared jobs**, each with its template and balance blob, the blobs
-   first, in one transaction.
+   first, in chunks of at most 1,000 jobs and 2 MiB of JSON (#785). Each chunk
+   is its own transaction under the cluster row's `FOR KEY SHARE`, the
+   blob-GC fence, and advances the cursor through its last job. A chunk that
+   fails stops the pass: the chunks before it stay applied, and applying them
+   again changes nothing. A job whose blobs alone exceed 2 MiB goes alone.
 
 Landed blocks and prepared jobs have no lock that orders their commits, so
 their pulls stop at the peer's sync barrier: every `sync_seq` is drawn under an

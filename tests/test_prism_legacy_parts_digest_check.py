@@ -22,6 +22,7 @@ SCRIPT = REPO / "scripts/prism_legacy_parts_digest_check.py"
 SIDECAR_TOOL = REPO / "scripts/prism_legacy_range_sidecars.py"
 SHARDED = REPO / "scripts/prism_legacy_range_sidecars_sharded.sh"
 FIXTURE = REPO / "tests/fixtures/prism-legacy-v2-audit-body"
+INLINE_FIXTURE = REPO / "tests/fixtures/prism-legacy-v2-inline-audit-body"
 spec = importlib.util.spec_from_file_location("legacy_parts_digest_check", SCRIPT)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -114,6 +115,31 @@ def share(seq):
         "job_issued_at_ms": 1755815340000 + seq, "accepted_at_ms": 1755815341000 + seq,
         "ntime": 1755815340,
     }
+
+
+def inline_variants(body):
+    """The inline fixture's body, and variants whose inline shares 3.x parses
+    into another form, each with the parts digest 2.x would have written over
+    them: (label, body, accepted by 3.x with #731's fix)."""
+    def variant(change):
+        changed = json.loads(json.dumps(body))
+        proof = changed["share_window_proof"]
+        change(proof["share_parts"][0]["shares"][0])
+        proof["share_parts_digest_hex"] = digest_as_2x_wrote_it(proof["share_parts"])
+        return changed
+
+    def reorder(share):
+        items = list(share.items())
+        share.clear()
+        share.update(reversed(items))
+
+    return [
+        ("as 2.x wrote it", body, True),
+        ("credit_policy set", variant(lambda share: share.update(credit_policy="pplns")), True),
+        ("credit_policy null", variant(lambda share: share.update(credit_policy=None)), False),
+        ("an unknown key", variant(lambda share: share.update(note="not 3.x's")), False),
+        ("keys reordered", variant(reorder), False),
+    ]
 
 
 def write_stub(directory):
@@ -366,6 +392,114 @@ class PartsDigestCheckTests(unittest.TestCase):
                     module.main([str(arg) for arg in argv])
                 self.assertEqual(raised.exception.code, 2)
 
+    def test_with_the_fix_a_2x_body_without_a_sidecar_passes(self):
+        # 3.1.1 (#809) imports 2.x's form as it is: nothing to list.
+        tree = Tree(self.dir, blocks=2)
+        affected = self.dir / "affected.csv"
+        code, rows, summary = check(tree, "--with-731-fix", "--affected-csv", affected)
+        self.assertEqual(code, 0)
+        self.assertEqual([(row["status"], row["parts"], row["has_inline"]) for row in rows],
+                         [("ok-in-3x", 2, False)] * 2)
+        self.assertEqual(summary, {"import_refuses": 0, "totals": {"ok-in-3x": 2},
+                                   "with_731_fix": True})
+        self.assertEqual(affected.read_text(), HEADER + "\n")
+
+    def test_with_the_fix_the_sorted_key_form_and_any_other_are_refused_and_listed(self):
+        tree = Tree(self.dir, blocks=2)
+        tree.write_body(tree.blocks[0], digest_as_3x_recomputes_it(tree.parts))
+        tree.write_body(tree.blocks[1], "00" * 32)
+        affected = self.dir / "affected.csv"
+        code, rows, summary = check(tree, "--with-731-fix", "--affected-csv", affected)
+        self.assertEqual(code, 3)
+        self.assertEqual([row["status"] for row in rows], ["matches-neither"] * 2)
+        self.assertEqual(summary, {"import_refuses": 2, "totals": {"matches-neither": 2},
+                                   "with_731_fix": True})
+        self.assertEqual(affected.read_text(), tree.rows.read_text())
+
+    def test_with_the_fix_unknown_keys_and_absent_bounds_are_dropped_and_text_escaped(self):
+        tree = Tree(self.dir)
+        parts = [dict(tree.parts[0], note="2.x kept it, 3.x has no such field"),
+                 dict(tree.parts[1], segment_first_share_seq=None, segment_last_share_seq=None,
+                      body_uri=tree.parts[1]["body_uri"] + "-Bj\u00f6rn")]
+        seen_by_3x = [{key: value for key, value in part.items()
+                       if key != "note" and value is not None} for part in parts]
+        # 3.x recomputes 2.x's form over the fields it parses, non-ASCII
+        # escaped; the raw parts, raw UTF-8 or sorted keys are other forms.
+        for parts_digest, status in (
+                (digest_as_2x_wrote_it(seen_by_3x), "ok-in-3x"),
+                (digest_as_2x_wrote_it(parts), "matches-neither"),
+                (hashlib.sha256(compact({"share_parts": seen_by_3x}, False)).hexdigest(),
+                 "matches-neither"),
+                (digest_as_3x_recomputes_it(seen_by_3x), "matches-neither")):
+            with self.subTest(status=status, parts_digest=parts_digest):
+                tree.write_body(tree.blocks[0], parts_digest, parts=parts)
+                code, [row], _ = check(tree, "--with-731-fix")
+                self.assertEqual((code, row["status"]), (0 if status == "ok-in-3x" else 3, status))
+
+    def test_the_fixtures_2x_wrote_are_refused_before_the_fix_and_pass_with_it(self):
+        [segment_range] = FIXTURE.glob("prism-audit-bundle-body-*.json")
+        [inline] = INLINE_FIXTURE.glob("prism-audit-bundle-body-*.json")
+        bodies = [segment_range, inline]
+        code, rows, summary = run_checker(bodies)
+        self.assertEqual((code, summary), (3, {"import_refuses": 2, "totals": {"2x-order-only": 2}}))
+        self.assertEqual([row["has_inline"] for row in rows], [False, True])
+        code, rows, summary = run_checker(["--with-731-fix", *bodies])
+        self.assertEqual((code, summary), (0, {"import_refuses": 0, "totals": {"ok-in-3x": 2},
+                                               "with_731_fix": True}))
+
+    def test_with_the_fix_inline_shares_are_parsed_as_3x_parses_them(self):
+        [path] = INLINE_FIXTURE.glob("prism-audit-bundle-body-*.json")
+        for label, body, accepted in inline_variants(json.loads(path.read_bytes())):
+            with self.subTest(label):
+                target = self.dir / "body.json"
+                target.write_bytes(compact(body))
+                code, [row], _ = run_checker(["--with-731-fix", target])
+                self.assertEqual((code, row["status"], row["has_inline"]),
+                                 (0, "ok-in-3x", True) if accepted else (3, "matches-neither", True))
+                # The default model keeps inline shares as stored.
+                code, [row], _ = run_checker([target])
+                self.assertEqual((code, row["status"]), (3, "2x-order-only"))
+
+    def test_the_default_mode_needs_no_other_script(self):
+        # Copied alone, the checker still runs without --with-731-fix.
+        alone = self.dir / "alone"
+        alone.mkdir()
+        shutil.copy(SCRIPT, alone / SCRIPT.name)
+        tree = Tree(self.dir / "tree")
+        run = subprocess.run([sys.executable, "-I", str(alone / SCRIPT.name), "--rows", str(tree.rows),
+                              "--audit-root", str(tree.audit)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 3, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["status"], "2x-order-only")
+        # --with-731-fix needs the sidecar tool's share model: refused up
+        # front, naming the file, not reported row by row.
+        run = subprocess.run([sys.executable, "-I", str(alone / SCRIPT.name), "--with-731-fix",
+                              "--rows", str(tree.rows), "--audit-root", str(tree.audit)],
+                             capture_output=True, text=True)
+        self.assertEqual((run.returncode, run.stdout), (2, ""))
+        self.assertIn(str(alone / "prism_legacy_range_sidecars.py"), run.stderr)
+
+    def test_with_the_fix_the_other_statuses_are_unchanged(self):
+        tree = Tree(self.dir, blocks=5)
+        sidecar, missing, no_digest, body_ref, other_digest = tree.blocks
+        tree.sidecar(sidecar).write_bytes(b"")
+        (tree.audit / tree.body_name(missing)).unlink()
+        tree.write_body(no_digest, None)
+        tree.write_body(body_ref, "00" * 32, schema=BODY_REF)
+        tree.write_body(other_digest, digest_as_2x_wrote_it(tree.parts), digest="11" * 32)
+        by_default, with_fix = check(tree), check(tree, "--with-731-fix")
+        expected = ["has-sidecar", "body-missing", "no-parts-digest", "no-window-proof",
+                    "body-digest-differs"]
+        for code, rows, summary in (by_default, with_fix):
+            self.assertEqual(code, 3)
+            self.assertEqual([row["status"] for row in rows], expected)
+            self.assertEqual(summary["import_refuses"], 0)
+        self.assertEqual(by_default[1], with_fix[1])
+        self.assertNotIn("with_731_fix", by_default[2])
+        # Without the body problems, the run passes.
+        tree.write_rows([(block, tree.body_uri(block), tree.digest)
+                         for block in (sidecar, no_digest, body_ref)])
+        self.assertEqual(check(tree, "--with-731-fix")[0], 0)
+
     def test_parallel_jobs_report_exactly_what_one_process_does(self):
         # Run as a script: a pool's workers import the checker by its path.
         tree = Tree(self.dir, blocks=6)
@@ -386,6 +520,14 @@ class PartsDigestCheckTests(unittest.TestCase):
         self.assertEqual([json.loads(line)["status"] for line in runs[0][1].splitlines()],
                          ["2x-order-only", "ok-in-3x", "matches-neither", "has-sidecar",
                           "body-missing", "2x-order-only"])
+        fixed = [subprocess.run(
+            [sys.executable, str(SCRIPT), "--with-731-fix", "--rows", str(tree.rows),
+             "--audit-root", str(tree.audit), "--sidecar-dir", str(tree.import_root),
+             "--jobs", jobs], capture_output=True, text=True) for jobs in ("1", "3")]
+        self.assertEqual(*[(run.returncode, run.stdout, run.stderr) for run in fixed])
+        self.assertEqual([json.loads(line)["status"] for line in fixed[0].stdout.splitlines()],
+                         ["ok-in-3x", "matches-neither", "matches-neither", "has-sidecar",
+                          "body-missing", "ok-in-3x"])
 
     def test_the_affected_rows_feed_the_sidecar_tool_and_clear_the_refusals(self):
         tree = Tree(self.dir, blocks=2)
@@ -486,7 +628,8 @@ class ShardedRunnerTests(unittest.TestCase):
 class RealCanonicalizerTests(unittest.TestCase):
     """The real 3.x canonicalizer, which has #731's fix, against a body 2.x's
     own writer produced (tests/fixtures/prism-legacy-v2-audit-body). The
-    checker's statuses are those of a release without the fix."""
+    checker's default statuses are those of a release without the fix; with
+    --with-731-fix they must agree with the canonicalizer."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -505,6 +648,8 @@ class RealCanonicalizerTests(unittest.TestCase):
         self.assertEqual(module.digest_2x(proof["share_parts"]), proof["share_parts_digest_hex"])
         code, [row], _ = run_checker([self.fixture_body])
         self.assertEqual((code, row["status"]), (3, "2x-order-only"))
+        code, [row], _ = run_checker(["--with-731-fix", self.fixture_body])
+        self.assertEqual((code, row["status"]), (0, "ok-in-3x"))
         # The canonicalizer passes the parts digest and goes on to read the
         # slots, which the body names by production paths absent here.
         unresolved = self.canonicalize(self.fixture_body)
@@ -526,11 +671,35 @@ class RealCanonicalizerTests(unittest.TestCase):
                 body.write_bytes(compact(self.body))
                 code, [row], _ = run_checker([body])
                 self.assertEqual(row["status"], status)
+                code, [row], _ = run_checker(["--with-731-fix", body])
+                self.assertEqual((code, row["status"]), (0, "ok-in-3x") if accepted
+                                 else (3, "matches-neither"))
                 run = self.canonicalize(body)
                 self.assertEqual(run.returncode == 0, accepted, run.stderr)
                 if accepted:
                     self.assertEqual(hashlib.sha256(run.stdout).hexdigest(), self.digest)
                 else:
+                    self.assertIn(b"share_parts_digest_hex mismatch", run.stderr)
+
+    def test_with_the_fix_the_checker_agrees_on_inline_shares(self):
+        [path] = INLINE_FIXTURE.glob("prism-audit-bundle-body-*.json")
+        for label, body, accepted in inline_variants(json.loads(path.read_bytes())):
+            with self.subTest(label):
+                target = self.dir / "body.json"
+                target.write_bytes(compact(body))
+                code, [row], _ = run_checker(["--with-731-fix", target])
+                self.assertEqual(row["status"], "ok-in-3x" if accepted else "matches-neither")
+                run = self.canonicalize(target)
+                if label == "as 2.x wrote it":
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                elif accepted:
+                    # Its parts digest passes; the changed share then fails
+                    # the window's other digests, which this checker leaves
+                    # to import.
+                    self.assertNotIn(b"share_parts_digest_hex mismatch", run.stderr)
+                    self.assertIn(b"share_slice_digest_hex mismatch", run.stderr)
+                else:
+                    self.assertNotEqual(run.returncode, 0)
                     self.assertIn(b"share_parts_digest_hex mismatch", run.stderr)
 
     @unittest.skipUnless(GNU_COREUTILS, "the sharded runner needs GNU coreutils")

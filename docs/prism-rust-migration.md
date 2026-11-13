@@ -135,11 +135,16 @@ The gate's carry-forward integrity check runs the same report `self-check`
 runs. At production size it took about a minute before migration 026 (#737).
 Since 026 it is estimated at about half a minute, the sum of its two checks'
 EXPLAIN ANALYZE times (20.29 s and 9.14 s), not a timed run. It holds one
-snapshot for as long. On a primary with live miners every share updates the
-cluster row, so a long snapshot there piles up dead row versions and slows
-the share append's lock (#738). Below about 200 shares/s that's harmless. Above it, set
-`PRISM_INTEGRITY_REPORT_DATABASE_URL` to a hot standby and the gate runs the
-report there. That standby must have `hot_standby_feedback` off, or the report
+snapshot for as long. While a frontend before 3.1.1 serves the database,
+every share it appends updates the cluster row, so a long snapshot on a
+primary with live miners piles up dead row versions and slows the share
+append's lock (#738). From 3.1.1 no share append writes the row (#801): of
+the clock `UPDATE`s, only the snapshot anchor's and the peer sync's own-log
+floor's remain, so under 3.1.1
+frontends alone a long snapshot no longer slows the append this way. Below about
+200 shares/s it's harmless either way. Above it, while a frontend before 3.1.1
+serves, set `PRISM_INTEGRITY_REPORT_DATABASE_URL` to a hot standby and the
+gate runs the report there. That standby must have `hot_standby_feedback` off, or the report
 holds back the writer all the same. Pause its replay first
 (`SELECT pg_wal_replay_pause();`, until `pg_get_wal_replay_pause_state()` reads
 `paused`; `pg_wal_replay_resume()` afterwards), or set
@@ -322,8 +327,9 @@ database is refused like this:
 refusing to migrate a native collision source before any DDL: the empty database already holds
 1 object(s) that the native migrations create and the 2.x.x release does not (table
 qbit_prism_cluster), so a native migration's IF NOT EXISTS would keep each such table, sequence,
-index, trigger, function or column whatever it holds and the migration would record a schema it
-did not build. Nothing was changed. Restore the full pre-migration backup, or check what those
+index, trigger, function or column whatever it holds, or skip its own object where a relation of
+another kind holds the name, and the migration would record a schema it did not build. Nothing
+was changed. Restore the full pre-migration backup, or check what those
 objects hold and remove them yourself, then migrate again
 ```
 
@@ -998,16 +1004,18 @@ form is still refused.
 ### 2.x v2 bodies whose window-proof parts digest 3.x recomputes differently (#731)
 
 **From 3.1.1 this procedure isn't needed:** 3.1.1's `import-audits`
-verifies these bodies as they are, so run it directly. The checker still
-reports for a release without the fix: with 3.1.1 it counts a
+verifies these bodies as they are, so run it directly. By default the checker
+still reports for a release without the fix: with 3.1.1 it counts a
 `2x-order-only` row in `import_refuses`, and exits 3, although import accepts
-the row. If you run it anyway, read its `totals`: any other status that
-stops it still needs the action below. The procedure describes import with an
-earlier release.
+the row. To check ahead of a 3.1.1 import, run it with `--with-731-fix`, which
+models the fixed import: a 2.x body is then `ok-in-3x`, and the run exits 3
+only for a row import still refuses (`matches-neither`) or a body problem,
+each of which still needs the action below. The procedure describes import
+with an earlier release.
 
 2.x wrote each audit-bundle.v2 body's `share_parts_digest_hex` over its share
-parts in insertion order; 3.x recomputes it with sorted keys. 3.x therefore
-refuses every such body, and `import-audits` stops on the first one with
+parts in insertion order; 3.x before 3.1.1 recomputes it with sorted keys. It
+therefore refuses every such body, and `import-audits` stops on the first one with
 `window proof share_parts_digest_hex mismatch`. The body is intact. Import
 reads a canonical sidecar before the body, so only a v2 body without one in the
 import root reaches the check. 2.x has written a sidecar beside each new v2
@@ -1034,6 +1042,33 @@ python3 scripts/prism_legacy_parts_digest_check.py --rows legacy-rows.csv \
 time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
 ```
 
+With 3.1.1 or later, pass `--with-731-fix` to both checker runs. A 2.x body
+is then `ok-in-3x` and needs no sidecar, so `refused-rows.csv` holds only the
+`matches-neither` rows, usually none. The sidecar runner still proves those:
+the tool rewrites a body as a body-ref without the window proof, so its parts
+digest is never checked, and the canonicalizer verifies the content against
+`audit_bundle_sha256`.
+
+```sh
+python3 scripts/prism_legacy_parts_digest_check.py --with-731-fix --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --sidecar-dir /var/lib/qbit-prism/audit \
+  --affected-csv refused-rows.csv --jobs 8 > parts-digest.jsonl
+scripts/prism_legacy_range_sidecars_sharded.sh refused-rows.csv \
+  /var/lib/qbit-mining-pool/prism/audit /var/lib/qbit-prism/audit \
+  target/release/qbit-prism-audit-canonicalize scripts/prism_legacy_range_sidecars.py \
+  legacy-sidecar-shards 8
+python3 scripts/prism_legacy_parts_digest_check.py --with-731-fix --rows legacy-rows.csv \
+  --audit-root /var/lib/qbit-mining-pool/prism/audit \
+  --sidecar-dir /var/lib/qbit-prism/audit --jobs 8 > /dev/null
+time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
+```
+
+The fixed mode checks the parts digest only: like the default mode, it does
+not parse a body as strictly as 3.x does, so a part or inline share with a
+missing or mistyped field can pass it and still be refused by import. 2.x's
+own writer writes complete records.
+
 - The checker reads each body once. A row whose sidecar is in `--sidecar-dir`
   is `has-sidecar` and its body is not read. That status means only that the
   file is there: import verifies the sidecar's bytes and stops on a bad one.
@@ -1059,13 +1094,18 @@ time qbit-prism-server import-audits --root /var/lib/qbit-prism/audit
   against a copy of the tree, writing into the directory import will read.
   In the window, rerun them for the rows added since.
 
-Since #731's fix, 3.x recomputes the digest as 2.x wrote it: each part's keys
-in insertion order and non-ASCII text escaped. A canonicalizer and an import
+Since #731's fix, 3.x recomputes the digest as 2.x wrote it, over the parts
+as it parses them: each part's known fields in the order 2.x writes them,
+`kind` first, an inline part's shares as 3.x's `AcceptedShare`, and non-ASCII
+text escaped. A body whose stored parts differ from that layout (other key
+order, unknown keys, a null `credit_policy`) is still refused. A canonicalizer and an import
 built from a release that includes it verify these bodies without sidecars.
-The checker's statuses stay those of a release without the fix, so with such
-a release its `2x-order-only` rows are ones import accepts, and the sidecar
-tool reports them as `ok-in-3x` without writing a sidecar. A parts digest of
-any other form, including the sorted-key one, is refused.
+The checker's default statuses stay those of a release without the fix, so
+with such a release its `2x-order-only` rows are ones import accepts, and the
+sidecar tool reports them as `ok-in-3x` without writing a sidecar.
+`--with-731-fix` gives that release's statuses instead: those rows are
+`ok-in-3x`, and a parts digest of any other form, including the sorted-key
+one, is `matches-neither`, refused, as import refuses it.
 
 ### Migration 002's share-hash backfill, applied online
 
@@ -1518,24 +1558,29 @@ false`. On a database whose backfill finished already there is nothing to
 map, and it succeeds all the same, with `"already_complete": true`,
 `"mapped": 0` and no range, so a retry after a lost reply is safe.
 
-**The snapshot rule (#738).** Every native share append updates the
-`qbit_prism_cluster` row inside `ORDER_LOCK`. A snapshot held anywhere on the
-primary keeps that row's dead versions, so each append's update costs more the
-longer it is held: at about 400 shares a second `ORDER_LOCK` saturates after
-18 to 20 seconds of held horizon, and at about 130 a second it takes about five
-minutes. So every statement the backfill issues on the primary is short, each
-in a transaction of its own, never one long snapshot: a batch statement is
-cancelled at its statement timeout, 2 s by default, and the run holds no
-transaction between batches. The double-credit check reads the native shares
-the same way, and so does the transaction that records 2. The statement
-timeout is at most 5 s for that reason; the default is 2 s.
+**The snapshot rule (#738).** While a frontend before 3.1.1 serves the
+database, every native share it appends updates the `qbit_prism_cluster` row
+inside `ORDER_LOCK`. A snapshot held anywhere on the primary keeps that row's
+dead versions, so each such append's update costs more the longer it is held:
+at about 400 shares a second `ORDER_LOCK` saturates after 18 to 20 seconds of
+held horizon, and at about 130 a second it takes about five minutes. From
+3.1.1 an append no longer updates the row (#801), so under 3.1.1 frontends alone a
+held snapshot no longer costs the append this way. The backfill can't tell
+which releases serve, and a rolling upgrade from 3.1.0 or earlier mixes them,
+so it keeps the rule as a conservative choice: every statement it issues on
+the primary is short, each in a transaction of its own, never one long
+snapshot. A batch statement is cancelled at its statement timeout, 2 s by
+default, and the run holds no transaction between batches. The double-credit
+check reads the native shares the same way, and so does the transaction that
+records 2. The statement timeout is at most 5 s for that reason; the default
+is 2 s.
 
 **The throttle.**
 
 | Flag | Default | What it bounds |
 | --- | --- | --- |
 | `--max-batch` | 5000 | the `share_seq` values one batch maps, at most as many legacy shares: about half a second at the 83 to 94 µs a row measured on a mainnet-shaped ledger. 1 to 50,000. Batches start at the smaller of 10,000 and this, and grow or shrink toward half a second within it, as rc.4's do within 1,000 to 50,000 |
-| `--statement-timeout-ms` | 2000 | each batch statement, each statement of the double-credit check and each of the record's, set for its own transaction (`SET LOCAL`). A batch that outlasts it is rolled back and tried again at half its size, down to the smaller of 1,000 and `--max-batch`, where a timeout stops the run instead. 1 to 5,000: no statement may hold a snapshot on the serving primary longer (#738) |
+| `--statement-timeout-ms` | 2000 | each batch statement, each statement of the double-credit check and each of the record's, set for its own transaction (`SET LOCAL`). A batch that outlasts it is rolled back and tried again at half its size, down to the smaller of 1,000 and `--max-batch`, where a timeout stops the run instead. 1 to 5,000: no statement may hold a snapshot on the serving primary longer while a frontend before 3.1.1 may serve it (#738), kept as a conservative bound from 3.1.1 |
 | `--duty-cycle` | 0.5 | the share of the time batches take: after a batch that took `t`, the run rests `t * (1 - d) / d` outside any transaction, so at 0.5 as long as the batch took, at 0.25 three times as long. 0.01 to 1 |
 
 Each is checked before anything connects. A lower duty cycle spares the
@@ -1916,13 +1961,13 @@ instance recorded meanwhile is not applied again.
 
 | Refusal | What to do |
 | --- | --- |
-| `refusing to apply migration 16: table qbit_share_ledger_p0 already hold names the share ledger partitions take. The migration is not recorded and nothing was changed by it. Check what they hold, then rename or move them aside and migrate again` | every relation named `qbit_share_ledger_p<k>` or `qbit_share_ledger_p<k>_<suffix>` is listed with its kind; rename or move each aside, then migrate again |
-| `migration 16: swapping the share ledger could not take its lock on qbit_share_ledger within 600 s; a transaction has held the table throughout (a long read, an open writer). Let it finish, or stop the frontends, and migrate again` | also raised for `preparing the partition bound` and `checking the partition bound`; find the holder in `pg_stat_activity` and `pg_locks`, let it finish or stop the frontends, and migrate again. Nothing after the last completed step was changed |
+| `refusing to apply migration 17: table qbit_share_ledger_p0 already hold names the share ledger partitions take. The migration is not recorded and nothing was changed by it. Check what they hold, then rename or move them aside and migrate again` | every relation named `qbit_share_ledger_p<k>` or `qbit_share_ledger_p<k>_<suffix>` is listed with its kind; rename or move each aside, then migrate again |
+| `migration 17: swapping the share ledger could not take its lock on qbit_share_ledger within 600 s; a transaction has held the table throughout (a long read, an open writer). Let it finish, or stop the frontends, and migrate again` | also raised for `preparing the partition bound` and `checking the partition bound`; find the holder in `pg_stat_activity` and `pg_locks`, let it finish or stop the frontends, and migrate again. Nothing after the last completed step was changed |
 | `qbit_share_ledger does not exist` | the runner was pointed at a schema without the ledger; check `search_path` and the database |
 | `qbit_share_ledger is a partitioned table but qbit_prism_share_partitioning does not record a conversion; the migrator did not partition it. Check what did, then restore the full backup or move the table aside and migrate again` | something other than this migrator partitioned the ledger; the runner will not adopt it |
 | `qbit_share_ledger is a relation of kind v, not a table; the migrator cannot partition it` | a view or other relation holds the ledger's name; restore the table from the full backup |
-| `refusing to record migration 16: qbit_share_ledger is no longer the converted table this run left; migrate again` | the ledger changed between the conversion and the recording; nothing is recorded, and the next run plans afresh from what it finds |
-| `validating the share ledger bound for migration 16; migrate again to resume` | the context on a failed or cancelled validation scan; the pending constraint stays, and the next `migrate` resumes from the pending stage |
+| `refusing to record migration 17: qbit_share_ledger is no longer the converted table this run left; migrate again` | the ledger changed between the conversion and the recording; nothing is recorded, and the next run plans afresh from what it finds |
+| `validating the share ledger bound for migration 17; migrate again to resume` | the context on a failed or cancelled validation scan; the pending constraint stays, and the next `migrate` resumes from the pending stage |
 
 From the SQL functions that do the work:
 
@@ -1943,10 +1988,10 @@ From the SQL functions that do the work:
 | `share ledger is converted but no partition is attached in qbit_prism_share_partitions` | from the ensure function: the catalog has no attached row to extend from, so it was edited or selectively restored; restore the full backup |
 
 And from the scratch apply, which proves before any DDL that the migration file
-converts the table: `migration 16: qbit_share_ledger is missing before it`,
-`migration 16: qbit_share_ledger already has partitions before it`,
-`migration 16: qbit_share_ledger is missing after it`, and
-`migration 16: qbit_share_ledger_p0 is not a partition of qbit_share_ledger
+converts the table: `migration 17: qbit_share_ledger is missing before it`,
+`migration 17: qbit_share_ledger already has partitions before it`,
+`migration 17: qbit_share_ledger is missing after it`, and
+`migration 17: qbit_share_ledger_p0 is not a partition of qbit_share_ledger
 after it`. These refuse the binary's own migration file, not the source
 database, and mean the file and the runner have gone out of step.
 
