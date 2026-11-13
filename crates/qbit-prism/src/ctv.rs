@@ -993,6 +993,48 @@ pub fn ctv_fanout_manifest_set_sha256_hex(
     Ok(sha256_hex(&canonical_ctv_fanout_manifest_set_bytes(set)?))
 }
 
+/// A CTV document's JSON text in the form 1.x and 2.x stored beside it:
+/// CPython's `json.dumps(value, sort_keys=True, separators=(",", ":"))`, so
+/// compact, every object's keys sorted, and non-ASCII text escaped as
+/// `\uXXXX`, a character above the BMP as a surrogate pair (#739). 2.x wrote
+/// a set's `manifest_set_json` and each artifact's `manifest_json` in this
+/// form and stored the text's sha256 beside it. The text is ASCII.
+pub fn legacy_ctv_json_text<T: Serialize + ?Sized>(value: &T) -> Result<String, PrismError> {
+    // A `Value` object is a sorted map unless some crate turns on
+    // serde_json's `preserve_order`; sorting makes the order `sort_keys=True`'s
+    // either way, and costs nothing when it is already sorted.
+    let mut value = serde_json::to_value(value)?;
+    value.sort_all_objects();
+    let mut bytes = Vec::new();
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut bytes,
+        crate::audit_body_ref::PythonJsonFormatter,
+    ))?;
+    String::from_utf8(bytes).map_err(|_| invalid_ctv_manifest("legacy CTV JSON text is not UTF-8"))
+}
+
+/// A manifest set's text in the form 2.x hashed and stored beside it
+/// ([`legacy_ctv_json_text`]). [`canonical_ctv_fanout_manifest_set_bytes`]
+/// is the 3.x struct-order form instead, so the two differ for the same
+/// set. A legacy set row keeps the text and digest it was written with: its
+/// artifacts and 2.x's evidence name that digest.
+pub fn legacy_ctv_fanout_manifest_set_json(
+    set: &CtvFanoutManifestSet,
+) -> Result<String, PrismError> {
+    verify_ctv_fanout_manifest_set(set)?;
+    legacy_ctv_json_text(set)
+}
+
+/// sha256 of [`legacy_ctv_fanout_manifest_set_json`]: the set digest 2.x
+/// stored. [`ctv_fanout_manifest_set_sha256_hex`] hashes the 3.x form.
+pub fn legacy_ctv_fanout_manifest_set_sha256_hex(
+    set: &CtvFanoutManifestSet,
+) -> Result<String, PrismError> {
+    Ok(sha256_hex(
+        legacy_ctv_fanout_manifest_set_json(set)?.as_bytes(),
+    ))
+}
+
 fn verify_precommitment(precommitment: &CtvFanoutPrecommitment) -> Result<(), PrismError> {
     if precommitment.schema != CTV_FANOUT_PRECOMMITMENT_SCHEMA {
         return Err(invalid_ctv_manifest(
@@ -2647,6 +2689,75 @@ mod tests {
             err.contains("fanout_tx_hex must be lowercase canonical hex"),
             "{err}"
         );
+    }
+
+    /// #739: 2.x stored `sha256(json.dumps(set, sort_keys=True,
+    /// separators=(",", ":")))`. The pinned digests are CPython's, computed
+    /// from each set's struct-order bytes, `json.loads` then that `dumps`.
+    #[test]
+    fn legacy_ctv_fanout_manifest_set_digest_is_2x_sorted_key_json() {
+        let set = sample_manifest_set();
+        let struct_order = canonical_ctv_fanout_manifest_set_bytes(&set).unwrap();
+        let sorted = serde_json::to_vec(&serde_json::to_value(&set).unwrap()).unwrap();
+        // As in #739's height-17 evidence, the two forms are a pure reorder:
+        // the same length and bytes, keys sorted, and a different digest.
+        assert!(struct_order.starts_with(br#"{"schema":"#));
+        assert!(sorted.starts_with(br#"{"block_height":"#));
+        let (mut left, mut right) = (struct_order.clone(), sorted.clone());
+        left.sort_unstable();
+        right.sort_unstable();
+        assert_eq!(left, right);
+        let legacy = legacy_ctv_fanout_manifest_set_sha256_hex(&set).unwrap();
+        assert_eq!(legacy, sha256_hex(&sorted));
+        assert_eq!(
+            legacy,
+            "7732d6aa8f4b7f79ca9bd0af23dda9eafa4d3acac6bc62877adb332a0c5d12a0"
+        );
+        assert_ne!(legacy, ctv_fanout_manifest_set_sha256_hex(&set).unwrap());
+
+        // A recipient id is free text: json.dumps escaped non-ASCII, a
+        // character above the BMP as a surrogate pair.
+        let mut set = sample_manifest_set();
+        set.manifests[0].precommitment.outputs[0].recipient_id = "miner-\u{e9}\u{1f600}".into();
+        refresh_precommitment_commitments(&mut set.manifests[0]);
+        let legacy = legacy_ctv_fanout_manifest_set_sha256_hex(&set).unwrap();
+        assert_ne!(
+            legacy,
+            sha256_hex(&serde_json::to_vec(&serde_json::to_value(&set).unwrap()).unwrap())
+        );
+        assert_eq!(
+            legacy,
+            "0cec81c1a917b7dd7ecca9fba968259d5f90d93895a6997df7bc0af1015faec2"
+        );
+        // 2.x stored that text, and each manifest's own in the same form:
+        // the manifest's slice of the set's text. 3.x writes a manifest as
+        // serde_json's sorted-key text, which keeps non-ASCII raw, so the two
+        // forms differ only in those escapes.
+        let set_json = legacy_ctv_fanout_manifest_set_json(&set).unwrap();
+        assert_eq!(sha256_hex(set_json.as_bytes()), legacy);
+        let manifest = legacy_ctv_json_text(&set.manifests[0]).unwrap();
+        assert!(manifest.is_ascii() && set_json.contains(&manifest));
+        let current =
+            serde_json::to_string(&serde_json::to_value(&set.manifests[0]).unwrap()).unwrap();
+        assert_eq!(
+            manifest,
+            current.replace("\u{e9}\u{1f600}", r"\u00e9\ud83d\ude00")
+        );
+        assert_ne!(manifest, current);
+        // CPython's digest of `json.dumps(json.loads(current), sort_keys=True,
+        // separators=(",", ":"))`.
+        assert_eq!(
+            sha256_hex(manifest.as_bytes()),
+            "f24f32c47b65a5072a38b3e1276ee46c285ba13bea3eb511ebf7cefaf8dcd123"
+        );
+
+        // A set that does not verify has no digest in either form.
+        let mut invalid = sample_manifest_set();
+        invalid.manifests.reverse();
+        let err = legacy_ctv_fanout_manifest_set_sha256_hex(&invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contiguous and canonical"), "{err}");
     }
 
     #[test]
