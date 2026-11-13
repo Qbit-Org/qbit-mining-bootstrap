@@ -347,6 +347,7 @@ fn the_gate_holds_churn_tips_and_first_jobs_and_fails_what_it_cannot_measure() {
         tip_last_notify_median_ms: None,
         d1_verdict_table: false,
         churn_tip_last_notify_p99_ms: Some(3000.0),
+        churn_tip_last_notify_median_ms: None,
         new_session_first_job_p99_ms: Some(10_000.0),
     };
     let clean = gate::evaluate(&report(json!(1200.0), json!(2500.0)), Some(0), &budgets);
@@ -367,4 +368,125 @@ fn the_gate_holds_churn_tips_and_first_jobs_and_fails_what_it_cannot_measure() {
     let mut none = report(json!(1200.0), json!(2500.0));
     none["churn"] = json!({"ran": false, "reason": "the run did not ask for --churn-seconds"});
     assert!(!gate::passed(&gate::evaluate(&none, Some(0), &budgets)));
+}
+
+/// #842: the churn tips get #790's split. One tip stalled on a contended
+/// runner (#834's 3,826 ms among tips of about 0.5 s) passes the median and
+/// the slowest-tip budget at twice it; a slowdown on most tips fails the
+/// median inside that headroom; a tip some connected session never got
+/// still fails both, unmeasured; and without the key there is no median row.
+#[test]
+fn churn_tips_are_gated_on_their_median_and_a_stall_on_the_p99_with_headroom() {
+    let planned_report = |times: &[Option<f64>], planned: usize| {
+        let tips: Vec<serde_json::Value> = times
+            .iter()
+            .map(|ms| {
+                json!({"last_served_milliseconds": ms,
+                       "unserved": if ms.is_some() { 0 } else { 3 }, "connected_at_tip": 500})
+            })
+            .collect();
+        json!({
+            "aborted": null, "durability_findings": [],
+            "phases": [{"name": "churn", "shortfall": 0, "rejected_valid_shares": 0,
+                        "reconciliation": {"missing": 0, "unexpected": 0}}],
+            "rejections": {"no_response_by_phase": {}, "by_phase_reason_and_message": []},
+            "time_to_usable_work": {"tips": [{"all_sessions_milliseconds": 100.0}]},
+            "churn": {"ran": true, "tip_delivery": {"tips": tips},
+                "plan": {"tips_at_seconds": vec![1.0; planned]},
+                "time_to_first_job": {"new_sessions": {"p99": 20.0, "samples": 3581,
+                    "max": 116.0, "unavailable_reason": null}},
+                "realised": {}},
+        })
+    };
+    let report = |times: &[Option<f64>]| planned_report(times, times.len());
+    let budgets = gate::Budgets {
+        phases: None,
+        max_shortfall: 0,
+        max_rejected_valid_shares: None,
+        max_unanswered_submits: None,
+        tip_last_notify_p99_ms: None,
+        tip_last_notify_median_ms: None,
+        d1_verdict_table: false,
+        churn_tip_last_notify_p99_ms: Some(6000.0),
+        churn_tip_last_notify_median_ms: Some(3000.0),
+        new_session_first_job_p99_ms: Some(10_000.0),
+    };
+    let row = |checks: &[gate::Check], statistic: &str| {
+        checks
+            .iter()
+            .find(|c| {
+                c.name
+                    == format!(
+                        "churn: tip to last notify, sessions connected at the tip, {statistic} \
+                         over tips"
+                    )
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no {statistic} row: {}", gate::markdown("x", checks)))
+    };
+    // #834's churn tips on 11-03.
+    let stalled = [569.0, 543.0, 717.0, 558.0, 1763.0, 3826.0, 683.0, 513.0].map(Some);
+    let checks = gate::evaluate(&report(&stalled), Some(0), &budgets);
+    assert!(gate::passed(&checks), "{}", gate::markdown("x", &checks));
+    assert_eq!(
+        row(&checks, "median").observed,
+        "569 ms over 8 tips (max 3826 ms)"
+    );
+    assert_eq!(row(&checks, "median").budget, "<= 3000 ms");
+    assert_eq!(row(&checks, "p99").budget, "<= 6000 ms");
+    // A stall past twice the budget still fails the slowest-tip row.
+    let mut beyond = stalled;
+    beyond[5] = Some(6100.0);
+    let checks = gate::evaluate(&report(&beyond), Some(0), &budgets);
+    assert_eq!(row(&checks, "p99").pass, Some(false));
+    assert_eq!(row(&checks, "median").pass, Some(true));
+    // Slow on most tips fails the median inside the p99's headroom.
+    let slow = [3100.0, 3200.0, 3300.0, 3400.0, 3500.0, 1000.0, 900.0, 800.0].map(Some);
+    let checks = gate::evaluate(&report(&slow), Some(0), &budgets);
+    assert_eq!(row(&checks, "median").pass, Some(false));
+    assert_eq!(row(&checks, "p99").pass, Some(true));
+    // An unserved tip fails both rows, unmeasured.
+    let mut unserved = stalled;
+    unserved[2] = None;
+    let checks = gate::evaluate(&report(&unserved), Some(0), &budgets);
+    for statistic in ["p99", "median"] {
+        let row = row(&checks, statistic);
+        assert_eq!(row.pass, Some(false), "{statistic}");
+        assert!(
+            row.observed
+                .starts_with("unmeasured: tip 2: 3 of 500 connected sessions unserved"),
+            "{row:?}"
+        );
+    }
+    // #854: the median is over every churn tip the phase planned. 2 of 8,
+    // one slow, have the faster as their median: unmeasured, not a pass.
+    let checks = gate::evaluate(
+        &planned_report(&[Some(500.0), Some(5900.0)], 8),
+        Some(0),
+        &budgets,
+    );
+    assert!(!gate::passed(&checks), "{}", gate::markdown("x", &checks));
+    assert_eq!(row(&checks, "median").pass, Some(false));
+    assert_eq!(
+        row(&checks, "median").observed,
+        "unmeasured: 2 of 8 planned tips delivered"
+    );
+    assert_eq!(row(&checks, "p99").pass, Some(true));
+    // A section that does not record its plan cannot show the premise.
+    let mut unplanned = report(&stalled);
+    unplanned["churn"].as_object_mut().unwrap().remove("plan");
+    let checks = gate::evaluate(&unplanned, Some(0), &budgets);
+    assert_eq!(
+        row(&checks, "median").observed,
+        "unmeasured: the churn section does not record its planned tips"
+    );
+    // Without the key, no median row, and the p99 gates alone as before.
+    let p99_only = gate::Budgets {
+        churn_tip_last_notify_p99_ms: Some(3000.0),
+        churn_tip_last_notify_median_ms: None,
+        ..budgets
+    };
+    let checks = gate::evaluate(&report(&stalled), Some(0), &p99_only);
+    assert!(!checks.iter().any(|c| c.name.contains("median")));
+    assert_eq!(row(&checks, "p99").pass, Some(false));
 }

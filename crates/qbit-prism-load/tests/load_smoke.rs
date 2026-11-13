@@ -298,6 +298,44 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             assert!(summary["samples"].as_u64() > Some(0), "{}", plan.name);
             assert!(summary["unavailable_reason"].is_null(), "{}", plan.name);
         }
+        // #842: the host was read over the phase. Linux's /proc/stat has
+        // steal and iowait; PSI may be off on the runner's kernel, so each of
+        // its figures is either measured or unknown with a reason, never a
+        // bare null.
+        let host = &phase["host_contention"];
+        assert!(
+            host["intervals"].as_u64() > Some(0),
+            "{}: {host}",
+            plan.name
+        );
+        if cfg!(target_os = "linux") {
+            for figure in ["steal", "iowait"] {
+                assert!(
+                    host[figure]["percent"].as_f64().is_some(),
+                    "{}: {figure}: {host}",
+                    plan.name
+                );
+            }
+        }
+        for figure in [
+            "cpu_some",
+            "io_some",
+            "io_full",
+            "memory_some",
+            "memory_full",
+        ] {
+            assert!(
+                host[figure]["percent"].as_f64().is_some()
+                    || host[figure]["unavailable_reason"].is_string(),
+                "{}: {figure}: {host}",
+                plan.name
+            );
+        }
+        assert!(
+            phase["order_lock"]["longest_sample_gap_milliseconds"].as_f64() > Some(0.0),
+            "{}",
+            plan.name
+        );
         // #829: where the acknowledgements' time went is measured against a
         // real server and PostgreSQL, from histograms the server exports
         // today and the managed cluster's statistics.
@@ -561,8 +599,18 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         {
             let hash = tip["tip"].as_str().context("tip hash")?;
             assert!(changed.contains(&hash), "{pointer}: {hash}");
+            // #842: each driven tip carries the host over its delivery,
+            // named to the phase it fell in.
+            let host = &tip["host_contention"];
+            assert!(host["intervals"].as_u64() > Some(0), "{pointer}: {host}");
+            assert!(host["phase"].is_string(), "{pointer}: {host}");
         }
     }
+    assert!(
+        report["host_contention"]["reads"].as_u64() > Some(1),
+        "{}",
+        report["host_contention"]
+    );
     for change in report["node"]["tip_changes"]
         .as_array()
         .context("tip changes")?

@@ -561,6 +561,17 @@ pub struct LockSummary {
     /// visible.
     pub sampler_query_millis_mean: Option<f64>,
     pub sampler_query_millis_max: Option<f64>,
+    /// The longest time between two consecutive recorded polls whose
+    /// interval overlaps the phase, on the harness's monotonic clock (#842):
+    /// the interval, the query, and any poll that failed in between. A
+    /// machine that stalled the harness shows here as one long gap, also
+    /// when the stall began before the phase. A poll still blocked when the
+    /// phase is summarised is not in it. `None` with no two polls around the
+    /// phase; see [`longest_sample_gap`].
+    pub longest_sample_gap_milliseconds: Option<f64>,
+    /// The server's `clock_timestamp()` of the poll that ended that gap, so
+    /// it can be placed against a tip's stamp.
+    pub longest_sample_gap_ended_at: Option<chrono::DateTime<chrono::Utc>>,
     pub unavailable_reason: Option<String>,
     /// `pg_stat_statements` aggregate for the advisory-lock statement, when
     /// the extension is loaded. The three PRISM locks share one query text.
@@ -798,14 +809,21 @@ impl LockSampler {
     pub fn summarize(&self, since: Instant, until: Instant) -> PhaseLocks {
         let all = self.samples.lock().expect("lock sampler").clone();
         let failure = self.failure.lock().expect("lock sampler failure").clone();
+        let gap = longest_sample_gap(&all, since, until);
         let window: Vec<LockSample> = all
             .into_iter()
             .filter(|s| s.monotonic >= since && s.monotonic <= until)
             .collect();
-        PhaseLocks {
+        let mut locks = PhaseLocks {
             order: self.summarize_lock(ORDER_LOCK, &window, failure.clone()),
             settlement: self.summarize_lock(SETTLEMENT_LOCK, &window, failure),
+        };
+        // One poll covers both locks, so both carry the same gap.
+        for summary in [&mut locks.order, &mut locks.settlement] {
+            summary.longest_sample_gap_milliseconds = gap.map(|(millis, _)| millis);
+            summary.longest_sample_gap_ended_at = gap.map(|(_, ended)| ended);
         }
+        locks
     }
 
     /// One lock's picture, over rows already restricted to that lock.
@@ -867,6 +885,8 @@ pub fn summarize_lock_window(
         longest_observed_wait_seconds: None,
         sampler_query_millis_mean: None,
         sampler_query_millis_max: None,
+        longest_sample_gap_milliseconds: None,
+        longest_sample_gap_ended_at: None,
         unavailable_reason: failure,
         advisory_lock_statement: None,
     };
@@ -961,6 +981,31 @@ pub fn summarize_lock_window(
         Some(query_millis.iter().sum::<f64>() / query_millis.len() as f64);
     summary.sampler_query_millis_max = query_millis.iter().copied().max_by(f64::total_cmp);
     summary
+}
+
+/// The longest time between two consecutive recorded polls whose interval
+/// overlaps `[since, until]` (#842), in milliseconds on the harness's
+/// monotonic clock, with the server's `clock_timestamp()` of the poll that
+/// ended it. `samples` are every poll the sampler recorded, in order, so a
+/// gap straddling the window's start or end is the window's too. `None` when
+/// no two polls span any of it.
+pub fn longest_sample_gap(
+    samples: &[LockSample],
+    since: Instant,
+    until: Instant,
+) -> Option<(f64, chrono::DateTime<chrono::Utc>)> {
+    samples
+        .windows(2)
+        .filter(|pair| pair[1].monotonic > since && pair[0].monotonic < until)
+        .map(|pair| {
+            let gap = pair[1]
+                .monotonic
+                .saturating_duration_since(pair[0].monotonic)
+                .as_secs_f64()
+                * 1000.0;
+            (gap, pair[1].server_time)
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
 /// Reset `pg_stat_statements`, if it is loaded.

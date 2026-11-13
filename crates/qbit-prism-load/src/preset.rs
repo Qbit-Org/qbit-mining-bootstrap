@@ -13,7 +13,7 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::CommandFactory;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -66,10 +66,11 @@ pub enum Schedule {
 
 /// What the gate holds a run of the preset to. See [`crate::gate`]. Every
 /// key of [`GATE_KEYS`] is required, `null` included, so a preset states
-/// what it does not gate as plainly as what it does. The one optional key,
-/// `tip_last_notify_median_budget_ms`, is absent from every preset but the
-/// one it was added for (#790), and absent means `null`.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+/// what it does not gate as plainly as what it does. The two optional keys,
+/// `tip_last_notify_median_budget_ms` (#790) and
+/// `churn_tip_last_notify_median_budget_ms` (#842), are absent from every
+/// preset that does not gate on them, and absent means `null`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gates {
     /// Phases the per-phase checks gate; `null` is every phase the run
@@ -97,6 +98,11 @@ pub struct Gates {
     /// at the tip that stayed connected; the p99 over the tips. `null` does
     /// not gate on it.
     pub churn_tip_last_notify_p99_budget_ms: Option<f64>,
+    /// The same churn figure's median over the churn tips (#842): one tip
+    /// stalled by a contended runner cannot fail it, and a slowdown on most
+    /// tips does. Optional; absent or `null` does not gate on it.
+    #[serde(default)]
+    pub churn_tip_last_notify_median_budget_ms: Option<f64>,
     /// The churn phase's new sessions (rental arrivals and storm
     /// reconnects): connection attempt to first job, p99. `null` does not
     /// gate on it.
@@ -197,6 +203,10 @@ impl Preset {
                 gates.churn_tip_last_notify_p99_budget_ms,
             ),
             (
+                "churn_tip_last_notify_median_budget_ms",
+                gates.churn_tip_last_notify_median_budget_ms,
+            ),
+            (
                 "new_session_first_job_p99_budget_ms",
                 gates.new_session_first_job_p99_budget_ms,
             ),
@@ -205,6 +215,30 @@ impl Preset {
                 ensure!(
                     budget.is_finite() && budget > 0.0,
                     "preset {}: {key} must be finite and positive",
+                    file.name
+                );
+            }
+        }
+        // A median budget above its p99 budget could never be the row that
+        // fails: the split would gate nothing the p99 does not (#842).
+        for (median_key, median, p99_key, p99) in [
+            (
+                "tip_last_notify_median_budget_ms",
+                gates.tip_last_notify_median_budget_ms,
+                "tip_last_notify_p99_budget_ms",
+                gates.tip_last_notify_p99_budget_ms,
+            ),
+            (
+                "churn_tip_last_notify_median_budget_ms",
+                gates.churn_tip_last_notify_median_budget_ms,
+                "churn_tip_last_notify_p99_budget_ms",
+                gates.churn_tip_last_notify_p99_budget_ms,
+            ),
+        ] {
+            if let (Some(median), Some(p99)) = (median, p99) {
+                ensure!(
+                    median <= p99,
+                    "preset {}: {median_key} ({median}) is above {p99_key} ({p99})",
                     file.name
                 );
             }

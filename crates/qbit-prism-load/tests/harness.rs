@@ -6040,6 +6040,7 @@ fn a_failed_gated_phase_prints_its_ack_accounting_without_gating_on_it() {
         tip_last_notify_median_ms: None,
         d1_verdict_table: false,
         churn_tip_last_notify_p99_ms: None,
+        churn_tip_last_notify_median_ms: None,
         new_session_first_job_p99_ms: None,
     };
     let row = |checks: &[gate::Check]| {
@@ -11847,6 +11848,9 @@ async fn the_next_warm_up_tip_waits_for_the_scheduled_block_the_node_has_not_ans
         "the third tip was minted on top of the pool block"
     );
     assert_eq!((remaining_tips, outcome.tips_unminted), (0, 0));
+    // #854: the phase records what it planned, which the tip median's
+    // premise holds the delivered tips to.
+    assert_eq!(outcome.tips_planned, 3);
     let landing = &outcome.ordered_landings[..];
     assert_eq!(landing.len(), 1, "{landing:?}");
     assert_eq!(
@@ -11995,6 +11999,8 @@ async fn a_refused_block_the_node_never_sees_is_reported_unsettled() -> Result<(
     assert_eq!(verdicts, vec![]);
     assert_eq!(chain, vec![External, External]);
     assert_eq!((remaining_tips, outcome.tips_unminted), (1, 1));
+    // #854: 3 planned, 2 delivered, the third held unminted.
+    assert_eq!(outcome.tips_planned, 3);
     let landing = &outcome.ordered_landings[0];
     assert!(landing.sent_seconds.is_some(), "{landing:?}");
     assert_eq!(
