@@ -1,5 +1,6 @@
 use super::read_models::*;
 use super::*;
+use futures_util::{future::BoxFuture, FutureExt};
 use num_bigint::BigUint;
 use num_traits::Zero;
 
@@ -39,7 +40,7 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
                         ));
                     }
                     let id = id.map(recipient).transpose()?;
-                    let (network, _) = network(state).await?;
+                    let network = network(state).await?;
                     return reward_leaderboard(
                         state,
                         network["network_difficulty"].as_str().unwrap(),
@@ -199,7 +200,103 @@ pub(super) fn scaled_difficulty(bits: &str) -> Option<BigUint> {
             .max(BigUint::from(1u8)),
     )
 }
-async fn network(state: &ApiState) -> ApiResult<(Value, Value)> {
+/// `network()`'s answer, remembered for a few seconds and shared by the
+/// pool summary, the reward leaderboard and the miner pages (#858), so their
+/// cache misses stop asking the node for a block template each.
+///
+/// One set of node calls runs at a time, each call bounded by the node
+/// client's 10 s timeout as before and the whole set by the public read
+/// timeout, counted from when it started, and every miss that arrives during
+/// it waits for it, each under its own request deadline; a waiter that gives
+/// up, its client gone or its own deadline passed, leaves it running for the
+/// others until the set's own deadline. Its answer is then served for
+/// [`network_lifetime`], counted from when its calls started. Only a complete
+/// answer is remembered: a failure (no usable `getblockchaininfo` or compact
+/// bits, or the set's deadline passed) fails the requests that waited for it,
+/// and an answer that fell back as before on any field (the chain's bits, a
+/// default name, height, tip, IBD flag or peer count), because a call failed
+/// or left the field out, answers only those requests. Either way the next
+/// miss asks the node again, as every miss did before.
+pub(super) type NetworkMemo = super::response_cache::CacheSlot<NetworkAnswer>;
+/// One set of node calls' network object, and whether it fell back on any
+/// field.
+#[derive(Clone)]
+pub(super) struct NetworkAnswer {
+    network: Value,
+    degraded: bool,
+}
+/// The routes that read `network()`.
+const NETWORK_ROUTES: [&str; 3] = [
+    "/public/v1/pool-summary",
+    "/public/v1/leaderboard",
+    "/public/v1/miners/{recipient_id}",
+];
+/// How long `network()`'s answer is remembered, from when its node calls
+/// started: the shortest public cache lifetime and staleness budget among the
+/// routes that read it, 5 s by default; zero, and every call asks the node as
+/// before, when any of them is not cached. A response that reads a remembered
+/// answer is dated, and cached, as before from when it was built: like the
+/// replica's lag, the answer's own age when the response asked for it, less
+/// than this lifetime (or, for a response that waited for a set of calls
+/// already running, the time since that set started), is an input's
+/// staleness its `Age` does not count.
+fn network_lifetime(config: &ApiConfig) -> Duration {
+    let seconds = NETWORK_ROUTES
+        .iter()
+        .map(|path| {
+            let budget = public_service::staleness_budget(path).unwrap_or(u64::MAX);
+            CachePolicy::for_path(path, config).ttl.min(budget)
+        })
+        .min()
+        .unwrap_or(0);
+    Duration::from_secs(seconds)
+}
+async fn network(state: &ApiState) -> ApiResult<Value> {
+    remembered_network(state, || network_from_node(state.clone()).boxed()).await
+}
+/// `network()` through its memo, with `calls` one set of node calls. With the
+/// memo on, a set that runs past the public read timeout, counted from when
+/// it started, fails with `read_timeout` and is dropped, its calls with it,
+/// so it is not remembered and the next miss asks the node again instead of
+/// waiting on a stalled set (#858). Zero, no whole-request deadline, leaves
+/// only the node client's per-call timeout. With the memo off, the calls run
+/// in the request, under its own deadline, as before.
+async fn remembered_network(
+    state: &ApiState,
+    calls: impl FnOnce() -> BoxFuture<'static, ApiResult<NetworkAnswer>>,
+) -> ApiResult<Value> {
+    let lifetime = network_lifetime(&state.config);
+    if lifetime.is_zero() {
+        return calls().await.map(|answer| answer.network);
+    }
+    let deadline = state.config.read_timeout;
+    state
+        .network
+        .remembered(
+            lifetime,
+            move || {
+                let calls = calls();
+                if deadline.is_zero() {
+                    return calls;
+                }
+                tokio::time::timeout(deadline, calls)
+                    .map(move |answer| {
+                        answer.unwrap_or_else(|_| {
+                            tracing::warn!(
+                                deadline_seconds = deadline.as_secs_f64(),
+                                "the node calls for the network object passed the public read timeout and were dropped"
+                            );
+                            Err(ApiError::read_timeout())
+                        })
+                    })
+                    .boxed()
+            },
+            |answer| !answer.degraded,
+        )
+        .await
+        .map(|answer| answer.network)
+}
+async fn network_from_node(state: ApiState) -> ApiResult<NetworkAnswer> {
     let chain = state.rpc("getblockchaininfo", json!([])).await?;
     if !chain.is_object() {
         return Err(ApiError::upstream(
@@ -228,16 +325,31 @@ async fn network(state: &ApiState) -> ApiResult<(Value, Value)> {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|v| v.parse::<u64>().ok()))
     };
-    let height = counter(&chain["blocks"])
-        .or_else(|| counter(&chain["headers"]))
-        .unwrap_or(0);
-    Ok((
-        json!({"name":name,"height":height,"tip_hash":chain["bestblockhash"].as_str().unwrap_or(&"0".repeat(64)).to_ascii_lowercase(),"bits":bits,"network_difficulty":difficulty.to_string(),"initial_block_download":chain["initialblockdownload"].as_bool().unwrap_or(false),"peers":counter(&info["connections"]).unwrap_or(0)}),
-        template,
-    ))
+    let blocks = counter(&chain["blocks"]);
+    let height = blocks.or_else(|| counter(&chain["headers"])).unwrap_or(0);
+    let tip = chain["bestblockhash"].as_str();
+    let initial_block_download = chain["initialblockdownload"].as_bool();
+    let peers = counter(&info["connections"]);
+    // Any field that fell back below a complete answer: a template without
+    // usable bits (failed or not), or no chain name, block count, tip, IBD
+    // flag or peer count.
+    let template_bits = template
+        .get("bits")
+        .and_then(Value::as_str)
+        .is_some_and(|b| scaled_difficulty(b).is_some());
+    let degraded = !template_bits
+        || chain["chain"].as_str().is_none()
+        || blocks.is_none()
+        || tip.is_none()
+        || initial_block_download.is_none()
+        || peers.is_none();
+    Ok(NetworkAnswer {
+        network: json!({"name":name,"height":height,"tip_hash":tip.unwrap_or(&"0".repeat(64)).to_ascii_lowercase(),"bits":bits,"network_difficulty":difficulty.to_string(),"initial_block_download":initial_block_download.unwrap_or(false),"peers":peers.unwrap_or(0)}),
+        degraded,
+    })
 }
 async fn pool_summary(state: &ApiState) -> ApiResult<Value> {
-    let (mut network, _) = network(state).await?;
+    let mut network = network(state).await?;
     network["hashrate_ths"] = state
         .rpc("getnetworkhashps", json!([120, -1, "permissionless"]))
         .await
@@ -290,7 +402,7 @@ fn mining_configuration(config: &ApiConfig) -> Value {
     )
 }
 async fn miner(state: &ApiState, id: &str) -> ApiResult<Value> {
-    let (network, _) = network(state).await?;
+    let network = network(state).await?;
     let summary: Value =
         sqlx::query_scalar(include_str!("queries/dashboard_miner_share_summary.sql"))
             .bind(id)
@@ -413,6 +525,8 @@ fn artifact_link(kind: &str, sha: &str, bytes: Option<usize>) -> Value {
     json!({"kind":kind,"sha256":sha,"url":format!("/public/v1/artifacts/{sha}"),"content_type":"application/json","byte_length":bytes})
 }
 
+#[cfg(test)]
+mod network_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

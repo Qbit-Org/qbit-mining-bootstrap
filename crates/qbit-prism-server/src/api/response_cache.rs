@@ -4,19 +4,117 @@ use futures_util::{
     FutureExt,
 };
 
-type Computation = Shared<BoxFuture<'static, ApiResult<Payload>>>;
-#[derive(Default)]
-pub(super) struct CacheSlot {
-    state: Mutex<SlotState>,
+type Computation<T> = Shared<BoxFuture<'static, ApiResult<T>>>;
+/// One remembered answer and the one computation of its next value: a public
+/// response here, and `network()`'s node answers (#858).
+pub(super) struct CacheSlot<T = Payload> {
+    state: Mutex<SlotState<T>>,
 }
-#[derive(Default)]
-struct SlotState {
-    entry: Option<Entry>,
-    inflight: Option<Computation>,
+impl<T> Default for CacheSlot<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(SlotState {
+                entry: None,
+                inflight: None,
+            }),
+        }
+    }
 }
-struct Entry {
-    payload: Payload,
+struct SlotState<T> {
+    entry: Option<Entry<T>>,
+    inflight: Option<Computation<T>>,
+}
+struct Entry<T> {
+    payload: T,
     created: Instant,
+}
+/// The instant a slot's entry is dated from, and its lifetime counted from.
+#[derive(Clone, Copy)]
+enum Dated {
+    /// When its flight ended: a public response, whose `Age` counts from
+    /// when it was built.
+    End,
+    /// When its flight started, before it asked anything: `network()`'s node
+    /// answers, so a height or tip served from the entry was read less than
+    /// its lifetime earlier, however long the rest of its calls took (#858).
+    /// A flight's own waiters get its answer as old as the flight was when
+    /// they joined it.
+    Start,
+}
+impl<T: Clone + Send + Sync + 'static> CacheSlot<T> {
+    /// The slot's one computation: the one in flight, or else `compute`,
+    /// started now. When it ends, a result `keep` accepts replaces the entry,
+    /// dated as `dated` says, one it refuses removes it, and a failure leaves
+    /// it as it was, so a failure is never remembered. A computation that
+    /// panics fails with an internal error instead of leaving its waiters,
+    /// and every later one, a poisoned flight. Flights never overlap: the next starts only after
+    /// this one has cleared itself, so an older result cannot replace a newer
+    /// one. A spawned task drives the flight to its end, so a waiter that
+    /// gives up, its deadline passed or its client gone, never cancels it for
+    /// the others; its own deadline still bounds that waiter.
+    fn flight(
+        self: &Arc<Self>,
+        stored: &mut SlotState<T>,
+        compute: impl FnOnce() -> BoxFuture<'static, ApiResult<T>>,
+        keep: impl FnOnce(&T) -> bool + Send + 'static,
+        dated: Dated,
+    ) -> Computation<T> {
+        if let Some(flight) = &stored.inflight {
+            return flight.clone();
+        }
+        let owner = self.clone();
+        let started = Instant::now();
+        let running = std::panic::AssertUnwindSafe(compute()).catch_unwind();
+        let flight = async move {
+            let result = running.await.unwrap_or_else(|_| {
+                tracing::error!("a shared public computation panicked");
+                Err(ApiError::internal())
+            });
+            let mut slot = owner.state.lock().await;
+            if let Ok(value) = &result {
+                slot.entry = keep(value).then(|| Entry {
+                    payload: value.clone(),
+                    created: match dated {
+                        Dated::End => Instant::now(),
+                        Dated::Start => started,
+                    },
+                });
+            }
+            slot.inflight = None;
+            result
+        }
+        .boxed()
+        .shared();
+        stored.inflight = Some(flight.clone());
+        let background = flight.clone();
+        tokio::spawn(async move {
+            let _ = background.await;
+        });
+        flight
+    }
+
+    /// The entry while it is younger than `lifetime`, counted from when its
+    /// flight started, else the result of the slot's flight, joined or
+    /// started with `compute` and remembered when `keep` accepts it. The
+    /// answer of a flight that took longer than `lifetime` has expired by the
+    /// time it ends, so it answers only that flight's waiters.
+    pub(super) async fn remembered(
+        self: &Arc<Self>,
+        lifetime: Duration,
+        compute: impl FnOnce() -> BoxFuture<'static, ApiResult<T>>,
+        keep: impl FnOnce(&T) -> bool + Send + 'static,
+    ) -> ApiResult<T> {
+        let flight = {
+            let mut stored = self.state.lock().await;
+            if let Some(entry) = &stored.entry {
+                if entry.created.elapsed() < lifetime {
+                    return Ok(entry.payload.clone());
+                }
+            }
+            self.flight(&mut stored, compute, keep, Dated::Start)
+        };
+        flight.await
+    }
 }
 
 pub(super) async fn public_response(
@@ -112,56 +210,33 @@ pub(super) async fn public_response(
     if degraded {
         return (unavailable(), "BYPASS", 0);
     }
-    let flight = if let Some(flight) = &stored.inflight {
-        flight.clone()
-    } else {
-        let owner = slot.clone();
-        let state = state.clone();
-        let path = path.to_string();
-        let query = query.clone();
-        let flight = async move {
-            let result = public_compute(state.clone(), path, query).await;
-            let mut slot = owner.state.lock().await;
-            if let Ok(payload) = &result {
-                if payload.canonical_fallback.is_none()
-                    && payload.bytes.len() <= state.config.cache_max_bytes
-                {
-                    slot.entry = Some(Entry {
-                        payload: payload.clone(),
-                        created: Instant::now(),
-                    });
-                } else {
-                    slot.entry = None;
-                }
-            }
-            slot.inflight = None;
-            result
-        }
-        .boxed()
-        .shared();
-        stored.inflight = Some(flight.clone());
-        // A disconnected HTTP waiter must not abandon the shared computation
-        // while retaining its cache slot. The request deadline still bounds it.
-        let background = flight.clone();
-        tokio::spawn(async move {
-            let _ = background.await;
-        });
-        flight
-    };
+    // A disconnected HTTP waiter must not abandon the shared computation
+    // while retaining its cache slot, and a STALE answer leaves its refresh
+    // running: the flight's own task drives it. The request deadline still
+    // bounds it.
+    let max_bytes = state.config.cache_max_bytes;
+    let flight = slot.flight(
+        &mut stored,
+        || compute().boxed(),
+        move |payload| cacheable(payload, max_bytes),
+        Dated::End,
+    );
     drop(stored);
     if let Some((payload, age)) = stale {
-        tokio::spawn(async move {
-            let _ = flight.await;
-        });
         (Ok(payload), "STALE", age)
     } else {
         let result = flight.await;
-        let bypass = result.as_ref().is_ok_and(|payload| {
-            payload.canonical_fallback.is_some()
-                || payload.bytes.len() > state.config.cache_max_bytes
-        });
+        let bypass = result
+            .as_ref()
+            .is_ok_and(|payload| !cacheable(payload, max_bytes));
         (result, if bypass { "BYPASS" } else { "MISS" }, 0)
     }
+}
+
+/// Whether a response may be remembered: not a canonical fallback, and no
+/// larger than `max_bytes`.
+fn cacheable(payload: &Payload, max_bytes: usize) -> bool {
+    payload.canonical_fallback.is_none() && payload.bytes.len() <= max_bytes
 }
 
 async fn public_compute(mut state: ApiState, path: String, query: Query) -> ApiResult<Payload> {
@@ -219,6 +294,25 @@ mod tests {
                 }),
             }),
         );
+    }
+    #[tokio::test]
+    async fn a_computation_that_panics_fails_and_leaves_nothing_in_flight() {
+        let slot = Arc::new(CacheSlot::<u32>::default());
+        let panicking = || async { panic!("computation panicked") }.boxed();
+        let error = slot
+            .remembered(Duration::from_secs(60), panicking, |_| true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(slot.state.lock().await.inflight.is_none());
+        let next = slot
+            .remembered(
+                Duration::from_secs(60),
+                || async { Ok(7) }.boxed(),
+                |_| true,
+            )
+            .await;
+        assert_eq!(next.unwrap(), 7);
     }
     #[tokio::test]
     async fn stale_entry_returns_immediately_while_one_refresh_replaces_it() {
