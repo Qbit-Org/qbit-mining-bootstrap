@@ -248,6 +248,7 @@ impl Metrics {
             Family::CarryOwnerPeerChecks,
             Family::LockWait,
             Family::OrderLockHold,
+            Family::ShareAppendStage,
             Family::RefreshSeconds,
             Family::RollupLag,
             Family::LandingTrimSeconds,

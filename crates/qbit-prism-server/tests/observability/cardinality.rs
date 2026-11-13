@@ -5,7 +5,7 @@ use super::{
 use qbit_prism_server::{
     api::router,
     metrics::{
-        AckResult, BlockAckPath, CaptureDecision, CarryOwnerState, Collector,
+        AckResult, AppendStage, BlockAckPath, CaptureDecision, CarryOwnerState, Collector,
         ConnectionRefusalReason, DatabaseMetrics, DeliveryMetrics, JobDeferral, LockKind, Metrics,
         NodeObservation, OrderLockHolder, Outcome, PeerCheckResult, ProcessMetrics,
         RefreshAcquisition, RefreshTrigger, RejectReason, RevisionRaceOutcome, RevisionRacePhase,
@@ -30,7 +30,7 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
     assert!(!startup_census
         .series
         .contains("qbit_prism_hashrate_rollup_watermark_lag_seconds"));
-    assert_eq!(startup_census.families.len(), 106);
+    assert_eq!(startup_census.families.len(), 107);
     // 318 with #630's post-offer revision races (2 phases x 2 outcomes), 320
     // with #816's payout-revision listener gauge and counter.
     assert_eq!(startup_census.series.len(), 320);
@@ -117,6 +117,11 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         for holder in OrderLockHolder::ALL {
             metrics.observe_order_lock_hold(*holder, elapsed);
         }
+        for stage in AppendStage::ALL {
+            for outcome in stage.outcomes() {
+                metrics.observe_append_stage(*stage, *outcome, elapsed);
+            }
+        }
         metrics.observe_first_offer(elapsed);
         for outcome in WindowAcquisition::ALL {
             metrics.record_window_acquisition(*outcome);
@@ -181,13 +186,14 @@ async fn every_http_family_and_closed_label_tuple_stays_bounded_under_varied_inp
         let body = running_scrape(router(state.clone()), &[]).await;
         contract::validate(&body, true).unwrap();
         let populated = contract::census(&body).unwrap();
-        assert_eq!(populated.families.len(), 106);
+        assert_eq!(populated.families.len(), 107);
         // 981 since the 3.1 dual writer's peer_sync ORDER_LOCK holder: one
         // more holder's hold histogram, 16 series; 998 with the carry owner
         // guard's state (14), alert (1) and peer check (2) series; 1002 with
         // #630's post-offer revision races (4); 1004 with #816's
-        // payout-revision listener gauge and counter.
-        assert_eq!(populated.series.len(), 1004);
+        // payout-revision listener gauge and counter; 1116 with #829's seven
+        // share append stage histograms (16 each).
+        assert_eq!(populated.series.len(), 1116);
         assert_eq!(
             sample(&body, "qbit_prism_tip_poll_age_seconds"),
             if known { elapsed.as_secs_f64() } else { -1. }

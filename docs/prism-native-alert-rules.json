@@ -858,6 +858,35 @@
       ]
     },
     {
+      "uid": "qbit-prism-share-append-admission-wait",
+      "title": "PrismShareAppendAdmissionWaitHigh",
+      "role": "run",
+      "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",network=\"__NETWORK__\",stage=\"admission\"}[5m]))) > bool 1) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",network=\"__NETWORK__\",stage=\"admission\"}[5m])) >= 100)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"__NETWORK__\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"__NETWORK__\"} == 0))",
+      "condition_type": "threshold",
+      "evaluator": "gt",
+      "threshold": 0,
+      "for": "10m",
+      "severity": "warning",
+      "service": "qbit-mining-pool",
+      "labels": {
+        "alert_class": "prism-runtime"
+      },
+      "summary": "PrismShareAppendAdmissionWaitHigh",
+      "description": "Share appends on this frontend are queueing for an append slot. A frontend admits at most PRISM_DATABASE_MAX_CONNECTIONS - 1 share appends at once (15 by default), each from before its pool checkout until its connection is back in the pool, just after its COMMIT; the rest wait here, in front of PostgreSQL, where ORDER_LOCK's own wait cannot show them (#829). A queue that persists means appends finish more slowly than they arrive: read the accepted-share rate, the cluster-wide ORDER_LOCK holds by holder on every frontend, the append's locked_call and commit stages, the runtime's wake and poll lag, WAL syncs and checkpoints and pool saturation, as docs/prism-ledger-ops.md's \"Shares queued for an append slot\" describes. Every outcome counts, so an append dropped at the share-commit deadline while it queued is counted with the time it waited. Gated on the snapshot, since the family is served from the cached body: a stale or unpublished body suppresses it. A frontend without the stage histogram (older than #829's stages) has no admission series and stays quiet; no-data and evaluation errors are OK because the snapshot and no-data rules own missing measurements. Admission-wait p99 over 1 second, on the ORDER_LOCK hold ladder's one-second boundary, from at least 100 admissions in five minutes, for ten minutes. At production's ~50 shares/s (about 25/s on each frontend of the pair) an append holds its slot for a few milliseconds (its call, COMMIT and the connection's release round trip), so a wait needs fifteen appends in flight on one frontend, an ORDER_LOCK hold of at least 0.6 s. The load lanes' clean steady states acknowledge at a p99 of 3-8 ms, while #829's occurrences queued here for seconds (acknowledgement p99 5.5 s on 10-30 and 6.6 s in #835's run; a 0.96 s repeat stays under). One second is also PrismShareAckP99High's bound and the load gate's, so the two rules read together say where slow acknowledgements waited. Ten minutes is twice the window: one landing's queue leaves the window five minutes after it formed, so a landing never warns on its own (at 25/s it needs a settlement hold over about 4.6 s even to lift the five-minute p99 over a second, as 2.x.x's 4-5 s block minutes would), while a queue that persists does. Repeated landings warn when, in every five minutes for ten minutes, their holds' time beyond about 1.6 s adds up to more than about 3 s, for example a hold over 2.2 s every minute; #602's R2 budget for those holds is 250 ms, and with arrivals spread evenly a hold under 0.6 s never fills the fifteen slots. Provisional, measure in #291.",
+      "no_data_state": "OK",
+      "exec_err_state": "OK",
+      "basis": "Admission-wait p99 over 1 second, on the ORDER_LOCK hold ladder's one-second boundary, from at least 100 admissions in five minutes, for ten minutes. At production's ~50 shares/s (about 25/s on each frontend of the pair) an append holds its slot for a few milliseconds (its call, COMMIT and the connection's release round trip), so a wait needs fifteen appends in flight on one frontend, an ORDER_LOCK hold of at least 0.6 s. The load lanes' clean steady states acknowledge at a p99 of 3-8 ms, while #829's occurrences queued here for seconds (acknowledgement p99 5.5 s on 10-30 and 6.6 s in #835's run; a 0.96 s repeat stays under). One second is also PrismShareAckP99High's bound and the load gate's, so the two rules read together say where slow acknowledgements waited. Ten minutes is twice the window: one landing's queue leaves the window five minutes after it formed, so a landing never warns on its own (at 25/s it needs a settlement hold over about 4.6 s even to lift the five-minute p99 over a second, as 2.x.x's 4-5 s block minutes would), while a queue that persists does. Repeated landings warn when, in every five minutes for ten minutes, their holds' time beyond about 1.6 s adds up to more than about 3 s, for example a hold over 2.2 s every minute; #602's R2 budget for those holds is 250 ms, and with arrivals spread evenly a hold under 0.6 s never fills the fifteen slots. Provisional, measure in #291.",
+      "producer_refs": [
+        "crates/qbit-prism-server/src/metrics/registry.rs#L124",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L196",
+        "crates/qbit-prism-server/src/metrics/labels.rs#L200",
+        "crates/qbit-prism-server/src/ledger/append_admission.rs#L63",
+        "crates/qbit-prism-server/src/ledger/append_admission.rs#L84",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L96",
+        "crates/qbit-prism-server/src/metrics/registry.rs#L97"
+      ]
+    },
+    {
       "uid": "qbit-prism-lease-monitor-wake",
       "title": "PrismRuntimeLagHigh",
       "role": "run",

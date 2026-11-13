@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: bf51596ca1b7a7527b1ead6e2fba3309863d35663d10c55cd1451ba69b116d26
++   Specification SHA-256: 2f28fad628622633019f9e3304b5995f3618b6c2d416eca78db62b6d59b3819f
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,892 @@
+@@ -118,53 +14,910 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -803,6 +803,24 @@
 +    "exec_err_state": "OK"
 +  },
 +  {
++    "uid": "qbit-prism-share-append-admission-wait",
++    "title": "PrismShareAppendAdmissionWaitHigh",
++    "expr": "((histogram_quantile(0.99, sum by (job, instance, network, le) (rate(qbit_prism_share_append_stage_seconds_bucket{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",stage=\"admission\"}[5m]))) > bool 1) and on(job, instance, network) (sum by (job, instance, network) (increase(qbit_prism_share_append_stage_seconds_count{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\",stage=\"admission\"}[5m])) >= 100)) and on(job, instance, network) ((qbit_prism_metrics_snapshot_available{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 1) and on(job, instance, network) (qbit_prism_metrics_snapshot_stale{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} == 0))",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "10m",
++    "severity": "warning",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime"
++    },
++    "summary": "PrismShareAppendAdmissionWaitHigh",
++    "description": "Share appends on this frontend are queueing for an append slot. A frontend admits at most PRISM_DATABASE_MAX_CONNECTIONS - 1 share appends at once (15 by default), each from before its pool checkout until its connection is back in the pool, just after its COMMIT; the rest wait here, in front of PostgreSQL, where ORDER_LOCK's own wait cannot show them (#829). A queue that persists means appends finish more slowly than they arrive: read the accepted-share rate, the cluster-wide ORDER_LOCK holds by holder on every frontend, the append's locked_call and commit stages, the runtime's wake and poll lag, WAL syncs and checkpoints and pool saturation, as docs/prism-ledger-ops.md's \"Shares queued for an append slot\" describes. Every outcome counts, so an append dropped at the share-commit deadline while it queued is counted with the time it waited. Gated on the snapshot, since the family is served from the cached body: a stale or unpublished body suppresses it. A frontend without the stage histogram (older than #829's stages) has no admission series and stays quiet; no-data and evaluation errors are OK because the snapshot and no-data rules own missing measurements. Admission-wait p99 over 1 second, on the ORDER_LOCK hold ladder's one-second boundary, from at least 100 admissions in five minutes, for ten minutes. At production's ~50 shares/s (about 25/s on each frontend of the pair) an append holds its slot for a few milliseconds (its call, COMMIT and the connection's release round trip), so a wait needs fifteen appends in flight on one frontend, an ORDER_LOCK hold of at least 0.6 s. The load lanes' clean steady states acknowledge at a p99 of 3-8 ms, while #829's occurrences queued here for seconds (acknowledgement p99 5.5 s on 10-30 and 6.6 s in #835's run; a 0.96 s repeat stays under). One second is also PrismShareAckP99High's bound and the load gate's, so the two rules read together say where slow acknowledgements waited. Ten minutes is twice the window: one landing's queue leaves the window five minutes after it formed, so a landing never warns on its own (at 25/s it needs a settlement hold over about 4.6 s even to lift the five-minute p99 over a second, as 2.x.x's 4-5 s block minutes would), while a queue that persists does. Repeated landings warn when, in every five minutes for ten minutes, their holds' time beyond about 1.6 s adds up to more than about 3 s, for example a hold over 2.2 s every minute; #602's R2 budget for those holds is 250 ms, and with arrivals spread evenly a hold under 0.6 s never fills the fifteen slots. Provisional, measure in #291.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
++  },
++  {
 +    "uid": "qbit-prism-lease-monitor-wake",
 +    "title": "PrismRuntimeLagHigh",
 +    "expr": "(max_over_time(qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m]) > bool 2) + on(job, instance, network) (max by (job, instance, network) (max_over_time(qbit_prism_runtime_poll_lag_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[5m])) > bool 2) + on(job, instance, network) (max by (job, instance, network) (qbit_prism_runtime_task_stalled{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}) > bool 0) + on(job, instance, network) (qbit_prism_runtime_lag_seconds{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"} < bool 0)",
@@ -1046,7 +1064,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +965,17 @@
+@@ -230,752 +983,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1802,7 +1820,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1454,84 @@
+@@ -1454,5 +1472,84 @@
    }
  ] %}
  {% endif %}

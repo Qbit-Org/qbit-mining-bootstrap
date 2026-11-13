@@ -1043,10 +1043,17 @@ pub struct AccountedSeries {
 pub const ORDER_LOCK_HOLD_APPEND: &str = "order_lock_hold_append";
 pub const ORDER_LOCK_WAIT_GRANTED: &str = "order_lock_wait_granted";
 pub const POOL_ACQUIRE_SUCCEEDED: &str = "pool_acquire_succeeded";
+pub const SUBMIT_CHECKS_PASSED: &str = "submit_checks_passed";
+pub const ADMISSION_ADMITTED: &str = "admission_admitted";
+pub const LOCKED_CALL_REPLIED: &str = "locked_call_replied";
+pub const COMMIT_COMMITTED: &str = "commit_committed";
 
-/// The server's existing histograms the accounting reads; the harness adds
-/// no server metric (#829).
-pub const ACCOUNTED_SERIES: [AccountedSeries; 3] = [
+/// The share append's stage histogram (#829), which a server from before it
+/// does not declare: its stages then read unknown.
+pub const APPEND_STAGE_FAMILY: &str = "qbit_prism_share_append_stage_seconds";
+
+/// The server histograms the accounting reads (#829).
+pub const ACCOUNTED_SERIES: [AccountedSeries; 7] = [
     AccountedSeries {
         key: ORDER_LOCK_HOLD_APPEND,
         family: "qbit_prism_database_order_lock_hold_seconds",
@@ -1061,6 +1068,26 @@ pub const ACCOUNTED_SERIES: [AccountedSeries; 3] = [
         key: POOL_ACQUIRE_SUCCEEDED,
         family: "qbit_prism_database_pool_acquire_seconds",
         labels: &[("result", "success")],
+    },
+    AccountedSeries {
+        key: SUBMIT_CHECKS_PASSED,
+        family: APPEND_STAGE_FAMILY,
+        labels: &[("stage", "submit_checks"), ("outcome", "passed")],
+    },
+    AccountedSeries {
+        key: ADMISSION_ADMITTED,
+        family: APPEND_STAGE_FAMILY,
+        labels: &[("stage", "admission"), ("outcome", "admitted")],
+    },
+    AccountedSeries {
+        key: LOCKED_CALL_REPLIED,
+        family: APPEND_STAGE_FAMILY,
+        labels: &[("stage", "locked_call"), ("outcome", "replied")],
+    },
+    AccountedSeries {
+        key: COMMIT_COMMITTED,
+        family: APPEND_STAGE_FAMILY,
+        labels: &[("stage", "commit"), ("outcome", "committed")],
     },
 ];
 
@@ -1795,13 +1822,27 @@ pub struct ShareAckAccounting {
     pub after_call: Accounted,
     pub before_lock_and_response: Accounted,
     pub commit_not_in_pg_stat_statements: &'static str,
+    /// The server's own stages (`qbit_prism_share_append_stage_seconds`),
+    /// unknown against a server from before them.
+    pub submit_checks: Accounted,
+    pub admission: Accounted,
+    pub locked_call: Accounted,
+    pub commit: Accounted,
+    pub hold_unattributed: Accounted,
+    pub before_lock_unattributed: Accounted,
 }
 
 pub const ACCOUNTING_DEFINITION: &str =
-    "accepted share acknowledgements' summed seconds, split at ORDER_LOCK. Every frontend's \
-     histogram deltas are summed; pg_stat_statements covers every frontend of the cluster. The \
-     populations differ slightly (holds and waits include appends that were refused, waits \
-     include the rebuild paths' few), so compare the counts beside each figure.";
+    "accepted share acknowledgements' summed seconds, split at ORDER_LOCK, and by the server's \
+     own append stages where it has them. Every frontend's histogram deltas are summed; \
+     pg_stat_statements covers every frontend of the cluster. The populations differ slightly \
+     (holds, waits and admissions include appends that were refused, waits include the rebuild \
+     paths' few, the submit checks every submission that passed them), so compare the counts \
+     beside each figure. The windows \
+     differ too: a frontend serves these histograms (pool acquire excepted) from its metrics \
+     snapshot, published every couple of seconds, while pg_stat_statements is reset and read \
+     live around the scrapes, so the call's window can run a snapshot's age past theirs and \
+     skew in_call_after_grant up and after_call down by that much.";
 
 /// `pg_stat_statements` cannot time a share's COMMIT: PostgreSQL commits the
 /// transaction, and flushes its WAL, in `finish_xact_command` after the
@@ -1952,8 +1993,9 @@ pub fn share_ack_accounting(
     );
     let order_lock_hold_append = series_of(
         ORDER_LOCK_HOLD_APPEND,
-        "frontend monotonic, from the grant (the call's lock_held_us back-dated from its reply) \
-         to the end of COMMIT",
+        "frontend monotonic, from the grant (the call's lock_held_us counted back from when the \
+         frontend processes its reply) to the end of COMMIT or ROLLBACK, or, for an append \
+         abandoned by an error, to its unwinding, before the queued ROLLBACK runs",
         "qbit_prism_database_order_lock_hold_seconds{holder=\"append\"}",
     );
     let pool_acquire = series_of(
@@ -1987,9 +2029,14 @@ pub fn share_ack_accounting(
         ("order_lock_hold_append", &order_lock_hold_append),
         &[("in_call_after_grant", &in_call_after_grant)],
         "order_lock_hold_append (frontend monotonic) - in_call_after_grant (PostgreSQL)",
-        "the call's reply in transit, the frontend runtime's turnaround to COMMIT, and the \
-         COMMIT round trip with its WAL flush; the phase's database_counters.wal times the \
-         flush itself",
+        "the COMMIT round trip with its WAL flush and the runtime's wake to its reply, and the \
+         holds the call's statistics do not time (block-bearing appends on the statement path, \
+         refused calls, rolled-back gates); the phase's database_counters.wal times the flush \
+         itself. The \
+         time PostgreSQL still holds the lock while the call's reply travels and the frontend's \
+         runtime wakes to it is not here: the hold starts at the grant the call reports, counted \
+         back from when the frontend processes the reply, so that time is in \
+         before_lock_and_response",
     );
     let before_lock_and_response = derived(
         ("accepted_acks", &accepted_acks),
@@ -1999,9 +2046,61 @@ pub fn share_ack_accounting(
         ],
         "accepted_acks (frontend monotonic) - order_lock_wait (PostgreSQL clock for appends) - \
          order_lock_hold_append (frontend monotonic)",
-        "not measured separately: the stratum's request handling, the submit checks (the \
-         payout-revision read and its pool checkout among them), the append-admission queue, \
-         the append's pool checkout and BEGIN, and the response write",
+        "the stratum's request handling, the submit checks (the payout-revision read and its \
+         pool checkout among them), the append task's start, the block-only and candidate work \
+         after the checks, the append-admission queue, the append's pool checkout and BEGIN, \
+         the call's trip to its lock, its reply's trip back and the runtime's wake to it, and \
+         the response write; a server with the append stages measures the submit checks and \
+         the admission queue below",
+    );
+    let submit_checks = series_of(
+        SUBMIT_CHECKS_PASSED,
+        "frontend monotonic",
+        "qbit_prism_share_append_stage_seconds{stage=\"submit_checks\",outcome=\"passed\"}: \
+         the coordinator's checks (readiness, fee, tip, the payout-revision read with its pool \
+         checkout, the fences) to the point the acknowledgement bounds start, for every \
+         submission that passed them, block-only work that takes no append slot included",
+    );
+    let admission = series_of(
+        ADMISSION_ADMITTED,
+        "frontend monotonic",
+        "qbit_prism_share_append_stage_seconds{stage=\"admission\",outcome=\"admitted\"}: the \
+         wait for one of the frontend's max_connections - 1 append permits, taken before the \
+         append's pool checkout",
+    );
+    let locked_call = series_of(
+        LOCKED_CALL_REPLIED,
+        "PostgreSQL clock_timestamp() (the call's lock_held_us)",
+        "qbit_prism_share_append_stage_seconds{stage=\"locked_call\",outcome=\"replied\"}: the \
+         one-call append's own hold, from its grant of ORDER_LOCK to its reply",
+    );
+    let commit = series_of(
+        COMMIT_COMMITTED,
+        "frontend monotonic",
+        "qbit_prism_share_append_stage_seconds{stage=\"commit\",outcome=\"committed\"}: the \
+         append's COMMIT round trip, its WAL flush and the runtime's wake to its reply \
+         included",
+    );
+    let hold_unattributed = derived(
+        ("order_lock_hold_append", &order_lock_hold_append),
+        &[("locked_call", &locked_call), ("commit", &commit)],
+        "order_lock_hold_append (frontend monotonic, from the grant the call reported) - \
+         locked_call (PostgreSQL clock) - commit (frontend monotonic)",
+        "the append hold the stages do not cover. For a committed one-call append that is only \
+         the microseconds of decoding its reply and the commit gate's check, since nothing \
+         awaits between them. Anything more is the hold of appends without both a locked_call \
+         and a committed commit: block-bearing ones (less any COMMIT), and refused, rolled \
+         back or failed ones. Compare the counts",
+    );
+    let before_lock_unattributed = derived(
+        ("before_lock_and_response", &before_lock_and_response),
+        &[("submit_checks", &submit_checks), ("admission", &admission)],
+        "before_lock_and_response (derived) - submit_checks (frontend monotonic) - admission \
+         (frontend monotonic)",
+        "not measured separately: the Stratum request handling before the coordinator's checks, \
+         the append task's start, the block-only and candidate work after the checks, the \
+         append's pool checkout and BEGIN, the call's trip to its lock, its reply's trip back \
+         and the runtime's wake to it, and the response write",
     );
     ShareAckAccounting {
         definition: ACCOUNTING_DEFINITION,
@@ -2015,6 +2114,12 @@ pub fn share_ack_accounting(
         after_call,
         before_lock_and_response,
         commit_not_in_pg_stat_statements: COMMIT_NOT_IN_PG_STAT_STATEMENTS,
+        submit_checks,
+        admission,
+        locked_call,
+        commit,
+        hold_unattributed,
+        before_lock_unattributed,
     }
 }
 

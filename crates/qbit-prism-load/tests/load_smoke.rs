@@ -330,6 +330,26 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             ] {
                 assert!(known(part), "{}: {part}: {accounting}", plan.name);
             }
+            // The server under test has its own append stages.
+            for part in [
+                "submit_checks",
+                "admission",
+                "locked_call",
+                "commit",
+                "hold_unattributed",
+                "before_lock_unattributed",
+            ] {
+                assert!(known(part), "{}: {part}: {accounting}", plan.name);
+            }
+            if accounting["accepted_acks"]["count"].as_f64() > Some(0.0) {
+                for part in ["submit_checks", "admission", "locked_call", "commit"] {
+                    assert!(
+                        accounting[part]["count"].as_f64() > Some(0.0),
+                        "{}: accepted shares passed through {part}: {accounting}",
+                        plan.name
+                    );
+                }
+            }
             if report["database"]["pg_stat_statements"] == "loaded" {
                 for part in ["append_call", "in_call_after_grant", "after_call"] {
                     assert!(known(part), "{}: {part}: {accounting}", plan.name);

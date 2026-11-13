@@ -30,6 +30,125 @@ instances may append; transaction locks protect a shared ordering boundary.
 Database connection and statement/lock limits bound resource use. Session
 extranonce allocation also uses the shared database sequence and never cycles.
 
+### Shares queued for an append slot (#844)
+
+Each frontend admits at most `PRISM_DATABASE_MAX_CONNECTIONS - 1` share
+appends at once (15 by default). An append takes its slot before its pool
+checkout and keeps it until its connection is back in the pool. That happens in
+a cleanup task after its COMMIT, which first sends any queued ROLLBACK and
+checks the connection with one more round trip. So at most that many appends
+per frontend can wait on `ORDER_LOCK`. Every other append waits for a slot
+inside the frontend, in front of PostgreSQL. Neither `pg_locks`, the
+`ORDER_LOCK` wait histogram nor the log can see that queue. In #829's load-lane
+stalls, 98.5% of the stalled acknowledgement time was spent there, while
+`ORDER_LOCK` waits stayed under 0.13 s.
+
+`PrismShareAppendAdmissionWaitHigh` warns when the `admission` stage of
+`qbit_prism_share_append_stage_seconds` has a p99 above one second over five
+minutes on a frontend with at least 100 admissions in that window, and that
+lasts ten minutes. Every outcome counts, so an append dropped at the
+share-commit deadline while it queued counts with the time it waited. A queue
+that lasts means this frontend's appends are finishing more slowly than they
+arrive.
+
+- **Landings.** A landing's settlement holds `ORDER_LOCK` while appends queue
+  behind it, but its queue leaves the five-minute window within five minutes,
+  so one landing never warns.
+  - At about 25 shares/s per frontend, with arrivals spread evenly, a hold
+    under 0.6 s never fills the fifteen slots, and #602 budgets settlement
+    holds at 250 ms.
+  - Repeated landings warn when, in every five minutes for ten minutes, their
+    holds' time beyond about 1.6 s adds up to more than about 3 s, for example
+    a hold over 2.2 s every minute.
+- **More connections don't help.** Raising `PRISM_DATABASE_MAX_CONNECTIONS`
+  lengthens the `ORDER_LOCK` queue instead of this one. It adds no throughput,
+  because `ORDER_LOCK` serialises the appends.
+
+Read where the time went:
+
+1. **Arrivals.** A rise in `rate(qbit_prism_accepted_shares_total[5m])`, for
+   example after a difficulty change, lengthens every queue at an unchanged
+   hold.
+2. **Who holds `ORDER_LOCK`.** The lock is shared by the whole cluster, so read
+   `qbit_prism_database_order_lock_hold_seconds` by `holder` on every frontend,
+   not only this one:
+   - `append` is normally about a millisecond;
+   - `settlement` and `first_confirmation` are the landing work;
+   - `reconcile` runs on every template build;
+   - `prepared`, `candidate_insert`, `cleanup`, `peer_sync` and the rest are
+     the frontend's other work under the lock.
+
+   `qbit_prism_database_advisory_lock_wait_seconds{lock="order"}` is every
+   wait for the lock on that frontend, whoever takes it.
+3. **The append's stages.** The same stage histogram splits a one-call
+   append's hold:
+   - `locked_call` is the call's own hold, on PostgreSQL's clock. When it
+     rises, the work is inside the call: full-page images after a checkpoint
+     starts, autovacuum or analyze on the ledger partition, or a cold cache.
+   - `commit` is the COMMIT round trip on the frontend's clock. It includes
+     the WAL flush (step 5), the network round trip to the primary, and the
+     runtime waking late to the reply.
+
+   For a committed one-call append the hold minus both is only microseconds.
+   Anything more is appends without both stages: block-bearing ones, and
+   refused, rolled back or failed ones. Compare the counts as well as the
+   means:
+   ```promql
+   sum by (instance, stage) (rate(qbit_prism_share_append_stage_seconds_sum{job="qbit-prism"}[5m]))
+     / sum by (instance, stage) (rate(qbit_prism_share_append_stage_seconds_count{job="qbit-prism"}[5m]))
+   ```
+4. **Time no stage covers.** If the queue grows while arrivals, holds and
+   stages stay flat, the slots are going to time that no stage measures:
+   - Inside the lock: the call's reply on its way back and the runtime's wake
+     to it, and for an append abandoned by an error, the ROLLBACK that its
+     cleanup sends later. PostgreSQL holds `ORDER_LOCK` then, but the hold the
+     frontend records ends before it.
+   - Outside the lock but inside the slot: the connection's return to the
+     pool, with its release round trip.
+
+   Both point to the frontend's runtime or the network to the primary. For
+   the runtime, read `qbit_prism_runtime_lag_seconds` (the sampler's wake
+   lateness) and `qbit_prism_runtime_poll_lag_seconds` (the longest poll, by
+   task). `PrismRuntimeLagHigh` fires only above 2 s, and 0.6 s of lag
+   already fills the slots at 25 shares/s.
+5. **WAL syncs and checkpoints on the primary.** Each append's COMMIT
+   flushes WAL inside `ORDER_LOCK`, so commits don't group.
+   - Read `pg_stat_wal`: `wal_sync`, `wal_sync_time` (with
+     `track_wal_io_timing` on) and `wal_fpi`.
+   - Read the checkpointer's counters.
+   - Look in the primary's log for a checkpoint starting or ending in the
+     window.
+
+   A `commit` mean well above `wal_sync_time / wal_sync` is the round trip,
+   the runtime, or a COMMIT-path wait other than the flush.
+6. **Pool saturation.** `qbit_prism_database_pool_acquire_seconds` and
+   `PrismDatabasePoolWaitHigh` show checkouts made after admission, which hold
+   a slot while they wait. They also show other callers starving the share
+   appends' pool.
+
+The load harness reports the same split offline, per phase, in
+`load-harness-report.json`:
+
+- `share_ack_accounting` splits the accepted acknowledgements' seconds into
+  four parts:
+  - `before_lock_and_response`, made up of `submit_checks`, `admission` and
+    `before_lock_unattributed`. Despite its name it includes the call's reply
+    on its way back and the runtime's wake to it.
+  - `order_lock_wait`;
+  - `in_call_after_grant`;
+  - `after_call`.
+- It also splits the append's whole hold (`order_lock_hold_append`, which is
+  `in_call_after_grant` plus `after_call`) into `locked_call`, `commit` and
+  `hold_unattributed`.
+- `database_counters` holds the WAL syncs, their mean time and full-page images,
+  and the timed and requested checkpoints.
+- `database.checkpoint_log` holds the primary's checkpoint log lines.
+- A failed gated phase prints the same figures in an informational gate row.
+
+This warning is not a page. The miner-visible signal is `PrismShareAckP99High`,
+which has the same one-second bound; when both fire, the slow acknowledgements
+waited in this queue.
+
 ## Snapshot and payout boundary
 
 `qbit_prism_window(anchor_job_issued_at, window_weight)` selects eligible shares

@@ -191,6 +191,32 @@ labels!(OrderLockHolder {
     Cleanup => "cleanup", FatalState => "fatal_state", Operator => "operator",
     PeerSync => "peer_sync"
 });
+// #829: the stages of a share's path to its append that the frontend times,
+// and how each ended. A stage records only the outcomes `outcomes` lists.
+labels!(AppendStage {
+    SubmitChecks => "submit_checks", Admission => "admission",
+    LockedCall => "locked_call", Commit => "commit"
+});
+labels!(AppendStageOutcome {
+    Passed => "passed", Admitted => "admitted", Cancelled => "cancelled", Closed => "closed",
+    Replied => "replied", Committed => "committed", Failed => "failed"
+});
+
+impl AppendStage {
+    /// The outcomes this stage records, so the family's series are fixed.
+    pub const fn outcomes(self) -> &'static [AppendStageOutcome] {
+        match self {
+            Self::SubmitChecks => &[AppendStageOutcome::Passed],
+            Self::Admission => &[
+                AppendStageOutcome::Admitted,
+                AppendStageOutcome::Cancelled,
+                AppendStageOutcome::Closed,
+            ],
+            Self::LockedCall => &[AppendStageOutcome::Replied],
+            Self::Commit => &[AppendStageOutcome::Committed, AppendStageOutcome::Failed],
+        }
+    }
+}
 // 3.1 dual writer (D1): the peer sync's streams, the path a pass took to the
 // peer's database, why it refused the peer, and the tables it copies.
 labels!(PeerSyncStream {

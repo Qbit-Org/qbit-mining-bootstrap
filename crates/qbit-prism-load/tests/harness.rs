@@ -5781,6 +5781,131 @@ fn share_ack_accounting_derives_only_from_known_inputs() {
     assert!(accounting.accepted_acks.unavailable_reason.is_some());
 }
 
+/// The server's append stages (#829) as a frontend's `/metrics` lines, the
+/// family declared: each argument is (count, sum), in the order submit
+/// checks, admission, the call's own hold, COMMIT.
+fn staged_body(stages: [(f64, f64); 4]) -> String {
+    let mut body = String::from(
+        "# HELP qbit_prism_share_append_stage_seconds Share append stages.\n\
+         # TYPE qbit_prism_share_append_stage_seconds histogram\n",
+    );
+    let labels = [
+        ("submit_checks", "passed"),
+        ("admission", "admitted"),
+        ("locked_call", "replied"),
+        ("commit", "committed"),
+    ];
+    for ((stage, outcome), (count, sum)) in labels.iter().zip(stages) {
+        body.push_str(&format!(
+            "qbit_prism_share_append_stage_seconds_sum{{stage=\"{stage}\",outcome=\"{outcome}\"}} {sum}\n\
+             qbit_prism_share_append_stage_seconds_count{{stage=\"{stage}\",outcome=\"{outcome}\"}} {count}\n"
+        ));
+    }
+    // Another stage's other outcome must not be read as the admitted wait.
+    body.push_str(
+        "qbit_prism_share_append_stage_seconds_sum{stage=\"admission\",outcome=\"cancelled\"} 99\n\
+         qbit_prism_share_append_stage_seconds_count{stage=\"admission\",outcome=\"cancelled\"} 9\n",
+    );
+    body
+}
+
+/// #829: the server's append stages turn the remainder before the lock into
+/// measured queues and split the append's hold into the call's own hold,
+/// COMMIT and the rest, which they do not cover. Against a server from
+/// before the stages each of them, and every part derived from them, is
+/// unknown, while the split at ORDER_LOCK stays as it was.
+#[test]
+fn the_server_append_stages_split_the_remainder_and_the_time_after_the_call() {
+    let before = accounted_scrape(
+        &(accounted_body((0.0, 0.0), (0.0, 0.0), (0.0, 0.0)) + &staged_body([(0.0, 0.0); 4])),
+        (0.0, 0.0),
+    );
+    // 1,000 accepted acks over 30 s: 25.5 s before the lock, of which the
+    // submit checks took 2 s and the admission queue 20 s; the 4 s hold is
+    // the call's own 1 s, COMMIT's 1.5 s and 1.5 s the stages leave over.
+    let after = accounted_scrape(
+        &(accounted_body((1000.0, 4.0), (1000.0, 0.5), (2000.0, 0.2))
+            + &staged_body([(1010.0, 2.0), (1005.0, 20.0), (1000.0, 1.0), (1000.0, 1.5)])),
+        (1000.0, 30.0),
+    );
+    let acks = vec![measure::ack_delta(&before, &after)];
+    let series = vec![series_deltas(&before, &[], &after, 0)];
+    let call = Ok(measure::AppendCallStats {
+        calls: 1000,
+        total_seconds: 1.5,
+        max_seconds: Some(0.2),
+    });
+    let accounting = measure::share_ack_accounting(&acks, &series, &call);
+    let close = |value: Option<f64>, expected: f64| {
+        assert!(
+            value.is_some_and(|v| (v - expected).abs() < 1e-9),
+            "{value:?} != {expected}"
+        )
+    };
+    close(accounting.submit_checks.seconds, 2.0);
+    assert_eq!(accounting.submit_checks.count, Some(1010.0));
+    close(accounting.admission.seconds, 20.0);
+    close(accounting.locked_call.seconds, 1.0);
+    assert!(accounting.locked_call.clock.contains("PostgreSQL"));
+    close(accounting.commit.seconds, 1.5);
+    close(accounting.hold_unattributed.seconds, 1.5);
+    close(accounting.before_lock_unattributed.seconds, 3.5);
+    close(accounting.before_lock_and_response.seconds, 25.5);
+    for part in [
+        &accounting.hold_unattributed,
+        &accounting.before_lock_unattributed,
+    ] {
+        assert_eq!(part.kind, "derived");
+        assert!(part
+            .formula
+            .is_some_and(|formula| formula.contains("frontend monotonic")));
+    }
+    assert_eq!(accounting.admission.kind, "measured");
+
+    // A server from before the stages does not declare the family: the
+    // stages are unknown, not zero, and so is everything derived from them;
+    // the split at ORDER_LOCK is unchanged.
+    let old_before = accounted_scrape(
+        &accounted_body((0.0, 0.0), (0.0, 0.0), (0.0, 0.0)),
+        (0.0, 0.0),
+    );
+    let old_after = accounted_scrape(
+        &accounted_body((1000.0, 4.0), (1000.0, 0.5), (2000.0, 0.2)),
+        (1000.0, 30.0),
+    );
+    let acks = vec![measure::ack_delta(&old_before, &old_after)];
+    let series = vec![series_deltas(&old_before, &[], &old_after, 0)];
+    let accounting = measure::share_ack_accounting(&acks, &series, &call);
+    for part in [
+        &accounting.submit_checks,
+        &accounting.admission,
+        &accounting.locked_call,
+        &accounting.commit,
+    ] {
+        assert_eq!(part.seconds, None, "{part:?}");
+        assert!(part.unavailable_reason.is_some(), "{part:?}");
+    }
+    assert_eq!(accounting.hold_unattributed.seconds, None);
+    assert!(accounting
+        .hold_unattributed
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("locked_call is unknown: ")));
+    assert_eq!(accounting.before_lock_unattributed.seconds, None);
+    close(accounting.before_lock_and_response.seconds, 25.5);
+    close(accounting.after_call.seconds, 3.0);
+
+    // Declared and not yet observed is a real zero: a phase in which no
+    // share reached an append leaves every stage known.
+    let declared = accounted_scrape(
+        "# TYPE qbit_prism_share_append_stage_seconds histogram\n",
+        (0.0, 0.0),
+    );
+    let deltas = series_deltas(&declared, &[], &declared, 0);
+    assert_eq!(deltas[measure::ADMISSION_ADMITTED].count, Some(0.0));
+    assert_eq!(deltas[measure::COMMIT_COMMITTED].seconds, Some(0.0));
+}
+
 /// WAL counters over a phase: counts are known whenever both reads were,
 /// the times only when track_wal_io_timing was on at both ends, and a reset
 /// or a replaced primary (counters going backwards) is unknown, not a
@@ -5958,6 +6083,40 @@ fn a_failed_gated_phase_prints_its_ack_accounting_without_gating_on_it() {
         "{}",
         printed.observed
     );
+
+    // A report without the server's stages keeps the line as it was.
+    assert!(
+        !printed.observed.contains("submit checks"),
+        "{}",
+        printed.observed
+    );
+
+    // With them, the remainder before the lock and the append's hold are
+    // split, the hold in a sentence of its own.
+    let mut staged = accounting.clone();
+    for (key, seconds, kind) in [
+        ("order_lock_hold_append", json!(1794.0), "measured"),
+        ("submit_checks", json!(700.0), "measured"),
+        ("admission", json!(31000.0), "measured"),
+        ("before_lock_unattributed", json!(1300.0), "derived"),
+        ("locked_call", json!(60.0), "measured"),
+        ("commit", json!(null), "measured"),
+        ("hold_unattributed", json!(null), "derived"),
+    ] {
+        staged[key] = json!({"seconds": seconds, "kind": kind});
+    }
+    let failed = gate::evaluate(&report(1022, Some(staged)), Some(0), &budgets);
+    let printed = row(&failed).expect("a failed gated phase prints its accounting");
+    for expected in [
+        "33000.0 s (93%, derived), of it submit checks 700.0 s (2%), the admission queue \
+         31000.0 s (88%) and the rest 1300.0 s (4%, derived)",
+        "after the call (COMMIT, its WAL flush and holds the call's statistics miss) 1794.0 s \
+         (5%, derived). The append's hold, \
+         1794.0 s (5%): the call's reported hold 60.0 s (0%), COMMIT unknown and the rest \
+         unknown. WAL: ",
+    ] {
+        assert!(printed.observed.contains(expected), "{}", printed.observed);
+    }
 
     let clean = gate::evaluate(&report(0, Some(accounting)), Some(0), &budgets);
     assert!(gate::passed(&clean));

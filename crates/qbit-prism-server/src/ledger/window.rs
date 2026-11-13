@@ -834,12 +834,14 @@ impl Ledger {
         } else {
             &APPEND_FIRST_READ_SQL
         };
-        let admission = super::append_admission::Admission::acquire(&self.pool).await?;
+        let admission =
+            super::append_admission::Admission::acquire(&self.pool, self.metrics.as_deref())
+                .await?;
         let mut connection = admission.attach(self.acquire().await?);
         let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
-        // Dropped on every path out: after the COMMIT or the gate's ROLLBACK
-        // below, or, on an error, just before the queued ROLLBACK runs.
-        let _order = self
+        // Ended by `commit_gated` once COMMIT or the gate's ROLLBACK is in,
+        // or, on an error, dropped just before the queued ROLLBACK runs.
+        let order = self
             .lock_order(&mut tx, crate::metrics::OrderLockHolder::Append)
             .await?;
         // Every client round trip from here to COMMIT is time ORDER_LOCK
@@ -941,7 +943,9 @@ impl Ledger {
                 result
             }
         };
-        let result = Self::commit_gated(tx, result, prepared.is_some(), pre_commit).await?;
+        let result = self
+            .commit_gated(tx, order, result, prepared.is_some(), pre_commit)
+            .await?;
         if let (Some((admitted, observed)), true) = (moved, result.captured) {
             tracing::warn!(
                 block = %prepared.map(|prepared| prepared.block_hash()).unwrap_or_default(),
@@ -972,7 +976,9 @@ impl Ledger {
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<AppendResult> {
         let header_hash = share_header_hash(&share.share_id);
-        let admission = super::append_admission::Admission::acquire(&self.pool).await?;
+        let admission =
+            super::append_admission::Admission::acquire(&self.pool, self.metrics.as_deref())
+                .await?;
         let mut connection = admission.attach(self.acquire().await?);
         let mut tx = connection.begin(Self::APPEND_TRANSACTION_BEGIN).await?;
         let lock = self.called_order_lock(crate::metrics::OrderLockHolder::Append);
@@ -1009,12 +1015,11 @@ impl Ledger {
                 return Err(refusal.error);
             }
         };
-        // Dropped on every path out: after the COMMIT or the gate's ROLLBACK
-        // below, or, on an error, just before the queued ROLLBACK runs.
-        let _order = lock.granted(
-            micros(row.try_get("lock_waited_us")?),
-            micros(row.try_get("lock_held_us")?),
-        );
+        let waited = micros(row.try_get("lock_waited_us")?);
+        let held = micros(row.try_get("lock_held_us")?);
+        // Ended by `commit_gated` once COMMIT or the gate's ROLLBACK is in,
+        // or, on an error, dropped just before the queued ROLLBACK runs.
+        let order = lock.granted(waited, held);
         let result = if row.try_get("inserted")? {
             share.share_seq = u64::try_from(row.try_get::<i64, _>("share_seq")?)?;
             share.accepted_at_ms = row.try_get("accepted_at_ms")?;
@@ -1034,14 +1039,31 @@ impl Ledger {
                 captured: false,
             }
         };
-        Self::commit_gated(tx, result, false, pre_commit).await
+        let ended = self
+            .commit_gated(tx, order, result, false, pre_commit)
+            .await;
+        // #829: the call's own hold on the server's clock, recorded once its
+        // transaction and its hold have ended, by COMMIT or the gate's
+        // ROLLBACK, so never inside the hold. A reply refused above records
+        // none.
+        if let Some(metrics) = self.metrics.as_deref() {
+            metrics.observe_append_stage(
+                crate::metrics::AppendStage::LockedCall,
+                crate::metrics::AppendStageOutcome::Replied,
+                held,
+            );
+        }
+        ended
     }
 
     /// The end of a share append's transaction once its statements have
     /// succeeded: the pre-commit gate, then COMMIT. `wrote_candidate` says
     /// whether the transaction also wrote a block's candidate or capture.
+    /// `order`, the transaction's ORDER_LOCK hold, ends with it.
     async fn commit_gated(
+        &self,
         tx: Transaction<'_, Postgres>,
+        order: super::connect::OrderHold<'_>,
         result: AppendResult,
         wrote_candidate: bool,
         pre_commit: Option<&(dyn Fn() -> bool + Send + Sync)>,
@@ -1059,7 +1081,20 @@ impl Ledger {
             }
             return Err(CommitGateClosed.into());
         }
-        tx.commit().await?;
+        // #829: the COMMIT round trip, read as its reply or failure is in and
+        // recorded once the hold has ended with it, so never inside the hold;
+        // a gate that refused sent no COMMIT and records none.
+        let (committed, elapsed) = timed(self.metrics.is_some(), tx.commit()).await;
+        drop(order);
+        if let (Some(metrics), Some(elapsed)) = (self.metrics.as_deref(), elapsed) {
+            let outcome = if committed.is_ok() {
+                crate::metrics::AppendStageOutcome::Committed
+            } else {
+                crate::metrics::AppendStageOutcome::Failed
+            };
+            metrics.observe_append_stage(crate::metrics::AppendStage::Commit, outcome, elapsed);
+        }
+        committed?;
         Ok(result)
     }
 
@@ -2320,6 +2355,17 @@ fn failed_past_the_lock(error: &sqlx::Error) -> bool {
                 .find(|line| line.contains("function qbit_prism_append_share("))
         })
         .is_some_and(|line| !line.ends_with(" at PERFORM"))
+}
+
+/// `future`'s output and, when `timed`, how long it ran, read as it returned
+/// (#829).
+async fn timed<T>(
+    timed: bool,
+    future: impl std::future::Future<Output = T>,
+) -> (T, Option<std::time::Duration>) {
+    let started = timed.then(tokio::time::Instant::now);
+    let output = future.await;
+    (output, started.map(|started| started.elapsed()))
 }
 
 /// A server-measured duration in microseconds; a negative one, from a step

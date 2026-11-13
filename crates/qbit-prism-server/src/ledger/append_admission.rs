@@ -1,5 +1,6 @@
 //! Keep share transactions from occupying every connection while they wait
 //! for ORDER_LOCK. This is admission to one pool, not an accounting lock.
+use crate::metrics::{AppendStage, AppendStageOutcome, Metrics};
 use sqlx::{pool::PoolConnection, PgPool, Postgres, Transaction};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -54,15 +55,54 @@ pub(super) struct Admission {
     runtime: tokio::runtime::Handle,
 }
 
+/// #829: times one wait for an admission permit and records it exactly
+/// once, when the wait ends: `admitted`, `closed` when the pool closed first,
+/// or `cancelled` when the append was dropped while it queued (an aborted
+/// append, a miner disconnect), with the time it actually waited. It ends
+/// before checkout, so ORDER_LOCK is never held while it records.
+struct AdmissionWait<'a> {
+    metrics: &'a Metrics,
+    started: tokio::time::Instant,
+    outcome: AppendStageOutcome,
+}
+
+impl Drop for AdmissionWait<'_> {
+    fn drop(&mut self) {
+        self.metrics.observe_append_stage(
+            AppendStage::Admission,
+            self.outcome,
+            self.started.elapsed(),
+        );
+    }
+}
+
 impl Admission {
     /// This wait remains inside the caller's original submission deadline.
     /// Cancellation before checkout releases only the queued admission; no
     /// SQL has started. In particular, retry does not create a new deadline.
-    pub(super) async fn acquire(pool: &PgPool) -> Result<Self, sqlx::Error> {
+    /// With `metrics`, the wait is recorded as the `admission` append stage.
+    pub(super) async fn acquire(
+        pool: &PgPool,
+        metrics: Option<&Metrics>,
+    ) -> Result<Self, sqlx::Error> {
         let admission = shared(pool);
+        let mut wait = metrics.map(|metrics| AdmissionWait {
+            metrics,
+            started: tokio::time::Instant::now(),
+            outcome: AppendStageOutcome::Cancelled,
+        });
+        let mut ended = |outcome| {
+            if let Some(wait) = &mut wait {
+                wait.outcome = outcome;
+            }
+        };
         let permit = tokio::select! {
-            _ = pool.close_event() => return Err(sqlx::Error::PoolClosed),
+            _ = pool.close_event() => {
+                ended(AppendStageOutcome::Closed);
+                return Err(sqlx::Error::PoolClosed);
+            }
             permit = admission.permits.clone().acquire_owned() => {
+                ended(AppendStageOutcome::Admitted);
                 permit.expect("append admission semaphore is never closed")
             }
         };
@@ -170,5 +210,77 @@ impl Drop for AppendConnection {
             cleanup.await;
             drop(admission);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The `admission` stage's `_count` and `_sum` for `outcome`, or `None`
+    /// while that series is unobserved.
+    fn admission(metrics: &Metrics, outcome: &str) -> Option<(f64, f64)> {
+        let body = metrics.render();
+        let value = |suffix: &str| {
+            let key = format!(
+                "qbit_prism_share_append_stage_seconds_{suffix}{{stage=\"admission\",outcome=\"{outcome}\"}} "
+            );
+            body.lines()
+                .find_map(|line| line.strip_prefix(&key))
+                .map(|value| value.parse::<f64>().unwrap())
+        };
+        value("count").zip(value("sum"))
+    }
+
+    /// #829: the wait for an admission permit, which ORDER_LOCK's own wait
+    /// cannot show, is recorded once it ends: `admitted` with the time it
+    /// queued, and an append dropped or refused while it queued records the
+    /// time it actually waited as `cancelled` or `closed`, not nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_admission_wait_is_recorded_however_it_ends() {
+        // Never connects: admission takes no connection.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(16)
+            .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+            .unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let mut held = Vec::new();
+        for _ in 0..15 {
+            held.push(Admission::acquire(&pool, Some(&metrics)).await.unwrap());
+        }
+        assert_eq!(admission(&metrics, "admitted"), Some((15.0, 0.0)));
+        assert_eq!(admission(&metrics, "cancelled"), None);
+        let queue = || {
+            let pool = pool.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move { Admission::acquire(&pool, Some(&metrics)).await })
+        };
+
+        // A sixteenth append queues until a permit is released.
+        let admitted = queue();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(admission(&metrics, "admitted"), Some((15.0, 0.0)));
+        drop(held.pop());
+        held.push(admitted.await.unwrap().unwrap());
+        assert_eq!(admission(&metrics, "admitted"), Some((16.0, 2.0)));
+
+        // One aborted while it queues (the share-commit deadline's abort).
+        let cancelled = queue();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancelled.abort();
+        assert!(cancelled.await.is_err_and(|error| error.is_cancelled()));
+        assert_eq!(admission(&metrics, "cancelled"), Some((1.0, 1.0)));
+
+        // One still queued when the pool closes.
+        let closed = queue();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        pool.close().await;
+        assert!(matches!(
+            closed.await.unwrap(),
+            Err(sqlx::Error::PoolClosed)
+        ));
+        assert_eq!(admission(&metrics, "closed"), Some((1.0, 0.5)));
+        assert_eq!(admission(&metrics, "admitted"), Some((16.0, 2.0)));
     }
 }

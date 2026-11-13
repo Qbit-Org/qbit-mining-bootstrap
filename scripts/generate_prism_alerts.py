@@ -140,7 +140,64 @@ def native_rules():
         rule["expr"] = expressions[rule["title"]]
         rule["basis"] = bases[rule["title"]]
         rule["description"] = REVISION_WORK_PREFIX + bases[rule["title"]]
+    admission_wait_rule(spec)
     return spec
+
+
+# #844: the append-slot queue, from the admission stage of #829's stage
+# histogram. The dwell is twice the window, so one landing's queue, which
+# leaves the window five minutes after it formed, never warns on its own.
+ADMISSION_TITLE = "PrismShareAppendAdmissionWaitHigh"
+ADMISSION_P99_SECONDS = 1
+ADMISSION_WINDOW = "5m"
+ADMISSION_MINIMUM = 100
+ADMISSION_FOR = "10m"
+
+
+def admission_wait_rule(spec):
+    """Generate the append-slot queue warning's expression, dwell and texts."""
+    (rule,) = [rule for rule in spec["rules"] if rule["title"] == ADMISSION_TITLE]
+    stage = "qbit_prism_share_append_stage_seconds"
+    selector = "{" + TARGET + ',stage="admission"}'
+    by = "(job, instance, network)"
+    p99 = (f"histogram_quantile(0.99, sum by (job, instance, network, le) "
+           f"(rate({stage}_bucket{selector}[{ADMISSION_WINDOW}])))")
+    flowing = f"sum by {by} (increase({stage}_count{selector}[{ADMISSION_WINDOW}]))"
+    snapshot = (f"({prism('qbit_prism_metrics_snapshot_available')} == 1) and on{by} "
+                f"({prism('qbit_prism_metrics_snapshot_stale')} == 0)")
+    rule["expr"] = (f"(({p99} > bool {ADMISSION_P99_SECONDS}) and on{by} ({flowing} >= {ADMISSION_MINIMUM})) "
+                    f"and on{by} ({snapshot})")
+    rule["for"] = ADMISSION_FOR
+    rule["basis"] = (
+        f"Admission-wait p99 over {ADMISSION_P99_SECONDS} second, on the ORDER_LOCK hold ladder's one-second "
+        f"boundary, from at least {ADMISSION_MINIMUM} admissions in five minutes, for ten minutes. At production's "
+        "~50 shares/s (about 25/s on each frontend of the pair) an append holds its slot for a few milliseconds (its call, COMMIT and the connection's release round "
+        "trip), so a "
+        "wait needs fifteen appends in flight on one frontend, an ORDER_LOCK hold of at least 0.6 s. The load lanes' "
+        "clean steady states acknowledge at a p99 of 3-8 ms, while #829's occurrences queued here for seconds "
+        "(acknowledgement p99 5.5 s on 10-30 and 6.6 s in #835's run; a 0.96 s repeat stays under). One second is "
+        "also PrismShareAckP99High's bound and the load gate's, so the two rules read together say where slow "
+        "acknowledgements waited. Ten minutes is twice the window: one landing's queue leaves the window five "
+        "minutes after it formed, so a landing never warns on its own (at 25/s it needs a settlement hold over "
+        "about 4.6 s even to lift the five-minute p99 over a second, as 2.x.x's 4-5 s block minutes would), while "
+        "a queue that persists does. Repeated landings warn when, in every five minutes for ten minutes, their "
+        "holds' time beyond about 1.6 s adds up to more than about 3 s, for example a hold over 2.2 s every "
+        "minute; #602's R2 budget for those holds is 250 ms, and with arrivals spread evenly a hold under 0.6 s "
+        "never fills the fifteen slots. Provisional, measure in #291.")
+    rule["description"] = (
+        "Share appends on this frontend are queueing for an append slot. A frontend admits at most "
+        "PRISM_DATABASE_MAX_CONNECTIONS - 1 share appends at once (15 by default), each from before its pool "
+        "checkout until its connection is back in the pool, just after its COMMIT; the rest wait here, in front of "
+        "PostgreSQL, where ORDER_LOCK's own wait cannot show them (#829). A queue that persists means appends "
+        "finish more slowly than they arrive: read the accepted-share rate, the cluster-wide ORDER_LOCK holds by "
+        "holder on every frontend, the append's locked_call and commit stages, the runtime's wake and poll lag, "
+        "WAL syncs and checkpoints and pool saturation, as docs/prism-ledger-ops.md's \"Shares queued for an "
+        "append slot\" describes. "
+        "Every outcome counts, so an append dropped at the share-commit deadline while it queued is counted with "
+        "the time it waited. Gated on the snapshot, since the family is served from the cached body: a stale or "
+        "unpublished body suppresses it. A frontend without the stage histogram (older than #829's stages) has "
+        "no admission series and stays quiet; no-data and evaluation errors are OK because the snapshot and "
+        "no-data rules own missing measurements. " + rule["basis"])
 
 
 # How the operator docs state the window; checked against MINER_WINDOW_MINUTES.
