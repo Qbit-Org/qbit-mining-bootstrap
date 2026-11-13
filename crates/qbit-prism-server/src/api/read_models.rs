@@ -3,6 +3,8 @@ use super::*;
 use chrono::DateTime;
 use num_bigint::BigUint;
 use num_traits::Zero;
+use std::future::Future;
+use tokio::sync::watch;
 
 pub(super) fn big(v: &Value) -> BigUint {
     v.as_str()
@@ -780,10 +782,360 @@ pub(super) async fn leaderboard(
         json!({"schema":"prism.dashboard.leaderboard.v1","generated_at":now(),"window":{"id":"3h","started_at":value["started_at"],"ended_at":value["ended_at"]},"totals":{"pool_hashrate_ths":hashrate(&value["total_difficulty"],10800),"pool_accepted_share_difficulty":value["total_difficulty"],"participant_count":value["participant_count"]},"pagination":pagination(page,limit,value["participant_count"].as_i64().unwrap_or(0)),"rows":rows}),
     )
 }
-pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
-    let hash:Option<String>=sqlx::query_scalar("SELECT a.block_hash FROM qbit_pool_audit_bundles a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,a.created_at DESC LIMIT 1").fetch_optional(&state.pool).await?;
-    let hash = hash.ok_or_else(|| ApiError::missing("no PRISM evidence has been produced"))?;
-    let body = bundle(state, &hash, false).await?;
+/// One `/audit/latest` run's bound, from its first query to its last (#859):
+/// fixed, as #833's integrity runs' is, and far beyond the run's usual time, a
+/// decode of the newest bundle at most. It is not the run's worst case. A run
+/// makes up to seven statements on the share writer's pool (the evidence key,
+/// the rollup check, the counts, the payout count, then, for new evidence,
+/// the bundle row and its canonical bytes, or its share snapshot and window),
+/// and each may wait up to the pool's 15 s for a connection and then run up
+/// to the statement timeout, 15 s by default. A new bundle's decode, last,
+/// waits for a decode permit and then runs with neither. So while every
+/// writer connection is busy and checkouts queue for seconds, with a raised
+/// statement timeout, or with a slow decode, a valid run can pass this bound
+/// every time, and the route answers `503 read_timeout` until a run fits
+/// again, where before #859 it answered slowly; `docs/prism-ledger-ops.md`
+/// says so.
+pub(super) const LATEST_EVIDENCE_RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `/audit/latest`'s answer is served after its run ends (#859). No
+/// request in that time touches the database, so after an answer a poller
+/// starts a run at most once per run time plus this, and the lifetime counts
+/// it serves are at most this much, plus the run's own time, behind the
+/// ledger. A failed run is not served: the next request starts another.
+pub(super) const LATEST_EVIDENCE_REUSE: Duration = Duration::from_secs(10);
+
+/// `/audit/latest` (#859): its answer computed by one run at a time, dated,
+/// and served for a short while, as the integrity routes' reports are since
+/// #833.
+///
+/// The route reads the newest confirmed block's evidence, decoding its whole
+/// audit bundle to count the shares, and lifetime share and miner counts over
+/// every daily rollup and the raw tail. Each request used to do all of that
+/// on the share writer's pool, with no route timeout and no limit on
+/// concurrent calls: the `ApiState.latest_evidence` field that looked like a
+/// cache came across from the Python runtime in #244 with its reader and no
+/// writer. Now every request that arrives during a run waits for that run and
+/// is answered with its outcome; its answer is served for [`reuse`] after the
+/// run ends, with when it was computed; and only the first request after that
+/// starts another run, bounded by [`timeout`]. A failure is never served
+/// again: the next request starts a run. A run reuses the evidence the newest
+/// answer decoded while the newest confirmed block, its audit bundle and its
+/// payout manifest are still those, and decodes after every other read, so a
+/// bundle is decoded once per new evidence unless its own decode, or the
+/// run's last steps, fail; the counts are read by every run.
+///
+/// [`reuse`]: LATEST_EVIDENCE_REUSE
+/// [`timeout`]: LATEST_EVIDENCE_RUN_TIMEOUT
+pub(super) struct LatestEvidence {
+    timeout: Duration,
+    reuse: Duration,
+    /// The frontend's stop signal: `true` once it is stopping.
+    stop: watch::Receiver<bool>,
+    state: std::sync::Mutex<EvidenceRuns>,
+}
+
+#[derive(Default)]
+struct EvidenceRuns {
+    /// How many runs have started; each run's number is its count.
+    started: u64,
+    /// The newest run that produced an answer.
+    latest: Option<Arc<EvidenceRun>>,
+    running: Option<RunningEvidence>,
+}
+
+/// The run in flight, and where the requests waiting for it hear its outcome.
+struct RunningEvidence {
+    number: u64,
+    outcome: watch::Receiver<Option<Arc<EvidenceRun>>>,
+}
+
+/// One finished run.
+struct EvidenceRun {
+    number: u64,
+    /// When the run started, by the wall clock. Its figures were read from
+    /// then until it ended.
+    computed_at: DateTime<Utc>,
+    started: tokio::time::Instant,
+    ended: tokio::time::Instant,
+    outcome: ApiResult<EvidenceAnswer>,
+}
+
+/// A run's answer, and the evidence it decoded for the next run to reuse.
+struct EvidenceAnswer {
+    answer: Value,
+    evidence: Arc<Evidence>,
+}
+
+/// The newest confirmed evidence a run read: which block, bundle and payout
+/// manifest it is, and the fields it served from the decoded bundle.
+pub(super) struct Evidence {
+    key: EvidenceKey,
+    fields: Value,
+}
+type EvidenceKey = (String, String, Option<String>);
+
+/// What a request does: serve the newest answer, wait for the run in flight,
+/// start one (`T`, its task) and wait for it, or refuse on a stopping
+/// frontend.
+enum NextEvidence<T> {
+    Reuse(Arc<EvidenceRun>),
+    Wait(watch::Receiver<Option<Arc<EvidenceRun>>>),
+    Start(watch::Receiver<Option<Arc<EvidenceRun>>>, T),
+    Stopping,
+}
+
+impl EvidenceRun {
+    /// The answer with when it was computed, its age now and how long its run
+    /// took, the three fields #833 dates the integrity reports with; or the
+    /// run's own failure.
+    fn response(&self) -> ApiResult<Value> {
+        let answer = self.outcome.as_ref().map_err(Clone::clone)?;
+        let mut answer = answer.answer.clone();
+        answer["computed_at"] = json!(self
+            .computed_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true));
+        answer["age_seconds"] = json!(self.started.elapsed().as_secs_f64());
+        answer["run_seconds"] = json!((self.ended - self.started).as_secs_f64());
+        Ok(answer)
+    }
+}
+
+impl LatestEvidence {
+    /// Runs bounded by `timeout`, an answer served for `reuse`, and no stop
+    /// signal.
+    pub(super) fn new(timeout: Duration, reuse: Duration) -> Self {
+        Self {
+            timeout,
+            reuse,
+            // A signal whose sender is gone never stops.
+            stop: watch::channel(false).1,
+            state: std::sync::Mutex::default(),
+        }
+    }
+
+    /// No run yet, with another run bound and reuse window.
+    pub(super) fn with_timing(&self, timeout: Duration, reuse: Duration) -> Self {
+        Self {
+            stop: self.stop.clone(),
+            ..Self::new(timeout, reuse)
+        }
+    }
+
+    /// No run yet, stopping when `stop` turns `true`.
+    pub(super) fn stopping_on(&self, stop: watch::Receiver<bool>) -> Self {
+        Self {
+            stop,
+            ..Self::new(self.timeout, self.reuse)
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, EvidenceRuns> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The route's answer from the run in flight, the newest answer while it
+    /// is served, or else a new run on `state`'s ledger pool.
+    pub(super) async fn answer_latest(self: &Arc<Self>, state: &ApiState) -> ApiResult<Value> {
+        let state = state.clone();
+        self.answer_with(move |previous| async move { latest_evidence(&state, previous).await })
+            .await
+    }
+
+    /// [`LatestEvidence::answer_latest`], with `compute` producing a new run's
+    /// answer from the newest answer's evidence. It is called only when a run
+    /// starts.
+    async fn answer_with<R, F>(self: &Arc<Self>, compute: R) -> ApiResult<Value>
+    where
+        R: FnOnce(Option<Arc<Evidence>>) -> F,
+        F: Future<Output = ApiResult<(Value, Arc<Evidence>)>> + Send + 'static,
+    {
+        let next = {
+            let mut runs = self.lock();
+            if let Some(running) = &runs.running {
+                NextEvidence::Wait(running.outcome.clone())
+            } else if let Some(run) = runs
+                .latest
+                .clone()
+                .filter(|run| run.ended.elapsed() < self.reuse)
+            {
+                NextEvidence::Reuse(run)
+            } else if self.stopped() {
+                NextEvidence::Stopping
+            } else {
+                let previous = runs.latest.as_ref().and_then(|run| {
+                    run.outcome
+                        .as_ref()
+                        .ok()
+                        .map(|answer| answer.evidence.clone())
+                });
+                let (outcome, task) = self.start(&mut runs, compute(previous));
+                NextEvidence::Start(outcome, task)
+            }
+        };
+        let mut outcome = match next {
+            NextEvidence::Reuse(run) => return run.response(),
+            NextEvidence::Stopping => {
+                return Err(ApiError::upstream(
+                    "the frontend is stopping, so it starts no latest-evidence run",
+                ))
+            }
+            NextEvidence::Wait(outcome) => outcome,
+            // Spawned once the lock is released: a runtime that is shutting
+            // down drops the task at once, and its guard takes that lock.
+            NextEvidence::Start(outcome, task) => {
+                tokio::spawn(task);
+                outcome
+            }
+        };
+        // A run whose task died without an outcome leaves the channel closed
+        // and empty.
+        let run = match outcome.wait_for(Option::is_some).await {
+            Ok(run) => (*run).clone(),
+            Err(_) => None,
+        };
+        match run {
+            Some(run) => run.response(),
+            None => Err(ApiError::internal()),
+        }
+    }
+
+    /// Record the next run and return its task, for the caller to spawn: a
+    /// request that stops waiting leaves the run going, bounded by its
+    /// timeout and the frontend's stop, for the next request.
+    fn start<F>(
+        self: &Arc<Self>,
+        runs: &mut EvidenceRuns,
+        running: F,
+    ) -> (
+        watch::Receiver<Option<Arc<EvidenceRun>>>,
+        impl Future<Output = ()> + Send + 'static,
+    )
+    where
+        F: Future<Output = ApiResult<(Value, Arc<Evidence>)>> + Send + 'static,
+    {
+        let computed_at = Utc::now();
+        let started = tokio::time::Instant::now();
+        let timeout = self.timeout;
+        runs.started += 1;
+        let number = runs.started;
+        let (sender, outcome) = watch::channel(None);
+        runs.running = Some(RunningEvidence {
+            number,
+            outcome: outcome.clone(),
+        });
+        let finishing = EvidenceFinishing {
+            evidence: Arc::clone(self),
+            number,
+        };
+        let stop = self.stop.clone();
+        let task = async move {
+            // Either way the run's future is dropped, and with it any
+            // statement in flight, which its session's statement timeout ends.
+            let outcome = tokio::select! {
+                // A run that has finished keeps its outcome, stop or not.
+                biased;
+                outcome = tokio::time::timeout_at(started + timeout, running) => match outcome {
+                    Ok(outcome) => outcome.map(|(answer, evidence)| EvidenceAnswer { answer, evidence }),
+                    Err(_) => Err(ApiError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        code: "read_timeout",
+                        message: format!(
+                            "the latest evidence run did not finish within its {} s; try again shortly",
+                            timeout.as_secs()
+                        ),
+                    }),
+                },
+                () = evidence_stopping(stop) => Err(ApiError::upstream(
+                    "the frontend stopped during the latest-evidence run",
+                )),
+            };
+            let run = Arc::new(EvidenceRun {
+                number,
+                computed_at,
+                started,
+                ended: tokio::time::Instant::now(),
+                outcome,
+            });
+            if let Err(error) = &run.outcome {
+                tracing::warn!(
+                    run_seconds = (run.ended - started).as_secs_f64(),
+                    code = error.code,
+                    reason = %error.message,
+                    "latest evidence run failed"
+                );
+            }
+            finishing.evidence.publish(Arc::clone(&run));
+            sender.send_replace(Some(run));
+            drop(finishing);
+        };
+        (outcome, task)
+    }
+
+    /// Record a finished run's answer, unless a newer run's answer is already
+    /// recorded, and end it as the run in flight. A failure is not recorded.
+    fn publish(&self, run: Arc<EvidenceRun>) {
+        let mut runs = self.lock();
+        if run.outcome.is_ok()
+            && runs
+                .latest
+                .as_ref()
+                .is_none_or(|latest| latest.number < run.number)
+        {
+            runs.latest = Some(Arc::clone(&run));
+        }
+        runs.end(run.number);
+    }
+}
+
+impl EvidenceRuns {
+    fn end(&mut self, number: u64) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.number == number)
+        {
+            self.running = None;
+        }
+    }
+}
+
+/// Ends run `number` as the run in flight however its task ends, a panic or
+/// an abort included, so a run that dies keeps no later request waiting on it
+/// and none from starting another.
+struct EvidenceFinishing {
+    evidence: Arc<LatestEvidence>,
+    number: u64,
+}
+
+impl Drop for EvidenceFinishing {
+    fn drop(&mut self) {
+        self.evidence.lock().end(self.number);
+    }
+}
+
+/// Resolves once `stop` turns `true`; never, once its sender is gone without
+/// having stopped.
+async fn evidence_stopping(mut stop: watch::Receiver<bool>) {
+    if stop.wait_for(|stopped| *stopped).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// One `/audit/latest` run's answer, on `state`'s ledger pool, and the
+/// evidence it served: `previous`, the newest answer's, when the newest
+/// confirmed block, its audit bundle and its payout manifest are still those,
+/// else the newest bundle decoded anew, after every other read.
+async fn latest_evidence(
+    state: &ApiState,
+    previous: Option<Arc<Evidence>>,
+) -> ApiResult<(Value, Arc<Evidence>)> {
+    let key:Option<EvidenceKey>=sqlx::query_as("SELECT a.block_hash,a.audit_bundle_sha256,b.payout_manifest_sha256 FROM qbit_pool_audit_bundles a JOIN qbit_pool_blocks b USING(block_hash) WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,a.created_at DESC LIMIT 1").fetch_optional(&state.pool).await?;
+    let key = key.ok_or_else(|| ApiError::missing("no PRISM evidence has been produced"))?;
+    let hash = &key.0;
     // Both counts are lifetime-scoped, and the share ledger is partitioned
     // with a retention path since #144: a `count(*)` over the online rows
     // would start falling the first time a partition is detached. The
@@ -834,14 +1186,36 @@ pub(super) async fn latest_evidence(state: &ApiState) -> ApiResult<Value> {
     .await?;
     let payout_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM qbit_pool_payout_entries WHERE block_hash=$1")
-            .bind(&hash)
+            .bind(hash)
             .fetch_one(&state.pool)
             .await?;
-    Ok(
-        json!({"schema":"qbit.prism.live-stratum-evidence.v1","block_hash":hash,"block_height":body["block_height"],"coinbase_tx_hex":body["coinbase_tx_hex"],"audit_bundle_path":format!("/audit/blocks/{hash}/bundle"),"audit_report":{"audit_bundle_sha256":body["audit_bundle_sha256"],"payout_manifest_sha256":body["payout_manifest_sha256"]},"ledger_backend":"postgres-native","persistence":{"backend":"postgres-native","payout_entry_count":payout_count},"confirmation":{"block_hash":hash,"chain_state":"confirmed"},"ctv_persistence":null,"accepted_share_count":counts["accepted_share_count"],"distinct_miner_count":counts["distinct_miner_count"],"job_share_count":body["audit_bundle"]["shares"].as_array().map_or(0,Vec::len)}),
-    )
+    // The window-sized decode last, so a run that fails before it, at the
+    // counts say, decodes nothing, and only when the evidence is not the
+    // previous answer's. Decoded, the evidence is keyed by what the body
+    // itself says it is, so a row re-imported between the two reads is
+    // decoded again by the next run.
+    let evidence = match previous.filter(|evidence| evidence.key == key) {
+        Some(evidence) => evidence,
+        None => {
+            let body = bundle(state, hash, false).await?;
+            let text = |field: &str| body[field].as_str().map(str::to_owned);
+            Arc::new(Evidence {
+                key: (
+                    text("block_hash").unwrap_or_default(),
+                    text("audit_bundle_sha256").unwrap_or_default(),
+                    text("payout_manifest_sha256"),
+                ),
+                fields: json!({"block_height":body["block_height"],"coinbase_tx_hex":body["coinbase_tx_hex"],"audit_bundle_sha256":body["audit_bundle_sha256"],"payout_manifest_sha256":body["payout_manifest_sha256"],"job_share_count":body["audit_bundle"]["shares"].as_array().map_or(0,Vec::len)}),
+            })
+        }
+    };
+    let body = &evidence.fields;
+    let answer = json!({"schema":"qbit.prism.live-stratum-evidence.v1","block_hash":hash,"block_height":body["block_height"],"coinbase_tx_hex":body["coinbase_tx_hex"],"audit_bundle_path":format!("/audit/blocks/{hash}/bundle"),"audit_report":{"audit_bundle_sha256":body["audit_bundle_sha256"],"payout_manifest_sha256":body["payout_manifest_sha256"]},"ledger_backend":"postgres-native","persistence":{"backend":"postgres-native","payout_entry_count":payout_count},"confirmation":{"block_hash":hash,"chain_state":"confirmed"},"ctv_persistence":null,"accepted_share_count":counts["accepted_share_count"],"distinct_miner_count":counts["distinct_miner_count"],"job_share_count":body["job_share_count"]});
+    Ok((answer, evidence))
 }
 
+#[cfg(test)]
+mod latest_evidence_tests;
 #[cfg(test)]
 mod artifact_fallback_tests {
     use super::*;

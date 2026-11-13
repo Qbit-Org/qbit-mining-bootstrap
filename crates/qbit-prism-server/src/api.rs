@@ -310,7 +310,8 @@ pub struct ApiState {
     pub health: Arc<RwLock<Value>>,
     metrics: Arc<RwLock<MetricsSnapshot>>,
     registry: Arc<crate::metrics::Metrics>,
-    pub latest_evidence: Arc<RwLock<Option<Value>>>,
+    /// `/audit/latest`'s run and newest answer (#859).
+    latest_evidence: Arc<read_models::LatestEvidence>,
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
     cache: ResponseCache,
@@ -384,7 +385,10 @@ impl ApiState {
             )),
             metrics: Arc::new(RwLock::new(MetricsSnapshot::default())),
             registry,
-            latest_evidence: Arc::new(RwLock::new(None)),
+            latest_evidence: Arc::new(read_models::LatestEvidence::new(
+                read_models::LATEST_EVIDENCE_RUN_TIMEOUT,
+                read_models::LATEST_EVIDENCE_REUSE,
+            )),
             health_published_at: Arc::new(RwLock::new(Instant::now())),
             // Idle node connections are dropped before the node's idle close (#759).
             client: crate::rpc::node_client_builder()
@@ -425,10 +429,24 @@ impl ApiState {
         self.integrity = Arc::new(self.integrity.with_timing(timeout, reuse));
         self
     }
+    /// `/audit/latest` with another reuse window than its 10 s, for the
+    /// tests; zero starts a run for every request that finds none in flight.
+    #[doc(hidden)]
+    pub fn with_latest_evidence_reuse(mut self, reuse: Duration) -> Self {
+        self.latest_evidence = Arc::new(
+            self.latest_evidence
+                .with_timing(read_models::LATEST_EVIDENCE_RUN_TIMEOUT, reuse),
+        );
+        self
+    }
     /// The frontend's stop signal, `true` once it is stopping: the integrity
-    /// routes then abandon their report run in flight and start none, so a
-    /// stop never waits on a report (#737).
+    /// routes and `/audit/latest` then abandon their run in flight and start
+    /// none, so a stop never waits on a report (#737, #859). An abandoned
+    /// `/audit/latest` statement still holds its ledger connection until it
+    /// ends, up to the statement timeout, which closing the ledger pool
+    /// waits for.
     pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.latest_evidence = Arc::new(self.latest_evidence.stopping_on(shutdown.clone()));
         self.integrity = Arc::new(self.integrity.stopping_on(shutdown));
         self
     }
@@ -1013,15 +1031,9 @@ async fn audit(state: &ApiState, path: &str, q: &Query) -> ApiResult<Value> {
             return state.integrity.answer_request(&state.pool).await;
         }
         "/audit/latest" => {
-            let row = state
-                .latest_evidence
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Some(row) = row {
-                return Ok(row);
-            }
-            return read_models::latest_evidence(state).await;
+            // #859: one run at a time under its own timeout, its answer
+            // served with when it was computed, for a few seconds.
+            return state.latest_evidence.answer_latest(state).await;
         }
         "/audit/share-window" => {
             let anchor = q

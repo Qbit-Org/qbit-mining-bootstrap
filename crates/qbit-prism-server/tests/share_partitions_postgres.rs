@@ -21,7 +21,7 @@ use qbit_prism_test_gate as gate;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -473,14 +473,19 @@ async fn latest_evidence_counts_lifetime_shares_across_the_rollup_watermark() ->
             let miner = if id % 2 == 0 { "bob" } else { "alice" };
             db.ledger.append(share(id, miner), None).await?;
         }
-        let app = router(ApiState::new(
-            db.pool().clone(),
-            ApiConfig {
-                cache_enabled: false,
-                ..ApiConfig::default()
-            },
-            Arc::new(Metrics::default()),
-        ));
+        // Every request reads the ledger as it is: no answer is served again
+        // (#859).
+        let app = router(
+            ApiState::new(
+                db.pool().clone(),
+                ApiConfig {
+                    cache_enabled: false,
+                    ..ApiConfig::default()
+                },
+                Arc::new(Metrics::default()),
+            )
+            .with_latest_evidence_reuse(Duration::ZERO),
+        );
 
         // Before the first sweep there is no watermark row, so both counts are
         // the raw lifetime ones, as they were before #144.
@@ -537,6 +542,158 @@ async fn latest_evidence_counts_lifetime_shares_across_the_rollup_watermark() ->
             tail == grown,
             "counts with a raw tail above the watermark are wrong: {tail:?} against {grown:?}"
         );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    db.close().await?;
+    result
+}
+
+async fn audit_latest(app: &Router) -> Result<Value> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/audit/latest")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status = response.status();
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 10_000_000).await?)?;
+    ensure!(status == StatusCode::OK, "/audit/latest: {status} {body}");
+    Ok(body)
+}
+
+/// The answer without the three fields that date it.
+fn undated(mut answer: Value) -> Value {
+    for key in ["computed_at", "age_seconds", "run_seconds"] {
+        answer.as_object_mut().unwrap().remove(key);
+    }
+    answer
+}
+
+/// #859: `/audit/latest` is computed by one run at a time, dated, served for
+/// its window, then computed afresh, and new evidence is decoded anew; what
+/// it serves equals what a frontend that never answered before computes.
+#[tokio::test]
+async fn latest_evidence_is_shared_dated_and_refreshed_after_its_window() -> Result<()> {
+    let Some(db) = Database::open("evidence_runs").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let (first_block, _) = land_block(&db.ledger, "alice", 402, 1).await?;
+        for id in 20..24 {
+            db.ledger.append(share(id, "bob"), None).await?;
+        }
+        let reuse = Duration::from_secs(4);
+        let state = || {
+            ApiState::new(
+                db.pool().clone(),
+                ApiConfig::default(),
+                Arc::new(Metrics::default()),
+            )
+        };
+        let app = router(state().with_latest_evidence_reuse(reuse));
+        // What a frontend computes that has never answered: no reuse, no
+        // evidence from an earlier run.
+        let fresh = || async { audit_latest(&router(state())).await.map(undated) };
+
+        // Concurrent requests share one run: one answer, one computed_at.
+        let answers =
+            futures_util::future::try_join_all((0..8).map(|_| audit_latest(&app))).await?;
+        let first = answers[0].clone();
+        ensure!(
+            answers
+                .iter()
+                .all(|answer| answer["computed_at"] == first["computed_at"]
+                    && undated(answer.clone()) == undated(first.clone())),
+            "{answers:?}"
+        );
+        ensure!(first["block_hash"] == first_block.as_str(), "{first}");
+        ensure!(
+            first["computed_at"].is_string()
+                && first["age_seconds"].is_number()
+                && first["run_seconds"].is_number(),
+            "{first}"
+        );
+        let raw = raw_lifetime_counts(db.pool()).await?;
+        ensure!(
+            (
+                first["accepted_share_count"].as_i64(),
+                first["distinct_miner_count"].as_i64()
+            ) == (Some(raw.0), Some(raw.1)),
+            "{first}"
+        );
+
+        // Within its window the answer is served again, new shares or not.
+        db.ledger.append(share(30, "carol"), None).await?;
+        let reused = audit_latest(&app).await?;
+        ensure!(
+            reused["computed_at"] == first["computed_at"]
+                && undated(reused.clone()) == undated(first.clone()),
+            "{reused}"
+        );
+
+        // After it, the next request computes afresh, reusing the evidence
+        // it decoded, and serves what a fresh frontend computes.
+        tokio::time::sleep(reuse + Duration::from_millis(100)).await;
+        let refreshed = audit_latest(&app).await?;
+        ensure!(
+            refreshed["computed_at"] != first["computed_at"],
+            "{refreshed}"
+        );
+        ensure!(
+            refreshed["accepted_share_count"].as_i64() == Some(raw.0 + 1)
+                && refreshed["distinct_miner_count"].as_i64() == Some(raw.1 + 1),
+            "{refreshed}"
+        );
+        ensure!(undated(refreshed) == fresh().await?);
+
+        // New evidence: the next run decodes the newest bundle.
+        let (second_block, _) = land_block(&db.ledger, "bob", 403, 40).await?;
+        tokio::time::sleep(reuse + Duration::from_millis(100)).await;
+        let renewed = audit_latest(&app).await?;
+        ensure!(
+            renewed["block_hash"] == second_block.as_str()
+                && renewed["block_hash"] != first_block.as_str(),
+            "{renewed}"
+        );
+        ensure!(undated(renewed.clone()) == fresh().await?);
+
+        // A run decodes a bundle only for evidence it has not decoded: with
+        // the newest block, its digest and its manifest unchanged, it serves
+        // the share count it decoded before, though the stored body now has
+        // none (its share snapshot detached and its inline shares emptied,
+        // as a fresh frontend's decode shows) ...
+        let every = router(state().with_latest_evidence_reuse(Duration::ZERO));
+        let decoded = audit_latest(&every).await?;
+        ensure!(decoded["job_share_count"].as_u64() > Some(0), "{decoded}");
+        let (snapshot, body): (Option<String>, Option<Value>) = sqlx::query_as("SELECT share_snapshot_sha256,audit_bundle::json FROM qbit_pool_audit_bundles WHERE block_hash=$1")
+            .bind(&second_block)
+            .fetch_one(db.pool())
+            .await?;
+        ensure!(snapshot.is_some() && body.is_some(), "the fixture's bundle is not a native row with an inline body");
+        sqlx::query("UPDATE qbit_pool_audit_bundles SET share_snapshot_sha256=NULL,audit_bundle=jsonb_set(audit_bundle,'{shares}','[]') WHERE block_hash=$1")
+            .bind(&second_block)
+            .execute(db.pool())
+            .await?;
+        let kept = audit_latest(&every).await?;
+        ensure!(kept["computed_at"] != decoded["computed_at"], "{kept}");
+        ensure!(undated(kept.clone()) == undated(decoded.clone()), "{kept}");
+        ensure!(fresh().await?["job_share_count"] == 0);
+        // ... and decodes it again once the evidence changes, here its
+        // payout manifest.
+        sqlx::query("UPDATE qbit_pool_blocks SET payout_manifest_sha256=repeat('e',64) WHERE block_hash=$1")
+            .bind(&second_block)
+            .execute(db.pool())
+            .await?;
+        let redecoded = audit_latest(&every).await?;
+        ensure!(
+            redecoded["job_share_count"] == 0
+                && redecoded["audit_report"]["payout_manifest_sha256"] == "e".repeat(64),
+            "{redecoded}"
+        );
+        ensure!(undated(redecoded) == fresh().await?);
         Ok::<_, anyhow::Error>(())
     }
     .await;
