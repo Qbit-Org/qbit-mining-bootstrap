@@ -616,7 +616,16 @@ jobs:
     services:
       postgres:
         # An empty image starts no service: none under a marker skip.
-        image: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') && 'postgres:16' || '' }}
+        #
+        # The minor version is pinned, and must not be newer than the
+        # postgresql-16 the runner installs below: the cutover rehearsal dumps
+        # this server with the runner's pg_dump and restores the dump into a
+        # disposable cluster started from PRISM_TEST_PG_BIN_DIR. When the
+        # floating postgres:16 tag moved to 16.16 while the runner's tools
+        # were 16.15, that restore failed on a column option the older server
+        # doesn't know (`unrecognized parameter "pg_attver"`). Raise this pin
+        # only once the "Install tools" step's log shows that minor or newer.
+        image: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') && 'postgres:16.15' || '' }}
         env:
           POSTGRES_DB: prism_test
           POSTGRES_USER: prism_test
