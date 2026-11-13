@@ -18,7 +18,8 @@ from jinja2.meta import find_undeclared_variables
 import yaml
 
 from check_prism_alert_uids import GRAFANA_UID
-from generate_prism_alerts import ROOT, deployment_template, load, miners_now, miners_recently
+from generate_prism_alerts import (ROOT, LISTENER_DOWN_MINUTES, deployment_template, listener_down, load,
+                                   miners_now, miners_recently)
 
 
 def main():
@@ -101,7 +102,7 @@ def main():
         assert set(deletions) == (all_old - all_new) | (native_uids - after.keys()), overrides
         assert not after.keys() & set(deletions)
         if index == 0:
-            assert len(before) == 78 and len(after) == 80
+            assert len(before) == 78 and len(after) == 81
             assert len(deletions) == 26
             assert after["qbit-prism-candidate-oldest-critical"]["labels"]["severity"] == "critical"
             assert after["qbit-prism-candidate-oldest-critical"]["labels"].get("page") == "true"
@@ -165,6 +166,14 @@ def main():
             for uid in ["qbit-prism-revision-work-pending", "qbit-prism-revision-work-unknown"]:
                 warning = json.dumps(after[uid])
                 assert rendered(miners_recently()) in warning and rendered(miners_now()) not in warning, uid
+            # #843: a listener that stays down warns after its dwell, on the
+            # revision-work warnings' recent-miner gate, and never pages.
+            listener = after["qbit-prism-revision-listener-down"]
+            assert "qbit-prism-revision-listener-down" not in paging and listener["labels"].get("page") is None
+            assert listener["labels"]["severity"] == "warning" and listener["for"] == f"{LISTENER_DOWN_MINUTES}m"
+            assert listener["noDataState"] == listener["execErrState"] == "OK"
+            assert json.dumps(listener_down().replace("__NETWORK__", "mainnet"))[1:-1] in json.dumps(listener)
+            assert rendered(miners_recently()) in json.dumps(listener)
             # #529: a found block offered without a confirmed standby copy
             # warns at once, never pages, and is quiet on no data.
             standby = after["qbit-prism-offer-standby-unconfirmed"]
@@ -209,7 +218,7 @@ def main():
     assert tuned_rules["qbit-prism-semantic-work-coverage"]["for"] == "11m"
     assert (args.snapshot / relative.name).read_bytes() == original
     print(f"Patch applies cleanly; {len(combinations)} Jinja gate combinations passed; "
-          "78 original / 80 proposed rules; 34 external definitions preserved; "
+          "78 original / 81 proposed rules; 34 external definitions preserved; "
           "26 baseline deletions plus every native UID disabled by its gate")
 
 
