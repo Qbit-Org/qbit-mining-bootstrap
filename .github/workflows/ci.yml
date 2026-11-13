@@ -193,8 +193,15 @@ jobs:
       - name: Check that the Rust toolchain pin is held in one version
         run: python3 scripts/check_toolchain_pin.py
 
-      - name: Check that both lock files build the vendored sqlx-core
-        run: python3 scripts/check_vendored_sqlx_core.py
+      # The script refuses the .crate unless its SHA-256 is the one
+      # vendor/sqlx-core/README.md records.
+      - name: Check that both lock files build the vendored sqlx-core, and that it is upstream's plus the recorded patches
+        run: |
+          set -euo pipefail
+          crate="${RUNNER_TEMP}/sqlx-core-0.8.6.crate"
+          curl --fail --location --retry 3 --output "${crate}" \
+            https://static.crates.io/crates/sqlx-core/sqlx-core-0.8.6.crate
+          python3 scripts/check_vendored_sqlx_core.py --upstream-crate "${crate}"
 
       - name: Check PRISM setting inventories and retired-setting guidance
         run: python3 scripts/check_prism_settings.py
@@ -278,11 +285,21 @@ jobs:
         if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         uses: ./.github/actions/rust-toolchain
 
+      # tests/test_check_vendored_sqlx_core.py checks the vendored tree
+      # against it, and refuses it unless its SHA-256 is the one
+      # vendor/sqlx-core/README.md records.
+      - name: Download upstream sqlx-core 0.8.6
+        if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
+        run: |
+          curl --fail --location --retry 3 --output "${RUNNER_TEMP}/sqlx-core-0.8.6.crate" \
+            https://static.crates.io/crates/sqlx-core/sqlx-core-0.8.6.crate
+
       - name: Run Python unit test shard
         if: ${{ !(needs.tree-marker.result == 'success' && needs.tree-marker.outputs.skip == 'true') }}
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_COUNT: ${{ strategy.job-total }}
+          SQLX_CORE_UPSTREAM_CRATE: ${{ runner.temp }}/sqlx-core-0.8.6.crate
         run: GIT_CONFIG_GLOBAL=/dev/null python scripts/run_python_test_shard.py --shard-index "$SHARD_INDEX" --shard-count "$SHARD_COUNT"
 
   rust-tests:

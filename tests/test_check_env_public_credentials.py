@@ -100,6 +100,15 @@ class CheckEnvPublicCredentialLauncherTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("public reader: invalid public PRISM_DATABASE_URL connection options", result.stderr)
 
+    def test_verify_ca_without_a_root_certificate_keeps_its_diagnostic(self):
+        result = self.run_preflight(
+            'print("Error: public PRISM_DATABASE_URL: sslmode=verify-ca requires sslrootcert: verify-ca does '
+            'not check the server\'s host name", file=sys.stderr)\nsys.exit(1)')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "public reader: public PRISM_DATABASE_URL: sslmode=verify-ca requires sslrootcert", result.stderr)
+        self.assertNotIn("prepare the selected PRISM image", result.stderr)
+
     def test_make_lab_prepares_image_before_mandatory_validation(self):
         result = self.run_preflight(
             'from pathlib import Path\n'
