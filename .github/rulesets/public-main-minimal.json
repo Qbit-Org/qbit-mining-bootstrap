@@ -6,7 +6,7 @@
     {
       "actor_type": "OrganizationAdmin",
       "actor_id": null,
-      "bypass_mode": "always"
+      "bypass_mode": "pull_request"
     }
   ],
   "conditions": {
