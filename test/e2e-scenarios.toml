@@ -955,6 +955,15 @@ runs = true
 tests = ["qbit-prism-dual-sim::scenarios::s10_single_writer_pair_keeps_every_share_and_pays_exactly_through_a_frontend_kill"]
 
 [[scenario]]
+id = "dual-writer-s10-single-writer-claim-at-kill"
+title = "S10, the kill mid-offer: the frontend holding a block's claim dies; its peer takes the claim over after the lease and lands the block once"
+owner = "#841"
+lanes = ["nightly"]
+criteria = "On the 3.0 pair (both frontends claiming from A's one outbox), under load: a block found on A's work is offered by whichever frontend claims its candidate, with the submitblock answer withheld at that frontend's gate (its submit timeout raised to 60 s so it is still in the call); once its node holds the block on its active chain the holder is killed with SIGKILL, its claim left in the table with the row offer_reserved. The survivor's next find waits until no candidate is unfinished, which needs the claim's whole 120 s lease (the survivor takes a claim over only once it has watched it unrenewed that long), so the wait allows that lease plus its 60 s bound for live work; no read shows the claim gone earlier than one lease after the block's share was sent. The survivor recovers the reservation, the block lands and confirms once (one pool block row, the candidate submitted with an unknown offer outcome), and it is offered exactly once: one submitblock through the dead holder's gate, none through the survivor's. The holder returns and finds a block, the checker's invariants hold, the standby holds every landing, and no node reports a dual-writer mode."
+runs = true
+tests = ["qbit-prism-dual-sim::scenarios::s10_single_writer_peer_takes_over_a_killed_frontends_claim_after_its_lease_and_lands_its_block_once"]
+
+[[scenario]]
 id = "dual-writer-r01-rc6-premigrate"
 title = "R1: the 3.0 pair keeps serving on 3.0.0-rc.6 while 3.1's migrate takes its database to 27, 28 and 31"
 owner = "#761"
