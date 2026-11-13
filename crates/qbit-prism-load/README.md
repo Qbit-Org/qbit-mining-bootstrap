@@ -899,8 +899,10 @@ the command line, where clap refuses any of them given again, and the side
 report's `preset` block records its name, path, SHA-256 and gates.
 
 A preset also names the runner it needs, its timeout, when it runs, and its
-`gates`, every key stated (`null` where it does not gate) except the optional
-`tip_last_notify_median_budget_ms`, which is absent where it does not gate:
+`gates`, every key stated (`null` where it does not gate) except the two
+optional median keys, `tip_last_notify_median_budget_ms` and
+`churn_tip_last_notify_median_budget_ms`, which are absent where they do not
+gate:
 
 | Gate | Meaning |
 |---|---|
@@ -909,9 +911,10 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `max_shortfall` | offers no session could take, per gated phase |
 | `max_rejected_valid_shares`, `max_unanswered_submits` | #473's D1 rule, per gated phase |
 | `tip_last_notify_p99_budget_ms` | per external tip, the slowest session's time to usable work (`time_to_usable_work.tips[].all_sessions_milliseconds`); the p99 over the tips, nearest rank. A tip some session never got work on fails |
-| `tip_last_notify_median_budget_ms` | optional (#790): the same per-tip figure, its median over the tips, nearest rank. The p99 of a few tips is their slowest, so one slow tip on a busy runner fails it; the median holds most tips to the budget while the p99 key, given headroom, still fails a stalled tip. Only `real-node-smoke` sets it: median <= 5000 ms, p99 <= 10000 ms over its 3 tips |
+| `tip_last_notify_median_budget_ms` | optional (#790): the same per-tip figure, its median over the tips, nearest rank. The p99 of a few tips is their slowest, so one slow tip on a busy runner fails it; the median holds most tips to the budget while the p99 key, given headroom, still fails a stalled tip. A regression confined to one tip that lands between the median budget and the p99 budget passes; one that slows more than half the tips fails the median. The median is measured only over every tip the run planned (#854): when fewer tips are in the report than its phases' `external_tips_planned` (one held unminted behind a landing, counted in `external_tips_unminted`, or a real node's mint that failed or never reached the watcher), or the report does not record the plan, the row is unmeasured and fails, since 2 tips of 8 have the faster as their median. `real-node-smoke` gates median <= 5000 ms and p99 <= 10000 ms over its 3 tips. A nearest-rank median of n tips is the ceil(n/2)-th fastest, so up to half the tips (the slower of 2, 3 of 6, 4 of 8) can sit between the two budgets and pass. After three single-tip stalls on contended runners failed PR runs (#842), the tip-delivery and mainnet-shape presets keep their old budget as the median and give the slowest tip twice it: `tip-delivery-2000-miners-400k-2fe-retarget` (nightly) and its manual 500-address variant 2500 / 5000 ms over 8 tips, `mainnet-shape-130-addresses` and `mainnet-shape-650-addresses` 3000 / 6000 ms over 6 |
 | `d1_verdict_table` | print #473's D1 verdict table, in its columns, for `steady_state` and `burst` |
 | `churn_tip_last_notify_p99_budget_ms` | per churn tip, the slowest served session of those connected at the tip; the p99 over the tips. A tip with a connected session never served fails |
+| `churn_tip_last_notify_median_budget_ms` | optional (#842): the same churn figure, its median over the churn tips, nearest rank, with the same trade-off as `tip_last_notify_median_budget_ms`, and the same premise over the churn section's planned tips (`plan.tips_at_seconds`). `rental-churn-bursts-and-storms` gates median <= 3000 ms and p99 <= 6000 ms over its 8 churn tips; its 2 warm-up tips keep `tip_last_notify_p99_budget_ms` 3000 ms and no median, since the median of 2 is the faster |
 | `new_session_first_job_p99_budget_ms` | the churn phase's new connections' time to first job, p99 |
 
 | Preset | Runs | Runner | What it is |
@@ -926,7 +929,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `mainnet-shape-130-addresses` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
 | `mainnet-shape-650-addresses` | nightly | 8 vCPU | mainnet-shape-130-addresses with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
 | `mainnet-shape-2600-addresses` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
-| `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
+| `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, warm-up tip delivery p99 3 s, connected-at-tip churn delivery (median 3 s, slowest tip 6 s) and new-session first-job p99 10 s |
 | `short-plan-20k-window-1fe` | manual | 8 vCPU | the short plan over `throughput-20k-window-1fe`'s fixture (2,000 sessions, one frontend, async standby, 20k window) at 50 shares/s with no burst; with `throughput-20k-window-1fe`, what the runner probe below runs on each class |
 | `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 | `real-node-smoke` | every PR | 2 vCPU | the per-PR real-node smoke run: [Real-node mode](#real-node-mode-547) |
@@ -1457,6 +1460,48 @@ sync time and mean, full-page images, bytes) and its checkpoint counters.
   restartpoint lines, with their own timestamps, to place a stall against them.
 - A gated phase that fails gets one informational gate row built from both
   blocks.
+
+`host_contention` (#842) says what the machine was doing, so a slow tip can be
+told from a contended host. The harness reads `/proc/stat` and
+`/proc/pressure/{cpu,io,memory}` every `--process-sample-interval-ms`.
+- **The run-level block** names its sources as the first read found them,
+  the interval, and the steal counter at start. A counter still at 0 since boot cannot tell a host the
+  hypervisor never took CPU from one whose hypervisor does not report steal.
+- **Each phase's and each tip's block:**
+  - `steal` and `iowait` are shares of the CPU time the kernel accounted over
+    every CPU.
+  - `cpu_some`, `io_some`, `io_full`, `memory_some` and `memory_full` are PSI
+    stall time as a share of the harness's monotonic time from before one read
+    of the file to after the next. That is the most the two totals can cover,
+    so time the sampler lost around a read lowers a share and never raises it.
+  - Each figure gives its share over the window and its largest single
+    interval.
+  - Reads that overlap the window count, and `covered_from_milliseconds` and
+    `covered_to_milliseconds` say how far they reach past it. Each figure
+    places its intervals by its own source's reads, so a pressure file read
+    late after a preempted `/proc/stat` read keeps its own interval.
+  - A tip's window runs from the node's tip stamp to its slowest session's
+    first usable job. When some session never got the tip, it runs to the
+    tip's replacement instead (a churn tip's phase end when no tip came), so
+    the window covers the time those sessions were starved. A tip never
+    replaced runs to its slowest served session, and one with no figure at
+    all gets the interval holding its stamp. Each block's `window` says
+    which. It is set in `time_to_usable_work.tips[]` and in each churn
+    section's `tip_delivery.tips[]`, beside the name of the phase it fell
+    in.
+- **Unknown, never 0:** a host without PSI, or a kernel whose `/proc/stat` has
+  no steal field, leaves that figure null with `unavailable_reason`. CPU
+  `full` is not read, because the kernel reports it as zero at the system
+  level.
+- **The lock sampler** adds `longest_sample_gap_milliseconds` to each phase's
+  lock blocks. It is the harness's time between two consecutive polls whose
+  interval overlaps the phase, with the server's `clock_timestamp()` of the
+  poll that ended it. A stall that began before the phase counts; a poll
+  still blocked when the phase is summarised does not.
+- **The gate:** a failed tip row gets one informational row with the host
+  over the slowest tip's delivery, over its phase, and that phase's longest
+  sampler gap. `gate::tip_timeline` prints each tip's line. Both add a
+  caveat when the steal counter was 0 since boot.
 
 The frontend environment is printed redacted, here and in
 `database-profile.json`: the RPC password and the signing seeds are replaced

@@ -418,7 +418,7 @@ id = "load-tip-delivery-275"
 title = "#275's tip-delivery benchmark: 2,000 miners, 400k window, two frontends, retargeting tips"
 owner = "#521"
 lanes = ["nightly"]
-criteria = "The preset's gates, with the tip-to-last-notify p99 within 2,500 ms."
+criteria = "The preset's gates, with the median tip-to-last-notify within 2,500 ms and the slowest tip within 5,000 ms (#842)."
 runs = true
 presets = ["tip-delivery-2000-miners-400k-2fe-retarget"]
 
@@ -427,7 +427,7 @@ id = "load-tip-delivery-275-500-addresses"
 title = "#275's tip-delivery benchmark with 500 Zipf(1.1) payout addresses"
 owner = "#521"
 lanes = ["dispatch"]
-criteria = "The preset's gates, with the tip-to-last-notify p99 within 2,500 ms."
+criteria = "The preset's gates, with the median tip-to-last-notify within 2,500 ms and the slowest tip within 5,000 ms (#842)."
 runs = true
 presets = ["tip-delivery-2000-miners-400k-2fe-retarget-500-addresses"]
 
@@ -445,7 +445,7 @@ id = "load-mainnet-floor"
 title = "Mainnet-shaped floor: 130 recipients, one whale, bursty arrivals"
 owner = "#521"
 lanes = ["nightly"]
-criteria = "The preset's gates, with the tip-to-last-notify p99 within 3,000 ms."
+criteria = "The preset's gates, with the median tip-to-last-notify within 3,000 ms and the slowest tip within 6,000 ms (#842)."
 runs = true
 presets = ["mainnet-shape-130-addresses"]
 
@@ -454,7 +454,7 @@ id = "load-growth-5x"
 title = "Mainnet floor scaled five times: 650 recipients, 2,000 sessions"
 owner = "#521"
 lanes = ["nightly"]
-criteria = "The preset's gates, with the tip-to-last-notify p99 within 3,000 ms."
+criteria = "The preset's gates, with the median tip-to-last-notify within 3,000 ms and the slowest tip within 6,000 ms (#842)."
 runs = true
 presets = ["mainnet-shape-650-addresses"]
 

@@ -4,7 +4,8 @@
   "description": "tip-delivery-2000-miners-400k-2fe-retarget with 500 payout addresses whose sessions and window shares follow Zipf(1.1) (#275).",
   "issues": [
     "#275",
-    "#521"
+    "#521",
+    "#842"
   ],
   "schedule": "manual",
   "runner": "blacksmith-8vcpu-ubuntu-2404",
@@ -18,7 +19,8 @@
     "max_shortfall": 0,
     "max_rejected_valid_shares": null,
     "max_unanswered_submits": null,
-    "tip_last_notify_p99_budget_ms": 2500,
+    "tip_last_notify_p99_budget_ms": 5000,
+    "tip_last_notify_median_budget_ms": 2500,
     "d1_verdict_table": false,
     "churn_tip_last_notify_p99_budget_ms": null,
     "new_session_first_job_p99_budget_ms": null

@@ -37,6 +37,9 @@ pub struct Budgets {
     /// The churn phase's tip delivery, over the sessions connected at each
     /// tip; `None` does not gate on it.
     pub churn_tip_last_notify_p99_ms: Option<f64>,
+    /// The same churn figure's median over the churn tips (#842); `None`
+    /// does not gate on it.
+    pub churn_tip_last_notify_median_ms: Option<f64>,
     /// The churn phase's new sessions' time to first job; `None` does not
     /// gate on it.
     pub new_session_first_job_p99_ms: Option<f64>,
@@ -53,6 +56,7 @@ impl From<&crate::preset::Gates> for Budgets {
             tip_last_notify_median_ms: gates.tip_last_notify_median_budget_ms,
             d1_verdict_table: gates.d1_verdict_table,
             churn_tip_last_notify_p99_ms: gates.churn_tip_last_notify_p99_budget_ms,
+            churn_tip_last_notify_median_ms: gates.churn_tip_last_notify_median_budget_ms,
             new_session_first_job_p99_ms: gates.new_session_first_job_p99_budget_ms,
         }
     }
@@ -211,6 +215,12 @@ pub fn tip_timeline(report: &Value) -> String {
                 None => "never".into(),
             }
         ));
+        if let Some(line) = host_contention_line(&tip["host_contention"]) {
+            out.push_str(&format!("  host over its delivery: {line}\n"));
+        }
+    }
+    if let Some(note) = steal_caveat(report) {
+        out.push_str(&format!("{note}\n"));
     }
     if let Some(rpc) = report["node"]["relay"]["rpc_latency_milliseconds"].as_object() {
         out.push_str("node RPC latency over the run (count, p50 / p99 / max ms):\n");
@@ -486,6 +496,7 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
         ));
     }
     let tips = tip_last_notify(report);
+    let before_tips = checks.len();
     tip_last_notify_check(
         &mut checks,
         "tip to last session's notify, p99 over tips",
@@ -495,15 +506,38 @@ pub fn evaluate(report: &Value, exit_code: Option<i32>, budgets: &Budgets) -> Ve
     );
     // The p99 of a few tips is their slowest (#790). A preset with few tips
     // can also hold their median to a budget, which one slow tip cannot fail
-    // and a frontend slow on most tips does. Reported only where gated.
+    // and a frontend slow on more than half the tips does. Reported only
+    // where gated, and only over every tip the run planned (#854).
     if budgets.tip_last_notify_median_ms.is_some() {
         tip_last_notify_check(
             &mut checks,
             "tip to last session's notify, median over tips",
             0.5,
-            &tips,
+            &every_planned_tip(
+                &tips,
+                delivered(&report["time_to_usable_work"]["tips"]),
+                planned_tips(report),
+            ),
             budgets.tip_last_notify_median_ms,
         );
+    }
+    // A failed tip row says what the host was doing while its slowest tip
+    // was delivered (#842), as a failed phase says where its acknowledgements'
+    // time went (#829). Informational only.
+    if checks[before_tips..]
+        .iter()
+        .any(|check| check.pass == Some(false))
+    {
+        if let Some(observed) = slowest_tip_contention(
+            report,
+            report["time_to_usable_work"]["tips"].as_array(),
+            "all_sessions_milliseconds",
+        ) {
+            checks.push(Check::info(
+                "slowest tip: the host over its delivery, and over its phase",
+                observed,
+            ));
+        }
     }
     churn_checks(report, budgets, &mut checks);
     let population = &report["population"];
@@ -578,6 +612,79 @@ fn tip_last_notify_check(
     });
 }
 
+/// A median's premise (#854): the tips it is over are every tip the run
+/// planned. One that was never minted (held behind a landing that never
+/// settled), or a real node's mint that failed or never reached the
+/// watcher, is an unmeasured tip, not a fast one, and the median of the
+/// rest is not the run's: 2 tips of 8 have the faster as their median, so
+/// one at twice the budget would pass. The p99 rows are unchanged; their
+/// figure is the slowest tip that came.
+///
+/// `delivered` counts every tip the report holds, served or not: an unserved
+/// one already leaves `tips` unmeasured, with its own reason.
+fn every_planned_tip(
+    tips: &Result<Vec<f64>, String>,
+    delivered: usize,
+    planned: Result<(usize, String), String>,
+) -> Result<Vec<f64>, String> {
+    let shortfall = match planned {
+        Err(reason) => Some(reason),
+        Ok((planned, _)) if delivered >= planned => None,
+        Ok((planned, why)) => Some(format!(
+            "{delivered} of {planned} planned tips delivered{why}"
+        )),
+    };
+    match (shortfall, tips) {
+        (None, tips) => tips.clone(),
+        (Some(reason), Ok(_)) => Err(reason),
+        (Some(reason), Err(also)) => Err(format!("{reason}; {also}")),
+    }
+}
+
+/// The external tips the run's phases planned, with why some are missing
+/// where the report says: the ones its ordered landings held unminted.
+fn planned_tips(report: &Value) -> Result<(usize, String), String> {
+    let phases: &[Value] = report["phases"].as_array().map_or(&[], Vec::as_slice);
+    let mut planned = 0;
+    let mut unminted = 0;
+    for phase in phases {
+        let Some(count) = phase[crate::run::EXTERNAL_TIPS_PLANNED].as_u64() else {
+            return Err(format!(
+                "phase {} does not record its planned tips ({})",
+                phase["name"].as_str().unwrap_or("?"),
+                crate::run::EXTERNAL_TIPS_PLANNED
+            ));
+        };
+        planned += count as usize;
+        unminted += phase["external_tips_unminted"].as_u64().unwrap_or(0);
+    }
+    if phases.is_empty() {
+        return Err("the report has no phases to plan tips".into());
+    }
+    let why = if unminted > 0 {
+        format!(", {unminted} held unminted behind a landing")
+    } else {
+        String::new()
+    };
+    Ok((planned, why))
+}
+
+fn delivered(tips: &Value) -> usize {
+    tips.as_array().map_or(0, Vec::len)
+}
+
+/// The tips one churn section planned (`plan.tips_at_seconds`). A section
+/// that did not run planned none, and its tips say why it has no figure.
+fn planned_churn_tips(churn: &Value) -> Result<(usize, String), String> {
+    if churn["ran"] != true {
+        return Ok((0, String::new()));
+    }
+    churn["plan"]["tips_at_seconds"]
+        .as_array()
+        .map(|tips| (tips.len(), String::new()))
+        .ok_or_else(|| "the churn section does not record its planned tips".into())
+}
+
 /// Every churn tip's slowest served session among those connected at the
 /// tip, or why a tip has none.
 pub fn churn_tip_last_notify(report: &Value) -> Result<Vec<f64>, String> {
@@ -617,7 +724,7 @@ fn churn_section_tip_last_notify(churn: &Value) -> Result<Vec<f64>, String> {
 }
 
 fn churn_checks(report: &Value, budgets: &Budgets, checks: &mut Vec<Check>) {
-    churn_section_checks(&report["churn"], "churn", budgets, checks);
+    churn_section_checks(report, &report["churn"], "churn", budgets, checks);
     // A soak drives a churn phase every cycle (#575); the section above is
     // the first, and each of them is held to the same budgets.
     for phase in report["soak"]["churn_phases"]
@@ -626,42 +733,67 @@ fn churn_checks(report: &Value, budgets: &Budgets, checks: &mut Vec<Check>) {
         .flatten()
     {
         let label = format!("{}: churn", phase["phase"].as_str().unwrap_or("?"));
-        churn_section_checks(&phase["report"], &label, budgets, checks);
+        churn_section_checks(report, &phase["report"], &label, budgets, checks);
     }
 }
 
-fn churn_section_checks(churn: &Value, label: &str, budgets: &Budgets, checks: &mut Vec<Check>) {
+fn churn_section_checks(
+    report: &Value,
+    churn: &Value,
+    label: &str,
+    budgets: &Budgets,
+    checks: &mut Vec<Check>,
+) {
     if churn["ran"] != true
         && budgets.churn_tip_last_notify_p99_ms.is_none()
+        && budgets.churn_tip_last_notify_median_ms.is_none()
         && budgets.new_session_first_job_p99_ms.is_none()
     {
         return;
     }
-    let name = format!("{label}: tip to last notify, sessions connected at the tip, p99 over tips");
-    let budget = budgets
-        .churn_tip_last_notify_p99_ms
-        .map_or("not gated".into(), |ms| format!("<= {ms} ms"));
-    let (observed, pass) = match churn_section_tip_last_notify(churn) {
-        Ok(times) => {
-            let p99 = nearest_rank(&times, 0.99);
-            (
-                p99.map_or("no tips".into(), |p| {
-                    format!(
-                        "{p:.0} ms over {} tips (max {:.0} ms)",
-                        times.len(),
-                        max(&times)
-                    )
-                }),
-                p99.zip(budgets.churn_tip_last_notify_p99_ms)
-                    .is_some_and(|(p, limit)| p <= limit),
-            )
+    // The churn tips are held as the run's own are: the p99 of a few tips is
+    // their slowest, and the optional median (#842) is what one stalled tip
+    // cannot fail and a slowdown on more than half the tips does, over every
+    // churn tip the phase planned (#854).
+    let tips = churn_section_tip_last_notify(churn);
+    let before_tips = checks.len();
+    tip_last_notify_check(
+        checks,
+        &format!("{label}: tip to last notify, sessions connected at the tip, p99 over tips"),
+        0.99,
+        &tips,
+        budgets.churn_tip_last_notify_p99_ms,
+    );
+    if budgets.churn_tip_last_notify_median_ms.is_some() {
+        tip_last_notify_check(
+            checks,
+            &format!(
+                "{label}: tip to last notify, sessions connected at the tip, median over tips"
+            ),
+            0.5,
+            &every_planned_tip(
+                &tips,
+                delivered(&churn["tip_delivery"]["tips"]),
+                planned_churn_tips(churn),
+            ),
+            budgets.churn_tip_last_notify_median_ms,
+        );
+    }
+    if checks[before_tips..]
+        .iter()
+        .any(|check| check.pass == Some(false))
+    {
+        if let Some(observed) = slowest_tip_contention(
+            report,
+            churn["tip_delivery"]["tips"].as_array(),
+            "last_served_milliseconds",
+        ) {
+            checks.push(Check::info(
+                format!("{label}: slowest tip: the host over its delivery, and over its phase"),
+                observed,
+            ));
         }
-        Err(reason) => (format!("unmeasured: {reason}"), false),
-    };
-    checks.push(match budgets.churn_tip_last_notify_p99_ms {
-        Some(_) => Check::gate(name, observed, budget, pass),
-        None => Check::info(name, observed),
-    });
+    }
     let first = &churn["time_to_first_job"]["new_sessions"];
     let p99 = first["p99"].as_f64();
     let observed = match p99 {
@@ -702,6 +834,110 @@ fn churn_section_checks(churn: &Value, label: &str, budgets: &Budgets, checks: &
             ),
         ));
     }
+}
+
+/// One `host_contention` block (#842) as a line: each figure's share over
+/// the window and its largest interval's, "unknown" where the host did not
+/// expose it, then the intervals the reads span relative to the window's
+/// start. `None` for a report written before the block existed.
+pub fn host_contention_line(block: &Value) -> Option<String> {
+    if !block.is_object() {
+        return None;
+    }
+    let intervals = block["intervals"].as_u64().unwrap_or(0);
+    let figure = |key: &str| {
+        let share = &block[key];
+        match (
+            share["percent"].as_f64(),
+            share["max_interval_percent"].as_f64(),
+        ) {
+            (Some(percent), Some(max)) => {
+                let measured = share["measured_intervals"].as_u64().unwrap_or(0);
+                let own = share["intervals"].as_u64().unwrap_or(intervals);
+                let partial = if measured < own {
+                    format!(" over {measured} of {own} intervals")
+                } else {
+                    String::new()
+                };
+                format!("{percent:.1}% (max {max:.1}%){partial}")
+            }
+            _ => "unknown".into(),
+        }
+    };
+    let covered = match (
+        block["covered_from_milliseconds"].as_f64(),
+        block["covered_to_milliseconds"].as_f64(),
+    ) {
+        (Some(from), Some(to)) => format!(", reads from {from:+.0} to {to:+.0} ms"),
+        _ => String::new(),
+    };
+    Some(format!(
+        "steal {}, iowait {}; PSI cpu some {}, io some {}, io full {}, memory some {}, memory \
+         full {}; {intervals} intervals{covered}",
+        figure("steal"),
+        figure("iowait"),
+        figure("cpu_some"),
+        figure("io_some"),
+        figure("io_full"),
+        figure("memory_some"),
+        figure("memory_full"),
+    ))
+}
+
+/// For a failed tip row: the host over the slowest tip's delivery (an
+/// unserved tip's, when one has no figure), then over the phase it fell in,
+/// and the lock sampler's longest gap in that phase. `None` when the report
+/// predates the blocks.
+fn slowest_tip_contention(report: &Value, tips: Option<&Vec<Value>>, key: &str) -> Option<String> {
+    let tips = tips?;
+    let tip = tips
+        .iter()
+        .find(|tip| tip[key].as_f64().is_none())
+        .or_else(|| {
+            tips.iter()
+                .filter_map(|tip| tip[key].as_f64().map(|ms| (ms, tip)))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, tip)| tip)
+        })?;
+    let block = &tip["host_contention"];
+    let line = host_contention_line(block)?;
+    let figure = tip[key]
+        .as_f64()
+        .map_or("unserved".into(), |ms| format!("{ms:.0} ms"));
+    let mut out = format!("tip at height {} ({figure}): {line}", tip["height"]);
+    let phase = block["phase"].as_str().and_then(|name| {
+        report["phases"]
+            .as_array()?
+            .iter()
+            .find(|phase| phase["name"] == name)
+    });
+    if let Some(phase) = phase {
+        let name = phase["name"].as_str().unwrap_or("?");
+        if let Some(line) = host_contention_line(&phase["host_contention"]) {
+            out.push_str(&format!(". Phase {name}: {line}"));
+        }
+        let lock = &phase["order_lock"];
+        if let Some(gap) = lock["longest_sample_gap_milliseconds"].as_f64() {
+            out.push_str(&format!(
+                ". Lock sampler's longest gap in {name}: {gap:.0} ms, ended {}",
+                lock["longest_sample_gap_ended_at"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    if let Some(note) = steal_caveat(report) {
+        out.push_str(&format!(". {note}"));
+    }
+    Some(out)
+}
+
+/// A steal counter still at 0 since boot cannot tell a hypervisor that took
+/// no CPU from one that does not report steal, so a printed 0% steal carries
+/// that caveat rather than reading as an uncontended host.
+fn steal_caveat(report: &Value) -> Option<&'static str> {
+    (report["host_contention"]["steal_counter_at_start_ticks"].as_u64() == Some(0)).then_some(
+        "The steal counter was 0 since boot, so this host may not report steal: 0% steal is \
+         not evidence of an uncontended host",
+    )
 }
 
 /// One line from a phase's `share_ack_accounting` and `database_counters`

@@ -11,6 +11,7 @@ use crate::{
         SessionHandle, SessionShared, SubmitRecord, TipSighting,
     },
     cluster::{self, ManagedPostgres, ObservedReplication, Replication},
+    contention::{self, HostSampler},
     digest,
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
     kill::KillDriver,
@@ -600,6 +601,10 @@ struct PhaseRun {
     shortfall: u64,
     locks: measure::PhaseLocks,
     processes: Vec<measure::ProcessSummary>,
+    /// The host's steal, iowait and pressure stall over the phase (#842),
+    /// set once the run has stopped reading the host: summarised at the
+    /// phase's own end, its last interval would have had no read after it.
+    host_contention: Option<contention::HostContention>,
     ack_deltas: Vec<measure::ServerAckDelta>,
     /// Each frontend's [`measure::ACCOUNTED_SERIES`] deltas, in frontend
     /// order, for the share-ack accounting (#829).
@@ -629,6 +634,8 @@ struct PhaseRun {
     /// [`PhaseOutcome::tips_unminted`].
     ordered_landings: Vec<OrderedLanding>,
     tips_unminted: usize,
+    /// See [`PhaseOutcome::tips_planned`].
+    tips_planned: usize,
     frontend_restarts: usize,
     /// Every drained restart this phase completed, with its timings and the
     /// scrapes bracketing the counter reset.
@@ -1513,6 +1520,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             )
         })
         .collect();
+    // #842: the host's steal, iowait and pressure stall over the same run, so
+    // a slow tip can be set against what the machine was doing.
+    let host_sampler = HostSampler::start(
+        std::path::PathBuf::from("/proc"),
+        Duration::from_millis(args.process_sample_interval_ms),
+    );
     // ORDER_LOCK is database-wide, so the sampler has to know which backends
     // are this run's. `application_name` only works if the driver carries it,
     // which is checked here rather than assumed.
@@ -1619,6 +1632,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                     )
                 });
             lock_sampler.stop();
+            host_sampler.stop();
             for sampler in &process_samplers {
                 sampler.stop();
             }
@@ -1650,6 +1664,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             let _ = session.control.send(client::Control::Stop);
         }
         lock_sampler.stop();
+        host_sampler.stop();
         for sampler in &process_samplers {
             sampler.stop();
         }
@@ -2034,6 +2049,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             shortfall: outcome.shortfall,
             locks,
             processes,
+            host_contention: None,
             ack_deltas: frontend_segments
                 .iter()
                 .map(|(before, splits, after, restarts)| {
@@ -2068,6 +2084,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             scheduled_blocks: outcome.scheduled_blocks,
             ordered_landings: outcome.ordered_landings,
             tips_unminted: outcome.tips_unminted,
+            tips_planned: outcome.tips_planned,
             frontend_restarts: outcome.frontend_restarts,
             restart_records: outcome.restart_records,
             mid_flight_indeterminate: outcome.indeterminate,
@@ -2129,8 +2146,19 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         let _ = tokio::time::timeout(Duration::from_secs(15), session.task).await;
     }
     lock_sampler.stop();
+    host_sampler.finish();
     for sampler in &process_samplers {
         sampler.stop();
+    }
+    // Every read the run will take is in now, the last taken just above: one
+    // snapshot for every phase, every tip and the run-level block.
+    let host_readings = host_sampler.readings();
+    for phase in &mut runs {
+        phase.host_contention = Some(contention::summarize(
+            &host_readings,
+            phase.started,
+            phase.ended,
+        ));
     }
     drop(shared_session);
     let _ = tokio::time::timeout(Duration::from_secs(10), collector).await;
@@ -2788,14 +2816,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "sha256": preset.sha256,
             "description": preset.description,
             "issues": preset.issues,
-            "gates": {
-                "phases": preset.gates.phases,
-                "max_shortfall": preset.gates.max_shortfall,
-                "max_rejected_valid_shares": preset.gates.max_rejected_valid_shares,
-                "max_unanswered_submits": preset.gates.max_unanswered_submits,
-                "tip_last_notify_p99_budget_ms": preset.gates.tip_last_notify_p99_budget_ms,
-                "d1_verdict_table": preset.gates.d1_verdict_table,
-            },
+            // Every key the run was held to, the optional medians included.
+            "gates": preset.gates,
         })),
         "time_to_usable_work": time_to_usable_work(
             &external_tips, &tip_changes, &collected, args.sessions,
@@ -2936,6 +2958,46 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             side_report["node"]["chain_reconciliation"]["reconciled"].clone();
         side_report["premise"]["node_failure"] = json!(real.failure());
     }
+    // #842: what the host was doing over the run and over each tip's
+    // delivery, so a slow tip can be told from a contended machine.
+    side_report["host_contention"] = contention::run_block(&host_readings, host_sampler.interval());
+    let phase_windows: Vec<(String, Instant, Instant)> = runs
+        .iter()
+        .map(|phase| (phase.plan.name.clone(), phase.started, phase.ended))
+        .collect();
+    // Looked up with pointer_mut, not indexing: indexing a missing key
+    // inserts it, and a report without churn or a soak keeps its shape.
+    annotate_tip_contention(
+        side_report
+            .pointer_mut("/time_to_usable_work/tips")
+            .and_then(Value::as_array_mut),
+        &tip_changes,
+        &host_readings,
+        &phase_windows,
+    );
+    annotate_tip_contention(
+        side_report
+            .pointer_mut("/churn/tip_delivery/tips")
+            .and_then(Value::as_array_mut),
+        &tip_changes,
+        &host_readings,
+        &phase_windows,
+    );
+    if let Some(phases) = side_report
+        .pointer_mut("/soak/churn_phases")
+        .and_then(Value::as_array_mut)
+    {
+        for phase in phases {
+            annotate_tip_contention(
+                phase
+                    .pointer_mut("/report/tip_delivery/tips")
+                    .and_then(Value::as_array_mut),
+                &tip_changes,
+                &host_readings,
+                &phase_windows,
+            );
+        }
+    }
     let report_path = args.out.join("load-harness-report.json");
     report::write_json(&report_path, &side_report)?;
 
@@ -3008,6 +3070,11 @@ pub struct PhaseOutcome {
     /// Warm-up tips the phase ended without minting, because a landing
     /// they were held behind never settled. Zero when every tip went out.
     pub tips_unminted: usize,
+    /// External tips the phase scheduled: the warm-up's share of
+    /// `--external-tips`, zero in every other phase. The gate holds a tip
+    /// median to it (#854): the median of the tips that came is not the
+    /// run's when some never did.
+    pub tips_planned: usize,
     /// When the phase stopped scheduling: its deadline, or the abort. This
     /// is the end of the measured window -- `duration_millis`, the lock and
     /// process windows and the rates' denominator -- and it is stamped
@@ -3336,6 +3403,7 @@ pub async fn drive_phase_with_population(
         slots_over_budget: 0,
         ordered_landings: Vec::new(),
         tips_unminted: 0,
+        tips_planned: 0,
         ended: started,
         ended_wall: chrono::Utc::now(),
         per_second: PerSecond::default(),
@@ -3382,6 +3450,7 @@ pub async fn drive_phase_with_population(
     } else {
         Vec::new()
     };
+    outcome.tips_planned = tip_times.len();
     let mut tip_cursor = 0usize;
     // A phase with both orders its landings against its tips (#638).
     let order_landings = !block_times.is_empty() && !tip_times.is_empty();
@@ -4553,6 +4622,68 @@ pub fn time_to_usable_work(
     })
 }
 
+/// #842: each tip's host contention over its delivery, from the node's tip
+/// stamp to the slowest session's first usable job. When no figure covers
+/// every session (some were never served), to the tip's replacement, which
+/// covers the time they were starved; a churn tip's replacement is its
+/// phase's end when no tip came. To the slowest served session's job only
+/// when nothing replaced it, and the interval holding the stamp when there
+/// is no figure at all. The phase
+/// the stamp fell in is named, so the gate can set the tip against the
+/// phase's own figures. A tip the node did not record keeps no block rather
+/// than one over a guessed window.
+pub fn annotate_tip_contention(
+    tips: Option<&mut Vec<Value>>,
+    changes: &[crate::node::TipChange],
+    readings: &[contention::HostReading],
+    phases: &[(String, Instant, Instant)],
+) {
+    for tip in tips.into_iter().flatten() {
+        let Some(change) = changes
+            .iter()
+            .find(|change| tip["tip"].as_str() == Some(change.hash.as_str()))
+        else {
+            continue;
+        };
+        let finite = |value: &Value| value.as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0);
+        let span = finite(&tip["all_sessions_milliseconds"])
+            .or_else(|| finite(&tip["last_served_milliseconds"]))
+            .map(|ms| (ms, "the slowest session's first usable job"))
+            .or_else(|| {
+                finite(&tip["replaced_after_milliseconds"]).map(|ms| {
+                    (
+                        ms,
+                        "its replacement, or its phase's end when no tip replaced it: no \
+                         figure covers its slowest session",
+                    )
+                })
+            })
+            .or_else(|| {
+                finite(&tip["latency_milliseconds"]["max"]).map(|ms| {
+                    (
+                        ms,
+                        "the slowest served session's first usable job: some sessions were \
+                         never served and no tip replaced it",
+                    )
+                })
+            });
+        let until = span.map_or(change.monotonic, |(ms, _)| {
+            change.monotonic + Duration::from_secs_f64(ms / 1000.0)
+        });
+        let mut block = json!(contention::summarize(readings, change.monotonic, until));
+        block["window"] = json!(match span {
+            Some((_, to)) => format!("from the node's tip stamp to {to}"),
+            None => "the interval holding the node's tip stamp: the tip has no delivery figure"
+                .to_owned(),
+        });
+        block["phase"] = phases
+            .iter()
+            .find(|(_, started, ended)| *started <= change.monotonic && change.monotonic <= *ended)
+            .map_or(Value::Null, |(name, ..)| json!(name));
+        tip["host_contention"] = block;
+    }
+}
+
 /// The `dense_cadence` section of the side report.
 ///
 /// Additive: nothing else in the report or the artifact changes shape, and a
@@ -5062,6 +5193,7 @@ fn phase_report(
         "order_lock": phase.locks.order,
         "settlement_lock": phase.locks.settlement,
         "processes": phase.processes,
+        "host_contention": phase.host_contention,
         "database_delay_milliseconds_configured": phase.proxy_delay_configured_ms,
         "previous_phase_settled_before_delay_change_seconds": phase.delay_settled_seconds,
         "database_delay_observed_select1_median_milliseconds": phase.proxy_delay_observed_ms.as_ref().ok(),
@@ -5072,6 +5204,7 @@ fn phase_report(
         "scheduled_blocks": phase.scheduled_blocks,
         "scheduled_blocks_ordered_against_tips": phase.ordered_landings,
         "external_tips_unminted": phase.tips_unminted,
+        EXTERNAL_TIPS_PLANNED: phase.tips_planned,
         "frontend_restarts": phase.frontend_restarts,
         "drained_restarts": phase.restart_records.iter().map(|record| json!({
             "frontend": record.index,
@@ -5168,6 +5301,10 @@ pub struct GapReport {
 /// The key of a fault phase's reconciliation that counts its missing shares
 /// a failover's verdict proves lie in the replication gap (#554).
 pub const MISSING_IN_A_FAILOVER_GAP: &str = "missing_in_a_failover_gap";
+
+/// A phase's planned external tips (#854), the key the gate's tip-median
+/// premise reads: one name on both sides.
+pub const EXTERNAL_TIPS_PLANNED: &str = "external_tips_planned";
 
 /// The kind a committed row that no phase offered is reported under.
 pub const OUTSIDE_PHASES_KIND: &str = "committed share that no phase offered";

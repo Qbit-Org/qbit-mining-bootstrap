@@ -493,6 +493,7 @@ fn preset_gate_rows(
     builds: [&Build; 2],
     runs: &[LoadedRun],
     budgets: &Budgets,
+    pinned_tips: Option<u64>,
 ) -> (String, [bool; 2]) {
     let mut out = String::from(
         "\n### The preset's own gates\n\n| build | runs passing | failed checks |\n|---|---|---|\n",
@@ -508,7 +509,8 @@ fn preset_gate_rows(
             } else {
                 run.run.exit_code
             };
-            let report = run.report.clone().unwrap_or(Value::Null);
+            let report =
+                with_pinned_tip_plan(run.report.clone().unwrap_or(Value::Null), pinned_tips);
             let checks = evaluate(&report, exit_code, budgets);
             if gate_passed(&checks) {
                 passing += 1;
@@ -536,6 +538,36 @@ fn preset_gate_rows(
         ));
     }
     (out, passed)
+}
+
+/// A report from a harness older than `external_tips_planned` (#854), as a
+/// base build's is: no phase records the tips it planned, so a tip median
+/// would be unmeasured and the base would fail every median-gated preset,
+/// hiding a candidate's regression. Its plan is the pinned
+/// `--external-tips`, all in `warm_up`, which this comparison already holds
+/// every counted run's tip list to (`PINNED_REPORT_COUNTS`). A report with
+/// the key on any phase is left as it is: a newer harness that dropped it
+/// from one is not an older one.
+pub fn with_pinned_tip_plan(mut report: Value, pinned_tips: Option<u64>) -> Value {
+    let key = crate::run::EXTERNAL_TIPS_PLANNED;
+    let Some(pinned) = pinned_tips else {
+        return report;
+    };
+    let Some(phases) = report.get_mut("phases").and_then(Value::as_array_mut) else {
+        return report;
+    };
+    if phases.iter().any(|phase| phase.get(key).is_some()) {
+        return report;
+    }
+    for phase in phases.iter_mut().filter(|phase| phase.is_object()) {
+        let planned = if phase["name"] == "warm_up" {
+            pinned
+        } else {
+            0
+        };
+        phase[key] = Value::from(planned);
+    }
+    report
 }
 
 /// What a phase was planned to do, as every harness since #271 reports it:
@@ -2646,7 +2678,12 @@ pub fn compare(
         passed = false;
         findings.push(why);
     }
-    let (gate_table, gates_ok) = preset_gate_rows([base, candidate], runs, budgets);
+    let (gate_table, gates_ok) = preset_gate_rows(
+        [base, candidate],
+        runs,
+        budgets,
+        pinned.get("--external-tips").and_then(Value::as_u64),
+    );
     out.push_str(&gate_table);
     if !gates_ok[1] {
         passed = false;
