@@ -187,6 +187,12 @@ jobs:
       - name: Check that published alert rule UIDs are unique and within Grafana's limits
         run: python3 scripts/check_prism_alert_uids.py
 
+      - name: Check that the generated alert rules and docs match their generator and the qbit-tools patch carries the current specification digest
+        run: python3 scripts/generate_prism_alerts.py --check
+
+      - name: Check that the generated metric inventory matches its generator
+        run: python3 scripts/generate_prism_metrics.py --check
+
       - name: Check that gated tests read their inputs only through the shared gate
         run: python3 scripts/check_gate_env_reads.py
 
