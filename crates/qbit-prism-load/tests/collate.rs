@@ -67,14 +67,19 @@ fn plan(entries: Vec<PlanEntry>) -> Plan {
     }
 }
 
-/// Every phase the preset plans, each meeting #473's rule at its rate.
+/// Every phase the preset plans, each meeting #473's rule at its rate. The
+/// run's one tip (below) is the one its first phase planned: a median gate
+/// (#842) counts the tips a run delivered against the ones its phases
+/// planned (#854), and a report that does not say is unmeasured.
 fn report(preset: &Preset, commit: &str) -> Value {
     let phases: Vec<Value> = compare::expected_phases(&preset.args)
         .unwrap()
         .into_iter()
-        .map(|plan| {
+        .enumerate()
+        .map(|(index, plan)| {
             json!({
                 "name": plan.name,
+                "external_tips_planned": u64::from(index == 0),
                 "target_rate_shares_per_second": plan.rate,
                 "duration_seconds": plan.seconds as f64,
                 "offered_rate_shares_per_second": plan.rate - 0.003,
