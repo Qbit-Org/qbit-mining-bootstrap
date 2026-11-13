@@ -18,6 +18,7 @@ qbit-prism-server::api_2x::block_views_markers_and_network_estimate_keep_2x_cont
 qbit-prism-server::api_2x::chart_rollups_match_raw_boundaries_tail_and_missing_progress
 qbit-prism-server::api_2x::chart_rollups_match_raw_for_every_range_bucket_and_watermark
 qbit-prism-server::api_2x::chart_rollups_read_only_the_partial_buckets_under_any_plan
+qbit-prism-server::api_2x::concurrent_pool_leaderboard_and_miner_misses_ask_the_node_for_one_template
 qbit-prism-server::api_2x::content_addressed_bytes_and_legacy_fallback_headers_are_exact
 qbit-prism-server::api_2x::fixture_migrations_do_not_share_advisory_locks
 qbit-prism-server::api_2x::legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_500

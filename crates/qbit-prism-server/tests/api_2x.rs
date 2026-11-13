@@ -878,3 +878,152 @@ async fn fixture_migrations_do_not_share_advisory_locks() -> Result<()> {
     .await;
     first.close(result).await
 }
+
+/// A node that counts the methods it is asked and holds `getblockchaininfo`
+/// until it is opened (#858).
+struct CountingNode {
+    calls: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+impl CountingNode {
+    fn calls(&self, method: &str) -> usize {
+        self.calls.lock().unwrap().get(method).copied().unwrap_or(0)
+    }
+}
+async fn counting_node_reply(
+    State(node): State<Arc<CountingNode>>,
+    Json(input): Json<Value>,
+) -> Json<Value> {
+    let method = input["method"].as_str().unwrap_or("").to_owned();
+    *node
+        .calls
+        .lock()
+        .unwrap()
+        .entry(method.clone())
+        .or_default() += 1;
+    let result = match method.as_str() {
+        "getblockchaininfo" => {
+            let _ = node.open.subscribe().wait_for(|open| *open).await;
+            json!({"chain":"regtest","blocks":100,"bestblockhash":"ab".repeat(32),"initialblockdownload":false})
+        }
+        "getblocktemplate" => json!({"bits":"207fffff","coinbasevalue":5000000000u64}),
+        "getnetworkinfo" => json!({"connections":2}),
+        "getnetworkhashps" => json!("1234567890123.125"),
+        _ => Value::Null,
+    };
+    Json(json!({"id":input["id"],"result":result,"error":null}))
+}
+
+/// #858: cache misses of the pool summary, the reward leaderboard and miner
+/// pages that arrive together wait for one set of node calls, and serve the
+/// network data an uncached request computes on the same node.
+#[tokio::test]
+async fn concurrent_pool_leaderboard_and_miner_misses_ask_the_node_for_one_template() -> Result<()>
+{
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let at = chrono::Utc::now().timestamp() - 60;
+        for (n, miner) in ["alice", "bob", "alice"].into_iter().enumerate() {
+            f.share(&format!("share-{n}"), miner, at + n as i64, 1000).await?;
+        }
+        let node = Arc::new(CountingNode {
+            calls: Default::default(),
+            open: tokio::sync::watch::channel(false).0,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc_url = format!("http://{}/", listener.local_addr()?);
+        let app = Router::new()
+            .route("/", post(counting_node_reply))
+            .with_state(node.clone());
+        let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        // Every route's lifetime at 60 s, so the remembered answer lives its
+        // longest, 15 s (the leaderboard's staleness budget), however slowly
+        // the routes' own reads run.
+        let lifetime = api::CacheLifetime {
+            ttl: 60,
+            stale_while_revalidate: 0,
+        };
+        let state = |cache_enabled| {
+            ApiState::new(
+                f.pool.clone(),
+                ApiConfig {
+                    rpc_url: rpc_url.clone(),
+                    cache_enabled,
+                    cache_debug_headers: true,
+                    cache_lifetimes: api::CacheLifetimes {
+                        default: lifetime,
+                        aggregate: lifetime,
+                        ..Default::default()
+                    },
+                    read_timeout: Duration::from_secs(30),
+                    ..Default::default()
+                },
+                Arc::new(qbit_prism_server::metrics::Metrics::default()),
+            )
+        };
+        let app = api::router(state(true));
+        let mut paths = vec![
+            "/public/v1/pool-summary".to_owned(),
+            "/public/v1/leaderboard?window=reward".to_owned(),
+            "/public/v1/leaderboard?window=reward&recipient_id=alice".to_owned(),
+        ];
+        paths.extend(["alice", "bob", "carol", "dave"].map(|m| format!("/public/v1/miners/{m}")));
+        let requests: Vec<_> = paths
+            .iter()
+            .cloned()
+            .map(|path| {
+                let app = app.clone();
+                tokio::spawn(async move { get(&app, &path).await })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while node.calls("getblockchaininfo") == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ensure!(
+            requests.iter().all(|request| !request.is_finished()),
+            "every miss waits for the node calls in flight"
+        );
+        ensure!(node.calls("getblockchaininfo") == 1);
+        node.open.send_replace(true);
+        let mut bodies = Vec::new();
+        for (path, request) in paths.iter().zip(requests) {
+            let (status, _, body) = request.await?;
+            ensure!(status == StatusCode::OK, "{path}: {body}");
+            bodies.push(body);
+        }
+        for method in ["getblockchaininfo", "getblocktemplate", "getnetworkinfo"] {
+            ensure!(node.calls(method) == 1, "{method}: {}", node.calls(method));
+        }
+        // A later miss reads the remembered answer.
+        let (status, headers, body) = get(&app, "/public/v1/miners/erin").await;
+        ensure!(
+            status == StatusCode::OK && headers["x-prism-public-cache"] == "MISS",
+            "{headers:?}: {body}"
+        );
+        ensure!(node.calls("getblocktemplate") == 1);
+        // The remembered answer is the one the node gives an uncached request.
+        let (status, _, uncached) = get(&api::router(state(false)), "/public/v1/pool-summary").await;
+        ensure!(status == StatusCode::OK, "{uncached}");
+        ensure!(node.calls("getblocktemplate") == 2);
+        ensure!(bodies[0]["network"] == uncached["network"], "{} != {}", bodies[0]["network"], uncached["network"]);
+        ensure!(
+            uncached["network"]
+                == json!({"name":"regtest","height":100,"tip_hash":"ab".repeat(32),"bits":"207fffff","network_difficulty":"1000000","initial_block_download":false,"peers":2,"hashrate_ths":"1.234567890123125"}),
+            "{}",
+            uncached["network"]
+        );
+        ensure!(bodies[1]["window"]["network_difficulty"] == "1000000", "{}", bodies[1]);
+        ensure!(bodies[3]["recipient_id"] == "alice" && bodies[3]["shares"]["accepted_3h"] == 2, "{}", bodies[3]);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.close(result).await
+}

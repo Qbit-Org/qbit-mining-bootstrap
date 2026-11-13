@@ -314,6 +314,8 @@ pub struct ApiState {
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
     cache: ResponseCache,
+    /// `network()`'s node answers, shared by the routes that read them (#858).
+    network: Arc<public::NetworkMemo>,
     public_pool: PgPool,
     /// Imported audit decodes run after their read connection is released,
     /// so they share the read pool's concurrency through this limit instead.
@@ -377,6 +379,7 @@ impl ApiState {
                 integrity::RUN_TIMEOUT,
                 integrity::REUSE,
             )),
+            network: Arc::default(),
             public_service: None,
             config: Arc::new(config),
             health: Arc::new(RwLock::new(
