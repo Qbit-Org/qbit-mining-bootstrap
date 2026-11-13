@@ -187,6 +187,16 @@ pub fn expected(populated: bool) -> Census {
         ),
         &[],
     );
+    // #856: every hint the listener's difficulty-hint writer was offered.
+    result.family(
+        "stratum_difficulty_hints_total",
+        "counter",
+        &labels(
+            "outcome",
+            "written,failed,timed_out,aged_out,dropped,superseded,abandoned,writer_panicked",
+        ),
+        &[],
+    );
     result.family(
         "capture_offer_decisions_total",
         "counter",
