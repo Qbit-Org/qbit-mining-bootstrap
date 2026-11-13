@@ -1,0 +1,45 @@
+launchbadge/sqlx#3861, "Fix NoHostnameTlsVerifier for rustls 0.23.24 and
+above" (merge commit 2970559e256ff11194cdc7c7aa18eb9d64fce494), for #713.
+
+As upstream wrote it, without its Cargo.lock hunk, which belongs to
+upstream's workspace. The rustls requirement moves to 0.23.24, the first
+release with `NotValidForNameContext`, in Cargo.toml.orig and, on the same
+requirement, in Cargo.toml.
+
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -144,7 +144,7 @@
+ default-features = false
+ 
+ [dependencies.rustls]
+-version = "0.23.15"
++version = "0.23.24"
+ features = [
+     "std",
+     "tls12",
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -39,7 +39,7 @@
+ # TLS
+ native-tls = { version = "0.2.10", optional = true }
+ 
+-rustls = { version = "0.23.15", default-features = false, features = ["std", "tls12"], optional = true }
++rustls = { version = "0.23.24", default-features = false, features = ["std", "tls12"], optional = true }
+ webpki-roots = { version = "0.26", optional = true }
+ rustls-native-certs = { version = "0.8.0", optional = true }
+ 
+--- a/src/net/tls/tls_rustls.rs
++++ b/src/net/tls/tls_rustls.rs
+@@ -306,9 +306,9 @@
+             ocsp_response,
+             now,
+         ) {
+-            Err(TlsError::InvalidCertificate(CertificateError::NotValidForName)) => {
+-                Ok(ServerCertVerified::assertion())
+-            }
++            Err(TlsError::InvalidCertificate(
++                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
++            )) => Ok(ServerCertVerified::assertion()),
+             res => res,
+         }
+     }
