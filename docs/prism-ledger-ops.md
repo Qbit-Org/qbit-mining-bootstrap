@@ -325,6 +325,121 @@ three-miner gate. A network-valid candidate below its assigned share target is
 stored without ordinary share credit. Active-chain confirmation inserts its
 deferred share at network difficulty; a losing candidate receives no credit.
 
+### A payout-revision listener that stays down (#843)
+
+Each frontend's refresh loop holds one `LISTEN` on the
+`qbit_prism_payout_revision` channel (#752), on a connection of its own outside
+the ledger pool, so that another frontend's same-tip payout revision bump, such
+as a block's confirmation, republishes this frontend's work at once.
+`qbit_prism_payout_revision_listener_up` reads 1 while that `LISTEN` holds and
+0 before the first one, while the listener reconnects and once the refresh loop
+stops (#816; [reading the gauge and its counter](prism-native-metrics.md#reading-the-payout-revision-listener-816)).
+`PrismPayoutRevisionListenerDown` warns when the gauge has read 0 for 10
+minutes on a frontend that has had an authorized miner in the last 15
+minutes, the revision-work warnings' gate (#758). It never pages. Each
+evaluation reads the latest scrape, and one that finds the `LISTEN` holding
+restarts the dwell, so a listener that keeps reconnecting and dropping can warn
+late or not at all; its log lines show it.
+
+- **What miners see.** While the listener is down, the frontend republishes
+  after most announced same-tip payout revision bumps, such as another
+  frontend's block confirmation, only at its next poll, a
+  `PRISM_BLOCKPOLL_SECONDS` tick (2 s by default) or a blockwait return, as
+  every frontend did before #752. Two do not wait: a confirmation this
+  frontend lands itself wakes its refresh, and a bump its own refresh makes
+  while reconciling the chain is republished by that refresh.
+  Until it republishes, shares on work at the superseded revision are refused
+  `stale-job`, counted as
+  `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`: up to one
+  poll interval of refusals after each such bump, on this frontend only. A
+  block found on that work is kept only as far as
+  [block capture](#block-capture-and-payout-divergence-478) allows.
+- **No gauge at all.** Check first that the frontend exports
+  `qbit_prism_payout_revision_listener_up`. One running an image from before
+  #834 does not, and the rule counts that as down under the same gate and
+  dwell, since its listener's state is unknown: none of the checks below
+  apply, upgrade the frontend.
+- **The database is down.** `PrismDatabaseUnavailable` pages after two
+  minutes; handle that. The listener waits at most 5 s between attempts and
+  holds again within seconds of the database answering, so this warning
+  resolves on its own; it fires only for an outage longer than its dwell.
+- **No connection to spare.** Each frontend needs one connection beyond its
+  `PRISM_DATABASE_MAX_CONNECTIONS` for the listener (see the budget under
+  [HA database and shutdown](#ha-database-and-shutdown)). An ordinary role
+  can use `max_connections` less `superuser_reserved_connections` and, from
+  PostgreSQL 16, `reserved_connections`. Once those slots are taken, the
+  listener's connect is refused, with `too many clients already` or
+  `remaining connection slots are reserved for …`, and the gauge stays 0 until
+  a slot frees up, while the frontend keeps working on the connections its
+  pool already holds. A `CONNECTION LIMIT` on the frontends' role or database
+  refuses it the same way, with `too many connections for role …` or
+  `… for database …`, while the server still has slots: compare
+  `pg_roles.rolconnlimit` with the `pg_stat_activity` rows for that `usename`,
+  and `pg_database.datconnlimit` with those for that `datname` (-1 is no
+  limit). Count the server's sessions as a superuser connected to the PRISM
+  database: a superuser can still connect through the reserved slots, and a
+  role without `pg_read_all_stats` (part of `pg_monitor`) reads other roles'
+  sessions without their `backend_type`, so it undercounts. The listener is
+  refused once `client_sessions` reaches `ordinary_slots`:
+
+  ```sql
+  SELECT count(*) AS client_sessions,
+         count(*) FILTER (WHERE application_name = 'qbit-prism-revision-wake'
+                            AND datname = current_database()) AS listeners,
+         current_setting('max_connections')::int
+           - current_setting('superuser_reserved_connections')::int
+           - coalesce(current_setting('reserved_connections', true), '0')::int AS ordinary_slots
+  FROM pg_stat_activity
+  WHERE backend_type = 'client backend';
+  ```
+
+  Every running frontend on this database should hold one
+  `qbit-prism-revision-wake` session. Raise `max_connections` (a PostgreSQL
+  restart) or lower a pool size until the frontends' budgets together, with
+  the reserve the budget names, fit in `ordinary_slots`; raise a role or
+  database limit with `ALTER ROLE … CONNECTION LIMIT` or
+  `ALTER DATABASE … CONNECTION LIMIT`, which needs no restart.
+- **A pooler in front of `PRISM_DATABASE_URL`.** `LISTEN` needs a session of
+  its own; a transaction-mode pooler does not keep one. A pooler that refuses
+  the listener's `LISTEN` keeps the gauge at 0 and fires this warning. One
+  that accepts it and then hears nothing, or drops the session later, reads 1
+  for all or most of the time, which this warning cannot see: there,
+  `qbit_prism_payout_revision_announcements_heard_total` stays flat while the
+  other frontends' counters on the same database grow. Point the URL at
+  PostgreSQL itself or at a session-mode pool.
+- **The listener's log lines.** When the listener cannot connect or loses its
+  connection, the frontend logs at WARN, at most once a minute while attempts
+  keep failing; a connection that held for 30 s or more resets that minute, so
+  the next failure warns at once and a session dropped every 40 s warns at
+  every drop:
+
+  ```
+  payout-revision listener unavailable: this frontend republishes after another frontend's block on its blockpoll tick until it reconnects (#752)
+  ```
+
+  Its `error` field is the reason, such as one of PostgreSQL's refusals
+  above, a timeout or a closed connection, and `retry_in` the wait before the
+  next attempt; the failures between two such lines log
+  `payout-revision listener unavailable` at DEBUG with the same fields. After
+  such a WARN, an INFO line,
+  `payout-revision listener reconnected; refresh woken once (#752)`, says when
+  it holds again. The WARN text names only another frontend's block and the
+  tick; the other bumps above wait the same way, for the tick or a blockwait
+  return.
+- **The refresh loop is not running.** The listener lives and ends with the
+  refresh loop, so a frontend whose loop has stopped, or a dual-writer
+  frontend still waiting for its own log at start, reads 0 with no WARN line.
+  After a restart the gate still counts the previous process's miners for
+  the window, so such a frontend can warn then. Look at its readiness and the
+  work-refresh alerts instead.
+
+The warning resolves at the first evaluation that finds the `LISTEN` holding
+at the latest scrape, or once the frontend has had no authorized miner for the
+whole window.
+Its two-minute windows ride over a failed scrape and carry the last reading for
+two minutes after scrapes stop; a scrape that keeps failing is
+`PrismMetricsEndpointDown`'s.
+
 ## Durable block candidates
 
 `qbit_block_candidate_outbox` stores complete candidate evidence before a node
@@ -2851,7 +2966,10 @@ PostgreSQL primaries. Budget database connections for all frontends together:
 each frontend uses up to `PRISM_DATABASE_MAX_CONNECTIONS` + 1 database
 connections (its payout-revision listener, #752), + 2 more in dual-writer mode
 (its health pool). Reserve capacity for migrations, monitoring, backup, and
-failover administration.
+failover administration. A role or database `CONNECTION LIMIT` on the
+frontends' login must allow the same sum. A frontend whose listener cannot
+connect keeps serving, and warns `PrismPayoutRevisionListenerDown` once it has stayed down
+with miners for the rule's dwell ([runbook](#a-payout-revision-listener-that-stays-down-843)).
 
 The cluster records its highest observed cumulative chain work. A node that is
 still synchronizing, follows a lower-work tip, or disagrees at equal work cannot

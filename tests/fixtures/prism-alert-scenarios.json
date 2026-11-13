@@ -4536,5 +4536,239 @@
         }
       ]
     }
+  },
+  {
+    "name": "#843 a down listener warns after the ten-minute dwell only on a frontend with a recent miner",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720",
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x720",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "3x720",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x720",
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"three\",network=\"mainnet\"}": "0x720",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"three\",network=\"mainnet\"}": "0x720",
+      "up{job=\"qbit-prism\",instance=\"three\",network=\"mainnet\"}": "1x720",
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"four\",network=\"mainnet\"}": "0x720",
+      "up{job=\"qbit-prism\",instance=\"four\",network=\"mainnet\"}": "1x720"
+    },
+    "eval_time": "11m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#843 a down listener is pending under the dwell",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720"
+    },
+    "eval_time": "9m30s",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": []
+    }
+  },
+  {
+    "name": "#843 a listener that reconnects inside the dwell does not warn, and an evaluation that finds it holding restarts the dwell",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x480 1x120 0x5 1x200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x805",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x805",
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "0x300 1 0x500",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "3x805",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x805"
+    },
+    "eval_time": "12m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": []
+    }
+  },
+  {
+    "name": "#843 a listener that held for one evaluation warns ten minutes after it dropped again, not before",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x300 1 0x700",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x1001",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1001",
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "0x330 1 0x670",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "3x1001",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x1001"
+    },
+    "eval_time": "15m20s",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 2
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#843 a failed scrape does not restart the listener's dwell",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x300 stale 0x419",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x300 stale 3x419",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x300 0 1x419"
+    },
+    "eval_time": "10m30s",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#843 a failed scrape of a healthy listener does not read as a missing gauge",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x300 stale 1x100",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x300 stale 3x100",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x300 0 1x100"
+    },
+    "eval_time": "5m1s",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 0
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": []
+    }
+  },
+  {
+    "name": "#843 a scraped frontend without the listener gauge warns after the dwell only with a recent miner, through a failed scrape",
+    "series": {
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "0x720",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x720",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"three\",network=\"mainnet\"}": "3x300 stale 3x419",
+      "up{job=\"qbit-prism\",instance=\"three\",network=\"mainnet\"}": "1x300 0 1x419"
+    },
+    "eval_time": "11m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 2
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        },
+        {
+          "job": "qbit-prism",
+          "instance": "three",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#843 a down listener keeps warning inside the recent-miner window after the last miner leaves",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x120 0x1080",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200"
+    },
+    "eval_time": "15m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#843 a down listener stops warning once its frontend has been idle longer than the recent-miner window",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x120 0x1080",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200"
+    },
+    "eval_time": "18m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 0
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": []
+    }
+  },
+  {
+    "name": "#843 miners failing over to a frontend whose listener is down warn ten minutes after they arrive",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x300 3x900",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1200",
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "0x1200",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "3x1200",
+      "up{job=\"qbit-prism\",instance=\"two\",network=\"mainnet\"}": "1x1200"
+    },
+    "eval_time": "14m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 2
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "two",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#843 a frontend whose scrape keeps failing is left to PrismMetricsEndpointDown",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x60 stale",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x60 stale",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x60 0x480"
+    },
+    "eval_time": "8m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 0,
+      "PrismMetricsEndpointDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [],
+      "PrismMetricsEndpointDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
   }
 ]

@@ -106,7 +106,7 @@
 -  that never increment RestartCount, so planned work needs no maintenance
 -  flag; drills that crash the coordinator on purpose use a Grafana silence.
 +{# Native 3.x.x cutover draft, bootstrap #279. Apply only with the native image.
-+   Specification SHA-256: 2f28fad628622633019f9e3304b5995f3618b6c2d416eca78db62b6d59b3819f
++   Specification SHA-256: b7ac55acbd3187efd82b167e3abdc5795409e107cba7f6cbadcd544662c6cfc7
 +   Generated from the reviewed a007a142 snapshot; backup, sidecar and lifecycle rules retain their producers.
 +   Native numeric bounds marked provisional must be measured in #291 before production cutover.
 +   The D3 group requires PRIMARY postgres_exporter query metrics; see bootstrap docs/prism-alert-migration.md.
@@ -121,7 +121,7 @@
  {% set prism_stratum_target_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true"' %}
  {% set prism_stratum_selector = 'job="qbit-stratum-health-sidecar",network="' ~ qbit_monitoring_stack_network ~ '",service="qbit-mining-pool",prism_capable="true",check=~"prism(-highdiff)?"' %}
  {% set prism_backup_selector = 'job="qbit-node-exporter",network="' ~ qbit_monitoring_stack_network ~ '",service="' ~ qbit_monitoring_stack_prism_backup_alert_service ~ '",node="' ~ qbit_monitoring_stack_prism_backup_alert_node ~ '"' %}
-@@ -118,53 +14,910 @@
+@@ -118,53 +14,928 @@
  {% set prism_backup_database_growth_gib_per_day = "(sum(clamp_min(last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h]) - last_over_time(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"full\"}[1h] offset " ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "), 0)) / " ~ qbit_monitoring_stack_prism_backup_alert_growth_window_days ~ " / 1073741824)" %}
  {% set prism_backup_audit_growth_gib_per_day = "(sum(clamp_min(deriv(qbit_prism_backup_last_success_bytes{" ~ prism_backup_selector ~ ",operation=\"audit\"}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
  {% set prism_backup_wal_growth_gib_per_day = "(sum(clamp_min(rate(qbit_prism_backup_wal_generated_bytes_total{" ~ prism_backup_selector ~ "}[" ~ qbit_monitoring_stack_prism_backup_alert_growth_window ~ "]), 0)) * 86400 / 1073741824)" %}
@@ -964,6 +964,24 @@
 +    "description": "Acceptance is observed locally; an unlanded acceptance has no revision work to deliver yet. An offer the node accepted (a null submitblock reply) that this frontend has not observed on the node's active chain for 30 minutes (#493 point 1). A lost tip race is settled as a proven orphan once a different block has PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS (default 6) confirmations at its height: about six minutes at the 60-second target spacing plus the reconciliation retry backoff, so a routine lost race leaves this gauge well inside the threshold. The reconciliation backoff is ten seconds times the row's attempt count, capped at an hour, and the count includes the pre-offer attempts, so the cumulative wait to the k-th retry is about 5k(k+1) seconds: the sixth competitor confirmation at 60-second spacing is reached around the eighth retry, about nine minutes, well inside 30 minutes, while a row that needed many pre-offer attempts starts its backoff higher and reaches 30 minutes in a few retries. Such an acceptance is never part of the known pending age, so the revision-work critical cannot page on it; a winning offer leaves this gauge at its first active-chain observation and joins the known age on its original acceptance clock. Past 30 minutes the row is not being reconciled, the node is not advancing, or the orphan verdict keeps failing: operator work, warned, never paged; the cluster-wide candidate oldest-pending rules see the same reconciliation row. -1 (none tracked while identity tracking is saturated) is owned by the tracking-unknown warning and does not fire here. Three-minute dwell like the other warnings; no-data is OK because the pending warning already reports a missing landing family. Provisional; measure in #291.",
 +    "no_data_state": "OK",
 +    "exec_err_state": "OK"
++  },
++  {
++    "uid": "qbit-prism-revision-listener-down",
++    "title": "PrismPayoutRevisionListenerDown",
++    "expr": "((((last_over_time(qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[2m]) == bool 0) or on(job, instance, network) (max_over_time(up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[2m]) == bool 1)) and on(job, instance, network) (max_over_time(qbit_prism_authorized_clients{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[15m]) > 0)) or on(job, instance, network) (0 * ((last_over_time(qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[2m]) == bool 0) or on(job, instance, network) (max_over_time(up{job=\"qbit-prism\",network=\"" ~ qbit_monitoring_stack_network ~ "\"}[2m]) == bool 1))))",
++    "condition_type": "threshold",
++    "evaluator": "gt",
++    "threshold": 0,
++    "for": "10m",
++    "severity": "warning",
++    "service": "qbit-mining-pool",
++    "labels": {
++      "alert_class": "prism-runtime"
++    },
++    "summary": "PrismPayoutRevisionListenerDown",
++    "description": "This frontend's payout-revision listener (#752) has not held its LISTEN for 10 minutes while it served miners (#843). While qbit_prism_payout_revision_listener_up reads 0, the frontend republishes after most announced same-tip payout revision bumps, such as another frontend's block confirmation, only at its next poll (a PRISM_BLOCKPOLL_SECONDS tick or a blockwait return), so until then its miners' shares on work at the superseded revision are refused stale-job (qbit_prism_stale_job_rejections_total{cause=\"payout_revision\"}), and a block found on that work is kept only as far as block capture (#478) allows. That is every frontend's exposure before #752, so this warns and never pages. Counts only on a frontend that has had an authorized miner within the last 15 minutes, the revision-work warnings' gate (#758): an idle standby's listener costs no miner anything, and when miners fail over to a frontend whose listener is down, the 10-minute dwell starts as they arrive; a miner count absent for the whole window closes the gate, and after a restart it still counts the previous process's miners for the window. A scraped frontend that does not export the gauge, an image from before #834, counts as down under the same gate and dwell: its listener's state is unknown, not healthy. Why 10 minutes: the listener waits at most 5 seconds between attempts, so it is back within seconds of the database answering and an ordinary reconnect reads 0 for a scrape or two, while a database that keeps refusing the listener's connection, for example with max_connections not raised by the one more connection each frontend needs, holds it at 0 for good. 40 consecutive 15-second scrapes leave no reconnect behind, and an outage of the database itself pages PrismDatabaseUnavailable after two minutes, so a short one does not warn here as well. The 2-minute windows ride over a failed scrape, which would otherwise restart the dwell, and carry the last reading for 2 minutes after scrapes stop; a scrape that keeps failing is PrismMetricsEndpointDown's. Each evaluation reads the latest scrape, and one that finds the LISTEN holding restarts the dwell, so a listener that keeps reconnecting and dropping can warn late or not at all; its WARN lines show it. Not this rule's: a LISTEN that holds but hears nothing, as through a transaction-pooling proxy, reads 1; compare qbit_prism_payout_revision_announcements_heard_total across the node's frontends. No-data and evaluation errors are OK because PrismMetricsNoData and PrismMetricsEndpointDown own a missing target. Provisional, measure in #291.",
++    "no_data_state": "OK",
++    "exec_err_state": "OK"
 +  }
 +] %}
 +{% set prism_public_read_alert_rules = [
@@ -1064,7 +1082,7 @@
    {
      "uid": "qbit-prism-stratum-nodata",
      "title": "PrismStratumHealthNoData",
-@@ -230,752 +983,17 @@
+@@ -230,752 +1001,17 @@
      "value_annotations": ["check_failures_in_window"],
      "no_data_state": "OK",
      "exec_err_state": "OK"
@@ -1820,7 +1838,7 @@
  {% endif %}
  {% if qbit_monitoring_stack_prism_backup_alerts_effective | bool %}
  {% set alert_rules = alert_rules + [
-@@ -1454,5 +1472,84 @@
+@@ -1454,5 +1490,84 @@
    }
  ] %}
  {% endif %}

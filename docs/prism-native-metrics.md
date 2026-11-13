@@ -797,13 +797,17 @@ after 30 s without an announcement and gives up after 5 s. Both families are
 overlaid on the cached body at every scrape, so a database outage that also
 stalls the health publisher still shows the listener down.
 
-While the gauge reads 0 the frontend works as before #752: after another
-frontend's block it republishes only on its `PRISM_BLOCKPOLL_SECONDS` tick (2 s
-by default), and until then shares on its new-tip work are refused `stale-job`,
-counted as `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`. A
+While the gauge reads 0 the frontend works as before #752: after most announced
+same-tip payout revision bumps, such as another frontend's block confirmation,
+it republishes only at its next poll (a `PRISM_BLOCKPOLL_SECONDS` tick, 2 s by
+default, or a blockwait return), and until then shares on work at the
+superseded revision are refused `stale-job`, counted as
+`qbit_prism_stale_job_rejections_total{cause="payout_revision"}`. A
 frontend that cannot open the extra connection at all, for example because
 `max_connections` was not raised by one per frontend, reads 0 for good. It
-also logs `payout-revision listener unavailable` at WARN at most once a minute.
+also logs `payout-revision listener unavailable` at WARN, at most once a minute
+while its attempts keep failing and at once when a connection that held for
+30 s or more is lost.
 
 `qbit_prism_payout_revision_announcements_heard_total` counts every notification
 the listener received, its own frontend's included, and never one made while
@@ -816,9 +820,11 @@ never hears anything, as through a transaction-pooling proxy in front of
 frontends' counters grow. In dual-writer mode each node's frontends listen on
 their own database, so compare the counters within a node.
 
-No alert rule reads these families yet. A frontend without its listener loses
-no block, share credit or payout: each pool block costs it at most one tick of
-`stale-job` refusals on new-tip work. The gauge also drops to 0 on every
-reconnect, so a rule needs a dwell chosen from fleet data. A warning such as
-`qbit_prism_payout_revision_listener_up == 0` for 10 minutes is a candidate for
-a later change through `scripts/generate_prism_alerts.py`.
+`PrismPayoutRevisionListenerDown` (#843) warns, and never pages, when the gauge
+has read 0 for 10 minutes on a frontend that has had an authorized miner in the
+last 15 minutes, the revision-work warnings' gate (#758). A scraped frontend
+that does not export the gauge, an image from before #834, counts as down: its
+listener's state is unknown, not healthy. The rule cannot see a `LISTEN` that
+holds and hears nothing; compare the counters as above. What a down listener
+costs, how the rule's dwell and windows behave and what to check are in the
+[ledger operations runbook](prism-ledger-ops.md#a-payout-revision-listener-that-stays-down-843).
