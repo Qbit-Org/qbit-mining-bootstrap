@@ -447,6 +447,19 @@ skips and everything runs as before; nothing else depends on it.
   creates a run for the other, or a closed earlier one labelled in L3 (if
   GitHub starts a run for that, which is unverified). Against those only the
   listing (two pull requests, so it refuses) stands.
+- **Renamed branches** (unverified). Nothing GitHub records names the pull
+  request a run belonged to: a run's record gives a head branch and a commit,
+  and the listing gives the pull requests opened from a branch of that name.
+  No event for a rename was found on a pull request, and whether one exists
+  can't be established from outside GitHub. If there is none, someone with
+  write access could rename branches so that a run of another pull request,
+  made on a base branch whose changed workflow uploads the artifact without
+  testing anything, carries this pull request's branch name and tree, rename
+  them back, and save a key that names that run in this pull request's cache.
+  A later push of the same tree would then skip. That takes write access, a
+  base branch that carries the changed workflow and deliberate renames.
+  Someone with that access can change what CI runs more directly; the
+  difference is that the diff under review would not show this.
 - **A pull request converted from an issue** (unverified). `POST
   /repos/{repo}/pulls` with `issue` turns an existing issue into a pull
   request. If that pull request's `created_at` were the issue's, a writer

@@ -137,6 +137,15 @@ release version.
 
 ## Reconcile the development branch
 
+A synchronization PR lands as it is, and the version lines accept only
+commits with a verified signature. Sign the merge commit you make for it
+(`git merge -S`), and never squash it. Name its branch `sync-…`, in this
+repository, with nothing before `sync-` and no `/` (`sync-main-into-3.x.x`,
+not `yourname/3.x.x-sync-main` or `sync-3.1.1/main`): the required
+`signed-landing` check lets a branch with such a name merge as it is, and
+expects every other pull request to be one signed commit. The same goes for any pull request that merges one version
+line into another.
+
 After promotion, open a synchronization PR from a branch that merges the
 released `main` commit into the latest development branch (`3.x.x` after a 3.x
 release, `2.x.x` after 2.0.0), and into a release branch such as `3.0.x` that
@@ -144,29 +153,30 @@ will take patch releases. Preserve subsequent development and resolve metadata
 and notes deliberately; do not reset or force-push the shared branch. Run its
 checks before merging.
 
-Land the synchronization PR by fast-forward, or with the merge button, which
-has made a merge commit since squash and rebase merges were turned off on
-2026-11-10. Never squash it into one commit: that drops `main` from the
-branch's history. The next merge between them then falls back to the old merge
-base and conflicts on changes only one side has made since this
-synchronization, and GitHub keeps counting each `main` commit as one the
-branch is behind. One rule guards the version lines: every commit added to
-them needs a verified signature, and the rule has no bypass list
-([`.github/rulesets/`](../.github/rulesets/)). So the PR's commits land as
-they are and must be signed, the merge of `main` included. The rule also
-refuses an old unsigned commit that the branch doesn't have yet, so a
-synchronization can't bring one in. A fast-forward push checks nothing else
-for you, so the commit pushed must be the PR's reviewed head. Once its checks
-and review pass:
+Land the synchronization PR with the merge button, which has made a merge
+commit since squash and rebase merges were turned off on 2026-11-10. Never
+squash it into one commit: that drops `main` from the branch's history. The
+next merge between them then falls back to the old merge base and conflicts on
+changes only one side has made since this synchronization, and GitHub keeps
+counting each `main` commit as one the branch is behind. Two rulesets guard
+the version lines, and neither has a bypass list
+([`.github/rulesets/`](../.github/rulesets/)). Every commit added to a line
+needs a verified signature, so the PR's commits land as they are and must be
+signed, the merge of `main` included. That rule also refuses an old unsigned
+commit that the branch doesn't have yet, so a synchronization can't bring one
+in. And a line other than the dormant `1.x.x` and `0.1.x` takes changes only
+through a pull request whose `signed-landing` check passes. Pushing the PR's
+head to the line as a fast-forward, which was how earlier synchronizations
+could land, is refused. Once its checks and review pass:
 
 ```sh
 gh pr checks <pr>
-git push origin "$(gh pr view <pr> --json headRefOid --jq .headRefOid)":<branch>
+gh pr merge <pr> --merge
 ```
 
-A plain push succeeds only as a fast-forward, and GitHub marks the PR merged.
-If it is rejected as non-fast-forward, the branch has moved: merge it into the
-synchronization branch and run the checks again. Other PRs into the branch
+If GitHub reports a conflict because the branch has moved, merge the branch
+into the synchronization branch, sign that merge too, and run the checks
+again. Other PRs into the branch
 are squashed into one signed commit by a maintainer and merged with the
 button, and a promotion still lands on `main` as one squashed commit, signed
 by a maintainer, under GitHub's merge commit. A promotion from `3.x.x` or
@@ -194,7 +204,7 @@ release.
 
 #826, the 3.1.1 synchronization, was squashed like the earlier ones, so
 `3.x.x`'s merge base with `main` stayed at `v1.1.0`. Merge commit
-`b51ac732`, landed by fast-forward like a synchronization, corrects that: it
+`b51ac732`, landed by fast-forward as a synchronization then could, corrects that: it
 has `main` at `60467262` as a parent and changes no file. It takes its tree
 from `3.x.x`, as `git merge -s ours` does, because #826's `d0c649b4` already
 had `60467262`'s exact tree. Use `-s ours` only when a commit on the branch
