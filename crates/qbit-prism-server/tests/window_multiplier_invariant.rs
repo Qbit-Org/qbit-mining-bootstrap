@@ -52,6 +52,10 @@ const EXPECTED_SITES: &[(&str, usize)] = &[
         1,
     ),
     (
+        "crates/qbit-prism-server/src/api/queries/dashboard_miner_reward_share.sql",
+        1,
+    ),
+    (
         "crates/qbit-prism-server/src/api/queries/dashboard_pool_snapshot.sql",
         1,
     ),

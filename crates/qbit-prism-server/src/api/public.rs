@@ -248,10 +248,11 @@ async fn pool_summary(state: &ApiState) -> ApiResult<Value> {
         .bind(network["network_difficulty"].as_str().unwrap())
         .fetch_one(&state.pool)
         .await?;
-    let h3 = hashrate(&value["h3_difficulty"], 10800);
+    let sums = pool_hashrate_sums(state).await?;
+    let h3 = hashrate(&sums["h3_difficulty"], 10800);
     Ok(wrap(
         "pool-summary",
-        json!({"network":network,"pool":{"name":state.config.pool_name,"hashrate_ths":{"h1":hashrate(&value["h1_difficulty"],3600),"h3":h3,"h24":hashrate(&value["h24_difficulty"],86400)},"participants_3h":value["participants_3h"],"blocks_found_total":value["blocks_found_total"],"prism_blocks_total":value["prism_blocks_total"],"blocks_reversed_total":value["blocks_reversed_total"],"blocks_inactive_total":value["blocks_inactive_total"],"total_mined_bits":value["total_mined_bits"],"expected_time_to_block_seconds":eta(&h3,&network["network_difficulty"]),"latest_block":value["latest_block"],"reward_window":{"window_multiplier":8,"requested_window_weight":(big(&network["network_difficulty"])*8u8).to_string(),"oldest_share_accepted_at":value["oldest_share_accepted_at"],"newest_share_accepted_at":value["newest_share_accepted_at"],"included_share_count":value["included_share_count"]}}}),
+        json!({"network":network,"pool":{"name":state.config.pool_name,"hashrate_ths":{"h1":hashrate(&sums["h1_difficulty"],3600),"h3":h3,"h24":hashrate(&sums["h24_difficulty"],86400)},"participants_3h":sums["participants_3h"],"blocks_found_total":value["blocks_found_total"],"prism_blocks_total":value["prism_blocks_total"],"blocks_reversed_total":value["blocks_reversed_total"],"blocks_inactive_total":value["blocks_inactive_total"],"total_mined_bits":value["total_mined_bits"],"expected_time_to_block_seconds":eta(&h3,&network["network_difficulty"]),"latest_block":value["latest_block"],"reward_window":{"window_multiplier":8,"requested_window_weight":(big(&network["network_difficulty"])*8u8).to_string(),"oldest_share_accepted_at":value["oldest_share_accepted_at"],"newest_share_accepted_at":value["newest_share_accepted_at"],"included_share_count":value["included_share_count"]}}}),
     ))
 }
 fn mining_configuration(config: &ApiConfig) -> Value {
@@ -296,31 +297,16 @@ async fn miner(state: &ApiState, id: &str) -> ApiResult<Value> {
             .bind(id)
             .fetch_one(&state.pool)
             .await?;
-    let reward = reward_leaderboard(
-        state,
-        network["network_difficulty"].as_str().unwrap(),
-        1,
-        1,
-        None,
-        Some(id),
-    )
-    .await?;
-    let share = reward["rows"]
-        .as_array()
-        .and_then(|rows| rows.first())
-        .map(|r| r["share_percent"].clone())
-        .unwrap_or(Value::Null);
+    let reward =
+        miner_reward_share(state, network["network_difficulty"].as_str().unwrap(), id).await?;
+    let share = reward["share_percent"].clone();
     let balance:Value=sqlx::query_scalar("SELECT jsonb_build_object('owed',COALESCE((SELECT sum(owed_balance_sats) FROM qbit_current_owed_balances() WHERE miner_id=$1),0),'lifetime',COALESCE((SELECT sum(c.gross_amount_sats) FROM qbit_payout_carry_forward c JOIN qbit_pool_blocks b USING(block_hash) WHERE c.miner_id=$1 AND c.maturity_state<>'reversed' AND b.chain_state='confirmed' AND b.maturity_state<>'reversed'),0),'pending',COALESCE((SELECT sum(GREATEST(c.onchain_amount_sats-c.settlement_fee_sats,0)) FROM qbit_payout_carry_forward c JOIN qbit_pool_blocks b USING(block_hash) WHERE c.miner_id=$1 AND c.action='onchain' AND c.maturity_state='immature' AND b.chain_state='confirmed' AND b.maturity_state='immature'),0))").bind(id).fetch_one(&state.pool).await?;
     let workers = workers(state, id, 1, 5, None, false).await?;
     let payouts = payouts(state, id, 1, 5, false).await?;
     let expected=sqlx::query_scalar::<_,Value>("SELECT COALESCE(to_jsonb(COALESCE(a.found_block_coinbase_value_sats,(a.audit_bundle#>>'{found_block,coinbase_value_sats}')::bigint)),'null'::jsonb) FROM qbit_pool_blocks b LEFT JOIN qbit_pool_audit_bundles a USING(block_hash) WHERE b.chain_state='confirmed' ORDER BY b.block_height DESC,b.found_at DESC LIMIT 1").fetch_optional(&state.pool).await?.filter(|v|big(v)>BigUint::zero()).unwrap_or(Value::Null);
     let estimated = if !share.is_null() && !expected.is_null() {
-        let part = reward["rows"]
-            .as_array()
-            .and_then(|r| r.first())
-            .map(|r| big(&r["counted_share_difficulty"]))
-            .unwrap_or_default();
-        let total = big(&reward["totals"]["pool_counted_share_difficulty"]);
+        let part = big(&reward["counted_share_difficulty"]);
+        let total = big(&reward["counted_window_weight"]);
         if total.is_zero() {
             Value::Null
         } else {

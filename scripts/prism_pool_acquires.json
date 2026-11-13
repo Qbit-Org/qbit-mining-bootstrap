@@ -205,6 +205,8 @@
     "api/read_models.rs::workers#1::fetch_one(& state . pool)": [1,"public"],
     "api/read_models.rs::payouts#1::fetch_one(& state . pool)": [1,"public"],
     "api/read_models.rs::reward_leaderboard#1::fetch_one(& state . pool)": [1,"public"],
+    "api/read_models.rs::miner_reward_share#1::fetch_one(& state . pool)": [1,"public"],
+    "api/read_models.rs::pool_hashrate_sums#1::fetch_one(& state . pool)": [2,"public"],
     "api/read_models.rs::leaderboard#1::fetch_one(& state . pool)": [1,"public"],
     "api/read_models.rs::latest_evidence#1::fetch_optional(& state . pool)": [1,"public"],
     "api/read_models.rs::latest_evidence#1::fetch_one(& state . pool)": [3,"public"],

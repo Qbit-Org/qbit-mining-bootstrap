@@ -755,6 +755,39 @@ pub(super) async fn reward_leaderboard(
         json!({"schema":"prism.dashboard.leaderboard.v2","generated_at":value["ended_at"],"window":{"id":"reward","started_at":value["oldest_share_accepted_at"],"ended_at":value["ended_at"],"observed_span_seconds":value["observed_span_seconds"],"network_difficulty":difficulty,"window_multiplier":8,"requested_window_weight":requested.to_string(),"counted_window_weight":counted.to_string(),"included_share_count":value["included_share_count"],"is_complete":!requested.is_zero()&&counted>=requested},"totals":{"pool_hashrate_ths":pool_hashrate,"pool_counted_share_difficulty":counted.to_string(),"participant_count":value["participant_count"],"expected_time_to_block_seconds":eta(&pool_hashrate,&json!(difficulty))},"pagination":pagination(page,limit,value["total_count"].as_i64().unwrap_or(0)),"rows":rows}),
     )
 }
+/// One miner's share of the reward window for `difficulty` (#857): its
+/// `share_percent` as the reward leaderboard's row for it shows it (null
+/// without one), its `counted_share_difficulty`, and the window's
+/// `counted_window_weight`, without the leaderboard's grouping, ranking and
+/// block attribution of every miner.
+pub(super) async fn miner_reward_share(
+    state: &ApiState,
+    difficulty: &str,
+    recipient: &str,
+) -> ApiResult<Value> {
+    let mut value: Value =
+        sqlx::query_scalar(include_str!("queries/dashboard_miner_reward_share.sql"))
+            .bind(difficulty)
+            .bind(recipient)
+            .fetch_one(&state.pool)
+            .await?;
+    value["share_percent"] = normalized_decimal(&value["share_percent"]);
+    Ok(value)
+}
+/// The pool summary's 1-, 3- and 24-hour accepted share difficulty and its
+/// 3-hour participants (#857): from the 5-minute rollups and the raw shares
+/// they do not hold yet, or, on a database without the rollup schema, from
+/// the raw ledger.
+pub(super) async fn pool_hashrate_sums(state: &ApiState) -> ApiResult<Value> {
+    let rollups_present: bool = sqlx::query_scalar("SELECT to_regclass('qbit_hashrate_rollup_progress') IS NOT NULL AND to_regclass('qbit_hashrate_rollup_pool') IS NOT NULL AND to_regclass('qbit_hashrate_rollup_miner') IS NOT NULL")
+        .fetch_one(&state.pool).await?;
+    let sql = if rollups_present {
+        include_str!("queries/dashboard_pool_hashrate_rollups.sql")
+    } else {
+        include_str!("queries/dashboard_pool_hashrate.sql")
+    };
+    Ok(sqlx::query_scalar(sql).fetch_one(&state.pool).await?)
+}
 pub(super) async fn leaderboard(
     state: &ApiState,
     page: i64,
