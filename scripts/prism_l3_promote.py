@@ -13,7 +13,10 @@ This script looks for that run and prints the decision as JSON:
     timed out),
   - uploaded `prism-l3-verdict-<tree>` for exactly this tree, whose
     `verdict.json` (`qbit.prism.l3-verdict.v1`) is for suite `l3-full` and
-    `complete`: every planned run reached its gate. A complete run that
+    `complete`: every planned run reached its gate, and every planned run
+    is gated (a verdict naming `gated_runs`, #695, must count every run, so
+    a tag never carries a suite whose budgets were partly report-only). A
+    complete run that
     failed a gate is promoted too, and the tag run then fails with it: the
     same tree would measure the same, and the verdict is carried, not
     dropped;
@@ -103,6 +106,13 @@ def verdict_rejection(verdict: object, tree: str) -> str | None:
         return f"ran suite {verdict.get('suite')!r}, not {FULL_SUITE}"
     if verdict.get("complete") is not True:
         return "did not bring every planned run to its gate"
+    # #695: a verdict from before report-only runs has no gated_runs and
+    # gated every run; one that has it must have gated them all.
+    if "gated_runs" in verdict and verdict.get("gated_runs") != verdict.get("planned"):
+        return (
+            f"gated {verdict.get('gated_runs')!r} of {verdict.get('planned')!r} planned runs; "
+            "a report-only run is not release evidence"
+        )
     if not isinstance(verdict.get("passed"), bool):
         return "its verdict does not say whether the suite passed"
     return None

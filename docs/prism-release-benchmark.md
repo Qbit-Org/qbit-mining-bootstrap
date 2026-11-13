@@ -197,8 +197,15 @@ columns but gets no D1 verdict.
 
 A run counts only when its artifact is present, its report names the plan's
 commit, it ran the checked-in preset byte for byte (SHA-256) and it was built
-from a clean tree. Exit 0 when every planned run reached its gate and passed
-it, 1 when not, 2 when the inputs cannot be read. The collation does not
+from a clean tree. Exit 0 when every planned run reached its gate and every
+gated run passed it, 1 when not, 2 when the inputs cannot be read. A
+report-only run (#695, a suite's `report_only`) is exempt from its capacity
+budgets (shortfall, latency) only: it must still reach its gate and hold
+every other check, harness exit 0 (completed and reconciled exactly) and its
+refused-valid-share and unanswered-submit budgets among them; of its refused
+valid shares only those answered `share was not confirmed by the database`
+in a phase short of its rate (a commit deadline passing under overload) are
+set aside (#847). The collation does not
 compare against a base. The A/B series on the reference host stays the
 release's regression check, and L3 is the production-window evidence beside
 it, on the CI runner class.

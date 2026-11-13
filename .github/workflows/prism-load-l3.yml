@@ -8,6 +8,18 @@ name: PRISM load harness (L3 production-window matrix)
 # flag its result depends on, so the suite file and the presets are the whole
 # configuration.
 #
+# A suite's `report_only` presets (#695: the reduced suite's 20x growth
+# shape, mainnet-shape-2600-addresses, a capacity-envelope point past the
+# share append's ceiling, #555 decision 5) run and are gated by their preset
+# like every other, but their matrix entry carries `gated: false`: the run
+# step may fail without failing its job (`continue-on-error` on that step
+# alone), and the collation shows them labelled "report-only, not gated".
+# Only their capacity budgets (shortfall, latency) are exempt: the suite
+# still fails unless such a run reached its gate and held every other check,
+# the harness's exit 0 (completed, reconciled exactly) among them, and its
+# job fails on a harness failure or a gate with no verdict. Every other run
+# gates the suite.
+#
 # What runs it (decision 8 of #487):
 #   - a pull request into 3.x.x or main that changes VERSION, the version
 #     bump, on every push to it. Only a pull request from this repository;
@@ -83,8 +95,10 @@ on:
       suite:
         description: >-
           Suite from crates/qbit-prism-load/presets/suites.toml: l3-full
-          (#447's matrix, three repeats) or l3-reduced (400k at 1, 2 and 4
-          frontends). Ignored when tag_dry_run is set, which runs l3-full.
+          (#447's matrix, three repeats) or l3-reduced (the weekly suite:
+          400k at 1, 2 and 4 frontends, the session points and the mainnet
+          shapes, the 20x shape report-only). Ignored when tag_dry_run is
+          set, which runs l3-full.
         required: true
         default: l3-full
       ref:
@@ -469,6 +483,7 @@ jobs:
         env:
           RUN_ID: ${{ matrix.id }}
           RUNNER_LABEL: ${{ matrix.runner }}
+          GATED: ${{ matrix.gated }}
         run: |
           set -euo pipefail
           {
@@ -476,13 +491,55 @@ jobs:
             echo
             echo "Commit \`$(git rev-parse HEAD)\`; the host, its disk and the runner label are in host.json below."
             echo
+            if [[ "${GATED}" == false ]]; then
+              echo "**Report-only, not gated** (#695): this suite measures the preset as a capacity-envelope point (#555 decision 5). Its gate below still judges it. Its capacity budgets (shortfall, latency) do not decide the suite; every other check still does, the harness's exit among them. Of its refused valid shares, the collation sets aside only those answered \`share was not confirmed by the database\` in a phase short of its rate (#847), so gate.md can list refusals the suite does not fail on."
+              echo
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
-      # The preset's own gates only: no override reaches an L3 run.
+      # The preset's own gates only: no override reaches an L3 run. A
+      # report-only run's (#695) failing step does not fail the job: only this
+      # step is continue-on-error, so a checkout, install, download, upload or
+      # timeout failure still fails it, and the collation still fails the
+      # suite unless the run reached its gate and held every check but its
+      # capacity budgets and the commit deadline's refusals under overload
+      # (#847).
+      # toJSON, not `matrix.gated == false`: Actions' loose equality makes a
+      # missing `gated` (a plan from before #695) equal false. Only an
+      # explicit false is report-only.
       - name: Run and gate the preset
+        id: gate
+        continue-on-error: ${{ toJSON(matrix.gated) == 'false' }}
         env:
           PRESET: ${{ matrix.preset }}
           RUNNER_LABEL: ${{ matrix.runner }}
         run: bash .github/scripts/prism-load-run.sh "${PRESET}" "${RUNNER_TEMP}/prism-load-out"
+      # Only a failed gate verdict (gate exit 1) on a run the harness
+      # completed and reconciled (exit 0) leaves the job green; the collation
+      # then says whether a check beyond the capacity budgets failed. A
+      # harness failure or no gate verdict fails the job here.
+      - name: Report a report-only run's failure
+        if: ${{ !cancelled() && steps.gate.outcome == 'failure' && steps.gate.conclusion == 'success' }}
+        env:
+          RUN_ID: ${{ matrix.id }}
+          OUT: ${{ runner.temp }}/prism-load-out
+        run: |
+          set -euo pipefail
+          harness="$(cat "${OUT}/harness-exit-code" 2>/dev/null || echo 'not captured')"
+          gate="$(cat "${OUT}/gate-exit-code" 2>/dev/null || echo 'not captured')"
+          if [[ "${harness}" == 0 && "${gate}" == 1 ]]; then
+            echo "::warning title=${RUN_ID} is report-only (#695)::its gate failed (harness exit 0, gate exit 1); this job is not failed, but the collation still fails the suite if any check failed other than its capacity budgets and refused valid shares answered as its commit deadline in a phase short of its rate (#847): see the collated verdict"
+            {
+              echo "**Report-only: its gate failed** (harness exit 0, gate exit 1). Not this job's failure; the collation exempts only its capacity budgets (shortfall, latency), and refused valid shares answered \`share was not confirmed by the database\` in a phase short of its rate (#847), and fails the suite on any other failed check in gate.md. The collated gates table says which."
+              echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          echo "::error title=${RUN_ID} did not complete and reconcile::harness exit ${harness}, gate exit ${gate}: report-only exempts capacity budgets only"
+          {
+            echo "**Report-only, but the run itself failed** (harness exit ${harness}, gate exit ${gate}): report-only exempts capacity budgets only, so this fails the job and the suite."
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 1
       - name: Upload the harness reports
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
@@ -494,8 +551,9 @@ jobs:
           if-no-files-found: error
 
   # Every planned run in #473's tables, and the verdict: complete when every
-  # planned run reached its gate, passed when every one passed it. A run with
-  # no artifact is listed, never dropped.
+  # planned run reached its gate, passed when every gated run passed it and
+  # every report-only run (#695) held every check but its capacity budgets.
+  # A run with no artifact is listed, never dropped.
   collate:
     name: Collate the suite into #473's tables
     needs: [plan, build, run]
@@ -587,14 +645,14 @@ jobs:
           retention-days: 90
           path: ${{ runner.temp }}/collated/verdict.json
           if-no-files-found: error
-      - name: Fail unless every planned run passed its gate
+      - name: Fail unless every planned run held the suite
         env:
           STATUS: ${{ steps.collate.outputs.status }}
         run: |
           set -euo pipefail
           case "${STATUS}" in
-            0) echo "every planned run reached its gate and passed it" ;;
-            1) echo "not every planned run passed its gate; see the tables above" >&2; exit 1 ;;
+            0) echo "every planned run reached its gate and every gated run passed it (report-only runs' budgets are in the tables, not the verdict)" ;;
+            1) echo "not every planned run held the suite; see the tables above" >&2; exit 1 ;;
             build-failed) echo "the build failed, so no planned run ran" >&2; exit 1 ;;
             *) echo "the collation could not read its inputs (exit ${STATUS:-none})" >&2; exit 1 ;;
           esac

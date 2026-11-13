@@ -279,7 +279,7 @@ run-to-run and VM-to-VM spread, and the runner class chosen for each lane.
 | Suite | Presets | Repeats | Runner | When |
 |---|---|---|---|---|
 | `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, `throughput-400k-window-2fe-async-3-blocks`, `dense-cadence-400k-window-{1,2}fe-async`, 500k fe1/2/4 | 3 (33 jobs) | 32 vCPU | the version-bump PR, `release-candidate`, a `v*` tag, dispatch |
-| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; `session-point-{5000,10000}-sessions-400k-2fe-async` (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521) | 1 (9 jobs) | 32 vCPU | Monday 06:13 UTC on `3.x.x`, dispatch |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; `session-point-{5000,10000}-sessions-400k-2fe-async` (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521); `mainnet-shape-2600-addresses` report-only (#695) | 1 (9 jobs) | 32 vCPU | Monday 06:13 UTC on `3.x.x`, dispatch |
 
 The runner is the 32 vCPU class until #542 picks one per lane. The triggers:
 
@@ -318,11 +318,21 @@ p99 against the limit, `ORDER_LOCK` waiters, the D1 verdict). A table of each
 preset's own gates follows. The job also writes a verdict:
 
 - `complete`: every planned run reached its gate;
-- `passed`: every planned run passed it.
+- `passed`: every gated run passed it, and every report-only run held every
+  check but its capacity budgets and the commit deadline's refusals in a
+  phase short of its rate (#847).
 
-A planned run whose job left no artifact, whose report names another commit,
-or which ran a preset file other than the checked-in one is listed and fails
-the suite. It is never dropped. A failed build lists every run as never run
+Every run is gated unless its suite lists the preset in `report_only` (see
+below). `verdict.json` carries, per run, `gated`, `holds_suite` and
+`refusals_set_aside` (#847), and `gated_runs`, the count of gated runs,
+beside `planned`, `reached_gate` and `passed_gate`, which count every run. A
+plan entry without `gated` is gated, so plans and verdicts written before
+#695 read unchanged; a plan that gates no run, or gates some repeats of a
+preset and not others, is refused. A tag promotes only a verdict whose
+`gated_runs` equals `planned`. A planned run whose job left no artifact,
+whose report names another commit, or which ran a preset file other than the
+checked-in one is listed and fails the suite.
+It is never dropped. A failed build lists every run as never run
 and writes no verdict. Concurrency is per PR and label (a new push cancels
 the older push's run), per tag, and one group for the weekly run. The
 workflow is never a required check. Cost: `l3-full` is about 660 runner-minutes
@@ -362,6 +372,104 @@ on the same runner class in the same week. The cost is measured as window
 rebuild (the tip-to-last-notify p99) or payout revision (a landing to every
 session holding the new revision's work, median over landings). The trigger
 is evaluated once that point runs.
+
+**Report-only points (#695).** A suite may list some of its presets in
+`report_only`; `l3-reduced` lists one, `mainnet-shape-2600-addresses`, #521's
+20x growth shape. It runs past the share append's `ORDER_LOCK` ceiling on one
+primary: about 420 of its 1,000 shares/s mean in `steady_state`, and a
+tip-to-last-notify p99 above its 5 s budget, in every weekly run from
+2026-10-26. That is a capacity limit to record (#695, #291), not a regression,
+and gating the suite on it turned every weekly run red, so a new failure
+could not show. As a capacity-envelope point it is measured, not a verdict
+(#555 decision 5):
+
+- It still runs every week, through `prism-load-run.sh`, held to its own
+  gates. Its matrix entry carries `gated: false`, and only its "Run and gate
+  the preset" step is `continue-on-error`. A gate verdict of fail (gate exit
+  1) on a run the harness completed and reconciled (exit 0) leaves the step
+  red, a `::warning::` and a summary line saying it is not gated, and the job
+  green. Any other failure of the step (a harness exit other than 0, or a
+  gate with no verdict) fails the job through the next step, and a failed
+  checkout, install, download or upload, or a timeout, fails it as before.
+- **What it exempts:** its capacity budgets: shortfall, and every latency
+  budget the preset sets (tip-to-last-notify p99 and median, churn tip
+  delivery, new sessions' first job). #695's misses are the `warm_up` and
+  `steady_state` shortfall and the tip-to-last-notify p99. The collation
+  re-evaluates the run with those budgets opened (shortfall unbounded, a set
+  latency budget infinite) and every other budget as the preset has it,
+  except that it judges refused valid shares itself (see the #847 bullet
+  below); a budget added to the gate later is not opened until it is
+  listed, so it gates report-only runs by default.
+- **What it does not exempt:** everything else. The run must reach its gate
+  (an artifact of this build's run of this preset, from a clean tree, and a
+  gate exit of 0 or 1), and the harness must exit 0 (completed, reconciled
+  exactly). No durability finding, every gated phase ran, every tip measured
+  (a tip some session never got work on still fails), unanswered submits
+  within the preset's budget, and refused valid shares within it but for
+  the commit deadline's under overload (below). A report-only
+  run that loses or double-counts an acknowledged share, aborts, skips a
+  phase or leaves no report fails the suite like any other.
+- **Refused valid shares and unanswered submits (#847).** A report-only
+  preset must budget both: the matrix and the collation refuse one whose
+  `max_rejected_valid_shares` or `max_unanswered_submits` is null, since its
+  run would otherwise be gated on neither. The 20x shape budgets both at 0.
+  Unanswered submits were 0 in every run of it so far (#695's two dispatches
+  of 2026-10-06 and the weekly runs of 10-26, 11-02 and 11-09). Refused valid
+  shares in its gated phases (`warm_up`, `steady_state`, `reconnect`) were
+  not: 34,670 and 2 in the two 10-06 dispatches, 11,513 on 10-26, then 0 on
+  11-02 and 11-09. On 10-26 every one was the server's answer when a share's
+  commit deadline passes before COMMIT (`ledger-confirmation-failed`, `share
+  was not confirmed by the database`; the frontends logged `share commit
+  deadline passed before COMMIT was sent` for each, bar three lock
+  timeouts), which is how an append past its capacity sheds load. So the
+  collation sets aside exactly that answer, in a report-only run only, and
+  only in a phase whose shortfall exceeds the preset's budget, the evidence
+  that the phase ran past its capacity. It holds every other refused valid
+  share in a gated phase to the preset's budget: that answer in a phase that
+  kept its rate, `current chain state is unavailable` (the #716/#779 class),
+  `share outcome is not yet known`, `share was not committed because its
+  commit gate closed`, and any refusal the phase counts that its rejection
+  table does not explain. A phase that reports no shortfall, refusal count
+  or rejection table fails. The commit gate's
+  answer can also be a deadline (at a tip-change lease's hook), but it is
+  the answer to a refusal with no recorded cause too, and the 20x shape gave
+  it only twice, on 10-06, so it stays gated: a deep-overload week that
+  produces it fails the suite and is read, not hidden.
+- **What that set-aside cannot see.** The server sends the same answer for
+  any failed ledger write, and the client cannot tell a deadline's from
+  another's, so a ledger failure in a phase that is also short of its rate
+  is not gated on this point. The first 10-06 dispatch is the example: most
+  of its refusals were the payout-revision fence answered as a ledger
+  failure (#675, fixed by #698), in phases that were short of their rate. A
+  distinct server answer for the commit deadline would close this. Among
+  the gated presets in the same suite, only the three 400k points budget
+  refused valid shares (at 0, in `steady_state`); the other mainnet shapes,
+  the session points and the rental churn preset leave them unbudgeted, as
+  they did before #695. The set-aside refusals stay in the phase tables
+  and, against the preset's own budget of 0, in the gates table and the
+  run's `gate.md`. The collation's report-only line and its PASS verdict
+  say how many were set aside, and `verdict.json` carries the count per run
+  as `refusals_set_aside`. The shortfall is evidence of overload, not proof:
+  a ledger failure that holds sessions until the deadline also makes one.
+- The collation keeps it in every table, its preset cell, its runs-table
+  gate and its D1 column labelled `report-only, not gated`, its shortfall in
+  the phase tables and its failed checks in the gates table. A line above the
+  tables names it and counts its runs that reached their gate, held every
+  check but their capacity budgets, and passed their own gates. Its D1 cell
+  keeps its own text behind the label. It is never shown as a pass.
+- Run on its own (the nightly workflow's dispatch, or any selection other
+  than a suite), it carries no `gated` and its gates fail the run as before.
+- Every other preset in both suites gates. A suite must keep at least one
+  gated preset, and `report_only` may name only the suite's own presets,
+  never a soak preset (whose own gates the collation cannot repeat), a D1
+  cell, or a preset with no budget for refused valid shares or unanswered
+  submits. `l3-full`, the suite a tag runs or promotes, takes no
+  `report_only`.
+
+The `continue-on-error` is the workflow's, so the weekly run, which reads
+`main`'s copy of the file, applies it only once the change reaches `main`.
+Until then the `collate` job passes on a weekly run whose 20x job fails its
+budgets, but the run's overall conclusion stays failed.
 
 ## L4: real-node scenarios
 
