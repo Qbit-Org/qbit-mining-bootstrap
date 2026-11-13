@@ -31,8 +31,10 @@ use tokio::{
 #[cfg(test)]
 use tokio::net::tcp::OwnedWriteHalf;
 
+mod difficulty_hints;
 mod retained_jobs;
 mod stale_grace;
+use difficulty_hints::{DifficultyHints, WriterEnd};
 pub use stale_grace::{RetentionTip, StaleGrace};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +196,13 @@ pub struct StratumConfig {
     pub resume_max_entries: usize,
     pub resume_max_start_factor: f64,
     pub retained_difficulties: RetainedDifficulties,
+    /// Vardiff resume hints each listener's difficulty-hint writer holds
+    /// queued, one per worker at most, before it drops new ones (#856). Not
+    /// read from the environment.
+    pub difficulty_hint_queue_capacity: usize,
+    /// The bound on each difficulty-hint write, its read-back included
+    /// (#856). Not read from the environment.
+    pub difficulty_hint_timeout_seconds: f64,
     pub startup_difficulty: f64,
     pub minimum_difficulty: f64,
     pub vardiff: VardiffConfig,
@@ -245,6 +254,8 @@ impl Default for StratumConfig {
             resume_max_entries: 8192,
             resume_max_start_factor: 1024.0,
             retained_difficulties: Arc::new(Mutex::new(HashMap::new())),
+            difficulty_hint_queue_capacity: difficulty_hints::DEFAULT_QUEUE_CAPACITY,
+            difficulty_hint_timeout_seconds: difficulty_hints::DEFAULT_WRITE_TIMEOUT_SECONDS,
             startup_difficulty: 0.000000001,
             minimum_difficulty: 0.0,
             vardiff: VardiffConfig::default(),
@@ -790,6 +801,16 @@ impl StratumConfig {
             "PRISM_STRATUM_VARDIFF_RESUME_MAX_START_FACTOR must be finite and at least 1"
         );
         ensure!(
+            self.difficulty_hint_queue_capacity > 0,
+            "the difficulty hint queue must hold at least one hint"
+        );
+        ensure!(
+            self.difficulty_hint_timeout_seconds.is_finite()
+                && self.difficulty_hint_timeout_seconds >= 0.001
+                && Duration::try_from_secs_f64(self.difficulty_hint_timeout_seconds).is_ok(),
+            "the difficulty hint timeout must be finite and at least 1 ms"
+        );
+        ensure!(
             (1..=crate::listen::MAX_LISTEN_BACKLOG).contains(&self.listen_backlog),
             "PRISM_STRATUM_LISTEN_BACKLOG must be between 1 and {}",
             crate::listen::MAX_LISTEN_BACKLOG
@@ -941,8 +962,13 @@ struct Session<C> {
     authorization_permit: Option<Arc<OwnedSemaphorePermit>>,
     observation: SessionObservation,
     pending_retarget: Option<(f64, Vardiff)>,
-    last_accepted_share: Option<(String, f64)>,
+    /// The session's last accepted share: its ID, the difficulty it proved
+    /// and when it was accepted.
+    last_accepted_share: Option<(String, f64, Instant)>,
     last_hint: Option<(f64, Instant)>,
+    /// Where this session's vardiff resume hints go: its listener's writer,
+    /// never awaited (#856).
+    hints: DifficultyHints,
     malformed_frames: SessionBudget,
     unknown_jobs: SessionBudget,
     authorize_attempts: SessionBudget,
@@ -950,7 +976,11 @@ struct Session<C> {
 }
 
 impl<C> Session<C> {
-    fn new(config: &StratumConfig, observation: SessionObservation) -> Self {
+    fn new(
+        config: &StratumConfig,
+        observation: SessionObservation,
+        hints: DifficultyHints,
+    ) -> Self {
         // Validation keeps this convertible; a zero-limit budget ignores it.
         let interval = Duration::try_from_secs_f64(config.session_budget_interval_seconds)
             .unwrap_or(Duration::from_secs(60));
@@ -977,6 +1007,7 @@ impl<C> Session<C> {
             pending_retarget: None,
             last_accepted_share: None,
             last_hint: None,
+            hints,
             malformed_frames: SessionBudget::new(
                 config.max_malformed_frames_per_interval,
                 interval,
@@ -1098,53 +1129,6 @@ fn retain_difficulty(
         }
     }
     retained.insert(key, (difficulty, recorded));
-}
-
-async fn remember_difficulty<B: MiningBackend>(
-    backend: &B,
-    config: &StratumConfig,
-    worker: &Worker,
-    difficulty: f64,
-    share_id: Option<&str>,
-    downward_only: bool,
-) {
-    if !config.resume_enabled || config.resume_ttl_seconds == 0 || config.resume_max_entries == 0 {
-        return;
-    }
-    if !downward_only && share_id.is_none() {
-        return;
-    }
-    let persisted = timeout(Duration::from_millis(500), async {
-        backend
-            .remember_worker_difficulty(
-                &config.listener_name,
-                worker,
-                difficulty,
-                share_id,
-                downward_only,
-            )
-            .await?;
-        // A different frontend may already have newer accepted evidence.
-        // Cache the canonical retained value and its database age, rather
-        // than treating this optional write as new evidence on this host.
-        backend
-            .worker_difficulty(&config.listener_name, worker, config.resume_ttl_seconds)
-            .await
-    })
-    .await;
-    match persisted {
-        Ok(Ok(Some((difficulty, age)))) => {
-            retain_difficulty(config, worker, difficulty, age, !downward_only);
-        }
-        Ok(Ok(None)) => {
-            config
-                .retained_difficulties
-                .lock()
-                .unwrap()
-                .remove(&(config.listener_name.clone(), worker.username.clone()));
-        }
-        _ => {}
-    }
 }
 
 async fn write_json(
@@ -1484,11 +1468,11 @@ async fn announce_job<B: MiningBackend>(
         let evidence = session
             .last_accepted_share
             .as_ref()
-            .filter(|(_, proved)| {
+            .filter(|(_, proved, _)| {
                 (!session.vardiff.proposed_initial && session.vardiff.proposed_share_backed)
                     || *proved == difficulty
             })
-            .map(|(share_id, _)| share_id.clone());
+            .map(|(share_id, _, accepted)| (share_id.clone(), *accepted));
         let downward_only = difficulty < previous && evidence.is_none();
         session.vardiff.delivered_retarget();
         (difficulty, evidence, downward_only)
@@ -1518,15 +1502,16 @@ async fn announce_job<B: MiningBackend>(
     // retarget seen since asks for the next one.
     observation.outcome = DeliveryOutcome::Success;
     if let Some((difficulty, evidence, downward_only)) = hint {
-        remember_difficulty(
-            backend,
+        session.hints.offer(
             config,
+            metrics,
             worker,
             difficulty,
-            evidence.as_deref(),
+            evidence
+                .as_ref()
+                .map(|(share_id, accepted)| (share_id.as_str(), *accepted)),
             downward_only,
-        )
-        .await;
+        );
     }
     Ok(())
 }
@@ -1934,7 +1919,9 @@ async fn request<B: MiningBackend>(
                 if let Some((_, previous)) = &mut session.pending_retarget {
                     previous.accepted(proved_difficulty);
                 }
-                session.last_accepted_share = Some((share_id.clone(), proved_difficulty));
+                let accepted_at = Instant::now();
+                session.last_accepted_share =
+                    Some((share_id.clone(), proved_difficulty, accepted_at));
                 config
                     .stats
                     .accepted_submissions
@@ -1952,15 +1939,16 @@ async fn request<B: MiningBackend>(
                             || at.elapsed() >= Duration::from_secs(30)
                     })
                 {
-                    remember_difficulty(
-                        backend,
+                    // Queued, never awaited: the write must not hold up
+                    // this session's next request (#856).
+                    session.hints.offer(
                         config,
+                        metrics,
                         &issued.worker,
                         issued.job.wire.share_difficulty,
-                        Some(&share_id),
+                        Some((&share_id, accepted_at)),
                         false,
-                    )
-                    .await;
+                    );
                     session.last_hint = Some((issued.job.wire.share_difficulty, Instant::now()));
                 }
                 session.retarget();
@@ -2005,10 +1993,14 @@ async fn session<B: MiningBackend>(
     refresh: watch::Receiver<u64>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<crate::metrics::Metrics>,
+    hints: DifficultyHints,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let (reader, writer) = stream.into_split();
-    serve_connection(reader, writer, backend, config, refresh, shutdown, metrics).await
+    serve_session(
+        reader, writer, backend, config, refresh, shutdown, metrics, hints,
+    )
+    .await
 }
 
 /// Whether the session breached a per-session budget. The breach was
@@ -2024,14 +2016,52 @@ fn budget_breached<C>(session: &Session<C>) -> bool {
     true
 }
 
-/// One Stratum connection's request loop over any byte stream (#575).
-/// `run_listener` calls it with an accepted socket's halves; the fuzz targets
-/// and property tests call it over an in-memory pipe, so the line framing and
-/// session state machine they exercise are exactly the production ones.
-/// Admission (the global, per-source and per-username limits taken at
-/// accept) and `StratumConfig::validate` stay with the caller.
+/// One Stratum connection's request loop over any byte stream (#575). The
+/// listeners serve each accepted socket's halves through the same loop
+/// (`serve_session`); the fuzz targets and property tests call this over an
+/// in-memory pipe, so the line framing and session state machine they
+/// exercise are the production ones. Admission (the global, per-source and
+/// per-username limits taken at accept) and `StratumConfig::validate` stay
+/// with the caller.
+///
+/// Served this way, on its own, the connection brings its own difficulty-hint
+/// writer (#856), which writes what the session queued before this returns,
+/// as when the session awaited each hint (combined per worker, and bar a
+/// decrease past its wait bound, aged out as on a listener), and whose panic
+/// is the connection's; a listener's sessions share the listener's writer.
 #[doc(hidden)]
 pub async fn serve_connection<B: MiningBackend>(
+    reader: impl AsyncRead + Unpin,
+    writer: impl AsyncWrite + Unpin,
+    backend: Arc<B>,
+    config: StratumConfig,
+    refresh: watch::Receiver<u64>,
+    shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
+) -> Result<()> {
+    let hints = DifficultyHints::new();
+    hints
+        .beside(
+            backend.clone(),
+            config.clone(),
+            metrics.clone(),
+            WriterEnd::Drain,
+            serve_session(
+                reader,
+                writer,
+                backend,
+                config,
+                refresh,
+                shutdown,
+                metrics,
+                hints.clone(),
+            ),
+        )
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_session<B: MiningBackend>(
     reader: impl AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
     backend: Arc<B>,
@@ -2039,9 +2069,10 @@ pub async fn serve_connection<B: MiningBackend>(
     mut refresh: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<crate::metrics::Metrics>,
+    hints: DifficultyHints,
 ) -> Result<()> {
     let observation = SessionObservation::new(config.stats.clone()).reporting_to(metrics.clone());
-    let mut session = Session::new(&config, observation);
+    let mut session = Session::new(&config, observation, hints);
     let mut reader = BufReader::new(reader);
     let mut buffer = Vec::new();
     let mut timer = interval(Duration::from_secs(1));
@@ -2197,25 +2228,33 @@ pub async fn run_listener<B: MiningBackend>(
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
     metrics.revision_work_sessions_tracked();
     let mut connections = JoinSet::new();
+    let hints = DifficultyHints::new();
     let sessions = Sessions {
         config: config.clone(),
         backend: backend.clone(),
         refresh: refresh.clone(),
         shutdown: shutdown.clone(),
         metrics: metrics.clone(),
+        hints: hints.clone(),
     };
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        tokio::select! {
-            changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
-            _ = connections.join_next(), if !connections.is_empty() => {}
-            accepted = listener.accept() => sessions.start(accepted?, &mut connections),
-        }
-    }
-    drain_sessions(connections).await;
-    Ok(())
+    // The sessions' difficulty-hint writer (#856) runs beside the accept
+    // loop and the drain, and stops with them.
+    hints
+        .beside(backend, config, metrics, WriterEnd::Abandon, async move {
+            loop {
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                    accepted = listener.accept() => sessions.start(accepted?, &mut connections),
+                }
+            }
+            drain_sessions(connections).await;
+            Ok(())
+        })
+        .await
 }
 
 /// A dual-writer Stratum listener (3.1): bound from startup, listening only
@@ -2231,6 +2270,43 @@ pub async fn run_listener<B: MiningBackend>(
 /// no other; what is left after a short drain is aborted.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_gated_listener<B: MiningBackend>(
+    address: crate::listen::ReservedAddress,
+    config: StratumConfig,
+    backend: Arc<B>,
+    refresh: watch::Receiver<u64>,
+    shutdown: watch::Receiver<bool>,
+    metrics: Arc<crate::metrics::Metrics>,
+    admission: watch::Receiver<crate::readiness::admission::AdmissionSignal>,
+    stale_after: Duration,
+) -> Result<()> {
+    config.validate()?;
+    // The sessions' difficulty-hint writer (#856) runs beside the listener,
+    // its sessions and their drains, and stops with them.
+    let hints = DifficultyHints::new();
+    hints
+        .beside(
+            backend.clone(),
+            config.clone(),
+            metrics.clone(),
+            WriterEnd::Abandon,
+            gated_listener(
+                address,
+                config,
+                backend,
+                refresh,
+                shutdown,
+                metrics,
+                admission,
+                stale_after,
+                hints.clone(),
+            ),
+        )
+        .await
+}
+
+/// [`run_gated_listener`]'s gate and accept loop.
+#[allow(clippy::too_many_arguments)]
+async fn gated_listener<B: MiningBackend>(
     mut address: crate::listen::ReservedAddress,
     config: StratumConfig,
     backend: Arc<B>,
@@ -2239,8 +2315,8 @@ pub async fn run_gated_listener<B: MiningBackend>(
     metrics: Arc<crate::metrics::Metrics>,
     mut admission: watch::Receiver<crate::readiness::admission::AdmissionSignal>,
     stale_after: Duration,
+    hints: DifficultyHints,
 ) -> Result<()> {
-    config.validate()?;
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
     metrics.revision_work_sessions_tracked();
     metrics.publish_stratum_listener_accepting(&config.listener_name, false);
@@ -2255,6 +2331,7 @@ pub async fn run_gated_listener<B: MiningBackend>(
         refresh: refresh.clone(),
         shutdown: sessions_stop,
         metrics: metrics.clone(),
+        hints,
     };
     // Sessions closed by a definite fault, draining off this loop.
     let mut drains = JoinSet::new();
@@ -2378,6 +2455,8 @@ struct Sessions<B> {
     refresh: watch::Receiver<u64>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<crate::metrics::Metrics>,
+    /// The listener's difficulty-hint queue (#856).
+    hints: DifficultyHints,
 }
 
 impl<B: MiningBackend> Sessions<B> {
@@ -2407,11 +2486,12 @@ impl<B: MiningBackend> Sessions<B> {
             drop(stream);
             return;
         };
-        let (backend, config, refresh, shutdown) = (
+        let (backend, config, refresh, shutdown, hints) = (
             self.backend.clone(),
             config.clone(),
             self.refresh.clone(),
             self.shutdown.clone(),
+            self.hints.clone(),
         );
         let metrics = metrics.clone();
         let runtime = metrics.runtime();
@@ -2420,7 +2500,7 @@ impl<B: MiningBackend> Sessions<B> {
                 let _permit = permit;
                 let _ip_permit = ip_permit;
                 if let Err(error) =
-                    session(stream, backend, config, refresh, shutdown, metrics).await
+                    session(stream, backend, config, refresh, shutdown, metrics, hints).await
                 {
                     tracing::warn!(error = %format_args!("{error:#}"), "Stratum connection ended");
                 }
@@ -2500,6 +2580,8 @@ pub async fn probe_first_difficulty(
     .context("Stratum difficulty probe timed out")?
 }
 
+#[cfg(test)]
+mod difficulty_hint_tests;
 #[cfg(test)]
 mod stale_grace_tests;
 

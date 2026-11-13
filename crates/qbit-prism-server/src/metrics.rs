@@ -188,6 +188,13 @@ impl Metrics {
                 0.,
             );
         }
+        for outcome in DifficultyHintOutcome::ALL {
+            registry.register(
+                Family::DifficultyHints,
+                label("outcome", outcome.as_str()),
+                0.,
+            );
+        }
         for decision in CaptureDecision::ALL {
             registry.register(
                 Family::CaptureOfferDecisions,

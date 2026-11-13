@@ -366,7 +366,11 @@ async fn bury_superseded_same_parent_retains_the_block_but_leaves_other_jobs_liv
         job_retention_seconds: 30.0,
         ..Default::default()
     };
-    let mut session = Session::new(&config, SessionObservation::new(config.stats.clone()));
+    let mut session = Session::new(
+        &config,
+        SessionObservation::new(config.stats.clone()),
+        DifficultyHints::new(),
+    );
     let issued = |mut job: MiningJob<JobContext>, id: &str| {
         job.wire.job_id = id.into();
         IssuedJob {
@@ -442,7 +446,11 @@ async fn burying_a_superseded_job_releases_its_reservation_but_keeps_it_block_su
         job_retention_seconds: 30.0,
         ..Default::default()
     };
-    let mut session = Session::new(&config, SessionObservation::new(config.stats.clone()));
+    let mut session = Session::new(
+        &config,
+        SessionObservation::new(config.stats.clone()),
+        DifficultyHints::new(),
+    );
     let semaphore = Arc::new(Semaphore::new(1));
     let permit = Arc::new(semaphore.clone().try_acquire_owned().unwrap());
     assert_eq!(semaphore.available_permits(), 0, "the reservation is held");
@@ -509,7 +517,11 @@ async fn permit_lookup_finds_the_reservation_past_block_only_work_on_every_run()
         ..config.clone()
     };
     for run in 0..64 {
-        let mut session = Session::new(&config, SessionObservation::new(config.stats.clone()));
+        let mut session = Session::new(
+            &config,
+            SessionObservation::new(config.stats.clone()),
+            DifficultyHints::new(),
+        );
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = Arc::new(semaphore.clone().try_acquire_owned().unwrap());
         // Current work evicted into the graveyard keeps its reservation.
@@ -551,7 +563,11 @@ async fn block_only_cap_counts_superseded_graveyard_work_and_spares_credit_work(
         job_retention_seconds: 30.0,
         ..Default::default()
     };
-    let mut session = Session::new(&config, SessionObservation::new(config.stats.clone()));
+    let mut session = Session::new(
+        &config,
+        SessionObservation::new(config.stats.clone()),
+        DifficultyHints::new(),
+    );
     // N superseded jobs evicted into the graveyard, then N more live.
     for i in 0..n {
         session.jobs.push_back(issued_with(

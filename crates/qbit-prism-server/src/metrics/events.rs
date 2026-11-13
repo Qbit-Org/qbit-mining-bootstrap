@@ -245,6 +245,19 @@ impl Metrics {
                 Labels::One(("reason", reason.as_str())),
             );
     }
+    /// Exactly once per difficulty hint a session offered its listener's
+    /// writer, when the hint's fate is known (#856); `count` hints at once
+    /// when a stopping writer abandons its queue.
+    pub fn record_difficulty_hints(&self, outcome: DifficultyHintOutcome, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).add(
+            Family::DifficultyHints,
+            Labels::One(("outcome", outcome.as_str())),
+            count as f64,
+        );
+    }
     /// The configured global ceiling, never the permits left after admissions.
     pub fn set_stratum_connection_limit(&self, limit: usize) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(

@@ -107,6 +107,13 @@ labels!(ConnectionRefusalReason {
     MalformedFrameBudget => "malformed_frame_budget", UnknownJobBudget => "unknown_job_budget",
     AuthorizeBudget => "authorize_budget"
 });
+// #856: what became of a vardiff resume hint a Stratum session handed to its
+// listener's difficulty-hint writer.
+labels!(DifficultyHintOutcome {
+    Written => "written", Failed => "failed", TimedOut => "timed_out", AgedOut => "aged_out",
+    Dropped => "dropped", Superseded => "superseded", Abandoned => "abandoned",
+    WriterPanicked => "writer_panicked"
+});
 // How a refresh snapshot acquired its payout window: the delta path advanced
 // the retired window, or the reason the newest-first full scan ran instead.
 labels!(WindowAcquisition {

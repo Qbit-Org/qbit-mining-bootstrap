@@ -976,6 +976,127 @@ async fn a_rebuild_keeps_moving_while_a_submit_is_handled() {
     task.await.unwrap();
 }
 
+fn difficulty_hints(metrics: &qbit_prism_server::metrics::Metrics, outcome: &str) -> f64 {
+    let name = format!("qbit_prism_stratum_difficulty_hints_total{{outcome=\"{outcome}\"}} ");
+    metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&name))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+// #856: an accepted share's difficulty hint is written beside the listener,
+// not awaited by the session. With the first share's hint write held, the
+// same session's next share is answered while that write is still pending.
+#[tokio::test]
+async fn a_submit_is_answered_while_the_previous_shares_difficulty_hint_write_is_held() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    // The write is held for as long as the test needs, never cut short by
+    // its bound.
+    let config = StratumConfig {
+        difficulty_hint_timeout_seconds: 60.0,
+        ..Default::default()
+    };
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let gate = Arc::new(observability::Gate::default());
+    *backend.hint_gate.lock().unwrap() = Some(gate.clone());
+    let mut client = Client::connect(address).await;
+    client.login("miner.hinted").await;
+    client
+        .send(client.solved_share(10, "miner.hinted", 0))
+        .await;
+    assert_eq!(client.response(10).await["result"], true);
+    gate.entered.notified().await;
+    client
+        .send(client.solved_share(11, "miner.hinted", 100_000))
+        .await;
+    let answer = client.response(11).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let key = ("default".to_string(), "miner.hinted".to_string());
+    assert!(
+        !backend.hints.lock().unwrap().contains_key(&key),
+        "the hint write finished before the next share was answered"
+    );
+    gate.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while difficulty_hints(&metrics, "written") < 1. {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the held hint was never written");
+    assert_eq!(backend.hints.lock().unwrap()[&key].0, client.difficulty);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
+// #856: the listener's hint queue is bounded. With its writer held in one
+// write and its one queue slot taken, a third worker's hint is dropped and
+// counted, and that worker's session goes on answering shares.
+#[tokio::test]
+async fn a_full_difficulty_hint_queue_drops_and_counts_a_new_hint_without_blocking_its_session() {
+    let metrics = Arc::new(qbit_prism_server::metrics::Metrics::default());
+    let config = StratumConfig {
+        difficulty_hint_queue_capacity: 1,
+        difficulty_hint_timeout_seconds: 60.0,
+        ..Default::default()
+    };
+    let (address, backend, _refresh, shutdown, task) =
+        start_with_metrics(config, metrics.clone()).await;
+    backend.network_bits.store(0x1d00ffff, Ordering::Relaxed);
+    let gate = Arc::new(observability::Gate::default());
+    *backend.hint_gate.lock().unwrap() = Some(gate.clone());
+    let workers = ["miner.held", "miner.queued", "miner.dropped"];
+    let mut clients = Vec::new();
+    for worker in workers {
+        let mut client = Client::connect(address).await;
+        client.login(worker).await;
+        clients.push(client);
+    }
+    for (index, (client, worker)) in clients.iter_mut().zip(workers).enumerate() {
+        client.send(client.solved_share(10, worker, 0)).await;
+        assert_eq!(client.response(10).await["result"], true, "{worker}");
+        if index == 0 {
+            // The writer takes the first hint and is held in its write.
+            gate.entered.notified().await;
+        }
+    }
+    assert_eq!(difficulty_hints(&metrics, "dropped"), 1.);
+    let dropped = &mut clients[2];
+    dropped
+        .send(dropped.solved_share(11, "miner.dropped", 100_000))
+        .await;
+    assert_eq!(dropped.response(11).await["result"], true);
+    assert!(
+        backend.hints.lock().unwrap().is_empty(),
+        "the write was not held"
+    );
+    gate.release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while difficulty_hints(&metrics, "written") < 2. {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the held and queued hints were never written");
+    let mut stored: Vec<_> = backend
+        .hints
+        .lock()
+        .unwrap()
+        .keys()
+        .map(|(_, worker)| worker.clone())
+        .collect();
+    stored.sort();
+    assert_eq!(stored, ["miner.held", "miner.queued"]);
+    assert_eq!(difficulty_hints(&metrics, "dropped"), 1.);
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}
+
 /// A writer whose writes wait, once armed, until the test releases them, or
 /// fail, once broken.
 #[derive(Default)]
