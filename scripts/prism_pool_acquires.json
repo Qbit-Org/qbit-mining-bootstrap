@@ -212,7 +212,7 @@
     "coordinator.rs::rebuild_claim_parts#1::match self . ledger .acquire()": [1,"ledger"],
     "coordinator.rs::submit_loop_with#1::attempt .run(& self , lease)": [1,"non-database"],
     "coordinator.rs::with_tracked_heartbeat#1::self . ledger .acquire()": [2,"ledger"],
-    "coordinator/issued_batcher.rs::with_dwell#1::run(ledger , receiver , shutdown . clone ( ) , dwell)": [1,"non-database"],
+    "coordinator/issued_batcher.rs::with_options#1::run(ledger , receiver , shutdown . clone ( ) , dwell , waves)": [1,"non-database"],
     "coordinator/miner_submit.rs::deferred_share_disposition#1::ledger .acquire()": [1,"ledger"],
     "coordinator/miner_submit.rs::persist_block_only#1::ledger .acquire()": [1,"ledger"],
     "coordinator/payout_identity.rs::validation_slot#1::self . validations .acquire()": [1,"non-database"],

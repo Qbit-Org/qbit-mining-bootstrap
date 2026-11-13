@@ -53,13 +53,38 @@ manifest public keys, reward multiplier, payout policy, and CTV policy. A
 mismatched instance fails startup. Coordinators can use different local resource
 limits and synchronized qbit nodes on the same chain.
 
-Compact issued-job hot writes use a per-Coordinator collector: at most 128
-admitted children (pending plus active), 64 children per transaction, and one
-active batch including cancellation cleanup. Collection dwells for up to 1 ms
-from the oldest admission when storage is available, flushing earlier when full
-or a deadline requires it. Time behind another batch and admission backpressure
-remain inside the original persistence deadline. These bounds are initial
-engineering choices, not evidence of a latency target or a speedup.
+Compact issued-job hot writes use a per-Coordinator collector: 64 children
+per transaction and at most two batches in flight, each holding its ledger
+connection and its flight through its cancellation cleanup (#860). A second
+flight is used only when the pool leaves at least four connections beside
+window reads (`PRISM_DATABASE_MAX_CONNECTIONS` minus `clamp(max - 2, 1,
+build workers)`), so a share append and the candidate-lease heartbeat keep
+two; smaller pools keep one flight, as before. Admission holds at most 64
+children per flight plus 64 being collected (192 with two flights).
+
+Batches start in waves. A second batch joins the first only within 2 ms of
+its start and while it is in flight; a later batch, or any batch once one of
+the wave has finished, waits until the whole wave has. PostgreSQL grants a
+new `FOR KEY SHARE` past a queued `FOR UPDATE`, so without that gap one
+frontend's overlapping batches could hold the cluster row through a whole
+fan-out while an authority writer or blob GC waits there holding
+`ORDER_LOCK`. With waves such a writer waits, per frontend, for the wave's
+first batch and a second that started within 2 ms of it; a second batch
+that first waited for a pool connection can still take its `KEY SHARE` past
+the writer, so on a saturated pool the wait can approach two batch
+durations. Batches of other frontends on the same ledger, and
+single-child repairs, overlapped one frontend's batches before #860 too.
+Collection dwells for up to 1 ms from the oldest admission, flushing earlier
+when full or a deadline requires it. Time behind other batches and admission
+backpressure remain inside the original persistence deadline. A batch's
+result goes only to its own children, and each caller revalidates its
+publication after its own batch, so batches may complete in any order.
+Overlapping batches take the locks below in the same order. A batch extends
+the prepared row's retention only for work issued more than about 135 s
+after its publication (165 s prepared retention against 30 s per child by
+default); two that both do serialize on that row's update lock until the
+first commits. These bounds are engineering choices, not evidence of a
+latency target.
 
 Groups share the complete original compact dependency identity and the expected
 current revision and parent; each Coordinator is bound to its own ledger/frontend.
@@ -2695,8 +2720,10 @@ would end legitimate transactions that idle between statements.
 their transactions with a plain `Transaction::begin` on a fresh checkout. The
 former runs inside the persist task on the missing-partition retry path and
 could be aborted mid-`BEGIN` there; it needs a detached partition lead first.
-The issued-job batch writer's `BatchConnection` runs in the batcher task and
-is cancelled only at shutdown.
+The issued-job batch writer's `BatchConnection` runs in a batch task the
+batcher spawns. Shutdown, the batch's shared deadline or the loss of all its
+callers can drop it mid-transaction; its drop rolls back explicitly, or
+retires the connection, before the batch's flight is released.
 
 ```sh
 test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server \
