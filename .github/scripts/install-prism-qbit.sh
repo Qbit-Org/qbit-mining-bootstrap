@@ -22,10 +22,10 @@ set -euo pipefail
 
 destination="${1:?usage: install-prism-qbit.sh <destination directory>}"
 
-version=1.0.0
-asset_id=478569140
+version=1.0.1
+asset_id=744951958
 asset="qbit-${version}-x86_64-linux-gnu.tar.gz"
-sha256=ae121af03263b55d530e3f3e8719a71362d0950cba82f54a2bc2d6c437a029b5
+sha256=5f3ce43c3525328f4f0cdcc898516e274a16e170e4ed91ccf648bbb1094f6cb6
 
 release_url="https://github.com/Qbit-Org/qbit/releases/download/v${version}/${asset}"
 asset_api_url="https://api.github.com/repos/Qbit-Org/qbit/releases/assets/${asset_id}"

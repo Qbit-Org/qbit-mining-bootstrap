@@ -904,7 +904,7 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
-      QBIT_CI_COMMIT: 7ebcddb622d6e639041f005a189b048ec2a221fe
+      QBIT_CI_COMMIT: 0439a7e5b37fb3f7e4ddfb735b68961445a882c8
       QBIT_CI_IMAGE: qbit-lab-qbitd:ci
 
     steps:

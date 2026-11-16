@@ -725,7 +725,7 @@ cargo build --locked --release -p qbit-prism-server -p qbit-prism-load
 # Only a real-node preset (--node qbitd) needs this. It exports nothing when
 # run like this, so set QBITD_BIN yourself.
 bash .github/scripts/install-prism-qbit.sh "$HOME/prism-qbit"
-export QBITD_BIN="$HOME/prism-qbit/qbit-1.0.0/bin/qbitd"   # the path it prints
+export QBITD_BIN="$HOME/prism-qbit/qbit-1.0.1/bin/qbitd"   # the path it prints
 PG_BIN_DIR=/usr/lib/postgresql/16/bin RUNNER_LABEL=local \
   .github/scripts/prism-load-run.sh short-plan-fake-node load-out
 ```
