@@ -63,12 +63,17 @@ open pull request usually means it hasn't been squashed and signed yet. If its
 message says it could not check, do what the message says, which is usually to
 re-run it. GitHub's signature rule can't tell that by itself, because it
 accepts any verified signature, GitHub's own included, such as on a web edit
-or an "Update branch" merge. A pull request from a branch whose name is one
-path segment starting with `sync-`, so nothing before `sync-` and no `/`,
-merges as it is, and passes without being judged: name a branch that merges
-one version line into another that way. That goes by the name alone, and only
-for a branch in this repository: whoever can create a branch with such a name
-can open a pull request that isn't judged, so keep those names for that use.
+or an "Update branch" merge. A pull request from a branch of this repository
+whose name is one path segment starting with `sync-`, so nothing before
+`sync-` and no `/` (`AS_IS_HEADS` in the workflow), merges as it is, with any
+number of commits: name a branch that merges one version line into another
+that way. The check judges its head commit instead: it passes when a person
+signed that commit with an OpenPGP key that is on their own GitHub account.
+The signature covers the commit's tree and its parents, so whoever signed the
+head answers for everything the pull request brings. A head commit that GitHub
+made fails, such as an "Update branch" merge or a web conflict resolution, so
+the last commit of a `sync-` branch is the merge commit a maintainer makes and
+signs. A fork's branch never merges as it is.
 The check is required by a ruleset with no bypass actors, so the merge button
 works only once it is green. It always runs from the default branch's copy of
 the workflow, `main`'s, whatever branch the pull request targets, so a pull
