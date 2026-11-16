@@ -57,11 +57,12 @@ at `987027fe` plus the release date, the fix PRs' numbers in the notes and
 this record.
 
 Merge the intended development cutoff into the promotion branch and retain
-fixes already made during promotion review. The repository allows only merge
-commits, and every commit on `main` needs a verified signature. A maintainer
-squashes the promotion into one commit, signs it and merges it, so the
-promotion lands on `main` as that one signed commit under GitHub's merge
-commit. The rulesets are in [`.github/rulesets/`](../.github/rulesets/). Check package versions together,
+fixes already made during promotion review. The repository squash-merges
+every pull request but a synchronization, and every commit on `main` needs a
+verified signature. A maintainer squashes the promotion into one commit,
+signs it and pushes it, and GitHub's squash merge then lands it on `main` as
+one commit, which GitHub makes with the signed commit's message and signs, and
+no merge commit. The rulesets are in [`.github/rulesets/`](../.github/rulesets/). Check package versions together,
 run Docker lint and the relevant test gates, and review upgrade and rollback
 instructions. Leave the release date out while publication is unscheduled;
 set the actual release date in a reviewed commit before the final merge.
@@ -71,9 +72,10 @@ set the actual release date in a reviewed commit before the final merge.
 Tag the promoted `main` commit unless the release was already tagged on its
 release or development branch, as 3.0.0 and 3.1.0 were. After the promotion PR
 passes required checks and is merged, identify the exact resulting commit on
-`main`: GitHub's merge commit. The maintainer's signed squash is a different
-commit from the promotion branch's earlier head, and the merge commit is
-another. Verify the resulting commit's checks, version metadata
+`main`: GitHub's squash commit. The maintainer's signed squash is a different
+commit from the promotion branch's earlier head, and GitHub's squash commit is
+another: the signed one stays as the pull request's head and isn't on `main`.
+Verify the resulting commit's checks, version metadata
 and dated release notes before tagging it.
 
 After confirming that the tag doesn't already exist, use the reviewed main
