@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "prepare-qbit-source.sh"
-QBIT_V1_MAINNET_COMMIT = "7ebcddb622d6e639041f005a189b048ec2a221fe"
+QBIT_V1_MAINNET_COMMIT = "0439a7e5b37fb3f7e4ddfb735b68961445a882c8"
 
 
 class PrepareQbitSourceTests(unittest.TestCase):
@@ -29,7 +29,7 @@ class PrepareQbitSourceTests(unittest.TestCase):
                     for line in lines
                     if line and not line.startswith("#") and "=" in line
                 )
-                self.assertEqual(values["QBIT_GIT_REF"], "v1.0.0")
+                self.assertEqual(values["QBIT_GIT_REF"], "v1.0.1")
                 self.assertEqual(values["QBIT_GIT_COMMIT"], QBIT_V1_MAINNET_COMMIT)
         ci = ROOT / ".github" / "workflows" / "ci.yml"
         self.assertIn(f"QBIT_CI_COMMIT: {QBIT_V1_MAINNET_COMMIT}", ci.read_text(encoding="utf-8"))

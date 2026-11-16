@@ -376,7 +376,7 @@ prescribes (below):
 # PostgreSQL 16 server binaries and the pinned qbitd:
 bash .github/scripts/install-prism-qbit.sh "$HOME/.prism-qbit"
 export PRISM_TEST_PG_BIN_DIR=/usr/lib/postgresql/16/bin
-export QBITD_BIN="$HOME/.prism-qbit/qbit-1.0.0/bin/qbitd"
+export QBITD_BIN="$HOME/.prism-qbit/qbit-1.0.1/bin/qbitd"
 # A short TMPDIR for the data directories, ideally on tmpfs (CI's
 # PostgreSQL runs on tmpfs too; a busy shared disk slows qbitd's start):
 export TMPDIR=/run/user/$(id -u)/dual-sim

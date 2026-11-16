@@ -27,10 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "install-prism-qbit.sh"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 ASSET = f"qbit-{VERSION}-x86_64-linux-gnu.tar.gz"
-ASSET_ID = "478569140"
-PINNED_SHA256 = "ae121af03263b55d530e3f3e8719a71362d0950cba82f54a2bc2d6c437a029b5"
+ASSET_ID = "744951958"
+PINNED_SHA256 = "5f3ce43c3525328f4f0cdcc898516e274a16e170e4ed91ccf648bbb1094f6cb6"
 RELEASE_PATH = f"/release/{ASSET}"
 API_PATH = f"/api/assets/{ASSET_ID}"
 
@@ -290,8 +290,9 @@ class InstallPrismQbitTests(unittest.TestCase):
         # CI must run the pins as written in the script: only the cache
         # directory is configured from the workflow.
         self.assertEqual(set(re.findall(r"PRISM_QBIT_\w+", native)), {"PRISM_QBIT_CACHE_DIR"})
-        # The inline download the script replaced must not come back.
-        self.assertNotIn("releases/download/v1.0.0", native)
+        # The inline download the script replaced must not come back, for
+        # any qbit release.
+        self.assertNotIn("Qbit-Org/qbit/releases/download/", native)
         self.assertNotIn(PINNED_SHA256, native)
 
 
