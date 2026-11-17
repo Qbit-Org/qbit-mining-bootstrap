@@ -61,10 +61,8 @@ impl LeaseHorizon {
 }
 
 /// Whether an attempt holds an offer reservation that it has provably not
-/// sent, and what its release then records. The offer sets it immediately
-/// before it takes the reservation (whether that commits is settled by the
-/// release's fence, [`return_unsent_reservation`]), clears it synchronously
-/// immediately before the
+/// sent, and what its release then records. The offer sets it once the
+/// reservation has committed, clears it synchronously immediately before the
 /// `submitblock` request can leave this process
 /// (`Coordinator::submit_block`), and sets it again once the node's answer
 /// proves the call did not run (`offer_not_executed`), before it writes the
@@ -356,8 +354,10 @@ fn unsent_reason(why: &str, error: &anyhow::Error) -> String {
 ///   ordinary release frees it now rather than leaving it to the lease,
 ///   keeping its schedule when `due_now` ([`Ledger::release_recovery_claim`])
 ///   and otherwise with the backoff ([`Ledger::release_candidate_claim`]).
-///   Nothing else writes the row under this token once the attempt is over,
-///   so the read cannot be overtaken by a reservation;
+///   The hold is taken only once the reservation's COMMIT has answered, and
+///   the attempt's own returns clear the token, so no write of this attempt
+///   can still turn the row back into an `offer_reserved` row under this
+///   token after the read;
 /// - another token, or none, holds the row: `Ok(false)`. A write whose
 ///   COMMIT committed although its reply was lost reads this way, which is
 ///   the case.
