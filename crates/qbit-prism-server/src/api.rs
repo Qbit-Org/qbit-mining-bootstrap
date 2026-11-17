@@ -315,7 +315,8 @@ pub struct ApiState {
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
     cache: ResponseCache,
-    /// `network()`'s node answers, shared by the routes that read them (#858).
+    /// `network()`'s node answers, shared by the routes that read them (#858),
+    /// and the pool summary's network hashrate.
     network: Arc<public::NetworkMemo>,
     public_pool: PgPool,
     /// Imported audit decodes run after their read connection is released,
@@ -867,20 +868,39 @@ fn json_response(status: StatusCode, payload: Value) -> Response {
     response
 }
 
+/// A request's query parameters: the first non-empty value of each, the only
+/// value a handler ever reads.
 #[derive(Default, Clone, Debug)]
-struct Query(BTreeMap<String, Vec<String>>);
+struct Query(BTreeMap<String, String>);
+#[cfg(test)]
+tokio::task_local! {
+    /// Every parameter name a handler asks a [`Query`] for, in this task.
+    static QUERY_READS: std::cell::RefCell<std::collections::BTreeSet<String>>;
+}
 impl Query {
     fn parse(value: &str) -> Self {
-        let mut q = BTreeMap::<String, Vec<String>>::new();
+        let mut q = BTreeMap::new();
         for (k, v) in url::form_urlencoded::parse(value.as_bytes()) {
             if !v.is_empty() {
-                q.entry(k.into_owned()).or_default().push(v.into_owned());
+                q.entry(k.into_owned()).or_insert_with(|| v.into_owned());
             }
         }
         Self(q)
     }
+    /// Only the parameters named in `names`.
+    fn only(&self, names: &[&str]) -> Self {
+        Self(
+            self.0
+                .iter()
+                .filter(|(name, _)| names.contains(&name.as_str()))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        )
+    }
     fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.first()).map(String::as_str)
+        #[cfg(test)]
+        let _ = QUERY_READS.try_with(|reads| reads.borrow_mut().insert(key.to_owned()));
+        self.0.get(key).map(String::as_str)
     }
     fn page(&self) -> ApiResult<(i64, i64)> {
         let page = self
@@ -975,6 +995,8 @@ impl CachePolicy {
         }
     }
 }
+/// The origin cache key of `path` with `q`, which the caller has already cut
+/// down to the parameters the route reads ([`public::parameters`]).
 fn cache_key(path: &str, q: &Query) -> String {
     let canonical = if path.starts_with("/public/v1/artifacts/")
         || path.starts_with("/public/v1/blocks/")

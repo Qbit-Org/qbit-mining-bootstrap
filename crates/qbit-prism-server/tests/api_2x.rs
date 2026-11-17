@@ -1567,3 +1567,85 @@ async fn concurrent_pool_leaderboard_and_miner_misses_ask_the_node_for_one_templ
     .await;
     f.close(result).await
 }
+
+/// Pool-summary requests that differ only in parameters it does not read,
+/// inside one memo lifetime, share one cache entry: the first computes it,
+/// asking the node for its network hashrate once, and every later one is a
+/// HIT carrying the same bytes. Each used to miss and ask the node again.
+#[tokio::test]
+async fn junk_parameters_hit_the_cached_pool_summary_and_ask_the_node_for_one_hashrate(
+) -> Result<()> {
+    let Some(f) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let at = chrono::Utc::now().timestamp() - 60;
+        for (n, miner) in ["alice", "bob"].into_iter().enumerate() {
+            f.share(&format!("share-{n}"), miner, at + n as i64, 1000)
+                .await?;
+        }
+        let node = Arc::new(CountingNode {
+            calls: Default::default(),
+            open: tokio::sync::watch::channel(true).0,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc_url = format!("http://{}/", listener.local_addr()?);
+        let app = Router::new()
+            .route("/", post(counting_node_reply))
+            .with_state(node.clone());
+        let _server = AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        let lifetime = api::CacheLifetime {
+            ttl: 60,
+            stale_while_revalidate: 0,
+        };
+        let app = api::router(ApiState::new(
+            f.pool.clone(),
+            ApiConfig {
+                rpc_url,
+                cache_debug_headers: true,
+                cache_lifetimes: api::CacheLifetimes {
+                    default: lifetime,
+                    aggregate: lifetime,
+                    ..Default::default()
+                },
+                read_timeout: Duration::from_secs(30),
+                ..Default::default()
+            },
+            Arc::new(qbit_prism_server::metrics::Metrics::default()),
+        ));
+        let mut first = None;
+        for n in 0..8 {
+            // `page` is a parameter other routes read; this one does not.
+            let path = format!("/public/v1/pool-summary?x={n}&page={n}");
+            let (status, headers, body) = raw_get(&app, &path).await;
+            ensure!(
+                status == StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let expected = if n == 0 { "MISS" } else { "HIT" };
+            ensure!(
+                headers["x-prism-public-cache"] == expected,
+                "{path}: {headers:?}"
+            );
+            match &first {
+                None => first = Some(body),
+                Some(first) => ensure!(*first == body, "{path} served other bytes"),
+            }
+        }
+        for method in ["getnetworkhashps", "getblocktemplate"] {
+            ensure!(node.calls(method) == 1, "{method}: {}", node.calls(method));
+        }
+        let summary: Value = serde_json::from_slice(first.as_deref().unwrap_or_default())?;
+        ensure!(
+            summary["network"]["hashrate_ths"] == "1.234567890123125"
+                && summary["pool"]["participants_3h"] == 2,
+            "{summary}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.close(result).await
+}
