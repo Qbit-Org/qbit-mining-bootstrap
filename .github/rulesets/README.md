@@ -12,6 +12,8 @@ merge-method setting in the same way.
 | `required-checks.json` | `main`: the `signed-landing` check must pass. No bypass actors. |
 | `required-checks-version-lines.json` | The version lines except the dormant `1.x.x` and `0.1.x`: pull requests only, with no approval required, squash merges and merge commits only, and the `signed-landing` check must pass. No bypass actors. Not enforced when the branch is created. |
 | `public-main-minimal.json` | `main`: pull requests with one approval and resolved review threads, squash merges and merge commits only; no deletion or force push. Organization admins can bypass it when merging a pull request. |
+| `version-lines.json` | Every version line, the dormant `1.x.x` and `0.1.x` included: no deletion or force push. No bypass actors. |
+| `release-tags.json` | `v*` tags can't be moved or deleted. No bypass actors. |
 
 A version line takes changes through pull requests only, with no approval
 required. The pull request is required because the check judges a commit
@@ -173,6 +175,8 @@ apply .github/rulesets/signed-commits.json &&
   apply .github/rulesets/required-checks.json &&
   apply .github/rulesets/required-checks-version-lines.json &&
   apply .github/rulesets/public-main-minimal.json &&
+  apply .github/rulesets/version-lines.json &&
+  apply .github/rulesets/release-tags.json &&
   gh api -X PATCH "$repo" --input .github/repository-settings.json --silent
 ```
 
