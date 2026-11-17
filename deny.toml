@@ -12,13 +12,19 @@ feature-depth = 1
 
 [advisories]
 # RustSec advisories: any vulnerability, unmaintained crate, or yanked
-# version in the lock file fails the check, except the advisories ignored
-# below, each with its reason.
+# version in the workspace's Cargo.lock fails the check, except the
+# advisories ignored below, each with its reason. (The fuzz workspace's own
+# lock file, crates/qbit-prism-server/fuzz/Cargo.lock, is not checked.)
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no vulnerability, no patched version); it is a direct dependency of the PRISM crates and reaches sqlx and the vendored sqlx-core, and replacing it is too large for a patch release; tracked in Qbit-Org/qbit-mining-bootstrap#878" },
+    # The advisory reports no vulnerability. qbit-prism-server,
+    # qbit-prism-load and qbit-prism-dual-sim use chrono directly; the
+    # vendored sqlx-core and crates.io sqlx-postgres use it through sqlx's
+    # `chrono` feature. Replacing it is too large for a patch release. Remove
+    # this entry when #878 removes chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no patched version; replacement tracked in Qbit-Org/qbit-mining-bootstrap#878" },
 ]
 
 [licenses]
