@@ -78,7 +78,9 @@ SCRAPE_SECONDS = 15
 # to a scrape interval and a timeout too early. The window is its dwell plus
 # one evaluation interval of the standard group both rules are evaluated in
 # (qbit-tools' qbit_monitoring_stack_grafana_alert_standard_evaluation_interval,
-# 1m by default, which covers the 15-second scrape interval and its timeout).
+# 1m by default). While that interval divides the dwell, the margin needed is
+# a scrape interval plus its timeout whatever the interval, so the minute
+# covers the 15-second scrape interval with a timeout of up to 45 seconds.
 ENDPOINT_TITLE = "PrismMetricsEndpointDown"
 STANDARD_EVALUATION_MINUTES = 1
 
@@ -135,8 +137,9 @@ def listener_basis():
         f"{SCRAPE_SECONDS}-second scrapes leave no reconnect behind, and an outage of the database itself pages "
         "PrismDatabaseUnavailable after two minutes, so a short one does not warn here as well. The "
         f"{smoothing}-minute windows ride over a failed scrape, which would otherwise restart the dwell, and carry "
-        f"the last reading for {smoothing} minutes after scrapes stop, {ENDPOINT_TITLE}'s {endpoint}-minute dwell and "
-        f"one {STANDARD_EVALUATION_MINUTES}-minute evaluation interval (#869), so a frontend whose scrapes stop while "
+        f"the last reading for {smoothing} minutes from the last successful scrape, {ENDPOINT_TITLE}'s "
+        f"{endpoint}-minute dwell and one {STANDARD_EVALUATION_MINUTES}-minute evaluation interval (#869), so a "
+        "frontend whose scrapes fail while "
         f"this warns or dwells keeps warning or dwelling until {ENDPOINT_TITLE} fires for it; a scrape that keeps "
         f"failing is {ENDPOINT_TITLE}'s. Each evaluation reads the latest scrape, and one that finds the "
         "LISTEN holding restarts the dwell, so a listener that keeps reconnecting and dropping can warn late or not "
@@ -311,9 +314,10 @@ PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.
 # How the runbook states how long the listener rule carries a reading, and
 # what that window is made of (#869).
 LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes",
+                         r"(\d+)\s+minutes\s+after\s+its\s+last\s+successful\s+scrape",
                          r"reading\s+up\s+to\s+(\d+)\s+minutes\s+old",
                          r"up\s+to\s+(\d+)\s+minutes\s+after\s+the\s+dwell"]
-ENDPOINT_DWELL_PROSE = [r"PrismMetricsEndpointDown`?'s\s+(\d+)-minute\s+dwell"]
+ENDPOINT_DWELL_PROSE = [re.escape(ENDPOINT_TITLE) + r"`?'s\s+(\d+)-minute\s+dwell"]
 EVALUATION_PROSE = [r"one\s+(\d+)-minute\s+evaluation\s+interval"]
 
 
@@ -343,7 +347,7 @@ def check_listener_prose():
     """#843: the operator docs state the listener rule's dwell the generator writes."""
     check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
     # #869: and the window that carries a reading after scrapes stop.
-    runbook = {"docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
+    runbook = {path: heading for path, heading in PROSE_DOCS.items() if heading == LISTENER_RUNBOOK}
     check_prose(LISTENER_WINDOW_PROSE, listener_smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
                 f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES", docs=runbook)
     check_prose(ENDPOINT_DWELL_PROSE, endpoint_dwell_minutes(), f"{ENDPOINT_TITLE}'s dwell",

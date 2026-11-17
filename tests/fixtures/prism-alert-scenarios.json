@@ -4847,7 +4847,29 @@
     }
   },
   {
-    "name": "#869 the listener rule carries a frontend's last reading for four minutes after its scrapes stop and no longer, once PrismMetricsEndpointDown has fired",
+    "name": "#869 a frontend without the listener gauge whose scrapes stop while it warns still warns at the last evaluation before PrismMetricsEndpointDown fires",
+    "series": {
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 0x300"
+    },
+    "eval_time": "15m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1,
+      "PrismMetricsEndpointDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismMetricsEndpointDown": []
+    }
+  },
+  {
+    "name": "#869 the listener rule carries a frontend's last reading for four minutes after its last successful scrape and no longer, once PrismMetricsEndpointDown has fired",
     "series": {
       "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720 stale",
       "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale",
