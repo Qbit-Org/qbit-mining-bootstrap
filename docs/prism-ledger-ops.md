@@ -1004,8 +1004,12 @@ after the reservation committed and before the `submitblock` request could
 leave, or after the node's answer proved the call did not run) releases with
 `release_unsent_offer` instead: the same retries, fenced on the token, on
 `offer_reserved` and on an empty offer record, return the row to `pending`
-with `last_error` starting `offer not sent`, and it is offered again. The
-frontend logs `the attempt failed before its block offer was sent` when that
+with `last_error` starting `offer not sent`, and it is offered again. A row
+the carry gate withdrew, and any row returned at shutdown, is due again at
+once; any other after the pending backoff. If the row turns out to be held
+by this claim but no longer reserved (a failover lost the reservation's
+commit), the ordinary release frees it at once. The frontend logs `the
+attempt failed holding an offer reservation the node never ran` when that
 release starts. If the database does not answer before the lease ends, the
 row keeps its reservation and the next claim settles it as unknown, as
 before. The frontend logs `candidate claim release deferred` when it
@@ -1027,10 +1031,11 @@ the landing that follows is left to the next claim, which lands the `offered`
 row without another offer. Without this, a restart between the reservation
 and the call left an `offer_reserved` row that was never sent and is never
 offered again. If the wait runs out before the request was sent, the claim's
-hand-back returns the reservation to `pending` (since 3.1.2); the shutdown's
-`ALERT` line saying recovery reconciles it as unknown is then followed by
-`the shutdown stopped the attempt before its block offer was sent`. A crash
-in the same window still recovers as delivery unknown.
+hand-back returns the reservation to `pending`, due at once (since 3.1.2);
+the shutdown's `ALERT` line saying recovery reconciles it as unknown is then
+followed by `the shutdown stopped an attempt holding an offer reservation the
+node never ran`, and the block is offered again. A crash in the same window
+still recovers as delivery unknown.
 
 **A call that never connected (#522).** When `submitblock` fails before its
 connection is established, the request provably never reached the node. That

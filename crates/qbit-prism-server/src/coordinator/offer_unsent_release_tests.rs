@@ -35,14 +35,42 @@ const RENEWAL: &str = "NEW.claim_renewals > OLD.claim_renewals";
 /// (`Ledger::release_unsent_offer`).
 const RETURN_TO_PENDING: &str = "OLD.state = 'offer_reserved' AND NEW.state = 'pending'";
 
+/// The ordinary claim release, which keeps the row's state
+/// (`Ledger::release_candidate_claim`, `Ledger::release_recovery_claim`).
+const ORDINARY_RELEASE: &str =
+    "OLD.claim_token IS NOT NULL AND NEW.claim_token IS NULL AND NEW.state = OLD.state";
+
+/// The heartbeat renews every second, so a deferred release is retried a
+/// second after it failed, and a failure injected after the offer reaches
+/// the heartbeat within a second.
+const AFTER_OFFER_LEASE: CandidateLease = CandidateLease {
+    interval: Duration::from_secs(1),
+    ..PRE_SEND_LEASE
+};
+
 const LOOPING: &str = "candidate-looping";
+
+/// Where the looping frontend's first attempt waits.
+#[derive(Clone, Copy, PartialEq)]
+enum Park {
+    /// Nowhere: it runs straight through.
+    No,
+    /// At the offer probe, after the reservation and right before the
+    /// strictly-live renewal and the send.
+    BeforeSend,
+    /// For build capacity, after the node accepted the block and the offer
+    /// was recorded: the test holds the frontend's only build slot.
+    AfterOffer,
+}
 
 /// A frontend's submit loop working on the fixture's candidate.
 struct Looping {
     frontend: Arc<Coordinator>,
-    /// The probe its first attempt parked at, after the reservation and
-    /// right before the strictly-live renewal; later attempts do not park.
+    /// The probe its first attempt parked at ([`Park::BeforeSend`]); later
+    /// attempts do not park.
     probe: Option<Arc<OfferProbe>>,
+    /// Its only build slot ([`Park::AfterOffer`]).
+    _build_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -70,14 +98,14 @@ impl Drop for Looping {
 
 impl Fixture {
     /// Hand the fixture's candidate to a new frontend's submit loop, reaching
-    /// the node at `rpc_url`, under `lease`. With `park`, wait until its
-    /// first attempt has taken the reservation and parked at the offer probe.
+    /// the node at `rpc_url`, under `lease`, and wait until its first attempt
+    /// is where `park` says.
     async fn start_loop(
         &self,
         rpc_url: String,
         lease: CandidateLease,
         block_submit_timeout: Duration,
-        park: bool,
+        park: Park,
     ) -> Result<Looping> {
         let frontend = Coordinator::new(
             Config {
@@ -90,8 +118,12 @@ impl Fixture {
         )
         .await?;
         *frontend.observed_tip.write().await = TipState::baseline("aa".repeat(32));
-        let probe = park.then(|| Arc::new(OfferProbe::default()));
+        let probe = (park == Park::BeforeSend).then(|| Arc::new(OfferProbe::default()));
         *frontend.offer_probe.lock().unwrap() = probe.clone();
+        let build_slot = match park {
+            Park::AfterOffer => Some(frontend.build_slots.clone().acquire_owned().await?),
+            Park::No | Park::BeforeSend => None,
+        };
         self.coordinator
             .ledger
             .retry_candidate(&self.claim, "handed to the looping frontend")
@@ -113,9 +145,15 @@ impl Fixture {
             // Later attempts run straight through.
             *frontend.offer_probe.lock().unwrap() = None;
         }
+        if park == Park::AfterOffer {
+            self.wait_for_row("offered", |row| row.state == "offered")
+                .await?;
+            ensure!(self.submissions().await == 1);
+        }
         Ok(Looping {
             frontend,
             probe,
+            _build_slot: build_slot,
             shutdown,
             task,
         })
@@ -275,7 +313,7 @@ async fn an_attempt_that_fails_before_its_send_returns_the_reservation_to_pendin
                         fixture.coordinator.config.rpc_url.clone(),
                         lease,
                         Duration::from_secs(1),
-                        true,
+                        Park::BeforeSend,
                     )
                     .await?;
                 if release_fails {
@@ -336,7 +374,12 @@ async fn a_refused_offer_whose_return_to_pending_fails_is_returned_by_the_deferr
             .fail_next_updates("fail_return", RETURN_TO_PENDING, 2)
             .await?;
         let looping = fixture
-            .start_loop(relay.url(), PRE_SEND_LEASE, Duration::from_secs(1), false)
+            .start_loop(
+                relay.url(),
+                PRE_SEND_LEASE,
+                Duration::from_secs(1),
+                Park::No,
+            )
             .await?;
         fixture
             .returned_unsent("refused before dispatch (HTTP 503 Service Unavailable)")
@@ -369,7 +412,12 @@ async fn an_attempt_dropped_while_its_submitblock_is_in_flight_keeps_the_reserva
     let result = async {
         // The call's own deadline is far beyond the heartbeat's failure.
         let looping = fixture
-            .start_loop(relay.url(), HEARTBEAT_LEASE, Duration::from_secs(20), true)
+            .start_loop(
+                relay.url(),
+                HEARTBEAT_LEASE,
+                Duration::from_secs(20),
+                Park::BeforeSend,
+            )
             .await?;
         relay.submit(Submit::HoldReply);
         looping.probe()?.release.notify_one();
@@ -436,4 +484,197 @@ async fn an_attempt_dropped_while_its_submitblock_is_in_flight_keeps_the_reserva
     drop(relay);
     fixture.close().await?;
     result
+}
+
+/// A shutdown that stops waiting for an attempt parked between its
+/// reservation and its send (the offer section's bound, here 2.5 s, runs
+/// out) drops the attempt, and the claim's hand-back returns the reservation
+/// to `pending`, due at once, as the ordinary hand-back keeps a row
+/// claimable at once. Another frontend offers the block, once. Before, the
+/// hand-back kept the reservation, and the block was never offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_that_stops_waiting_before_the_send_returns_the_reservation_to_pending_due_at_once(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let looping = fixture
+            .start_loop(
+                fixture.coordinator.config.rpc_url.clone(),
+                PRE_SEND_LEASE,
+                Duration::from_secs(1),
+                Park::BeforeSend,
+            )
+            .await?;
+        let probe = looping
+            .probe
+            .clone()
+            .context("the attempt was not parked")?;
+        let bound = looping.frontend.offer_section_bound(PRE_SEND_LEASE);
+        // The probe is never released: the shutdown waits out the bound.
+        let stopping = Instant::now();
+        let frontend = looping.stop().await?;
+        ensure!(
+            stopping.elapsed() >= bound,
+            "the shutdown did not wait for the offer in flight: {:?} of {bound:?}",
+            stopping.elapsed()
+        );
+        ensure!(
+            probe.left.load(Ordering::SeqCst),
+            "the parked attempt was not dropped"
+        );
+        let row = fixture.row().await?;
+        let reason = row.last_error.clone().unwrap_or_default();
+        ensure!(
+            row.state == "pending"
+                && row.token.is_none()
+                && row.outcome.is_none()
+                && row.offered_at_ms.is_none()
+                && row.reserved_by.is_none()
+                && row.evidence,
+            "the hand-back kept the unsent reservation: {} {:?}, reason {reason}",
+            row.state,
+            row.outcome
+        );
+        ensure!(
+            reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX)
+                && reason.contains("stopped at shutdown")
+                && reason.contains(LOOPING),
+            "the return is not recorded: {reason}"
+        );
+        ensure!(
+            !fixture.backed_off().await?,
+            "the handed-back row is not due at once"
+        );
+        ensure!(fixture.submissions().await == 0);
+        frontend.ledger.pool.close().await;
+        // Another frontend offers it at once.
+        let offer = fixture
+            .successor
+            .claim_candidate(10)
+            .await?
+            .context("the handed-back row was not claimable at once")?;
+        ensure!(offer.lifecycle.state == CandidateState::Pending);
+        fixture
+            .successor_coordinator
+            .process_candidate(&offer)
+            .await?;
+        let row = fixture.row().await?;
+        ensure!(
+            row.state == "submitted" && row.outcome.as_deref() == Some("accepted"),
+            "the returned block landed as {} with outcome {:?}",
+            row.state,
+            row.outcome
+        );
+        ensure!(
+            fixture.submissions().await == 1,
+            "the block was offered more than once"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    fixture.close().await?;
+    result
+}
+
+/// The control for the ordinary release, which the attempts above no longer
+/// reach: the node accepted the block and the offer was recorded, then the
+/// heartbeat dropped the attempt waiting to land it, and its claim release
+/// failed once. The deferred retry, or the shutdown's release, frees the
+/// claim keeping the `offered` row, never returning it to `pending`, and the
+/// next claim lands it without a second `submitblock`. The deferred retry
+/// backs the row off; the shutdown's keeps its schedule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_release_after_the_offer_is_retried_and_keeps_the_offer_without_a_second_send(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    for at_shutdown in [false, true] {
+        let Some(fixture) = Fixture::open().await? else {
+            return Ok(());
+        };
+        let result = async {
+            let looping = fixture
+                .start_loop(
+                    fixture.coordinator.config.rpc_url.clone(),
+                    AFTER_OFFER_LEASE,
+                    Duration::from_secs(1),
+                    Park::AfterOffer,
+                )
+                .await?;
+            fixture
+                .fail_next_updates("fail_release", ORDINARY_RELEASE, 1)
+                .await?;
+            fixture
+                .fail_next_updates("fail_renewal", RENEWAL, 1)
+                .await?;
+            // The heartbeat drops the attempt and its immediate release fails.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while fixture.injected("fail_release").await? == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("the dropped attempt never tried to release its claim")??;
+            let frontend = if at_shutdown {
+                // The next retry is a second away; the shutdown's comes first.
+                looping.stop().await?
+            } else {
+                fixture
+                    .wait_for_row("released", |row| row.token.is_none())
+                    .await?;
+                looping.stop().await?
+            };
+            ensure!(
+                fixture.injected("fail_release").await? >= 2,
+                "the claim was freed without a second release"
+            );
+            let row = fixture.row().await?;
+            let reason = row.last_error.clone().unwrap_or_default();
+            ensure!(
+                row.state == "offered"
+                    && row.token.is_none()
+                    && row.outcome.as_deref() == Some("accepted")
+                    && row.offered_at_ms.is_some()
+                    && !reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX),
+                "the released offer changed: {} {:?}, reason {reason}",
+                row.state,
+                row.outcome
+            );
+            ensure!(
+                fixture.backed_off().await? != at_shutdown,
+                "the {} release did not keep its schedule rule",
+                if at_shutdown {
+                    "shutdown's"
+                } else {
+                    "deferred"
+                }
+            );
+            frontend.ledger.pool.close().await;
+            fixture.due_now().await?;
+            let recovered = fixture
+                .successor
+                .claim_candidate(10)
+                .await?
+                .context("the released offer was not claimable")?;
+            ensure!(recovered.lifecycle.state == CandidateState::Offered);
+            fixture
+                .successor_coordinator
+                .process_candidate(&recovered)
+                .await?;
+            ensure!(fixture.state().await? == "submitted");
+            ensure!(fixture.landed().await?);
+            ensure!(
+                fixture.submissions().await == 1,
+                "the recovery offered the block again"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        fixture.close().await?;
+        result.with_context(|| format!("at shutdown: {at_shutdown}"))?;
+    }
+    Ok(())
 }

@@ -3376,10 +3376,13 @@ impl Coordinator {
         // reservation to `pending` (`claim_release`). A reservation whose
         // COMMIT reply was lost is an error above, before this is set: the
         // row may still be `pending`, and it keeps the ordinary release.
-        unsent.hold(format!(
-            "the attempt holding the reservation taken by {} stopped before its submitblock call was sent",
-            self.config.instance_id
-        ));
+        unsent.hold(
+            format!(
+                "the attempt holding the reservation taken by {} stopped before its submitblock call was sent",
+                self.config.instance_id
+            ),
+            false,
+        );
         // #529: the reservation, and the candidate row before it, reach the
         // failover standby before the block leaves this frontend, within the
         // bound. The wait never holds the block: an unconfirmed one is logged
@@ -3436,6 +3439,15 @@ impl Coordinator {
                 crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
                 self.config.instance_id
             );
+            // If this write fails, the owner's release returns the row
+            // instead, still due at once and with this reason.
+            unsent.hold(
+                format!(
+                    "the carry gate moved, or this node's journal stopped claiming ownership, after this carry-paying block was reserved as current work by {}, and its reservation was not offered",
+                    self.config.instance_id
+                ),
+                true,
+            );
             self.ledger.release_unmade_offer(claim, &reason).await?;
             tracing::warn!(block = %candidate.block_hash, %reason, "the carry gate moved before the offer; the next attempt decides it again, through the capture path");
             return Ok(());
@@ -3451,10 +3463,13 @@ impl Coordinator {
         if let Some(not_run) = offer_not_executed(&result) {
             // Held again before the write: if it fails, or the heartbeat
             // drops it, the owner's release returns the reservation instead.
-            unsent.hold(format!(
-                "{not_run}; the reservation taken by {} was not offered",
-                self.config.instance_id
-            ));
+            unsent.hold(
+                format!(
+                    "{not_run}; the reservation taken by {} was not offered",
+                    self.config.instance_id
+                ),
+                false,
+            );
             let reason = format!(
                 "{}: {not_run}; the reservation taken by {} was returned to pending for another offer",
                 crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
