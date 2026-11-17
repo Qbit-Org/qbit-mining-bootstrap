@@ -69,16 +69,13 @@ fn retained(row: Option<PgRow>) -> Result<Option<WorkerDifficulty>> {
 }
 
 /// How much of a hint write's bound its statements' server-side timeouts
-/// leave unused, as a divisor of the bound: a tenth. A quarter of it is how
-/// long after its setting's reply a timeout may still be used
-/// ([`HintDeadline::arm`]); the rest covers the round trips between the
-/// client's clock and the server's timer: the setting's own (its value is
-/// taken as it is sent), a statement's way to the server, where its timer
-/// starts, and the server's cancel's way back. A statement then ends on the
-/// server, and its cancel reaches the client, before the client's bound for
-/// round trips up to about three-eighths of the margin (19 ms at the default
-/// 500 ms bound). A setting whose own reply took longer than that is not
-/// used again: the next statement sets the timeout afresh (once).
+/// leave unused, as a divisor of the bound: a tenth. A statement is sent
+/// under the timeout in force only if it would end by the deadline less half
+/// of it ([`HintDeadline::arm`]); the other half covers the statement's way
+/// to the server, where its timer starts, and the cancel's way back. A
+/// statement then ends on the server before the writer's bound for round
+/// trips up to the whole margin (50 ms at the default 500 ms bound), and its
+/// cancel reaches the writer first for round trips up to half of it.
 const HINT_MARGIN_DIVISOR: u32 = 10;
 
 /// PostgreSQL's largest `statement_timeout`, in milliseconds (an `int`).
@@ -149,28 +146,28 @@ impl HintDeadline {
         (millis > 0).then(|| Duration::from_millis(millis))
     }
 
-    /// How a statement sent at `now` is bounded when the transaction's last
-    /// timeout setting was sent at `sent` and its reply read at `answered`.
-    /// That timeout was what was left at `sent`, so a statement sent under it
-    /// runs at most `now - sent` past what is left now. It is used, with no
-    /// further round trip, while its own reply took at most three-eighths of
-    /// the margin and it was answered at most a quarter of the margin ago:
-    /// time spent only in statements that sent nothing (a cached prepare)
-    /// never sets it again. Otherwise the timeout is set again from what is
-    /// left, under the same never-zero rule as the first; the caller arms at
-    /// most once per statement, so slow replies cannot chain re-arms.
-    fn arm(
-        &self,
-        sent: tokio::time::Instant,
-        answered: tokio::time::Instant,
-        now: tokio::time::Instant,
-    ) -> Arm {
-        if answered.saturating_duration_since(sent) <= self.margin * 3 / 8
-            && now.saturating_duration_since(answered) <= self.margin / 4
+    /// How a statement sent at `now` is bounded when the timeout in force is
+    /// `armed` and the last round trip took `round_trip`. The timeout in force
+    /// is used if the statement would end under it by the deadline less half
+    /// the margin: so neither the time since it was set, nor a slow reply to
+    /// its setting, nor statements that sent nothing (a cached prepare) can
+    /// let a statement outlive the bound. Otherwise it is set again, to what
+    /// will be left once the setting's own round trip is over (the last one
+    /// measured, taken as its estimate), under the same never-zero rule as
+    /// the first.
+    fn arm(&self, armed: Duration, round_trip: Duration, now: tokio::time::Instant) -> Arm {
+        let latest = self.at.checked_sub(self.margin / 2);
+        if now
+            .checked_add(armed)
+            .zip(latest)
+            .is_some_and(|(end, latest)| end <= latest)
         {
             return Arm::Armed;
         }
-        match self.statement_timeout(now) {
+        match now
+            .checked_add(round_trip)
+            .and_then(|sent| self.statement_timeout(sent))
+        {
             Some(timeout) => Arm::Set(timeout),
             None => Arm::Spent,
         }
@@ -234,11 +231,10 @@ type HintQuery<'q> = sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArgument
 struct HintTransaction<'c> {
     tx: Transaction<'c, Postgres>,
     deadline: HintDeadline,
-    /// The `statement_timeout` in force, when its setting was sent, and when
-    /// the reply to it was read.
+    /// The `statement_timeout` in force, and how long the last setting's
+    /// round trip took.
     armed: Duration,
-    sent: tokio::time::Instant,
-    answered: tokio::time::Instant,
+    round_trip: Duration,
 }
 
 impl<'c> HintTransaction<'c> {
@@ -250,33 +246,42 @@ impl<'c> HintTransaction<'c> {
             tx,
             deadline,
             armed,
-            sent,
-            answered: tokio::time::Instant::now(),
+            round_trip: sent.elapsed(),
         })
     }
 
     /// The `statement_timeout` the next statement runs under, set first if
-    /// the one in force is too old ([`HintDeadline::arm`]).
+    /// the one in force would let it run too late ([`HintDeadline::arm`]):
+    /// at most twice per statement, the second time only when the first
+    /// setting's reply came back too late for it to be used. Still too late
+    /// after that, the statement is not sent ([`HintBoundSpent`]).
     async fn arm(&mut self) -> Result<Duration> {
-        let now = tokio::time::Instant::now();
-        match self.deadline.arm(self.sent, self.answered, now) {
-            Arm::Armed => {}
-            Arm::Spent => return Err(HintBoundSpent.into()),
-            Arm::Set(timeout) => {
-                // Trivial work, under the timeout it replaces.
-                timed(
-                    self.armed,
-                    sqlx::query(REARM_SQL)
-                        .bind(timeout.as_millis().to_string())
-                        .execute(&mut *self.tx),
-                )
-                .await?;
-                self.armed = timeout;
-                self.sent = now;
-                self.answered = tokio::time::Instant::now();
+        for _ in 0..2 {
+            let now = tokio::time::Instant::now();
+            match self.deadline.arm(self.armed, self.round_trip, now) {
+                Arm::Armed => return Ok(self.armed),
+                Arm::Spent => return Err(HintBoundSpent.into()),
+                Arm::Set(timeout) => {
+                    // Trivial work, under the timeout it replaces.
+                    timed(
+                        self.armed,
+                        sqlx::query(REARM_SQL)
+                            .bind(timeout.as_millis().to_string())
+                            .execute(&mut *self.tx),
+                    )
+                    .await?;
+                    self.armed = timeout;
+                    self.round_trip = now.elapsed();
+                }
             }
         }
-        Ok(self.armed)
+        match self
+            .deadline
+            .arm(self.armed, self.round_trip, tokio::time::Instant::now())
+        {
+            Arm::Armed => Ok(self.armed),
+            Arm::Set(_) | Arm::Spent => Err(HintBoundSpent.into()),
+        }
     }
 
     /// Prepare `statements`, `(text, parameter types)`, on this connection
@@ -395,8 +400,8 @@ impl Ledger {
     /// Each statement runs under a `statement_timeout` taken from what is
     /// left of the deadline less a tenth of the bound (see [`HintDeadline`]):
     /// the first is set in the `BEGIN`'s own round trip, and another only
-    /// when a statement is sent more than a quarter of that margin after
-    /// the last setting's reply. A statement with less than a millisecond left is not sent
+    /// when a statement sent under the one in force could end later than
+    /// the deadline less half that margin. A statement with less than a millisecond left is not sent
     /// ([`HintBoundSpent`]); one the server cancelled at its timeout is
     /// marked so ([`hint_timed_out`]). Either way the transaction rolls
     /// back, and every setting ends with it. `COMMIT` is not sent with less

@@ -54,9 +54,16 @@ fn a_statement_with_less_than_a_millisecond_left_is_not_sent_rather_than_given_z
     let small = HintDeadline::starting(start, Duration::from_micros(1_200));
     assert_eq!(small.statement_timeout(start), Some(ms(1)));
     // The re-arm follows the same rule.
-    assert_eq!(deadline.arm(start, start, start + ms(450)), Arm::Spent);
     assert_eq!(
-        deadline.arm(start, start, start + Duration::from_micros(449_100)),
+        deadline.arm(ms(450), Duration::ZERO, start + ms(450)),
+        Arm::Spent
+    );
+    assert_eq!(
+        deadline.arm(
+            ms(450),
+            Duration::ZERO,
+            start + Duration::from_micros(449_100)
+        ),
         Arm::Spent
     );
     // Whatever is set reads at least 1.
@@ -70,61 +77,107 @@ fn a_statement_with_less_than_a_millisecond_left_is_not_sent_rather_than_given_z
     );
 }
 
-// Each statement's timeout comes from what is left when it is sent: a
-// timeout whose setting was answered up to a quarter of the margin ago still
-// ends the statement inside the bound; an older one is set again from what is
-// left, so a statement sent late gets only the rest. The age runs from the
-// setting's reply, so a re-arm's own round trip, or a statement that sent
-// nothing, never sets it again at once.
+// Each statement's timeout comes from what is left when it is sent. The
+// timeout in force is used while a statement sent under it would end by the
+// deadline less half the margin (475 ms into a 500 ms bound); otherwise it is
+// set again, to what will be left once the setting's own round trip (the last
+// one measured) is over, so a statement sent late gets only the rest, and one
+// sent after a slow reply is not let run past the bound.
 #[test]
 fn a_later_statement_of_one_write_gets_only_what_is_left_of_its_bound() {
     let start = Instant::now();
     let deadline = HintDeadline::starting(start, ms(500));
-    assert_eq!(deadline.arm(start, start, start), Arm::Armed);
-    assert_eq!(deadline.arm(start, start, start + ms(12)), Arm::Armed);
+    let first = deadline.statement_timeout(start).unwrap();
+    assert_eq!(first, ms(450));
+    assert_eq!(deadline.arm(first, Duration::ZERO, start), Arm::Armed);
     assert_eq!(
-        deadline.arm(start, start, start + ms(13)),
-        Arm::Set(ms(437))
+        deadline.arm(first, Duration::ZERO, start + ms(25)),
+        Arm::Armed
     );
     assert_eq!(
-        deadline.arm(start, start, start + ms(300)),
+        deadline.arm(first, Duration::ZERO, start + ms(26)),
+        Arm::Set(ms(424))
+    );
+    assert_eq!(
+        deadline.arm(first, Duration::ZERO, start + ms(300)),
         Arm::Set(ms(150))
     );
-    // Measured from the last setting's reply, not from the start.
+    // Set again, it allows for the setting's own round trip, as measured.
     assert_eq!(
-        deadline.arm(start + ms(300), start + ms(300), start + ms(312)),
-        Arm::Armed
+        deadline.arm(first, ms(20), start + ms(300)),
+        Arm::Set(ms(130))
     );
+    // Its reply on time: the statement goes out under it.
+    assert_eq!(deadline.arm(ms(130), ms(20), start + ms(320)), Arm::Armed);
+    // Its reply 45 ms late: used, the statement would end at 495 ms, so it is
+    // set again from the slower round trip.
     assert_eq!(
-        deadline.arm(start + ms(300), start + ms(300), start + ms(313)),
-        Arm::Set(ms(137))
+        deadline.arm(ms(130), ms(65), start + ms(365)),
+        Arm::Set(ms(20))
     );
-    // A setting sent at `start` and answered a round trip later: a statement
-    // sent under it ends on the server by the deadline less three-quarters
-    // of the margin, plus that round trip and its own way there.
-    let armed = deadline.statement_timeout(start).unwrap();
-    for round_trip in [0, 5, 10] {
-        let answered = start + ms(round_trip);
-        for after in 0..=12 {
-            let sent = answered + ms(after);
-            assert_eq!(deadline.arm(start, answered, sent), Arm::Armed);
-            assert!(sent + armed <= deadline.at() - ms(37) + ms(round_trip));
+    // Whatever the timeout in force and the round trip: a statement sent
+    // under an armed timeout ends by the deadline less half the margin, and
+    // one sent once a new setting's estimated round trip is over ends under
+    // it by the deadline less the margin.
+    for now in (0..=500).step_by(5) {
+        for armed in [1, 50, 130, 450] {
+            for round_trip in [0, 5, 30] {
+                let now = start + ms(now);
+                match deadline.arm(ms(armed), ms(round_trip), now) {
+                    Arm::Armed => assert!(now + ms(armed) <= deadline.at() - ms(25)),
+                    Arm::Set(timeout) => {
+                        assert!(now + ms(round_trip) + timeout <= deadline.at() - ms(50))
+                    }
+                    Arm::Spent => {
+                        assert!(deadline.statement_timeout(now + ms(round_trip)).is_none())
+                    }
+                }
+            }
         }
     }
-    // A setting whose reply took longer than three-eighths of the margin
-    // (18.75 ms) is not used again: the next statement sets it afresh.
-    assert_eq!(
-        deadline.arm(start, start + ms(18), start + ms(18)),
-        Arm::Armed
-    );
-    assert_eq!(
-        deadline.arm(start, start + ms(19), start + ms(19)),
-        Arm::Set(ms(431))
-    );
-    assert_eq!(
-        deadline.arm(start, start + ms(200), start + ms(200)),
-        Arm::Set(ms(250))
-    );
+}
+
+// With every round trip 30 ms, past half the 50 ms margin: a decrease's
+// write, as `write_worker_difficulty_hint` sends it (four prepares SQLx has
+// cached, which send nothing, then the guard, the update and the read-back,
+// each armed first, then `COMMIT`), costs one re-arm per statement at most and
+// none for a cached prepare, and still commits inside its 500 ms bound.
+#[test]
+fn slow_round_trips_cost_at_most_one_re_arm_per_statement() {
+    let start = Instant::now();
+    let deadline = HintDeadline::starting(start, ms(500));
+    let trip = ms(30);
+    let mut armed = deadline.statement_timeout(start).unwrap();
+    let mut now = start + trip; // the BEGIN's reply
+    let mut round_trip = trip;
+    let mut trips = 1;
+    for sends in [false, false, false, false, true, true, true] {
+        let mut sets = 0;
+        loop {
+            match deadline.arm(armed, round_trip, now) {
+                Arm::Armed => break,
+                Arm::Set(timeout) => {
+                    sets += 1;
+                    trips += 1;
+                    now += trip;
+                    armed = timeout;
+                    round_trip = trip;
+                }
+                Arm::Spent => panic!("spent at {:?}", now - start),
+            }
+        }
+        assert!(sets <= 1, "{sets} settings for one statement");
+        if sends {
+            trips += 1;
+            now += trip;
+        }
+    }
+    // `COMMIT` is sent with more than the margin left, and returns in time.
+    assert!(deadline.statement_timeout(now).is_some());
+    trips += 1;
+    now += trip;
+    assert!(now < deadline.at(), "done {:?} in", now - start);
+    assert_eq!(trips, 8);
 }
 
 #[test]

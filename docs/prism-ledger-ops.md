@@ -2871,9 +2871,9 @@ it:
   `COMMIT` PostgreSQL ends by that bound. Each statement runs under a
   transaction-local `statement_timeout` of what is left of the bound less a
   tenth of it: the first is set in the `BEGIN`'s own round trip, and another
-  only when a statement is sent more than a fortieth of the bound after the
-  last setting's reply (or right away when that reply took over three-eighths
-  of the tenth). A statement with less than a millisecond left is not sent,
+  only when a statement sent under the one in force could end later than the
+  deadline less half the tenth, to what will be left once that setting's own
+  round trip is over (at most twice per statement). A statement with less than a millisecond left is not sent,
   nor a `COMMIT` with less than the tenth and a millisecond left. PostgreSQL turns the
   statement timer off before it commits, so the transaction also sets
   `synchronous_commit = local` for itself: a hint's `COMMIT` waits for the
@@ -2894,7 +2894,7 @@ it:
   before, and a lock wait it ends counts as `failed`. The row lock a hint's
   write takes is held through its read-back and `COMMIT`, a round trip or
   two and the local flush. While database round trips stay within that
-  tenth's allowance (about 19 ms at 500 ms), no statement before `COMMIT`
+  tenth (50 ms at 500 ms), no statement before `COMMIT`
   holds it past the bound; a local flush that stalls holds it, and its
   connection, until the flush ends, and a connection that stalls mid-transaction holds it until
   the session ends, as before. Another
