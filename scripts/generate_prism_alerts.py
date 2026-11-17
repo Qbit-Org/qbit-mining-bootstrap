@@ -66,23 +66,50 @@ def miner_gated(term):
 LISTENER_TITLE = "PrismPayoutRevisionListenerDown"
 LISTENER_DOWN_MINUTES = 10
 SCRAPE_SECONDS = 15
-# Rides over a failed scrape, which would otherwise restart the dwell (#666).
-LISTENER_SMOOTHING_MINUTES = 2
+# #869: the smoothing windows ride over a failed scrape, which would otherwise
+# restart the dwell (#666), and carry a frontend's last reading after its
+# scrapes stop until PrismMetricsEndpointDown has fired for it, so a warning
+# that is firing or dwelling is never dropped before that alert owns the
+# frontend. That alert's first pending evaluation comes up to a scrape
+# interval, a scrape timeout and an evaluation interval after the last
+# successful scrape, and it fires one dwell later, while a range selector
+# drops a sample exactly one window old: a window equal to its dwell ends up
+# to a scrape interval and a timeout too early. The window is its dwell plus
+# one evaluation interval of the standard group both rules are evaluated in
+# (qbit-tools' qbit_monitoring_stack_grafana_alert_standard_evaluation_interval,
+# 1m by default, which covers the 15-second scrape interval and its timeout).
+ENDPOINT_TITLE = "PrismMetricsEndpointDown"
+STANDARD_EVALUATION_MINUTES = 1
+
+
+def endpoint_dwell_minutes():
+    """PrismMetricsEndpointDown's dwell, from its authored rule."""
+    [endpoint] = [rule for rule in load("docs/prism-native-alert-rules.json")["rules"]
+                  if rule["title"] == ENDPOINT_TITLE]
+    match = re.fullmatch(r"(\d+)m", endpoint["for"])
+    assert match, f"{ENDPOINT_TITLE}'s dwell {endpoint['for']!r} is not whole minutes"
+    return int(match.group(1))
+
+
+def listener_smoothing_minutes():
+    return endpoint_dwell_minutes() + STANDARD_EVALUATION_MINUTES
 
 
 def listener_down():
     """1 where the listener is down, or a scraped frontend does not report it, on a frontend with a recent miner."""
     listener = prism("qbit_prism_payout_revision_listener_up")
     up = prism("up")
-    down = f"(last_over_time({listener}[{LISTENER_SMOOTHING_MINUTES}m]) == bool 0)"
+    smoothing = listener_smoothing_minutes()
+    down = f"(last_over_time({listener}[{smoothing}m]) == bool 0)"
     # Present from startup on every frontend since #834, so a scraped target
     # without it runs an older image: unknown, which is not healthy.
-    unreported = f"(max_over_time({up}[{LISTENER_SMOOTHING_MINUTES}m]) == bool 1)"
+    unreported = f"(max_over_time({up}[{smoothing}m]) == bool 1)"
     return miner_gated(f"({down} or {TARGETS} {unreported})")
 
 
 def listener_basis():
     dwell, window = LISTENER_DOWN_MINUTES, MINER_WINDOW_MINUTES
+    smoothing, endpoint = listener_smoothing_minutes(), endpoint_dwell_minutes()
     return (
         f"This frontend's payout-revision listener (#752) has not held its LISTEN for {dwell} minutes while it "
         "served miners (#843). While qbit_prism_payout_revision_listener_up reads 0, the frontend republishes after "
@@ -104,9 +131,11 @@ def listener_basis():
         f"one more connection each frontend needs, holds it at 0 for good. {dwell * 60 // SCRAPE_SECONDS} consecutive "
         f"{SCRAPE_SECONDS}-second scrapes leave no reconnect behind, and an outage of the database itself pages "
         "PrismDatabaseUnavailable after two minutes, so a short one does not warn here as well. The "
-        f"{LISTENER_SMOOTHING_MINUTES}-minute windows ride over a failed scrape, which would otherwise restart the "
-        f"dwell, and carry the last reading for {LISTENER_SMOOTHING_MINUTES} minutes after scrapes stop; a scrape that "
-        "keeps failing is PrismMetricsEndpointDown's. Each evaluation reads the latest scrape, and one that finds the "
+        f"{smoothing}-minute windows ride over a failed scrape, which would otherwise restart the dwell, and carry "
+        f"the last reading for {smoothing} minutes after scrapes stop, {ENDPOINT_TITLE}'s {endpoint}-minute dwell and "
+        f"one {STANDARD_EVALUATION_MINUTES}-minute evaluation interval (#869), so a frontend whose scrapes stop while "
+        f"this warns or dwells keeps warning or dwelling until {ENDPOINT_TITLE} fires for it; a scrape that keeps "
+        f"failing is {ENDPOINT_TITLE}'s. Each evaluation reads the latest scrape, and one that finds the "
         "LISTEN holding restarts the dwell, so a listener that keeps reconnecting and dropping can warn late or not "
         "at all; its WARN lines show it. "
         "Not this rule's: a LISTEN that holds but hears nothing, as through a transaction-pooling proxy, reads 1; "
@@ -272,12 +301,15 @@ WINDOW_PROSE = [r"authorized\s+miner\s+in\s+the\s+last\s+(\d+)\s+minutes",
 LISTENER_PROSE = [r"has\s+read\s+0\s+for\s+(\d+)\s+minutes",
                   r"served\s+miners\s+for\s+(\d+)\s+minutes"]
 # The docs that state them; in the ops guide only its listener runbook (#843).
+LISTENER_RUNBOOK = "### A payout-revision listener that stays down (#843)\n"
 PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.md": None,
-              "docs/prism-ledger-ops.md": "### A payout-revision listener that stays down (#843)\n"}
+              "docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
+# How the runbook states how long the listener rule carries a reading (#869).
+LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes"]
 
 
-def check_prose(patterns, expected, what, constant):
-    for path, heading in PROSE_DOCS.items():
+def check_prose(patterns, expected, what, constant, docs=PROSE_DOCS):
+    for path, heading in docs.items():
         text = (ROOT / path).read_text()
         if heading is not None:
             if heading not in text:
@@ -301,6 +333,10 @@ def check_window_prose():
 def check_listener_prose():
     """#843: the operator docs state the listener rule's dwell the generator writes."""
     check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
+    # #869: and the window that carries a reading after scrapes stop.
+    check_prose(LISTENER_WINDOW_PROSE, listener_smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
+                f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES",
+                docs={"docs/prism-ledger-ops.md": LISTENER_RUNBOOK})
 
 
 def postgres_rules():

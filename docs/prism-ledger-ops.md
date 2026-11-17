@@ -448,9 +448,14 @@ late or not at all; its log lines show it.
 The warning resolves at the first evaluation that finds the `LISTEN` holding
 at the latest scrape, or once the frontend has had no authorized miner for the
 whole window.
-Its two-minute windows ride over a failed scrape and carry the last reading for
-two minutes after scrapes stop; a scrape that keeps failing is
-`PrismMetricsEndpointDown`'s.
+Its windows ride over a failed scrape and carry the last reading for 4
+minutes after scrapes stop: `PrismMetricsEndpointDown`'s 3-minute dwell and one
+1-minute evaluation interval, the standard rule group's default (#869). So a
+frontend whose scrapes stop while this warns or dwells keeps warning or
+dwelling until `PrismMetricsEndpointDown` fires for it, and a dwell can end on
+a reading up to 4 minutes old; a scrape that keeps failing is
+`PrismMetricsEndpointDown`'s. A standard evaluation interval longer than a
+minute can leave an evaluation between the two uncovered again.
 
 ## Durable block candidates
 
