@@ -15,12 +15,17 @@
 //!
 //! A found block's append is the only path to `submitblock`, so one that
 //! fails before COMMIT for a passing database condition (a lock wait past
-//! `lock_timeout`, a pool timeout, a dropped connection) is run again inside
+//! `lock_timeout`, a pool timeout, a connection lost before COMMIT) is run
+//! again inside
 //! its own task, a bounded number of times, while the job's parent is still
 //! the observed tip ([`FoundBlockRetry`]). Only a failure proven to precede
-//! COMMIT is run again, so the earlier attempt wrote nothing; every attempt
-//! probes the share's ID, and the outbox's block hash under `ORDER_LOCK`, so
-//! none credits the share twice or writes a second outbox row.
+//! COMMIT is run again, so the earlier attempt wrote nothing, and every
+//! attempt finds what is already recorded: a share-pass append probes the
+//! share's ID under `ORDER_LOCK` and inserts its outbox row only if the block
+//! hash has none, and a block-only enqueue checks for the row under
+//! `ORDER_LOCK`. None credits the share twice or writes a second outbox row.
+//! A block-only enqueue that may have sent COMMIT (its connection failed
+//! during it) keeps its unknown answer and is followed, never run again.
 use super::submit_ledger::{Appended, CommitGate, GateClosure, GateState};
 use super::*;
 use crate::ledger::{CommitGateClosed, OwnLogLost, PayoutRevisionChanged, WindowNotHeld};
@@ -226,12 +231,14 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
 /// Whether a found block's append that failed before COMMIT met a passing
 /// condition of the database or of its connection, which the same append may
 /// clear by running again: the pool timed out (`PoolTimedOut`), the
-/// connection failed (`Io`), or the server answered with a connection
-/// exception (class 08), insufficient resources (class 53), a serialization
-/// failure or deadlock (40001, 40P01), a lock wait past `lock_timeout`
-/// (55P03, `ORDER_LOCK` included), a cancelled statement (57014) or a server
-/// shutting down or starting (57P01, 57P02, 57P03). The caller proves that
-/// COMMIT was never sent; this only says whether trying again can help.
+/// connection or its TLS session failed (`Io`, `Tls`), or the server answered
+/// with a connection exception (class 08), insufficient resources (class
+/// 53), a serialization failure or deadlock (40001, 40P01), a lock wait past
+/// `lock_timeout` (55P03, `ORDER_LOCK` included), a server shutting down,
+/// crashing or starting (57P01, 57P02, 57P03; `pg_terminate_backend` sends
+/// 57P01 too, and cannot be told from a shutdown), or an idle session's or
+/// idle transaction's timeout (57P05, 25P03). The caller proves that COMMIT
+/// was never sent; this only says whether trying again can help.
 ///
 /// Nothing else is run again. The deliberate refusals, all raised before any
 /// write, are named here even though none is a database error, so that no
@@ -251,8 +258,11 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
 /// writer, a duplicate share or a payload that differs from the recorded one,
 /// a candidate identity conflict, a candidate that fails its own checks, the
 /// partition refusal (23514) that the ledger already ran once more, a
-/// read-only database (25006), a closed pool (`PoolClosed`, a shutdown) and
-/// every other server or protocol error.
+/// read-only database (25006), a cancelled statement (57014: an operator's
+/// `pg_cancel_backend`, or a statement that ran out `statement_timeout`,
+/// which the error alone cannot tell apart), a closed pool (`PoolClosed`, a
+/// shutdown), a protocol error (the connection setup's own refusal of a
+/// server without `fsync` is one) and every other server error.
 pub(super) fn transient_before_commit(error: &anyhow::Error) -> bool {
     let refused = error.chain().any(|cause| {
         cause.is::<CommitGateClosed>()
@@ -264,13 +274,13 @@ pub(super) fn transient_before_commit(error: &anyhow::Error) -> bool {
         return false;
     }
     match sqlx_error(error) {
-        Some(sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)) => true,
+        Some(sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_)) => true,
         Some(sqlx::Error::Database(database)) => database.code().is_some_and(|code| {
             code.starts_with("08")
                 || code.starts_with("53")
                 || matches!(
                     code.as_ref(),
-                    "40001" | "40P01" | "55P03" | "57014" | "57P01" | "57P02" | "57P03"
+                    "40001" | "40P01" | "55P03" | "57P01" | "57P02" | "57P03" | "57P05" | "25P03"
                 )
         }),
         _ => false,
@@ -278,11 +288,13 @@ pub(super) fn transient_before_commit(error: &anyhow::Error) -> bool {
 }
 
 /// How many times in all a found block's append runs, the first attempt
-/// included, when each fails before COMMIT for a passing reason. A failing
-/// attempt usually waits out `lock_timeout` (5 s) or the pool's 15 s acquire
-/// timeout, so [`FOUND_BLOCK_APPEND_WINDOW`] ends the retry first; this bound
-/// stops a failure that returns at once, a reset connection, from spinning.
-pub(super) const FOUND_BLOCK_APPEND_ATTEMPTS: u32 = 8;
+/// included, when each fails before COMMIT for a passing reason. An attempt
+/// that waits out `lock_timeout` (5 s) or the pool's 15 s acquire timeout
+/// meets [`FOUND_BLOCK_APPEND_WINDOW`] first (after about 9 or 4 attempts);
+/// this bound stops a failure that returns at once, a dead pooled connection
+/// after a failover, from spinning, and ends it only after about 48 s of
+/// pauses, so such a failover still has most of the window.
+pub(super) const FOUND_BLOCK_APPEND_ATTEMPTS: u32 = 16;
 
 /// No attempt of a found block's append starts later than this after its
 /// submit checks admitted it: one 60 s block interval. A blip (a lock stall,
@@ -319,10 +331,13 @@ pub(super) struct CandidateSource {
 enum RetryEnd {
     /// A deliberate refusal, or an error the same append would meet again.
     NotTransient,
-    /// The frontend is stopping: its own log was lost (D-8, D-9, a
-    /// `FrontendStop`) or is behind (a detected local rollback), or its
-    /// ledger pool closed at the end of a shutdown.
-    Stopping,
+    /// The frontend is shutting down: its shutdown was signalled, or its
+    /// ledger pool closed, the last step of every shutdown.
+    Shutdown,
+    /// This node's own log was lost (D-8, D-9: a `FrontendStop` sets it
+    /// before the stop) or is behind (a detected local rollback): no share of
+    /// this node's may be appended.
+    OwnLog,
     /// The job's parent is no longer the observed tip: the block can no
     /// longer extend the chain.
     ParentChanged,
@@ -338,7 +353,8 @@ impl RetryEnd {
     fn label(self) -> &'static str {
         match self {
             Self::NotTransient => "not-transient",
-            Self::Stopping => "stopping",
+            Self::Shutdown => "shutdown",
+            Self::OwnLog => "own-log",
             Self::ParentChanged => "parent-changed",
             Self::Attempts => "attempts",
             Self::Window => "window",
@@ -350,14 +366,18 @@ impl RetryEnd {
 /// The retry of one found block's append, share-pass or block-only, after a
 /// failure proven to precede COMMIT. It lives in the append's own spawned
 /// task, so neither the acknowledgement deadline nor a cancelled submission
-/// ends it, and it ends that task no later than the frontend's shutdown:
-/// it stops once the own log is lost or behind and once the ledger pool
-/// closes, the last step of every shutdown, which wakes its backoff.
+/// ends it, and it never outlives the frontend: it starts no new attempt once
+/// the shutdown is signalled (`Coordinator::shutdown_signal`), the own log is
+/// lost or behind, or the ledger pool has closed, and the shutdown signal and
+/// the pool's close both wake its backoff. An attempt already running
+/// finishes under its own database timeouts and its result stands. Without a
+/// shutdown signal (tools, test fixtures) only the other endings apply.
 pub(super) struct FoundBlockRetry {
     source: CandidateSource,
     ledger: Arc<Ledger>,
     observed_tip: Arc<RwLock<TipState>>,
     peer_sync: Option<watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    shutdown: Option<watch::Receiver<bool>>,
     share_id: String,
     path: &'static str,
     window_end: tokio::time::Instant,
@@ -393,7 +413,7 @@ impl FoundBlockRetry {
                     self.attempts += 1;
                     return Some(candidate);
                 }
-                None => match self.source.build().await {
+                None => match submission_candidate(&self.source).await {
                     Ok(candidate) => {
                         self.attempts += 1;
                         return Some(candidate);
@@ -420,15 +440,18 @@ impl FoundBlockRetry {
         None
     }
 
-    /// Decide whether the append runs again and wait out its backoff.
+    /// Decide whether the append runs again and wait out its backoff. A
+    /// failure that is not run again is decided before the observed tip's
+    /// lock is read, so its answer never waits for a publication.
     async fn wait(&mut self, error: &anyhow::Error) -> Result<(), RetryEnd> {
-        self.still_matters().await?;
+        self.running()?;
         if !transient_before_commit(error) {
             return Err(RetryEnd::NotTransient);
         }
         if self.attempts >= FOUND_BLOCK_APPEND_ATTEMPTS {
             return Err(RetryEnd::Attempts);
         }
+        self.parent_is_tip().await?;
         let resume = tokio::time::Instant::now() + self.backoff;
         if resume > self.window_end {
             return Err(RetryEnd::Window);
@@ -442,26 +465,48 @@ impl FoundBlockRetry {
             error = %format_args!("{error:#}"),
             "found block's append failed before COMMIT; appending it again"
         );
-        // A shutdown closes the pool last; it wakes this wait at once.
+        // The shutdown signal, and the pool's close that ends every shutdown,
+        // wake this wait at once. A signal whose sender is gone is a frontend
+        // that has stopped.
+        let signalled = async {
+            match self.shutdown.clone() {
+                Some(mut shutdown) => drop(shutdown.wait_for(|stop| *stop).await),
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             () = tokio::time::sleep_until(resume) => {}
-            () = self.ledger.pool.close_event() => return Err(RetryEnd::Stopping),
+            () = signalled => return Err(RetryEnd::Shutdown),
+            () = self.ledger.pool.close_event() => return Err(RetryEnd::Shutdown),
         }
         self.backoff = (self.backoff * 2).min(FOUND_BLOCK_APPEND_BACKOFF_CAP);
-        self.still_matters().await
+        self.running()?;
+        self.parent_is_tip().await
     }
 
-    /// The frontend is not stopping and the block can still extend the
-    /// chain: its job's parent is the observed tip, as the submit check
-    /// required when it admitted the share.
-    async fn still_matters(&self) -> Result<(), RetryEnd> {
+    /// The frontend is not stopping: no shutdown is signalled, its ledger
+    /// pool is open, and its own log is neither lost nor behind.
+    fn running(&self) -> Result<(), RetryEnd> {
+        let signalled = self
+            .shutdown
+            .as_ref()
+            .is_some_and(|shutdown| *shutdown.borrow() || shutdown.has_changed().is_err());
+        if signalled || self.ledger.pool.is_closed() {
+            return Err(RetryEnd::Shutdown);
+        }
         let own_log_behind = self
             .peer_sync
             .as_ref()
             .is_some_and(|status| !status.borrow().own_log_caught_up);
-        if self.ledger.own_log_lost() || own_log_behind || self.ledger.pool.is_closed() {
-            return Err(RetryEnd::Stopping);
+        if self.ledger.own_log_lost() || own_log_behind {
+            return Err(RetryEnd::OwnLog);
         }
+        Ok(())
+    }
+
+    /// The block can still extend the chain: its job's parent is the
+    /// observed tip, as the submit check required when it admitted the share.
+    async fn parent_is_tip(&self) -> Result<(), RetryEnd> {
         if self.observed_tip.read().await.as_deref() != Some(self.source.parent.as_str()) {
             return Err(RetryEnd::ParentChanged);
         }
@@ -594,68 +639,68 @@ impl CandidateSource {
             deferred_share,
         }
     }
+}
 
-    /// Construct the durable candidate from the job's immutable issued
-    /// inputs. Every call builds the same candidate.
-    pub(super) async fn build(&self) -> Result<Candidate> {
-        let Self {
-            context,
+/// Construct the durable candidate from the job's immutable issued inputs.
+/// Every call with the same source builds the same candidate.
+pub(super) async fn submission_candidate(source: &CandidateSource) -> Result<Candidate> {
+    let CandidateSource {
+        context,
+        job_id,
+        parent: _,
+        extranonce1,
+        extranonce2_size,
+        submission,
+        deferred_share,
+    } = source.clone();
+    // The job context is shared; the recipient-sized copy and block
+    // encoding belong on a blocking worker, before the ledger
+    // transaction begins.
+    tokio::task::spawn_blocking(move || {
+        let original = context
+            .bundle
+            .coinbase_script_sig_suffix_hex
+            .as_ref()
+            .context("job coinbase suffix missing")?;
+        let placeholder_length = (4 + extranonce2_size) * 2;
+        let prefix = original
+            .get(
+                ..original
+                    .len()
+                    .checked_sub(placeholder_length)
+                    .context("job coinbase suffix too short")?,
+            )
+            .context("invalid job suffix")?;
+        let suffix = format!("{prefix}{}{}", extranonce1, submission.extranonce2_hex);
+        // The slim candidate: the window reference `refresh_once`
+        // already computed, the stored inputs the job was built with,
+        // and the block as bytes. Nothing here walks the window, clones
+        // the bundle or reads configuration. The as-issued balances,
+        // O(recipients), travel beside the document so the enqueue can
+        // write the snapshot the post-offer landing rebuilds from.
+        let inputs = &context.prepared.inputs;
+        let block_bytes = hex::decode(&submission.block_hex)?;
+        anyhow::Ok(Candidate {
+            block_hash: submission.block_hash_hex.clone(),
+            block_sha256: Candidate::block_digest_hex(&block_bytes),
             job_id,
-            parent: _,
-            extranonce1,
-            extranonce2_size,
-            submission,
+            payout_revision: context.prepared.snapshot.payout_revision,
+            window: context.prepared.window,
+            bootstrap_share: context.bootstrap_share.clone(),
+            found_block: context.bundle.found_block.clone(),
+            payout_policy: inputs.payout_policy.clone(),
+            ctv: inputs.ctv.clone(),
+            audit_builder_version: inputs.audit_builder_version,
+            signer_keys: inputs.signer_keys.clone(),
+            leased: false,
+            coinbase_suffix_hex: suffix,
             deferred_share,
-        } = self.clone();
-        // The job context is shared; the recipient-sized copy and block
-        // encoding belong on a blocking worker, before the ledger
-        // transaction begins.
-        tokio::task::spawn_blocking(move || {
-            let original = context
-                .bundle
-                .coinbase_script_sig_suffix_hex
-                .as_ref()
-                .context("job coinbase suffix missing")?;
-            let placeholder_length = (4 + extranonce2_size) * 2;
-            let prefix = original
-                .get(
-                    ..original
-                        .len()
-                        .checked_sub(placeholder_length)
-                        .context("job coinbase suffix too short")?,
-                )
-                .context("invalid job suffix")?;
-            let suffix = format!("{prefix}{}{}", extranonce1, submission.extranonce2_hex);
-            // The slim candidate: the window reference `refresh_once`
-            // already computed, the stored inputs the job was built with,
-            // and the block as bytes. Nothing here walks the window, clones
-            // the bundle or reads configuration. The as-issued balances,
-            // O(recipients), travel beside the document so the enqueue can
-            // write the snapshot the post-offer landing rebuilds from.
-            let inputs = &context.prepared.inputs;
-            let block_bytes = hex::decode(&submission.block_hex)?;
-            anyhow::Ok(Candidate {
-                block_hash: submission.block_hash_hex.clone(),
-                block_sha256: Candidate::block_digest_hex(&block_bytes),
-                job_id,
-                payout_revision: context.prepared.snapshot.payout_revision,
-                window: context.prepared.window,
-                bootstrap_share: context.bootstrap_share.clone(),
-                found_block: context.bundle.found_block.clone(),
-                payout_policy: inputs.payout_policy.clone(),
-                ctv: inputs.ctv.clone(),
-                audit_builder_version: inputs.audit_builder_version,
-                signer_keys: inputs.signer_keys.clone(),
-                leased: false,
-                coinbase_suffix_hex: suffix,
-                deferred_share,
-                block_bytes,
-                as_issued_balances: (*context.prepared.reservation.balances).clone(),
-            })
+            block_bytes,
+            as_issued_balances: (*context.prepared.reservation.balances).clone(),
         })
-        .await
-        .context("candidate construction worker failed")?
-    }
+    })
+    .await
+    .context("candidate construction worker failed")?
 }
 
 impl Coordinator {
@@ -680,6 +725,7 @@ impl Coordinator {
             ledger: self.ledger.clone(),
             observed_tip: self.observed_tip.clone(),
             peer_sync: self.peer_sync.get().cloned(),
+            shutdown: self.shutdown_signal.get().cloned(),
             share_id: share_id.to_owned(),
             path,
             window_end: start + FOUND_BLOCK_APPEND_WINDOW,
@@ -902,7 +948,7 @@ impl Coordinator {
         let found = match (submission.block_pass && (candidate_current || capture_stale))
             .then(|| CandidateSource::new(job, submission, deferred_share))
         {
-            Some(source) => source.build().await.map(|candidate| {
+            Some(source) => submission_candidate(&source).await.map(|candidate| {
                 let path = if credit_now { "share" } else { "block-only" };
                 Some((
                     candidate,

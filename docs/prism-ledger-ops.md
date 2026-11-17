@@ -2779,7 +2779,7 @@ Every later attempt is a separate public operation with its own claim.
 | Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |
 | Expired or lost claim across a halt | never revived | none | Clearing `fatal_error` restores authority for new work only; the token that expired during the halt is still rejected by every operation and a new claim is required. | dynamic: `restored_authority_requires_fresh_claim` |
 | Share append: `append`, `append_at_revision` | public reinvocation, idempotent by share identity | none | A miner or frontend resubmission is a new call; the share identity and proof-hash registry return the existing row without a second credit. | inventory: `ledger_postgres::global_duplicates_idempotence_and_config_fencing`, `postgres_failover` |
-| Found block's append (coordinator): a share-pass append that carries a found block, or a block-only proof's duplicate probe and candidate enqueue | the one stated exception: bounded re-execution, idempotent by share identity and block hash | after a failure proven to precede `COMMIT` that is a passing database condition, at most 8 attempts in all, none starting later than 60 s after the share's admission, while the job's parent is the observed tip and the frontend is not stopping | The same append, with the same share, revision and candidate, in the task that ran the first attempt. Each attempt probes the share ID and the outbox's block hash under `ORDER_LOCK`. Deliberate refusals are never run again. See "Found block's append" below. | dynamic: `commit_reconcile_tests::found_block_retry::*`; classifier: `miner_tests::commit_reconcile::found_block_retry_runs_again_only_for_a_passing_database_failure` |
+| Found block's append (coordinator): a share-pass append that carries a found block, or a block-only proof's duplicate probe and candidate enqueue | the one stated exception: bounded re-execution, idempotent by share identity and block hash | after a failure proven to precede `COMMIT` that is a passing database condition, at most 16 attempts in all, none starting later than 60 s after the share's admission, while the job's parent is the observed tip and no shutdown is signalled | The same append, with the same share, revision and candidate, in the task that ran the first attempt. Each attempt finds what is already recorded: the share-pass append probes the share ID under `ORDER_LOCK` and inserts the outbox row only if its block hash has none, and the block-only enqueue checks for the row under `ORDER_LOCK`. Deliberate refusals are never run again. See "Found block's append" below. | dynamic: `commit_reconcile_tests::found_block_retry::*`; classifier: `miner_tests::commit_reconcile::found_block_retry_runs_again_only_for_a_passing_database_failure` |
 | Page traversal: `read_window`, `snapshot`, audit materialization | normal page traversal | none | A page is not a retry. `read_window` pages inside one `REPEATABLE READ READ ONLY` transaction and reports an incomplete range as an error instead of a partial window. `snapshot` fixes its anchor and revision in one short transaction, then pages immutable rows at or before that anchor in a second one. Audit materialization reads the snapshot row and the share range through separate checkouts; the share count, snapshot digest and bundle digest authenticate the result, and a mismatch is an error. | inventory: `window_reference`, `window_read_oracle` |
 | Dependency reread or repair: `save_issued_job` with a repair payload, `backfill_ctv`, `import_legacy_audits` | dependency reread/repair | none | Cold-path calls that re-read the durable dependency and verify its identity, or rebuild a missing row idempotently. None replays a failed write. | inventory: `issued_job_dependency`, `ledger_postgres::ctv_artifacts_wait_for_maturity_and_claims_are_fenced`, `ledger_postgres::legacy_audit_import_validates_envelope_hash_and_pinned_key` |
 | Reconciliation: `pool_blocks_for_reconcile`, `reconcile_blocks`, `reconcile_blocks_at_revision`, `observe_fanout` | public reinvocation, revision fenced | none | Periodic calls. `pool_blocks_for_reconcile` is one query. A stale expected revision (for `observe_fanout`, when the observation carries one) is an error that changes nothing. | inventory: `ledger_postgres::verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced` |
@@ -2830,24 +2830,33 @@ again, inside the task that ran it, under these rules:
   connection during the enqueue) keeps its existing answer and is followed,
   never run again.
 - **Only a passing database condition**: a pool timeout, a failed
-  connection, or SQLSTATE class 08 or 53, 40001, 40P01, 55P03 (a wait for
-  `ORDER_LOCK` past `lock_timeout` included), 57014, 57P01, 57P02 or 57P03.
-  A deliberate refusal is never run again: a closed commit gate, a moved
-  payout revision with capture off, a window this primary does not hold
-  (#619), a lost own log (D-8, D-9), a configuration fingerprint that is not
-  this frontend's, a halted cluster, a live legacy writer, a duplicate or
-  conflicting share or candidate, a candidate that fails its own checks.
-  Neither is any other error, a closed pool or a read-only database
-  included.
+  connection or TLS session, or SQLSTATE class 08 or 53, 40001, 40P01,
+  55P03 (a wait for `ORDER_LOCK` past `lock_timeout` included), 57P01,
+  57P02, 57P03, 57P05 or 25P03. A deliberate refusal is never run again: a
+  closed commit gate, a moved payout revision with capture off, a window
+  this primary does not hold (#619), a lost own log (D-8, D-9), a
+  configuration fingerprint that is not this frontend's, a halted cluster, a
+  live legacy writer, a duplicate or conflicting share or candidate, a
+  candidate that fails its own checks. Neither is any other error: a closed
+  pool, a read-only database, a protocol error, or a cancelled statement
+  (57014, which an operator's `pg_cancel_backend` and an expired
+  `statement_timeout` both send). `pg_terminate_backend` sends 57P01, as a
+  server shutting down does, so terminating a found block's append does not
+  end it: it runs again while its parent is the tip.
 - **Bounded.** Pauses of 0.25, 0.5, 1, 2, then 4 s between attempts; at most
-  8 attempts; no attempt starts later than 60 s (one block interval) after
-  the share's submit checks admitted it. An attempt already running keeps
-  its own pool, lock and statement timeouts.
+  16 attempts; no attempt starts later than 60 s (one block interval) after
+  the share's submit checks admitted it. Attempts that wait out
+  `lock_timeout` or the pool's acquire timeout meet the 60 s first; the
+  count ends attempts that fail at once after about 48 s of pauses. An
+  attempt already running keeps its own pool, lock and statement timeouts.
 - **Only while the block can matter.** Before and after each pause the job's
   parent must still be the observed tip.
-- **Never past the frontend.** The retry stops once the own log is lost
-  (a `FrontendStop`) or behind, and once the ledger pool closes, the last
-  step of every shutdown, which also wakes a pause at once.
+- **Never past the frontend.** No attempt starts once the shutdown is
+  signalled (the first step of every shutdown, before the session drain and
+  the stopped marker), once the ledger pool has closed (its last step), or
+  once the own log is lost (a `FrontendStop`) or behind; the shutdown signal
+  and the pool's close also wake a pause at once. An attempt already running
+  finishes under its own timeouts, and its result stands.
 
 A retried attempt cannot credit the share twice or write a second outbox
 row: the attempt before it wrote nothing, and each attempt probes the share
@@ -2864,8 +2873,9 @@ again logs a WARN `found block's append failed before COMMIT; appending it
 again`; a block recorded by a later attempt logs a WARN `found block recorded
 after its append was run again`; a retry that ends with the block unrecorded
 logs an ERROR `found block not recorded: ...` with `block_hash`, `share_id`,
-`attempts` and `stopped` (`not-transient`, `stopping`, `parent-changed`,
-`attempts`, `window` or `rebuild-failed`). That block is never offered.
+`attempts` and `stopped` (`not-transient`, `shutdown`, `own-log`,
+`parent-changed`, `attempts`, `window` or `rebuild-failed`). That block is
+never offered.
 
 ### Deadlines
 
