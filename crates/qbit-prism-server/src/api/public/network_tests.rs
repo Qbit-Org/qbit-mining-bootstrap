@@ -11,7 +11,8 @@ use tokio_util::task::AbortOnDropHandle;
 /// A node that counts each method it is asked, holds `getblockchaininfo`
 /// while closed and `getnetworkhashps` while its own gate is closed, and
 /// fails the next `fail_chain` of the first, `fail_info` `getnetworkinfo`,
-/// or `fail_hashrate` `getnetworkhashps`, which otherwise answers `hashrate`.
+/// or `fail_hashrate` `getnetworkhashps`, which otherwise answers `hashrate`
+/// and keeps the parameters it was asked with in `hashrate_params`.
 struct FakeNode {
     calls: StdMutex<BTreeMap<String, usize>>,
     open: watch::Sender<bool>,
@@ -21,6 +22,7 @@ struct FakeNode {
     fail_hashrate: AtomicUsize,
     tip: StdMutex<String>,
     hashrate: StdMutex<Value>,
+    hashrate_params: StdMutex<Vec<Value>>,
 }
 impl FakeNode {
     fn calls(&self, method: &str) -> usize {
@@ -78,7 +80,10 @@ async fn fake_node_reply(
             json!({"connections":2})
         }
         "getnetworkhashps" => {
-            assert_eq!(input["params"], json!([120, -1, "permissionless"]));
+            node.hashrate_params
+                .lock()
+                .unwrap()
+                .push(input["params"].clone());
             let _ = node.hashrate_open.subscribe().wait_for(|open| *open).await;
             if failed(&node.fail_hashrate) {
                 return Json(json!({"id":input["id"],"result":null,"error":{"code":-1}}));
@@ -132,6 +137,7 @@ async fn fake(
         fail_hashrate: AtomicUsize::new(0),
         tip: StdMutex::new("ab".repeat(32)),
         hashrate: StdMutex::new(json!("1234567890123.125")),
+        hashrate_params: StdMutex::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rpc_url = format!("http://{}/", listener.local_addr().unwrap());
@@ -175,17 +181,6 @@ impl StallingNode {
     fn sets(&self) -> usize {
         self.sets.load(Ordering::SeqCst)
     }
-}
-
-/// `state` with every ledger read failing at once, as with no database.
-fn without_database(mut state: ApiState) -> ApiState {
-    let reads = sqlx::postgres::PgPoolOptions::new()
-        .acquire_timeout(Duration::from_millis(10))
-        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
-        .unwrap();
-    state.pool = reads.clone();
-    state.public_pool = reads;
-    state
 }
 
 /// The fake node's `getnetworkhashps` answer as the pool summary serves it.
@@ -409,6 +404,11 @@ async fn pool_summary_requests_with_junk_parameters_share_one_entry_and_one_hash
     ] {
         assert_eq!(node.calls(method), 1, "{method}");
     }
+    assert_eq!(
+        *node.hashrate_params.lock().unwrap(),
+        [json!([120, -1, "permissionless"])],
+        "the call pool-summary always made"
+    );
 }
 
 #[tokio::test]

@@ -117,6 +117,23 @@ impl<T: Clone + Send + Sync + 'static> CacheSlot<T> {
     }
 }
 
+#[cfg(test)]
+impl CacheSlot<Payload> {
+    /// A slot whose entry is `payload`, built just now, as a completed
+    /// computation leaves it.
+    pub(super) fn holding(payload: Payload) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SlotState {
+                entry: Some(Entry {
+                    payload,
+                    created: Instant::now(),
+                }),
+                inflight: None,
+            }),
+        })
+    }
+}
+
 pub(super) async fn public_response(
     state: &ApiState,
     path: &str,

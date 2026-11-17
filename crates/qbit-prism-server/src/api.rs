@@ -871,7 +871,11 @@ fn json_response(status: StatusCode, payload: Value) -> Response {
 /// A request's query parameters: the first non-empty value of each, the only
 /// value a handler ever reads.
 #[derive(Default, Clone, Debug)]
-struct Query(BTreeMap<String, String>);
+struct Query {
+    values: BTreeMap<String, String>,
+    /// The names [`Query::only`] kept, which are all a handler may ask for.
+    allowed: Option<&'static [&'static str]>,
+}
 #[cfg(test)]
 tokio::task_local! {
     /// Every parameter name a handler asks a [`Query`] for, in this task.
@@ -879,28 +883,43 @@ tokio::task_local! {
 }
 impl Query {
     fn parse(value: &str) -> Self {
-        let mut q = BTreeMap::new();
+        let mut values = BTreeMap::new();
         for (k, v) in url::form_urlencoded::parse(value.as_bytes()) {
             if !v.is_empty() {
-                q.entry(k.into_owned()).or_insert_with(|| v.into_owned());
+                values
+                    .entry(k.into_owned())
+                    .or_insert_with(|| v.into_owned());
             }
         }
-        Self(q)
+        Self {
+            values,
+            allowed: None,
+        }
     }
-    /// Only the parameters named in `names`.
-    fn only(&self, names: &[&str]) -> Self {
-        Self(
-            self.0
+    /// Only the parameters named in `names`, the only ones a handler may then
+    /// ask for.
+    fn only(&self, names: &'static [&'static str]) -> Self {
+        Self {
+            values: self
+                .values
                 .iter()
                 .filter(|(name, _)| names.contains(&name.as_str()))
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-        )
+            allowed: Some(names),
+        }
     }
     fn get(&self, key: &str) -> Option<&str> {
+        // A public route that asks for a parameter its list leaves out would
+        // answer every value of it from one cache entry; in a build with
+        // debug assertions, any test that runs such a route fails here.
+        debug_assert!(
+            self.allowed.is_none_or(|names| names.contains(&key)),
+            "a route read the query parameter {key:?}, which public::parameters leaves out of its cache key"
+        );
         #[cfg(test)]
         let _ = QUERY_READS.try_with(|reads| reads.borrow_mut().insert(key.to_owned()));
-        self.0.get(key).map(String::as_str)
+        self.values.get(key).map(String::as_str)
     }
     fn page(&self) -> ApiResult<(i64, i64)> {
         let page = self
@@ -1015,7 +1034,7 @@ fn cache_key(path: &str, q: &Query) -> String {
     } else {
         path.into()
     };
-    format!("{canonical}?{}", serde_json::to_string(&q.0).unwrap())
+    format!("{canonical}?{}", serde_json::to_string(&q.values).unwrap())
 }
 fn decode(s: &str) -> String {
     percent_decode_str(s).decode_utf8_lossy().into_owned()

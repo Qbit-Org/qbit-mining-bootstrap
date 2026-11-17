@@ -1,38 +1,70 @@
 //! The query parameters each public route reads, against [`parameters`],
-//! the ones its origin cache key is made of.
+//! the ones its origin cache key is made of, and against the ones the
+//! OpenAPI document gives it.
 use super::*;
 use axum::{body::to_bytes, http::Request};
 use std::collections::BTreeSet;
 use tower::ServiceExt;
 
-/// Every public route `dispatch` answers, with concrete identifiers, and the
-/// unknown endpoints under it.
+const OPENAPI: &str = include_str!("../../../../../docs/public-dashboard-api-v1.openapi.yaml");
+
+/// Each path `docs/public-dashboard-api-v1.openapi.yaml` documents, under
+/// `/public/v1`, with the query parameters it documents for it.
+fn documented() -> BTreeMap<String, BTreeSet<String>> {
+    let mut routes = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut route = None;
+    let mut name = None;
+    for line in OPENAPI.lines() {
+        if line == "components:" {
+            break;
+        }
+        if let Some(path) = line.strip_prefix("  /").and_then(|p| p.strip_suffix(':')) {
+            let path = format!("/public/v1/{path}");
+            routes.insert(path.clone(), BTreeSet::new());
+            route = Some(path);
+            continue;
+        }
+        let Some(route) = &route else {
+            continue;
+        };
+        let parameter = match line.trim() {
+            "- $ref: \"#/components/parameters/Page\"" => "page",
+            "- $ref: \"#/components/parameters/Limit\"" => "limit",
+            "in: query" => name.take().expect("a query parameter without a name"),
+            line => {
+                if let Some(parameter) = line.strip_prefix("- name: ") {
+                    name = Some(parameter);
+                }
+                continue;
+            }
+        };
+        routes.get_mut(route).unwrap().insert(parameter.to_owned());
+    }
+    assert_eq!(routes.len(), 14, "the document's paths were not all found");
+    routes
+}
+
+/// `path` with its documented identifiers filled in.
+fn concrete(path: &str) -> String {
+    path.replace("{recipient_id}", "bob")
+        .replace("{block_hash}", &"ab".repeat(32))
+        .replace("{fanout_txid}", &"cd".repeat(32))
+        .replace("{sha256}", &"ef".repeat(32))
+}
+
+/// Every documented public route, with concrete identifiers, and unknown
+/// endpoints under `/public/v1`.
 fn routes() -> Vec<String> {
-    let hash = "ab".repeat(32);
-    let mut routes: Vec<String> = [
-        "/public/v1/pool-summary",
-        "/public/v1/mining-configuration",
-        "/public/v1/blocks",
-        "/public/v1/leaderboard",
-        "/public/v1/hashrate-series",
-        "/public/v1/block-markers",
-        "/public/v1/fanouts/pending",
-        "/public/v1/miners/bob",
-        "/public/v1/miners/bob/earnings",
-        "/public/v1/miners/bob/payouts",
-        "/public/v1/miners/bob/workers",
-        "/public/v1",
-        "/public/v1/unknown",
-        "/public/v1/miners/bob/unknown",
-        "/public/v1/miners/bob/workers/unknown",
-    ]
-    .map(String::from)
-    .into();
-    routes.extend([
-        format!("/public/v1/blocks/{hash}/settlement-artifacts"),
-        format!("/public/v1/fanouts/{hash}"),
-        format!("/public/v1/artifacts/{hash}"),
-    ]);
+    let mut routes: Vec<String> = documented().keys().map(|path| concrete(path)).collect();
+    routes.extend(
+        [
+            "/public/v1",
+            "/public/v1/unknown",
+            "/public/v1/miners/bob/unknown",
+            "/public/v1/miners/bob/workers/unknown",
+        ]
+        .map(String::from),
+    );
     routes
 }
 
@@ -45,21 +77,17 @@ const EVERY_PARAMETER: &str = "page=2&limit=3&chain_state=all&search=b&recipient
 /// A state whose node refuses connections and whose ledger reads fail at
 /// once, so a route's computation ends at its first read of either.
 fn state() -> ApiState {
-    let reads = sqlx::postgres::PgPoolOptions::new()
-        .acquire_timeout(Duration::from_millis(10))
-        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
-        .unwrap();
-    let mut state = ApiState::new(
-        reads.clone(),
+    without_database(ApiState::new(
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+            .unwrap(),
         ApiConfig {
             rpc_url: "http://127.0.0.1:1/".into(),
             cache_debug_headers: true,
             ..ApiConfig::default()
         },
         Arc::new(crate::metrics::Metrics::default()),
-    );
-    state.public_pool = reads;
-    state
+    ))
 }
 
 /// The parameter names `dispatch` asks `query` for on `path`.
@@ -73,21 +101,29 @@ async fn reads(state: &ApiState, path: &str, query: &Query) -> BTreeSet<String> 
 }
 
 /// The drift test: on every route, the handler asks for exactly the
-/// parameters its cache key holds. One it asked for beyond them would be
-/// one its answer depends on but its key does not; one it never asked for
-/// would split its cache for nothing.
+/// parameters its cache key holds, and those are the ones the OpenAPI
+/// document gives the route. One it asked for beyond them would be one its
+/// answer depends on but its key does not; one it never asked for would
+/// split its cache for nothing.
 ///
 /// Each route runs as it is served, with only its own parameters, once with
-/// none and once with every parameter set, and with the reward leaderboard's
-/// window alone. Its computation ends at its first ledger or node read, which
-/// every route reaches only after reading its parameters; a parameter read
-/// after that would go unseen here, and, absent from the key, would also be
-/// absent from what the route is given.
+/// none, once with every parameter set, and once with the reward
+/// leaderboard's window alone. Its computation ends at its first ledger or
+/// node read, which every route reaches only after reading its parameters. A
+/// parameter read after that goes unseen here, but [`Query::get`]'s debug
+/// assertion fails any test that runs the route with a database.
 #[tokio::test]
 async fn every_public_route_reads_exactly_the_parameters_its_cache_key_holds() {
     let state = state();
+    let documented = documented();
     for path in routes() {
         let declared: BTreeSet<String> = parameters(&path).iter().map(|p| p.to_string()).collect();
+        if let Some((_, given)) = documented.iter().find(|(doc, _)| concrete(doc) == path) {
+            assert_eq!(
+                &declared, given,
+                "{path}: the OpenAPI document gives it {given:?}"
+            );
+        }
         let mut read = BTreeSet::new();
         for raw in ["", EVERY_PARAMETER, "window=reward"] {
             read.extend(reads(&state, &path, &Query::parse(raw).only(parameters(&path))).await);
@@ -116,10 +152,12 @@ fn two_values(parameter: &str) -> [&'static str; 2] {
     }
 }
 
-/// For every parameter of every route, two requests that differ only in it
-/// get two cache entries, and a third with the first one's value, repeated
-/// with the second's after it, and a parameter no route reads, gets the first
-/// one's: a route reads only a parameter's first value.
+/// For every parameter of every route, with an answer remembered for each of
+/// two values under the key its request gets, each request is served its
+/// own value's answer: two requests that differ only in a parameter the route
+/// reads never share an entry. A third, with the first one's value, then the
+/// second's repeated after it, and a parameter no route reads, is served the
+/// first one's: a route reads only a parameter's first value.
 #[tokio::test]
 async fn requests_that_differ_in_a_parameter_their_route_reads_get_different_entries() {
     let mut cases = 0;
@@ -128,13 +166,25 @@ async fn requests_that_differ_in_a_parameter_their_route_reads_get_different_ent
             let state = state();
             let policy = CachePolicy::for_path(&path, &state.config);
             let [one, other] = two_values(parameter);
-            let mut keys = Vec::new();
-            for raw in [
-                format!("{parameter}={one}"),
-                format!("{parameter}={other}"),
-                format!("{parameter}={one}&junk=1&{parameter}={other}"),
+            for value in [one, other] {
+                let key = cache_key(
+                    &path,
+                    &Query::parse(&format!("{parameter}={value}")).only(parameters(&path)),
+                );
+                state.cache.lock().await.insert(
+                    key,
+                    super::super::response_cache::CacheSlot::holding(Payload::json(
+                        json!({ "value": value }),
+                    )),
+                );
+            }
+            assert_eq!(state.cache.lock().await.len(), 2, "{path} {parameter}");
+            for (raw, value) in [
+                (format!("{parameter}={one}"), one),
+                (format!("{parameter}={other}"), other),
+                (format!("{parameter}={one}&junk=1&{parameter}={other}"), one),
             ] {
-                let _ = super::super::response_cache::public_response(
+                let (result, cache, _) = super::super::response_cache::public_response(
                     &state,
                     &path,
                     &Query::parse(&raw),
@@ -142,14 +192,21 @@ async fn requests_that_differ_in_a_parameter_their_route_reads_get_different_ent
                     None,
                 )
                 .await;
-                keys.push(state.cache.lock().await.keys().cloned().collect::<Vec<_>>());
+                assert_eq!(cache, "HIT", "{path}?{raw}");
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&result.unwrap().bytes).unwrap()["value"],
+                    value,
+                    "{path}?{raw}"
+                );
             }
-            assert_eq!(keys[1].len(), 2, "{path} {parameter}: {keys:?}");
-            assert_eq!(keys[2], keys[1], "{path} {parameter}: {keys:?}");
             cases += 1;
         }
     }
-    assert_eq!(cases, 24, "every parameter of every route");
+    assert_eq!(
+        cases,
+        documented().values().map(BTreeSet::len).sum::<usize>(),
+        "every documented parameter of every route"
+    );
 }
 
 /// Requests that differ only in parameters their route does not read, one a

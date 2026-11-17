@@ -144,9 +144,11 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
 /// The query parameters each public route reads: the only ones
 /// [`dispatch`] is given, and the only ones its origin cache key is made of
 /// (`response_cache::public_response`). Any other parameter is ignored, as
-/// before. A route that read a parameter missing here would see it absent
-/// rather than share an entry across its values; `parameter_tests` fails
-/// either way the two drift apart.
+/// before. A route that asked for a parameter missing here would see it
+/// absent in a release build, never another value's entry, and fails a
+/// debug assertion in [`Query::get`], so any test that runs the route fails.
+/// `parameter_tests` holds this list to what each route asks for and to the
+/// query parameters `docs/public-dashboard-api-v1.openapi.yaml` documents.
 pub(super) fn parameters(path: &str) -> &'static [&'static str] {
     const PAGE: &[&str] = &["page", "limit"];
     match path {
@@ -350,6 +352,7 @@ async fn remembered_from_node<T: Clone + Send + Sync + 'static>(
                 .map(move |answer| {
                     answer.unwrap_or_else(|_| {
                         tracing::warn!(
+                            calls = what,
                             deadline_seconds = deadline.as_secs_f64(),
                             "the node calls for {what} passed the public read timeout and were dropped"
                         );
@@ -583,6 +586,18 @@ fn artifact_link(kind: &str, sha: &str, bytes: Option<usize>) -> Value {
     json!({"kind":kind,"sha256":sha,"url":format!("/public/v1/artifacts/{sha}"),"content_type":"application/json","byte_length":bytes})
 }
 
+/// `state` with every ledger read failing at once, as with no database, for
+/// the tests.
+#[cfg(test)]
+fn without_database(mut state: ApiState) -> ApiState {
+    let reads = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(10))
+        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    state.pool = reads.clone();
+    state.public_pool = reads;
+    state
+}
 #[cfg(test)]
 mod network_tests;
 #[cfg(test)]
