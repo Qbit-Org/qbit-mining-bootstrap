@@ -8,8 +8,9 @@
 //! binary opens, in parallel with these tests, so the timeout is lowered on
 //! the coordinator's own pooled sessions instead ([`ledger_sessions`]), only
 //! while the lock is held, and set back before any step that is not run
-//! again: other modules of this binary take the same cluster-wide advisory
-//! locks without this module's serial lock. For the same reason a wait for
+//! again: other modules of this binary take the same advisory locks in the
+//! same database (every test schema lives in one) without this module's
+//! serial lock. For the same reason a wait for
 //! the append to queue behind the lock looks only at the coordinator's own
 //! backends.
 //!
@@ -22,6 +23,10 @@ use super::*;
 /// The ledger sessions' `lock_timeout` while `ORDER_LOCK` is held here, in
 /// place of the 5 s default.
 const LOCK_TIMEOUT: &str = "300ms";
+
+/// The acknowledgement deadline of the tests that wait for the retry's 4 s
+/// pause (about 5.5 s in), so the miner's answer is the retry's end.
+const LONG_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The WARN each attempt that runs again logs.
 const RAN_AGAIN: &str = "found block's append failed before COMMIT; appending it again";
@@ -250,25 +255,66 @@ async fn open(raw: &str, tune: impl FnOnce(&mut Config)) -> Result<Fixture> {
     .await
 }
 
+/// The longest pause, 4 s: the retry has failed five attempts against the
+/// held lock and is waiting to run a sixth. Returns how many attempts have
+/// run.
+async fn wait_for_the_longest_pause(log: &SharedLog) -> Result<usize> {
+    until("the retry's longest pause", || async {
+        Ok(log
+            .text()
+            .lines()
+            .any(|line| line.contains(RAN_AGAIN) && line.contains("backoff_ms=4000")))
+    })
+    .await?;
+    Ok(log.text().matches(RAN_AGAIN).count())
+}
+
+/// Ended by `end` while it waited out a 4 s pause: the retry logs its end
+/// well within that pause, after the `attempts` attempts that had already
+/// run and no other.
+async fn ensure_the_pause_woke(
+    log: &SharedLog,
+    block_hash: &str,
+    end: &str,
+    attempts: usize,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !log.text().contains(GAVE_UP) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("the retry slept out its pause instead of ending at once")?;
+    ensure_gave_up(log, block_hash, end)?;
+    let text = log.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains(GAVE_UP))
+        .unwrap_or_default();
+    ensure!(
+        line.contains(&format!("attempts={attempts} ")),
+        "another attempt started after the retry was ended (expected {attempts}): {line}"
+    );
+    ensure!(
+        text.matches(RAN_AGAIN).count() == attempts,
+        "another attempt was scheduled after the retry was ended"
+    );
+    Ok(())
+}
+
 /// The shutdown is signalled while the retry waits out its backoff, and
-/// `ORDER_LOCK` is still held: the retry ends with the shutdown, starts no
-/// other attempt, and once the lock is released nothing is written.
+/// `ORDER_LOCK` is still held: the pause wakes, the retry ends with the
+/// shutdown, starts no other attempt, and once the lock is released nothing
+/// is written.
 async fn shutdown_in_the_backoff_starts_no_attempt(fixture: &Fixture, proof: Proof) -> Result<()> {
     let signal = attach_shutdown_signal(fixture)?;
     let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
     let sessions = ledger_sessions(fixture, Some(LOCK_TIMEOUT)).await?;
     let (mut holder, holder_pid) = fixture.hold_order_lock().await?;
     let (submitted, log) = fixture.submit(proof);
-    until("the append to fail and run again", || async {
-        Ok(log.text().contains(RAN_AGAIN))
-    })
-    .await?;
+    let attempts = wait_for_the_longest_pause(&log).await?;
     signal.send_replace(true);
-    until("the retry to end", || async {
-        Ok(log.text().contains(GAVE_UP))
-    })
-    .await?;
-    ensure_gave_up(&log, &block_hash, "shutdown")?;
+    ensure_the_pause_woke(&log, &block_hash, "shutdown", attempts).await?;
     ensure!(
         !our_append_waits(fixture, holder_pid, &sessions).await?,
         "an attempt is waiting on ORDER_LOCK after the shutdown ended the retry"
@@ -427,7 +473,7 @@ async fn found_block_retry_share_append_starts_no_attempt_once_shutdown_is_signa
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
-    let fixture = open(&raw, |_| {}).await?;
+    let fixture = open(&raw, |config| config.share_commit_timeout = LONG_DEADLINE).await?;
     let outcome = async {
         let proof = fixture.block_bearing_proof().await?;
         shutdown_in_the_backoff_starts_no_attempt(&fixture, proof).await
@@ -489,27 +535,24 @@ async fn found_block_retry_share_append_ends_when_the_ledger_pool_closes() -> Re
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
-    let fixture = open(&raw, |_| {}).await?;
+    let fixture = open(&raw, |config| config.share_commit_timeout = LONG_DEADLINE).await?;
     let outcome = async {
         let proof = fixture.block_bearing_proof().await?;
         let (share_id, block_hash) = (proof.share_id.clone(), proof.block_hash.clone());
         ledger_sessions(&fixture, Some(LOCK_TIMEOUT)).await?;
         let (mut holder, _) = fixture.hold_order_lock().await?;
         let (submitted, log) = fixture.submit(proof);
-        until("the append to fail and run again", || async {
-            Ok(log.text().contains(RAN_AGAIN))
-        })
-        .await?;
+        let attempts = wait_for_the_longest_pause(&log).await?;
         tokio::time::timeout(PATIENCE, fixture.coordinator.ledger.pool.close())
             .await
             .context("the ledger pool did not close")?;
+        ensure_the_pause_woke(&log, &block_hash, "shutdown", attempts).await?;
         let answer = answer(submitted).await?;
         ensure!(
             reason(&answer).as_deref() == Some("ledger-confirmation-failed"),
             "the unrecorded block's share was answered {:?}",
             reason(&answer)
         );
-        ensure_gave_up(&log, &block_hash, "shutdown")?;
         release_order_lock(&mut holder).await?;
         ensure_unrecorded(&fixture, (&share_id, &block_hash)).await?;
         drop(holder);
@@ -824,7 +867,7 @@ async fn found_block_retry_block_only_enqueue_starts_no_attempt_once_shutdown_is
         return Ok(());
     };
     let _serial = TEST_LOCK.lock().await;
-    let fixture = open(&raw, |_| {}).await?;
+    let fixture = open(&raw, |config| config.share_commit_timeout = LONG_DEADLINE).await?;
     let outcome = async {
         let proof = fixture.proof(true).await?;
         shutdown_in_the_backoff_starts_no_attempt(&fixture, proof).await

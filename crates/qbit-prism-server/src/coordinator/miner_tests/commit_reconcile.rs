@@ -750,6 +750,8 @@ fn found_block_retry_runs_again_only_for_a_passing_database_failure() {
         ("no-partition", coded("23514")),
         ("statement-cancelled", coded("57014")),
         ("database-dropped", coded("57P04")),
+        ("protocol-violation", coded("08P01")),
+        ("configuration-limit", coded("53400")),
         ("read-only", coded("25006")),
         ("unique", coded("23505")),
         ("pool-closed", sqlx::Error::PoolClosed.into()),

@@ -2830,9 +2830,10 @@ again, inside the task that ran it, under these rules:
   connection during the enqueue) keeps its existing answer and is followed,
   never run again.
 - **Only a passing database condition**: a pool timeout, a failed
-  connection or TLS session, or SQLSTATE class 08 or 53, 40001, 40P01,
-  55P03 (a wait for `ORDER_LOCK` past `lock_timeout` included), 57P01,
-  57P02, 57P03, 57P05 or 25P03. A deliberate refusal is never run again: a
+  connection or TLS session, or SQLSTATE class 08 (but 08P01) or 53 (but
+  53400), 40001, 40P01, 55P03 (a wait for `ORDER_LOCK` past `lock_timeout`
+  included), 57P01, 57P02, 57P03, 57P05 or 25P03. A deliberate refusal is
+  never run again: a
   closed commit gate, a moved payout revision with capture off, a window
   this primary does not hold (#619), a lost own log (D-8, D-9), a
   configuration fingerprint that is not this frontend's, a halted cluster, a
@@ -2845,23 +2846,27 @@ again, inside the task that ran it, under these rules:
   end it: it runs again while its parent is the tip.
 - **Bounded.** Pauses of 0.25, 0.5, 1, 2, then 4 s between attempts; at most
   16 attempts; no attempt starts later than 60 s (one block interval) after
-  the share's submit checks admitted it. Attempts that wait out
-  `lock_timeout` or the pool's acquire timeout meet the 60 s first; the
+  the share's submit checks admitted it, enough for a lock stall, a
+  saturated pool or a failover. Attempts that wait out `lock_timeout` or
+  the pool's acquire timeout meet the 60 s first; the
   count ends attempts that fail at once after about 48 s of pauses. An
   attempt already running keeps its own pool, lock and statement timeouts.
 - **Only while the block can matter.** Before and after each pause the job's
   parent must still be the observed tip.
-- **Never past the frontend.** No attempt starts once the shutdown is
-  signalled (the first step of every shutdown, before the session drain and
-  the stopped marker), once the ledger pool has closed (its last step), or
+- **Never past the frontend.** No attempt (and no retried block-only
+  enqueue after its probe) starts once the shutdown is signalled (the first
+  step of every shutdown, before the session drain and the stopped marker),
+  once the ledger pool has closed (its last step), or
   once the own log is lost (a `FrontendStop`) or behind; the shutdown signal
   and the pool's close also wake a pause at once. An attempt already running
   finishes under its own timeouts, and its result stands.
 
 A retried attempt cannot credit the share twice or write a second outbox
-row: the attempt before it wrote nothing, and each attempt probes the share
-ID under `ORDER_LOCK` (an existing share is a duplicate) and writes the
-outbox row only when its block hash has none.
+row: the attempt before it wrote nothing, a share-pass attempt probes the
+share ID under `ORDER_LOCK` (an existing share is a duplicate) and writes
+the outbox row only when its block hash has none, and a block-only attempt
+probes the share ID first and then checks for the outbox row under
+`ORDER_LOCK` before writing it.
 
 The miner's answer keeps its deadline. Within `share_commit_timeout` it is
 the outcome of the attempts so far: accepted (or, for a block-only proof or a

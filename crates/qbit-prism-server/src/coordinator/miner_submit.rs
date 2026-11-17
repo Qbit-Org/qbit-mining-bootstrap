@@ -85,6 +85,23 @@ enum EnqueueStep {
     Enqueue(Result<bool>),
 }
 
+/// Spawn a share append's task. A found block's carries the submission's
+/// dispatcher, so its retries and refusals log where the submission logs. A
+/// plain share's, on the acknowledgement's hot path, installs no scoped
+/// dispatcher, which would take every tracing call site in the process off
+/// its global fast path while it runs.
+fn spawn_append<F>(found_block: bool, append: F) -> JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if found_block {
+        tokio::spawn(append.with_current_subscriber())
+    } else {
+        tokio::spawn(append)
+    }
+}
+
 /// Leave a probe and candidate enqueue that outlived the acknowledgement
 /// bound running, and log its outcome once it resolves. Cancelling it could
 /// strand a COMMIT that was already sent, or leave the block unenqueued.
@@ -232,8 +249,9 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
 /// condition of the database or of its connection, which the same append may
 /// clear by running again: the pool timed out (`PoolTimedOut`), the
 /// connection or its TLS session failed (`Io`, `Tls`), or the server answered
-/// with a connection exception (class 08), insufficient resources (class
-/// 53), a serialization failure or deadlock (40001, 40P01), a lock wait past
+/// with a connection exception (class 08 but 08P01, a protocol violation),
+/// insufficient resources (class 53 but 53400, a configuration limit), a
+/// serialization failure or deadlock (40001, 40P01), a lock wait past
 /// `lock_timeout` (55P03, `ORDER_LOCK` included), a server shutting down,
 /// crashing or starting (57P01, 57P02, 57P03; `pg_terminate_backend` sends
 /// 57P01 too, and cannot be told from a shutdown), or an idle session's or
@@ -276,8 +294,8 @@ pub(super) fn transient_before_commit(error: &anyhow::Error) -> bool {
     match sqlx_error(error) {
         Some(sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_)) => true,
         Some(sqlx::Error::Database(database)) => database.code().is_some_and(|code| {
-            code.starts_with("08")
-                || code.starts_with("53")
+            (code.starts_with("08") && code != "08P01")
+                || (code.starts_with("53") && code != "53400")
                 || matches!(
                     code.as_ref(),
                     "40001" | "40P01" | "55P03" | "57P01" | "57P02" | "57P03" | "57P05" | "25P03"
@@ -298,7 +316,7 @@ pub(super) const FOUND_BLOCK_APPEND_ATTEMPTS: u32 = 16;
 
 /// No attempt of a found block's append starts later than this after its
 /// submit checks admitted it: one 60 s block interval. A blip (a lock stall,
-/// a checkpoint storm, a saturated pool, a failover) fits in it; a database
+/// a saturated pool, a failover) fits in it; a database
 /// still failing past it is in an outage, and the block has most likely been
 /// superseded, which the parent check usually sees first. An attempt already
 /// running at the end keeps its own bounds (pool, lock and statement
@@ -407,23 +425,23 @@ impl FoundBlockRetry {
         // keeps its existing answer and logs; only a retry that was entered
         // logs its end.
         let entered = self.attempts > 1 || transient_before_commit(error);
-        let end = match self.wait(error).await {
+        let candidate = match self.wait(error).await {
             Ok(()) => match unused {
-                Some(candidate) => {
-                    self.attempts += 1;
-                    return Some(candidate);
-                }
-                None => match submission_candidate(&self.source).await {
-                    Ok(candidate) => {
-                        self.attempts += 1;
-                        return Some(candidate);
-                    }
-                    Err(rebuild) => {
-                        tracing::warn!(block_hash = self.block_hash(), error = %format_args!("{rebuild:#}"), "found block's candidate could not be built again for its next append");
-                        RetryEnd::Rebuild
-                    }
-                },
+                Some(candidate) => Ok(candidate),
+                None => submission_candidate(&self.source).await.map_err(|rebuild| {
+                    tracing::warn!(block_hash = self.block_hash(), error = %format_args!("{rebuild:#}"), "found block's candidate could not be built again for its next append");
+                    RetryEnd::Rebuild
+                }),
             },
+            Err(end) => Err(end),
+        };
+        // The last check before the attempt starts: a shutdown signalled, or
+        // an own log lost, while the candidate was built again ends it here.
+        let end = match candidate.and_then(|candidate| self.running().map(|()| candidate)) {
+            Ok(candidate) => {
+                self.attempts += 1;
+                return Some(candidate);
+            }
             Err(end) => end,
         };
         if entered {
@@ -511,6 +529,13 @@ impl FoundBlockRetry {
             return Err(RetryEnd::ParentChanged);
         }
         Ok(())
+    }
+
+    /// Whether a retried block-only attempt must not go on from its probe to
+    /// its enqueue: the frontend stopped while the probe ran. A first attempt
+    /// is the request in hand and always goes on.
+    fn stopped_before_enqueue(&self) -> bool {
+        self.attempts > 1 && self.running().is_err()
     }
 
     /// The append recorded the block, or found it recorded, after `attempts`.
@@ -1123,7 +1148,7 @@ impl Coordinator {
         let ledger = self.submit_ledger.clone();
         let task_gate = gate.clone();
         let mut task = AppendTask {
-            handle: Some(tokio::spawn(async move {
+            handle: Some(spawn_append(retry.is_some(), async move {
                 let mut attempt = (share, candidate);
                 let result = loop {
                     // Only a lease fence sends a refused append round again
@@ -1187,9 +1212,7 @@ impl Coordinator {
                 // scheduled late must not turn a durable commit into unknown.
                 let commit_elapsed = task_gate.committing_since().map(|since| since.elapsed());
                 (result, commit_elapsed, tokio::time::Instant::now())
-            }
-            // Its retries and refusals log where the submission logs.
-            .with_current_subscriber())),
+            })),
             gate: gate.clone(),
             refusable,
         };
@@ -1377,6 +1400,20 @@ impl Coordinator {
                 // attempt; an enqueue consumes it.
                 let (step, unused) = match probed {
                     Ok(true) => (EnqueueStep::Recorded, None),
+                    // Nothing was written, and the retry ends at its next
+                    // check, logging the block.
+                    Ok(false)
+                        if retry
+                            .as_ref()
+                            .is_some_and(FoundBlockRetry::stopped_before_enqueue) =>
+                    {
+                        (
+                            EnqueueStep::ProbeFailed(anyhow::anyhow!(
+                                "the frontend stopped before the found block's enqueue ran again"
+                            )),
+                            Some(candidate),
+                        )
+                    }
                     Ok(false) => (
                         EnqueueStep::Enqueue(
                             ledger
@@ -1411,7 +1448,8 @@ impl Coordinator {
                 }
             }
         }
-        // Its retries and refusals log where the submission logs.
+        // A found block's task: its retries and refusals log to the
+        // submission's dispatcher.
         .with_current_subscriber());
         match tokio::time::timeout_at(bound, &mut enqueue).await {
             Ok(Ok(EnqueueStep::Recorded)) => return SaveOutcome::Duplicate,

@@ -353,8 +353,9 @@ pub struct Coordinator {
     /// attached once by `server::run`. A found block's append that is run
     /// again (`miner_submit::FoundBlockRetry`) starts no new attempt after
     /// it, and its backoff wakes on it. Unset in tools and test fixtures,
-    /// which nothing shuts down: the retry then ends only for its own
-    /// reasons, a lost own log or the ledger pool's close.
+    /// which nothing shuts down: the retry then keeps its other endings (a
+    /// refusal, a parent change, its bounds, a lost own log, the ledger
+    /// pool's close).
     pub shutdown_signal: std::sync::OnceLock<watch::Receiver<bool>>,
     /// 3.1 dual writer (D-19): the wait before a found block's offer for the
     /// peer to hold what adopting it needs; `None` on a single writer or
