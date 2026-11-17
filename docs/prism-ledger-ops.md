@@ -2867,12 +2867,20 @@ it:
   wait, lock hold and total times.
 - Difficulty-hint writes (#856, #872). Each listener's hint writer gives a
   vardiff resume hint's write and its read-back one bound (500 ms), and runs
-  them as one transaction on one pool checkout whose every statement
-  PostgreSQL ends by that bound. Each statement runs under a
+  them as one transaction on one pool checkout whose every statement before
+  `COMMIT` PostgreSQL ends by that bound. Each statement runs under a
   transaction-local `statement_timeout` of what is left of the bound less a
   tenth of it: the first is set in the `BEGIN`'s own round trip, and another
   only when a statement is sent more than a twentieth of the bound after the
-  last was set. A statement with less than a millisecond left is not sent.
+  last was set. A statement with less than a millisecond left is not sent,
+  nor a `COMMIT` with less than the tenth left. PostgreSQL turns the
+  statement timer off before it commits, so the transaction also sets
+  `synchronous_commit = local` for itself: a hint's `COMMIT` waits for the
+  local WAL flush only, never a standby (see the
+  [HA reference](prism-ha-reference-architecture.md), D3). That flush is the
+  one part no server-side timer bounds; the writer's own bound is its outer
+  limit, and a bound that passes during `COMMIT` leaves the outcome unknown,
+  counted `timed_out`.
   A hint that runs out of time therefore rolls back and leaves no statement
   running and no connection busy, and the connection goes back to the pool
   at `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` (or, when the frontend's own
@@ -2883,8 +2891,9 @@ it:
   `PRISM_DATABASE_LOCK_TIMEOUT_MS` still applies to their lock waits, as
   before, and a lock wait it ends counts as `failed`. The row lock a hint's
   write takes is held through its read-back and `COMMIT`, a round trip or
-  two, and no statement holds it past the bound; a connection that stalls
-  mid-transaction holds it until the session ends, as before. Another
+  two and the local flush, and no statement holds it past the bound; a
+  connection that stalls mid-transaction holds it until the session ends, as
+  before. Another
   frontend's hint for the same worker waits for it under its own bound, and
   the pruner skips locked rows. A hint ended so counts as
   `timed_out` in `qbit_prism_stratum_difficulty_hints_total`, told from an

@@ -865,9 +865,11 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::probe_tests::a_d
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::probe_tests::a_dead_idle_connection_is_replaced_when_the_idle_gap_reaches_the_threshold
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::postgres_fixture_cleans_up_after_setup_error_and_body_panic
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_committed_hint_leaves_its_connection_at_the_pools_settings
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_custom_begin_cancelled_mid_round_trip_retires_its_connection
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_custom_begin_that_completes_returns_its_connection_at_the_pool_timeout
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_hint_statement_sent_late_gets_only_what_is_left_of_the_write_bound
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_hint_write_reaches_no_table_but_the_hint_rows
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_refused_custom_begin_retires_its_connection
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_statement_that_waits_while_it_is_prepared_gets_only_what_is_left_to_run
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_write_whose_bound_is_spent_at_checkout_keeps_its_connection

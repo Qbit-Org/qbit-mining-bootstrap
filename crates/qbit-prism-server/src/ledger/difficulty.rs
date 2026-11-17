@@ -82,13 +82,14 @@ const HINT_MARGIN_DIVISOR: u32 = 10;
 const MAX_STATEMENT_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 /// One difficulty-hint write's deadline (#872): the writer bounds the write
-/// by it (`timeout_at`), and every statement the write sends runs under a
-/// server-side `statement_timeout` taken from what is left of it, so
-/// PostgreSQL ends a statement before the writer gives up on the write. A
-/// statement dropped by the writer's bound would otherwise run on until it
-/// ended or reached the connection's own timeout (15 s by default), holding
-/// its connection and its locks. On the writer's clock (`tokio::time`), the
-/// clock its own bound runs on.
+/// by it (`timeout_at`), and every statement the write sends before its
+/// `COMMIT` runs under a server-side `statement_timeout` taken from what is
+/// left of it, so PostgreSQL ends a statement before the writer gives up on
+/// the write. A statement dropped by the writer's bound would otherwise run
+/// on until it ended or reached the connection's own timeout (15 s by
+/// default), holding its connection and its locks. No server-side timer
+/// bounds the `COMMIT` (see [`begin_statement`]). On the writer's clock
+/// (`tokio::time`), the clock its own bound runs on.
 #[derive(Clone, Copy, Debug)]
 pub struct HintDeadline {
     at: tokio::time::Instant,
@@ -186,13 +187,27 @@ pub fn hint_timed_out(error: &anyhow::Error) -> bool {
     timed_out(error) || error.downcast_ref::<HintBoundSpent>().is_some()
 }
 
-/// The statement that opens a hint's transaction with its first statement
-/// timeout, in the one round trip a `BEGIN` takes. `timeout` comes from
-/// [`HintDeadline::statement_timeout`], so it is at least 1 ms and never
-/// reads 0.
+/// The statement that opens a hint's transaction, in the one round trip a
+/// `BEGIN` takes, with its first statement timeout and its commit level.
+/// `timeout` comes from [`HintDeadline::statement_timeout`], so it is at
+/// least 1 ms and never reads 0.
+///
+/// `synchronous_commit = local`: PostgreSQL turns the statement timer off
+/// before it commits, so no `statement_timeout` ends a commit's wait for a
+/// synchronous standby (#529 measured one waiting 18.7 minutes), and a hint
+/// would hold its row lock and connection past its bound for as long as the
+/// standby lags. A hint commit waits for the local WAL flush only. The
+/// session's own level is `on` or `remote_apply` (`connect.rs` sets it on
+/// every connection), so this only ever lowers it, for this transaction
+/// alone: it is `LOCAL`, set nowhere else, and this transaction writes the
+/// hint row and nothing else (its other statements read), never anything
+/// that determines credit, a payout, a candidate or a session. A failover
+/// can lose the last hint rows, which only moves a reconnecting miner's
+/// resume difficulty; with the approved asynchronous standby
+/// (`synchronous_standby_names` empty) `local` waits exactly as `on` does.
 fn begin_statement(timeout: Duration) -> String {
     format!(
-        "BEGIN; SET LOCAL statement_timeout = {}",
+        "BEGIN; SET LOCAL statement_timeout = {}; SET LOCAL synchronous_commit = local",
         timeout.as_millis()
     )
 }
@@ -246,23 +261,28 @@ impl<'c> HintTransaction<'c> {
         Ok(self.armed)
     }
 
-    /// The `statement_timeout` that `sql`, with parameters of `types`, runs
-    /// under. A statement SQLx has not prepared on this connection takes a
-    /// round trip of its own first (`Parse`, `Describe`, `Sync`), whose lock
-    /// waits run under a timer of their own, since `Sync` ends a statement's
-    /// timer: prepared here under the timeout in force, the statement's run is
-    /// then armed from what is left after it, rather than given a second
-    /// full timeout. SQLx caches the prepared statement under its text, so
-    /// one already prepared sends nothing here.
-    async fn armed_for(&mut self, sql: &str, types: &[PgTypeInfo]) -> Result<Duration> {
-        let timeout = self.arm().await?;
-        timed(timeout, Executor::prepare_with(&mut *self.tx, sql, types)).await?;
-        self.arm().await
+    /// Prepare `statements`, `(text, parameter types)`, on this connection
+    /// before any of them runs, each under the timeout in force (set again
+    /// first when it is too old). A statement SQLx has not prepared on this
+    /// connection otherwise takes a round trip of its own as it is first
+    /// sent (`Parse`, `Describe`, `Sync`), and `Sync` restarts the server's
+    /// timer, so lock waits while it is prepared and while it runs would
+    /// each get a full timeout. SQLx caches a prepared statement under its
+    /// text, so on a connection that has run them all this sends nothing.
+    async fn prepare_hint_statements(
+        &mut self,
+        statements: &[(&str, &[PgTypeInfo])],
+    ) -> Result<()> {
+        for (sql, types) in statements {
+            let timeout = self.arm().await?;
+            timed(timeout, Executor::prepare_with(&mut *self.tx, sql, types)).await?;
+        }
+        Ok(())
     }
 
     /// The cluster's write guard, [`writable`]'s statement and check.
     async fn hint_guard(&mut self) -> Result<()> {
-        let timeout = self.armed_for(&GUARD_SQL, &[]).await?;
+        let timeout = self.arm().await?;
         let row = timed(timeout, sqlx::query(&GUARD_SQL).fetch_one(&mut *self.tx)).await?;
         check_writable(&row)
     }
@@ -270,7 +290,7 @@ impl<'c> HintTransaction<'c> {
     /// [`Ledger::share_accepted_at_ms`], in this transaction.
     async fn hint_evidence_at_ms(&mut self, share_id: &str) -> Result<Option<i64>> {
         for sql in [ACCEPTED_AT_RECENT_SQL, ACCEPTED_AT_SQL] {
-            let timeout = self.armed_for(sql, &[text()]).await?;
+            let timeout = self.arm().await?;
             let accepted = timed(
                 timeout,
                 sqlx::query_scalar::<_, i64>(sql)
@@ -285,15 +305,13 @@ impl<'c> HintTransaction<'c> {
         Ok(None)
     }
 
-    /// `sql`, with parameters of `types` bound by `bind`, after
-    /// [`Self::armed_for`].
+    /// `sql`, with its parameters bound by `bind`.
     async fn run_hint_statement<'q>(
         &mut self,
         sql: &'q str,
-        types: &[PgTypeInfo],
         bind: impl FnOnce(HintQuery<'q>) -> HintQuery<'q>,
     ) -> Result<()> {
-        let timeout = self.armed_for(sql, types).await?;
+        let timeout = self.arm().await?;
         timed(timeout, bind(sqlx::query(sql)).execute(&mut *self.tx)).await?;
         Ok(())
     }
@@ -302,10 +320,9 @@ impl<'c> HintTransaction<'c> {
     async fn read_hint_row<'q>(
         &mut self,
         sql: &'q str,
-        types: &[PgTypeInfo],
         bind: impl FnOnce(HintQuery<'q>) -> HintQuery<'q>,
     ) -> Result<Option<PgRow>> {
-        let timeout = self.armed_for(sql, types).await?;
+        let timeout = self.arm().await?;
         timed(
             timeout,
             bind(sqlx::query(sql)).fetch_optional(&mut *self.tx),
@@ -313,9 +330,18 @@ impl<'c> HintTransaction<'c> {
         .await
     }
 
-    async fn commit_hint(mut self) -> Result<()> {
-        let timeout = self.arm().await?;
-        timed(timeout, self.tx.commit()).await
+    /// `COMMIT`, unless less than the margin and a millisecond is left, when
+    /// the write rolls back instead ([`HintBoundSpent`]). PostgreSQL turns a
+    /// statement's timer off before it commits, so no `statement_timeout`
+    /// bounds a commit (deferred triggers, the WAL flush, a synchronous
+    /// standby's confirmation) and none is set for it; a commit started this
+    /// late could only outlast the bound, with an unknown outcome.
+    async fn commit_hint(self) -> Result<()> {
+        self.deadline
+            .statement_timeout(tokio::time::Instant::now())
+            .ok_or(HintBoundSpent)?;
+        self.tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -337,7 +363,9 @@ impl Ledger {
 
     /// Write one difficulty hint and read its row back (#856), in one
     /// transaction on one connection, every statement of which PostgreSQL
-    /// ends by `deadline` (#872). `share_id` is the accepted share that
+    /// ends by `deadline` (#872), bar the `COMMIT`, which no server-side
+    /// timer bounds: it waits for the local WAL flush only (see
+    /// [`begin_statement`]), and the writer's own bound is its outer limit. `share_id` is the accepted share that
     /// proves `difficulty` (its acceptance time is the evidence, and a share
     /// the ledger does not hold records nothing); `None` lowers a higher
     /// row. The read-back is the retained hint younger than `ttl_seconds`,
@@ -351,14 +379,17 @@ impl Ledger {
     /// was set. A statement with less than a millisecond left is not sent
     /// ([`HintBoundSpent`]); one the server cancelled at its timeout is
     /// marked so ([`hint_timed_out`]). Either way the transaction rolls
-    /// back, and every setting ends with it. One round trip per statement:
+    /// back, and every setting ends with it. `COMMIT` is not sent with less
+    /// than the margin and a millisecond left either. The transaction writes
+    /// the hint row and nothing else. One round trip per statement:
     /// for a decrease `BEGIN` with the timeout, the cluster's write guard,
     /// the write, the read-back and `COMMIT` (five); for evidence the
     /// share's probe comes first (a second, unbounded one only when it
     /// misses), and the guard and the write only when the share is found
     /// (six; seven with the second probe; five when the share is not found).
     /// A timeout set again adds one, and so does each statement the
-    /// connection has not prepared yet (its first use there).
+    /// connection has not prepared yet (its first use there, before the
+    /// write's first statement runs).
     pub async fn write_worker_difficulty_hint(
         &self,
         listener: &str,
@@ -378,10 +409,18 @@ impl Ledger {
             .ok_or(HintBoundSpent)?;
         let mut connection = CustomBegin::checked_out(self.acquire().await?);
         let mut tx = HintTransaction::open_hint(&mut connection, deadline).await?;
+        let read_types = [text(), text(), <f64 as Type<Postgres>>::type_info()];
         match share_id {
             None => {
+                let lower_types = [text(), text(), text()];
+                tx.prepare_hint_statements(&[
+                    (&GUARD_SQL, &[]),
+                    (LOWER_SQL, &lower_types),
+                    (READ_SQL, &read_types),
+                ])
+                .await?;
                 tx.hint_guard().await?;
-                tx.run_hint_statement(LOWER_SQL, &[text(), text(), text()], |query| {
+                tx.run_hint_statement(LOWER_SQL, |query| {
                     query
                         .bind(listener)
                         .bind(username)
@@ -390,6 +429,15 @@ impl Ledger {
                 .await?;
             }
             Some(share_id) => {
+                let record_types = [text(), text(), text(), <i64 as Type<Postgres>>::type_info()];
+                tx.prepare_hint_statements(&[
+                    (ACCEPTED_AT_RECENT_SQL, &[text()]),
+                    (ACCEPTED_AT_SQL, &[text()]),
+                    (&GUARD_SQL, &[]),
+                    (RECORD_SQL, &record_types),
+                    (READ_SQL, &read_types),
+                ])
+                .await?;
                 if let Some(evidence_at_ms) = tx.hint_evidence_at_ms(share_id).await? {
                     // As `record_worker_difficulty` checks them, once the
                     // share is found.
@@ -399,8 +447,7 @@ impl Ledger {
                         "worker difficulty identity must not be empty"
                     );
                     tx.hint_guard().await?;
-                    let types = [text(), text(), text(), <i64 as Type<Postgres>>::type_info()];
-                    tx.run_hint_statement(RECORD_SQL, &types, |query| {
+                    tx.run_hint_statement(RECORD_SQL, |query| {
                         query
                             .bind(listener)
                             .bind(username)
@@ -411,9 +458,8 @@ impl Ledger {
                 }
             }
         }
-        let types = [text(), text(), <f64 as Type<Postgres>>::type_info()];
         let row = tx
-            .read_hint_row(READ_SQL, &types, |query| {
+            .read_hint_row(READ_SQL, |query| {
                 query.bind(listener).bind(username).bind(ttl_seconds as f64)
             })
             .await?;

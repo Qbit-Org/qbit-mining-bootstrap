@@ -161,7 +161,7 @@ normally. **Cancellation is a separate qualification concern below.**
 | `synchronous_commit` | ACK guarantee with `synchronous_standby_names='FIRST 1 (prism_standby_1)'` | Standby down | Current PRISM writer session |
 | --- | --- | --- | --- |
 | `off` | No local WAL-flush guarantee; acknowledged shares can disappear after a primary crash. | Does not wait. | Replaced with `on`. |
-| `local` | Local WAL is durable; no replica durability guarantee. | Does not wait. | Replaced with `on`. |
+| `local` | Local WAL is durable; no replica durability guarantee. | Does not wait. | Replaced with `on`. A difficulty-hint transaction alone sets it for itself (#872, below). |
 | `remote_write` | Local WAL durable, standby OS has written WAL; standby OS/power failure can lose it. | Waits for the named standby. | Replaced with `on`. |
 | `on` | WAL flushed on primary and named standby; survives primary loss if the standby's storage survives. | Waits for the named standby. | Preserved. |
 | `remote_apply` | As `on`, plus the commit is replayed and visible to standby queries. | Waits for standby replay. | Preserved if set when the connection opens. |
@@ -177,6 +177,22 @@ sets `on`, and refuses `fsync=off` / `full_page_writes=off`. A role default of
 pool, so it observes the session value actually used, not just a server default.
 For `remote_apply`, set the writer role/database default before reconnecting all
 writer pools; existing connections do not retroactively receive a role default.
+
+**One exception: difficulty hints (#872).** The Stratum listener's
+vardiff resume-hint writes run in a transaction of their own that sets
+`SET LOCAL synchronous_commit = local`, so a hint's COMMIT waits for the local
+WAL flush only, never for a standby: a statement timeout cannot end that wait
+(#529, below), and a hint is bounded by 500 ms. The setting is transaction-local
+and only lowers the session's `on` or `remote_apply`. The transaction writes
+one row of `qbit_worker_difficulty` and nothing else (its other statements
+read); no share, credit, payout, candidate, fanout or session reservation is
+ever committed this way, and the ACK guarantees above are unchanged for all of
+them. What a failover can lose is the last hint rows a synchronous standby had
+not confirmed, which only moves a reconnecting miner's resume difficulty (it
+starts from an older hint, or from the listener's startup difficulty). With
+the approved asynchronous standby (`synchronous_standby_names=''`) `local`
+waits exactly as `on` does, so this changes nothing in the reference
+deployment.
 
 ### Selected policy and optional synchronous qualification
 
@@ -359,7 +375,9 @@ explicit cancel (for example an operator watchdog that cancels backends whose
 `wait_event` is `SyncRep` past a limit) or by returning to async. For the same
 reason, `SET LOCAL synchronous_commit` for found blocks alone is not a safe
 alternative to the bounded wait above: it also needs a non-empty
-`synchronous_standby_names`, which changes D3.
+`synchronous_standby_names`, which changes D3. The difficulty-hint exception
+(#872, under D3) goes the other way: it lowers a hint's level to `local`,
+so a hint never enters this wait, and raises nothing.
 
 **Remaining limits:** a block-only ACK can follow a locally visible credit whose
 sync-rep wait was cancelled; its poll does not observe the crediting transaction's

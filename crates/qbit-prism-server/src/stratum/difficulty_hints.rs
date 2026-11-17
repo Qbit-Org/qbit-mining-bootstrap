@@ -625,11 +625,13 @@ impl DifficultyHints {
                 // One deadline for the whole write, its read-back included,
                 // and for every statement the backend sends for it (#872).
                 // EP-ERRORS: where a dropped statement goes. PostgreSQL ends
-                // each statement by the deadline less half a tenth of the
-                // bound, so this bound fires mid-statement only when the
-                // server's answer is held up on the way (a stalled
-                // connection). The statement has then ended, or ends at its
-                // own timeout. As the connection returns, SQLx reads what is
+                // each statement before the `COMMIT` by the deadline less half
+                // a tenth of the bound, so this bound fires mid-statement only
+                // when the server's answer is held up on the way (a stalled
+                // connection), or during the `COMMIT`, which no server-side
+                // timer bounds (it waits for the local WAL flush only, never a
+                // standby). A statement has then ended, or ends at its own
+                // timeout. As the connection returns, SQLx reads what is
                 // still unread: a completed statement's reply and then the
                 // transaction's queued `ROLLBACK`, and the pool keeps the
                 // connection; or the server's cancel, which SQLx takes for a

@@ -74,6 +74,21 @@ fn statements(executions: &[Execution]) -> Result<Vec<(Protocol, String)>> {
         .collect())
 }
 
+/// Whether `sent` opens its transaction with the hint's settings and writes
+/// nothing but the hint row: every statement but the `BEGIN`, the write and
+/// `COMMIT` is a `SELECT`, and the write is the hint row's (#872: the hint
+/// commits at `synchronous_commit = local`).
+fn writes_only_the_hint_row(sent: &[(Protocol, String)]) -> bool {
+    sent.first()
+        .is_some_and(|(_, begin)| begin.ends_with("; SET LOCAL synchronous_commit = local"))
+        && sent[1..].iter().all(|(_, sql)| {
+            sql.starts_with("SELECT ")
+                || sql == "COMMIT"
+                || sql.starts_with("INSERT INTO qbit_worker_difficulty(")
+                || sql.starts_with("UPDATE qbit_worker_difficulty SET ")
+        })
+}
+
 /// Whether `sent` is `expected`, statement by statement: the same protocol,
 /// and text that starts with the expected text (all of it when it ends with
 /// `$`).
@@ -227,7 +242,7 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
             sent_as(
                 &sent,
                 &[BEGIN, RECENT_PROBE, GUARD, RECORD, READ_BACK, COMMIT]
-            ),
+            ) && writes_only_the_hint_row(&sent),
             "{sent:#?}"
         );
         ensure!(taken == 1., "evidence took {taken} checkouts");
@@ -238,7 +253,8 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
         let (hint, sent, taken) = fixture.write(8.0, None).await?;
         ensure!(hint == Some(8.0), "{hint:?}");
         ensure!(
-            sent_as(&sent, &[BEGIN, GUARD, LOWER, READ_BACK, COMMIT]),
+            sent_as(&sent, &[BEGIN, GUARD, LOWER, READ_BACK, COMMIT])
+                && writes_only_the_hint_row(&sent),
             "{sent:#?}"
         );
         ensure!(taken == 1., "a decrease took {taken} checkouts");
@@ -251,7 +267,8 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
         let (hint, sent, taken) = fixture.write(64.0, Some(&absent.share_id)).await?;
         ensure!(hint == Some(8.0), "{hint:?}");
         ensure!(
-            sent_as(&sent, &[BEGIN, RECENT_PROBE, PROBE, READ_BACK, COMMIT]),
+            sent_as(&sent, &[BEGIN, RECENT_PROBE, PROBE, READ_BACK, COMMIT])
+                && writes_only_the_hint_row(&sent),
             "{sent:#?}"
         );
         ensure!(taken == 1., "a missing share took {taken} checkouts");

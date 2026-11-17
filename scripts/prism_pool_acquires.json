@@ -309,7 +309,7 @@
     "ledger/difficulty.rs::prune_worker_difficulties#1::self .begin()": [1,"ledger"],
     "ledger/difficulty.rs::share_accepted_at_ms#1::self .acquire()": [1,"ledger"],
     "ledger/difficulty.rs::write_worker_difficulty_hint#1::self .acquire()": [1,"ledger"],
-    "ledger/difficulty.rs::armed_for#1::prepare_with(& mut * self . tx , sql , types)": [1,"hint-prepare"],
+    "ledger/difficulty.rs::prepare_hint_statements#1::prepare_with(& mut * self . tx , sql , types)": [1,"hint-prepare"],
     "ledger/fanout.rs::renew_fanout_claim#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::release_fanout_claim#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::hand_back_fanout#1::self .begin()": [1,"ledger"],

@@ -85,11 +85,14 @@ async fn held_hint(raw: &str, admin: &PgPool, schema: &str) -> Result<()> {
     let application = format!("hint-writer-{}", &schema[18..30]);
     let mut url = url::Url::parse(raw)?;
     // The coordinator's ledger sessions start at 15 s, the pool's own
-    // `statement_timeout`, as `Ledger::connect` sets its sessions'.
+    // `statement_timeout`, as `Ledger::connect` sets its sessions', and at
+    // `remote_apply`, a `synchronous_commit` the pool keeps.
     url.query_pairs_mut()
         .append_pair(
             "options",
-            &format!("-csearch_path={schema} -cstatement_timeout=15000"),
+            &format!(
+                "-csearch_path={schema} -cstatement_timeout=15000 -csynchronous_commit=remote_apply"
+            ),
         )
         .append_pair("application_name", &application);
     let ledger = Ledger::connect(url.as_str(), "hint-writer".into(), 2, true).await?;
@@ -105,7 +108,7 @@ async fn held_hint(raw: &str, admin: &PgPool, schema: &str) -> Result<()> {
             // Not the 500 ms default: the server must be given this one.
             let config = StratumConfig {
                 listener_name: "primary".into(),
-                difficulty_hint_timeout_seconds: 1.0,
+                difficulty_hint_timeout_seconds: 2.0,
                 ..Default::default()
             };
             let metrics = Arc::new(Metrics::default());
@@ -129,11 +132,11 @@ async fn held_hint(raw: &str, admin: &PgPool, schema: &str) -> Result<()> {
                     },
                 )
                 .await?;
-            // PostgreSQL ended the decrease at what was left of the 1 s
-            // bound less its 100 ms margin, before the writer's own bound:
+            // PostgreSQL ended the decrease at what was left of the 2 s
+            // bound less its 200 ms margin, before the writer's own bound:
             // not the default bound's 450 ms, nor the pool's 15 s.
             ensure!(
-                elapsed >= Duration::from_millis(850) && elapsed < Duration::from_secs(1),
+                elapsed >= Duration::from_millis(1_700) && elapsed < Duration::from_secs(2),
                 "the held hint ended {elapsed:?} in"
             );
             for outcome in [DifficultyHintOutcome::Failed, DifficultyHintOutcome::Written] {
@@ -160,12 +163,14 @@ async fn held_hint(raw: &str, admin: &PgPool, schema: &str) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let mut connection = pool.acquire().await?;
-            let (again, setting): (i32, String) =
-                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
-                    .fetch_one(&mut *connection)
-                    .await?;
+            let (again, setting): (i32, String) = sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
+                .fetch_one(&mut *connection)
+                .await?;
             ensure!(again == pid, "the hint ran on {pid}, the pool offered {again}");
-            ensure!(setting == "15s", "the connection kept the hint's timeout: {setting}");
+            ensure!(
+                setting == "15s remote_apply",
+                "the connection kept the hint's settings: {setting}"
+            );
             drop(connection);
             // The rolled-back decrease changed nothing.
             let kept = ledger.worker_difficulty("primary", "rig", 900).await?;

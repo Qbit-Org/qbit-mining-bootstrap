@@ -66,7 +66,7 @@ fn a_statement_with_less_than_a_millisecond_left_is_not_sent_rather_than_given_z
     }
     assert_eq!(
         begin_statement(ms(1)),
-        "BEGIN; SET LOCAL statement_timeout = 1"
+        "BEGIN; SET LOCAL statement_timeout = 1; SET LOCAL synchronous_commit = local"
     );
 }
 
@@ -134,7 +134,12 @@ impl Database {
         let application = format!("hint-bound-{}", &schema[17..29]);
         let mut url = url::Url::parse(&raw)?;
         url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"))
+            // `remote_apply`, which the pool keeps, as an HA deployment's
+            // writer role may set it: a hint must leave it as it found it.
+            .append_pair(
+                "options",
+                &format!("-csearch_path={schema} -csynchronous_commit=remote_apply"),
+            )
             .append_pair("application_name", &application);
         let url = url.to_string();
         match Ledger::connect(&url, "hint-bound".into(), 2, true).await {
@@ -407,7 +412,7 @@ async fn postgres_a_refused_custom_begin_retires_its_connection() -> Result<()> 
             let pool = &db.ledger.pool;
             let mut connection = pool.acquire().await?;
             let (pid, default): (i32, String) =
-                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
                     .fetch_one(&mut *connection)
                     .await?;
             let mut custom = CustomBegin::checked_out(connection);
@@ -434,7 +439,7 @@ async fn postgres_a_custom_begin_cancelled_mid_round_trip_retires_its_connection
             let pool = &db.ledger.pool;
             let mut connection = pool.acquire().await?;
             let (pid, default): (i32, String) =
-                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
                     .fetch_one(&mut *connection)
                     .await?;
             let mut custom = CustomBegin::checked_out(connection);
@@ -468,17 +473,17 @@ async fn postgres_a_custom_begin_that_completes_returns_its_connection_at_the_po
             let pool = &db.ledger.pool;
             let mut connection = pool.acquire().await?;
             let (pid, default): (i32, String) =
-                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
                     .fetch_one(&mut *connection)
                     .await?;
             let mut custom = CustomBegin::checked_out(connection);
             {
                 let mut tx = custom.custom_begin(begin_statement(ms(1234))).await?;
                 let inside: String =
-                    sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+                    sqlx::query_scalar("SELECT current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
                         .fetch_one(&mut *tx)
                         .await?;
-                ensure!(inside == "1234ms", "{inside}");
+                ensure!(inside == "1234ms local", "{inside}");
             }
             drop(custom);
             ensure!(
@@ -499,7 +504,7 @@ async fn postgres_a_custom_begin_that_completes_returns_its_connection_at_the_po
                 );
                 let mut next = pool.acquire().await?;
                 let (again, setting): (i32, String) =
-                    sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+                    sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
                         .fetch_one(&mut *next)
                         .await?;
                 if again == pid {
@@ -527,11 +532,12 @@ async fn returned(pool: &PgPool) -> bool {
 }
 
 /// The next checkout is not backend `old`, runs at the pool's own
-/// `statement_timeout`, `default`, outside any transaction, and can begin.
+/// `statement_timeout` and `synchronous_commit`, `default`, outside any
+/// transaction, and can begin.
 async fn next_checkout_is_fresh(pool: &PgPool, old: i32, default: &str) -> Result<()> {
     let mut next = pool.acquire().await?;
     let (pid, setting): (i32, String) =
-        sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+        sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
             .fetch_one(&mut *next)
             .await?;
     ensure!(pid != old, "the retired connection was offered again");
@@ -590,6 +596,86 @@ async fn postgres_a_write_whose_bound_is_spent_at_checkout_keeps_its_connection(
                 );
                 held.push(connection);
             }
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// The pool's own `statement_timeout` and `synchronous_commit`, as the
+/// fixture's tests read them: `<timeout> <level>`.
+async fn pool_settings(pool: &PgPool) -> Result<String> {
+    let settings: String = sqlx::query_scalar(
+        "SELECT current_setting('statement_timeout')||' '||current_setting('synchronous_commit')",
+    )
+    .fetch_one(pool)
+    .await?;
+    ensure!(settings.ends_with(" remote_apply"), "{settings}");
+    Ok(settings)
+}
+
+// A committed hint leaves its connection as the pool keeps it: its
+// `statement_timeout` and its `synchronous_commit` (`remote_apply` here) are
+// the pool's again, not the hint's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_committed_hint_leaves_its_connection_at_the_pools_settings() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let pool = &db.ledger.pool;
+            let default = pool_settings(pool).await?;
+            db.ledger
+                .record_worker_difficulty("primary", "rig", 64.0, now_ms())
+                .await?;
+            // Hold one of the pool's two connections, so the hint takes the
+            // other.
+            let mut held = pool.acquire().await?;
+            let other: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *held)
+                .await?;
+            let hint = db
+                .ledger
+                .write_worker_difficulty_hint(
+                    "primary",
+                    "rig",
+                    32.0,
+                    None,
+                    900,
+                    HintDeadline::after(Duration::from_secs(5)),
+                )
+                .await?;
+            ensure!(hint.as_ref().map(|hint| hint.difficulty) == Some(32.0), "{hint:?}");
+            ensure!(returned(pool).await, "the hint's connection never returned");
+            let mut connection = pool.acquire().await?;
+            let (pid, settings): (i32, String) = sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')||' '||current_setting('synchronous_commit')")
+                .fetch_one(&mut *connection)
+                .await?;
+            ensure!(pid != other, "the hint ran on the held connection");
+            ensure!(settings == default, "{settings}, not the pool's {default}");
+            Ok(())
+        })
+    })
+    .await
+}
+
+// `synchronous_commit = local` is safe only because a hint transaction
+// writes the hint row and nothing else. Its statements are pinned on the
+// wire (`tests/difficulty_hint_bound.rs`); this pins that no trigger, rule
+// or referencing key carries a hint row's write to another table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_hint_write_reaches_no_table_but_the_hint_rows() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let (triggers, rules, referencing): (i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid='qbit_worker_difficulty'::regclass AND NOT tgisinternal),\
+                 (SELECT count(*) FROM pg_rewrite WHERE ev_class='qbit_worker_difficulty'::regclass),\
+                 (SELECT count(*) FROM pg_constraint WHERE confrelid='qbit_worker_difficulty'::regclass)",
+            )
+            .fetch_one(&db.ledger.pool)
+            .await?;
+            ensure!(
+                (triggers, rules, referencing) == (0, 0, 0),
+                "qbit_worker_difficulty has {triggers} triggers, {rules} rules and {referencing} referencing keys"
+            );
             Ok(())
         })
     })
