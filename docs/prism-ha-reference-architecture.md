@@ -488,14 +488,30 @@ primary/failover pair; the pair alone does not supply a partition-safe election.
    and confirm `pg_is_in_recovery() = false`. A timeout needs inspection, not a
    second competing promotion. Apply the approved no-standby ACK policy.
 5. Move `prism-writer.internal`/the managed writer endpoint to this sole primary.
-   Flush or drain existing database proxy connections and reconnect both PRISM
-   pools as needed; DNS changes do not retarget established sockets. Verify both
-   frontends use the same writer, matching keys/fingerprint and preserved share
-   history, then resume admission under the approved policy. A found block that
-   was mid-landing on a surviving frontend lands within seconds of the move:
-   that frontend retries its failed claim release until the new primary
-   answers (#529). A claim held by a frontend lost with the old primary waits
-   for its 120 s candidate lease.
+   Flush or drain existing database proxy connections; DNS changes do not
+   retarget established sockets. **Then restart both frontends** (in the
+   bundled stack, `docker compose restart --timeout 45 prism-coordinator prism-coordinator-2`),
+   unless the move resets every connection the frontends had established to
+   the old primary: a proxy that closes its client connections, or an address
+   move that answers them with a reset. This is a precaution for an unclean
+   loss whose fence leaves those connections silent, such as a power-off or a
+   rule that drops their packets without a reset. A frontend's ledger
+   connections set no TCP keepalive or user timeout, so one with a request in
+   flight then waits for the kernel's retransmissions to give up, which with
+   Linux's default `net.ipv4.tcp_retries2` of 15 the kernel documents as
+   about 15 minutes (924.6 s). Until then it holds its pool slot, and a share
+   append its append slot, so shares can be refused
+   `ledger-confirmation-failed` and other ledger calls can fail their 15 s
+   pool acquire although the new primary serves. A frontend in that state
+   keeps running, so no restart policy restarts it; a restart closes the old
+   sockets. Verify both frontends use the same writer, matching
+   keys/fingerprint and preserved share history, then resume admission under
+   the approved policy. A found block that was mid-landing on a surviving
+   frontend lands once that frontend reaches the new primary: it retries its
+   failed claim release until the new primary answers (#529), within seconds
+   of a move that reset its connections. A claim held by a frontend lost with
+   the old primary, or by one restarted before it could release its claim,
+   waits for its 120 s candidate lease.
 6. **Reconcile found blocks offered without a standby copy.** Collect every
    `block offer standby wait unconfirmed` hash that either frontend logged
    before the primary was lost, at least back to the last time the standby was

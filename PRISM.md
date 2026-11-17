@@ -134,7 +134,9 @@ Direct and CTV settlement apply the same policy, so every settlement mode
 requires `PRISM_POOL_FEE_ENABLED=1` with a recipient (#535);
 `PRISM_POOL_FEE_BPS=0` is allowed and takes no share of the coinbase; the fee
 output is non-zero only when dust must be swept or when window work pays out to
-the fee address itself (#822).
+the fee address itself (#822). Only 3.1.2 and later build such a window: an
+earlier frontend, dual-writer node or verifier refuses it; see
+[what that means during a rolling upgrade from 3.1.1](docs/prism-ledger-ops.md#work-paid-to-the-pool-fee-address-during-a-311-to-312-upgrade-822).
 `run`, `check-config`, `self-check`, a `policy-transition` target and
 `make doctor` refuse a pool without a fee. `.env.example` enables a 0-bps fee
 to a synthetic lab program (`PRISM_POOL_FEE_P2MR_PROGRAM_HEX`, recipient

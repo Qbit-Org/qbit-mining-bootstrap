@@ -566,6 +566,52 @@ finish retry a lost race within their own budgets, and it counts the block
 toward `qbit_prism_blocks_total` only when its finish was the block's first
 confirmation.
 
+### Work paid to the pool-fee address during a 3.1.1 to 3.1.2 upgrade (#822)
+
+From 3.1.2, a window that holds work whose payout address is the pool fee's
+own program builds: that work's gross is paid in the fee output
+([pool-fee changes](#offline-pool-fee-and-ctv-fee-rate-changes)). Every audit
+bundle publishes the fee program, so any miner can authorize with it. A
+frontend, dual-writer node or verifier before 3.1.2 still refuses such a
+window with `pool fee account duplicates a miner payout account`. So while
+3.1.1 and 3.1.2 frontends serve together and such work is in the window:
+
+- each 3.1.1 frontend fails every work build, as 3.1.1 does; the 3.1.2 ones
+  build the window;
+- a block found on that work is offered as usual, since `submitblock` doesn't
+  wait for a rebuild. If a 3.1.1 frontend claims it for its landing, as after
+  the finder's frontend dies, its rebuild fails, and it logs
+
+  ```
+  ALERT: offered candidate could not be processed; kept for reconciliation, never offered again
+  ```
+
+  with a reason that starts `post-offer processing failed (…)` and ends with
+  that refusal. The row waits in `reconciliation`, retried
+  `min(3600, 10 × attempt_count)` s apart and never offered again; nothing
+  wrong is written. The next claim by a 3.1.2 frontend lands it, while each
+  3.1.1 claim fails again and lengthens the wait. If pool blocks confirm in the
+  meantime, the block's confirmation can record a divergence and debt
+  ([the overpay a captured block can cause](#the-overpay-a-captured-block-can-cause));
+- a 3.1.1 dual-writer node cannot adopt such a block from its peer's prepared
+  record ([blocks found by a dying node](#blocks-found-by-a-dying-node-s8)):
+  it logs `ALERT: a pool block on the active chain has no landing rows here
+  and no adoptable prepared record` with the same refusal as its reason, and
+  tries again;
+- 3.1.1's `qbit-prism-audit-verify` and `backfill-ctv` refuse the block's
+  bundle.
+
+**What to do.** Finish replacing the frontends; on a dual-writer node, replace
+its frontends together. For the ALERT with this reason, check that a 3.1.2
+frontend serves, then run `qbit-prism-server candidates list` once the row's
+`next_attempt` has passed: the row is gone after a 3.1.2 frontend has claimed
+it. Never abandon it. Verify such bundles with a 3.1.2 or later
+`qbit-prism-audit-verify`, and tell third-party verifiers so. A rollback to
+3.1.1 brings all of this back while such work is in the window, and no 3.1.1
+frontend can land such a row. `AUDIT_BUILDER_VERSION` stays 1 on purpose: a
+new version would make 3.1.1 refuse every candidate 3.1.2 builds, and the
+bundles of windows without such work are unchanged.
+
 ### Candidate commands
 
 Three operator commands read and finish the rows in the state table above.
@@ -3062,7 +3108,12 @@ crash. Zero acknowledged-share loss on database-primary failure additionally
 requires synchronous standby flush and a promotion policy restricted to a
 standby containing acknowledged commits. An HA endpoint does not establish this
 by itself. Test primary failure and client reconnection using the actual
-replication, proxy, and storage configuration.
+replication, proxy, and storage configuration. The ledger's connections set no
+TCP keepalive or user timeout, so after an unclean primary loss whose fence
+leaves their established connections silent, restart both frontends once the
+writer endpoint has moved, as
+[the failover procedure's step 5](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint)
+says.
 
 ### Found blocks and the failover standby (#529)
 
@@ -4147,7 +4198,9 @@ remains deferred.
    then set the same values in the frontends' environment. A 0-bps fee takes
    no share of the coinbase. It adds a coinbase output only when dust must be
    swept or when window work pays out to the fee address itself (#822): that
-   work's gross is paid in the fee output.
+   work's gross is paid in the fee output. A frontend or verifier before
+   3.1.2 refuses such a window
+   ([during an upgrade](#work-paid-to-the-pool-fee-address-during-a-311-to-312-upgrade-822)).
 
 2. Disable automatic restarts and stop every frontend and standalone candidate
    or CTV worker. Graceful SIGTERM closes miner admission and drains workers;

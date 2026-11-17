@@ -183,9 +183,17 @@ session lifetime totals: a full window's allowance is admitted as a burst and
 refills whole at the next window. Valid `mining.submit` traffic is never
 charged against any of them.
 
-The authorization budget is on by default (#823): a username is not
+The authorization budget is on by default since 3.1.2 (#823): a username is not
 authenticated, and an address the frontend has not seen costs a node
-`validateaddress` call. Only the address before the first `.` decides the
+`validateaddress` call. An explicit value wins over the default, and
+`.env.example` up to 3.1.1 set
+`PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL=0`, so an `.env` copied
+from it keeps the budget off: delete the line, or set 32. A session's 33rd
+attempt in an interval is answered with error 20 `too many authorization
+attempts`, and the session is closed and counted as
+`qbit_prism_stratum_connection_refusals_total{reason="authorize_budget"}`. A
+Stratum proxy that authorizes more than 32 downstream workers over one
+upstream connection within an interval needs a higher value, or 0. Only the address before the first `.` decides the
 payout, so a resolved address is cached for an hour and a new worker suffix on
 it costs no call. Sessions naming the same new address share one validation,
 and a frontend runs at most four validations at once, so authorization cannot
