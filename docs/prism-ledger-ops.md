@@ -49,7 +49,10 @@ minutes on a frontend with at least 100 admissions in that window, and that
 lasts ten minutes. Every outcome counts, so an append dropped at the
 share-commit deadline while it queued counts with the time it waited. A queue
 that lasts means this frontend's appends are finishing more slowly than they
-arrive.
+arrive. Its snapshot gate keeps the last snapshot readings for one minute, so a
+failed scrape does not restart the ten-minute wait, while a frontend not scraped
+for a minute stops counting here and `PrismMetricsEndpointDown` reports it from
+three minutes.
 
 - **Landings.** A landing's settlement holds `ORDER_LOCK` while appends queue
   behind it, but its queue leaves the five-minute window within five minutes,
