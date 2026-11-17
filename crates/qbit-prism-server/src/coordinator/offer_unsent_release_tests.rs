@@ -1,0 +1,439 @@
+//! On a real PostgreSQL: a submit-loop attempt that took a found block's
+//! offer reservation and then failed before its `submitblock` could leave
+//! (the strictly-live renewal before the send failed, or a heartbeat renewal
+//! failed and dropped the attempt's work), knows that nothing was sent. Its
+//! failed-attempt release returns the reservation to `pending`, and the block
+//! is offered again, exactly once, instead of being settled as delivery
+//! unknown by the next claim and never offered. When that release write fails
+//! too, the deferred retry returns it. An attempt dropped while its
+//! `submitblock` was in flight may have been run by the node, and stays
+//! unknown. Failures are injected by a trigger that fails the next matching
+//! update of the outbox row once, so each case is deterministic.
+use super::*;
+use std::sync::atomic::Ordering;
+
+/// The heartbeat renews only after 10 s, so within a test the only renewal
+/// after the attempt parks is the strictly-live one before the send.
+const PRE_SEND_LEASE: CandidateLease = CandidateLease {
+    seconds: 30,
+    interval: Duration::from_secs(10),
+    timeout: Duration::from_millis(500),
+    rebuild_deadline: Duration::from_secs(60),
+};
+
+/// The heartbeat renews every 200 ms, so a failure injected while the
+/// attempt is parked reaches the heartbeat first, which drops the work.
+const HEARTBEAT_LEASE: CandidateLease = CandidateLease {
+    interval: Duration::from_millis(200),
+    ..PRE_SEND_LEASE
+};
+
+/// The outbox update that renews a claim (`renew_candidate_claim`).
+const RENEWAL: &str = "NEW.claim_renewals > OLD.claim_renewals";
+
+/// The outbox update that returns a reservation to `pending`
+/// (`Ledger::release_unsent_offer`).
+const RETURN_TO_PENDING: &str = "OLD.state = 'offer_reserved' AND NEW.state = 'pending'";
+
+const LOOPING: &str = "candidate-looping";
+
+/// A frontend's submit loop working on the fixture's candidate.
+struct Looping {
+    frontend: Arc<Coordinator>,
+    /// The probe its first attempt parked at, after the reservation and
+    /// right before the strictly-live renewal; later attempts do not park.
+    probe: Option<Arc<OfferProbe>>,
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl Looping {
+    fn probe(&self) -> Result<&OfferProbe> {
+        self.probe.as_deref().context("the attempt was not parked")
+    }
+
+    async fn stop(mut self) -> Result<Arc<Coordinator>> {
+        self.shutdown.send(true)?;
+        tokio::time::timeout(Duration::from_secs(10), &mut self.task)
+            .await
+            .context("the submit loop did not stop")??;
+        Ok(self.frontend.clone())
+    }
+}
+
+/// A test that failed midway leaves no loop running on a dropped schema.
+impl Drop for Looping {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Fixture {
+    /// Hand the fixture's candidate to a new frontend's submit loop, reaching
+    /// the node at `rpc_url`, under `lease`. With `park`, wait until its
+    /// first attempt has taken the reservation and parked at the offer probe.
+    async fn start_loop(
+        &self,
+        rpc_url: String,
+        lease: CandidateLease,
+        block_submit_timeout: Duration,
+        park: bool,
+    ) -> Result<Looping> {
+        let frontend = Coordinator::new(
+            Config {
+                instance_id: LOOPING.into(),
+                rpc_url,
+                block_submit_timeout,
+                ..(*self.coordinator.config).clone()
+            },
+            Arc::new(crate::metrics::Metrics::default()),
+        )
+        .await?;
+        *frontend.observed_tip.write().await = TipState::baseline("aa".repeat(32));
+        let probe = park.then(|| Arc::new(OfferProbe::default()));
+        *frontend.offer_probe.lock().unwrap() = probe.clone();
+        self.coordinator
+            .ledger
+            .retry_candidate(&self.claim, "handed to the looping frontend")
+            .await?;
+        self.due_now().await?;
+        let (shutdown, receiver) = watch::channel(false);
+        let task = tokio::spawn(frontend.clone().submit_loop_with(lease, receiver));
+        if let Some(probe) = &probe {
+            tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
+                .await
+                .context("the loop never reserved the offer")?;
+            let row = self.row().await?;
+            ensure!(
+                row.state == "offer_reserved" && row.reserved_by.as_deref() == Some(LOOPING),
+                "the parked attempt holds no reservation: {} by {:?}",
+                row.state,
+                row.reserved_by
+            );
+            // Later attempts run straight through.
+            *frontend.offer_probe.lock().unwrap() = None;
+        }
+        Ok(Looping {
+            frontend,
+            probe,
+            shutdown,
+            task,
+        })
+    }
+
+    async fn due_now(&self) -> Result<()> {
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1")
+            .bind(&self.claim.candidate.block_hash)
+            .execute(&self.coordinator.ledger.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Fail the next `times` outbox updates matching `when` with a database
+    /// error raised before they write anything. The count is a sequence, so a
+    /// failure's rollback does not re-arm it; [`Fixture::injected`] reads how
+    /// many matching updates were attempted.
+    async fn fail_next_updates(&self, name: &str, when: &str, times: i64) -> Result<()> {
+        sqlx::raw_sql(&format!(
+            "CREATE SEQUENCE {name}_seq; \
+             CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('{name}_seq') <= {times} THEN RAISE EXCEPTION 'injected {name}'; END IF; RETURN NEW; END $$; \
+             CREATE TRIGGER {name} BEFORE UPDATE ON qbit_block_candidate_outbox FOR EACH ROW WHEN ({when}) EXECUTE FUNCTION {name}();"
+        ))
+        .execute(&self.coordinator.ledger.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How many updates [`Fixture::fail_next_updates`]'s `name` has seen.
+    async fn injected(&self, name: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM {name}_seq"
+        ))
+        .fetch_one(&self.coordinator.ledger.pool)
+        .await?)
+    }
+
+    /// Wait until the fixture's row satisfies `done`.
+    async fn wait_for_row(&self, what: &str, done: impl Fn(&Row) -> bool) -> Result<Row> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row = self.row().await?;
+                if done(&row) {
+                    return Ok::<_, anyhow::Error>(row);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "the row never became {what}: {:?}",
+                self.claim.candidate.block_hash
+            )
+        })?
+    }
+
+    /// The row, returned unsent by the looping frontend: `pending`, no claim,
+    /// no offer record, its evidence kept, and a reason that says so.
+    async fn returned_unsent(&self, says: &str) -> Result<()> {
+        let row = self
+            .wait_for_row("pending as not sent", |row| {
+                // The hand-over left it `pending` too, with another reason.
+                row.state == "pending"
+                    && row.token.is_none()
+                    && row.last_error.as_deref().is_some_and(|reason| {
+                        reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX)
+                    })
+            })
+            .await?;
+        let reason = row.last_error.clone().unwrap_or_default();
+        ensure!(
+            row.outcome.is_none()
+                && row.offered_at_ms.is_none()
+                && row.reserved_by.is_none()
+                && row.evidence,
+            "the returned row kept an offer record: outcome {:?}, call time {:?}, reserved by {:?}",
+            row.outcome,
+            row.offered_at_ms,
+            row.reserved_by
+        );
+        ensure!(
+            reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX)
+                && reason.contains(LOOPING)
+                && reason.contains(says)
+                && reason.contains("returned to pending for another offer"),
+            "the return is not recorded: {reason}"
+        );
+        ensure!(
+            self.backed_off().await?,
+            "the returned row did not back off"
+        );
+        ensure!(
+            self.submissions().await == 0,
+            "the unsent block reached the node"
+        );
+        ensure!(
+            self.unknown_outcomes().await? == 0,
+            "an unsent block was counted as an unknown outcome"
+        );
+        Ok(())
+    }
+
+    /// The returned row is offered again by the running loop, once, and lands.
+    async fn offered_once_more(&self, looping: Looping) -> Result<()> {
+        self.due_now().await?;
+        self.wait_for_row("submitted", |row| row.state == "submitted")
+            .await?;
+        let frontend = looping.stop().await?;
+        let row = self.row().await?;
+        ensure!(
+            row.outcome.as_deref() == Some("accepted")
+                && row.offered_at_ms.is_some()
+                && row.reserved_by.as_deref() == Some(LOOPING),
+            "the re-offered block landed with outcome {:?} reserved by {:?}",
+            row.outcome,
+            row.reserved_by
+        );
+        ensure!(self.landed().await?);
+        ensure!(
+            self.submissions().await == 1,
+            "the block was offered {} times",
+            self.submissions().await
+        );
+        ensure!(first_offer_samples(&frontend.metrics) == 1);
+        frontend.ledger.pool.close().await;
+        Ok(())
+    }
+}
+
+/// The attempt holds the reservation and fails before its `submitblock` can
+/// leave: the strictly-live renewal right before the send fails, or the
+/// heartbeat's renewal fails and drops the attempt's work while it waits
+/// (the standby or peer-ingest wait's place). Its release returns the row to
+/// `pending`, with no outcome and the failure as its reason, and the next
+/// attempt offers the block exactly once. With the release write failing
+/// too, the deferred retry returns it a moment later. Before, the release
+/// kept `offer_reserved`, and the next claim settled the block as delivery
+/// unknown without ever offering it: lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_that_fails_before_its_send_returns_the_reservation_to_pending_and_the_block_is_offered_once(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    for pre_send in [true, false] {
+        let (failure, lease) = if pre_send {
+            ("the renewal before the send", PRE_SEND_LEASE)
+        } else {
+            ("the heartbeat", HEARTBEAT_LEASE)
+        };
+        for release_fails in [false, true] {
+            let Some(fixture) = Fixture::open().await? else {
+                return Ok(());
+            };
+            let result = async {
+                let looping = fixture
+                    .start_loop(
+                        fixture.coordinator.config.rpc_url.clone(),
+                        lease,
+                        Duration::from_secs(1),
+                        true,
+                    )
+                    .await?;
+                if release_fails {
+                    fixture
+                        .fail_next_updates("fail_return", RETURN_TO_PENDING, 1)
+                        .await?;
+                }
+                fixture
+                    .fail_next_updates("fail_renewal", RENEWAL, 1)
+                    .await?;
+                let probe = looping.probe()?;
+                if pre_send {
+                    // Let the attempt run on into its renewal before the send.
+                    // Otherwise it stays parked until the heartbeat drops it.
+                    probe.release.notify_one();
+                }
+                fixture.returned_unsent("renewal").await?;
+                ensure!(
+                    probe.left.load(Ordering::SeqCst),
+                    "the row was returned while the attempt's work was still running"
+                );
+                ensure!(fixture.injected("fail_renewal").await? >= 1);
+                if release_fails {
+                    ensure!(
+                        fixture.injected("fail_return").await? >= 2,
+                        "the row was returned without the deferred retry"
+                    );
+                }
+                fixture.offered_once_more(looping).await
+            }
+            .await;
+            fixture.close().await?;
+            result.with_context(|| format!("{failure}, release write failing: {release_fails}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The node refused the `submitblock` before dispatching it (its work queue
+/// was full), and the attempt's own write returning the reservation to
+/// `pending` failed, as did its failed-attempt release right after: the
+/// attempt fails holding a reservation the node provably never ran. The
+/// deferred retry returns it, and the block is offered once more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_offer_whose_return_to_pending_fails_is_returned_by_the_deferred_retry(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let relay = Relay::start(fixture.node_address()?).await?;
+    let result = async {
+        relay.submit(Submit::RefuseBeforeDispatch {
+            body: "Work queue depth exceeded",
+            close: false,
+        });
+        fixture
+            .fail_next_updates("fail_return", RETURN_TO_PENDING, 2)
+            .await?;
+        let looping = fixture
+            .start_loop(relay.url(), PRE_SEND_LEASE, Duration::from_secs(1), false)
+            .await?;
+        fixture
+            .returned_unsent("refused before dispatch (HTTP 503 Service Unavailable)")
+            .await?;
+        ensure!(
+            fixture.injected("fail_return").await? >= 3,
+            "the row was returned without the deferred retry"
+        );
+        fixture.offered_once_more(looping).await
+    }
+    .await;
+    drop(relay);
+    fixture.close().await?;
+    result
+}
+
+/// The control: the heartbeat fails while the `submitblock` is in flight,
+/// after the node received and accepted the block, and drops the call. The
+/// call may have run, so the attempt's release keeps the reservation, and
+/// every later claim settles the block as delivery unknown without offering
+/// it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_dropped_while_its_submitblock_is_in_flight_keeps_the_reservation_and_never_offers_again(
+) -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let relay = Relay::start(fixture.node_address()?).await?;
+    let result = async {
+        // The call's own deadline is far beyond the heartbeat's failure.
+        let looping = fixture
+            .start_loop(relay.url(), HEARTBEAT_LEASE, Duration::from_secs(20), true)
+            .await?;
+        relay.submit(Submit::HoldReply);
+        looping.probe()?.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.submissions().await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the submitblock never reached the node")?;
+        // The node has run the call; its reply is held. Now the heartbeat
+        // fails and drops the call in flight.
+        fixture
+            .fail_next_updates("fail_renewal", RENEWAL, 1)
+            .await?;
+        let row = fixture
+            .wait_for_row("released", |row| row.token.is_none())
+            .await?;
+        let frontend = looping.stop().await?;
+        relay.submit(Submit::Forward);
+        ensure!(
+            row.state == "offer_reserved" && row.outcome.is_none(),
+            "a call dropped in flight did not keep its reservation: {} {:?}, reason {:?}",
+            row.state,
+            row.outcome,
+            row.last_error
+        );
+        ensure!(
+            !row.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX),
+            "a call dropped in flight was recorded as not sent: {:?}",
+            row.last_error
+        );
+        ensure!(fixture.submissions().await == 1);
+        // Every later claim, on any frontend, settles and never offers.
+        for _ in 0..2 {
+            fixture.expire().await?;
+            fixture.due_now().await?;
+            if let Some(claim) = fixture.successor.claim_candidate(10).await? {
+                ensure!(claim.lifecycle.state != CandidateState::Pending);
+                fixture
+                    .successor_coordinator
+                    .process_candidate_with_lease(&claim, CANDIDATE_LEASE)
+                    .await?;
+            }
+        }
+        let row = fixture.row().await?;
+        ensure!(
+            row.state == "submitted" && row.outcome.as_deref() == Some("unknown"),
+            "the recovered reservation settled as {} with outcome {:?}",
+            row.state,
+            row.outcome
+        );
+        ensure!(
+            fixture.submissions().await == 1,
+            "the block was offered again after a call that may have run"
+        );
+        frontend.ledger.pool.close().await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(relay);
+    fixture.close().await?;
+    result
+}

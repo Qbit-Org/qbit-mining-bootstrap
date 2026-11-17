@@ -170,6 +170,83 @@ impl RpcNotSentError {
     }
 }
 
+/// A [`RELAY_METHODS`] call that qbitd refused with HTTP 503 before it
+/// dispatched the request to any handler, so the node never ran it. The
+/// request reached the node, unlike [`RpcNotSentError`]'s, but no call ran.
+///
+/// qbitd writes exactly two such replies, both before its JSON-RPC handler
+/// is chosen (Qbit Core v1.0.1, `src/httpserver.cpp`, `http_request_cb` and
+/// `http_reject_request_cb`), and nothing else in the node answers 503 on
+/// the RPC path: its JSON-RPC handler (`src/httprpc.cpp`) never does, and
+/// the REST handlers' 503 carries another body under another path. Only the
+/// exact body proves the refusal, never the status alone: a reverse proxy in
+/// front of the node answers 503 with its own page, possibly after it
+/// forwarded the request, and such a reply stays an ordinary error whose
+/// outcome is unknown. A proxy that relays the node's reply unchanged keeps
+/// the proof, for the one node it sent the request to; an endpoint that
+/// retries a failed POST on another backend is not supported, as for the
+/// warmup rule ([`RpcReplyError::in_warmup`]).
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("qbit RPC {method} refused before dispatch (HTTP 503 Service Unavailable): {}", .refusal.wording())]
+pub struct RpcNotDispatchedError {
+    pub method: String,
+    pub refusal: NotDispatched,
+}
+
+/// Why qbitd refused a request before dispatching it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotDispatched {
+    /// Its HTTP work queue (`-rpcworkqueue`) was full: the event thread
+    /// answers `WriteReply(HTTP_SERVICE_UNAVAILABLE, "Work queue depth
+    /// exceeded")` when the queue refuses the work item, which is then
+    /// destroyed unrun.
+    WorkQueueFull,
+    /// Its HTTP server was stopping: `InterruptHTTPServer` replaces the
+    /// request callback with `http_reject_request_cb`, which answers every
+    /// request, kept-alive connections included, with
+    /// `evhttp_send_error(req, HTTP_SERVUNAVAIL, nullptr)`, libevent's own
+    /// 503 page.
+    ShuttingDown,
+}
+
+/// qbitd's body for [`NotDispatched::WorkQueueFull`], verbatim.
+const WORK_QUEUE_FULL_BODY: &[u8] = b"Work queue depth exceeded";
+
+/// The page `evhttp_send_error` writes for a 503 with no reason in libevent
+/// 2.1.12-stable, the version Qbit Core v1.0.1's release build pins
+/// (`depends/packages/libevent.mk`): its `ERR_FORMAT` with the status
+/// phrase. Another libevent writes another page (2.2's differs), which then
+/// stays unknown.
+const LIBEVENT_SERVICE_UNAVAILABLE_PAGE: &[u8] =
+    b"<HTML><HEAD>\n<TITLE>503 Service Unavailable</TITLE>\n</HEAD><BODY>\n<H1>Service Unavailable</H1>\n</BODY></HTML>\n";
+
+impl NotDispatched {
+    /// The refusal a reply proves, if it is HTTP 503 with exactly one of
+    /// qbitd's two pre-dispatch bodies.
+    fn of_reply(status: reqwest::StatusCode, body: &[u8]) -> Option<Self> {
+        if status != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            None
+        } else if body == WORK_QUEUE_FULL_BODY {
+            Some(Self::WorkQueueFull)
+        } else if body == LIBEVENT_SERVICE_UNAVAILABLE_PAGE {
+            Some(Self::ShuttingDown)
+        } else {
+            None
+        }
+    }
+
+    fn wording(self) -> &'static str {
+        match self {
+            Self::WorkQueueFull => {
+                "the node's HTTP work queue was full (\"Work queue depth exceeded\"), so it ran no call"
+            }
+            Self::ShuttingDown => {
+                "the node's HTTP server was shutting down and rejected the request before any handler ran"
+            }
+        }
+    }
+}
+
 /// The calls that hand the node a block or a transaction to relay to the
 /// network. PRISM makes the first three; the wallet's own sends are listed
 /// so that no later caller can relay through one either (#291).
@@ -772,9 +849,19 @@ impl Rpc {
             }
         })?;
         let status = response.status();
-        let value: Value = response.json().await.map_err(|_| {
-            anyhow::anyhow!("qbit RPC {method} returned invalid JSON (HTTP {status})")
-        })?;
+        let invalid = || anyhow::anyhow!("qbit RPC {method} returned invalid JSON (HTTP {status})");
+        // The whole body, read under the call's deadline as `json` read it.
+        let body = response.bytes().await.map_err(|_| invalid())?;
+        if RELAY_METHODS.contains(&method) {
+            if let Some(refusal) = NotDispatched::of_reply(status, &body) {
+                return Err(RpcNotDispatchedError {
+                    method: method.to_owned(),
+                    refusal,
+                }
+                .into());
+            }
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
         if !value["error"].is_null() {
             return Err(RpcReplyError {
                 method: method.to_owned(),

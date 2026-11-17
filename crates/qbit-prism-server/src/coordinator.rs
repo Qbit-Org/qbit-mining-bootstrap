@@ -388,19 +388,27 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 /// the submit deadline included, #762) or because the HTTP client handed the
 /// request back unwritten when its connection closed first (#816); the client
 /// refused to send it under `PRISM_BLOCK_SUBMIT_ENABLED`
-/// (`rpc::RpcRelayRefused`, #291); or the node answered it with
+/// (`rpc::RpcRelayRefused`, #291); the node answered it with
 /// `RPC_IN_WARMUP`, which qbitd returns before it dispatches any call
-/// (`rpc::RpcReplyError::in_warmup`, #526). Only a `submitblock` reply counts:
-/// a warmup answer to another call says nothing about this one. Every other
-/// result, any other error code, any other transport failure after the
-/// connection existed or the submit deadline included, may have run and is
-/// `None`.
+/// (`rpc::RpcReplyError::in_warmup`, #526); or the node refused it with one
+/// of its two exact HTTP 503 replies written before dispatch, a full work
+/// queue or a server shutting down (`rpc::RpcNotDispatchedError`). Only a
+/// `submitblock` reply counts: a warmup answer or a refusal of another call
+/// says nothing about this one. Every other result, any other error code,
+/// any other HTTP 503 body, any other transport failure after the connection
+/// existed or the submit deadline included, may have run and is `None`.
 fn offer_not_executed(result: &Result<Value>) -> Option<String> {
     let error = result.as_ref().err()?;
     if let Some(not_sent) = error.downcast_ref::<crate::rpc::RpcNotSentError>() {
         return Some(not_sent.to_string());
     }
     if let Some(refused) = error.downcast_ref::<crate::rpc::RpcRelayRefused>() {
+        return Some(refused.to_string());
+    }
+    if let Some(refused) = error
+        .downcast_ref::<crate::rpc::RpcNotDispatchedError>()
+        .filter(|refused| refused.method == "submitblock")
+    {
         return Some(refused.to_string());
     }
     error
@@ -415,7 +423,7 @@ fn offer_not_executed(result: &Result<Value>) -> Option<String> {
 /// may not have reached the node, and the row is reconciled against the
 /// chain rather than offered again. A call the node provably never ran
 /// ([`offer_not_executed`]) never reaches this classification: it returns
-/// the reservation to `pending` instead (#522, #526).
+/// the reservation to `pending` instead (#522, #526, and a pre-dispatch 503).
 fn classify_offer(result: &Result<Value>) -> (OfferOutcome, Option<String>) {
     match result {
         Ok(Value::Null) => (OfferOutcome::Accepted, None),
@@ -2558,8 +2566,15 @@ impl Coordinator {
         claim: &CandidateClaim,
         lease: CandidateLease,
     ) -> Result<()> {
-        self.with_candidate_heartbeat(claim, lease, self.process_candidate_inner(claim, lease))
-            .await
+        // No submit-loop attempt owns this claim, so no failed-attempt
+        // release reads whether its offer was sent.
+        let unsent = claim_release::UnsentOffer::default();
+        self.with_candidate_heartbeat(
+            claim,
+            lease,
+            self.process_candidate_inner(claim, lease, &unsent),
+        )
+        .await
     }
 
     /// Run `work` on a claimed row while the ordinary heartbeat renews its
@@ -3158,10 +3173,13 @@ impl Coordinator {
         Ok(landed.unwrap_or_else(|refusal| Landing::Refused(format!("{refusal:#}"))))
     }
 
+    /// `unsent` is the owning attempt's record of an offer reservation it
+    /// took and has not sent (see [`claim_release::UnsentOffer`]).
     async fn process_candidate_inner(
         &self,
         claim: &CandidateClaim,
         lease: CandidateLease,
+        unsent: &claim_release::UnsentOffer,
     ) -> Result<()> {
         // #291: a frontend with PRISM_BLOCK_SUBMIT_ENABLED off processes no
         // claim. Its submit loop takes none; any other caller is refused here,
@@ -3172,10 +3190,12 @@ impl Coordinator {
             claim.candidate.block_hash
         ))?;
         match claim.lifecycle.state {
-            CandidateState::Pending => self.offer_candidate(claim, lease).await,
+            CandidateState::Pending => self.offer_candidate(claim, lease, unsent).await,
             // A reservation this or another frontend took and never recorded
             // an outcome for: the call may or may not have been made. Never
-            // offered again; reconciled against the chain as unknown.
+            // offered again; reconciled against the chain as unknown. (A
+            // holder whose attempt knew it sent nothing returned the row to
+            // `pending` itself; one that crashed or lost its claim could not.)
             CandidateState::OfferReserved => {
                 let reserved_by = claim
                     .lifecycle
@@ -3211,7 +3231,19 @@ impl Coordinator {
     /// fenced immediately before the bounded RPC, and the node's answer is
     /// recorded. Builder admission, the rebuild, verification, landing and
     /// confirmation all follow in the post-offer phase.
-    async fn offer_candidate(&self, claim: &CandidateClaim, lease: CandidateLease) -> Result<()> {
+    ///
+    /// `unsent` holds the reservation while nothing has been sent: from the
+    /// moment it commits until immediately before the request can leave
+    /// ([`Coordinator::submit_block`]), and again once the node's answer
+    /// proves the call did not run. However the attempt ends meanwhile (an
+    /// error, its heartbeat dropping it, a shutdown), its owner then returns
+    /// the reservation to `pending` (`claim_release`).
+    async fn offer_candidate(
+        &self,
+        claim: &CandidateClaim,
+        lease: CandidateLease,
+        unsent: &claim_release::UnsentOffer,
+    ) -> Result<()> {
         let candidate = &claim.candidate;
         let parent = header_parent(&candidate.block_bytes)?;
         if !candidate.leased
@@ -3339,6 +3371,15 @@ impl Coordinator {
                 return Ok(());
             }
         }
+        // The reservation committed and nothing has been sent. Until the
+        // send clears this, an attempt that ends by any path returns the
+        // reservation to `pending` (`claim_release`). A reservation whose
+        // COMMIT reply was lost is an error above, before this is set: the
+        // row may still be `pending`, and it keeps the ordinary release.
+        unsent.hold(format!(
+            "the attempt holding the reservation taken by {} stopped before its submitblock call was sent",
+            self.config.instance_id
+        ));
         // #529: the reservation, and the candidate row before it, reach the
         // failover standby before the block leaves this frontend, within the
         // bound. The wait never holds the block: an unconfirmed one is logged
@@ -3399,14 +3440,21 @@ impl Coordinator {
             tracing::warn!(block = %candidate.block_hash, %reason, "the carry gate moved before the offer; the next attempt decides it again, through the capture path");
             return Ok(());
         }
-        let (result, offered_at_ms) = self.submit_block(params).await?;
-        // #522, #526: a call whose connection was never established, or
-        // that the node answered from its warmup, provably did not run, so
-        // nothing was offered. The reservation goes back to `pending` for
-        // another attempt after the ordinary backoff, with no outcome, no
-        // call time and no first-offer sample. Every other failure may have
-        // run on the node and stays unknown below.
+        let (result, offered_at_ms) = self.submit_block(params, unsent).await?;
+        // #522, #526: a call whose connection was never established, that
+        // the node answered from its warmup, or that it refused with a
+        // pre-dispatch 503, provably did not run, so nothing was offered.
+        // The reservation goes back to `pending` for another attempt after
+        // the ordinary backoff, with no outcome, no call time and no
+        // first-offer sample. Every other failure may have run on the node
+        // and stays unknown below.
         if let Some(not_run) = offer_not_executed(&result) {
+            // Held again before the write: if it fails, or the heartbeat
+            // drops it, the owner's release returns the reservation instead.
+            unsent.hold(format!(
+                "{not_run}; the reservation taken by {} was not offered",
+                self.config.instance_id
+            ));
             let reason = format!(
                 "{}: {not_run}; the reservation taken by {} was returned to pending for another offer",
                 crate::ledger::OFFER_NOT_SENT_REASON_PREFIX,
@@ -3797,8 +3845,17 @@ impl Coordinator {
     /// clock is read immediately before the request is sent, after the token
     /// fence and after the request was prepared: the actual call boundary,
     /// which is what `offered_at_ms` records and where the sample starts.
-    async fn submit_block(&self, params: Value) -> Result<(Result<Value>, i64)> {
+    /// `unsent` is cleared at the same boundary: from here the request may
+    /// leave this process, and the reservation is no longer provably unsent.
+    async fn submit_block(
+        &self,
+        params: Value,
+        unsent: &claim_release::UnsentOffer,
+    ) -> Result<(Result<Value>, i64)> {
         let offered_at_ms = unix_ms_now()?;
+        // Synchronously before the call's future is first polled: nothing of
+        // the request is written before that poll.
+        unsent.sending();
         let result = self
             .rpc
             .call_timeout(
