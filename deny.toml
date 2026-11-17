@@ -12,11 +12,14 @@ feature-depth = 1
 
 [advisories]
 # RustSec advisories: any vulnerability, unmaintained crate, or yanked
-# version in the lock file fails the check.
+# version in the lock file fails the check, except the advisories ignored
+# below, each with its reason.
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no vulnerability, no patched version); it is a direct dependency of the PRISM crates and reaches sqlx and the vendored sqlx-core, and replacing it is too large for a patch release; tracked in Qbit-Org/qbit-mining-bootstrap#878" },
+]
 
 [licenses]
 # Every crate in the graph must carry one of these licenses. The list is what
