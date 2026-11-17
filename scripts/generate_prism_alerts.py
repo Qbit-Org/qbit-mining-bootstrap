@@ -100,7 +100,8 @@ def endpoint_dwell_minutes():
     return int(match.group(1))
 
 
-def listener_smoothing_minutes():
+def smoothing_minutes():
+    """How long the listener rule and the append-slot rule's snapshot gate carry a frontend's last reading."""
     return endpoint_dwell_minutes() + STANDARD_EVALUATION_MINUTES
 
 
@@ -108,7 +109,7 @@ def listener_down():
     """1 where the listener is down, or a scraped frontend does not report it, on a frontend with a recent miner."""
     listener = prism("qbit_prism_payout_revision_listener_up")
     up = prism("up")
-    smoothing = listener_smoothing_minutes()
+    smoothing = smoothing_minutes()
     down = f"(last_over_time({listener}[{smoothing}m]) == bool 0)"
     # Present from startup on every frontend since #834, so a scraped target
     # without it runs an older image: unknown, which is not healthy.
@@ -118,7 +119,7 @@ def listener_down():
 
 def listener_basis():
     dwell, window = LISTENER_DOWN_MINUTES, MINER_WINDOW_MINUTES
-    smoothing, endpoint = listener_smoothing_minutes(), endpoint_dwell_minutes()
+    smoothing, endpoint = smoothing_minutes(), endpoint_dwell_minutes()
     return (
         f"This frontend's payout-revision listener (#752) has not held its LISTEN for {dwell} minutes while it "
         "served miners (#843). While qbit_prism_payout_revision_listener_up reads 0, the frontend republishes after "
@@ -266,8 +267,15 @@ def admission_wait_rule(spec):
     p99 = (f"histogram_quantile(0.99, sum by (job, instance, network, le) "
            f"(rate({stage}_bucket{selector}[{ADMISSION_WINDOW}])))")
     flowing = f"sum by {by} (increase({stage}_count{selector}[{ADMISSION_WINDOW}]))"
-    snapshot = (f"({prism('qbit_prism_metrics_snapshot_available')} == 1) and on{by} "
-                f"({prism('qbit_prism_metrics_snapshot_stale')} == 0)")
+    # A failed scrape writes staleness markers, so instant gauges would drop
+    # the series for an evaluation and, in Grafana when no other frontend has
+    # one (a NoData result, alertingNoDataErrorExecution), restart the ten-
+    # minute dwell. The gate carries their last values for the listener
+    # rule's window instead; a published stale or unavailable body is the
+    # last value and still suppresses at once.
+    carry = smoothing_minutes()
+    snapshot = (f"(last_over_time({prism('qbit_prism_metrics_snapshot_available')}[{carry}m]) == 1) and on{by} "
+                f"(last_over_time({prism('qbit_prism_metrics_snapshot_stale')}[{carry}m]) == 0)")
     rule["expr"] = (f"(({p99} > bool {ADMISSION_P99_SECONDS}) and on{by} ({flowing} >= {ADMISSION_MINIMUM})) "
                     f"and on{by} ({snapshot})")
     rule["for"] = ADMISSION_FOR
@@ -298,7 +306,10 @@ def admission_wait_rule(spec):
         "append slot\" describes. "
         "Every outcome counts, so an append dropped at the share-commit deadline while it queued is counted with "
         "the time it waited. Gated on the snapshot, since the family is served from the cached body: a stale or "
-        "unpublished body suppresses it. A frontend without the stage histogram (older than #829's stages) has "
+        "unpublished body suppresses it. The gate reads each snapshot gauge's last value in the last "
+        f"{carry} minutes, the window {LISTENER_TITLE} carries a reading for, so a failed scrape, which would "
+        "otherwise restart the ten-minute dwell, does not, while a stale or unpublished body the frontend "
+        "publishes suppresses it at the next evaluation. A frontend without the stage histogram (older than #829's stages) has "
         "no admission series and stays quiet; no-data and evaluation errors are OK because the snapshot and "
         "no-data rules own missing measurements. " + rule["basis"])
 
@@ -358,7 +369,7 @@ def check_listener_prose():
     """#843: the operator docs state the listener rule's dwell the generator writes."""
     check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
     # #869: and the window that carries a reading after scrapes stop.
-    check_prose(LISTENER_WINDOW_PROSE, listener_smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
+    check_prose(LISTENER_WINDOW_PROSE, smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
                 f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES", docs=RUNBOOK_DOCS)
     check_prose(ENDPOINT_DWELL_PROSE, endpoint_dwell_minutes(), f"{ENDPOINT_TITLE}'s dwell",
                 f"{ENDPOINT_TITLE}'s for", docs=RUNBOOK_DOCS)
