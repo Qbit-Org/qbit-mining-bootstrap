@@ -3,8 +3,10 @@
 //! the bound, and, on a real PostgreSQL, the remaining-time rule and the
 //! custom `BEGIN` that sets the first timeout.
 use super::*;
+use futures_util::FutureExt;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
+use std::panic::{resume_unwind, AssertUnwindSafe};
 use tokio::time::Instant;
 
 fn ms(millis: u64) -> Duration {
@@ -231,14 +233,16 @@ async fn run(
     let Some(db) = Database::open().await? else {
         return Ok(());
     };
-    let result = body(&db).await;
+    // The schema and pools are cleaned up whether the body fails or panics.
+    let result = AssertUnwindSafe(body(&db)).catch_unwind().await;
     let cleanup = db.close().await;
-    match (result, cleanup) {
-        (Ok(()), cleanup) => cleanup,
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-        }
+    match result {
+        Err(panic) => resume_unwind(panic),
+        Ok(Ok(())) => cleanup,
+        Ok(Err(error)) => match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!("schema cleanup also failed: {cleanup}"))),
+        },
     }
 }
 
@@ -326,6 +330,72 @@ async fn postgres_a_hint_statement_sent_late_gets_only_what_is_left_of_the_write
     .await
 }
 
+// A statement the connection has not prepared yet takes its `Parse` round
+// trip first, and `Sync` restarts the server's timer for its run. Here the
+// update waits while it is prepared (its `ROW EXCLUSIVE` lock against a
+// `SHARE` lock held for half the bound) and then while it runs (a row lock).
+// Prepared under the timeout in force and armed again from what is left, it
+// still ends before the bound, where a second full timeout would have let it
+// run 1.8 s from the middle of a 2 s bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_statement_that_waits_while_it_is_prepared_gets_only_what_is_left_to_run(
+) -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            db.ledger
+                .record_worker_difficulty("primary", "rig", 64.0, now_ms())
+                .await?;
+            let mut row = db.admin.begin().await?;
+            sqlx::query(&format!("SELECT 1 FROM {}.qbit_worker_difficulty WHERE listener='primary' AND worker_username='rig' FOR UPDATE", db.schema))
+                .fetch_one(&mut *row)
+                .await?;
+            let mut table = db.admin.begin().await?;
+            sqlx::query(&format!(
+                "LOCK TABLE {}.qbit_worker_difficulty IN SHARE MODE",
+                db.schema
+            ))
+            .execute(&mut *table)
+            .await?;
+            let bound = Duration::from_secs(2);
+            let deadline = HintDeadline::after(bound);
+            let ledger = &db.ledger;
+            // No connection has prepared the decrease's update yet.
+            let write =
+                ledger.write_worker_difficulty_hint("primary", "rig", 32.0, None, 900, deadline);
+            let release = async {
+                let pid = db.waiting().await?;
+                let query: String = sqlx::query_scalar("SELECT query FROM pg_stat_activity WHERE pid=$1")
+                    .bind(pid)
+                    .fetch_one(&db.admin)
+                    .await?;
+                ensure!(query.starts_with("UPDATE qbit_worker_difficulty"), "{query}");
+                tokio::time::sleep_until(deadline.at() - bound / 2).await;
+                table.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            let (written, released) = tokio::join!(write, release);
+            released?;
+            let ended = Instant::now();
+            let error = written.err().context("the held write returned")?;
+            ensure!(
+                hint_timed_out(&error) && sqlstate(&error).as_deref() == Some("57014"),
+                "not the server's timeout: {error:#}"
+            );
+            let start = deadline.at() - bound;
+            ensure!(
+                ended < deadline.at() && ended >= start + ms(1_700),
+                "ended {:?} into the 2 s bound",
+                ended - start
+            );
+            let active = db.active().await?;
+            ensure!(active.is_empty(), "still running: {active:?}");
+            row.rollback().await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
 // A refused custom `BEGIN` (its `BEGIN` ran, its `SET LOCAL` did not) leaves
 // the server in an aborted transaction SQLx never counted. The connection is
 // retired, so the next checkout is a fresh one at the pool's own timeout that
@@ -336,9 +406,10 @@ async fn postgres_a_refused_custom_begin_retires_its_connection() -> Result<()> 
         Box::pin(async move {
             let pool = &db.ledger.pool;
             let mut connection = pool.acquire().await?;
-            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *connection)
-                .await?;
+            let (pid, default): (i32, String) =
+                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+                    .fetch_one(&mut *connection)
+                    .await?;
             let mut custom = CustomBegin::checked_out(connection);
             let refused = custom
                 .custom_begin("BEGIN; SET LOCAL statement_timeout = 'never'".into())
@@ -347,7 +418,7 @@ async fn postgres_a_refused_custom_begin_retires_its_connection() -> Result<()> 
             ensure!(refused, "the server took the refused setting");
             drop(custom);
             ensure!(db.gone(pid).await?, "the aborted connection is still open");
-            next_checkout_is_fresh(pool, pid).await
+            next_checkout_is_fresh(pool, pid, &default).await
         })
     })
     .await
@@ -362,9 +433,10 @@ async fn postgres_a_custom_begin_cancelled_mid_round_trip_retires_its_connection
         Box::pin(async move {
             let pool = &db.ledger.pool;
             let mut connection = pool.acquire().await?;
-            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *connection)
-                .await?;
+            let (pid, default): (i32, String) =
+                sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
+                    .fetch_one(&mut *connection)
+                    .await?;
             let mut custom = CustomBegin::checked_out(connection);
             let cancelled = tokio::time::timeout(
                 ms(100),
@@ -380,7 +452,7 @@ async fn postgres_a_custom_begin_cancelled_mid_round_trip_retires_its_connection
                 db.gone(pid).await?,
                 "the cancelled connection is still open"
             );
-            next_checkout_is_fresh(pool, pid).await
+            next_checkout_is_fresh(pool, pid, &default).await
         })
     })
     .await
@@ -435,7 +507,7 @@ async fn postgres_a_custom_begin_that_completes_returns_its_connection_at_the_po
                 }
                 held.push(next);
             };
-            ensure!(setting == default && setting == "15s", "{setting}");
+            ensure!(setting == default, "{setting}, not the pool's {default}");
             Ok(())
         })
     })
@@ -455,17 +527,71 @@ async fn returned(pool: &PgPool) -> bool {
 }
 
 /// The next checkout is not backend `old`, runs at the pool's own
-/// `statement_timeout` outside any transaction, and can begin.
-async fn next_checkout_is_fresh(pool: &PgPool, old: i32) -> Result<()> {
+/// `statement_timeout`, `default`, outside any transaction, and can begin.
+async fn next_checkout_is_fresh(pool: &PgPool, old: i32, default: &str) -> Result<()> {
     let mut next = pool.acquire().await?;
     let (pid, setting): (i32, String) =
         sqlx::query_as("SELECT pg_backend_pid(),current_setting('statement_timeout')")
             .fetch_one(&mut *next)
             .await?;
     ensure!(pid != old, "the retired connection was offered again");
-    ensure!(setting == "15s", "{setting}");
+    ensure!(setting == default, "{setting}, not the pool's {default}");
     let mut tx = shielded_begin(next).await?;
     sqlx::query("SELECT 1").execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
+}
+
+// A write whose bound is spent by the time its checkout arrives sends
+// nothing, so its connection, untouched, goes back to the pool: it is not
+// closed, and the pool opens no new one for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_a_write_whose_bound_is_spent_at_checkout_keeps_its_connection() -> Result<()> {
+    run(|db| {
+        Box::pin(async move {
+            let pool = &db.ledger.pool;
+            // Both of the pool's connections, so the write waits for one.
+            let mut first = pool.acquire().await?;
+            let mut second = pool.acquire().await?;
+            let mut pids = Vec::new();
+            for connection in [&mut first, &mut second] {
+                let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut **connection)
+                    .await?;
+                pids.push(pid);
+            }
+            let bound = ms(400);
+            let deadline = HintDeadline::after(bound);
+            let write = db
+                .ledger
+                .write_worker_difficulty_hint("primary", "rig", 32.0, None, 900, deadline);
+            let release = async {
+                // 20 ms left, under the 40 ms margin.
+                tokio::time::sleep_until(deadline.at() - ms(20)).await;
+                drop(first);
+            };
+            let (written, ()) = tokio::join!(write, release);
+            let error = written.err().context("a spent write ran")?;
+            ensure!(
+                error.downcast_ref::<HintBoundSpent>().is_some() && hint_timed_out(&error),
+                "{error:#}"
+            );
+            drop(second);
+            ensure!(db.settled().await?, "a connection is busy");
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let mut connection = pool.acquire().await?;
+                let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *connection)
+                    .await?;
+                ensure!(
+                    pids.contains(&pid),
+                    "the pool opened {pid} in place of {pids:?}"
+                );
+                held.push(connection);
+            }
+            Ok(())
+        })
+    })
+    .await
 }

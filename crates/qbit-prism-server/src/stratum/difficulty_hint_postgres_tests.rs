@@ -7,8 +7,10 @@ use super::*;
 use crate::coordinator::miner_tests::Fixture as Frontend;
 use crate::ledger::Ledger;
 use anyhow::{ensure, Context, Result};
+use futures_util::FutureExt;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
+use std::panic::{resume_unwind, AssertUnwindSafe};
 
 fn now_ms() -> i64 {
     i64::try_from(
@@ -61,17 +63,21 @@ async fn postgres_a_hint_held_past_a_non_default_bound_is_ended_by_the_server_an
     sqlx::query(&format!("CREATE SCHEMA {schema}"))
         .execute(&admin)
         .await?;
-    let result = held_hint(&raw, &admin, &schema).await;
+    // The schema is dropped whether the case fails or panics.
+    let result = AssertUnwindSafe(held_hint(&raw, &admin, &schema))
+        .catch_unwind()
+        .await;
     let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
         .await;
     admin.close().await;
-    match (result, cleanup) {
-        (Ok(()), cleanup) => cleanup.map(|_| ()).map_err(Into::into),
-        (Err(error), Ok(_)) => Err(error),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("schema cleanup also failed: {cleanup}")))
-        }
+    match result {
+        Err(panic) => resume_unwind(panic),
+        Ok(Ok(())) => cleanup.map(|_| ()).map_err(Into::into),
+        Ok(Err(error)) => match cleanup {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(error.context(format!("schema cleanup also failed: {cleanup}"))),
+        },
     }
 }
 

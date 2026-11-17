@@ -869,6 +869,8 @@ qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_cust
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_custom_begin_that_completes_returns_its_connection_at_the_pool_timeout
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_hint_statement_sent_late_gets_only_what_is_left_of_the_write_bound
 qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_refused_custom_begin_retires_its_connection
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_statement_that_waits_while_it_is_prepared_gets_only_what_is_left_to_run
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_write_whose_bound_is_spent_at_checkout_keeps_its_connection
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued::dependency_row_tests::a_dual_writer_prepared_row_matches_its_columns_on_a_single_writer
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse

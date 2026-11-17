@@ -109,6 +109,11 @@
       "class": "borrowed",
       "owner": "ledger",
       "reason": "shielded_begin runs BEGIN on a connection the caller already checked out (and timed) in a task of its own (#482); no additional pool checkout."
+    },
+    "hint-prepare": {
+      "class": "borrowed",
+      "owner": "ledger",
+      "reason": "Prepares a difficulty-hint statement on the connection its transaction already holds (#872), so that a first use's Parse round trip runs under the hint's own statement timeout; a statement SQLx has cached sends nothing. No additional pool checkout."
     }
   },
   "sites": {
@@ -304,6 +309,7 @@
     "ledger/difficulty.rs::prune_worker_difficulties#1::self .begin()": [1,"ledger"],
     "ledger/difficulty.rs::share_accepted_at_ms#1::self .acquire()": [1,"ledger"],
     "ledger/difficulty.rs::write_worker_difficulty_hint#1::self .acquire()": [1,"ledger"],
+    "ledger/difficulty.rs::armed_for#1::prepare_with(& mut * self . tx , sql , types)": [1,"hint-prepare"],
     "ledger/fanout.rs::renew_fanout_claim#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::release_fanout_claim#1::self .begin()": [1,"ledger"],
     "ledger/fanout.rs::hand_back_fanout#1::self .begin()": [1,"ledger"],

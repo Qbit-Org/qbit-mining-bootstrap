@@ -629,13 +629,16 @@ impl DifficultyHints {
                 // bound, so this bound fires mid-statement only when the
                 // server's answer is held up on the way (a stalled
                 // connection). The statement has then ended, or ends at its
-                // own timeout; SQLx drains its reply and the transaction's
-                // `ROLLBACK` when the connection returns to the pool, or a
-                // closed pool closes the connection. Dropped during the
-                // `COMMIT`, the write may have committed: `timed_out`, an
-                // unknown outcome, and the next hint applies on top of either
-                // (the ledger keeps the newer evidence and lowers only a
-                // higher row).
+                // own timeout. As the connection returns, SQLx reads what is
+                // still unread: a completed statement's reply and then the
+                // transaction's queued `ROLLBACK`, and the pool keeps the
+                // connection; or the server's cancel, which SQLx takes for a
+                // broken connection and closes it (with a warning). A closed
+                // pool closes it at once. Either way the transaction ends on
+                // the server. Dropped during the `COMMIT`, the write may have
+                // committed: `timed_out`, an unknown outcome, and the next
+                // hint applies on top of either (the ledger keeps the newer
+                // evidence and lowers only a higher row).
                 let deadline = HintDeadline::after(bound);
                 let persisted = timeout_at(
                     deadline.at(),

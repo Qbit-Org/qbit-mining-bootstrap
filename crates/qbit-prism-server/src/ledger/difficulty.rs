@@ -2,6 +2,8 @@
 use super::connect::CustomBegin;
 use super::migration::{timed, timed_out};
 use super::*;
+use sqlx::{postgres::PgTypeInfo, Executor, Type};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -37,6 +39,20 @@ const LOWER_SQL: &str = "UPDATE qbit_worker_difficulty SET difficulty=$3::text::
 const ACCEPTED_AT_RECENT_SQL: &str = "SELECT floor(extract(epoch FROM accepted_at)*1000)::bigint FROM qbit_share_ledger WHERE share_id=$1 AND accepted AND share_seq>=qbit_prism_share_probe_floor()";
 const ACCEPTED_AT_SQL: &str =
     "SELECT floor(extract(epoch FROM accepted_at)*1000)::bigint FROM qbit_share_ledger WHERE share_id=$1 AND accepted";
+
+/// The cluster's write guard, as [`writable`] reads it.
+static GUARD_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT {WRITABLE_COLUMNS} FROM qbit_prism_cluster c WHERE c.singleton")
+});
+
+/// Setting the transaction's `statement_timeout` again.
+const REARM_SQL: &str = "SELECT set_config('statement_timeout',$1,true)";
+
+/// A hint statement's parameter types, as SQLx prepares a statement from the
+/// binds it carries: `text` for `&str` and `String`.
+fn text() -> PgTypeInfo {
+    <&str as Type<Postgres>>::type_info()
+}
 
 fn retained(row: Option<PgRow>) -> Result<Option<WorkerDifficulty>> {
     let Some(row) = row else { return Ok(None) };
@@ -181,6 +197,8 @@ fn begin_statement(timeout: Duration) -> String {
     )
 }
 
+type HintQuery<'q> = sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>;
+
 /// A hint write's transaction and the statement timeout last set on it. Every
 /// setting is `LOCAL`, so the transaction's end, commit or rollback, puts the
 /// connection back at the pool's own `statement_timeout`.
@@ -213,9 +231,10 @@ impl<'c> HintTransaction<'c> {
             Arm::Armed => {}
             Arm::Spent => return Err(HintBoundSpent.into()),
             Arm::Set(timeout) => {
+                // Trivial work, under the timeout it replaces.
                 timed(
                     self.armed,
-                    sqlx::query("SELECT set_config('statement_timeout',$1,true)")
+                    sqlx::query(REARM_SQL)
                         .bind(timeout.as_millis().to_string())
                         .execute(&mut *self.tx),
                 )
@@ -227,49 +246,71 @@ impl<'c> HintTransaction<'c> {
         Ok(self.armed)
     }
 
-    async fn hint_guard(&mut self) -> Result<()> {
+    /// The `statement_timeout` that `sql`, with parameters of `types`, runs
+    /// under. A statement SQLx has not prepared on this connection takes a
+    /// round trip of its own first (`Parse`, `Describe`, `Sync`), whose lock
+    /// waits run under a timer of their own, since `Sync` ends a statement's
+    /// timer: prepared here under the timeout in force, the statement's run is
+    /// then armed from what is left after it, rather than given a second
+    /// full timeout. SQLx caches the prepared statement under its text, so
+    /// one already prepared sends nothing here.
+    async fn armed_for(&mut self, sql: &str, types: &[PgTypeInfo]) -> Result<Duration> {
         let timeout = self.arm().await?;
-        timed(timeout, writable(&mut self.tx)).await
+        timed(timeout, Executor::prepare_with(&mut *self.tx, sql, types)).await?;
+        self.arm().await
+    }
+
+    /// The cluster's write guard, [`writable`]'s statement and check.
+    async fn hint_guard(&mut self) -> Result<()> {
+        let timeout = self.armed_for(&GUARD_SQL, &[]).await?;
+        let row = timed(timeout, sqlx::query(&GUARD_SQL).fetch_one(&mut *self.tx)).await?;
+        check_writable(&row)
     }
 
     /// [`Ledger::share_accepted_at_ms`], in this transaction.
     async fn hint_evidence_at_ms(&mut self, share_id: &str) -> Result<Option<i64>> {
-        let timeout = self.arm().await?;
-        let recent = timed(
-            timeout,
-            sqlx::query_scalar::<_, i64>(ACCEPTED_AT_RECENT_SQL)
-                .bind(share_id)
-                .fetch_optional(&mut *self.tx),
-        )
-        .await?;
-        if recent.is_some() {
-            return Ok(recent);
+        for sql in [ACCEPTED_AT_RECENT_SQL, ACCEPTED_AT_SQL] {
+            let timeout = self.armed_for(sql, &[text()]).await?;
+            let accepted = timed(
+                timeout,
+                sqlx::query_scalar::<_, i64>(sql)
+                    .bind(share_id)
+                    .fetch_optional(&mut *self.tx),
+            )
+            .await?;
+            if accepted.is_some() {
+                return Ok(accepted);
+            }
         }
-        let timeout = self.arm().await?;
-        timed(
-            timeout,
-            sqlx::query_scalar::<_, i64>(ACCEPTED_AT_SQL)
-                .bind(share_id)
-                .fetch_optional(&mut *self.tx),
-        )
-        .await
+        Ok(None)
     }
 
-    async fn run_hint_statement(
+    /// `sql`, with parameters of `types` bound by `bind`, after
+    /// [`Self::armed_for`].
+    async fn run_hint_statement<'q>(
         &mut self,
-        query: sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments>,
+        sql: &'q str,
+        types: &[PgTypeInfo],
+        bind: impl FnOnce(HintQuery<'q>) -> HintQuery<'q>,
     ) -> Result<()> {
-        let timeout = self.arm().await?;
-        timed(timeout, query.execute(&mut *self.tx)).await?;
+        let timeout = self.armed_for(sql, types).await?;
+        timed(timeout, bind(sqlx::query(sql)).execute(&mut *self.tx)).await?;
         Ok(())
     }
 
-    async fn read_hint_row(
+    /// [`Self::run_hint_statement`], reading the row it returns, if any.
+    async fn read_hint_row<'q>(
         &mut self,
-        query: sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments>,
+        sql: &'q str,
+        types: &[PgTypeInfo],
+        bind: impl FnOnce(HintQuery<'q>) -> HintQuery<'q>,
     ) -> Result<Option<PgRow>> {
-        let timeout = self.arm().await?;
-        timed(timeout, query.fetch_optional(&mut *self.tx)).await
+        let timeout = self.armed_for(sql, types).await?;
+        timed(
+            timeout,
+            bind(sqlx::query(sql)).fetch_optional(&mut *self.tx),
+        )
+        .await
     }
 
     async fn commit_hint(mut self) -> Result<()> {
@@ -316,7 +357,8 @@ impl Ledger {
     /// share's probe comes first (a second, unbounded one only when it
     /// misses), and the guard and the write only when the share is found
     /// (six; seven with the second probe; five when the share is not found).
-    /// A timeout set again adds one.
+    /// A timeout set again adds one, and so does each statement the
+    /// connection has not prepared yet (its first use there).
     pub async fn write_worker_difficulty_hint(
         &self,
         listener: &str,
@@ -326,46 +368,54 @@ impl Ledger {
         ttl_seconds: u64,
         deadline: HintDeadline,
     ) -> Result<Option<WorkerDifficulty>> {
-        valid_difficulty(difficulty)?;
+        if share_id.is_none() {
+            // As `lower_worker_difficulty` checks it, before anything is sent.
+            valid_difficulty(difficulty)?;
+        }
+        // Spent before the checkout: no connection is taken.
+        deadline
+            .statement_timeout(tokio::time::Instant::now())
+            .ok_or(HintBoundSpent)?;
         let mut connection = CustomBegin::checked_out(self.acquire().await?);
         let mut tx = HintTransaction::open_hint(&mut connection, deadline).await?;
         match share_id {
             None => {
                 tx.hint_guard().await?;
-                tx.run_hint_statement(
-                    sqlx::query(LOWER_SQL)
+                tx.run_hint_statement(LOWER_SQL, &[text(), text(), text()], |query| {
+                    query
                         .bind(listener)
                         .bind(username)
-                        .bind(difficulty.to_string()),
-                )
+                        .bind(difficulty.to_string())
+                })
                 .await?;
             }
             Some(share_id) => {
                 if let Some(evidence_at_ms) = tx.hint_evidence_at_ms(share_id).await? {
-                    // As `record_worker_difficulty` checks it.
+                    // As `record_worker_difficulty` checks them, once the
+                    // share is found.
+                    valid_difficulty(difficulty)?;
                     ensure!(
                         !listener.is_empty() && !username.is_empty(),
                         "worker difficulty identity must not be empty"
                     );
                     tx.hint_guard().await?;
-                    tx.run_hint_statement(
-                        sqlx::query(RECORD_SQL)
+                    let types = [text(), text(), text(), <i64 as Type<Postgres>>::type_info()];
+                    tx.run_hint_statement(RECORD_SQL, &types, |query| {
+                        query
                             .bind(listener)
                             .bind(username)
                             .bind(difficulty.to_string())
-                            .bind(evidence_at_ms),
-                    )
+                            .bind(evidence_at_ms)
+                    })
                     .await?;
                 }
             }
         }
+        let types = [text(), text(), <f64 as Type<Postgres>>::type_info()];
         let row = tx
-            .read_hint_row(
-                sqlx::query(READ_SQL)
-                    .bind(listener)
-                    .bind(username)
-                    .bind(ttl_seconds as f64),
-            )
+            .read_hint_row(READ_SQL, &types, |query| {
+                query.bind(listener).bind(username).bind(ttl_seconds as f64)
+            })
             .await?;
         tx.commit_hint().await?;
         retained(row)

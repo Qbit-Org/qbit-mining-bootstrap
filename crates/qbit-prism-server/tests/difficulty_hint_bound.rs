@@ -10,12 +10,14 @@
 //! the counts below are the write's whole cost; the pool's release and
 //! checkout pings are `Sync` frames, not statements, and are not counted.
 use anyhow::{ensure, Context, Result};
+use futures_util::FutureExt;
 use qbit_prism::AcceptedShare;
 use qbit_prism_server::ledger::{hint_timed_out, HintDeadline, Ledger};
 use qbit_prism_server::metrics::Metrics;
 use qbit_prism_test_gate as gate;
 use sqlx::PgPool;
 use std::net::SocketAddr;
+use std::panic::{resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -211,7 +213,7 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
     let Some(fixture) = Fixture::open().await? else {
         return Ok(());
     };
-    let result = async {
+    let result = AssertUnwindSafe(async {
         // Evidence of a share the ledger holds: BEGIN with the timeout, the
         // recent-partition probe, the write guard, the record, the read-back
         // and COMMIT. Six round trips on one checkout, as before #872 (the
@@ -254,7 +256,7 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
         );
         ensure!(taken == 1., "a missing share took {taken} checkouts");
 
-        // A write with no time left sends nothing at all.
+        // A write with no time left takes no connection and sends nothing.
         let before = checkouts(&fixture.metrics)?;
         let mark = fixture.proxy.mark();
         let spent = HintDeadline::after(Duration::from_millis(1));
@@ -268,7 +270,7 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
         ensure!(hint_timed_out(&error), "{error:#}");
         let sent = fixture.proxy.executions_since(mark)?;
         ensure!(sent.is_empty(), "a spent write sent {sent:#?}");
-        ensure!(checkouts(&fixture.metrics)? - before == 1.);
+        ensure!(checkouts(&fixture.metrics)? - before == 0.);
         let kept = fixture
             .ledger
             .worker_difficulty(LISTENER, WORKER, 900)
@@ -278,8 +280,14 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
             "{kept:?}"
         );
         Ok(())
-    }
+    })
+    .catch_unwind()
     .await;
+    // The proxy, pools and schema are cleaned up whether the body fails or
+    // panics.
     let closed = fixture.close().await;
-    result.and(closed)
+    match result {
+        Err(panic) => resume_unwind(panic),
+        Ok(result) => result.and(closed),
+    }
 }

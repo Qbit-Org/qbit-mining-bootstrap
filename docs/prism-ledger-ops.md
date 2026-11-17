@@ -2875,12 +2875,18 @@ it:
   last was set. A statement with less than a millisecond left is not sent.
   A hint that runs out of time therefore rolls back and leaves no statement
   running and no connection busy, and the connection goes back to the pool
-  at `PRISM_DATABASE_STATEMENT_TIMEOUT_MS`. These statements run under the
-  hint's bound in place of that setting, even where it is set lower: they
-  are hints, never share credit. The row lock a hint's write takes is held
-  through its read-back and `COMMIT`, a round trip or two, and never past
-  the bound; another frontend's hint for the same worker waits for it under
-  its own bound, and the pruner skips locked rows. A hint ended so counts as
+  at `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` (or, when the frontend's own
+  bound passed first with the server's cancel still on its way, SQLx closes
+  it with a warning, `error occurred while testing the connection
+  on-release`). These statements run under the hint's bound in place of that
+  setting, even where it is set lower: they are hints, never share credit.
+  `PRISM_DATABASE_LOCK_TIMEOUT_MS` still applies to their lock waits, as
+  before, and a lock wait it ends counts as `failed`. The row lock a hint's
+  write takes is held through its read-back and `COMMIT`, a round trip or
+  two, and no statement holds it past the bound; a connection that stalls
+  mid-transaction holds it until the session ends, as before. Another
+  frontend's hint for the same worker waits for it under its own bound, and
+  the pruner skips locked rows. A hint ended so counts as
   `timed_out` in `qbit_prism_stratum_difficulty_hints_total`, told from an
   operator's `pg_cancel_backend` by SQLSTATE 57014 and by having run its
   timeout, all but a tenth, never by the server's message, and PostgreSQL

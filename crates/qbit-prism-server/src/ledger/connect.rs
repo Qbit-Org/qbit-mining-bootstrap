@@ -917,22 +917,31 @@ pub(crate) async fn shielded_begin(
 /// cancelled between the write and the reply would hand it one whose server
 /// side is in a transaction, and our `SET LOCAL`, that the client never
 /// counted (#482). So the transaction borrows the connection here, and
-/// `Drop` takes it out of the pool unless the statement's reply was read
-/// whole, as the share append's `AppendConnection` does. On the successful
-/// path nothing changes: one round trip, the same connection, and the
+/// `Drop` takes it out of the pool once the statement has been handed to
+/// SQLx unless its reply was read whole, as the share append's
+/// `AppendConnection` does. A guard dropped before that, with nothing sent,
+/// returns its connection to the pool as it was. On the successful path
+/// nothing changes: one round trip, the same connection, and the
 /// transaction's own drop queues its `ROLLBACK` as for any other.
 pub(super) struct CustomBegin {
     /// Taken by `Drop`; present for the guard's whole life before that.
     connection: Option<PoolConnection<Postgres>>,
+    /// Whether the statement was handed to SQLx to send.
+    sent: bool,
     /// Whether the statement's reply was read whole, `ReadyForQuery`
     /// included, with the server in a transaction.
     began: bool,
 }
 
+/// How long a retired connection's graceful close may take before its
+/// socket is simply dropped, as SQLx bounds its own close on drop.
+const RETIRE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl CustomBegin {
     pub(super) fn checked_out(connection: PoolConnection<Postgres>) -> Self {
         Self {
             connection: Some(connection),
+            sent: false,
             began: false,
         }
     }
@@ -948,6 +957,7 @@ impl CustomBegin {
         statement: String,
     ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
         let connection = self.connection.as_mut().expect("custom begin connection");
+        self.sent = true;
         let transaction = Transaction::begin(&mut **connection, Some(statement.into())).await?;
         self.began = true;
         Ok(transaction)
@@ -959,9 +969,10 @@ impl Drop for CustomBegin {
         let Some(connection) = self.connection.take() else {
             return;
         };
-        if self.began {
+        if self.began || !self.sent {
             // Back to the pool, which flushes the transaction's queued
-            // `ROLLBACK` (or an unread `COMMIT` reply) before offering it.
+            // `ROLLBACK` (or an unread `COMMIT` reply) before offering it;
+            // or never used, as it was checked out.
             drop(connection);
             return;
         }
@@ -973,7 +984,8 @@ impl Drop for CustomBegin {
         let raw = connection.detach();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = sqlx::Connection::close(raw).await;
+                let _ =
+                    tokio::time::timeout(RETIRE_CLOSE_TIMEOUT, sqlx::Connection::close(raw)).await;
             });
         }
     }
