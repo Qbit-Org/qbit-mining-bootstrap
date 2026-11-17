@@ -579,8 +579,10 @@ window with `pool fee account duplicates a miner payout account`. So while
 - each 3.1.1 frontend fails every work build, as 3.1.1 does; the 3.1.2 ones
   build the window;
 - a block found on that work is offered as usual, since `submitblock` doesn't
-  wait for a rebuild. If a 3.1.1 frontend claims it for its landing, as after
-  the finder's frontend dies, its rebuild fails, and it logs
+  wait for a rebuild. But any frontend's submit loop claims whichever
+  candidate row is due, whoever found it, so a 3.1.1 frontend can claim the
+  row without any frontend failing. It offers the block if nobody has yet,
+  then its rebuild fails, and it logs
 
   ```
   ALERT: offered candidate could not be processed; kept for reconciliation, never offered again
@@ -601,8 +603,7 @@ window with `pool fee account duplicates a miner payout account`. So while
 - 3.1.1's `qbit-prism-audit-verify` and `backfill-ctv` refuse the block's
   bundle.
 
-**What to do.** Finish replacing the frontends; on a dual-writer node, replace
-its frontends together. For the ALERT with this reason, check that a 3.1.2
+**What to do.** Finish replacing the frontends. For the ALERT with this reason, check that a 3.1.2
 frontend serves, then run `qbit-prism-server candidates list` once the row's
 `next_attempt` has passed: the row is gone after a 3.1.2 frontend has claimed
 it. Never abandon it. Verify such bundles with a 3.1.2 or later

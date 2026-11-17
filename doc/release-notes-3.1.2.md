@@ -1,7 +1,7 @@
 # qbit-mining-bootstrap 3.1.2 Release Notes
 
-Release date: not yet set. The tag will be `v3.1.2`, cut from the `3.x.x`
-branch.
+Release date: not yet set. Prepared on `3.x.x`; the tag `v3.1.2` goes on
+its promotion into `main`, as 3.1.1's did.
 
 3.1.2 is a patch release of [3.1.1](release-notes-3.1.1.md): fixes, bounds
 and measurements, with no migration and no new setting. One default changes:
@@ -12,12 +12,13 @@ The dual writer stays off by default: with `PRISM_DUAL_WRITER` unset, a
 frontend runs as one writer, as in 3.1.1.
 
 The upgrade from 3.1.1 is a binary swap, with three things to do around it:
-- **Two lines an existing `.env` keeps.** An `.env` copied from 3.1.1's
+- **Three lines an existing `.env` keeps.** An `.env` copied from 3.1.1's
   `.env.example` sets `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL=0`,
-  which keeps the new authorize budget off, and pins Qbit Core v1.0.0
-  ([Settings](#settings)).
-- **Two new warning rules.** Re-vendor them only once every frontend runs
-  3.1.2, and roll them back before the binaries
+  which keeps the new authorize budget off, and pins Qbit Core v1.0.0 with
+  `QBIT_GIT_REF` and `QBIT_GIT_COMMIT` ([Settings](#settings)).
+- **Two new warning rules.** `PrismPayoutRevisionListenerDown` must follow
+  the binaries both ways: re-vendor it only once every frontend runs 3.1.2,
+  and roll it back before a frontend returns to 3.1.1
   ([Alert rules](#alert-rules)).
 - **Work paid to the pool-fee address is a 3.1.2-only input** (#822). A
   3.1.1 frontend, dual-writer node or verifier refuses what 3.1.2 builds
@@ -49,9 +50,11 @@ changes below.
     one of the four, is refused with `backend-rpc-unavailable` (`payout
     address validation is busy; retry`) and keeps its connection. Share
     submission, `getblocktemplate` and `submitblock` never wait on this.
-  - When the cache (4,096 addresses, an hour each) is full, entries past
-    their hour go first, then the addresses the node refused, which resolved
-    to `PRISM_USERNAME_FALLBACK_ADDRESS`, and only then the others.
+  - When the cache (4,096 addresses, an hour each) is full, it drops the
+    entries past their hour first, then those whose payout address is not
+    the text as typed (the addresses the node refused, which resolved to
+    `PRISM_USERNAME_FALLBACK_ADDRESS`), then those older than five minutes,
+    and if it is still full, every entry.
   - `PRISM_STRATUM_MAX_CONNECTIONS_PER_IP` stays 0 by default: this
     repository reads no PROXY header, so behind a load balancer every miner
     arrives from the balancer's addresses
@@ -330,7 +333,7 @@ binary runs on it after a rollback.
   (`scripts/prepare-qbit-source.sh`, which `make` runs), independently of
   the PRISM binaries. A deployment that passes both values in its
   environment is unaffected by the new default.
-- **Added, removed or renamed:** none. So, apart from the two lines above,
+- **Added, removed or renamed:** none. So, apart from the three lines above,
   the environment is the same for upgrade and rollback.
 - **Refused at startup now:** `sslmode=verify-ca` without a root
   certificate on `PRISM_DATABASE_URL`, the public reader's URL and both
@@ -382,8 +385,9 @@ in this order:
   not export it. Deployed while a 3.1.1 frontend serves miners, it warns on
   that frontend after 10 minutes. The admission rule stays quiet on a
   frontend without the stage histogram, so it can go first.
-- **Unlike 3.1.1's rules,** these do not survive a binary rollback
-  unchanged: see [Rolling back](#rolling-back).
+- **Unlike 3.1.1's rules,** the listener rule does not survive a binary
+  rollback unchanged: roll it back first, as
+  [Rolling back](#rolling-back) says. The admission rule can stay.
 
 Both are in [the alert migration](../docs/prism-alert-migration.md#review-and-apply-the-draft).
 
@@ -402,9 +406,11 @@ Both are in [the alert migration](../docs/prism-alert-migration.md#review-and-ap
   counts can trail the ledger by 10 s plus the run's time; a run is bounded
   at 60 s and then answers 503 `read_timeout`. It adds the same three
   fields. Every key it had keeps its name and value.
-- **No 304 from these three routes.** Each answer carries `age_seconds`,
-  which changes from one request to the next, and the `ETag` is the body's
-  hash, so a request with `If-None-Match` gets the full body.
+- **No 304 for an earlier `ETag` from these three routes.** Each answer
+  carries `age_seconds`, which changes from one request to the next, and
+  the `ETag` is the body's hash, so a request whose `If-None-Match` names
+  the `ETag` of an earlier answer gets the full body. `If-None-Match: *`
+  still answers 304, as on every route.
 - **Public network fields** (#858): on the pool summary, the reward
   leaderboard and the miner pages, the `network` object (all but
   `network.hashrate_ths`, read by every response) and what its
@@ -419,10 +425,10 @@ Both are in [the alert migration](../docs/prism-alert-migration.md#review-and-ap
 ## Upgrading
 
 - **From 3.1.1:** replace the binaries.
-  1. **Decide the two `.env` lines** ([Settings](#settings)): delete
+  1. **Decide the three `.env` lines** ([Settings](#settings)): delete
      `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL=0` or set it to 32
-     (higher behind a Stratum proxy), and move the Qbit Core pin to v1.0.1
-     when you rebuild the node.
+     (higher behind a Stratum proxy), and move both `QBIT_GIT_REF` and
+     `QBIT_GIT_COMMIT` to v1.0.1 when you rebuild the node.
   2. **Replace the binary** on every frontend and tool, and on the
      `public-api` service. There is no `migrate` step: 3.1.2 adds no
      migration and runs on 3.1.1's database as it is.
@@ -443,10 +449,12 @@ Both are in [the alert migration](../docs/prism-alert-migration.md#review-and-ap
     - a 3.1.1 frontend still fails every work build, as in 3.1.1; a 3.1.2
       one builds the window;
     - a block found on that work is offered as usual, since `submitblock`
-      doesn't wait for a rebuild. If a 3.1.1 frontend claims it for its
-      landing, as after the finder's frontend dies, the rebuild fails: it
-      logs `ALERT: offered candidate could not be processed; kept for
-      reconciliation, never offered again`, with a reason that starts
+      doesn't wait for a rebuild. But any frontend's submit loop claims
+      whichever candidate row is due, whoever found it, so a 3.1.1 frontend
+      can claim the row without any frontend failing. It offers the block
+      if nobody has yet, then its rebuild fails: it logs `ALERT: offered
+      candidate could not be processed; kept for reconciliation, never
+      offered again`, with a reason that starts
       `post-offer processing failed (…)` and ends `pool fee account
       duplicates a miner payout account`, and the row waits in
       `reconciliation`, retried `min(3600, 10 × attempt_count)` s apart.
@@ -465,11 +473,11 @@ Both are in [the alert migration](../docs/prism-alert-migration.md#review-and-ap
     `AUDIT_BUILDER_VERSION` stays 1 on purpose: a new version would make
     3.1.1 refuse every candidate 3.1.2 builds.
 
-  **In dual-writer mode,** replace each node's frontends as above, and a
-  node's frontends together, since they claim from one candidate outbox.
-  3.1.2 changes no table and no row format the peer sync copies. A 3.1.1 node that has to adopt its peer's block from the
-  peer's prepared record (a block found by a dying node, S8) cannot rebuild
-  one whose window holds fee-program work: it logs `ALERT: a pool block on
+  **In dual-writer mode,** replace each node's frontends as above. 3.1.2
+  changes no table and no row format the peer sync copies. A 3.1.1 node
+  that has to adopt its peer's block from the peer's prepared record (a
+  block found by a dying node, S8) cannot rebuild one whose window holds
+  fee-program work: it logs `ALERT: a pool block on
   the active chain has no landing rows here and no adoptable prepared
   record` with the same refusal as its reason, and tries again.
 - **From 3.1.0:** as in the [3.1.1 notes](release-notes-3.1.1.md#upgrading),
@@ -552,12 +560,12 @@ changes.
   the frontends' established connections to it silent (a power-off, or a
   rule that drops packets without a reset), a frontend's ledger connection
   that had a request in flight has no TCP keepalive or user timeout to end
-  it. It waits for the kernel's retransmissions to give up, which with
-  Linux's default `net.ipv4.tcp_retries2` the kernel documents as about
-  15 minutes, and while it waits it holds its pool slot and, for a share
-  append, its append slot.
-  So a frontend can refuse shares with `ledger-confirmation-failed` after a
-  failover that otherwise succeeded. As a precaution, the failover runbook
+  it. It waits for the kernel's retransmissions to give up, at least about
+  15 minutes with Linux's default `net.ipv4.tcp_retries2`, which the kernel
+  documents as a lower bound, and while it waits it holds its pool slot
+  and, for a share append, its append slot. So a frontend can refuse shares
+  with `ledger-confirmation-failed` after a failover that otherwise
+  succeeded. As a precaution, the failover runbook
   now restarts both frontends after moving the writer endpoint, unless the
   move resets every established connection
   ([step 5](../docs/prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint)).
@@ -594,5 +602,5 @@ release coordinator replaces this list before the release:
 - the pull request for #869 (`PrismPayoutRevisionListenerDown`'s smoothing
   against `PrismMetricsEndpointDown`'s dwell);
 - six more this wave opens: the found-block re-offer, the found-block append
-  retry, the public cache key, `accept()` and `ntime`, the release guard,
-  and these notes with their runbook changes.
+  retry, the public cache key, the Stratum listener's `accept()` errors, the
+  release guard, and these notes with their runbook changes.

@@ -489,22 +489,25 @@ primary/failover pair; the pair alone does not supply a partition-safe election.
    second competing promotion. Apply the approved no-standby ACK policy.
 5. Move `prism-writer.internal`/the managed writer endpoint to this sole primary.
    Flush or drain existing database proxy connections; DNS changes do not
-   retarget established sockets. **Then restart both frontends** (in the
-   bundled stack, `docker compose restart --timeout 45 prism-coordinator prism-coordinator-2`),
-   unless the move resets every connection the frontends had established to
-   the old primary: a proxy that closes its client connections, or an address
-   move that answers them with a reset. This is a precaution for an unclean
-   loss whose fence leaves those connections silent, such as a power-off or a
-   rule that drops their packets without a reset. A frontend's ledger
-   connections set no TCP keepalive or user timeout, so one with a request in
-   flight then waits for the kernel's retransmissions to give up, which with
-   Linux's default `net.ipv4.tcp_retries2` of 15 the kernel documents as
-   about 15 minutes (924.6 s). Until then it holds its pool slot, and a share
-   append its append slot, so shares can be refused
-   `ledger-confirmation-failed` and other ledger calls can fail their 15 s
-   pool acquire although the new primary serves. A frontend in that state
-   keeps running, so no restart policy restarts it; a restart closes the old
-   sockets. Verify both frontends use the same writer, matching
+   retarget established sockets. **Then restart both frontends,** unless the
+   move resets every connection the frontends had established to the old
+   primary (a proxy that closes its client connections, or an address move
+   that answers them with a reset). Restart them with the Compose files, env
+   files and project name the stack was deployed with, for the bundled HA
+   overlay above
+   `docker compose -f compose.yaml -f compose.prism-ha.yaml --profile prism restart --timeout 45 prism-coordinator prism-coordinator-2`,
+   and check that both containers restarted. This is a precaution for an
+   unclean loss whose fence leaves those connections silent, such as a
+   power-off or a rule that drops their packets without a reset. A frontend's
+   ledger connections set no TCP keepalive or user timeout, so one with a
+   request in flight then waits for the kernel's retransmissions to give up:
+   with Linux's default `net.ipv4.tcp_retries2` of 15, at least about
+   15 minutes (924.6 s, which the kernel documents as a lower bound). Until
+   then it holds its pool slot, and a share append its append slot, so shares
+   can be refused `ledger-confirmation-failed` and other ledger calls can fail
+   their 15 s pool acquire although the new primary serves. A frontend in that
+   state keeps running, so no restart policy restarts it; a restart closes the
+   old sockets. Verify both frontends use the same writer, matching
    keys/fingerprint and preserved share history, then resume admission under
    the approved policy. A found block that was mid-landing on a surviving
    frontend lands once that frontend reaches the new primary: it retries its
