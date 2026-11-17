@@ -455,7 +455,12 @@ frontend whose scrapes stop while this warns or dwells keeps warning or
 dwelling until `PrismMetricsEndpointDown` fires for it, and a dwell can end on
 a reading up to 4 minutes old; a scrape that keeps failing is
 `PrismMetricsEndpointDown`'s. A standard evaluation interval longer than a
-minute can leave an evaluation between the two uncovered again.
+minute can leave an evaluation between the two uncovered again. The window
+covers scrapes stopping, not resuming: after an outage longer than it, the
+dwell starts again at the first successful scrape, so a listener still down
+then warns 10 minutes later. The same carry delays the missing-gauge case: a
+frontend rolled back to an image from before #834 keeps its last reading of 1
+for the window, so it warns up to 4 minutes after the dwell.
 
 ## Durable block candidates
 

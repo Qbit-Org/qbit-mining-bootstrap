@@ -3,6 +3,7 @@
 
 import argparse
 import difflib
+import functools
 import hashlib
 import json
 from pathlib import Path
@@ -82,12 +83,14 @@ ENDPOINT_TITLE = "PrismMetricsEndpointDown"
 STANDARD_EVALUATION_MINUTES = 1
 
 
+@functools.cache
 def endpoint_dwell_minutes():
-    """PrismMetricsEndpointDown's dwell, from its authored rule."""
+    """PrismMetricsEndpointDown's dwell, from its authored rule (the generator never rewrites it)."""
     [endpoint] = [rule for rule in load("docs/prism-native-alert-rules.json")["rules"]
                   if rule["title"] == ENDPOINT_TITLE]
     match = re.fullmatch(r"(\d+)m", endpoint["for"])
-    assert match, f"{ENDPOINT_TITLE}'s dwell {endpoint['for']!r} is not whole minutes"
+    if not match:
+        raise SystemExit(f"{ENDPOINT_TITLE}'s dwell {endpoint['for']!r} is not whole minutes")
     return int(match.group(1))
 
 
@@ -299,13 +302,19 @@ WINDOW_PROSE = [r"authorized\s+miner\s+in\s+the\s+last\s+(\d+)\s+minutes",
 
 # How the operator docs state the listener rule's dwell (#843).
 LISTENER_PROSE = [r"has\s+read\s+0\s+for\s+(\d+)\s+minutes",
-                  r"served\s+miners\s+for\s+(\d+)\s+minutes"]
+                  r"served\s+miners\s+for\s+(\d+)\s+minutes",
+                  r"still\s+down\s+then\s+warns\s+(\d+)\s+minutes\s+later"]
 # The docs that state them; in the ops guide only its listener runbook (#843).
 LISTENER_RUNBOOK = "### A payout-revision listener that stays down (#843)\n"
 PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.md": None,
               "docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
-# How the runbook states how long the listener rule carries a reading (#869).
-LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes"]
+# How the runbook states how long the listener rule carries a reading, and
+# what that window is made of (#869).
+LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes",
+                         r"reading\s+up\s+to\s+(\d+)\s+minutes\s+old",
+                         r"up\s+to\s+(\d+)\s+minutes\s+after\s+the\s+dwell"]
+ENDPOINT_DWELL_PROSE = [r"PrismMetricsEndpointDown`?'s\s+(\d+)-minute\s+dwell"]
+EVALUATION_PROSE = [r"one\s+(\d+)-minute\s+evaluation\s+interval"]
 
 
 def check_prose(patterns, expected, what, constant, docs=PROSE_DOCS):
@@ -334,9 +343,13 @@ def check_listener_prose():
     """#843: the operator docs state the listener rule's dwell the generator writes."""
     check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
     # #869: and the window that carries a reading after scrapes stop.
+    runbook = {"docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
     check_prose(LISTENER_WINDOW_PROSE, listener_smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
-                f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES",
-                docs={"docs/prism-ledger-ops.md": LISTENER_RUNBOOK})
+                f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES", docs=runbook)
+    check_prose(ENDPOINT_DWELL_PROSE, endpoint_dwell_minutes(), f"{ENDPOINT_TITLE}'s dwell",
+                f"{ENDPOINT_TITLE}'s for", docs=runbook)
+    check_prose(EVALUATION_PROSE, STANDARD_EVALUATION_MINUTES, "the standard evaluation interval",
+                "STANDARD_EVALUATION_MINUTES", docs=runbook)
 
 
 def postgres_rules():
