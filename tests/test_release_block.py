@@ -428,7 +428,7 @@ class ReleaseBlockTests(unittest.TestCase):
 
     def test_ci_that_has_not_passed_is_refused(self) -> None:
         cases = {
-            "failure": "/actions/runs/901 concluded failure",
+            "failure": "/actions/runs/901 concluded failure: read it",
             "cancelled": "/actions/runs/900 concluded cancelled",
             "none": f"CI has no push run on {self.release}",
             "in_progress": "/actions/runs/900 is in_progress: wait for it",
@@ -437,7 +437,10 @@ class ReleaseBlockTests(unittest.TestCase):
         for ci, wanted in cases.items():
             with self.subTest(ci=ci):
                 self.state["ci"] = ci
-                self.assertRefused(self.run_block(self.release), wanted)
+                result = self.run_block(self.release)
+                self.assertRefused(result, wanted)
+                if ci in ("failure", "cancelled"):
+                    self.assertIn("promote again (docs/releasing.md says how that promotion gets its L3 run)", result.stderr)
 
     def test_an_l3_verdict_a_tag_would_not_carry_as_a_pass_is_refused(self) -> None:
         cases = {
@@ -453,6 +456,7 @@ class ReleaseBlockTests(unittest.TestCase):
                 self.assertRefused(result, wanted, f"a tag on {self.release} would not carry a passing L3 verdict")
                 if l3 != "failed":
                     self.assertIn(f"-f ref={self.release} -f tag_dry_run=true", result.stderr)
+                    self.assertIn("gets that run only from release-candidate applied after its last change", result.stderr)
 
     def test_a_newer_verdict_whose_run_is_unknown_is_refused(self) -> None:
         cases = {

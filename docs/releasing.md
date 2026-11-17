@@ -170,7 +170,7 @@ for run in runs:
     elif run.get("status") != "completed":
         problems.append(f"CI run {url} is {run.get('status')}: wait for it (gh run watch {number} --repo {repo}) and run this again")
     elif run.get("conclusion") != "success":
-        problems.append(f"CI run {url} concluded {run.get('conclusion')}: read it (gh run view {number} --repo {repo} --log-failed); re-run a flaky job (gh run rerun {number} --repo {repo} --failed) and run this again once it passes, or fix the cause on 3.x.x and promote again")
+        problems.append(f"CI run {url} concluded {run.get('conclusion')}: read it (gh run view {number} --repo {repo} --log-failed); re-run a flaky job (gh run rerun {number} --repo {repo} --failed) and run this again once it passes, or fix the cause on 3.x.x and promote again (docs/releasing.md says how that promotion gets its L3 run)")
     else:
         print(f"CI passed: {url}")
 sys.exit("\n".join(problems) or None)
@@ -190,7 +190,7 @@ verdict = decision.get("verdict")
 if decision.get("promote") is not True or not isinstance(verdict, dict):
     lines = [f"L3: a tag would run l3-full again, after the release is public: {decision.get('reason')}"]
     lines += [f"  run {c.get('run')}: {c.get('rejected')}" for c in decision.get("considered") or [] if isinstance(c, dict)]
-    lines.append(f"If the promotion's L3 run is still going, wait for it (gh run list --repo {repo} --workflow prism-load-l3.yml --event pull_request) and run this again. Otherwise see what a tag would do: gh workflow run prism-load-l3.yml --repo {repo} -f ref={sha} -f tag_dry_run=true")
+    lines.append(f"If the L3 run of the pull request that landed this commit is still going, wait for it (gh run list --repo {repo} --workflow prism-load-l3.yml --event pull_request) and run this again. A pull request into main that doesn't change VERSION gets that run only from release-candidate applied after its last change, before it merges (docs/releasing.md). To see what a tag would do: gh workflow run prism-load-l3.yml --repo {repo} -f ref={sha} -f tag_dry_run=true")
     sys.exit("\n".join(lines))
 if decision.get("tree") != tree or verdict.get("tree") != tree:
     sys.exit(f"L3: the decision is for tree {decision.get('tree')}, verdict tree {verdict.get('tree')}, not {tree}")
@@ -249,12 +249,29 @@ do, unless all of these hold:
   signature verifies (see below).
 
 Each check reads GitHub as it is when the block runs, so after fixing the
-cause, or once a run finishes, run the block again. When it refuses for L3
-and the promotion pull request's L3 run is still going, wait for that run: it
-uploads its verdict at the end. The block sees only verdicts already
-uploaded: between running it and the tag's run, don't start another pull
-request run of the suite on the same tree (by applying `release-candidate`
-again), since the tag's run promotes the newest verdict. Otherwise, run the L3 workflow with
+cause, or once a run finishes, run the block again. While the tag doesn't
+exist yet, a cause on `main`, such as the notes, is fixed through a reviewed
+PR into `main`, and the commit that PR lands as is the one to check and tag.
+
+The commit to tag needs a finished L3 run of `l3-full` on its tree, from the
+pull request that landed it: a run on that pull request's merge result after
+its last change, while `main` stays where it was until it merges (a
+maintainer's squash keeps the tree). The pull request must come from a
+branch of this repository, since a fork's run is never promoted. A promotion
+that changes `VERSION` runs the suite on every push, and the block refuses
+for L3 while that run is still going: wait for it, as it uploads its verdict
+at the end. A pull request into `main` that doesn't change `VERSION`, such as
+a second promotion of the same version or, as a fallback when the date
+wasn't set before the promotion merged, one that dates or fixes the notes,
+runs the suite only on the `labeled` event of `release-candidate`. After its
+last change, remove the label if it is there, apply it, and let the run
+finish before it merges. Applying a label the pull request already has
+starts nothing, and applying it again while its run is going cancels that
+run. If `main` moves before it merges, bring the branch up to date, squash
+and sign it again, and apply the label again. The block sees only verdicts already uploaded:
+between running it and the tag's run, don't start another pull request run
+of the suite on the same tree (by applying `release-candidate` again), since
+the tag's run promotes the newest verdict. Otherwise, run the L3 workflow with
 `tag_dry_run` on the commit, which makes the tag's decision without a tag and
 runs `l3-full` when there is nothing to promote. A dry run's own suite run is
 not a pull request run, so a tag doesn't promote it and the block still
@@ -294,8 +311,6 @@ failed, it pushes once it verifies. If a check refuses on such a rerun, it
 says the tag is public and the release wasn't created: publishing the
 release anyway is the release coordinator's decision. If
 `gh release view v<version>` already shows a release, inspect it instead.
-Notes are fixed on `main` through a reviewed PR, and the resulting commit is
-identified and checked as above before it is tagged.
 
 Pushing a `v*` tag also runs the L3 production-window matrix
 (`prism-load-l3.yml`), which promotes the promotion PR's run on the same tree
