@@ -109,8 +109,8 @@ fn a_later_statement_of_one_write_gets_only_what_is_left_of_its_bound() {
     );
     // Its reply on time: the statement goes out under it.
     assert_eq!(deadline.arm(ms(130), ms(20), start + ms(320)), Arm::Armed);
-    // Its reply 45 ms late: used, the statement would end at 495 ms, so it is
-    // set again from the slower round trip.
+    // Its reply 45 ms late: if used, the statement would end at 495 ms, so it
+    // is set again from the slower round trip.
     assert_eq!(
         deadline.arm(ms(130), ms(65), start + ms(365)),
         Arm::Set(ms(20))
@@ -137,47 +137,123 @@ fn a_later_statement_of_one_write_gets_only_what_is_left_of_its_bound() {
     }
 }
 
-// With every round trip 30 ms, past half the 50 ms margin: a decrease's
-// write, as `write_worker_difficulty_hint` sends it (four prepares SQLx has
-// cached, which send nothing, then the guard, the update and the read-back,
-// each armed first, then `COMMIT`), costs one re-arm per statement at most and
-// none for a cached prepare, and still commits inside its 500 ms bound.
-#[test]
-fn slow_round_trips_cost_at_most_one_re_arm_per_statement() {
-    let start = Instant::now();
-    let deadline = HintDeadline::starting(start, ms(500));
-    let trip = ms(30);
-    let mut armed = deadline.statement_timeout(start).unwrap();
-    let mut now = start + trip; // the BEGIN's reply
-    let mut round_trip = trip;
+/// A timeout setting on the paused clock: each takes the next of `trips`
+/// (the last one once they run out), and is counted.
+struct ClockedSetting {
+    trips: Vec<Duration>,
+    settings: usize,
+}
+
+impl SetStatementTimeout for ClockedSetting {
+    async fn set_statement_timeout(
+        &mut self,
+        _timeout: Duration,
+        _in_force: Duration,
+    ) -> Result<()> {
+        let trip = self
+            .trips
+            .get(self.settings)
+            .or(self.trips.last())
+            .copied()
+            .unwrap_or_default();
+        self.settings += 1;
+        tokio::time::advance(trip).await;
+        Ok(())
+    }
+}
+
+/// One hint write as `write_worker_difficulty_hint` sends it, at a steady
+/// round trip `trip`, through the real [`arm_with`] on the paused clock: the
+/// `BEGIN`, then `prepares` prepares SQLx has cached (they send nothing), then
+/// `statements` statements, each armed first, then `COMMIT` if more than the
+/// margin is left. Its round trips, and whether it committed inside the bound.
+async fn hint_write(trip: Duration, prepares: usize, statements: usize) -> (usize, bool) {
+    let deadline = HintDeadline::after(ms(500));
+    let mut state = ArmState {
+        timeout: deadline.statement_timeout(Instant::now()).unwrap(),
+        round_trip: Duration::ZERO,
+    };
+    tokio::time::advance(trip).await;
+    state.round_trip = trip;
+    let mut setting = ClockedSetting {
+        trips: vec![trip],
+        settings: 0,
+    };
     let mut trips = 1;
-    for sends in [false, false, false, false, true, true, true] {
-        let mut sets = 0;
-        loop {
-            match deadline.arm(armed, round_trip, now) {
-                Arm::Armed => break,
-                Arm::Set(timeout) => {
-                    sets += 1;
-                    trips += 1;
-                    now += trip;
-                    armed = timeout;
-                    round_trip = trip;
-                }
-                Arm::Spent => panic!("spent at {:?}", now - start),
-            }
-        }
-        assert!(sets <= 1, "{sets} settings for one statement");
-        if sends {
+    for step in 0..prepares + statements {
+        let before = setting.settings;
+        arm_with(&deadline, &mut state, &mut setting)
+            .await
+            .expect("the write was spent");
+        assert!(
+            setting.settings - before <= 1,
+            "{} settings for one statement",
+            setting.settings - before
+        );
+        if step >= prepares {
+            tokio::time::advance(trip).await;
             trips += 1;
-            now += trip;
         }
     }
-    // `COMMIT` is sent with more than the margin left, and returns in time.
-    assert!(deadline.statement_timeout(now).is_some());
+    trips += setting.settings;
+    let committed = deadline.statement_timeout(Instant::now()).is_some();
+    tokio::time::advance(trip).await;
     trips += 1;
-    now += trip;
-    assert!(now < deadline.at(), "done {:?} in", now - start);
-    assert_eq!(trips, 8);
+    (trips, committed && Instant::now() < deadline.at())
+}
+
+// The real arming loop, at round trips past half the 50 ms margin: one re-arm
+// per statement at most, none for prepares that send nothing beyond the one
+// the late `BEGIN` timeout needs, and the write commits inside its 500 ms
+// bound. On a local database it never re-arms.
+#[tokio::test(start_paused = true)]
+async fn slow_round_trips_cost_at_most_one_re_arm_per_statement() {
+    // A decrease: four prepares (the re-arm, the guard, the update, the
+    // read-back), then the guard, the update and the read-back.
+    assert_eq!(hint_write(ms(1), 4, 3).await, (5, true));
+    assert_eq!(hint_write(ms(30), 4, 3).await, (8, true));
+    // Evidence whose share is in a recent partition: six prepares (the
+    // re-arm, both probes, the guard, the record, the read-back), then the
+    // probe, the guard, the record and the read-back.
+    assert_eq!(hint_write(ms(1), 6, 4).await, (6, true));
+    assert_eq!(hint_write(ms(30), 6, 4).await, (10, true));
+}
+
+// A re-arm whose reply comes back late is checked again when it arrives: set
+// once more from the slower round trip, and used only if the statement would
+// still end in time, else the write is spent. No statement goes out under a
+// timeout that would end past the deadline less half the margin.
+#[tokio::test(start_paused = true)]
+async fn a_late_re_arm_reply_is_set_again_once_then_the_write_is_spent() {
+    for (trips, expected) in [
+        (vec![ms(70), ms(1)], Some(ms(10))),
+        (vec![ms(70), ms(120)], None),
+    ] {
+        let deadline = HintDeadline::after(ms(500));
+        let mut state = ArmState {
+            timeout: ms(450),
+            round_trip: ms(1),
+        };
+        // A statement waited 300 ms under the first timeout.
+        tokio::time::advance(ms(300)).await;
+        let mut setting = ClockedSetting { trips, settings: 0 };
+        let armed = arm_with(&deadline, &mut state, &mut setting).await;
+        assert_eq!(setting.settings, 2);
+        match expected {
+            Some(timeout) => {
+                let armed = armed.unwrap();
+                assert_eq!(armed, timeout);
+                assert!(Instant::now() + armed <= deadline.at() - ms(25));
+            }
+            None => {
+                let error = armed.unwrap_err();
+                assert!(
+                    error.downcast_ref::<HintBoundSpent>().is_some(),
+                    "{error:#}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

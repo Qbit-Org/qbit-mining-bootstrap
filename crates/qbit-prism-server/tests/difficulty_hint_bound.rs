@@ -6,10 +6,11 @@
 //! `Query` frame (one round trip each) with the connection that sent it. The
 //! pool's checkouts are read from the ledger's own
 //! `qbit_prism_database_pool_acquire_seconds` counter. The writes run under a
-//! 300 s bound, so none sets its timeout again (that waits for a fortieth of
-//! the bound, 7.5 s, after the last setting's reply), and the counts below
-//! are the write's whole cost; the pool's release and checkout pings are
-//! `Sync` frames, not statements, and are not counted.
+//! 300 s bound, so none sets its timeout again (that happens only when a
+//! statement could end later than the deadline less half the margin, 15 s
+//! before it here), and the counts below are every statement each write
+//! sends; the pool's release and checkout pings are `Sync` frames, and a
+//! first use's `Parse` is not an `Execute`, so neither is counted.
 use anyhow::{ensure, Context, Result};
 use futures_util::FutureExt;
 use qbit_prism::AcceptedShare;

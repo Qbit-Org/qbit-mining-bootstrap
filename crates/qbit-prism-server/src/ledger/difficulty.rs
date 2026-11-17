@@ -75,7 +75,8 @@ fn retained(row: Option<PgRow>) -> Result<Option<WorkerDifficulty>> {
 /// to the server, where its timer starts, and the cancel's way back. A
 /// statement then ends on the server before the writer's bound for round
 /// trips up to the whole margin (50 ms at the default 500 ms bound), and its
-/// cancel reaches the writer first for round trips up to half of it.
+/// cancel reaches the writer first for round trips up to half of it, each
+/// round trip taken as half on the way there and half back.
 const HINT_MARGIN_DIVISOR: u32 = 10;
 
 /// PostgreSQL's largest `statement_timeout`, in milliseconds (an `int`).
@@ -100,7 +101,7 @@ pub struct HintDeadline {
 /// How a statement sent now in a hint's transaction is bounded.
 #[derive(Debug, PartialEq, Eq)]
 enum Arm {
-    /// By the timeout already set, recent enough.
+    /// By the timeout in force: it ends the statement in time.
     Armed,
     /// By this one, set first.
     Set(Duration),
@@ -225,16 +226,76 @@ fn begin_statement(timeout: Duration) -> String {
 
 type HintQuery<'q> = sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>;
 
+/// The `statement_timeout` in force in a hint's transaction, and how long the
+/// last setting's round trip took.
+#[derive(Clone, Copy, Debug)]
+struct ArmState {
+    timeout: Duration,
+    round_trip: Duration,
+}
+
+/// What sets a hint transaction's `statement_timeout` again: one round trip,
+/// returning once its reply is read.
+trait SetStatementTimeout {
+    /// Set `timeout`, sent under `in_force`.
+    fn set_statement_timeout(
+        &mut self,
+        timeout: Duration,
+        in_force: Duration,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+impl SetStatementTimeout for Transaction<'_, Postgres> {
+    async fn set_statement_timeout(&mut self, timeout: Duration, in_force: Duration) -> Result<()> {
+        // Trivial work, under the timeout it replaces.
+        timed(
+            in_force,
+            sqlx::query(REARM_SQL)
+                .bind(timeout.as_millis().to_string())
+                .execute(&mut **self),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// The `statement_timeout` the next statement runs under, set first through
+/// `setting` if the one in force would let it run too late
+/// ([`HintDeadline::arm`]): at most twice per statement, the second time only
+/// when the first setting's reply came back too late for it to be used.
+/// Still too late after that, the statement is not sent ([`HintBoundSpent`]).
+async fn arm_with(
+    deadline: &HintDeadline,
+    state: &mut ArmState,
+    setting: &mut impl SetStatementTimeout,
+) -> Result<Duration> {
+    for _ in 0..2 {
+        let now = tokio::time::Instant::now();
+        match deadline.arm(state.timeout, state.round_trip, now) {
+            Arm::Armed => return Ok(state.timeout),
+            Arm::Spent => return Err(HintBoundSpent.into()),
+            Arm::Set(timeout) => {
+                setting
+                    .set_statement_timeout(timeout, state.timeout)
+                    .await?;
+                state.timeout = timeout;
+                state.round_trip = now.elapsed();
+            }
+        }
+    }
+    match deadline.arm(state.timeout, state.round_trip, tokio::time::Instant::now()) {
+        Arm::Armed => Ok(state.timeout),
+        Arm::Set(_) | Arm::Spent => Err(HintBoundSpent.into()),
+    }
+}
+
 /// A hint write's transaction and the statement timeout last set on it. Every
 /// setting is `LOCAL`, so the transaction's end, commit or rollback, puts the
 /// connection back at the pool's own `statement_timeout`.
 struct HintTransaction<'c> {
     tx: Transaction<'c, Postgres>,
     deadline: HintDeadline,
-    /// The `statement_timeout` in force, and how long the last setting's
-    /// round trip took.
-    armed: Duration,
-    round_trip: Duration,
+    state: ArmState,
 }
 
 impl<'c> HintTransaction<'c> {
@@ -245,48 +306,21 @@ impl<'c> HintTransaction<'c> {
         Ok(Self {
             tx,
             deadline,
-            armed,
-            round_trip: sent.elapsed(),
+            state: ArmState {
+                timeout: armed,
+                round_trip: sent.elapsed(),
+            },
         })
     }
 
-    /// The `statement_timeout` the next statement runs under, set first if
-    /// the one in force would let it run too late ([`HintDeadline::arm`]):
-    /// at most twice per statement, the second time only when the first
-    /// setting's reply came back too late for it to be used. Still too late
-    /// after that, the statement is not sent ([`HintBoundSpent`]).
+    /// The `statement_timeout` the next statement runs under ([`arm_with`]).
     async fn arm(&mut self) -> Result<Duration> {
-        for _ in 0..2 {
-            let now = tokio::time::Instant::now();
-            match self.deadline.arm(self.armed, self.round_trip, now) {
-                Arm::Armed => return Ok(self.armed),
-                Arm::Spent => return Err(HintBoundSpent.into()),
-                Arm::Set(timeout) => {
-                    // Trivial work, under the timeout it replaces.
-                    timed(
-                        self.armed,
-                        sqlx::query(REARM_SQL)
-                            .bind(timeout.as_millis().to_string())
-                            .execute(&mut *self.tx),
-                    )
-                    .await?;
-                    self.armed = timeout;
-                    self.round_trip = now.elapsed();
-                }
-            }
-        }
-        match self
-            .deadline
-            .arm(self.armed, self.round_trip, tokio::time::Instant::now())
-        {
-            Arm::Armed => Ok(self.armed),
-            Arm::Set(_) | Arm::Spent => Err(HintBoundSpent.into()),
-        }
+        arm_with(&self.deadline, &mut self.state, &mut self.tx).await
     }
 
     /// Prepare `statements`, `(text, parameter types)`, on this connection
     /// before any of them runs, each under the timeout in force (set again
-    /// first when it is too old). A statement SQLx has not prepared on this
+    /// first when it would let the prepare run too late). A statement SQLx has not prepared on this
     /// connection otherwise takes a round trip of its own as it is first
     /// sent (`Parse`, `Describe`, `Sync`), and `Sync` restarts the server's
     /// timer, so lock waits while it is prepared and while it runs would
