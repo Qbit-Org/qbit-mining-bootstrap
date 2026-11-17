@@ -912,8 +912,9 @@ impl Query {
     fn get(&self, key: &str) -> Option<&str> {
         // A public route that asks for a parameter its list leaves out sees it
         // absent, whatever the request sent. In a build with debug assertions
-        // it fails here instead: a panic outside the response cache, a 500
-        // `internal_error` inside it, where the shared computation catches it.
+        // it panics here instead: a cached route's shared computation turns
+        // that into a 500 `internal_error`; computed outside it (the cache off
+        // or full), the panic ends the request without a response.
         debug_assert!(
             self.allowed.is_none_or(|names| names.contains(&key)),
             "a route read the query parameter {key:?}, which public::parameters leaves out of its cache key"
