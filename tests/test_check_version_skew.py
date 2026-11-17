@@ -12,8 +12,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_version_skew.py"
+FUZZ_LOCK = "crates/qbit-prism-server/fuzz/Cargo.lock"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 MAKEFILE = ROOT / "Makefile"
+
+
+def write_lockfile(path: Path, packages: dict[str, str], *, registry: dict[str, str] | None = None) -> None:
+    """A Cargo.lock listing `packages` as path packages and `registry` as crates.io ones."""
+    entries = [f'[[package]]\nname = "{name}"\nversion = "{version}"\n' for name, version in packages.items()]
+    entries += [
+        f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        for name, version in (registry or {}).items()
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("version = 4\n\n" + "\n".join(entries), encoding="utf-8")
 
 
 def write_workspace(
@@ -22,8 +35,15 @@ def write_workspace(
     workspace_version: str,
     version_file: str | None,
     crates: dict[str, str | None],
+    lockfiles: dict[str, dict[str, str] | None] | None = None,
+    notes: bool = True,
 ) -> None:
-    """Lay out a Cargo workspace; a crate inherits the workspace version unless given a literal."""
+    """Lay out a Cargo workspace; a crate inherits the workspace version unless given a literal.
+
+    Both lockfiles list every crate at its version unless `lockfiles` says
+    otherwise (None: no such file), and the notes for VERSION exist unless
+    `notes` is False.
+    """
     members = "".join(f'    "crates/{name}",\n' for name in crates)
     (root / "Cargo.toml").write_text(
         "[workspace]\n"
@@ -47,6 +67,17 @@ def write_workspace(
         )
     if version_file is not None:
         (root / "VERSION").write_text(version_file, encoding="utf-8")
+    locked = {name: literal or workspace_version for name, literal in crates.items()}
+    for lockfile in ("Cargo.lock", FUZZ_LOCK):
+        packages = (lockfiles or {}).get(lockfile, locked)
+        if packages is not None:
+            write_lockfile(root / lockfile, packages)
+    version = (version_file or "").strip()
+    if notes and version and not any(character.isspace() for character in version):
+        (root / "doc").mkdir(exist_ok=True)
+        (root / "doc" / f"release-notes-{version}.md").write_text(
+            "# Notes\n\nRelease date: pending\n", encoding="utf-8"
+        )
 
 
 def run_check(root: Path, **env_overrides: str) -> subprocess.CompletedProcess[str]:
@@ -78,7 +109,87 @@ class CheckVersionSkewTests(unittest.TestCase):
         self.assertIn(
             "VERSION 3.0.0 matches every workspace crate: alpha, beta", result.stdout
         )
+        self.assertIn(f"both lockfiles (Cargo.lock, {FUZZ_LOCK}) agree", result.stdout)
+        self.assertIn("doc/release-notes-3.0.0.md exists", result.stdout)
         self.assertEqual(result.stderr, "")
+
+    def test_a_lockfile_behind_version_names_the_crate_and_the_file(self) -> None:
+        # The fuzz workspace is built without --locked, so only this check
+        # notices its lockfile keeping the previous release's version.
+        for lockfile in ("Cargo.lock", FUZZ_LOCK):
+            with self.subTest(lockfile=lockfile), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                write_workspace(
+                    root,
+                    workspace_version="3.1.2",
+                    version_file="3.1.2\n",
+                    crates={"alpha": None, "beta": None},
+                    lockfiles={lockfile: {"alpha": "3.1.2", "beta": "3.1.1"}},
+                )
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"{lockfile} has beta 3.1.1 but VERSION is 3.1.2", result.stderr)
+                self.assertNotIn("has alpha", result.stderr)
+                self.assertIn(f"bump {lockfile} with VERSION", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_a_registry_package_named_like_a_workspace_crate_is_not_its_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_workspace(
+                root,
+                workspace_version="3.1.2",
+                version_file="3.1.2\n",
+                crates={"alpha": None},
+            )
+            write_lockfile(root / FUZZ_LOCK, {"alpha": "3.1.2"}, registry={"alpha": "0.1.0"})
+            result = run_check(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_missing_unreadable_or_unrelated_lockfile_fails(self) -> None:
+        cases = {
+            "missing": (None, "is missing"),
+            "no workspace crate": ({"gamma": "3.1.2"}, "lists no workspace crate"),
+        }
+        for lockfile in ("Cargo.lock", FUZZ_LOCK):
+            for case, (packages, message) in cases.items():
+                with self.subTest(lockfile=lockfile, case=case), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    write_workspace(
+                        root,
+                        workspace_version="3.1.2",
+                        version_file="3.1.2\n",
+                        crates={"alpha": None},
+                        lockfiles={lockfile: packages},
+                    )
+                    result = run_check(root)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f"{root / lockfile} {message}", result.stderr)
+            with self.subTest(lockfile=lockfile, case="not TOML"), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                write_workspace(
+                    root, workspace_version="3.1.2", version_file="3.1.2\n", crates={"alpha": None}
+                )
+                (root / lockfile).write_text("[[package]\n", encoding="utf-8")
+                result = run_check(root)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(f"cannot read {root / lockfile}", result.stderr)
+
+    def test_missing_release_notes_for_version_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_workspace(
+                root,
+                workspace_version="3.1.2",
+                version_file="3.1.2\n",
+                crates={"alpha": None},
+                notes=False,
+            )
+            (root / "doc").mkdir()
+            (root / "doc" / "release-notes-3.1.1.md").write_text("# 3.1.1\n", encoding="utf-8")
+            result = run_check(root)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("doc/release-notes-3.1.2.md is missing", result.stderr)
 
     def test_version_file_behind_the_workspace_names_every_crate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,7 +265,8 @@ class CheckVersionSkewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "matches every workspace crate: qbit-pool-builder, qbit-prism, "
-            "qbit-prism-dual-sim, qbit-prism-load, qbit-prism-server, qbit-prism-test-gate",
+            "qbit-prism-dual-sim, qbit-prism-load, qbit-prism-server, qbit-prism-test-gate; "
+            f"both lockfiles (Cargo.lock, {FUZZ_LOCK}) agree",
             result.stdout,
         )
 
