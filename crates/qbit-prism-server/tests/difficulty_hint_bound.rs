@@ -25,6 +25,15 @@ use std::time::Duration;
 mod proxy;
 use proxy::{Execution, ExecutionProxy, Protocol};
 
+#[path = "support/live_host_tools.rs"]
+#[allow(dead_code)]
+mod host_tools;
+
+#[path = "support/live_private_postgres.rs"]
+#[allow(dead_code)]
+mod private_postgres;
+use private_postgres::{ClusterOptions, PrivateCluster};
+
 const LISTENER: &str = "primary";
 const WORKER: &str = "worker";
 
@@ -306,5 +315,125 @@ async fn a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
     match result {
         Err(panic) => resume_unwind(panic),
         Ok(result) => result.and(closed),
+    }
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// Whether a commit at the session's own level, on `probe`, waits for a
+/// synchronous standby now: it has not returned within 300 ms. The waiting
+/// commit is left behind until the standby list is reset.
+async fn commits_wait_for_the_standby(admin: &PgPool) -> Result<bool> {
+    let mut probe = admin.acquire().await?;
+    let insert = sqlx::query("INSERT INTO prism_sync_probe VALUES (1)").execute(&mut *probe);
+    Ok(tokio::time::timeout(Duration::from_millis(300), insert)
+        .await
+        .is_err())
+}
+
+// PostgreSQL turns the statement timer off before it commits (#529), so no
+// `statement_timeout` ends a commit's wait for a synchronous standby. A hint
+// commits at `synchronous_commit = local` for that reason (#872). On a
+// disposable cluster whose `synchronous_standby_names` names a standby that
+// never connects, every commit at the session's level waits; the hint still
+// commits within its bound and its row is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hint_commits_without_waiting_for_a_synchronous_standby() -> Result<()> {
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    let home = tempfile::Builder::new().prefix("h872-").tempdir()?;
+    let cluster = PrivateCluster::start(ClusterOptions {
+        bin: std::path::PathBuf::from(bin),
+        data: home.path().join("data"),
+        home: home.path().to_path_buf(),
+        initdb: &[],
+        settings: "",
+        env: Vec::new(),
+    })?;
+    let url = cluster.url();
+    let admin = PgPool::connect(&url).await?;
+    let ledger = Ledger::connect(&url, "hint-sync".into(), 2, true).await?;
+    let result = AssertUnwindSafe(async {
+        ledger
+            .record_worker_difficulty(LISTENER, WORKER, 64.0, now_ms())
+            .await?;
+        sqlx::query("CREATE TABLE prism_sync_probe(x int)")
+            .execute(&admin)
+            .await?;
+        sqlx::query("ALTER SYSTEM SET synchronous_standby_names = 'prism_absent_standby'")
+            .execute(&admin)
+            .await?;
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&admin)
+            .await?;
+        // The reload reaches the backends and the standby bookkeeping in
+        // its own time: wait until a commit at the session's level waits.
+        let mut waiting = false;
+        for _ in 0..20 {
+            if commits_wait_for_the_standby(&admin).await? {
+                waiting = true;
+                break;
+            }
+        }
+        ensure!(waiting, "commits never waited for the absent standby");
+        let started = tokio::time::Instant::now();
+        let bound = Duration::from_secs(2);
+        let written = tokio::time::timeout(
+            Duration::from_secs(10),
+            ledger.write_worker_difficulty_hint(
+                LISTENER,
+                WORKER,
+                32.0,
+                None,
+                900,
+                HintDeadline::after(bound),
+            ),
+        )
+        .await
+        .context("the hint's commit waited for the standby")??;
+        let took = started.elapsed();
+        ensure!(
+            written.as_ref().map(|hint| hint.difficulty) == Some(32.0),
+            "{written:?}"
+        );
+        ensure!(took < bound, "the hint took {took:?}");
+        let row: String = sqlx::query_scalar(
+            "SELECT difficulty::text FROM qbit_worker_difficulty WHERE listener=$1 AND worker_username=$2",
+        )
+        .bind(LISTENER)
+        .bind(WORKER)
+        .fetch_one(&admin)
+        .await?;
+        ensure!(row.parse::<f64>()? == 32.0, "the row holds {row}");
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    // Release every waiting commit before anything closes.
+    let reset = async {
+        sqlx::query("ALTER SYSTEM RESET synchronous_standby_names")
+            .execute(&admin)
+            .await?;
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&admin)
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    ledger.pool.close().await;
+    admin.close().await;
+    drop(cluster);
+    match result {
+        Err(panic) => resume_unwind(panic),
+        Ok(result) => result.and(reset),
     }
 }

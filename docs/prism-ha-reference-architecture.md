@@ -182,7 +182,10 @@ writer pools; existing connections do not retroactively receive a role default.
 vardiff resume-hint writes run in a transaction of their own that sets
 `SET LOCAL synchronous_commit = local`, so a hint's COMMIT waits for the local
 WAL flush only, never for a standby: a statement timeout cannot end that wait
-(#529, below), and a hint is bounded by 500 ms. The setting is transaction-local
+(#529, below), and the hint writer gives a hint 500 ms. The local flush itself is
+still bounded by no server-side timer; the writer's bound is its outer limit,
+and a bound that passes during COMMIT leaves the hint's outcome unknown (it
+counts `timed_out`). The setting is transaction-local
 and only lowers the session's `on` or `remote_apply`. The transaction writes
 one row of `qbit_worker_difficulty` and nothing else (its other statements
 read); no share, credit, payout, candidate, fanout or session reservation is

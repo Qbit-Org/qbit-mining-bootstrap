@@ -2871,8 +2871,8 @@ it:
   `COMMIT` PostgreSQL ends by that bound. Each statement runs under a
   transaction-local `statement_timeout` of what is left of the bound less a
   tenth of it: the first is set in the `BEGIN`'s own round trip, and another
-  only when a statement is sent more than a twentieth of the bound after the
-  last was set. A statement with less than a millisecond left is not sent,
+  only when a statement is sent more than a fortieth of the bound after the
+  last setting's reply. A statement with less than a millisecond left is not sent,
   nor a `COMMIT` with less than the tenth left. PostgreSQL turns the
   statement timer off before it commits, so the transaction also sets
   `synchronous_commit = local` for itself: a hint's `COMMIT` waits for the
@@ -2881,8 +2881,9 @@ it:
   one part no server-side timer bounds; the writer's own bound is its outer
   limit, and a bound that passes during `COMMIT` leaves the outcome unknown,
   counted `timed_out`.
-  A hint that runs out of time therefore rolls back and leaves no statement
-  running and no connection busy, and the connection goes back to the pool
+  A hint that runs out of time before its `COMMIT` therefore rolls back and
+  leaves no statement running and no connection busy, and the connection
+  goes back to the pool
   at `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` (or, when the frontend's own
   bound passed first with the server's cancel still on its way, SQLx closes
   it with a warning, `error occurred while testing the connection
@@ -2891,9 +2892,10 @@ it:
   `PRISM_DATABASE_LOCK_TIMEOUT_MS` still applies to their lock waits, as
   before, and a lock wait it ends counts as `failed`. The row lock a hint's
   write takes is held through its read-back and `COMMIT`, a round trip or
-  two and the local flush, and no statement holds it past the bound; a
-  connection that stalls mid-transaction holds it until the session ends, as
-  before. Another
+  two and the local flush. No statement before `COMMIT` holds it past the
+  bound; a local flush that stalls holds it, and its connection, until the
+  flush ends, and a connection that stalls mid-transaction holds it until
+  the session ends, as before. Another
   frontend's hint for the same worker waits for it under its own bound, and
   the pruner skips locked rows. A hint ended so counts as
   `timed_out` in `qbit_prism_stratum_difficulty_hints_total`, told from an

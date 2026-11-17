@@ -69,13 +69,15 @@ fn retained(row: Option<PgRow>) -> Result<Option<WorkerDifficulty>> {
 }
 
 /// How much of a hint write's bound its statements' server-side timeouts
-/// leave unused, as a divisor of the bound: a tenth. Half of it covers the
-/// round trips between the client's clock and the server's timer (a
-/// statement's timer starts once it reaches the server, and the server's
-/// cancel takes as long to come back), so the client reads the cancel
-/// before its own bound passes; the other half is how old the timeout set
-/// on the transaction may be when a statement is sent under it
-/// ([`HintDeadline::arm`]).
+/// leave unused, as a divisor of the bound: a tenth. A quarter of it is how
+/// long after its setting's reply a timeout may still be used
+/// ([`HintDeadline::arm`]); the rest covers the round trips between the
+/// client's clock and the server's timer: the setting's own (its value is
+/// taken as it is sent), a statement's way to the server, where its timer
+/// starts, and the server's cancel's way back. A statement then ends on the
+/// server, and its cancel reaches the client, before the client's bound for
+/// round trips up to about three-eighths of the margin (19 ms at the default
+/// 500 ms bound).
 const HINT_MARGIN_DIVISOR: u32 = 10;
 
 /// PostgreSQL's largest `statement_timeout`, in milliseconds (an `int`).
@@ -146,14 +148,17 @@ impl HintDeadline {
         (millis > 0).then(|| Duration::from_millis(millis))
     }
 
-    /// How a statement sent at `now` is bounded when the transaction's
-    /// timeout was last set at `armed_at`. That timeout was what was left
-    /// then, so a statement sent under it runs at most `now - armed_at` past
-    /// what is left now; up to half the margin it may, and it is sent
-    /// without another round trip. Older, the timeout is set again from what
-    /// is left, under the same never-zero rule as the first.
-    fn arm(&self, armed_at: tokio::time::Instant, now: tokio::time::Instant) -> Arm {
-        if now.saturating_duration_since(armed_at) <= self.margin / 2 {
+    /// How a statement sent at `now` is bounded when the reply to the
+    /// transaction's last timeout setting was read at `answered`. That
+    /// timeout was what was left as it was sent, a round trip before, so a
+    /// statement sent under it runs at most that round trip and `now -
+    /// answered` past what is left now. Up to a quarter of the margin after
+    /// the reply, it may, and it is sent without another round trip: time
+    /// spent only in round trips and statements that sent nothing (a cached
+    /// prepare) never sets it again. Older, the timeout is set again from
+    /// what is left, under the same never-zero rule as the first.
+    fn arm(&self, answered: tokio::time::Instant, now: tokio::time::Instant) -> Arm {
+        if now.saturating_duration_since(answered) <= self.margin / 4 {
             return Arm::Armed;
         }
         match self.statement_timeout(now) {
@@ -220,21 +225,23 @@ type HintQuery<'q> = sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArgument
 struct HintTransaction<'c> {
     tx: Transaction<'c, Postgres>,
     deadline: HintDeadline,
-    /// The `statement_timeout` in force, and when it was sent.
+    /// The `statement_timeout` in force, and when the reply to its setting
+    /// was read.
     armed: Duration,
-    armed_at: tokio::time::Instant,
+    answered: tokio::time::Instant,
 }
 
 impl<'c> HintTransaction<'c> {
     async fn open_hint(connection: &'c mut CustomBegin, deadline: HintDeadline) -> Result<Self> {
-        let armed_at = tokio::time::Instant::now();
-        let armed = deadline.statement_timeout(armed_at).ok_or(HintBoundSpent)?;
+        let armed = deadline
+            .statement_timeout(tokio::time::Instant::now())
+            .ok_or(HintBoundSpent)?;
         let tx = connection.custom_begin(begin_statement(armed)).await?;
         Ok(Self {
             tx,
             deadline,
             armed,
-            armed_at,
+            answered: tokio::time::Instant::now(),
         })
     }
 
@@ -242,7 +249,7 @@ impl<'c> HintTransaction<'c> {
     /// the one in force is too old ([`HintDeadline::arm`]).
     async fn arm(&mut self) -> Result<Duration> {
         let now = tokio::time::Instant::now();
-        match self.deadline.arm(self.armed_at, now) {
+        match self.deadline.arm(self.answered, now) {
             Arm::Armed => {}
             Arm::Spent => return Err(HintBoundSpent.into()),
             Arm::Set(timeout) => {
@@ -255,7 +262,7 @@ impl<'c> HintTransaction<'c> {
                 )
                 .await?;
                 self.armed = timeout;
-                self.armed_at = now;
+                self.answered = tokio::time::Instant::now();
             }
         }
         Ok(self.armed)
@@ -375,8 +382,8 @@ impl Ledger {
     /// Each statement runs under a `statement_timeout` taken from what is
     /// left of the deadline less a tenth of the bound (see [`HintDeadline`]):
     /// the first is set in the `BEGIN`'s own round trip, and another only
-    /// when a statement is sent more than half that margin after the last
-    /// was set. A statement with less than a millisecond left is not sent
+    /// when a statement is sent more than a quarter of that margin after
+    /// the last setting's reply. A statement with less than a millisecond left is not sent
     /// ([`HintBoundSpent`]); one the server cancelled at its timeout is
     /// marked so ([`hint_timed_out`]). Either way the transaction rolls
     /// back, and every setting ends with it. `COMMIT` is not sent with less
@@ -414,6 +421,7 @@ impl Ledger {
             None => {
                 let lower_types = [text(), text(), text()];
                 tx.prepare_hint_statements(&[
+                    (REARM_SQL, &[text()]),
                     (&GUARD_SQL, &[]),
                     (LOWER_SQL, &lower_types),
                     (READ_SQL, &read_types),
@@ -431,6 +439,7 @@ impl Ledger {
             Some(share_id) => {
                 let record_types = [text(), text(), text(), <i64 as Type<Postgres>>::type_info()];
                 tx.prepare_hint_statements(&[
+                    (REARM_SQL, &[text()]),
                     (ACCEPTED_AT_RECENT_SQL, &[text()]),
                     (ACCEPTED_AT_SQL, &[text()]),
                     (&GUARD_SQL, &[]),
