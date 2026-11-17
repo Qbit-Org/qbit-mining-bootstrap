@@ -61,8 +61,10 @@ impl LeaseHorizon {
 }
 
 /// Whether an attempt holds an offer reservation that it has provably not
-/// sent, and what its release then records. The offer sets it once the
-/// reservation has committed, clears it synchronously immediately before the
+/// sent, and what its release then records. The offer sets it immediately
+/// before it takes the reservation (whether that commits is settled by the
+/// release's fence, [`return_unsent_reservation`]), clears it synchronously
+/// immediately before the
 /// `submitblock` request can leave this process
 /// (`Coordinator::submit_block`), and sets it again once the node's answer
 /// proves the call did not run (`offer_not_executed`), before it writes the
@@ -93,6 +95,16 @@ impl UnsentOffer {
     /// provably unsent.
     pub(super) fn sending(&self) {
         *self.0.lock().unwrap() = None;
+    }
+
+    /// The attempt returned the reservation to `pending` itself: nothing is
+    /// held any more.
+    pub(super) fn returned(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    fn is_held(&self) -> bool {
+        self.0.lock().unwrap().is_some()
     }
 
     fn take(&self) -> Option<Unsent> {
@@ -156,6 +168,13 @@ impl Attempt {
                 coordinator.process_candidate_inner(&self.claim, lease, &self.unsent),
             )
             .await
+    }
+
+    /// Whether the attempt holds an offer reservation that it has not sent
+    /// (the submit loop's shutdown cuts such an attempt in time for the
+    /// hand-back to return it).
+    pub(super) fn holds_unsent_offer(&self) -> bool {
+        self.unsent.is_held()
     }
 
     /// The attempt's run failed with `error`. When it held an offer
@@ -327,7 +346,9 @@ fn unsent_reason(why: &str, error: &anyhow::Error) -> String {
 /// not answer.
 ///
 /// That write reports a row its fence did not match as an error, like a
-/// database that did not answer, so a failed write is followed by a read:
+/// database that did not answer, so a failed write is followed by a read on
+/// a primary (an answer from a server in recovery may be stale, and is
+/// retried):
 /// - the row is still this claim's unsent reservation (the same fence as the
 ///   write's `WHERE`; keep the two equal): the write's error, retried;
 /// - this claim's token holds the row in another state, as when a failover
@@ -361,19 +382,20 @@ async fn return_unsent_reservation(
         return Ok(true);
     };
     let held = async {
-        sqlx::query_as::<_, (bool, bool)>(
-            "SELECT claim_token IS NOT DISTINCT FROM $2,state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1",
+        sqlx::query_as::<_, (bool, bool, bool)>(
+            "SELECT pg_is_in_recovery(),COALESCE((SELECT claim_token IS NOT DISTINCT FROM $2 FROM qbit_block_candidate_outbox WHERE block_hash=$1),false),COALESCE((SELECT state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1),false)",
         )
         .bind(&claim.candidate.block_hash)
         .bind(&claim.claim_token)
-        .fetch_optional(&mut *ledger.acquire().await?)
+        .fetch_one(&mut *ledger.acquire().await?)
         .await
     };
     match held.await {
-        Ok(Some((true, true))) | Err(_) => Err(error),
-        Ok(Some((true, false))) if due_now => ledger.release_recovery_claim(claim, reason).await,
-        Ok(Some((true, false))) => ledger.release_candidate_claim(claim, reason).await,
-        Ok(Some((false, _)) | None) => Ok(false),
+        // A standby's answer may be stale: never conclude from it.
+        Ok((true, ..)) | Ok((false, true, true)) | Err(_) => Err(error),
+        Ok((false, true, false)) if due_now => ledger.release_recovery_claim(claim, reason).await,
+        Ok((false, true, false)) => ledger.release_candidate_claim(claim, reason).await,
+        Ok((false, false, _)) => Ok(false),
     }
 }
 

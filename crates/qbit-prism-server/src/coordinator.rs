@@ -3232,8 +3232,8 @@ impl Coordinator {
     /// recorded. Builder admission, the rebuild, verification, landing and
     /// confirmation all follow in the post-offer phase.
     ///
-    /// `unsent` holds the reservation while nothing has been sent: from the
-    /// moment it commits until immediately before the request can leave
+    /// `unsent` holds the reservation while nothing has been sent: from just
+    /// before it is taken until immediately before the request can leave
     /// ([`Coordinator::submit_block`]), and again once the node's answer
     /// proves the call did not run. However the attempt ends meanwhile (an
     /// error, its heartbeat dropping it, a shutdown), its owner then returns
@@ -3316,6 +3316,19 @@ impl Coordinator {
         let mut reserved_current = false;
         // The gate as the reservation finds it, at the latest.
         let carry_generation = self.ledger.carry_gate_generation();
+        // From here nothing is sent until the send clears this, so an attempt
+        // that ends by any path returns its reservation to `pending`
+        // (`claim_release`). Held before the reservation, so a reservation
+        // whose COMMIT reply was lost, or that was dropped mid-commit, is
+        // covered too: the return is fenced on `offer_reserved`, and a row
+        // the reservation never reached is released the ordinary way.
+        unsent.hold(
+            format!(
+                "the attempt reserving the offer as {} stopped before its submitblock call was sent",
+                self.config.instance_id
+            ),
+            false,
+        );
         match self
             .ledger
             .reserve_offer_within(claim, Some(self.config.capture_overpay_ceiling_bps))
@@ -3371,18 +3384,6 @@ impl Coordinator {
                 return Ok(());
             }
         }
-        // The reservation committed and nothing has been sent. Until the
-        // send clears this, an attempt that ends by any path returns the
-        // reservation to `pending` (`claim_release`). A reservation whose
-        // COMMIT reply was lost is an error above, before this is set: the
-        // row may still be `pending`, and it keeps the ordinary release.
-        unsent.hold(
-            format!(
-                "the attempt holding the reservation taken by {} stopped before its submitblock call was sent",
-                self.config.instance_id
-            ),
-            false,
-        );
         // #529: the reservation, and the candidate row before it, reach the
         // failover standby before the block leaves this frontend, within the
         // bound. The wait never holds the block: an unconfirmed one is logged
@@ -3449,6 +3450,7 @@ impl Coordinator {
                 true,
             );
             self.ledger.release_unmade_offer(claim, &reason).await?;
+            unsent.returned();
             tracing::warn!(block = %candidate.block_hash, %reason, "the carry gate moved before the offer; the next attempt decides it again, through the capture path");
             return Ok(());
         }
@@ -3476,6 +3478,7 @@ impl Coordinator {
                 self.config.instance_id
             );
             self.ledger.release_unsent_offer(claim, &reason).await?;
+            unsent.returned();
             tracing::warn!(block = %candidate.block_hash, %reason, "the node never ran the block offer; it will be offered again");
             return Ok(());
         }
@@ -3932,18 +3935,35 @@ impl Coordinator {
                                 _ = shutdown.changed() => {
                                     // #578: an offer in flight is sent and
                                     // recorded before the attempt is dropped.
-                                    // The wait leaves the lease's bound for
-                                    // the hand-back below: one that drops an
-                                    // attempt before its send returns the
-                                    // reservation to `pending` in it.
-                                    let left = unreleased
-                                        .stop_deadline()
-                                        .saturating_duration_since(tokio::time::Instant::now());
-                                    let bound = self
-                                        .offer_section_bound(lease)
-                                        .min(left.saturating_sub(lease.timeout));
-                                    let finished =
-                                        self.finish_offer_section(running.as_mut(), bound).await;
+                                    let stop = unreleased.stop_deadline();
+                                    let left =
+                                        stop.saturating_duration_since(tokio::time::Instant::now());
+                                    let bound = self.offer_section_bound(lease).min(left);
+                                    // An attempt that still holds a
+                                    // reservation it never sent once only the
+                                    // lease's bound of the stop budget is left
+                                    // is cut then, so the hand-back below has
+                                    // that bound to return it to `pending`.
+                                    // One that is sending or recording keeps
+                                    // the whole wait.
+                                    let cut_at = stop.checked_sub(lease.timeout).unwrap_or(stop);
+                                    let unsent_at_cut = async {
+                                        tokio::time::sleep_until(cut_at).await;
+                                        while !attempt.holds_unsent_offer() {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
+                                    };
+                                    let driven = async {
+                                        tokio::select! {
+                                            biased;
+                                            result = running.as_mut() => Some(result),
+                                            () = unsent_at_cut => None,
+                                        }
+                                    };
+                                    let finished = self
+                                        .finish_offer_section(std::pin::pin!(driven), bound)
+                                        .await
+                                        .flatten();
                                     break (finished, true);
                                 }
                                 result = &mut running => break (Some(result), false),
