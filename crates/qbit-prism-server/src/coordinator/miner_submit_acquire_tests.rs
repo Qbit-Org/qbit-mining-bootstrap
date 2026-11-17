@@ -59,6 +59,7 @@ impl Harness {
         self.coordinator().persist_block_only(
             &self.share,
             Some(self.candidate.clone()),
+            None,
             Some(1234),
             &self.candidate.block_hash,
             start,
@@ -140,7 +141,7 @@ where
             credit_policy: None,
         };
         let deferred = (!proof.share_pass).then(|| share.clone());
-        let candidate = submission_candidate(&job, proof, deferred).await?;
+        let candidate = CandidateSource::new(&job, proof, deferred).build().await?;
         Arc::get_mut(&mut fixture.coordinator)
             .expect("fixture coordinator has no other owners before the test starts")
             .ledger = Arc::new(ledger);
@@ -367,6 +368,7 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
                 .coordinator()
                 .persist_block_only(
                     &h.share,
+                    None,
                     None,
                     None,
                     &h.candidate.block_hash,

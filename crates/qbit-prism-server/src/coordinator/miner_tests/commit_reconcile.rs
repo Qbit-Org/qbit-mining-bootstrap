@@ -4,7 +4,9 @@
 //! deadlines.
 use super::*;
 use crate::metrics::{Metrics, RejectReason};
-use miner_submit::{classify_share_append, enqueue_failed_before_commit, SaveOutcome};
+use miner_submit::{
+    classify_share_append, enqueue_failed_before_commit, transient_before_commit, SaveOutcome,
+};
 use submit_ledger::GateState;
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
@@ -623,6 +625,140 @@ fn commit_reconcile_block_only_enqueue_errors_are_definite_only_before_commit() 
     }
     for error in [sqlx::Error::PoolTimedOut, sqlx::Error::PoolClosed] {
         assert!(enqueue_failed_before_commit(&error.into()));
+    }
+}
+
+/// A database error with a SQLSTATE, as the retry of a found block's append
+/// reads it from any driver's error.
+#[derive(Debug)]
+struct CodedDatabaseError(&'static str);
+
+impl std::fmt::Display for CodedDatabaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SQLSTATE {}", self.0)
+    }
+}
+
+impl std::error::Error for CodedDatabaseError {}
+
+impl sqlx::error::DatabaseError for CodedDatabaseError {
+    fn message(&self) -> &str {
+        self.0
+    }
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(self.0.into())
+    }
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
+    }
+}
+
+/// A found block's append runs again only for a passing database condition;
+/// every deliberate refusal, and every error the same append would meet
+/// again, ends it, however it is wrapped.
+#[test]
+fn found_block_retry_runs_again_only_for_a_passing_database_failure() {
+    let coded =
+        |code| anyhow::Error::from(sqlx::Error::Database(Box::new(CodedDatabaseError(code))));
+    let transient: Vec<(&str, anyhow::Error)> = vec![
+        ("pool-timed-out", sqlx::Error::PoolTimedOut.into()),
+        (
+            "io",
+            sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into()).into(),
+        ),
+        (
+            "wrapped-io",
+            anyhow::Error::from(sqlx::Error::Io(std::io::ErrorKind::BrokenPipe.into()))
+                .context("share append"),
+        ),
+        (
+            "window-database",
+            anyhow::Error::from(crate::ledger::WindowError::Database(
+                sqlx::Error::PoolTimedOut,
+            )),
+        ),
+        ("lock-timeout", coded("55P03")),
+        ("statement-cancelled", coded("57014")),
+        ("serialization", coded("40001")),
+        ("deadlock", coded("40P01")),
+        ("connection-failure", coded("08006")),
+        ("too-many-connections", coded("53300")),
+        ("admin-shutdown", coded("57P01")),
+        ("crash-shutdown", coded("57P02")),
+        ("cannot-connect-now", coded("57P03")),
+        (
+            "partition-attach-timed-out",
+            anyhow::Error::from(sqlx::Error::PoolTimedOut)
+                .context("attaching the partition lead failed"),
+        ),
+    ];
+    for (name, error) in &transient {
+        assert!(transient_before_commit(error), "{name}: {error:#}");
+    }
+    let refused: Vec<(&str, anyhow::Error)> = vec![
+        ("gate-closed", crate::ledger::CommitGateClosed.into()),
+        (
+            "revision-moved",
+            crate::ledger::PayoutRevisionChanged {
+                expected: 1,
+                observed: 2,
+            }
+            .into(),
+        ),
+        (
+            "window-not-held",
+            crate::ledger::WindowNotHeld {
+                block_hash: "aa".repeat(32),
+                first_share_seq: 1,
+                last_share_seq: 2,
+                anchor_ms: 3,
+            }
+            .into(),
+        ),
+        ("own-log-lost", crate::ledger::OwnLogLost.into()),
+        (
+            "wrapped-own-log-lost",
+            anyhow::Error::from(crate::ledger::OwnLogLost).context("share append"),
+        ),
+        (
+            "fingerprint",
+            anyhow::anyhow!("cluster configuration fingerprint a is not this frontend's pinned b; refusing to enqueue candidate c"),
+        ),
+        ("halted", anyhow::anyhow!("cluster halted: fatal")),
+        ("legacy-writer", anyhow::anyhow!("live legacy Python writer lease")),
+        (
+            "duplicate",
+            anyhow::anyhow!("duplicate-share: header already credited globally"),
+        ),
+        (
+            "payload-mismatch",
+            anyhow::anyhow!("duplicate share_id payload mismatch"),
+        ),
+        ("candidate-identity", anyhow::anyhow!("candidate identity conflict")),
+        ("candidate-check", anyhow::anyhow!("candidate header hash mismatch")),
+        ("no-partition", coded("23514")),
+        ("read-only", coded("25006")),
+        ("unique", coded("23505")),
+        ("pool-closed", sqlx::Error::PoolClosed.into()),
+        (
+            "protocol",
+            sqlx::Error::Protocol("PostgreSQL fsync and full_page_writes must be enabled".into())
+                .into(),
+        ),
+        ("foreign-database", sqlx::Error::Database(Box::new(ForeignDatabaseError)).into()),
+        ("row-not-found", sqlx::Error::RowNotFound.into()),
+    ];
+    for (name, error) in &refused {
+        assert!(!transient_before_commit(error), "{name}: {error:#}");
     }
 }
 

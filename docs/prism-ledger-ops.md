@@ -2749,7 +2749,11 @@ require it.
 
 ## Retry, replay and deadline contract
 
-The ledger never replays SQL automatically. After a `statement_timeout`
+The ledger never replays SQL automatically, with one stated exception: a
+found block's append, which the coordinator runs again after a failure proven
+to precede `COMMIT` (below, "Found block's append"). (The share append also
+runs once more after the share ledger refused it for want of a partition,
+SQLSTATE 23514; see "Lead partitions".) After a `statement_timeout`
 (`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, default 15000), a `lock_timeout`
 (`PRISM_DATABASE_LOCK_TIMEOUT_MS`, default 5000), a closed connection or a lost
 acknowledgement, the error reaches the caller and the ledger neither re-sends
@@ -2775,6 +2779,7 @@ Every later attempt is a separate public operation with its own claim.
 | Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |
 | Expired or lost claim across a halt | never revived | none | Clearing `fatal_error` restores authority for new work only; the token that expired during the halt is still rejected by every operation and a new claim is required. | dynamic: `restored_authority_requires_fresh_claim` |
 | Share append: `append`, `append_at_revision` | public reinvocation, idempotent by share identity | none | A miner or frontend resubmission is a new call; the share identity and proof-hash registry return the existing row without a second credit. | inventory: `ledger_postgres::global_duplicates_idempotence_and_config_fencing`, `postgres_failover` |
+| Found block's append (coordinator): a share-pass append that carries a found block, or a block-only proof's duplicate probe and candidate enqueue | the one stated exception: bounded re-execution, idempotent by share identity and block hash | after a failure proven to precede `COMMIT` that is a passing database condition, at most 8 attempts in all, none starting later than 60 s after the share's admission, while the job's parent is the observed tip and the frontend is not stopping | The same append, with the same share, revision and candidate, in the task that ran the first attempt. Each attempt probes the share ID and the outbox's block hash under `ORDER_LOCK`. Deliberate refusals are never run again. See "Found block's append" below. | dynamic: `commit_reconcile_tests::found_block_retry::*`; classifier: `miner_tests::commit_reconcile::found_block_retry_runs_again_only_for_a_passing_database_failure` |
 | Page traversal: `read_window`, `snapshot`, audit materialization | normal page traversal | none | A page is not a retry. `read_window` pages inside one `REPEATABLE READ READ ONLY` transaction and reports an incomplete range as an error instead of a partial window. `snapshot` fixes its anchor and revision in one short transaction, then pages immutable rows at or before that anchor in a second one. Audit materialization reads the snapshot row and the share range through separate checkouts; the share count, snapshot digest and bundle digest authenticate the result, and a mismatch is an error. | inventory: `window_reference`, `window_read_oracle` |
 | Dependency reread or repair: `save_issued_job` with a repair payload, `backfill_ctv`, `import_legacy_audits` | dependency reread/repair | none | Cold-path calls that re-read the durable dependency and verify its identity, or rebuild a missing row idempotently. None replays a failed write. | inventory: `issued_job_dependency`, `ledger_postgres::ctv_artifacts_wait_for_maturity_and_claims_are_fenced`, `ledger_postgres::legacy_audit_import_validates_envelope_hash_and_pinned_key` |
 | Reconciliation: `pool_blocks_for_reconcile`, `reconcile_blocks`, `reconcile_blocks_at_revision`, `observe_fanout` | public reinvocation, revision fenced | none | Periodic calls. `pool_blocks_for_reconcile` is one query. A stale expected revision (for `observe_fanout`, when the observation carries one) is an error that changes nothing. | inventory: `ledger_postgres::verified_landing_reconstructs_audit_and_reorgs_are_revision_fenced` |
@@ -2807,6 +2812,60 @@ tests named; they were not re-tested for this contract.
 PRISM_TEST_DATABASE_URL=postgresql://test_user@127.0.0.1:5432/test_db \
   cargo test --locked -p qbit-prism-server --test ledger_single_execution -- --nocapture
 ```
+
+### Found block's append
+
+A found block commits with its share (or, for a block-only proof, with its
+outbox row), and the outbox row is the only path to `submitblock`. An append
+that failed before `COMMIT` used to lose the block: nothing recorded it, so
+no claim, gauge or alert ever saw it. The coordinator now runs such an append
+again, inside the task that ran it, under these rules:
+
+- **Only a failure proven to precede `COMMIT`.** For a share-pass append,
+  its commit gate is still open: the pre-commit hook never let `COMMIT` be
+  sent, and the transaction rolled back. For a block-only proof, the
+  duplicate probe failed (it writes nothing), or the enqueue failed without
+  a database connection, or with a severity-ERROR reply. An outcome that may
+  have committed (a gate at `Committing`, a lost `COMMIT` reply, a dropped
+  connection during the enqueue) keeps its existing answer and is followed,
+  never run again.
+- **Only a passing database condition**: a pool timeout, a failed
+  connection, or SQLSTATE class 08 or 53, 40001, 40P01, 55P03 (a wait for
+  `ORDER_LOCK` past `lock_timeout` included), 57014, 57P01, 57P02 or 57P03.
+  A deliberate refusal is never run again: a closed commit gate, a moved
+  payout revision with capture off, a window this primary does not hold
+  (#619), a lost own log (D-8, D-9), a configuration fingerprint that is not
+  this frontend's, a halted cluster, a live legacy writer, a duplicate or
+  conflicting share or candidate, a candidate that fails its own checks.
+  Neither is any other error, a closed pool or a read-only database
+  included.
+- **Bounded.** Pauses of 0.25, 0.5, 1, 2, then 4 s between attempts; at most
+  8 attempts; no attempt starts later than 60 s (one block interval) after
+  the share's submit checks admitted it. An attempt already running keeps
+  its own pool, lock and statement timeouts.
+- **Only while the block can matter.** Before and after each pause the job's
+  parent must still be the observed tip.
+- **Never past the frontend.** The retry stops once the own log is lost
+  (a `FrontendStop`) or behind, and once the ledger pool closes, the last
+  step of every shutdown, which also wakes a pause at once.
+
+A retried attempt cannot credit the share twice or write a second outbox
+row: the attempt before it wrote nothing, and each attempt probes the share
+ID under `ORDER_LOCK` (an existing share is a duplicate) and writes the
+outbox row only when its block hash has none.
+
+The miner's answer keeps its deadline. Within `share_commit_timeout` it is
+the outcome of the attempts so far: accepted (or, for a block-only proof or a
+capture, its block's disposition), `ledger-confirmation-failed` once the
+retry has ended with nothing written, or the refusal's own answer. An append
+still being run again at the deadline is answered `ledger-outcome-unknown`,
+counted in `block_proof_ack_capped_total`, and followed. Each attempt run
+again logs a WARN `found block's append failed before COMMIT; appending it
+again`; a block recorded by a later attempt logs a WARN `found block recorded
+after its append was run again`; a retry that ends with the block unrecorded
+logs an ERROR `found block not recorded: ...` with `block_hash`, `share_id`,
+`attempts` and `stopped` (`not-transient`, `stopping`, `parent-changed`,
+`attempts`, `window` or `rebuild-failed`). That block is never offered.
 
 ### Deadlines
 
