@@ -88,8 +88,10 @@ STANDARD_EVALUATION_MINUTES = 1
 @functools.cache
 def endpoint_dwell_minutes():
     """PrismMetricsEndpointDown's dwell, from its authored rule (the generator never rewrites it)."""
-    [endpoint] = [rule for rule in load("docs/prism-native-alert-rules.json")["rules"]
-                  if rule["title"] == ENDPOINT_TITLE]
+    found = [rule for rule in load("docs/prism-native-alert-rules.json")["rules"] if rule["title"] == ENDPOINT_TITLE]
+    if len(found) != 1:
+        raise SystemExit(f"docs/prism-native-alert-rules.json has {len(found)} rules titled {ENDPOINT_TITLE}, not one")
+    [endpoint] = found
     match = re.fullmatch(r"(\d+)m", endpoint["for"])
     if not match:
         raise SystemExit(f"{ENDPOINT_TITLE}'s dwell {endpoint['for']!r} is not whole minutes")
@@ -140,7 +142,9 @@ def listener_basis():
         f"the last reading for {smoothing} minutes from the last successful scrape, {ENDPOINT_TITLE}'s "
         f"{endpoint}-minute dwell and one {STANDARD_EVALUATION_MINUTES}-minute evaluation interval (#869), so a "
         "frontend whose scrapes fail while "
-        f"this warns or dwells keeps warning or dwelling until {ENDPOINT_TITLE} fires for it; a scrape that keeps "
+        f"this warns or dwells keeps warning or dwelling until {ENDPOINT_TITLE} fires for it, while a scrape "
+        f"interval and its timeout stay within that {STANDARD_EVALUATION_MINUTES}-minute margin and the evaluation "
+        "interval divides the dwell; a scrape that keeps "
         f"failing is {ENDPOINT_TITLE}'s. Each evaluation reads the latest scrape, and one that finds the "
         "LISTEN holding restarts the dwell, so a listener that keeps reconnecting and dropping can warn late or not "
         "at all; its WARN lines show it. "
@@ -299,6 +303,7 @@ def admission_wait_rule(spec):
 
 # How the operator docs state the window; checked against MINER_WINDOW_MINUTES.
 WINDOW_PROSE = [r"authorized\s+miner\s+in\s+the\s+last\s+(\d+)\s+minutes",
+                r"whole\s+(\d+)-minute\s+miner\s+window",
                 r"for\s+(\d+)\s+minutes\s+after\s+(?:the|its)\s+last",
                 r"qbit_prism_authorized_clients\[(\d+)m\]"]
 
@@ -311,14 +316,18 @@ LISTENER_PROSE = [r"has\s+read\s+0\s+for\s+(\d+)\s+minutes",
 LISTENER_RUNBOOK = "### A payout-revision listener that stays down (#843)\n"
 PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.md": None,
               "docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
+RUNBOOK_DOCS = {"docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
 # How the runbook states how long the listener rule carries a reading, and
 # what that window is made of (#869).
 LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes",
                          r"(\d+)\s+minutes\s+after\s+its\s+last\s+successful\s+scrape",
                          r"reading\s+up\s+to\s+(\d+)\s+minutes\s+old",
                          r"up\s+to\s+(\d+)\s+minutes\s+after\s+the\s+dwell"]
-ENDPOINT_DWELL_PROSE = [re.escape(ENDPOINT_TITLE) + r"`?'s\s+(\d+)-minute\s+dwell"]
-EVALUATION_PROSE = [r"one\s+(\d+)-minute\s+evaluation\s+interval"]
+ENDPOINT_DWELL_PROSE = [re.escape(ENDPOINT_TITLE) + r"`?'s\s+(\d+)-minute\s+dwell",
+                        r"divide\s+the\s+(\d+)-minute\s+dwell"]
+EVALUATION_PROSE = [r"one\s+(\d+)-minute\s+evaluation\s+interval",
+                    r"stay\s+within\s+(\d+)\s+minutes?,\s+the\s+margin"]
+SCRAPE_PROSE = [r"(\d+)-second\s+scrape\s+interval"]
 
 
 def check_prose(patterns, expected, what, constant, docs=PROSE_DOCS):
@@ -347,13 +356,14 @@ def check_listener_prose():
     """#843: the operator docs state the listener rule's dwell the generator writes."""
     check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
     # #869: and the window that carries a reading after scrapes stop.
-    runbook = {path: heading for path, heading in PROSE_DOCS.items() if heading == LISTENER_RUNBOOK}
+    runbook = RUNBOOK_DOCS
     check_prose(LISTENER_WINDOW_PROSE, listener_smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
                 f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES", docs=runbook)
     check_prose(ENDPOINT_DWELL_PROSE, endpoint_dwell_minutes(), f"{ENDPOINT_TITLE}'s dwell",
                 f"{ENDPOINT_TITLE}'s for", docs=runbook)
     check_prose(EVALUATION_PROSE, STANDARD_EVALUATION_MINUTES, "the standard evaluation interval",
                 "STANDARD_EVALUATION_MINUTES", docs=runbook)
+    check_prose(SCRAPE_PROSE, SCRAPE_SECONDS, "the scrape interval", "SCRAPE_SECONDS", docs=runbook)
 
 
 def postgres_rules():

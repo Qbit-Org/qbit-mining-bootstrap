@@ -4795,7 +4795,7 @@
     }
   },
   {
-    "name": "#869 a frontend whose scrapes stop while its listener warns: PrismMetricsEndpointDown fires three minutes after the first failed scrape, while the listener still warns",
+    "name": "#869 a frontend whose scrapes stop while its listener warns: PrismMetricsEndpointDown fires three minutes after the first failed scrape, the hand-off",
     "series": {
       "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720 stale",
       "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale",
@@ -4889,6 +4889,122 @@
           "network": "mainnet"
         }
       ]
+    }
+  },
+  {
+    "name": "#869 a listener still down after a five-minute scrape outage, longer than the carry, dwells again from the first successful scrape: pending nine minutes later",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720 stale _x300 0x900",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale _x300 3x900",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 0x300 1x900"
+    },
+    "eval_time": "26m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1,
+      "PrismMetricsEndpointDown": 0
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [],
+      "PrismMetricsEndpointDown": []
+    }
+  },
+  {
+    "name": "#869 a listener still down after a five-minute scrape outage, longer than the carry, warns ten minutes after the first successful scrape",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720 stale _x300 0x900",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale _x300 3x900",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 0x300 1x900"
+    },
+    "eval_time": "28m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1,
+      "PrismMetricsEndpointDown": 0
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismMetricsEndpointDown": []
+    }
+  },
+  {
+    "name": "#869 a frontend whose listener gauge disappears while its scrapes succeed, as on a rollback to an image from before #834, keeps its last reading of 1 for the carry: still pending ten minutes after the carry began",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 stale",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x1800",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1800"
+    },
+    "eval_time": "25m50s",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": []
+    }
+  },
+  {
+    "name": "#869 a frontend whose listener gauge disappears while its scrapes succeed warns ten minutes after the four-minute carry ends",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 stale",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x1800",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x1800"
+    },
+    "eval_time": "26m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ]
+    }
+  },
+  {
+    "name": "#869 a target removed from Prometheus's configuration while its listener warns keeps warning for the carry, and PrismMetricsEndpointDown never fires for it",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720 stale",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 stale"
+    },
+    "eval_time": "15m59s",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": 1,
+      "PrismMetricsEndpointDown": null
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [
+        {
+          "job": "qbit-prism",
+          "instance": "one",
+          "network": "mainnet"
+        }
+      ],
+      "PrismMetricsEndpointDown": []
+    }
+  },
+  {
+    "name": "#869 a target removed from Prometheus's configuration has no listener series once the carry ends",
+    "series": {
+      "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "0x720 stale",
+      "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x720 stale",
+      "up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 stale"
+    },
+    "eval_time": "16m",
+    "expect": {
+      "PrismPayoutRevisionListenerDown": null,
+      "PrismMetricsEndpointDown": null
+    },
+    "alerts": {
+      "PrismPayoutRevisionListenerDown": [],
+      "PrismMetricsEndpointDown": []
     }
   }
 ]
