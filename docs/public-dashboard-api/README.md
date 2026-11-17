@@ -93,10 +93,11 @@ concurrent misses for the same key. The `stale-while-revalidate` window
 applies in-process too, not only at CDNs: an entry that has expired inside the
 window is served immediately with its honest `Age` while a single background
 refresh recomputes it. Concurrent stale hits share that one refresh, and a
-failed refresh keeps the stale entry servable until the window ends. The in-process window is clamped so a
-stale-served `Age` never exceeds the route's staleness budget (below); past
-the window the next request blocks and recomputes as before. Error responses
-use `Cache-Control: no-store` and are not cached by that origin cache.
+failed refresh keeps the stale entry servable until the window ends. The
+in-process window is clamped so a stale-served `Age` never exceeds the
+route's staleness budget (below); past the window the next request blocks
+and recomputes as before. Error responses use `Cache-Control: no-store` and
+are not cached by that origin cache.
 Miner pages calculate reward-window aggregates directly in PostgreSQL and
 share the same response cache as the other public routes. The former Python
 `PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS` <!-- retired-setting: PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS --> inner-cache setting is obsolete.

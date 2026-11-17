@@ -145,10 +145,11 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
 /// [`dispatch`] is given, and the only ones its origin cache key is made of
 /// (`response_cache::public_response`). Any other parameter is ignored, as
 /// before. A route that asked for a parameter missing here would see it
-/// absent in a release build, never another value's entry, and fails a
-/// debug assertion in [`Query::get`], so any test that runs the route fails.
-/// `parameter_tests` holds this list to what each route asks for and to the
-/// query parameters `docs/public-dashboard-api-v1.openapi.yaml` documents.
+/// absent, never another value's entry, and in a build with debug
+/// assertions fails one in [`Query::get`] (a 500 when the response cache
+/// catches it). `parameter_tests` holds this list to what each route asks
+/// for and to the query parameters `docs/public-dashboard-api-v1.openapi.yaml`
+/// documents.
 pub(super) fn parameters(path: &str) -> &'static [&'static str] {
     const PAGE: &[&str] = &["page", "limit"];
     match path {

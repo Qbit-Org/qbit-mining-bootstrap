@@ -910,9 +910,10 @@ impl Query {
         }
     }
     fn get(&self, key: &str) -> Option<&str> {
-        // A public route that asks for a parameter its list leaves out would
-        // answer every value of it from one cache entry; in a build with
-        // debug assertions, any test that runs such a route fails here.
+        // A public route that asks for a parameter its list leaves out sees it
+        // absent, whatever the request sent. In a build with debug assertions
+        // it fails here instead: a panic outside the response cache, a 500
+        // `internal_error` inside it, where the shared computation catches it.
         debug_assert!(
             self.allowed.is_none_or(|names| names.contains(&key)),
             "a route read the query parameter {key:?}, which public::parameters leaves out of its cache key"
@@ -1014,9 +1015,10 @@ impl CachePolicy {
         }
     }
 }
-/// The origin cache key of `path` with `q`, which the caller has already cut
-/// down to the parameters the route reads ([`public::parameters`]).
+/// The origin cache key of `path` with `q`: the path, its hashes in lower
+/// case, and only the parameters the route reads ([`public::parameters`]).
 fn cache_key(path: &str, q: &Query) -> String {
+    let q = q.only(public::parameters(path));
     let canonical = if path.starts_with("/public/v1/artifacts/")
         || path.starts_with("/public/v1/blocks/")
         || path.starts_with("/public/v1/fanouts/")

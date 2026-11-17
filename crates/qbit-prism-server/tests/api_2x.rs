@@ -1572,6 +1572,8 @@ async fn concurrent_pool_leaderboard_and_miner_misses_ask_the_node_for_one_templ
 /// inside one memo lifetime, share one cache entry: the first computes it,
 /// asking the node for its network hashrate once, and every later one is a
 /// HIT carrying the same bytes. Each used to miss and ask the node again.
+/// Requests the cache cannot keep, here because every response is over its
+/// size cap, each compute the summary, and share one hashrate call too.
 #[tokio::test]
 async fn junk_parameters_hit_the_cached_pool_summary_and_ask_the_node_for_one_hashrate(
 ) -> Result<()> {
@@ -1600,21 +1602,25 @@ async fn junk_parameters_hit_the_cached_pool_summary_and_ask_the_node_for_one_ha
             ttl: 60,
             stale_while_revalidate: 0,
         };
-        let app = api::router(ApiState::new(
-            f.pool.clone(),
-            ApiConfig {
-                rpc_url,
-                cache_debug_headers: true,
-                cache_lifetimes: api::CacheLifetimes {
-                    default: lifetime,
-                    aggregate: lifetime,
+        let app = |cache_max_bytes| {
+            api::router(ApiState::new(
+                f.pool.clone(),
+                ApiConfig {
+                    rpc_url: rpc_url.clone(),
+                    cache_debug_headers: true,
+                    cache_lifetimes: api::CacheLifetimes {
+                        default: lifetime,
+                        aggregate: lifetime,
+                        ..Default::default()
+                    },
+                    cache_max_bytes,
+                    read_timeout: Duration::from_secs(30),
                     ..Default::default()
                 },
-                read_timeout: Duration::from_secs(30),
-                ..Default::default()
-            },
-            Arc::new(qbit_prism_server::metrics::Metrics::default()),
-        ));
+                Arc::new(qbit_prism_server::metrics::Metrics::default()),
+            ))
+        };
+        let (bypassing, app) = (app(1), app(ApiConfig::default().cache_max_bytes));
         let mut first = None;
         for n in 0..8 {
             // `page` is a parameter other routes read; this one does not.
@@ -1644,6 +1650,19 @@ async fn junk_parameters_hit_the_cached_pool_summary_and_ask_the_node_for_one_ha
                 && summary["pool"]["participants_3h"] == 2,
             "{summary}"
         );
+        for n in 0..4 {
+            let path = format!("/public/v1/pool-summary?x={n}");
+            let (status, headers, body) = get(&bypassing, &path).await;
+            ensure!(status == StatusCode::OK, "{path}: {body}");
+            ensure!(
+                headers["x-prism-public-cache"] == "BYPASS",
+                "{path}: {headers:?}"
+            );
+            ensure!(body["network"] == summary["network"], "{path}: {body}");
+        }
+        for method in ["getnetworkhashps", "getblocktemplate"] {
+            ensure!(node.calls(method) == 2, "{method}: {}", node.calls(method));
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;

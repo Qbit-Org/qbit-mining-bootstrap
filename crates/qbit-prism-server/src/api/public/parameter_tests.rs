@@ -27,17 +27,30 @@ fn documented() -> BTreeMap<String, BTreeSet<String>> {
         let Some(route) = &route else {
             continue;
         };
-        let parameter = match line.trim() {
-            "- $ref: \"#/components/parameters/Page\"" => "page",
-            "- $ref: \"#/components/parameters/Limit\"" => "limit",
-            "in: query" => name.take().expect("a query parameter without a name"),
-            line => {
+        // The document names each inline parameter on the line before its
+        // `in:`; anything else fails here rather than be read wrongly.
+        let line = line.trim();
+        let parameter =
+            if let Some(component) = line.strip_prefix("- $ref: \"#/components/parameters/") {
+                match component {
+                    "Page\"" => "page",
+                    "Limit\"" => "limit",
+                    other => panic!("no test mapping for the parameter component {other}"),
+                }
+            } else if let Some(place) = line.strip_prefix("in: ") {
+                let parameter = name
+                    .take()
+                    .expect("a parameter without a name before its `in:`");
+                if place != "query" {
+                    continue;
+                }
+                parameter
+            } else {
                 if let Some(parameter) = line.strip_prefix("- name: ") {
                     name = Some(parameter);
                 }
                 continue;
-            }
-        };
+            };
         routes.get_mut(route).unwrap().insert(parameter.to_owned());
     }
     assert_eq!(routes.len(), 14, "the document's paths were not all found");
@@ -167,10 +180,7 @@ async fn requests_that_differ_in_a_parameter_their_route_reads_get_different_ent
             let policy = CachePolicy::for_path(&path, &state.config);
             let [one, other] = two_values(parameter);
             for value in [one, other] {
-                let key = cache_key(
-                    &path,
-                    &Query::parse(&format!("{parameter}={value}")).only(parameters(&path)),
-                );
+                let key = cache_key(&path, &Query::parse(&format!("{parameter}={value}")));
                 state.cache.lock().await.insert(
                     key,
                     super::super::response_cache::CacheSlot::holding(Payload::json(
