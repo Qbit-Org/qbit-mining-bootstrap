@@ -78,9 +78,11 @@ SCRAPE_SECONDS = 15
 # to a scrape interval and a timeout too early. The window is its dwell plus
 # one evaluation interval of the standard group both rules are evaluated in
 # (qbit-tools' qbit_monitoring_stack_grafana_alert_standard_evaluation_interval,
-# 1m by default). While that interval divides the dwell, the margin needed is
-# a scrape interval plus its timeout whatever the interval, so the minute
-# covers the 15-second scrape interval with a timeout of up to 45 seconds.
+# 1m by default). While that interval divides the dwell and both rules are
+# evaluated on the same tick (no within-group jitter), the margin needed is a
+# scrape interval plus its timeout whatever the interval: the minute covers
+# the 15-second scrape interval and any timeout Prometheus allows (at most the
+# interval), with 30 seconds to spare for ingestion and query lag.
 ENDPOINT_TITLE = "PrismMetricsEndpointDown"
 STANDARD_EVALUATION_MINUTES = 1
 
@@ -316,7 +318,7 @@ LISTENER_PROSE = [r"has\s+read\s+0\s+for\s+(\d+)\s+minutes",
 LISTENER_RUNBOOK = "### A payout-revision listener that stays down (#843)\n"
 PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.md": None,
               "docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
-RUNBOOK_DOCS = {"docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
+RUNBOOK_DOCS = {path: heading for path, heading in PROSE_DOCS.items() if heading == LISTENER_RUNBOOK}
 # How the runbook states how long the listener rule carries a reading, and
 # what that window is made of (#869).
 LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes",
@@ -356,14 +358,13 @@ def check_listener_prose():
     """#843: the operator docs state the listener rule's dwell the generator writes."""
     check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
     # #869: and the window that carries a reading after scrapes stop.
-    runbook = RUNBOOK_DOCS
     check_prose(LISTENER_WINDOW_PROSE, listener_smoothing_minutes(), f"{LISTENER_TITLE}'s smoothing window",
-                f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES", docs=runbook)
+                f"{ENDPOINT_TITLE}'s dwell + STANDARD_EVALUATION_MINUTES", docs=RUNBOOK_DOCS)
     check_prose(ENDPOINT_DWELL_PROSE, endpoint_dwell_minutes(), f"{ENDPOINT_TITLE}'s dwell",
-                f"{ENDPOINT_TITLE}'s for", docs=runbook)
+                f"{ENDPOINT_TITLE}'s for", docs=RUNBOOK_DOCS)
     check_prose(EVALUATION_PROSE, STANDARD_EVALUATION_MINUTES, "the standard evaluation interval",
-                "STANDARD_EVALUATION_MINUTES", docs=runbook)
-    check_prose(SCRAPE_PROSE, SCRAPE_SECONDS, "the scrape interval", "SCRAPE_SECONDS", docs=runbook)
+                "STANDARD_EVALUATION_MINUTES", docs=RUNBOOK_DOCS)
+    check_prose(SCRAPE_PROSE, SCRAPE_SECONDS, "the scrape interval", "SCRAPE_SECONDS", docs=RUNBOOK_DOCS)
 
 
 def postgres_rules():

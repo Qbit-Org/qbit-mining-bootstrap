@@ -4932,7 +4932,7 @@
     }
   },
   {
-    "name": "#869 a frontend whose listener gauge disappears while its scrapes succeed, as on a rollback to an image from before #834, keeps its last reading of 1 for the carry: still pending ten minutes after the carry began",
+    "name": "#869 a frontend whose listener gauge disappears while its scrapes succeed, as on a rollback to an image from before #834, keeps its last reading of 1 for the carry: still pending just under ten minutes after the four-minute carry ends",
     "series": {
       "qbit_prism_payout_revision_listener_up{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "1x720 stale",
       "qbit_prism_authorized_clients{job=\"qbit-prism\",instance=\"one\",network=\"mainnet\"}": "3x1800",
