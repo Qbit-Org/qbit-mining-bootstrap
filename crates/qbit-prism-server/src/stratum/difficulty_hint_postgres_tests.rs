@@ -142,8 +142,11 @@ async fn held_hint(raw: &str, admin: &PgPool, schema: &str) -> Result<()> {
             for outcome in [DifficultyHintOutcome::Failed, DifficultyHintOutcome::Written] {
                 ensure!(count(&metrics, outcome) == 0., "{}", outcome.as_str());
             }
-            // Nothing of the hint is still running while the row is held.
-            ensure!(backends(admin, &application, "='active'").await? == 0);
+            // Nothing of the hint is still running, and no transaction of it
+            // is open, while the row is still held: within a second (the
+            // pool's return flushes the `ROLLBACK` in a task of its own),
+            // where a statement left running would hold on for the pool's
+            // 15 s.
             let mut settled = false;
             for _ in 0..100 {
                 if backends(admin, &application, "<>'idle'").await? == 0 {
@@ -152,7 +155,7 @@ async fn held_hint(raw: &str, admin: &PgPool, schema: &str) -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            ensure!(settled, "the hint's transaction stayed open");
+            ensure!(settled, "the hint's statement or transaction stayed open");
             locker.rollback().await?;
             // The same pooled connection, idle outside any transaction (as
             // the server reports it above) and back at the pool's own timeout.

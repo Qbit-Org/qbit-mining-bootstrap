@@ -14,8 +14,10 @@
 //! than cancelling it mid-statement, and whatever it still holds then is
 //! dropped and counted. Each write has one deadline, its bound from when it
 //! starts, which the writer holds it to and which the coordinator's ledger
-//! has PostgreSQL end every statement of the write by (#872), so a write
-//! that runs out of time leaves nothing running on the server.
+//! has PostgreSQL end every statement of the write before its `COMMIT` by
+//! (#872), so a write that runs out of time before its commit leaves
+//! nothing running on the server; the commit waits for the local WAL flush
+//! only, bounded by the writer alone.
 use super::{retain_difficulty, MiningBackend, StratumConfig, Worker};
 use crate::ledger::{hint_timed_out, HintDeadline};
 use crate::metrics::{DifficultyHintOutcome as Outcome, Metrics, TaskKind};
@@ -484,8 +486,8 @@ impl DifficultyHints {
     /// dropped first, a write still in flight is cancelled and whatever is
     /// still queued is dropped, both counted as abandoned (besides a write's
     /// own bound on a stalled connection, the only way a write is cancelled
-    /// mid-statement; its statement then runs on the server no longer than
-    /// the write's deadline, #872). Should
+    /// mid-statement; a statement before its `COMMIT` then runs on the server
+    /// no longer than the write's deadline, #872). Should
     /// the writer panic, see
     /// [`Self::writer_ended`]. When `work` ends,
     /// `end` says what becomes of what is left, and the writer task has

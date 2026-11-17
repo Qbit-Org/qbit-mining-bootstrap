@@ -54,9 +54,9 @@ fn a_statement_with_less_than_a_millisecond_left_is_not_sent_rather_than_given_z
     let small = HintDeadline::starting(start, Duration::from_micros(1_200));
     assert_eq!(small.statement_timeout(start), Some(ms(1)));
     // The re-arm follows the same rule.
-    assert_eq!(deadline.arm(start, start + ms(450)), Arm::Spent);
+    assert_eq!(deadline.arm(start, start, start + ms(450)), Arm::Spent);
     assert_eq!(
-        deadline.arm(start, start + Duration::from_micros(449_100)),
+        deadline.arm(start, start, start + Duration::from_micros(449_100)),
         Arm::Spent
     );
     // Whatever is set reads at least 1.
@@ -80,14 +80,23 @@ fn a_statement_with_less_than_a_millisecond_left_is_not_sent_rather_than_given_z
 fn a_later_statement_of_one_write_gets_only_what_is_left_of_its_bound() {
     let start = Instant::now();
     let deadline = HintDeadline::starting(start, ms(500));
-    assert_eq!(deadline.arm(start, start), Arm::Armed);
-    assert_eq!(deadline.arm(start, start + ms(12)), Arm::Armed);
-    assert_eq!(deadline.arm(start, start + ms(13)), Arm::Set(ms(437)));
-    assert_eq!(deadline.arm(start, start + ms(300)), Arm::Set(ms(150)));
-    // Measured from the last setting's reply, not from the start.
-    assert_eq!(deadline.arm(start + ms(300), start + ms(312)), Arm::Armed);
+    assert_eq!(deadline.arm(start, start, start), Arm::Armed);
+    assert_eq!(deadline.arm(start, start, start + ms(12)), Arm::Armed);
     assert_eq!(
-        deadline.arm(start + ms(300), start + ms(313)),
+        deadline.arm(start, start, start + ms(13)),
+        Arm::Set(ms(437))
+    );
+    assert_eq!(
+        deadline.arm(start, start, start + ms(300)),
+        Arm::Set(ms(150))
+    );
+    // Measured from the last setting's reply, not from the start.
+    assert_eq!(
+        deadline.arm(start + ms(300), start + ms(300), start + ms(312)),
+        Arm::Armed
+    );
+    assert_eq!(
+        deadline.arm(start + ms(300), start + ms(300), start + ms(313)),
         Arm::Set(ms(137))
     );
     // A setting sent at `start` and answered a round trip later: a statement
@@ -98,10 +107,24 @@ fn a_later_statement_of_one_write_gets_only_what_is_left_of_its_bound() {
         let answered = start + ms(round_trip);
         for after in 0..=12 {
             let sent = answered + ms(after);
-            assert_eq!(deadline.arm(answered, sent), Arm::Armed);
+            assert_eq!(deadline.arm(start, answered, sent), Arm::Armed);
             assert!(sent + armed <= deadline.at() - ms(37) + ms(round_trip));
         }
     }
+    // A setting whose reply took longer than three-eighths of the margin
+    // (18.75 ms) is not used again: the next statement sets it afresh.
+    assert_eq!(
+        deadline.arm(start, start + ms(18), start + ms(18)),
+        Arm::Armed
+    );
+    assert_eq!(
+        deadline.arm(start, start + ms(19), start + ms(19)),
+        Arm::Set(ms(431))
+    );
+    assert_eq!(
+        deadline.arm(start, start + ms(200), start + ms(200)),
+        Arm::Set(ms(250))
+    );
 }
 
 #[test]
@@ -176,14 +199,24 @@ impl Database {
         Ok(())
     }
 
-    /// The ledger's backends running a statement now.
+    /// The ledger's backends still running a statement after up to a second:
+    /// none, unless one runs on. (The pool's return flushes a dropped
+    /// transaction's `ROLLBACK` in a task of its own, briefly `active`.)
     async fn active(&self) -> Result<Vec<(i32, String)>> {
-        Ok(sqlx::query_as(
-            "SELECT pid,query FROM pg_stat_activity WHERE application_name=$1 AND state='active'",
-        )
-        .bind(&self.application)
-        .fetch_all(&self.admin)
-        .await?)
+        let mut active = Vec::new();
+        for _ in 0..100 {
+            active = sqlx::query_as(
+                "SELECT pid,query FROM pg_stat_activity WHERE application_name=$1 AND state='active'",
+            )
+            .bind(&self.application)
+            .fetch_all(&self.admin)
+            .await?;
+            if active.is_empty() {
+                break;
+            }
+            tokio::time::sleep(ms(10)).await;
+        }
+        Ok(active)
     }
 
     /// Whether every one of the ledger's backends is idle outside a

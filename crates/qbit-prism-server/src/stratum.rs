@@ -151,7 +151,8 @@ pub trait MiningBackend: Send + Sync + 'static {
     /// a decrease. A backend whose statements a database server runs must
     /// have the server end them by `deadline`, so that none outlives the
     /// writer's bound; the coordinator runs the write as one transaction
-    /// under a statement timeout taken from it. This default, for a backend
+    /// under a statement timeout taken from it, whose commit waits for the
+    /// local WAL flush only. This default, for a backend
     /// with no such server, is [`Self::remember_worker_difficulty`] and then
     /// [`Self::worker_difficulty`], bounded only by the writer.
     fn write_difficulty_hint(

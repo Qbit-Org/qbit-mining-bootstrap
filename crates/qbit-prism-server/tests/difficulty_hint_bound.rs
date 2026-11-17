@@ -5,10 +5,11 @@
 //! `support/ledger_execution_proxy.rs`, which records every `Execute` and
 //! `Query` frame (one round trip each) with the connection that sent it. The
 //! pool's checkouts are read from the ledger's own
-//! `qbit_prism_database_pool_acquire_seconds` counter. A write whose
-//! statements all finish within the margin never sets its timeout again, so
-//! the counts below are the write's whole cost; the pool's release and
-//! checkout pings are `Sync` frames, not statements, and are not counted.
+//! `qbit_prism_database_pool_acquire_seconds` counter. The writes run under a
+//! 300 s bound, so none sets its timeout again (that waits for a fortieth of
+//! the bound, 7.5 s, after the last setting's reply), and the counts below
+//! are the write's whole cost; the pool's release and checkout pings are
+//! `Sync` frames, not statements, and are not counted.
 use anyhow::{ensure, Context, Result};
 use futures_util::FutureExt;
 use qbit_prism::AcceptedShare;
@@ -205,7 +206,7 @@ impl Fixture {
                 difficulty,
                 share_id,
                 900,
-                HintDeadline::after(Duration::from_secs(30)),
+                HintDeadline::after(Duration::from_secs(300)),
             )
             .await?;
         let executions = self.proxy.executions_since(mark)?;
@@ -328,13 +329,13 @@ fn now_ms() -> i64 {
     .unwrap()
 }
 
-/// Whether a commit at the session's own level, on `probe`, waits for a
-/// synchronous standby now: it has not returned within 300 ms. The waiting
-/// commit is left behind until the standby list is reset.
+/// Whether a commit at the session's own level waits for a synchronous
+/// standby now: it has not returned within a second. The waiting commit is
+/// left behind until the standby list is reset.
 async fn commits_wait_for_the_standby(admin: &PgPool) -> Result<bool> {
     let mut probe = admin.acquire().await?;
     let insert = sqlx::query("INSERT INTO prism_sync_probe VALUES (1)").execute(&mut *probe);
-    Ok(tokio::time::timeout(Duration::from_millis(300), insert)
+    Ok(tokio::time::timeout(Duration::from_secs(1), insert)
         .await
         .is_err())
 }
@@ -377,12 +378,14 @@ async fn a_hint_commits_without_waiting_for_a_synchronous_standby() -> Result<()
             .await?;
         // The reload reaches the backends and the standby bookkeeping in
         // its own time: wait until a commit at the session's level waits.
+        let reloaded_by = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut waiting = false;
-        for _ in 0..20 {
+        while tokio::time::Instant::now() < reloaded_by {
             if commits_wait_for_the_standby(&admin).await? {
                 waiting = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         ensure!(waiting, "commits never waited for the absent standby");
         let started = tokio::time::Instant::now();
@@ -429,9 +432,17 @@ async fn a_hint_commits_without_waiting_for_a_synchronous_standby() -> Result<()
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    ledger.pool.close().await;
-    admin.close().await;
-    drop(cluster);
+    if reset.is_err() {
+        // Commits still wait, and a pool closes only once its connections
+        // are back: stop the cluster first, which ends them.
+        drop(cluster);
+        ledger.pool.close().await;
+        admin.close().await;
+    } else {
+        ledger.pool.close().await;
+        admin.close().await;
+        drop(cluster);
+    }
     match result {
         Err(panic) => resume_unwind(panic),
         Ok(result) => result.and(reset),

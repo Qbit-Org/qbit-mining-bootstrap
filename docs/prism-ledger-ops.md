@@ -2872,8 +2872,9 @@ it:
   transaction-local `statement_timeout` of what is left of the bound less a
   tenth of it: the first is set in the `BEGIN`'s own round trip, and another
   only when a statement is sent more than a fortieth of the bound after the
-  last setting's reply. A statement with less than a millisecond left is not sent,
-  nor a `COMMIT` with less than the tenth left. PostgreSQL turns the
+  last setting's reply (or right away when that reply took over three-eighths
+  of the tenth). A statement with less than a millisecond left is not sent,
+  nor a `COMMIT` with less than the tenth and a millisecond left. PostgreSQL turns the
   statement timer off before it commits, so the transaction also sets
   `synchronous_commit = local` for itself: a hint's `COMMIT` waits for the
   local WAL flush only, never a standby (see the
@@ -2892,9 +2893,10 @@ it:
   `PRISM_DATABASE_LOCK_TIMEOUT_MS` still applies to their lock waits, as
   before, and a lock wait it ends counts as `failed`. The row lock a hint's
   write takes is held through its read-back and `COMMIT`, a round trip or
-  two and the local flush. No statement before `COMMIT` holds it past the
-  bound; a local flush that stalls holds it, and its connection, until the
-  flush ends, and a connection that stalls mid-transaction holds it until
+  two and the local flush. While database round trips stay within that
+  tenth's allowance (about 19 ms at 500 ms), no statement before `COMMIT`
+  holds it past the bound; a local flush that stalls holds it, and its
+  connection, until the flush ends, and a connection that stalls mid-transaction holds it until
   the session ends, as before. Another
   frontend's hint for the same worker waits for it under its own bound, and
   the pruner skips locked rows. A hint ended so counts as
