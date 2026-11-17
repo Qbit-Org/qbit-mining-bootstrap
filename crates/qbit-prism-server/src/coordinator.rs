@@ -3932,10 +3932,16 @@ impl Coordinator {
                                 _ = shutdown.changed() => {
                                     // #578: an offer in flight is sent and
                                     // recorded before the attempt is dropped.
+                                    // The wait leaves the lease's bound for
+                                    // the hand-back below: one that drops an
+                                    // attempt before its send returns the
+                                    // reservation to `pending` in it.
                                     let left = unreleased
                                         .stop_deadline()
                                         .saturating_duration_since(tokio::time::Instant::now());
-                                    let bound = self.offer_section_bound(lease).min(left);
+                                    let bound = self
+                                        .offer_section_bound(lease)
+                                        .min(left.saturating_sub(lease.timeout));
                                     let finished =
                                         self.finish_offer_section(running.as_mut(), bound).await;
                                     break (finished, true);

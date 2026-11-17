@@ -199,7 +199,7 @@ impl Attempt {
                 Some(Unsent { why, .. }) => {
                     tracing::warn!(%block,"the shutdown stopped an attempt holding an offer reservation the node never ran; returning the reservation to pending");
                     let reason = unsent_reason(&why, &anyhow::anyhow!("stopped at shutdown"));
-                    return_unsent_reservation(ledger, &self.claim, &reason, true, true).await
+                    return_unsent_reservation(ledger, &self.claim, &reason, true).await
                 }
                 None => {
                     ledger
@@ -243,15 +243,20 @@ impl FailedAttempt {
 
     /// One bounded release: `Ok(true)` released, `Ok(false)` no longer held
     /// by this claim, an error when the database did not answer in time.
+    /// Once the loop is stopping (`stop_by`), an unsent reservation is
+    /// returned due at once, as at shutdown.
     async fn try_release(
         &self,
         ledger: &Ledger,
         lease: CandidateLease,
         stop_by: Option<tokio::time::Instant>,
     ) -> Result<bool> {
-        tokio::time::timeout(self.budget(lease, stop_by), self.release(ledger, false))
-            .await
-            .context("candidate claim release deadline exceeded")?
+        tokio::time::timeout(
+            self.budget(lease, stop_by),
+            self.release_with(ledger, false, stop_by.is_some()),
+        )
+        .await
+        .context("candidate claim release deadline exceeded")?
     }
 
     /// The shutdown's release, the submit loop's token-fenced claim release
@@ -263,27 +268,29 @@ impl FailedAttempt {
         lease: CandidateLease,
         stop_by: Option<tokio::time::Instant>,
     ) -> Result<bool> {
-        tokio::time::timeout(self.budget(lease, stop_by), self.release(ledger, true))
-            .await
-            .context("candidate claim release deadline exceeded")?
+        tokio::time::timeout(
+            self.budget(lease, stop_by),
+            self.release_with(ledger, true, true),
+        )
+        .await
+        .context("candidate claim release deadline exceeded")?
     }
 
     /// The release itself: an unsent reservation goes back to `pending`
-    /// ([`return_unsent_reservation`]), due at once at shutdown as the
+    /// ([`return_unsent_reservation`]), due at once when `stopping`, as the
     /// ordinary shutdown release keeps the row claimable at once; any other
     /// claim is released keeping the row's state, with the backoff, or at
     /// shutdown keeping its schedule.
-    async fn release(&self, ledger: &Ledger, at_shutdown: bool) -> Result<bool> {
+    async fn release_with(
+        &self,
+        ledger: &Ledger,
+        at_shutdown: bool,
+        stopping: bool,
+    ) -> Result<bool> {
         match self.release {
             Release::Unsent { due_now } => {
-                return_unsent_reservation(
-                    ledger,
-                    &self.claim,
-                    &self.reason,
-                    due_now || at_shutdown,
-                    at_shutdown,
-                )
-                .await
+                return_unsent_reservation(ledger, &self.claim, &self.reason, due_now || stopping)
+                    .await
             }
             Release::Claim if at_shutdown => {
                 ledger
@@ -305,14 +312,15 @@ impl FailedAttempt {
 /// [`Ledger::release_unsent_offer`] requires.
 fn unsent_reason(why: &str, error: &anyhow::Error) -> String {
     format!(
-        "{}: {why} ({error}); the reservation was returned to pending for another offer",
+        "{}: {why} ({error:#}); the reservation was returned to pending for another offer",
         crate::ledger::OFFER_NOT_SENT_REASON_PREFIX
     )
 }
 
 /// Return `claim`'s offer reservation, which the node provably never ran, to
-/// `pending`: [`Ledger::release_unmade_offer`] when `due_now`, else
-/// [`Ledger::release_unsent_offer`], one transaction fenced on the token,
+/// `pending`: [`Ledger::release_unmade_offer`], due at once, when `due_now`,
+/// else [`Ledger::release_unsent_offer`], after the pending backoff; one
+/// transaction fenced on the token,
 /// `offer_reserved`, no call time and no outcome, so a row another claim has
 /// taken, or one that has moved on, is never touched. `Ok(true)` released,
 /// `Ok(false)` no longer held by this claim, an error when the database did
@@ -324,10 +332,11 @@ fn unsent_reason(why: &str, error: &anyhow::Error) -> String {
 ///   write's `WHERE`; keep the two equal): the write's error, retried;
 /// - this claim's token holds the row in another state, as when a failover
 ///   lost the reservation's commit and the row is `pending` again: the
-///   ordinary release frees it at once ([`Ledger::release_candidate_claim`],
-///   or at shutdown [`Ledger::release_recovery_claim`]) rather than leaving
-///   it to the lease. Nothing else writes the row under this token once the
-///   attempt is over, so the read cannot be overtaken by a reservation;
+///   ordinary release frees it now rather than leaving it to the lease,
+///   keeping its schedule when `due_now` ([`Ledger::release_recovery_claim`])
+///   and otherwise with the backoff ([`Ledger::release_candidate_claim`]).
+///   Nothing else writes the row under this token once the attempt is over,
+///   so the read cannot be overtaken by a reservation;
 /// - another token, or none, holds the row: `Ok(false)`. A write whose
 ///   COMMIT committed although its reply was lost reads this way, which is
 ///   the case.
@@ -342,7 +351,6 @@ async fn return_unsent_reservation(
     claim: &CandidateClaim,
     reason: &str,
     due_now: bool,
-    at_shutdown: bool,
 ) -> Result<bool> {
     let returned = if due_now {
         ledger.release_unmade_offer(claim, reason).await
@@ -363,9 +371,7 @@ async fn return_unsent_reservation(
     };
     match held.await {
         Ok(Some((true, true))) | Err(_) => Err(error),
-        Ok(Some((true, false))) if at_shutdown => {
-            ledger.release_recovery_claim(claim, reason).await
-        }
+        Ok(Some((true, false))) if due_now => ledger.release_recovery_claim(claim, reason).await,
         Ok(Some((true, false))) => ledger.release_candidate_claim(claim, reason).await,
         Ok(Some((false, _)) | None) => Ok(false),
     }

@@ -603,9 +603,23 @@ async fn a_failed_release_after_the_offer_is_retried_and_keeps_the_offer_without
                     Park::AfterOffer,
                 )
                 .await?;
-            fixture
-                .fail_next_updates("fail_release", ORDINARY_RELEASE, 1)
-                .await?;
+            if at_shutdown {
+                // Every release that backs the row off fails, so only the
+                // shutdown's, which keeps its schedule, can free the claim.
+                fixture
+                    .fail_next_updates(
+                        "fail_release",
+                        &format!(
+                            "{ORDINARY_RELEASE} AND NEW.next_attempt_at > OLD.next_attempt_at"
+                        ),
+                        i64::MAX,
+                    )
+                    .await?;
+            } else {
+                fixture
+                    .fail_next_updates("fail_release", ORDINARY_RELEASE, 1)
+                    .await?;
+            }
             fixture
                 .fail_next_updates("fail_renewal", RENEWAL, 1)
                 .await?;
@@ -619,18 +633,22 @@ async fn a_failed_release_after_the_offer_is_retried_and_keeps_the_offer_without
             .await
             .context("the dropped attempt never tried to release its claim")??;
             let frontend = if at_shutdown {
-                // The next retry is a second away; the shutdown's comes first.
+                ensure!(
+                    fixture.row().await?.token.is_some(),
+                    "a release that backs the row off freed the claim"
+                );
                 looping.stop().await?
             } else {
                 fixture
                     .wait_for_row("released", |row| row.token.is_none())
                     .await?;
-                looping.stop().await?
+                let frontend = looping.stop().await?;
+                ensure!(
+                    fixture.injected("fail_release").await? >= 2,
+                    "the claim was freed without a second release"
+                );
+                frontend
             };
-            ensure!(
-                fixture.injected("fail_release").await? >= 2,
-                "the claim was freed without a second release"
-            );
             let row = fixture.row().await?;
             let reason = row.last_error.clone().unwrap_or_default();
             ensure!(
@@ -677,4 +695,42 @@ async fn a_failed_release_after_the_offer_is_retried_and_keeps_the_offer_without
         result.with_context(|| format!("at shutdown: {at_shutdown}"))?;
     }
     Ok(())
+}
+
+/// The attempt holds what it believes is its unsent reservation, but the row
+/// it finds is `pending` again under its own claim, as after a failover to a
+/// standby that had the claim's commit and not the reservation's. The return
+/// to `pending` misses its fence; the claim is then freed at once with the
+/// ordinary release instead of being left to its 30 s lease, and the block is
+/// offered once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsent_return_that_finds_the_reservation_gone_frees_the_claim_at_once() -> Result<()> {
+    let _serial = TEST_LOCK.lock().await;
+    let Some(fixture) = Fixture::open().await? else {
+        return Ok(());
+    };
+    let result = async {
+        let looping = fixture
+            .start_loop(
+                fixture.coordinator.config.rpc_url.clone(),
+                PRE_SEND_LEASE,
+                Duration::from_secs(1),
+                Park::BeforeSend,
+            )
+            .await?;
+        // The reservation's commit is lost; the claim's is not.
+        sqlx::query("UPDATE qbit_block_candidate_outbox SET state='pending',offer_reserved_at=NULL,offer_reserved_by=NULL WHERE block_hash=$1 AND claim_token IS NOT NULL")
+            .bind(&fixture.claim.candidate.block_hash)
+            .execute(&fixture.coordinator.ledger.pool)
+            .await?;
+        fixture.fail_next_updates("fail_renewal", RENEWAL, 1).await?;
+        looping.probe()?.release.notify_one();
+        // Freed well inside the 30 s lease, with the backoff of the ordinary
+        // release.
+        fixture.returned_unsent("renewal").await?;
+        fixture.offered_once_more(looping).await
+    }
+    .await;
+    fixture.close().await?;
+    result
 }
