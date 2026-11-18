@@ -185,9 +185,11 @@ impl Fixture {
 /// The relayed frontend's attempt dies with its connections and its release
 /// fails with them. Once the database answers again, the holder releases the
 /// claim itself, well inside the 30 s lease, and only after the attempt's work
-/// was dropped. Another frontend then recovers the reservation, which is never
-/// offered again, and lands it with the outcome `unknown` (#529 a); no
-/// `submitblock` was ever made.
+/// was dropped (#529 a). The attempt was parked between its reservation and
+/// its `submitblock`, so it knows nothing was sent: the release returns the
+/// reservation to `pending`, and another frontend offers the block, once.
+/// Before, the release kept the reservation, and the block was settled as
+/// delivery unknown without ever reaching the node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_release_is_retried_after_the_attempt_stops_and_frees_the_row_before_its_lease(
 ) -> Result<()> {
@@ -223,37 +225,46 @@ async fn a_failed_release_is_retried_after_the_attempt_stops_and_frees_the_row_b
         let released_after = healed.elapsed();
         parked.stop().await?;
         let row = fixture.row().await?;
+        let reason = row.last_error.clone().unwrap_or_default();
         ensure!(
-            row.state == "offer_reserved" && row.outcome.is_none() && row.offered_at_ms.is_none(),
-            "the released row changed its reservation: {} {:?}",
+            row.state == "pending"
+                && row.outcome.is_none()
+                && row.offered_at_ms.is_none()
+                && row.reserved_by.is_none()
+                && row.evidence,
+            "the unsent reservation was not returned to pending: {} {:?}, reason {reason}",
             row.state,
             row.outcome
         );
+        ensure!(
+            reason.starts_with(crate::ledger::OFFER_NOT_SENT_REASON_PREFIX)
+                && reason.contains("candidate-relayed"),
+            "the return is not recorded: {reason}"
+        );
+        ensure!(fixture.submissions().await == 0);
 
-        // Recovery on another frontend: the block reached the chain through
-        // an offer whose answer was never recorded.
-        fixture.activate_on_node().await;
+        // Another frontend offers the block, once.
         sqlx::query("UPDATE qbit_block_candidate_outbox SET next_attempt_at=clock_timestamp() WHERE block_hash=$1")
             .bind(&fixture.claim.candidate.block_hash)
             .execute(&fixture.coordinator.ledger.pool)
             .await?;
-        let recovered = fixture
+        let offer = fixture
             .successor
             .claim_candidate(10)
             .await?
             .context("the released row could not be claimed")?;
-        ensure!(recovered.lifecycle.state == CandidateState::OfferReserved);
+        ensure!(offer.lifecycle.state == CandidateState::Pending);
         fixture
             .successor_coordinator
-            .process_candidate(&recovered)
+            .process_candidate(&offer)
             .await?;
         let row = fixture.row().await?;
         ensure!(
             row.state == "submitted"
-                && row.outcome.as_deref() == Some("unknown")
-                && row.offered_at_ms.is_none()
-                && row.reserved_by.as_deref() == Some("candidate-relayed"),
-            "the recovered reservation landed as {} with outcome {:?} at {:?} reserved by {:?}",
+                && row.outcome.as_deref() == Some("accepted")
+                && row.offered_at_ms.is_some()
+                && row.reserved_by.as_deref() == Some("candidate-successor"),
+            "the returned block landed as {} with outcome {:?} at {:?} reserved by {:?}",
             row.state,
             row.outcome,
             row.offered_at_ms,
@@ -261,8 +272,9 @@ async fn a_failed_release_is_retried_after_the_attempt_stops_and_frees_the_row_b
         );
         ensure!(fixture.landed().await?);
         ensure!(
-            fixture.submissions().await == 0,
-            "a reservation was offered again"
+            fixture.submissions().await == 1,
+            "the block was offered {} times",
+            fixture.submissions().await
         );
         eprintln!(
             "deferred release: claim released {:.2} s after the database answered (lease {} s)",
@@ -278,7 +290,9 @@ async fn a_failed_release_is_retried_after_the_attempt_stops_and_frees_the_row_b
 
 /// A deferred release is fenced on its own token: once the lease expired and
 /// another frontend took the row, the holder's release, retried after the
-/// database answers, leaves the new claim untouched.
+/// database answers, leaves the new claim untouched, although the holder's
+/// attempt never sent its reservation. The new holder cannot know that, and
+/// settles the block as delivery unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deferred_release_never_frees_a_row_another_frontend_took() -> Result<()> {
     let _serial = TEST_LOCK.lock().await;
@@ -325,7 +339,8 @@ async fn a_deferred_release_never_frees_a_row_another_frontend_took() -> Result<
 
 /// A shutdown attempts each deferred release once. The heartbeat interval is
 /// 1 s here, so the next scheduled retry falls after the shutdown and only
-/// the shutdown's attempt can free the row.
+/// the shutdown's attempt can free the row. The attempt never sent its
+/// reservation, so the shutdown's release returns it to `pending` too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_attempts_each_deferred_release_once() -> Result<()> {
     let _serial = TEST_LOCK.lock().await;
@@ -354,6 +369,13 @@ async fn shutdown_attempts_each_deferred_release_once() -> Result<()> {
         ensure!(
             token.is_none(),
             "shutdown left the deferred release to the lease: still held by {holder:?}"
+        );
+        let row = fixture.row().await?;
+        ensure!(
+            row.state == "pending" && row.outcome.is_none() && row.reserved_by.is_none(),
+            "the shutdown's release kept the unsent reservation: {} {:?}",
+            row.state,
+            row.outcome
         );
         Ok::<_, anyhow::Error>(())
     }

@@ -15,6 +15,12 @@ use tokio::net::{TcpListener, TcpStream};
 #[path = "offer_warmup_tests.rs"]
 mod offer_warmup_tests;
 
+#[path = "offer_not_dispatched_tests.rs"]
+mod offer_not_dispatched_tests;
+
+#[path = "offer_unsent_release_tests.rs"]
+mod offer_unsent_release_tests;
+
 /// What the relay does with a `submitblock` request.
 #[derive(Clone, Copy, PartialEq)]
 enum Submit {
@@ -35,6 +41,18 @@ enum Submit {
     WarmupAfterReply,
     /// Answer every call, of any method, as a node still warming up (#526).
     Warming,
+    /// Answer the next `submitblock` with HTTP 503 and `body`, as qbitd's
+    /// HTTP server does before it dispatches a request, without forwarding
+    /// it, closing the connection after the reply when `close`; then forward
+    /// again.
+    RefuseBeforeDispatch {
+        body: &'static str,
+        close: bool,
+    },
+    /// Forward it, read the node's reply, and answer with a reverse proxy's
+    /// own 503 page instead: the node ran the call, and the page proves
+    /// nothing.
+    UnavailableAfterForward,
 }
 
 struct RelayState {
@@ -174,6 +192,19 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
         let call = serde_json::from_slice::<Value>(&body).unwrap_or_default();
         let submit = call["method"] == "submitblock";
         let mode = *state.submit.lock().unwrap();
+        if let (true, Submit::RefuseBeforeDispatch { body, close }) = (submit, mode) {
+            *state.submit.lock().unwrap() = Submit::Forward;
+            if client
+                .get_mut()
+                .write_all(&unavailable_reply(body, close))
+                .await
+                .is_err()
+                || close
+            {
+                return;
+            }
+            continue;
+        }
         if mode == Submit::Warming || (submit && mode == Submit::Warmup) {
             if client
                 .get_mut()
@@ -201,6 +232,13 @@ async fn relay(state: Arc<RelayState>, client: TcpStream) {
         }
         if submit && mode == Submit::HoldReply {
             return std::future::pending().await;
+        }
+        if submit && mode == Submit::UnavailableAfterForward {
+            let _ = client
+                .get_mut()
+                .write_all(&unavailable_reply(PROXY_503_PAGE, true))
+                .await;
+            return;
         }
         if client.get_mut().write_all(&reply).await.is_err() {
             return;
@@ -236,6 +274,24 @@ fn warmup_reply(id: &Value) -> Vec<u8> {
     )
     .into_bytes()
 }
+
+/// An HTTP 503 reply with `body`, under the headers libevent writes; with
+/// `close`, as `evhttp_send_error` sends it, `Connection: close`.
+fn unavailable_reply(body: &str, close: bool) -> Vec<u8> {
+    let (content_type, connection) = if close {
+        ("text/html", "Connection: close\r\n")
+    } else {
+        ("text/html; charset=ISO-8859-1", "")
+    };
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: {content_type}\r\n{connection}Date: Tue, 17 Nov 2026 00:00:00 GMT\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// nginx's own 503 page, as a reverse proxy in front of the node writes it.
+const PROXY_503_PAGE: &str = "<html>\r\n<head><title>503 Service Temporarily Unavailable</title></head>\r\n<body>\r\n<center><h1>503 Service Temporarily Unavailable</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
 
 impl Fixture {
     /// A third frontend on the fixture's database that reaches the node

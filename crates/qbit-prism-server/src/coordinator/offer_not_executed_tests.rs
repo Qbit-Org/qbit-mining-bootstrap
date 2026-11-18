@@ -1,10 +1,13 @@
 //! #526: which `submitblock` results prove that the node never ran the call.
 //! Only a connection that was never established (#522), a request hyper
-//! handed back unwritten (#816) and a warmup answer to `submitblock` itself
-//! do; every other result stays with
-//! [`classify_offer`], where a failure is an unknown outcome.
+//! handed back unwritten (#816), a warmup answer to `submitblock` itself and
+//! qbitd's own pre-dispatch HTTP 503 refusal of it do; every other result
+//! stays with [`classify_offer`], where a failure is an unknown outcome.
 use super::*;
-use crate::rpc::{NotSentStage, RpcNotSentError, RpcRelayRefused, RpcReplyError, RPC_IN_WARMUP};
+use crate::rpc::{
+    NotDispatched, NotSentStage, RpcNotDispatchedError, RpcNotSentError, RpcRelayRefused,
+    RpcReplyError, RPC_IN_WARMUP,
+};
 
 /// The node's error object, as qbitd writes it into a JSON-RPC 1.0 reply.
 fn reply(method: &str, error: Value) -> Result<Value> {
@@ -74,6 +77,33 @@ fn a_relay_refused_under_the_kill_switch_was_not_executed() {
     assert!(reason.contains("PRISM_BLOCK_SUBMIT_ENABLED"), "{reason}");
 }
 
+/// qbitd refused the `submitblock` with one of its two pre-dispatch 503
+/// replies, a full work queue or a server shutting down: the node never ran
+/// it, so the reservation goes back to `pending`. The same refusal of
+/// another call says nothing about this one.
+#[test]
+fn a_submitblock_refused_before_dispatch_was_not_executed() {
+    for (refusal, wording) in [
+        (NotDispatched::WorkQueueFull, "Work queue depth exceeded"),
+        (NotDispatched::ShuttingDown, "shutting down"),
+    ] {
+        let refused = |method: &str| -> Result<Value> {
+            Err(RpcNotDispatchedError {
+                method: method.into(),
+                refusal,
+            }
+            .into())
+        };
+        let reason = offer_not_executed(&refused("submitblock"))
+            .unwrap_or_else(|| panic!("{refusal:?} was taken for a call that may have run"));
+        assert!(
+            reason.contains("refused before dispatch (HTTP 503") && reason.contains(wording),
+            "{reason}"
+        );
+        assert_eq!(offer_not_executed(&refused("sendrawtransaction")), None);
+    }
+}
+
 /// Another call's warmup answer says nothing about this `submitblock`: the
 /// classification is scoped to the one call it describes.
 #[test]
@@ -117,6 +147,10 @@ fn every_other_submitblock_error_may_have_executed() {
 #[test]
 fn answers_and_other_failures_are_not_classified_here() {
     let transport: Result<Value> = Err(anyhow::anyhow!("qbit RPC submitblock transport failed"));
+    // Any other 503: a proxy's page, possibly after it forwarded the call.
+    let unavailable: Result<Value> = Err(anyhow::anyhow!(
+        "qbit RPC submitblock returned invalid JSON (HTTP 503 Service Unavailable)"
+    ));
     let timeout: Result<Value> = Err(anyhow::Error::new(std::io::Error::from(
         std::io::ErrorKind::TimedOut,
     )));
@@ -125,6 +159,7 @@ fn answers_and_other_failures_are_not_classified_here() {
         Ok(json!("duplicate")),
         Ok(json!({"unexpected": true})),
         transport,
+        unavailable,
         timeout,
     ] {
         assert_eq!(offer_not_executed(&result), None, "{result:?}");

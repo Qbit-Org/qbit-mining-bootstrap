@@ -4,12 +4,16 @@
 //! deadline included (#762), and one whose request hyper handed back
 //! unwritten because its connection closed first (#816); every failure after
 //! the request may have been written, whether or not the peer read it, stays
-//! an ordinary error that the offer path records as an unknown outcome. Each
+//! an ordinary error that the offer path records as an unknown outcome. A
+//! relaying call that reached the node and was refused with one of qbitd's
+//! two exact pre-dispatch HTTP 503 replies is [`RpcNotDispatchedError`]; any
+//! other 503 is an ordinary error. Each
 //! case runs the real client against a real socket on the loopback interface,
 //! so a change in reqwest's or hyper's error kinds fails here rather than in
 //! production.
 use qbit_prism_server::rpc::{
-    relay_connect_budget, Rpc, RpcNotSentError, RpcRelayRefused, RpcReplyError, RELAY_METHODS,
+    relay_connect_budget, NotDispatched, Rpc, RpcNotDispatchedError, RpcNotSentError,
+    RpcRelayRefused, RpcReplyError, RELAY_METHODS,
 };
 #[cfg(target_os = "linux")]
 use qbit_prism_server::rpc::{NotSentStage, SpareObserver};
@@ -806,6 +810,108 @@ async fn http_and_node_errors_after_the_send_are_not_unsent() {
         if status.starts_with("200") {
             assert!(error.downcast_ref::<RpcReplyError>().is_some(), "{error:#}");
         }
+    }
+}
+
+/// qbitd's body when its HTTP work queue is full (Qbit Core v1.0.1,
+/// `src/httpserver.cpp`, `http_request_cb`: `WriteReply(HTTP_SERVICE_UNAVAILABLE,
+/// "Work queue depth exceeded")`), written before the request is queued.
+const WORK_QUEUE_FULL: &str = "Work queue depth exceeded";
+
+/// libevent 2.1.12's `evhttp_send_error(req, HTTP_SERVUNAVAIL, nullptr)`
+/// page, which qbitd's `http_reject_request_cb` answers every request with
+/// once its HTTP server is interrupted for shutdown.
+const LIBEVENT_503_PAGE: &str = "<HTML><HEAD>\n<TITLE>503 Service Unavailable</TITLE>\n</HEAD><BODY>\n<H1>Service Unavailable</H1>\n</BODY></HTML>\n";
+
+/// Answer one call with `status` and `body`, under the headers libevent
+/// writes, and return the call's error and the method the server read.
+async fn answer_once(method: &str, status: &str, body: &str) -> (anyhow::Error, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reply = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nConnection: close\r\nDate: Tue, 17 Nov 2026 00:00:00 GMT\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let (_, call) = read_call(&mut stream).await;
+        stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        call["method"].as_str().unwrap_or_default().to_owned()
+    });
+    let error = rpc(port)
+        .call_timeout(method, json!(["00"]), Some(SUBMIT_DEADLINE))
+        .await
+        .expect_err("the call must fail");
+    (error, server.await.unwrap())
+}
+
+/// qbitd refused a relaying call with one of its two HTTP 503 replies that
+/// it writes before dispatching a request: a full work queue, or a server
+/// shutting down. The request reached the node (it is not
+/// [`RpcNotSentError`]), but no handler ran it, and the error says which.
+#[tokio::test]
+async fn a_relaying_call_the_node_refused_before_dispatch_was_not_dispatched() {
+    for (body, refusal) in [
+        (WORK_QUEUE_FULL, NotDispatched::WorkQueueFull),
+        (LIBEVENT_503_PAGE, NotDispatched::ShuttingDown),
+    ] {
+        for method in ["submitblock", "sendrawtransaction"] {
+            let (error, read) = answer_once(method, "503 Service Unavailable", body).await;
+            assert_eq!(read, method);
+            let refused = error
+                .downcast_ref::<RpcNotDispatchedError>()
+                .unwrap_or_else(|| panic!("{refusal:?} to {method} was not typed: {error:#}"));
+            assert_eq!(
+                (refused.method.as_str(), refused.refusal),
+                (method, refusal)
+            );
+            assert!(not_sent(&error).is_none(), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("refused before dispatch (HTTP 503"),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// Only those exact bodies under 503, to a relaying call, prove anything. A
+/// proxy's 503 page (which may follow a forwarded request), a near miss, the
+/// page of another libevent, an empty 503, the exact bodies under another
+/// status, and a refusal of a call that relays nothing all stay ordinary
+/// errors, whose outcome on `submitblock` is unknown.
+#[tokio::test]
+async fn any_other_503_or_status_or_call_is_not_proven_undispatched() {
+    let nginx = "<html>\r\n<head><title>503 Service Temporarily Unavailable</title></head>\r\n<body>\r\n<center><h1>503 Service Temporarily Unavailable</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+    let libevent_2_2 = "<html><head><title>503 Service Unavailable</title></head><body><h1>503 Service Unavailable</h1></body></html>";
+    let near_miss = format!("{WORK_QUEUE_FULL}\n");
+    let cases = [
+        ("submitblock", "503 Service Unavailable", nginx),
+        ("submitblock", "503 Service Unavailable", near_miss.as_str()),
+        ("submitblock", "503 Service Unavailable", libevent_2_2),
+        ("submitblock", "503 Service Unavailable", ""),
+        ("submitblock", "500 Internal Server Error", WORK_QUEUE_FULL),
+        ("submitblock", "502 Bad Gateway", LIBEVENT_503_PAGE),
+        ("getblockcount", "503 Service Unavailable", WORK_QUEUE_FULL),
+        (
+            "getblockcount",
+            "503 Service Unavailable",
+            LIBEVENT_503_PAGE,
+        ),
+    ];
+    for (method, status, body) in cases {
+        let (error, read) = answer_once(method, status, body).await;
+        assert_eq!(read, method);
+        assert!(
+            error.downcast_ref::<RpcNotDispatchedError>().is_none() && not_sent(&error).is_none(),
+            "{method} {status} {body:?} was taken for a call the node never ran: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("returned invalid JSON (HTTP "),
+            "{method} {status}: {error}"
+        );
     }
 }
 
