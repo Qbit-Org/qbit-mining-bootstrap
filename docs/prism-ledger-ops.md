@@ -3049,16 +3049,20 @@ was rejected too: it reaps an idle leftover only after its timeout, does
 nothing under load, where the leftover is reused within milliseconds, and
 would end legitimate transactions that idle between statements.
 
-**Residual.** `partitions::ensure_with_metrics` and the rollup writer open
-their transactions with a plain `Transaction::begin` on a fresh checkout. The
-former runs inside the persist task on the missing-partition retry path and
-could be aborted mid-`BEGIN` there; it needs a detached partition lead first.
-The issued-job batch writer's `BatchConnection` runs in the batcher task and
-is cancelled only at shutdown.
+**Residual.** Partition maintenance (`partitions::ensure_with_metrics`, which
+the share append's missing-partition retry also calls) and the rollup sweep
+(`rollups::advance_with_metrics`) open their transactions through
+`shielded_begin` as well, since 3.1.2, and `scripts/check_prism_pool_acquires.py`
+rejects a plain `Transaction::begin` on a fresh pool checkout. The issued-job
+batch writer's `BatchConnection` begins on the connection it holds and, unless
+the batch ended cleanly, sends its own `ROLLBACK` before the connection is
+reused, closing it if that fails. The one plain `BEGIN` left under a timeout is
+on the peer pool: `PeerJournal::view` (`carry_owner.rs`). A leftover there ends
+with its session at the peer role's 5 s `idle_in_transaction_session_timeout`.
 
 ```sh
 test/prism-native-tests.sh cargo-args --locked -p qbit-prism-server \
-  --test ledger_cancelled_begin -- --nocapture
+  --test ledger_cancelled_begin --test maintenance_cancelled_begin -- --nocapture
 ```
 
 ### Native snapshot rejection and legacy segments
@@ -3757,9 +3761,12 @@ left without having been archived and verified first.
 attached above the next `share_seq`, about 67 M rows of headroom at the
 defaults. Every instance calls it at startup and then every
 `PRISM_SHARE_PARTITION_ENSURE_INTERVAL_SECONDS`, default 60. The call takes
-the online migration runner's advisory lock, so it is serialized per schema,
-two frontends never race on one partition name, and no partition is created
-while a conversion is swapping the table. It creates
+an advisory lock of its own, class 1347571027 (0x50524D53) with the schema as
+the second key, which the conversion to partitions takes too, so it is
+serialized per schema, two frontends never race on one partition name, and no
+partition is created while a conversion is swapping the table. It is not the
+online migration runner's lock class (0x50524953), so the two do not
+serialize each other through it. It creates
 nothing when the lead is intact and returns the number it created.
 
 A new partition is a standalone table `LIKE` the parent with a validated bound
