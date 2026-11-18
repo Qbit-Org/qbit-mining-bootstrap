@@ -144,6 +144,38 @@ pub trait MiningBackend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
+    /// One difficulty hint's write and its read-back (#856), which the
+    /// listener's writer bounds by `deadline` (#872): the retained
+    /// difficulty and its age, as [`Self::worker_difficulty`] returns them.
+    /// `share_id` is the accepted share that proves `difficulty`; `None` is
+    /// a decrease. A backend whose statements a database server runs must
+    /// have the server end them by `deadline`, so that none outlives the
+    /// writer's bound; the coordinator runs the write as one transaction
+    /// under a statement timeout taken from it, whose commit waits for the
+    /// local WAL flush only. This default, for a backend
+    /// with no such server, is [`Self::remember_worker_difficulty`] and then
+    /// [`Self::worker_difficulty`], bounded only by the writer.
+    fn write_difficulty_hint(
+        &self,
+        listener: &str,
+        worker: &Worker,
+        difficulty: f64,
+        share_id: Option<&str>,
+        ttl_seconds: u64,
+        _deadline: crate::ledger::HintDeadline,
+    ) -> impl Future<Output = Result<Option<(f64, Duration)>>> + Send {
+        async move {
+            self.remember_worker_difficulty(
+                listener,
+                worker,
+                difficulty,
+                share_id,
+                share_id.is_none(),
+            )
+            .await?;
+            self.worker_difficulty(listener, worker, ttl_seconds).await
+        }
+    }
     fn new_session_id(
         &self,
     ) -> impl Future<Output = std::result::Result<SessionId, StratumError>> + Send;

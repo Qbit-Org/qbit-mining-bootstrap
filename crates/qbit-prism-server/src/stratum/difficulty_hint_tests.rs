@@ -1059,3 +1059,24 @@ async fn a_refused_difficulty_is_written_however_long_it_waited() {
     assert_eq!(count(&f.metrics, DifficultyHintOutcome::AgedOut), 0.);
     assert_eq!(count(&f.metrics, DifficultyHintOutcome::Written), 1.);
 }
+
+// The coordinator writes a hint only through `write_difficulty_hint`, under
+// the writer's deadline (#872). Its `remember_worker_difficulty` refuses,
+// rather than fall back to the trait's default, which writes nothing, or to
+// the ledger's unbounded calls, so a caller that reaches it counts `failed`.
+#[tokio::test]
+async fn the_coordinator_refuses_a_hint_write_outside_the_writers_deadline() {
+    let frontend = crate::coordinator::miner_tests::Fixture::new(Duration::from_secs(60)).await;
+    let refused = frontend
+        .coordinator
+        .remember_worker_difficulty("primary", &worker("rig"), 2.0, None, true)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("write_difficulty_hint"),
+        "{refused:#}"
+    );
+}
+
+#[path = "difficulty_hint_postgres_tests.rs"]
+mod postgres;

@@ -273,6 +273,8 @@ qbit-prism-server::ctv_fanout_bookkeeping::a_hold_set_mid_attempt_hands_the_fano
 qbit-prism-server::ctv_fanout_bookkeeping::a_refused_completion_requeues_its_fanout_behind_the_rows_already_due
 qbit-prism-server::ctv_fanout_bookkeeping::a_send_whose_completion_is_refused_is_recorded_as_an_attempt
 qbit-prism-server::ctv_fanout_bookkeeping::a_shutdown_mid_attempt_hands_the_fanout_claim_back
+qbit-prism-server::difficulty_hint_bound::a_hint_commits_without_waiting_for_a_synchronous_standby
+qbit-prism-server::difficulty_hint_bound::a_hint_write_is_one_checkout_and_its_statements_are_counted_on_the_wire
 qbit-prism-server::dual_writer::a_single_writer_refuses_a_dual_writer_database_without_the_downgrade_flag
 qbit-prism-server::dual_writer::migration_027_adds_origin_node_to_every_copied_table
 qbit-prism-server::dual_writer::node_identity_set_gives_each_node_its_origin_parity_and_extranonce_half
@@ -864,6 +866,14 @@ qbit-prism-server::qbit_prism_server::ledger::connect::acquire::probe_tests::a_d
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::probe_tests::a_dead_idle_connection_is_replaced_when_the_idle_gap_reaches_the_threshold
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::test_support::postgres_fixture_cleans_up_after_setup_error_and_body_panic
 qbit-prism-server::qbit_prism_server::ledger::connect::acquire::tests::postgres_checkout_boundaries_and_callers
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_committed_hint_leaves_its_connection_at_the_pools_settings
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_custom_begin_cancelled_mid_round_trip_retires_its_connection
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_custom_begin_that_completes_returns_its_connection_at_the_pool_timeout
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_hint_statement_sent_late_gets_only_what_is_left_of_the_write_bound
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_hint_write_reaches_no_table_but_the_hint_rows
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_refused_custom_begin_retires_its_connection
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_statement_that_waits_while_it_is_prepared_gets_only_what_is_left_to_run
+qbit-prism-server::qbit_prism_server::ledger::difficulty::tests::postgres_a_write_whose_bound_is_spent_at_checkout_keeps_its_connection
 qbit-prism-server::qbit_prism_server::ledger::instances::live_instance_tests::heartbeat_sql_observes_empty_stale_and_missing_table
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued::dependency_row_tests::a_dual_writer_prepared_row_matches_its_columns_on_a_single_writer
 qbit-prism-server::qbit_prism_server::ledger::jobs::compact_issued_batch::tests::canceled_begin_cleans_untracked_transaction_before_pool_reuse
@@ -935,6 +945,7 @@ qbit-prism-server::qbit_prism_server::rollups::tests::postgres_run_shutdown_canc
 qbit-prism-server::qbit_prism_server::rollups::tests::postgres_run_shutdown_during_sql_preserves_success_and_compatibility
 qbit-prism-server::qbit_prism_server::rollups::tests::postgres_sql_cancellation_retains_success_and_rolls_back
 qbit-prism-server::qbit_prism_server::rollups::tests::postgres_sql_wait_and_failure_keep_completed_checkout
+qbit-prism-server::qbit_prism_server::stratum::difficulty_hint_tests::postgres::postgres_a_hint_held_past_a_non_default_bound_is_ended_by_the_server_and_counted_timed_out
 qbit-prism-server::readiness_frontend::a_dual_writer_frontend_on_the_other_nodes_database_fails_its_healthcheck
 qbit-prism-server::readiness_frontend::a_dual_writer_frontend_that_is_not_ready_refuses_stratum_and_answers_not_ready
 qbit-prism-server::readiness_frontend::a_rebuild_inside_the_grace_keeps_the_endpoint_ready_and_a_longer_one_withdraws

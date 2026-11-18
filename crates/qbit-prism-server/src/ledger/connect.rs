@@ -887,6 +887,8 @@ pub(super) async fn begin(
 /// offered again. On the successful path nothing changes: one `BEGIN`, the
 /// same connection, no further statement. The task is joined, never
 /// spawned-and-forgotten, so a panic in it propagates as it did before.
+/// A transaction opened by a statement other than `BEGIN` uses
+/// [`CustomBegin`] instead.
 pub(crate) async fn shielded_begin(
     connection: PoolConnection<Postgres>,
 ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
@@ -897,6 +899,95 @@ pub(crate) async fn shielded_begin(
         // connection it held is closed rather than returned, and the caller
         // sees the same kind of error a closed socket would give it.
         Err(join) => Err(sqlx::Error::Io(std::io::Error::other(join))),
+    }
+}
+
+/// A checked-out connection whose transaction is opened by a statement of
+/// the caller's (`BEGIN` and what the transaction sets, in one simple query),
+/// retired rather than offered to the next checkout unless that statement
+/// completed (#872).
+///
+/// [`shielded_begin`]'s task cannot cover such a statement. SQLx 0.8.6's
+/// `Transaction::begin` takes the connection by value, and its guard rolls
+/// back nothing until the reply is read (`transaction_depth` 0). A statement
+/// whose `BEGIN` ran but whose `SET LOCAL` the server refused, or that a
+/// cancel request reached between the two, would hand the pool a connection
+/// whose server side is in an aborted transaction, and every statement of
+/// every later checkout on it would fail until it is closed. A caller
+/// cancelled between the write and the reply would hand it one whose server
+/// side is in a transaction, and our `SET LOCAL`, that the client never
+/// counted (#482). So the transaction borrows the connection here, and
+/// `Drop` takes it out of the pool once the statement has been handed to
+/// SQLx unless its reply was read whole, as the share append's
+/// `AppendConnection` does. A guard dropped before that, with nothing sent,
+/// returns its connection to the pool as it was. On the successful path
+/// nothing changes: one round trip, the same connection, and the
+/// transaction's own drop queues its `ROLLBACK` as for any other.
+pub(super) struct CustomBegin {
+    /// Taken by `Drop`; present for the guard's whole life before that.
+    connection: Option<PoolConnection<Postgres>>,
+    /// Whether the statement was handed to SQLx to send.
+    sent: bool,
+    /// Whether the statement's reply was read whole, `ReadyForQuery`
+    /// included, with the server in a transaction.
+    began: bool,
+}
+
+/// How long a retired connection's graceful close may take before its
+/// socket is simply dropped, as SQLx bounds its own close on drop.
+const RETIRE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl CustomBegin {
+    pub(super) fn checked_out(connection: PoolConnection<Postgres>) -> Self {
+        Self {
+            connection: Some(connection),
+            sent: false,
+            began: false,
+        }
+    }
+
+    /// Open the transaction with `statement`. It starts with `BEGIN`, and the
+    /// rest of it must end with the transaction (`SET LOCAL`) and return no
+    /// rows: SQLx sends it as one simple query and reads its replies only up
+    /// to `ReadyForQuery`, so a row would be read and discarded, and anything
+    /// that outlived the transaction (a session `SET`, a lock taken for the
+    /// session) would outlive this guard's retirement check too.
+    pub(super) async fn custom_begin(
+        &mut self,
+        statement: String,
+    ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+        let connection = self.connection.as_mut().expect("custom begin connection");
+        self.sent = true;
+        let transaction = Transaction::begin(&mut **connection, Some(statement.into())).await?;
+        self.began = true;
+        Ok(transaction)
+    }
+}
+
+impl Drop for CustomBegin {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if self.began || !self.sent {
+            // Back to the pool, which flushes the transaction's queued
+            // `ROLLBACK` (or an unread `COMMIT` reply) before offering it;
+            // or never used, as it was checked out.
+            drop(connection);
+            return;
+        }
+        // `detach` leaves the pool at once, size and permit included, so the
+        // pool opens a replacement and never sees this connection again. The
+        // close sends `Terminate`; without a runtime to run it, dropping the
+        // raw connection closes the socket. Either way the server ends the
+        // session and aborts whatever transaction it held.
+        let raw = connection.detach();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ =
+                    tokio::time::timeout(RETIRE_CLOSE_TIMEOUT, sqlx::Connection::close(raw)).await;
+            });
+        }
     }
 }
 
