@@ -3,6 +3,7 @@ use crate::{ledger::Ledger, ledger_test_database::FixtureDatabase};
 use anyhow::Context;
 use futures_util::{future::LocalBoxFuture, FutureExt};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::Transaction;
 use std::panic::{resume_unwind, AssertUnwindSafe};
 
 const BOUND: Duration = Duration::from_secs(5);
