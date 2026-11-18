@@ -289,10 +289,27 @@ def census(root: Path) -> tuple[Counter, list[dict], int]:
     return sites, details, borrowed
 
 
+def unshielded_begin(site: str) -> bool:
+    """Whether `site` is a plain `begin(...)` call (no receiver, so
+    `Transaction::begin`) whose arguments check out a pool connection. Such a
+    `BEGIN` cancelled between its write and its reply hands the pool a
+    connection whose server side is in a transaction SQLx never counted
+    (#482); `crate::ledger::shielded_begin` opens it safely. Rejected whatever
+    the inventory says, since a plain BEGIN on a fresh checkout was once
+    classified as a held connection's. Only this shape is caught: a
+    `pool.begin()`, or a checkout bound to a variable first, still passes on
+    its classification alone."""
+    call = site.split("::", 2)[-1]
+    return call.startswith("begin(") and "acquire (" in call
+
+
 def check(sites: Counter, inventory: dict) -> list[str]:
     errors = []
     entries = inventory["sites"]
     policies = inventory["policies"]
+    for site in sites:
+        if unshielded_begin(site):
+            errors.append(f"unshielded BEGIN on a pool checkout, use crate::ledger::shielded_begin: {site}")
     for site, count in sites.items():
         entry = entries.get(site)
         if entry is None:

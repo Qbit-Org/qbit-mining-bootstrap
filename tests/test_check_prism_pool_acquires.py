@@ -178,6 +178,23 @@ mod negative_conditional {
                 self.assertTrue(any("unclassified" in e and "connect/acquire.rs" in e for e in errors))
                 self.assertTrue(any("stale classification" in e and "connect/acquire.rs" in e for e in errors))
 
+    def test_plain_begin_on_a_pool_checkout_is_rejected_even_when_classified(self):
+        self.append("partitions.rs", '''
+async fn negative_unshielded(pool: &PgPool) -> anyhow::Result<()> {
+    let transaction = sqlx::Transaction::begin(pool.acquire().await?, None).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+''')
+        sites = guard.census(self.root)[0]
+        site = next(site for site in sites if "negative_unshielded" in site and "::begin(" in site)
+        inventory = json.loads(json.dumps(self.inventory))
+        for key in sites:
+            if "negative_unshielded" in key:
+                inventory["sites"][key] = [sites[key], "transaction"]
+        errors = guard.check(sites, inventory)
+        self.assertIn(f"unshielded BEGIN on a pool checkout, use crate::ledger::shielded_begin: {site}", errors)
+
     def test_allowlist_requires_owner_reason_and_current_policy(self):
         site = "fixture::query::fetch_one(database)"
         sites = Counter({site: 1})
