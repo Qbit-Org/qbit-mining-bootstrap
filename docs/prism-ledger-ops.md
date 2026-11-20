@@ -446,11 +446,32 @@ late or not at all; its log lines show it.
   work-refresh alerts instead.
 
 The warning resolves at the first evaluation that finds the `LISTEN` holding
-at the latest scrape, or once the frontend has had no authorized miner for the
-whole window.
-Its two-minute windows ride over a failed scrape and carry the last reading for
-two minutes after scrapes stop; a scrape that keeps failing is
-`PrismMetricsEndpointDown`'s.
+at the latest scrape, once the frontend has had no authorized miner for the
+whole 15-minute miner window, or 4 minutes after its last successful scrape.
+Its windows ride over a failed scrape and carry the last reading for 4
+minutes from the last successful scrape: `PrismMetricsEndpointDown`'s
+3-minute dwell and one 1-minute evaluation interval, the standard rule group's
+default (#869). So a frontend whose scrapes fail while this warns or dwells
+keeps warning or dwelling until `PrismMetricsEndpointDown` fires for it, and a
+dwell can end on a reading up to 4 minutes old; a scrape that keeps failing is
+`PrismMetricsEndpointDown`'s. That needs the 15-second scrape interval plus its
+timeout (10 seconds by Prometheus's default, never more than the interval) to
+stay within 1 minute, the margin beyond the dwell, the standard evaluation
+interval to divide the 3-minute dwell, and both rules to be evaluated on the
+same tick, as one Grafana rule group's are unless within-group jitter is on;
+a scrape interval and timeout that, with any ingestion or query lag, exceed
+the margin, an evaluation interval that does not divide the dwell, or jitter
+can leave an evaluation between the two uncovered again. A target removed from
+Prometheus's configuration has no failing scrape, so
+`PrismMetricsEndpointDown` does not fire for its instance (only, as no data,
+for a network left with no target); this warning's series ends with
+the carry, and Grafana resolves it as a missing series, which takes its
+missing-series evaluations longer. The carry covers scrapes stopping, not resuming: after an outage
+longer than it, the dwell starts again at the first successful scrape, so a
+listener still down then warns 10 minutes later. It also delays the
+missing-gauge case: a frontend rolled back to an image from before #834 keeps
+its last reading of 1 for the carry, so it warns up to 4 minutes after the
+dwell.
 
 ## Durable block candidates
 
