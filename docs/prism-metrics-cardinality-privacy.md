@@ -45,6 +45,18 @@ startup: the `qbit_prism_payout_revision_listener_up` gauge (0 at startup) and
 the `qbit_prism_payout_revision_announcements_heard_total` counter (zero at
 startup), 2 startup and 2 populated series. The announcement's payload, a
 payout revision, never enters the exposition.
+#829's share append stages add one histogram family,
+`qbit_prism_share_append_stage_seconds{stage,outcome}`, declared at startup
+without samples. Its seven closed stage/outcome pairs (`submit_checks` with
+`passed`; `admission` with `admitted`, `cancelled` or `closed`; `locked_call`
+with `replied`; `commit` with `committed` or `failed`) are reserved at startup
+and render 16 series each on the `ORDER_LOCK` hold ladder once observed: 0
+startup and 112 populated series. No share, worker, job or block identity
+enters them.
+#856's difficulty-hint writer adds one counter family,
+`qbit_prism_stratum_difficulty_hints_total{outcome}`, whose eight closed
+outcomes are present at zero from startup: 8 startup and 8 populated series.
+A hint's worker, username and difficulty never enter the exposition.
 Adjacent node/rollup additions are outside this branch's census and must be
 combined explicitly when integrating another metrics change.
 
