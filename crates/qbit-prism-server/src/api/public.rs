@@ -141,6 +141,32 @@ pub(super) async fn dispatch(state: &ApiState, path: &str, q: &Query) -> ApiResu
     }
     Err(ApiError::missing("unknown public dashboard endpoint"))
 }
+/// The query parameters each public route reads: the only ones
+/// [`dispatch`] is given, and the only ones its origin cache key is made of
+/// (`response_cache::public_response`). Any other parameter is ignored, as
+/// before. A route that asked for a parameter missing here would see it
+/// absent, never another value's entry, and in a build with debug
+/// assertions panics in [`Query::get`], so the request fails.
+/// `parameter_tests` holds this list to what each route asks for and to the
+/// query parameters `docs/public-dashboard-api-v1.openapi.yaml` documents.
+pub(super) fn parameters(path: &str) -> &'static [&'static str] {
+    const PAGE: &[&str] = &["page", "limit"];
+    match path {
+        "/public/v1/blocks" => &["page", "limit", "chain_state"],
+        "/public/v1/leaderboard" => &["page", "limit", "search", "recipient_id", "window"],
+        "/public/v1/hashrate-series" => &["range", "bucket", "subject", "view"],
+        "/public/v1/block-markers" => &["range", "bucket"],
+        "/public/v1/fanouts/pending" => PAGE,
+        _ => match path
+            .strip_prefix("/public/v1/miners/")
+            .and_then(|miner| miner.split_once('/'))
+        {
+            Some((_, "earnings" | "payouts")) => PAGE,
+            Some((_, "workers")) => &["page", "limit", "search", "hide_inactive"],
+            _ => &[],
+        },
+    }
+}
 fn chart_range(q: &Query) -> ApiResult<(&str, &str)> {
     let range = q.get("range").unwrap_or("1m");
     if !matches!(range, "1w" | "1m" | "6m" | "all") {
@@ -217,7 +243,19 @@ pub(super) fn scaled_difficulty(bits: &str) -> Option<BigUint> {
 /// default name, height, tip, IBD flag or peer count), because a call failed
 /// or left the field out, answers only those requests. Either way the next
 /// miss asks the node again, as every miss did before.
-pub(super) type NetworkMemo = super::response_cache::CacheSlot<NetworkAnswer>;
+///
+/// The pool summary's network hashrate (`getnetworkhashps`) is remembered
+/// the same way in a slot of its own, so that a pool-summary miss, however
+/// it came about, no longer asks the node for it each. Only a usable answer
+/// is remembered: a failed or unusable call answers `null`, as before, to
+/// the requests that waited for it, and the next miss asks again. It never
+/// marks the network answer incomplete, so a node that cannot answer it does
+/// not stop the other routes sharing theirs.
+#[derive(Default)]
+pub(super) struct NetworkMemo {
+    answer: Arc<super::response_cache::CacheSlot<NetworkAnswer>>,
+    hashrate: Arc<super::response_cache::CacheSlot<String>>,
+}
 /// One set of node calls' network object, and whether it fell back on any
 /// field.
 #[derive(Clone)]
@@ -231,10 +269,11 @@ const NETWORK_ROUTES: [&str; 3] = [
     "/public/v1/leaderboard",
     "/public/v1/miners/{recipient_id}",
 ];
-/// How long `network()`'s answer is remembered, from when its node calls
-/// started: the shortest public cache lifetime and staleness budget among the
-/// routes that read it, 5 s by default; zero, and every call asks the node as
-/// before, when any of them is not cached. A response that reads a remembered
+/// How long `network()`'s answer, and the pool summary's network hashrate,
+/// are remembered, from when their node calls started: the shortest public
+/// cache lifetime and staleness budget among the routes that read
+/// `network()`, 5 s by default; zero, and every call asks the node as before,
+/// when any of them is not cached. A response that reads a remembered
 /// answer is dated, and cached, as before from when it was built: like the
 /// replica's lag, the answer's own age when the response asked for it, less
 /// than this lifetime (or, for a response that waited for a set of calls
@@ -254,47 +293,77 @@ fn network_lifetime(config: &ApiConfig) -> Duration {
 async fn network(state: &ApiState) -> ApiResult<Value> {
     remembered_network(state, || network_from_node(state.clone()).boxed()).await
 }
-/// `network()` through its memo, with `calls` one set of node calls. With the
-/// memo on, a set that runs past the public read timeout, counted from when
-/// it started, fails with `read_timeout` and is dropped, its calls with it,
-/// so it is not remembered and the next miss asks the node again instead of
-/// waiting on a stalled set (#858). Zero, no whole-request deadline, leaves
-/// only the node client's per-call timeout. With the memo off, the calls run
-/// in the request, under its own deadline, as before.
+/// `network()` through its memo, with `calls` one set of node calls.
 async fn remembered_network(
     state: &ApiState,
     calls: impl FnOnce() -> BoxFuture<'static, ApiResult<NetworkAnswer>>,
 ) -> ApiResult<Value> {
+    remembered_from_node(
+        state,
+        &state.network.answer,
+        "the network object",
+        calls,
+        |answer| !answer.degraded,
+    )
+    .await
+    .map(|answer| answer.network)
+}
+/// The pool summary's `network.hashrate_ths` through its memo; `None`, served
+/// as `null`, when the node did not answer it with a usable value.
+async fn remembered_hashrate(state: &ApiState) -> Option<String> {
+    remembered_from_node(
+        state,
+        &state.network.hashrate,
+        "the network hashrate",
+        || hashrate_from_node(state.clone()).boxed(),
+        |_| true,
+    )
+    .await
+    .ok()
+}
+/// `calls`, node calls for `what`, through `slot`, remembering an answer
+/// `keep` accepts. With the memo on, a set that runs past the public read
+/// timeout, counted from when it started, fails with `read_timeout` and is
+/// dropped, its calls with it, so it is not remembered and the next miss asks
+/// the node again instead of waiting on a stalled set (#858). Zero, no
+/// whole-request deadline, leaves only the node client's per-call timeout.
+/// With the memo off, the calls run in the request, under its own deadline,
+/// as before.
+async fn remembered_from_node<T: Clone + Send + Sync + 'static>(
+    state: &ApiState,
+    slot: &Arc<super::response_cache::CacheSlot<T>>,
+    what: &'static str,
+    calls: impl FnOnce() -> BoxFuture<'static, ApiResult<T>>,
+    keep: impl FnOnce(&T) -> bool + Send + 'static,
+) -> ApiResult<T> {
     let lifetime = network_lifetime(&state.config);
     if lifetime.is_zero() {
-        return calls().await.map(|answer| answer.network);
+        return calls().await;
     }
     let deadline = state.config.read_timeout;
-    state
-        .network
-        .remembered(
-            lifetime,
-            move || {
-                let calls = calls();
-                if deadline.is_zero() {
-                    return calls;
-                }
-                tokio::time::timeout(deadline, calls)
-                    .map(move |answer| {
-                        answer.unwrap_or_else(|_| {
-                            tracing::warn!(
-                                deadline_seconds = deadline.as_secs_f64(),
-                                "the node calls for the network object passed the public read timeout and were dropped"
-                            );
-                            Err(ApiError::read_timeout())
-                        })
+    slot.remembered(
+        lifetime,
+        move || {
+            let calls = calls();
+            if deadline.is_zero() {
+                return calls;
+            }
+            tokio::time::timeout(deadline, calls)
+                .map(move |answer| {
+                    answer.unwrap_or_else(|_| {
+                        tracing::warn!(
+                            calls = what,
+                            deadline_seconds = deadline.as_secs_f64(),
+                            "the node calls for {what} passed the public read timeout and were dropped"
+                        );
+                        Err(ApiError::read_timeout())
                     })
-                    .boxed()
-            },
-            |answer| !answer.degraded,
-        )
-        .await
-        .map(|answer| answer.network)
+                })
+                .boxed()
+        },
+        keep,
+    )
+    .await
 }
 async fn network_from_node(state: ApiState) -> ApiResult<NetworkAnswer> {
     let chain = state.rpc("getblockchaininfo", json!([])).await?;
@@ -348,13 +417,19 @@ async fn network_from_node(state: ApiState) -> ApiResult<NetworkAnswer> {
         degraded,
     })
 }
+/// One `getnetworkhashps` call: the node's network hashrate in TH/s, or an
+/// error when the call failed or its answer is unusable.
+async fn hashrate_from_node(state: ApiState) -> ApiResult<String> {
+    let value = state
+        .rpc("getnetworkhashps", json!([120, -1, "permissionless"]))
+        .await?;
+    network_hashrate(&value)
+        .ok_or_else(|| ApiError::upstream("qbit RPC getnetworkhashps returned an invalid payload"))
+}
 async fn pool_summary(state: &ApiState) -> ApiResult<Value> {
     let mut network = network(state).await?;
-    network["hashrate_ths"] = state
-        .rpc("getnetworkhashps", json!([120, -1, "permissionless"]))
+    network["hashrate_ths"] = remembered_hashrate(state)
         .await
-        .ok()
-        .and_then(|value| network_hashrate(&value))
         .map_or(Value::Null, Value::String);
     let value: Value = sqlx::query_scalar(include_str!("queries/dashboard_pool_snapshot.sql"))
         .bind(network["network_difficulty"].as_str().unwrap())
@@ -511,8 +586,22 @@ fn artifact_link(kind: &str, sha: &str, bytes: Option<usize>) -> Value {
     json!({"kind":kind,"sha256":sha,"url":format!("/public/v1/artifacts/{sha}"),"content_type":"application/json","byte_length":bytes})
 }
 
+/// `state` with every ledger read failing at once, as with no database, for
+/// the tests.
+#[cfg(test)]
+fn without_database(mut state: ApiState) -> ApiState {
+    let reads = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(10))
+        .connect_lazy("postgres://invalid@127.0.0.1:1/invalid")
+        .unwrap();
+    state.pool = reads.clone();
+    state.public_pool = reads;
+    state
+}
 #[cfg(test)]
 mod network_tests;
+#[cfg(test)]
+mod parameter_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
