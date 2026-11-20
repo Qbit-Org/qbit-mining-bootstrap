@@ -122,16 +122,17 @@ async fn block_only_work_earns_no_share_credit_at_the_current_revision() {
 
 /// A block on block-only work takes the block-only path even when its revision
 /// is current, so its share is never credited through the share append. (The
-/// fixture's ledger is offline, so that path fails before any write.)
+/// fixture's ledger is offline, so that path writes nothing.)
 #[tokio::test]
 async fn block_only_work_block_never_takes_the_credited_share_path() {
-    // The block-only proof's duplicate probe fails on this fixture's offline
-    // ledger at the pool's 30 s acquire timeout. The share deadline, which
-    // bounds a block-only proof (#580), has to outlast it for that failure,
-    // not the bound, to be the answer.
+    // The block-only proof's duplicate probe waits on this fixture's offline
+    // ledger for the pool's 30 s acquire timeout, and a found block's probe
+    // that times out runs again while its parent is the tip, so the proof is
+    // answered unknown at its share deadline, which bounds a block-only proof
+    // (#580).
     let fixture = Fixture::build(
         Duration::from_secs(10),
-        |config| config.share_commit_timeout = Duration::from_secs(60),
+        |config| config.share_commit_timeout = Duration::from_secs(1),
         None,
     )
     .await;
@@ -148,8 +149,8 @@ async fn block_only_work_block_never_takes_the_credited_share_path() {
     }
     assert_error(
         fixture.submit(&retired, false).await.unwrap_err(),
-        "ledger-confirmation-failed",
-        "share was not confirmed by the database",
+        "ledger-outcome-unknown",
+        "share outcome is not yet known",
     );
     assert_eq!(
         fixture.store.records.lock().unwrap().len(),

@@ -349,6 +349,14 @@ pub struct Coordinator {
     /// `own_log_caught_up` is the readiness input (D-8).
     pub peer_sync:
         std::sync::OnceLock<tokio::sync::watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    /// The frontend's shutdown signal, `true` once a shutdown is signalled,
+    /// attached once by `server::run`. A found block's append that is run
+    /// again (`miner_submit::FoundBlockRetry`) starts no new attempt after
+    /// it, and its backoff wakes on it. Unset in tools and test fixtures,
+    /// which nothing shuts down: the retry then keeps its other endings (a
+    /// refusal, a parent change, its bounds, a lost own log, the ledger
+    /// pool's close).
+    pub shutdown_signal: std::sync::OnceLock<watch::Receiver<bool>>,
     /// 3.1 dual writer (D-19): the wait before a found block's offer for the
     /// peer to hold what adopting it needs; `None` on a single writer or
     /// with `PRISM_PEER_INGEST_WAIT_MS=0`.
@@ -1435,6 +1443,7 @@ impl Coordinator {
             landing_trim: Default::default(),
             submission_hold: Default::default(),
             peer_sync: Default::default(),
+            shutdown_signal: Default::default(),
             peer_ingest,
             finder_liveness: Default::default(),
             dual_writer,

@@ -1584,3 +1584,9 @@ async fn commit_reconcile_credited_block_resubmitted_as_its_revision_moves_is_a_
     .await;
     settle(outcome, fixture.close().await)
 }
+
+/// A found block's append that fails before COMMIT is run again while its
+/// parent is the observed tip; deliberate refusals are not. The file name
+/// marks it a test file for the source scans that skip test files.
+#[path = "commit_reconcile_tests/found_block_retry_tests.rs"]
+mod found_block_retry;

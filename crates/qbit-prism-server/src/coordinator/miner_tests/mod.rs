@@ -565,6 +565,7 @@ impl Fixture {
             landing_trim: Default::default(),
             submission_hold: Default::default(),
             peer_sync: Default::default(),
+            shutdown_signal: Default::default(),
             peer_ingest: None,
             finder_liveness: Default::default(),
             dual_writer: None,
