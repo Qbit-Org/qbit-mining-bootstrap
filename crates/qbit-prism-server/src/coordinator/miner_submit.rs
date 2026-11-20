@@ -12,12 +12,27 @@
 //! A block-bearing submission still pending at its bound is answered
 //! `ledger-outcome-unknown` and counted in `block_proof_ack_capped_total`; the
 //! bound only ends the wait, never the probe, enqueue, append or landing.
+//!
+//! A found block's append is the only path to `submitblock`, so one that
+//! fails before COMMIT for a passing database condition (a lock wait past
+//! `lock_timeout`, a pool timeout, a connection lost before COMMIT) is run
+//! again inside
+//! its own task, a bounded number of times, while the job's parent is still
+//! the observed tip ([`FoundBlockRetry`]). Only a failure proven to precede
+//! COMMIT is run again, so the earlier attempt wrote nothing, and every
+//! attempt finds what is already recorded: a share-pass append probes the
+//! share's ID under `ORDER_LOCK` and inserts its outbox row only if the block
+//! hash has none, and a block-only enqueue checks for the row under
+//! `ORDER_LOCK`. None credits the share twice or writes a second outbox row.
+//! A block-only enqueue that may have sent COMMIT (its connection failed
+//! during it) keeps its unknown answer and is followed, never run again.
 use super::submit_ledger::{Appended, CommitGate, GateClosure, GateState};
 use super::*;
-use crate::ledger::CommitGateClosed;
+use crate::ledger::{CommitGateClosed, OwnLogLost, PayoutRevisionChanged, WindowNotHeld};
 use crate::metrics::{AppendStage, AppendStageOutcome, BlockAckPath, StaleJobCause};
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
+use tracing::instrument::WithSubscriber;
 
 #[cfg(test)]
 #[path = "miner_submit_acquire_tests.rs"]
@@ -68,6 +83,23 @@ enum EnqueueStep {
     ProbeFailed(anyhow::Error),
     /// The enqueue's own result: `true` enqueued, `false` already enqueued.
     Enqueue(Result<bool>),
+}
+
+/// Spawn a share append's task. A found block's carries the submission's
+/// dispatcher, so its retries and refusals log where the submission logs. A
+/// plain share's, on the acknowledgement's hot path, installs no scoped
+/// dispatcher, which would take every tracing call site in the process off
+/// its global fast path while it runs.
+fn spawn_append<F>(found_block: bool, append: F) -> JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if found_block {
+        tokio::spawn(append.with_current_subscriber())
+    } else {
+        tokio::spawn(append)
+    }
 }
 
 /// Leave a probe and candidate enqueue that outlived the acknowledgement
@@ -213,6 +245,313 @@ pub(super) fn enqueue_failed_before_commit(error: &anyhow::Error) -> bool {
     }
 }
 
+/// Whether a found block's append that failed before COMMIT met a passing
+/// condition of the database or of its connection, which the same append may
+/// clear by running again: the pool timed out (`PoolTimedOut`), the
+/// connection or its TLS session failed (`Io`, `Tls`), or the server answered
+/// with a connection exception (class 08 but 08P01, a protocol violation),
+/// insufficient resources (class 53 but 53400, a configuration limit), a
+/// serialization failure or deadlock (40001, 40P01), a lock wait past
+/// `lock_timeout` (55P03, `ORDER_LOCK` included), a server shutting down,
+/// crashing or starting (57P01, 57P02, 57P03; `pg_terminate_backend` sends
+/// 57P01 too, and cannot be told from a shutdown), or an idle session's or
+/// idle transaction's timeout (57P05, 25P03). The caller proves that COMMIT
+/// was never sent; this only says whether trying again can help.
+///
+/// Nothing else is run again. The deliberate refusals, all raised before any
+/// write, are named here even though none is a database error, so that no
+/// wrapping can make one look transient:
+/// - [`CommitGateClosed`]: the gate refused COMMIT; a found block's gate
+///   carries no lease and is never closed, so it is not met here.
+/// - [`PayoutRevisionChanged`]: the revision moved with capture off; the
+///   block is dropped by that setting, as the submit check drops one.
+/// - [`WindowNotHeld`]: this primary does not hold the window the coinbase
+///   pays (#619); the block could never land here.
+/// - [`OwnLogLost`]: this node's database was restored under it (D-8, D-9),
+///   and the frontend is stopping.
+///
+/// The rest are refusals or errors the same append would meet again, so they
+/// fall outside the list above without naming them: a configuration
+/// fingerprint that is not this frontend's, a halted cluster, a live legacy
+/// writer, a duplicate share or a payload that differs from the recorded one,
+/// a candidate identity conflict, a candidate that fails its own checks, the
+/// partition refusal (23514) that the ledger already ran once more, a
+/// read-only database (25006), a cancelled statement (57014: an operator's
+/// `pg_cancel_backend`, or a statement that ran out `statement_timeout`,
+/// which the error alone cannot tell apart), a closed pool (`PoolClosed`, a
+/// shutdown), a protocol error (the connection setup's own refusal of a
+/// server without `fsync` is one) and every other server error.
+pub(super) fn transient_before_commit(error: &anyhow::Error) -> bool {
+    let refused = error.chain().any(|cause| {
+        cause.is::<CommitGateClosed>()
+            || cause.is::<PayoutRevisionChanged>()
+            || cause.is::<WindowNotHeld>()
+            || cause.is::<OwnLogLost>()
+    });
+    if refused {
+        return false;
+    }
+    match sqlx_error(error) {
+        Some(sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_)) => true,
+        Some(sqlx::Error::Database(database)) => database.code().is_some_and(|code| {
+            (code.starts_with("08") && code != "08P01")
+                || (code.starts_with("53") && code != "53400")
+                || matches!(
+                    code.as_ref(),
+                    "40001" | "40P01" | "55P03" | "57P01" | "57P02" | "57P03" | "57P05" | "25P03"
+                )
+        }),
+        _ => false,
+    }
+}
+
+/// How many times in all a found block's append runs, the first attempt
+/// included, when each fails before COMMIT for a passing reason. An attempt
+/// that waits out `lock_timeout` (5 s) or the pool's 15 s acquire timeout
+/// meets [`FOUND_BLOCK_APPEND_WINDOW`] first (after about 9 or 4 attempts);
+/// this bound stops a failure that returns at once, a dead pooled connection
+/// after a failover, from spinning, and ends it only after about 48 s of
+/// pauses, so such a failover still has most of the window.
+pub(super) const FOUND_BLOCK_APPEND_ATTEMPTS: u32 = 16;
+
+/// No attempt of a found block's append starts later than this after its
+/// submit checks admitted it: one 60 s block interval. A blip (a lock stall,
+/// a saturated pool, a failover) fits in it; a database
+/// still failing past it is in an outage, and the block has most likely been
+/// superseded, which the parent check usually sees first. An attempt already
+/// running at the end keeps its own bounds (pool, lock and statement
+/// timeouts), as every append's does.
+pub(super) const FOUND_BLOCK_APPEND_WINDOW: Duration = Duration::from_secs(60);
+
+/// The pause before the second attempt. Each later pause doubles, up to
+/// [`FOUND_BLOCK_APPEND_BACKOFF_CAP`]: 0.25, 0.5, 1, 2, then 4 s.
+pub(super) const FOUND_BLOCK_APPEND_BACKOFF: Duration = Duration::from_millis(250);
+pub(super) const FOUND_BLOCK_APPEND_BACKOFF_CAP: Duration = Duration::from_secs(4);
+
+/// What a found block's candidate is built from: the job's immutable issued
+/// inputs and the submission. A retried append builds its candidate again
+/// from here, on a blocking worker, since the attempt before it consumed its
+/// own; the first attempt pays nothing for a copy it may never need.
+#[derive(Clone)]
+pub(super) struct CandidateSource {
+    context: Arc<JobContext>,
+    job_id: String,
+    /// The job's parent: the block matters only while it is the observed tip.
+    parent: String,
+    extranonce1: String,
+    extranonce2_size: usize,
+    submission: Arc<codec::Submission>,
+    deferred_share: Option<AcceptedShare>,
+}
+
+/// Why a found block's append is not run again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryEnd {
+    /// A deliberate refusal, or an error the same append would meet again.
+    NotTransient,
+    /// The frontend is shutting down: its shutdown was signalled, or its
+    /// ledger pool closed, the last step of every shutdown.
+    Shutdown,
+    /// This node's own log was lost (D-8, D-9: a `FrontendStop` sets it
+    /// before the stop) or is behind (a detected local rollback): no share of
+    /// this node's may be appended.
+    OwnLog,
+    /// The job's parent is no longer the observed tip: the block can no
+    /// longer extend the chain.
+    ParentChanged,
+    /// [`FOUND_BLOCK_APPEND_ATTEMPTS`] attempts have run.
+    Attempts,
+    /// The next attempt would start past [`FOUND_BLOCK_APPEND_WINDOW`].
+    Window,
+    /// The candidate could not be built again: its blocking worker failed.
+    Rebuild,
+}
+
+impl RetryEnd {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotTransient => "not-transient",
+            Self::Shutdown => "shutdown",
+            Self::OwnLog => "own-log",
+            Self::ParentChanged => "parent-changed",
+            Self::Attempts => "attempts",
+            Self::Window => "window",
+            Self::Rebuild => "rebuild-failed",
+        }
+    }
+}
+
+/// The retry of one found block's append, share-pass or block-only, after a
+/// failure proven to precede COMMIT. It lives in the append's own spawned
+/// task, so neither the acknowledgement deadline nor a cancelled submission
+/// ends it, and it never outlives the frontend: it starts no new attempt once
+/// the shutdown is signalled (`Coordinator::shutdown_signal`), the own log is
+/// lost or behind, or the ledger pool has closed, and the shutdown signal and
+/// the pool's close both wake its backoff. An attempt already running
+/// finishes under its own database timeouts and its result stands. Without a
+/// shutdown signal (tools, test fixtures) only the other endings apply.
+pub(super) struct FoundBlockRetry {
+    source: CandidateSource,
+    ledger: Arc<Ledger>,
+    observed_tip: Arc<RwLock<TipState>>,
+    peer_sync: Option<watch::Receiver<crate::peer_sync::PeerSyncStatus>>,
+    shutdown: Option<watch::Receiver<bool>>,
+    share_id: String,
+    path: &'static str,
+    window_end: tokio::time::Instant,
+    /// Attempts run so far, the one that just failed included.
+    attempts: u32,
+    backoff: Duration,
+}
+
+impl FoundBlockRetry {
+    fn block_hash(&self) -> &str {
+        &self.source.submission.block_hash_hex
+    }
+
+    /// After attempt `attempts` failed before COMMIT with `error`: the
+    /// candidate for the next attempt, once its backoff has passed, or
+    /// `None` when the append is not run again. `unused` is a candidate the
+    /// failed attempt did not consume (a block-only probe that failed before
+    /// its enqueue); otherwise one is built again. A retry that ends with the
+    /// block unrecorded after a passing failure is logged at ERROR with the
+    /// block hash: nothing will offer that block.
+    async fn next_attempt(
+        &mut self,
+        error: &anyhow::Error,
+        unused: Option<Candidate>,
+    ) -> Option<Candidate> {
+        // A first attempt that met a deliberate refusal or a lasting error
+        // keeps its existing answer and logs; only a retry that was entered
+        // logs its end.
+        let entered = self.attempts > 1 || transient_before_commit(error);
+        let candidate = match self.wait(error).await {
+            Ok(()) => match unused {
+                Some(candidate) => Ok(candidate),
+                None => submission_candidate(&self.source).await.map_err(|rebuild| {
+                    tracing::warn!(block_hash = self.block_hash(), error = %format_args!("{rebuild:#}"), "found block's candidate could not be built again for its next append");
+                    RetryEnd::Rebuild
+                }),
+            },
+            Err(end) => Err(end),
+        };
+        // The last check before the attempt starts: a shutdown signalled, or
+        // an own log lost, while the candidate was built again ends it here.
+        let end = match candidate.and_then(|candidate| self.running().map(|()| candidate)) {
+            Ok(candidate) => {
+                self.attempts += 1;
+                return Some(candidate);
+            }
+            Err(end) => end,
+        };
+        if entered {
+            tracing::error!(
+                block_hash = self.block_hash(),
+                share_id = self.share_id,
+                path = self.path,
+                attempts = self.attempts,
+                stopped = end.label(),
+                error = %format_args!("{error:#}"),
+                "found block not recorded: its append failed before COMMIT and is not run again, so the block is never offered"
+            );
+        }
+        None
+    }
+
+    /// Decide whether the append runs again and wait out its backoff. A
+    /// failure that is not run again is decided before the observed tip's
+    /// lock is read, so its answer never waits for a publication.
+    async fn wait(&mut self, error: &anyhow::Error) -> Result<(), RetryEnd> {
+        self.running()?;
+        if !transient_before_commit(error) {
+            return Err(RetryEnd::NotTransient);
+        }
+        if self.attempts >= FOUND_BLOCK_APPEND_ATTEMPTS {
+            return Err(RetryEnd::Attempts);
+        }
+        self.parent_is_tip().await?;
+        let resume = tokio::time::Instant::now() + self.backoff;
+        if resume > self.window_end {
+            return Err(RetryEnd::Window);
+        }
+        tracing::warn!(
+            block_hash = self.block_hash(),
+            share_id = self.share_id,
+            path = self.path,
+            attempt = self.attempts,
+            backoff_ms = self.backoff.as_millis() as u64,
+            error = %format_args!("{error:#}"),
+            "found block's append failed before COMMIT; appending it again"
+        );
+        // The shutdown signal, and the pool's close that ends every shutdown,
+        // wake this wait at once. A signal whose sender is gone is a frontend
+        // that has stopped.
+        let signalled = async {
+            match self.shutdown.clone() {
+                Some(mut shutdown) => drop(shutdown.wait_for(|stop| *stop).await),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(resume) => {}
+            () = signalled => return Err(RetryEnd::Shutdown),
+            () = self.ledger.pool.close_event() => return Err(RetryEnd::Shutdown),
+        }
+        self.backoff = (self.backoff * 2).min(FOUND_BLOCK_APPEND_BACKOFF_CAP);
+        self.running()?;
+        self.parent_is_tip().await
+    }
+
+    /// The frontend is not stopping: no shutdown is signalled, its ledger
+    /// pool is open, and its own log is neither lost nor behind.
+    fn running(&self) -> Result<(), RetryEnd> {
+        let signalled = self
+            .shutdown
+            .as_ref()
+            .is_some_and(|shutdown| *shutdown.borrow() || shutdown.has_changed().is_err());
+        if signalled || self.ledger.pool.is_closed() {
+            return Err(RetryEnd::Shutdown);
+        }
+        let own_log_behind = self
+            .peer_sync
+            .as_ref()
+            .is_some_and(|status| !status.borrow().own_log_caught_up);
+        if self.ledger.own_log_lost() || own_log_behind {
+            return Err(RetryEnd::OwnLog);
+        }
+        Ok(())
+    }
+
+    /// The block can still extend the chain: its job's parent is the
+    /// observed tip, as the submit check required when it admitted the share.
+    async fn parent_is_tip(&self) -> Result<(), RetryEnd> {
+        if self.observed_tip.read().await.as_deref() != Some(self.source.parent.as_str()) {
+            return Err(RetryEnd::ParentChanged);
+        }
+        Ok(())
+    }
+
+    /// Whether a retried block-only attempt must not go on from its probe to
+    /// its enqueue: the frontend stopped while the probe ran. A first attempt
+    /// is the request in hand and always goes on.
+    fn stopped_before_enqueue(&self) -> bool {
+        self.attempts > 1 && self.running().is_err()
+    }
+
+    /// The append recorded the block, or found it recorded, after `attempts`.
+    fn recorded(&self) {
+        if self.attempts > 1 {
+            tracing::warn!(
+                block_hash = self.block_hash(),
+                share_id = self.share_id,
+                path = self.path,
+                attempts = self.attempts,
+                "found block recorded after its append was run again"
+            );
+        }
+    }
+}
+
 /// A spawned share append. If the submission itself is cancelled first, an
 /// append that may still be refused is closed and aborted, as dropping it
 /// did before; one already committing, or carrying a block, runs on.
@@ -309,18 +648,39 @@ impl Drop for AppendTask {
     }
 }
 
+impl CandidateSource {
+    pub(super) fn new(
+        job: &MiningJob<JobContext>,
+        submission: codec::Submission,
+        deferred_share: Option<AcceptedShare>,
+    ) -> Self {
+        Self {
+            context: Arc::clone(&job.context),
+            job_id: job.wire.job_id.clone(),
+            parent: job.wire.previousblockhash.clone(),
+            extranonce1: job.wire.extranonce1.clone(),
+            extranonce2_size: job.wire.extranonce2_size,
+            submission: Arc::new(submission),
+            deferred_share,
+        }
+    }
+}
+
 /// Construct the durable candidate from the job's immutable issued inputs.
-pub(super) async fn submission_candidate(
-    job: &MiningJob<JobContext>,
-    submission: codec::Submission,
-    deferred_share: Option<AcceptedShare>,
-) -> Result<Candidate> {
-    let context = Arc::clone(&job.context);
-    let job_id = job.wire.job_id.clone();
-    let extranonce1 = job.wire.extranonce1.clone();
-    let extranonce2_size = job.wire.extranonce2_size;
-    // The job context is shared; the recipient-sized copy and block encoding
-    // belong on a blocking worker, before the ledger transaction begins.
+/// Every call with the same source builds the same candidate.
+pub(super) async fn submission_candidate(source: &CandidateSource) -> Result<Candidate> {
+    let CandidateSource {
+        context,
+        job_id,
+        parent: _,
+        extranonce1,
+        extranonce2_size,
+        submission,
+        deferred_share,
+    } = source.clone();
+    // The job context is shared; the recipient-sized copy and block
+    // encoding belong on a blocking worker, before the ledger
+    // transaction begins.
     tokio::task::spawn_blocking(move || {
         let original = context
             .bundle
@@ -346,7 +706,7 @@ pub(super) async fn submission_candidate(
         let inputs = &context.prepared.inputs;
         let block_bytes = hex::decode(&submission.block_hex)?;
         anyhow::Ok(Candidate {
-            block_hash: submission.block_hash_hex,
+            block_hash: submission.block_hash_hex.clone(),
             block_sha256: Candidate::block_digest_hex(&block_bytes),
             job_id,
             payout_revision: context.prepared.snapshot.payout_revision,
@@ -374,6 +734,29 @@ impl Coordinator {
     fn stale_job(&self, cause: StaleJobCause) -> StratumError {
         self.metrics.record_stale_job_rejection(cause);
         protocol_error("stale-job", "stale job")
+    }
+
+    /// The retry of the found block built from `source`, whose share
+    /// `share_id` was admitted at `start`; `path` labels its logs.
+    fn found_block_retry(
+        &self,
+        source: CandidateSource,
+        share_id: &str,
+        path: &'static str,
+        start: tokio::time::Instant,
+    ) -> FoundBlockRetry {
+        FoundBlockRetry {
+            source,
+            ledger: self.ledger.clone(),
+            observed_tip: self.observed_tip.clone(),
+            peer_sync: self.peer_sync.get().cloned(),
+            shutdown: self.shutdown_signal.get().cloned(),
+            share_id: share_id.to_owned(),
+            path,
+            window_end: start + FOUND_BLOCK_APPEND_WINDOW,
+            attempts: 1,
+            backoff: FOUND_BLOCK_APPEND_BACKOFF,
+        }
     }
 
     pub(super) async fn submit_share(
@@ -584,19 +967,27 @@ impl Coordinator {
         // revision, #478), or never (block-only work, #478).
         let credit_now = submission.share_pass && !capture_stale;
         let deferred_share = (!credit_now && !block_only).then(|| share.clone());
-        let candidate = if submission.block_pass && (candidate_current || capture_stale) {
-            submission_candidate(job, submission, deferred_share)
-                .await
-                .map(Some)
-        } else {
-            Ok(None)
+        // A found block carries what its append needs to run again after a
+        // passing failure before COMMIT: the inputs its candidate is built
+        // from, and the parent its retry checks against the observed tip.
+        let found = match (submission.block_pass && (candidate_current || capture_stale))
+            .then(|| CandidateSource::new(job, submission, deferred_share))
+        {
+            Some(source) => submission_candidate(&source).await.map(|candidate| {
+                let path = if credit_now { "share" } else { "block-only" };
+                Some((
+                    candidate,
+                    self.found_block_retry(source, &share.share_id, path, start),
+                ))
+            }),
+            None => Ok(None),
         };
-        let outcome = match candidate {
+        let outcome = match found {
             Err(error) => SaveOutcome::Failed(error),
             // A captured stale-revision block goes through the block-only path:
             // its share is deferred (credited only if the block confirms), so
             // no share is credited against the superseded revision.
-            Ok(candidate) if credit_now => {
+            Ok(found) if credit_now => {
                 // Ordinary current-tip/candidate admission keeps its existing
                 // credit contract, including a proof that returned from lease
                 // selection to ordinary authority before admission finished.
@@ -605,7 +996,7 @@ impl Coordinator {
                     .map(|lease| self.lease_commit_fence(lease, job.wire.resume_expires_at));
                 self.persist_share_pass(
                     share,
-                    candidate,
+                    found,
                     proof_observed_at_ms,
                     revision,
                     &block_hash,
@@ -614,9 +1005,17 @@ impl Coordinator {
                 )
                 .await
             }
-            Ok(candidate) => {
-                self.persist_block_only(&share, candidate, proof_observed_at_ms, &block_hash, start)
-                    .await
+            Ok(found) => {
+                let (candidate, retry) = found.unzip();
+                self.persist_block_only(
+                    &share,
+                    candidate,
+                    retry,
+                    proof_observed_at_ms,
+                    &block_hash,
+                    start,
+                )
+                .await
             }
         };
         match outcome {
@@ -724,7 +1123,7 @@ impl Coordinator {
     async fn persist_share_pass(
         &self,
         share: AcceptedShare,
-        candidate: Option<Candidate>,
+        found: Option<(Candidate, FoundBlockRetry)>,
         proof_observed_at_ms: Option<i64>,
         revision: i64,
         block_hash: &str,
@@ -732,6 +1131,7 @@ impl Coordinator {
         lease: Option<publication_authority::LeaseCommitFence>,
     ) -> SaveOutcome {
         let share_id = share.share_id.clone();
+        let (candidate, mut retry) = found.unzip();
         // #657: with capture on, a block whose revision moved before its
         // commit is captured, as the submit check captures one whose revision
         // already moved; with it off, the fence refuses it as before.
@@ -742,18 +1142,22 @@ impl Coordinator {
         };
         let gate = Arc::new(CommitGate::with_lease(lease));
         // A found block commits with its share, and the outbox is the only
-        // path to submitblock, so a candidate-bearing append is never refused.
+        // path to submitblock, so a candidate-bearing append is never refused,
+        // and one that fails before COMMIT for a passing reason runs again.
         let refusable = candidate.is_none();
         let ledger = self.submit_ledger.clone();
         let task_gate = gate.clone();
         let mut task = AppendTask {
-            handle: Some(tokio::spawn(async move {
+            handle: Some(spawn_append(retry.is_some(), async move {
                 let mut attempt = (share, candidate);
                 let result = loop {
                     // Only a lease fence sends a refused append round again
                     // (#716), and a fenced append carries no candidate, so the
                     // copy is a share's few strings.
                     let again = task_gate.fenced().then(|| attempt.clone());
+                    // A found block's append keeps its share's few strings
+                    // for another attempt; its candidate is built again.
+                    let share_again = retry.as_ref().map(|_| attempt.0.clone());
                     let (share, candidate) = attempt;
                     let result = ledger
                         .append_at_revision_observed(
@@ -766,21 +1170,43 @@ impl Coordinator {
                         )
                         .await;
                     let refused = matches!(&result, Err(error) if refused_at_hook(error));
-                    let Some(again) = again.filter(|_| refused) else {
+                    if let Some(again) = again.filter(|_| refused) {
+                        // Nothing was written: the hook refused before COMMIT
+                        // and the attempt rolled back, releasing ORDER_LOCK.
+                        let waited = tokio::time::Instant::now();
+                        if !task_gate.retry_after_contention().await {
+                            break result;
+                        }
+                        tracing::info!(
+                            share_id = %again.0.share_id,
+                            waited_ms = waited.elapsed().as_millis() as u64,
+                            "share commit gate waited out contention for its authority; appending again"
+                        );
+                        attempt = again;
+                        continue;
+                    }
+                    let (Some(retry), Some(share)) = (retry.as_mut(), share_again) else {
                         break result;
                     };
-                    // Nothing was written: the hook refused before COMMIT and
-                    // the attempt rolled back, releasing ORDER_LOCK.
-                    let waited = tokio::time::Instant::now();
-                    if !task_gate.retry_after_contention().await {
+                    let error = match &result {
+                        Ok(_) => {
+                            retry.recorded();
+                            break result;
+                        }
+                        Err(error) => error,
+                    };
+                    // A found block's gate carries no lease and nothing closes
+                    // it, so it is still open exactly when the attempt failed
+                    // before its pre-COMMIT hook let COMMIT be sent: nothing
+                    // was written and the transaction rolled back. A gate at
+                    // `Committing` may have committed, and keeps its answer.
+                    if task_gate.state() != GateState::Open {
                         break result;
                     }
-                    tracing::info!(
-                        share_id = %again.0.share_id,
-                        waited_ms = waited.elapsed().as_millis() as u64,
-                        "share commit gate waited out contention for its authority; appending again"
-                    );
-                    attempt = again;
+                    let Some(candidate) = retry.next_attempt(error, None).await else {
+                        break result;
+                    };
+                    attempt = (share, Some(candidate));
                 };
                 // Measured here, not at the join: a coordinator task that is
                 // scheduled late must not turn a durable commit into unknown.
@@ -915,6 +1341,7 @@ impl Coordinator {
         &self,
         share: &AcceptedShare,
         candidate: Option<Candidate>,
+        mut retry: Option<FoundBlockRetry>,
         proof_observed_at_ms: Option<i64>,
         block_hash: &str,
         start: tokio::time::Instant,
@@ -948,29 +1375,82 @@ impl Coordinator {
         // The enqueue commits the pending outbox row and the deferred share
         // together, so it is never cut off either: dropping it could discard
         // the reply to a COMMIT that was already sent.
+        //
+        // A probe that failed wrote nothing, and so did an enqueue that
+        // provably failed before COMMIT; when the failure was a passing one,
+        // both run again in this task while the block can still matter
+        // ([`FoundBlockRetry`]). Each attempt probes the share again, and
+        // the enqueue finds an existing outbox row and writes no second one.
         let mut phase = "candidate-pending";
         let ledger = self.ledger.clone();
         let share_id = share.share_id.clone();
         let mut enqueue = tokio::spawn(async move {
-            let probed = async {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
-                )
-                .bind(&share_id)
-                .fetch_one(&mut *ledger.acquire().await?)
-                .await
+            let mut candidate = candidate;
+            loop {
+                let probed = async {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM qbit_share_ledger WHERE share_id=$1 AND share_seq>=qbit_prism_share_probe_floor())",
+                    )
+                    .bind(&share_id)
+                    .fetch_one(&mut *ledger.acquire().await?)
+                    .await
+                }
+                .await;
+                // A probe that failed leaves the candidate for the next
+                // attempt; an enqueue consumes it.
+                let (step, unused) = match probed {
+                    Ok(true) => (EnqueueStep::Recorded, None),
+                    // Nothing was written, and the retry ends at its next
+                    // check, logging the block.
+                    Ok(false)
+                        if retry
+                            .as_ref()
+                            .is_some_and(FoundBlockRetry::stopped_before_enqueue) =>
+                    {
+                        (
+                            EnqueueStep::ProbeFailed(anyhow::anyhow!(
+                                "the frontend stopped before the found block's enqueue ran again"
+                            )),
+                            Some(candidate),
+                        )
+                    }
+                    Ok(false) => (
+                        EnqueueStep::Enqueue(
+                            ledger
+                                .enqueue_candidate_observed(candidate, proof_observed_at_ms)
+                                .await,
+                        ),
+                        None,
+                    ),
+                    Err(error) => (EnqueueStep::ProbeFailed(error.into()), Some(candidate)),
+                };
+                let error = match &step {
+                    EnqueueStep::ProbeFailed(error) => error,
+                    EnqueueStep::Enqueue(Err(error)) if enqueue_failed_before_commit(error) => {
+                        error
+                    }
+                    // An enqueue whose COMMIT may have been sent keeps its
+                    // answer, followed through the outbox.
+                    EnqueueStep::Enqueue(Err(_)) => break step,
+                    EnqueueStep::Recorded | EnqueueStep::Enqueue(Ok(_)) => {
+                        if let Some(retry) = &retry {
+                            retry.recorded();
+                        }
+                        break step;
+                    }
+                };
+                let Some(retry) = retry.as_mut() else {
+                    break step;
+                };
+                match retry.next_attempt(error, unused).await {
+                    Some(next) => candidate = next,
+                    None => break step,
+                }
             }
-            .await;
-            match probed {
-                Ok(true) => EnqueueStep::Recorded,
-                Ok(false) => EnqueueStep::Enqueue(
-                    ledger
-                        .enqueue_candidate_observed(candidate, proof_observed_at_ms)
-                        .await,
-                ),
-                Err(error) => EnqueueStep::ProbeFailed(error.into()),
-            }
-        });
+        }
+        // A found block's task: its retries and refusals log to the
+        // submission's dispatcher.
+        .with_current_subscriber());
         match tokio::time::timeout_at(bound, &mut enqueue).await {
             Ok(Ok(EnqueueStep::Recorded)) => return SaveOutcome::Duplicate,
             // Nothing is written before the enqueue, so every failure up to
