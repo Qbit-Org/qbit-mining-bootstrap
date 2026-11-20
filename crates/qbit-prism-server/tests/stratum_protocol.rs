@@ -2534,3 +2534,237 @@ mod observability;
 
 #[path = "observability/privacy.rs"]
 mod metrics_privacy;
+
+/// Set in the child [`a_listener_out_of_descriptors_keeps_its_sessions_and_serves_the_next_miner`]
+/// runs itself as, under [`DESCRIPTOR_EXHAUSTION_NOFILE`].
+#[cfg(target_os = "linux")]
+const DESCRIPTOR_EXHAUSTION_CHILD: &str = "PRISM_TEST_DESCRIPTOR_EXHAUSTION_CHILD";
+#[cfg(target_os = "linux")]
+const DESCRIPTOR_EXHAUSTION_NOFILE: libc::rlim_t = 64;
+#[cfg(target_os = "linux")]
+const DESCRIPTOR_EXHAUSTION_DONE: &str = "descriptor exhaustion ridden out";
+
+/// `accept()` failing for want of a descriptor (`EMFILE`) used to end the
+/// listener, abort its sessions and stop the frontend. The listener runs in a
+/// child process whose descriptor limit is low: connections are opened until
+/// the process has none left, so every accept fails; a session already open
+/// is still answered and the listener still runs; once the connections close,
+/// a new miner's `mining.subscribe` is answered. The retries are paced: no
+/// more failed accepts than one per pause in the time descriptors ran out.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_listener_out_of_descriptors_keeps_its_sessions_and_serves_the_next_miner() {
+    if std::env::var_os(DESCRIPTOR_EXHAUSTION_CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(descriptor_exhaustion_child());
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "a_listener_out_of_descriptors_keeps_its_sessions_and_serves_the_next_miner",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DESCRIPTOR_EXHAUSTION_CHILD, "1");
+    // SAFETY: the closure only calls setrlimit, which is async-signal-safe,
+    // and reads errno.
+    unsafe {
+        child.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: DESCRIPTOR_EXHAUSTION_NOFILE,
+                rlim_max: DESCRIPTOR_EXHAUSTION_NOFILE,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    // The child is waited for with a deadline: a hung child is killed and
+    // fails the test with what it printed, not the whole job at its timeout.
+    let child = child
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    let output = match receiver.recv_timeout(Duration::from_secs(120)) {
+        Ok(output) => output.unwrap(),
+        Err(_) => {
+            // SAFETY: kill(2) on the child's own PID, which it still holds:
+            // its waiter has not reaped it.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let output = receiver.recv().unwrap().unwrap();
+            panic!(
+                "the child hung and was killed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(DESCRIPTOR_EXHAUSTION_DONE),
+        "the child failed ({}):\n{stdout}\n{stderr}",
+        output.status
+    );
+    for line in stdout
+        .lines()
+        .filter(|line| line.contains(DESCRIPTOR_EXHAUSTION_DONE))
+    {
+        eprintln!("{line}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn descriptor_exhaustion_child() {
+    let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = log.clone();
+    let _dump = DumpLogOnPanic(log.clone());
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || LogSink(sink.clone()))
+            .finish(),
+    )
+    .unwrap();
+    let lines = |message: &str| -> Vec<Value> {
+        String::from_utf8_lossy(&log.lock().unwrap())
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| {
+                line["fields"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with(message))
+            })
+            .collect()
+    };
+    const FAILED: &str = "Stratum listener accept failed";
+    const RECOVERED: &str = "Stratum listener accepting again";
+
+    let (address, _backend, _refresh, shutdown, task) = start(StratumConfig::default()).await;
+    let mut served = Client::connect(address).await;
+    served
+        .send(json!({"id":1,"method":"mining.subscribe","params":[]}))
+        .await;
+    assert!(served.response(1).await["error"].is_null());
+
+    // Nothing yields to the listener while these connect, so every one waits
+    // in its accept queue and the process ends with no descriptor left.
+    let exhausted_from = Instant::now();
+    let mut held = Vec::new();
+    loop {
+        match std::net::TcpStream::connect(address) {
+            Ok(stream) => held.push(stream),
+            Err(error) if error.raw_os_error() == Some(libc::EMFILE) => break,
+            Err(error) => panic!("connect failed other than for want of a descriptor: {error}"),
+        }
+    }
+    assert!(!held.is_empty(), "no connection fit under the limit");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lines(FAILED).is_empty() {
+        assert!(Instant::now() < deadline, "no accept failed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let warning = &lines(FAILED)[0];
+    assert_eq!(warning["level"], "WARN", "{warning}");
+    assert_eq!(warning["fields"]["kind"], "EMFILE", "{warning}");
+    // The listener rides it out: still running, and its session still served.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!task.is_finished(), "the listener ended on EMFILE");
+    assert_eq!(served.request_health(2).await["result"]["ready"], false);
+    assert!(
+        lines(RECOVERED).is_empty(),
+        "an accept succeeded with no descriptor free"
+    );
+
+    drop(held);
+    let mut miner = Client::connect(address).await;
+    miner
+        .send(json!({"id":1,"method":"mining.subscribe","params":[]}))
+        .await;
+    let subscribed = miner.response(1).await;
+    assert!(
+        subscribed["error"].is_null() && subscribed["result"][1].is_string(),
+        "{subscribed}"
+    );
+    let window = exhausted_from.elapsed();
+    assert!(!task.is_finished(), "the listener ended");
+    // The first line after the warned run reports it whole. Once the
+    // connections close, more are queued than descriptors are free, so a
+    // second, shorter run can follow; no line names it within the interval.
+    let recovered = lines(RECOVERED);
+    assert!(
+        !recovered.is_empty(),
+        "no accept after the run was reported"
+    );
+    // Each line counts the failures since the one before: the warning was
+    // the run's first, and the recovery line counts the rest.
+    let failures = lines(FAILED)[0]["fields"]["failed_accepts"]
+        .as_u64()
+        .unwrap()
+        + recovered[0]["fields"]["failed_accepts"].as_u64().unwrap();
+    // Every retry waits out the pause, so the failures cannot outnumber the
+    // pauses that fit in the window; a spinning loop fails millions of times.
+    let pause = qbit_prism_server::listen::ACCEPT_RETRY_PAUSE;
+    let pauses = (window.as_millis() / pause.as_millis()) as u64;
+    assert!(
+        (1..=pauses + 1).contains(&failures),
+        "{failures} failed accepts in {window:?}"
+    );
+
+    shutdown.send(true).unwrap();
+    timeout(Duration::from_secs(15), task)
+        .await
+        .expect("the listener did not drain")
+        .unwrap();
+    println!(
+        "{DESCRIPTOR_EXHAUSTION_DONE}: {failures} failed accepts in {} ms",
+        window.as_millis()
+    );
+}
+
+/// Prints the child's log to stderr, which the parent shows, when the child
+/// fails.
+#[cfg(target_os = "linux")]
+struct DumpLogOnPanic(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(target_os = "linux")]
+impl Drop for DumpLogOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let log = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            eprintln!("the child's log:\n{}", String::from_utf8_lossy(&log));
+        }
+    }
+}
+
+/// The child's log, kept in memory: a descriptor-starved process cannot
+/// rely on writing anywhere else.
+#[cfg(target_os = "linux")]
+struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(target_os = "linux")]
+impl std::io::Write for LogSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
