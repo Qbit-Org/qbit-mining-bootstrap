@@ -23,6 +23,7 @@ qbit-prism-server::api_2x::concurrent_pool_leaderboard_and_miner_misses_ask_the_
 qbit-prism-server::api_2x::content_addressed_bytes_and_legacy_fallback_headers_are_exact
 qbit-prism-server::api_2x::dashboard_queries_answer_what_their_3_1_1_queries_answer
 qbit-prism-server::api_2x::fixture_migrations_do_not_share_advisory_locks
+qbit-prism-server::api_2x::junk_parameters_hit_the_cached_pool_summary_and_ask_the_node_for_one_hashrate
 qbit-prism-server::api_2x::legacy_artifact_without_its_body_answers_uncached_404_and_faults_stay_500
 qbit-prism-server::api_2x::pool_hashrate_sums_read_only_the_partial_buckets_and_the_lag
 qbit-prism-server::api_2x::public_service_is_read_only_and_bounds_http_database_work

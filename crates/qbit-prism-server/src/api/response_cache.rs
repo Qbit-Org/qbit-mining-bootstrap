@@ -117,6 +117,23 @@ impl<T: Clone + Send + Sync + 'static> CacheSlot<T> {
     }
 }
 
+#[cfg(test)]
+impl CacheSlot<Payload> {
+    /// A slot whose entry is `payload`, built just now, as a completed
+    /// computation leaves it.
+    pub(super) fn holding(payload: Payload) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SlotState {
+                entry: Some(Entry {
+                    payload,
+                    created: Instant::now(),
+                }),
+                inflight: None,
+            }),
+        })
+    }
+}
+
 pub(super) async fn public_response(
     state: &ApiState,
     path: &str,
@@ -124,6 +141,11 @@ pub(super) async fn public_response(
     policy: &CachePolicy,
     view: Option<&public_service::ServiceView>,
 ) -> (ApiResult<Payload>, &'static str, u64) {
+    // The route's computation and its cache key both see only the parameters
+    // the route reads: one that it ignores neither changes the answer nor
+    // gets a cache entry of its own, and one that it reads is always in the
+    // key, so no request is answered from another request's entry.
+    let query = &query.only(public::parameters(path));
     let database = public_service::reads_database(path);
     if database {
         if let Some(error) = view.and_then(|v| v.replica_error.as_ref()) {
