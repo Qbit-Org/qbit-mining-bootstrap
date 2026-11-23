@@ -4,7 +4,8 @@
   "description": "The #275 tip-delivery benchmark in realistic mode: two frontends, 2,000 sessions, a 400k window, 8 retargeting tips 45 s apart over 133 shares/s of background load.",
   "issues": [
     "#275",
-    "#521"
+    "#521",
+    "#842"
   ],
   "schedule": "nightly",
   "runner": "blacksmith-8vcpu-ubuntu-2404",
@@ -18,7 +19,8 @@
     "max_shortfall": 0,
     "max_rejected_valid_shares": null,
     "max_unanswered_submits": null,
-    "tip_last_notify_p99_budget_ms": 2500,
+    "tip_last_notify_p99_budget_ms": 5000,
+    "tip_last_notify_median_budget_ms": 2500,
     "d1_verdict_table": false,
     "churn_tip_last_notify_p99_budget_ms": null,
     "new_session_first_job_p99_budget_ms": null

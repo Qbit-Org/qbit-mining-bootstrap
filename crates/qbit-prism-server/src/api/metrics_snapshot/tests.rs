@@ -561,6 +561,12 @@ async fn census_and_privacy_hold_through_unavailable_fresh_and_stale_http_snapsh
     for holder in crate::metrics::OrderLockHolder::ALL {
         metrics.observe_order_lock_hold(*holder, Duration::from_millis(5));
     }
+    // #829: every share append stage's outcomes observed once.
+    for stage in crate::metrics::AppendStage::ALL {
+        for outcome in stage.outcomes() {
+            metrics.observe_append_stage(*stage, *outcome, Duration::from_millis(2));
+        }
+    }
     // The refresh families are the other owner-dependent series: every closed
     // pair observed once, so the populated census covers them too.
     for outcome in WindowAcquisition::ALL {

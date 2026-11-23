@@ -483,8 +483,8 @@ async fn history_refused_at_the_deadline(db: &Database) -> Result<()> {
 /// contention, tried again like a timeout, not a failure of the migrate.
 /// The request here locks two tables of its own, the first free and the
 /// second held by a reader that then asks for the first, with a deadlock
-/// check due after 80 ms of waiting: before the request's own 100 ms
-/// timeouts, and long after the reader joins the cycle.
+/// check due after `UNLOWERED_CHECK` of waiting: before the request's own
+/// `LOCK_WAIT`, and long after the reader joins the cycle.
 #[tokio::test]
 async fn a_deadlock_abort_of_the_up_front_request_is_contention() -> Result<()> {
     let Some(db) = Database::open().await? else {
@@ -607,9 +607,16 @@ async fn lowered_for_the_request(db: &Database) -> Result<()> {
     Ok(())
 }
 
-/// The cycle above, the request's deadlock check due after 80 ms of its
-/// own, or after `DEADLOCK_CHECK` where the run lowers it (`lowered`).
+/// The deadlock check of a request whose run does not lower it, in
+/// `deadlock_is_contention`: after `DEADLOCK_CHECK`, and as far before
+/// `LOCK_WAIT` as #791's 80 ms check was before its 100 ms timeouts.
+const UNLOWERED_CHECK: Duration = Duration::from_millis(60);
+
+/// The cycle above, the request's deadlock check due after
+/// `UNLOWERED_CHECK` of its own, or after `DEADLOCK_CHECK` where the run
+/// lowers it (`lowered`).
 async fn deadlock_is_contention(db: &Database, lowered: bool) -> Result<()> {
+    ensure!(DEADLOCK_CHECK < UNLOWERED_CHECK && UNLOWERED_CHECK < LOCK_WAIT);
     sqlx::raw_sql("CREATE TABLE deadlock_first(x int); CREATE TABLE deadlock_second(x int)")
         .execute(&db.ledger.pool)
         .await?;
@@ -625,9 +632,12 @@ async fn deadlock_is_contention(db: &Database, lowered: bool) -> Result<()> {
     let mut migrate = PgConnection::connect(&db.url).await?;
     let mut tx = migrate.begin().await?;
     if !lowered {
-        sqlx::query("SET LOCAL deadlock_timeout = '80ms'")
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "SET LOCAL deadlock_timeout = '{}ms'",
+            UNLOWERED_CHECK.as_millis()
+        ))
+        .execute(&mut *tx)
+        .await?;
     }
     let request = LOWER_DEADLOCK_TIMEOUT.scope(
         lowered,
@@ -670,12 +680,131 @@ async fn deadlock_is_contention(db: &Database, lowered: bool) -> Result<()> {
         .downcast_ref::<LockContention>()
         .with_context(|| format!("a deadlock abort was not contention: {error:#}"))?;
     ensure!(
-        contention.reason.contains("deadlock detected"),
+        contention.sqlstate == "40P01",
         "the request gave up for another reason: {error:#}"
     );
     tx.rollback().await?;
     migrate.close().await?;
     reader.close().await?;
+    Ok(())
+}
+
+/// A request blocked on one table ends at `LOCK_WAIT` with the lock
+/// timeout's 55P03, whose SQLSTATE alone says so, before the statement
+/// timeout's 57014, which an operator's cancel shares (#824). A read of one
+/// of 027's tables held open gives the request up so, and every attempt of
+/// the migrate while it lasts; once it ends the migrate applies 27 and 28.
+#[tokio::test]
+async fn a_request_blocked_on_one_table_ends_with_the_lock_timeout_and_is_tried_again() -> Result<()>
+{
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let result = blocked_on_one_table(&db).await;
+    finish(db, result).await
+}
+
+async fn blocked_on_one_table(db: &Database) -> Result<()> {
+    let mut frontend = PgConnection::connect(&db.url).await?;
+    let mut reader = frontend.begin().await?;
+    sqlx::query("SELECT count(*) FROM qbit_prism_templates")
+        .execute(&mut *reader)
+        .await?;
+    let mut migrate = PgConnection::connect(&db.url).await?;
+    blocked_until_the_lock_timeout(&mut migrate, LOCK_TEMPLATES).await?;
+    migrate.close().await?;
+    migrated_once_the_read_ends(db, reader, "table-locks-one-table").await?;
+    frontend.close().await?;
+    Ok(())
+}
+
+/// The up-front request for one of 027's tables.
+const LOCK_TEMPLATES: &str = "LOCK TABLE qbit_prism_templates IN ACCESS EXCLUSIVE MODE";
+
+/// `statement`, blocked on a table a read holds, requested until it gives
+/// up on the lock timeout's 55P03, at most `TRIES` times, and that error. A
+/// request whose backend is held up for the margin before its wait, on a
+/// loaded host, reaches `ATTEMPT` first and gives up on the statement
+/// timeout's 57014: contention too, and requested again. Any other outcome
+/// fails.
+async fn blocked_until_the_lock_timeout(
+    connection: &mut PgConnection,
+    statement: &str,
+) -> Result<anyhow::Error> {
+    const TRIES: usize = 5;
+    for _ in 0..TRIES {
+        let error = request(connection, statement).await?;
+        let sqlstate = error
+            .downcast_ref::<LockContention>()
+            .map(|contention| contention.sqlstate.clone());
+        match sqlstate.as_deref() {
+            Some("55P03") => return Ok(error),
+            Some("57014") => continue,
+            _ => bail!("a blocked request did not give the attempt up: {error:#}"),
+        }
+    }
+    bail!("a blocked request never gave up on its lock timeout in {TRIES} tries")
+}
+
+/// `statement` as an attempt's up-front request, on `connection`, in a
+/// transaction rolled back afterwards: the error it ended with.
+async fn request(connection: &mut PgConnection, statement: &str) -> Result<anyhow::Error> {
+    let mut tx = connection.begin().await?;
+    let error = lock_within_attempt(
+        &mut tx,
+        statement,
+        Locking::Migrations(vec![27]),
+        vec!["qbit_prism_templates"],
+        "the test's request".to_owned(),
+    )
+    .await
+    .err()
+    .with_context(|| format!("{statement} gave nothing up"))?;
+    tx.rollback().await?;
+    Ok(error)
+}
+
+/// The migrate while `reader` holds one of 027's tables: its first attempt
+/// gives up, warned with its SQLSTATE, the lock timeout's 55P03 or, on a
+/// loaded host, the statement timeout's 57014, the read then ends, and a
+/// later attempt applies 27 and 28.
+async fn migrated_once_the_read_ends(
+    db: &Database,
+    reader: sqlx::Transaction<'_, Postgres>,
+    instance_id: &str,
+) -> Result<()> {
+    let log = SharedLog::default();
+    let migrate = committed_within(
+        &db.ledger.pool,
+        instance_id,
+        ShareHashBackfill::Initialize,
+        None,
+        Duration::from_secs(30),
+    )
+    .with_subscriber(log.dispatch());
+    let release = async {
+        let seen = tokio::time::timeout(Duration::from_secs(20), async {
+            while !log.text().contains("could not lock the tables it alters") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        reader.commit().await?;
+        seen.context("no attempt of the migrate gave up while the read held its table")
+    };
+    let (migrated, released) = tokio::join!(migrate, release);
+    let logs = log.text();
+    released?;
+    migrated.with_context(|| logs.clone())?;
+    ensure!(
+        logs.contains("sqlstate=55P03") || logs.contains("sqlstate=57014"),
+        "{logs}"
+    );
+    let versions = db.versions().await?;
+    ensure!(
+        versions.contains(&27) && versions.contains(&28),
+        "{versions:?}"
+    );
     Ok(())
 }
 
@@ -700,6 +829,11 @@ impl Cluster {
     const SUPERUSER: &'static str = "prism";
 
     fn start(bin: String) -> Result<Self> {
+        Self::start_with(bin, &[])
+    }
+
+    /// The same, the server started with `env` in its environment.
+    fn start_with(bin: String, env: &[(&str, &str)]) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let password = uuid::Uuid::new_v4().simple().to_string();
         let password_file = dir.path().join("password");
@@ -738,6 +872,7 @@ impl Cluster {
                 cluster.port
             ))
             .args(["-w", "start"])
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .status()?;
         ensure!(
@@ -1019,4 +1154,188 @@ async fn named_then_granted(cluster: &Cluster, pass: &Pass) -> Result<()> {
             )
         })?;
     pass.cancelled(cluster).await
+}
+
+/// What a server that translates nothing says for a statement timeout, a
+/// lock timeout and a cancel request: the German cluster says none of it.
+const ENGLISH: [&str; 3] = [
+    "canceling statement due to statement timeout",
+    "canceling statement due to lock timeout",
+    "canceling statement due to user request",
+];
+
+/// The SQLSTATE and the message of the server's error in `error`.
+fn reported(error: &anyhow::Error) -> Option<(String, String)> {
+    let database = database_error(error)?;
+    Some((database.code()?.into_owned(), database.message().to_owned()))
+}
+
+/// Whether `error` is the server's, with `code`, in a language other than
+/// English.
+fn translated(error: &anyhow::Error, code: &str) -> bool {
+    reported(error)
+        .is_some_and(|(reported, message)| reported == code && !ENGLISH.contains(&message.as_str()))
+}
+
+/// Whether `error` gave the attempt up on `code`, PostgreSQL's message in a
+/// language other than English.
+fn given_up_in_translation(error: &anyhow::Error, code: &str) -> bool {
+    error
+        .downcast_ref::<LockContention>()
+        .is_some_and(|contention| {
+            contention.sqlstate == code && !ENGLISH.contains(&contention.reason.as_str())
+        })
+}
+
+/// On a server whose messages are German (#824), where PostgreSQL's
+/// message no longer says "statement timeout": `timed` still tells a
+/// statement cancelled by the statement timeout this code set as that
+/// timeout, and an operator's cancel request, a `pg_cancel_backend` the
+/// statement sends its own backend here, as a cancel. The up-front request
+/// gives an attempt up on the statement timeout's 57014 and the lock
+/// timeout's 55P03, but not on a cancel, which stops the run. The requests
+/// lock a table of the test's own, so the cluster migrates no ledger: the
+/// retry that follows a give-up is `committed_within`'s, whatever gave the
+/// attempt up (`a_request_blocked_on_one_table_ends_with_the_lock_timeout_and_is_tried_again`).
+#[tokio::test]
+async fn on_a_server_whose_messages_are_german_a_timeout_is_still_told_from_a_cancel() -> Result<()>
+{
+    let Some(bin) = gate::pg_bin_dir(gate::site!())? else {
+        return Ok(());
+    };
+    // gettext reads LANGUAGE under any lc_messages but C and POSIX.
+    let cluster = Cluster::start_with(bin, &[("LANGUAGE", "de")])?;
+    let locale = german(&cluster).await?;
+    let url = cluster.url(Cluster::SUPERUSER);
+    async {
+        told_apart(&url).await?;
+        requests_in_german(&url).await
+    }
+    .await
+    .with_context(|| format!("lc_messages {locale}, LANGUAGE=de"))
+}
+
+/// Set `lc_messages` for the cluster's database to a locale under which
+/// gettext reads `LANGUAGE`: one but C and POSIX, from the collations
+/// initdb found on the host.
+async fn german(cluster: &Cluster) -> Result<String> {
+    let root = PgPool::connect(&cluster.url(Cluster::SUPERUSER)).await?;
+    let locale: Option<String> = sqlx::query_scalar(
+        "SELECT collcollate FROM pg_collation WHERE collprovider='c' \
+         AND collcollate NOT IN ('C','POSIX') AND collcollate NOT ILIKE 'C.%' \
+         ORDER BY collcollate LIMIT 1",
+    )
+    .fetch_optional(&root)
+    .await?;
+    let locale = locale.context(
+        "the host has no locale but C and POSIX, under which PostgreSQL translates nothing: generate one, en_US.UTF-8 say",
+    )?;
+    sqlx::query(&format!(
+        "ALTER DATABASE postgres SET lc_messages = '{}'",
+        locale.replace('\'', "''")
+    ))
+    .execute(&root)
+    .await?;
+    root.close().await;
+    Ok(locale)
+}
+
+/// A statement timeout and a cancel request through `timed`, in German.
+async fn told_apart(url: &str) -> Result<()> {
+    let mut session = PgConnection::connect(url).await?;
+    let bound = Duration::from_millis(50);
+    sqlx::query(&format!(
+        "SET statement_timeout = '{}ms'",
+        bound.as_millis()
+    ))
+    .execute(&mut session)
+    .await?;
+    let timeout = timed(
+        bound,
+        sqlx::query("SELECT pg_sleep(5)").execute(&mut session),
+    )
+    .await
+    .err()
+    .context("pg_sleep(5) outlived its statement timeout")?;
+    ensure!(
+        translated(&timeout, "57014"),
+        "PostgreSQL did not translate its statement timeout, so its German catalog is missing on the host: {timeout:#}"
+    );
+    ensure!(
+        timed_out(&timeout),
+        "a statement timeout in German was not told as one: {timeout:#}"
+    );
+    let bound = Duration::from_secs(60);
+    sqlx::query(&format!(
+        "SET statement_timeout = '{}ms'",
+        bound.as_millis()
+    ))
+    .execute(&mut session)
+    .await?;
+    let cancel = timed(
+        bound,
+        sqlx::query("SELECT pg_cancel_backend(pg_backend_pid()), pg_sleep(5)")
+            .execute(&mut session),
+    )
+    .await
+    .err()
+    .context("pg_sleep(5) outlived a cancel request")?;
+    ensure!(translated(&cancel, "57014"), "{cancel:#}");
+    ensure!(
+        !timed_out(&cancel),
+        "a cancel request in German was taken for the statement timeout: {cancel:#}"
+    );
+    session.close().await?;
+    Ok(())
+}
+
+/// The up-front request's outcomes at `url`, in German.
+async fn requests_in_german(url: &str) -> Result<()> {
+    let mut migrate = PgConnection::connect(url).await?;
+    sqlx::query("CREATE TABLE german_locked(x int)")
+        .execute(&mut migrate)
+        .await?;
+    // Cancelled by its statement timeout, `ATTEMPT`.
+    let timeout = request(&mut migrate, "SELECT pg_sleep(1)").await?;
+    ensure!(
+        given_up_in_translation(&timeout, "57014"),
+        "a statement timeout in German did not give the attempt up: {timeout:#}"
+    );
+    // Cancelled by an operator, at once: prepared first, so the request is
+    // one round trip, far within `ATTEMPT`.
+    let cancel_itself = "SELECT pg_cancel_backend(pg_backend_pid()), pg_sleep(1)";
+    ensure!(
+        sqlx::query(cancel_itself)
+            .execute(&mut migrate)
+            .await
+            .is_err(),
+        "a statement that cancels itself ran"
+    );
+    let cancel = request(&mut migrate, cancel_itself).await?;
+    ensure!(
+        translated(&cancel, "57014")
+            && cancel.downcast_ref::<LockContention>().is_none()
+            && format!("{cancel:#}").starts_with("the test's request: "),
+        "a cancel request in German gave the attempt up: {cancel:#}"
+    );
+    // Blocked on a table a read holds.
+    let mut frontend = PgConnection::connect(url).await?;
+    let mut reader = frontend.begin().await?;
+    sqlx::query("SELECT count(*) FROM german_locked")
+        .execute(&mut *reader)
+        .await?;
+    let blocked = blocked_until_the_lock_timeout(
+        &mut migrate,
+        "LOCK TABLE german_locked IN ACCESS EXCLUSIVE MODE",
+    )
+    .await;
+    reader.commit().await?;
+    frontend.close().await?;
+    migrate.close().await?;
+    let blocked = blocked?;
+    ensure!(
+        given_up_in_translation(&blocked, "55P03"),
+        "a lock timeout in German did not give the attempt up: {blocked:#}"
+    );
+    Ok(())
 }

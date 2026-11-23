@@ -125,6 +125,7 @@ pub fn expected(populated: bool) -> Census {
         "divergent_landings_total",
         "divergent_landing_overpay_sats_total",
         "landing_malloc_trim_released_bytes_total",
+        "payout_revision_announcements_heard_total",
     ] {
         result.family(name, "counter", &unlabelled, &[]);
     }
@@ -164,6 +165,7 @@ pub fn expected(populated: bool) -> Census {
         "work_refresh_stalled_seconds",
         "landing_malloc_trim_resident_bytes",
         "tip_poll_age_seconds",
+        "payout_revision_listener_up",
     ] {
         result.family(name, "gauge", &unlabelled, &[]);
     }
@@ -182,6 +184,16 @@ pub fn expected(populated: bool) -> Census {
         &labels(
             "reason",
             "global_limit,username_limit,ip_limit,malformed_frame_budget,unknown_job_budget,authorize_budget",
+        ),
+        &[],
+    );
+    // #856: every hint the listener's difficulty-hint writer was offered.
+    result.family(
+        "stratum_difficulty_hints_total",
+        "counter",
+        &labels(
+            "outcome",
+            "written,failed,timed_out,aged_out,dropped,superseded,abandoned,writer_panicked",
         ),
         &[],
     );
@@ -335,6 +347,25 @@ pub fn expected(populated: bool) -> Census {
         "database_order_lock_hold_seconds",
         "histogram",
         if populated { &holders } else { &[] },
+        HOLD_SECONDS,
+    );
+    // #829: each stage records only its own outcomes.
+    let stages: Vec<_> = [
+        ("submit_checks", "passed"),
+        ("admission", "admitted"),
+        ("admission", "cancelled"),
+        ("admission", "closed"),
+        ("locked_call", "replied"),
+        ("commit", "committed"),
+        ("commit", "failed"),
+    ]
+    .into_iter()
+    .map(|(stage, outcome)| format!("stage=\"{stage}\",outcome=\"{outcome}\""))
+    .collect();
+    result.family(
+        "share_append_stage_seconds",
+        "histogram",
+        if populated { &stages } else { &[] },
         HOLD_SECONDS,
     );
     let refreshes: Vec<_> = [

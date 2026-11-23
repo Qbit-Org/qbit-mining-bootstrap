@@ -12,7 +12,10 @@ use crate::node_identity::{NodeIdentity, NodeIndex};
 pub const DEFAULT_PEER_SYNC_INTERVAL_MS: u64 = 250;
 const PEER_SYNC_INTERVAL_MS: std::ops::RangeInclusive<u64> = 10..=60_000;
 /// `PRISM_PEER_SYNC_BATCH_ROWS` when unset: the most rows of one stream one
-/// pull reads from the peer and inserts in one local transaction.
+/// pull reads from the peer. A share batch is inserted in one local
+/// transaction; a prepared batch in chunks of at most 1,000 jobs and 2 MiB
+/// (a job whose blobs alone are larger goes alone), each its own
+/// transaction (#785).
 pub const DEFAULT_PEER_SYNC_BATCH_ROWS: u32 = 5000;
 /// At most 20,000: a batch is one statement on the peer, rows and header
 /// mappings built into JSON, which must finish inside its 8 s timeout.
@@ -192,10 +195,9 @@ fn peer_url(
     );
     // The sync and the found-block wait connect with these options, so a
     // URL they cannot use fails here, by name, never at the first offer.
-    ensure!(
-        <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(&raw).is_ok(),
-        "{name} is not a connection URL the PostgreSQL client accepts"
-    );
+    let options = super::database::client_options(&parsed)
+        .with_context(|| format!("{name} is not a connection URL the PostgreSQL client accepts"))?;
+    super::database::verify_ca_has_root_cert(name, &options)?;
     ensure!(
         !same_database(&parsed, database_url),
         "{name} names this node's own database (PRISM_DATABASE_URL); it must name the peer's"
@@ -290,6 +292,12 @@ mod tests {
                 "postgresql://sync:secret@db-b/prism?sslmode=sometimes",
                 "is not a connection URL the PostgreSQL client accepts",
             ),
+            // The URL's own (empty) sslrootcert wins over PGSSLROOTCERT, so
+            // this holds whatever the test's environment.
+            (
+                "postgresql://sync:secret@db-b/prism?sslmode=verify-ca&sslrootcert=",
+                "sslmode=verify-ca requires sslrootcert",
+            ),
         ] {
             let error = peer_url(name, Some(bad.into()), OWN, false)
                 .unwrap_err()
@@ -298,10 +306,14 @@ mod tests {
             assert!(error.contains(name), "{bad:?}: {error}");
             assert!(!error.contains("secret"), "a value leaked: {error}");
         }
-        // Same host, another database or port: a second cluster on the host.
+        // Same host, another database or port: a second cluster on the host;
+        // and the TLS modes that verify-ca's root certificate check leaves alone.
         for other in [
             "postgresql://u:secret@db-a:5432/prism_b",
             "postgresql://u:secret@db-a:5433/prism",
+            "postgresql://u:secret@db-b/prism?sslmode=verify-ca&sslrootcert=/etc/prism/peer-ca.pem",
+            "postgresql://u:secret@db-b/prism?sslmode=verify-full",
+            "postgresql://u:secret@db-b/prism?sslmode=require",
         ] {
             assert!(peer_url(name, Some(other.into()), OWN, false).is_ok());
         }

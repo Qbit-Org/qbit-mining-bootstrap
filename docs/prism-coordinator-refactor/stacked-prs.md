@@ -15,7 +15,10 @@ same way rather than merging the new tip into individual slices.
 Stack commits are GPG-signed. An earlier waiver (owner decision, 2026-08-17)
 applied while the publishing environment held no signing key; the `2.x.x`
 rebase was performed where a key was available, so every slice now carries a
-signature. No branch rule requires them.
+signature. Since 2026-11-10 a ruleset requires a verified signature on every
+commit added to `2.x.x` and the other version lines
+([`.github/rulesets/`](../../.github/rulesets/)). The stack's own branches
+are not covered.
 
 | PR | Branch | Scope |
 | --- | --- | --- |
@@ -41,6 +44,7 @@ with explicit force-with-lease expectations; stop if any remote tip changed.
 
 Validate focused behavior per PR. Run cumulative PRISM discovery after PR 2,
 PostgreSQL/Rust after PR 3, the image build after PR 6, and the complete final
-matrix on PR 9. Merge bottom-up. If the repository squash-merges a lower PR,
-rebase the remaining branches onto the new `2.x.x` tip and force-push only with
-lease.
+matrix on PR 9. Merge bottom-up. Squash merges are off since 2026-11-10: a
+maintainer squashes a lower PR into one signed commit and merges it. After
+that, rebase the remaining branches onto the new `2.x.x` tip and force-push
+only with lease.

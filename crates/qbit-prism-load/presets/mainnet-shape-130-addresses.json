@@ -3,7 +3,8 @@
   "name": "mainnet-shape-130-addresses",
   "description": "The mainnet 2.x.x shape as a floor: 130 payout addresses, one whale at 85% of the work over a Zipf(1.1) tail, session difficulty over three orders of magnitude, bursty arrivals (1 s CV about 1.2) peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee.",
   "issues": [
-    "#521"
+    "#521",
+    "#842"
   ],
   "schedule": "nightly",
   "runner": "blacksmith-8vcpu-ubuntu-2404",
@@ -17,7 +18,8 @@
     "max_shortfall": 0,
     "max_rejected_valid_shares": null,
     "max_unanswered_submits": null,
-    "tip_last_notify_p99_budget_ms": 3000,
+    "tip_last_notify_p99_budget_ms": 6000,
+    "tip_last_notify_median_budget_ms": 3000,
     "d1_verdict_table": false,
     "churn_tip_last_notify_p99_budget_ms": null,
     "new_session_first_job_p99_budget_ms": null

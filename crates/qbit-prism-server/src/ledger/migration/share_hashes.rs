@@ -159,10 +159,15 @@ const BATCH_TARGET: Duration = Duration::from_millis(500);
 const REPORT_EVERY: Duration = Duration::from_secs(10);
 
 /// How hard the rest of a deferred backfill presses on a primary that
-/// serves (#738). Every native share UPDATEs the cluster singleton under
-/// the order lock, and a snapshot held anywhere on the primary keeps that
-/// row's dead versions: at about 400 shares a second the order lock
-/// saturates after 18 to 20 seconds of held horizon. So while frontends
+/// serves (#738). While a frontend before 3.1.1 serves, every native share
+/// it appends UPDATEs the cluster singleton under the order lock, and a
+/// snapshot held anywhere on the primary keeps that row's dead versions: at
+/// about 400 shares a second the order lock saturates after 18 to 20
+/// seconds of held horizon. From 3.1.1 an append only reads
+/// `ledger_clock_ms` (#801), and the row's remaining writers are the
+/// snapshot anchor, once per window snapshot, and the peer sync's own-log
+/// floor; but the backfill cannot tell which releases serve, so it keeps
+/// the bound below as a conservative choice. So while frontends
 /// serve, each batch is one statement of at most `max_batch` `share_seq`
 /// values, cancelled at `statement_timeout`, in a transaction of its own,
 /// and the run holds no snapshot between batches. After each batch it
@@ -300,20 +305,20 @@ impl Throttle {
         took.mul_f64((1.0 - self.duty_cycle) / self.duty_cycle)
     }
 
-    /// What a run that stopped on `error` says to change, when its smallest
-    /// `what` (a batch or a chunk of `rows` `share_seq`) outlasted the
-    /// statement timeout: a smaller batch first, then a longer timeout, up
-    /// to the cap. Only `backfill-share-hashes` takes the flags; plain
-    /// `migrate` runs the defaults.
-    fn smallest_timed_out(&self, what: &str, rows: i64, error: &sqlx::Error) -> String {
-        match error {
-            sqlx::Error::Database(error) if statement_timed_out(&**error) => format!(
-                ": even a {what} of {rows} share_seq, the smallest, outlasted its {} ms statement timeout, so run it with a smaller --max-batch, or else a larger --statement-timeout-ms, at most {}",
-                self.statement_timeout.as_millis(),
-                Self::MAX_STATEMENT_TIMEOUT_MS
-            ),
-            _ => String::new(),
+    /// What a run that stopped on `error`, as `timed` returned it, says to
+    /// change, when its smallest `what` (a batch or a chunk of `rows`
+    /// `share_seq`) outlasted the statement timeout: a smaller batch first,
+    /// then a longer timeout, up to the cap. Only `backfill-share-hashes`
+    /// takes the flags; plain `migrate` runs the defaults.
+    fn smallest_timed_out(&self, what: &str, rows: i64, error: &anyhow::Error) -> String {
+        if !timed_out(error) {
+            return String::new();
         }
+        format!(
+            ": even a {what} of {rows} share_seq, the smallest, outlasted its {} ms statement timeout, so run it with a smaller --max-batch, or else a larger --statement-timeout-ms, at most {}",
+            self.statement_timeout.as_millis(),
+            Self::MAX_STATEMENT_TIMEOUT_MS
+        )
     }
 
     /// The backoff after the record attempt `attempt` (from 1) waited too
@@ -686,13 +691,31 @@ async fn throttled<'c>(
     Ok(tx)
 }
 
+/// The `statement_timeout` a statement on `connection` runs under outside a
+/// transaction that sets its own: the pool's,
+/// `PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, which the connection set when it
+/// was opened; zero where there is none. `pg_settings` gives it in
+/// milliseconds.
+async fn session_statement_timeout(connection: &mut PgConnection) -> Result<Duration> {
+    let millis: i64 = sqlx::query_scalar(
+        "SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .context("migration 2: reading the session's statement_timeout before backfilling qbit_prism_share_hashes")?;
+    Ok(Duration::from_millis(u64::try_from(millis).unwrap_or(0)))
+}
+
 /// Map the legacy shares of `[from, to)` in ascending batches of
 /// consecutive `share_seq`, each one statement in its own transaction under
 /// the pool's statement timeout, and return the rows mapped. A batch that
 /// outlasts the timeout is rolled back and tried again at half its size.
 /// With a `throttle`, while frontends serve, the batches keep within its
 /// size, each statement is cancelled at its timeout instead, and the run
-/// rests between batches as its duty cycle says.
+/// rests between batches as its duty cycle says. Each batch is `timed`
+/// under the timeout it runs under, so a batch the timeout cancelled is told
+/// from one an operator cancelled, which stops the run, without
+/// PostgreSQL's message (#824).
 async fn map_batches(
     connection: &mut PgConnection,
     pass: Pass,
@@ -719,6 +742,13 @@ async fn map_batches(
             "share-hash backfill batches throttled: each one statement in its own transaction, none holding a snapshot past its timeout, resting between them"
         );
     }
+    // The throttle's timeout, which `throttled` sets for each batch, or else
+    // the session's, the pool's, read once here where there is a batch.
+    let timeout = match throttle {
+        Some(throttle) => throttle.statement_timeout,
+        None if from < to => session_statement_timeout(connection).await?,
+        None => Duration::ZERO,
+    };
     let mut next = from;
     let mut mapped: u64 = 0;
     while next < to {
@@ -735,13 +765,11 @@ async fn map_batches(
                 .bind(upper)
                 .bind(min_height),
         };
-        let inserted = match statement.execute(&mut *tx).await {
+        let inserted = match timed(timeout, statement.execute(&mut *tx)).await {
             Ok(done) => done.rows_affected(),
             // Only this batch is lost; the same range is tried again at
             // half the size.
-            Err(sqlx::Error::Database(error))
-                if rows > min_rows && statement_timed_out(&*error) =>
-            {
+            Err(error) if rows > min_rows && timed_out(&error) => {
                 tx.rollback().await?;
                 rows = (rows / 2).max(min_rows);
                 tracing::warn!(
@@ -767,7 +795,7 @@ async fn map_batches(
                     ),
                     (Pass::Recent { min_height }, _) => format!("migration 2: mapping the recent range of qbit_prism_share_hashes, template height {min_height} and above, for share_seq {next} to {upper}; every earlier batch committed, and `qbit-prism-server migrate --defer-share-hashes` maps the range again from its start, keeping them"),
                 };
-                return Err(anyhow::Error::from(error).context(context));
+                return Err(error.context(context));
             }
         };
         if pass == Pass::Backfill {
@@ -1075,7 +1103,8 @@ async fn run_to_end(
             progress.end_seq = end_seq;
             continue;
         }
-        record_2(&mut tx).await?;
+        // No statement timeout: set to 0 above.
+        record_2(&mut tx, Duration::ZERO).await?;
         tx.commit().await?;
         break;
     }
@@ -1109,20 +1138,29 @@ async fn refuse_newer_fence(tx: &mut Transaction<'_, Postgres>) -> Result<Option
 }
 
 /// Drop the cursor and the fence and record 2, in the caller's transaction,
-/// which holds the migration lock.
-async fn record_2(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability=$1")
-        .bind(PENDING_CAPABILITY)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO qbit_prism_schema_migrations(version) VALUES($1) ON CONFLICT (version) DO NOTHING",
+/// which holds the migration lock, each statement `timed` under the
+/// statement timeout the caller set, `timeout` (zero where it set none).
+async fn record_2(tx: &mut Transaction<'_, Postgres>, timeout: Duration) -> Result<()> {
+    timed(
+        timeout,
+        sqlx::raw_sql("DROP TABLE qbit_prism_share_hash_backfill").execute(&mut **tx),
     )
-    .bind(VERSION)
-    .execute(&mut **tx)
+    .await?;
+    timed(
+        timeout,
+        sqlx::query("DELETE FROM qbit_prism_schema_capabilities WHERE capability=$1")
+            .bind(PENDING_CAPABILITY)
+            .execute(&mut **tx),
+    )
+    .await?;
+    timed(
+        timeout,
+        sqlx::query(
+            "INSERT INTO qbit_prism_schema_migrations(version) VALUES($1) ON CONFLICT (version) DO NOTHING",
+        )
+        .bind(VERSION)
+        .execute(&mut **tx),
+    )
     .await?;
     Ok(())
 }
@@ -1388,15 +1426,19 @@ async fn record_serving_once(
 ) -> Result<()> {
     #[cfg(test)]
     faults::before_record_attempt(connection).await?;
+    let timeout = throttle.statement_timeout;
     let mut tx = record_transaction(connection, throttle).await?;
-    lock(&mut tx, MIGRATION_LOCK, metrics).await?;
-    refuse_newer_fence(&mut tx).await?;
+    // Every statement under the record's timeouts is `timed` on its own, so
+    // that `waited_too_long` tells its statement timeout from an operator's
+    // cancel (#824).
+    timed(timeout, lock(&mut tx, MIGRATION_LOCK, metrics)).await?;
+    timed(timeout, refuse_newer_fence(&mut tx)).await?;
     // Frontends serve: every row at or above the planned end is a native
     // share, which mapped its own header as it was appended, so the end
     // stays where it was planned.
-    check_frozen_end(&mut tx, progress).await?;
-    record_2(&mut tx).await?;
-    tx.commit().await?;
+    check_frozen_end(&mut tx, progress, timeout).await?;
+    record_2(&mut tx, timeout).await?;
+    timed(timeout, tx.commit()).await?;
     #[cfg(test)]
     faults::after_record_commit(connection).await?;
     Ok(())
@@ -1569,16 +1611,15 @@ fn connection_lost(error: &anyhow::Error) -> bool {
 }
 
 /// Whether an attempt failed only because it waited too long: on a lock,
-/// past `lock_timeout`, or past the statement timeout. An operator's
-/// cancel request carries 57014 too, and stops the run.
+/// past `lock_timeout` (55P03), or past the statement timeout (57014, which
+/// `timed` marked once the statement had run that long, but for a tenth's
+/// slack for the server's clock). An operator's
+/// cancel request carries 57014 too, sooner, and stops the run. Told by
+/// SQLSTATE and time alone, never by PostgreSQL's message, which the server
+/// translates under `lc_messages` (#824).
 fn waited_too_long(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<sqlx::Error>(),
-            Some(sqlx::Error::Database(error))
-                if error.code().as_deref() == Some("55P03") || statement_timed_out(&**error)
-        )
-    })
+    timed_out(error)
+        || database_error(error).is_some_and(|database| database.code().as_deref() == Some("55P03"))
 }
 
 /// What a backfill that permits serving checks under the migration lock
@@ -1587,12 +1628,19 @@ fn waited_too_long(error: &anyhow::Error) -> bool {
 /// ledger's, so it lies within the release table that 017 attached as the
 /// first partition, at or below the conversion bound. Native shares are
 /// appended from it upwards, below that bound too until the sequence
-/// passes it.
-async fn check_frozen_end(tx: &mut Transaction<'_, Postgres>, progress: &Progress) -> Result<()> {
-    let cursor: (i64, i64) = sqlx::query_as(
-        "SELECT next_seq,end_seq FROM qbit_prism_share_hash_backfill WHERE singleton FOR UPDATE",
+/// passes it. Each statement is `timed` under the record's `timeout`.
+async fn check_frozen_end(
+    tx: &mut Transaction<'_, Postgres>,
+    progress: &Progress,
+    timeout: Duration,
+) -> Result<()> {
+    let cursor: (i64, i64) = timed(
+        timeout,
+        sqlx::query_as(
+            "SELECT next_seq,end_seq FROM qbit_prism_share_hash_backfill WHERE singleton FOR UPDATE",
+        )
+        .fetch_one(&mut **tx),
     )
-    .fetch_one(&mut **tx)
     .await?;
     let end_seq = progress.end_seq;
     ensure!(
@@ -1602,7 +1650,7 @@ async fn check_frozen_end(tx: &mut Transaction<'_, Postgres>, progress: &Progres
         cursor.1
     );
     ensure!(
-        conversion_bound_covers(tx, end_seq).await?,
+        timed(timeout, conversion_bound_covers(tx, end_seq)).await?,
         "refusing to record migration 2: its share-hash backfill permits serving, but qbit_prism_share_partitioning records no conversion bound, so migration 017 has not partitioned the share ledger and nothing should have served it. Migrate again, which applies 017 before it finishes the backfill"
     );
     Ok(())
@@ -1657,8 +1705,8 @@ const DOUBLE_CREDIT: &str = "SELECT n.share_id,n.share_seq FROM qbit_share_ledge
 /// chunk that outlasts it tried again at half its size, and a rest after
 /// each by the duty cycle. Days after a cutover a single statement over
 /// them all would outlast any timeout, or, given none, hold a snapshot on
-/// the serving primary for minutes, while every append updates the cluster
-/// row (#738). Shares appended once the check has started need no reading:
+/// the serving primary for minutes, while a frontend before 3.1.1 updates
+/// the cluster row with every append (#738). Shares appended once the check has started need no reading:
 /// every legacy header is mapped by then, committed by the batches before
 /// it, so an append that repeats one finds it credited at its probe, or,
 /// if its probe ran before the batch that mapped the header committed,
@@ -1693,19 +1741,20 @@ async fn refuse_double_credit(
         let upper = next.saturating_add(rows).min(to);
         let chunk = Instant::now();
         let mut tx = throttled(connection, throttle).await?;
-        let repeat: Option<(String, i64)> = match sqlx::query_as(DOUBLE_CREDIT)
-            .bind(end_seq)
-            .bind(next)
-            .bind(upper)
-            .fetch_optional(&mut *tx)
-            .await
+        let repeat: Option<(String, i64)> = match timed(
+            throttle.statement_timeout,
+            sqlx::query_as(DOUBLE_CREDIT)
+                .bind(end_seq)
+                .bind(next)
+                .bind(upper)
+                .fetch_optional(&mut *tx),
+        )
+        .await
         {
             Ok(repeat) => repeat,
             // Only this chunk is lost; the same range is read again at half
             // the size.
-            Err(sqlx::Error::Database(error))
-                if rows > throttle.min_batch() && statement_timed_out(&*error) =>
-            {
+            Err(error) if rows > throttle.min_batch() && timed_out(&error) => {
                 tx.rollback().await?;
                 rows = (rows / 2).max(throttle.min_batch());
                 tracing::warn!(
@@ -1720,7 +1769,7 @@ async fn refuse_double_credit(
             }
             Err(error) => {
                 let smallest = throttle.smallest_timed_out("chunk", rows, &error);
-                return Err(anyhow::Error::from(error).context(format!("migration 2: checking the native shares from share_seq {next} to {upper} for a header an accepted legacy share holds, before recording 2. Every batch of the backfill committed, and 2 is not recorded; run `qbit-prism-server backfill-share-hashes` again{smallest}")));
+                return Err(error.context(format!("migration 2: checking the native shares from share_seq {next} to {upper} for a header an accepted legacy share holds, before recording 2. Every batch of the backfill committed, and 2 is not recorded; run `qbit-prism-server backfill-share-hashes` again{smallest}")));
             }
         };
         tx.commit().await?;
@@ -2083,9 +2132,11 @@ pub(crate) mod faults {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum Fault {
-        /// The record attempt commits, then fails with the statement
-        /// timeout's 57014, as an attempt whose COMMIT reply was cut short
-        /// after the commit would.
+        /// The record attempt commits, then fails with 57014, as an
+        /// attempt whose COMMIT reply was cut short after the commit
+        /// would. It fails at once, so `timed` would take it for a cancel
+        /// request, not the statement timeout: the run must find 2 recorded
+        /// before it asks why the attempt failed (`record_while_serving`).
         LoseRecordCommitReply,
         /// A read of the cursor first runs this SQL, after the look-up that
         /// found the cursor: what another session can do between the two.
@@ -2241,6 +2292,7 @@ mod postgres_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{failed_after, Reported, LONG};
     use super::*;
 
     #[test]
@@ -2364,45 +2416,6 @@ mod tests {
             .is_err());
     }
 
-    /// A database error carrying `0`'s SQLSTATE alone, as a server sends
-    /// one.
-    #[derive(Debug)]
-    struct Sqlstate(&'static str);
-
-    impl std::fmt::Display for Sqlstate {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "SQLSTATE {}", self.0)
-        }
-    }
-
-    impl std::error::Error for Sqlstate {}
-
-    impl sqlx::error::DatabaseError for Sqlstate {
-        fn message(&self) -> &str {
-            "a test's"
-        }
-
-        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-            Some(self.0.into())
-        }
-
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::Other
-        }
-    }
-
     /// The connection is lost to the run on a failed transport or
     /// protocol, on a session the server ended, whatever its SQLSTATE says
     /// ended it, and on an attempt without a reply within its deadline,
@@ -2414,7 +2427,8 @@ mod tests {
         let lost = |error: sqlx::Error| {
             connection_lost(&anyhow::Error::from(error).context("recording migration 2"))
         };
-        let database = |code: &'static str| sqlx::Error::Database(Box::new(Sqlstate(code)));
+        let database =
+            |code: &'static str| sqlx::Error::Database(Box::new(Reported(code, "a test's")));
         assert!(lost(sqlx::Error::Io(std::io::Error::from(
             std::io::ErrorKind::UnexpectedEof
         ))));
@@ -2438,6 +2452,59 @@ mod tests {
             &anyhow::Error::from(AttemptUnanswered(Duration::from_secs(45)))
                 .context("recording migration 2")
         ));
+    }
+
+    /// A statement under `bound` that failed with `code` after `ran`, as
+    /// `timed` returns it, with the context the record adds on its way up:
+    /// under `LONG` instead where it failed at once (`ran` zero).
+    async fn failed(code: &'static str, bound: Duration, ran: Duration) -> anyhow::Error {
+        let bound = if ran.is_zero() && !bound.is_zero() {
+            LONG
+        } else {
+            bound
+        };
+        failed_after(code, "a test's", bound, ran)
+            .await
+            .context("recording migration 2")
+    }
+
+    /// An attempt to record 2 waited too long on a lock timeout's 55P03, or
+    /// on a 57014 once the statement had run its statement timeout, and on
+    /// nothing else: a 57014 sooner is an operator's cancel, which stops
+    /// the run. The SQLSTATE and the time tell them apart, never a message,
+    /// which a server translates under `lc_messages` (#824). The smallest
+    /// batch's failure names the remedy for its statement timeout alone.
+    #[tokio::test]
+    async fn a_record_attempt_waited_too_long_by_its_sqlstate_and_time() {
+        let bound = Duration::from_millis(20);
+        assert!(waited_too_long(
+            &failed("55P03", bound, Duration::ZERO).await
+        ));
+        assert!(waited_too_long(&failed("57014", bound, bound).await));
+        assert!(!waited_too_long(
+            &failed("57014", bound, Duration::ZERO).await
+        ));
+        assert!(!waited_too_long(
+            &failed("57014", Duration::ZERO, bound).await
+        ));
+        assert!(!waited_too_long(&failed("40P01", bound, bound).await));
+        let throttle = Throttle::new(1_000, bound, 1.0).unwrap();
+        assert_eq!(
+            throttle.smallest_timed_out("batch", 1_000, &failed("57014", bound, bound).await),
+            ": even a batch of 1000 share_seq, the smallest, outlasted its 20 ms statement timeout, so run it with a smaller --max-batch, or else a larger --statement-timeout-ms, at most 5000"
+        );
+        assert_eq!(
+            throttle.smallest_timed_out(
+                "chunk",
+                1_000,
+                &failed("57014", bound, Duration::ZERO).await
+            ),
+            ""
+        );
+        assert_eq!(
+            throttle.smallest_timed_out("chunk", 1_000, &failed("55P03", bound, bound).await),
+            ""
+        );
     }
 
     /// An attempt to record 2 may take, on the client's side, its ten

@@ -1160,40 +1160,339 @@ async fn bump_revision(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     Ok(())
 }
 
+type PgQuery<'q> = sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>;
+
+/// Every column of `qbit_ctv_fanout_sets` the verified set determines, key
+/// first, in [`FanoutSetRow::bind`]'s order. `created_at` and `origin_node`
+/// record when and where the row was written, not what it holds.
+const FANOUT_SET_COLUMNS: [&str; 10] = [
+    "block_hash",
+    "manifest_set_json",
+    "manifest_set",
+    "manifest_set_sha256",
+    "settlement_mode",
+    "parent_coinbase_txid",
+    "parent_coinbase_tx_hex",
+    "fanout_count",
+    "fanout_output_sum_sats",
+    "covenant_output_value_sats",
+];
+
+/// Every column of `qbit_ctv_fanout_artifacts` the verified set determines,
+/// key first, in [`FanoutArtifactRow::bind`]'s order: the columns peer sync
+/// carries, less `origin_node`. The others (settlement status, claims,
+/// schedules, confirmations, `updated_at`) move as the fanout settles.
+const FANOUT_ARTIFACT_COLUMNS: [&str; 18] = [
+    "fanout_txid",
+    "block_hash",
+    "manifest_set_sha256",
+    "manifest_json",
+    "manifest",
+    "manifest_sha256",
+    "precommitment_sha256",
+    "ctv_hash",
+    "commitment_witness_leaf_hex",
+    "chunk_index",
+    "chunk_count",
+    "parent_coinbase_txid",
+    "parent_coinbase_vout",
+    "fanout_tx_template_hex",
+    "fanout_tx_hex",
+    "anchor_vout",
+    "covenant_output_value_sats",
+    "fanout_output_sum_sats",
+];
+
+const SET_CONFLICT: &str = "existing CTV manifest set conflicts with verified audit";
+const ARTIFACT_CONFLICT: &str = "existing CTV artifact conflicts with verified audit";
+
+fn insert_fanout_row_sql(table: &str, columns: &[&str]) -> String {
+    let values: Vec<String> = (1..=columns.len()).map(|n| format!("${n}")).collect();
+    format!(
+        "INSERT INTO {table}({}) VALUES({}) ON CONFLICT DO NOTHING",
+        columns.join(","),
+        values.join(",")
+    )
+}
+
+/// The columns after the key whose held value is not the bound one, as a
+/// text array, NULL matching NULL (`anchor_vout`): empty for the bound row.
+fn differing_fanout_columns_sql(columns: &[&str]) -> String {
+    let checks: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, column)| {
+            format!(
+                "CASE WHEN {column} IS NOT DISTINCT FROM ${} THEN NULL ELSE '{column}' END",
+                index + 1
+            )
+        })
+        .collect();
+    format!("array_remove(ARRAY[{}]::text[],NULL)", checks.join(","))
+}
+
+/// The two forms a CTV set and its artifacts store their JSON text in
+/// (#739). 3.x writes the set in struct order and each manifest as
+/// serde_json's sorted-key text. 1.x and 2.x wrote both as
+/// `json.dumps(sort_keys=True, separators=(",", ":"))`, which escapes
+/// everything outside printable ASCII ([`qbit_prism::legacy_ctv_json_text`]);
+/// for printable ASCII text a manifest's two forms are the same bytes. Every
+/// artifact is in its set's
+/// form, so a chunk restored under a 2.x set reads as its 2.x siblings do.
+#[derive(Clone, Copy)]
+enum FanoutTextForm {
+    Current,
+    Legacy,
+}
+
+/// A `qbit_ctv_fanout_sets` row as the verified set determines it in one
+/// text form.
+struct FanoutSetRow<'a> {
+    block_hash: &'a str,
+    json: String,
+    value: Value,
+    sha256: String,
+    settlement_mode: String,
+    parent_coinbase_txid: &'a str,
+    parent_coinbase_tx_hex: &'a str,
+    fanout_count: i32,
+    fanout_output_sum_sats: i64,
+    covenant_output_value_sats: i64,
+}
+
+impl<'a> FanoutSetRow<'a> {
+    fn current(block_hash: &'a str, set: &'a qbit_prism::CtvFanoutManifestSet) -> Result<Self> {
+        let json = String::from_utf8(qbit_prism::canonical_ctv_fanout_manifest_set_bytes(set)?)?;
+        Ok(Self {
+            block_hash,
+            sha256: hex::encode(Sha256::digest(json.as_bytes())),
+            json,
+            value: serde_json::to_value(set)?,
+            settlement_mode: serde_json::to_value(&set.settlement_mode)?
+                .as_str()
+                .context("invalid settlement mode")?
+                .to_owned(),
+            parent_coinbase_txid: &set.parent_coinbase_txid,
+            // The set verified above, so it has a first chunk.
+            parent_coinbase_tx_hex: &set.manifests[0].parent_coinbase_tx_hex,
+            fanout_count: i32::try_from(set.fanout_count)?,
+            fanout_output_sum_sats: i64::try_from(set.fanout_output_sum_sats)?,
+            covenant_output_value_sats: i64::try_from(set.covenant_output_value_sats)?,
+        })
+    }
+
+    fn bind<'q>(&'q self, query: PgQuery<'q>) -> PgQuery<'q> {
+        query
+            .bind(self.block_hash)
+            .bind(&self.json)
+            .bind(&self.value)
+            .bind(&self.sha256)
+            .bind(&self.settlement_mode)
+            .bind(self.parent_coinbase_txid)
+            .bind(self.parent_coinbase_tx_hex)
+            .bind(self.fanout_count)
+            .bind(self.fanout_output_sum_sats)
+            .bind(self.covenant_output_value_sats)
+    }
+}
+
+/// A `qbit_ctv_fanout_artifacts` row as one verified manifest determines it,
+/// under its set's stored digest and in its set's text form.
+struct FanoutArtifactRow<'a> {
+    manifest: &'a qbit_prism::CtvFanoutManifest,
+    block_hash: &'a str,
+    manifest_set_sha256: &'a str,
+    json: String,
+    value: Value,
+    sha256: String,
+    chunk_index: i32,
+    chunk_count: i32,
+    parent_coinbase_vout: i32,
+    anchor_vout: Option<i32>,
+    covenant_output_value_sats: i64,
+    fanout_output_sum_sats: i64,
+}
+
+impl<'a> FanoutArtifactRow<'a> {
+    fn new(
+        set: &'a FanoutSetRow<'a>,
+        form: FanoutTextForm,
+        manifest: &'a qbit_prism::CtvFanoutManifest,
+    ) -> Result<Self> {
+        let pre = &manifest.precommitment;
+        let mut value = serde_json::to_value(manifest)?;
+        // Sorted as every 3.x release wrote it, whatever serde_json's
+        // `preserve_order` feature says; the jsonb column ignores key order.
+        value.sort_all_objects();
+        let json = match form {
+            FanoutTextForm::Current => serde_json::to_string(&value)?,
+            FanoutTextForm::Legacy => qbit_prism::legacy_ctv_json_text(&value)?,
+        };
+        Ok(Self {
+            manifest,
+            block_hash: set.block_hash,
+            manifest_set_sha256: &set.sha256,
+            sha256: hex::encode(Sha256::digest(json.as_bytes())),
+            json,
+            value,
+            chunk_index: i32::try_from(pre.chunk_index)?,
+            chunk_count: i32::try_from(pre.chunk_count)?,
+            parent_coinbase_vout: i32::try_from(manifest.parent_coinbase_vout)?,
+            anchor_vout: pre.anchor_vout.map(i32::try_from).transpose()?,
+            covenant_output_value_sats: i64::try_from(manifest.covenant_output_value_sats)?,
+            fanout_output_sum_sats: i64::try_from(pre.fanout_output_sum_sats)?,
+        })
+    }
+
+    fn bind<'q>(&'q self, query: PgQuery<'q>) -> PgQuery<'q> {
+        let manifest = self.manifest;
+        let pre = &manifest.precommitment;
+        query
+            .bind(&manifest.fanout_txid)
+            .bind(self.block_hash)
+            .bind(self.manifest_set_sha256)
+            .bind(&self.json)
+            .bind(&self.value)
+            .bind(&self.sha256)
+            .bind(&manifest.precommitment_sha256_hex)
+            .bind(&pre.ctv_hash_hex)
+            .bind(&manifest.commitment_witness_leaf_hex)
+            .bind(self.chunk_index)
+            .bind(self.chunk_count)
+            .bind(&manifest.parent_coinbase_txid)
+            .bind(self.parent_coinbase_vout)
+            .bind(&pre.fanout_tx_template_hex)
+            .bind(&manifest.fanout_tx_hex)
+            .bind(self.anchor_vout)
+            .bind(self.covenant_output_value_sats)
+            .bind(self.fanout_output_sum_sats)
+    }
+}
+
+/// Write a block's verified CTV set and its artifacts, or check the rows
+/// already held against them. A held row must equal the verified set in
+/// every column the set determines, as 2.x's persist required: its stored
+/// text, digests, transaction hex and amounts as well as its jsonb, so what
+/// the artifact routes, the fanout status and the sponsor check read is
+/// what the audit proves. Columns that move as a fanout settles are not
+/// compared. This holds for 3.x rows as for 2.x ones: only this function
+/// writes them, and peer sync copies a peer's rows verbatim. A refusal is an
+/// error naming the block, the fanout and the differing columns, and the
+/// caller's transaction rolls back everything it wrote.
 pub(super) async fn persist_fanouts(
     tx: &mut Transaction<'_, Postgres>,
     block_hash: &str,
     set: &qbit_prism::CtvFanoutManifestSet,
 ) -> Result<()> {
-    let raw = qbit_prism::canonical_ctv_fanout_manifest_set_bytes(set)?;
-    let digest = hex::encode(Sha256::digest(&raw));
-    let mode = serde_json::to_value(&set.settlement_mode)?
-        .as_str()
-        .context("invalid settlement mode")?
-        .to_owned();
-    sqlx::query("INSERT INTO qbit_ctv_fanout_sets(block_hash,manifest_set_json,manifest_set,manifest_set_sha256,settlement_mode,parent_coinbase_txid,parent_coinbase_tx_hex,fanout_count,fanout_output_sum_sats,covenant_output_value_sats) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING")
-        .bind(block_hash).bind(String::from_utf8(raw)?).bind(serde_json::to_value(set)?).bind(&digest).bind(mode).bind(&set.parent_coinbase_txid).bind(&set.manifests[0].parent_coinbase_tx_hex)
-        .bind(i32::try_from(set.fanout_count)?).bind(i64::try_from(set.fanout_output_sum_sats)?).bind(i64::try_from(set.covenant_output_value_sats)?).execute(&mut **tx).await?;
-    let matches: bool = sqlx::query_scalar("SELECT manifest_set=$2 AND manifest_set_sha256=$3 FROM qbit_ctv_fanout_sets WHERE block_hash=$1")
-        .bind(block_hash).bind(serde_json::to_value(set)?).bind(&digest).fetch_one(&mut **tx).await?;
-    ensure!(
-        matches,
-        "existing CTV manifest set conflicts with verified audit"
+    let mut row = FanoutSetRow::current(block_hash, set)?;
+    // A row this statement wrote is the bound row, so only a held one is
+    // compared: a landing writes its set and artifacts fresh.
+    let fresh_set = row
+        .bind(sqlx::query(&insert_fanout_row_sql(
+            "qbit_ctv_fanout_sets",
+            &FANOUT_SET_COLUMNS,
+        )))
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+        == 1;
+    // A held set is this set in one of its two forms (#739): 3.x's, or the
+    // one 1.x and 2.x stored, whose digest every one of their artifacts and
+    // their evidence name. A legacy row is read as written, never
+    // re-canonicalised. Its text must be the form's text exactly, so it
+    // hashes to the digest it is served under. The legacy form is computed
+    // only when the 3.x one does not match.
+    let form = if fresh_set {
+        FanoutTextForm::Current
+    } else {
+        let differing_set = format!(
+            "SELECT manifest_set_sha256,{} FROM qbit_ctv_fanout_sets WHERE block_hash=$1",
+            differing_fanout_columns_sql(&FANOUT_SET_COLUMNS)
+        );
+        let held = row
+            .bind(sqlx::query(&differing_set))
+            .fetch_one(&mut **tx)
+            .await?;
+        let (held_digest, current): (String, Vec<String>) = (held.try_get(0)?, held.try_get(1)?);
+        if current.is_empty() {
+            FanoutTextForm::Current
+        } else {
+            // The set verified above; only its 2.x text is needed here.
+            row.json = qbit_prism::legacy_ctv_json_text(set)?;
+            row.sha256 = hex::encode(Sha256::digest(row.json.as_bytes()));
+            let legacy: Vec<String> = row
+                .bind(sqlx::query(&differing_set))
+                .fetch_one(&mut **tx)
+                .await?
+                .try_get(1)?;
+            if !legacy.is_empty() {
+                // Name the form the row is nearer; on a tie, the one whose
+                // digest it holds.
+                let (name, columns) = if legacy.len() < current.len()
+                    || (legacy.len() == current.len() && held_digest == row.sha256)
+                {
+                    ("2.x", legacy)
+                } else {
+                    ("3.x", current)
+                };
+                bail!(
+                    "{SET_CONFLICT}: block {block_hash} differs from the verified set's {name} form in {}",
+                    columns.join(",")
+                );
+            }
+            FanoutTextForm::Legacy
+        }
+    };
+    let insert = insert_fanout_row_sql("qbit_ctv_fanout_artifacts", &FANOUT_ARTIFACT_COLUMNS);
+    let differing_artifact = format!(
+        "SELECT {} FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1",
+        differing_fanout_columns_sql(&FANOUT_ARTIFACT_COLUMNS)
     );
     for manifest in &set.manifests {
-        let pre = &manifest.precommitment;
-        let value = serde_json::to_value(manifest)?;
-        let raw = serde_json::to_string(&value)?;
-        sqlx::query("INSERT INTO qbit_ctv_fanout_artifacts(fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT DO NOTHING")
-            .bind(&manifest.fanout_txid).bind(block_hash).bind(&digest).bind(&raw).bind(value).bind(hex::encode(Sha256::digest(raw.as_bytes())))
-            .bind(&manifest.precommitment_sha256_hex).bind(&pre.ctv_hash_hex).bind(&manifest.commitment_witness_leaf_hex).bind(i32::try_from(pre.chunk_index)?).bind(i32::try_from(pre.chunk_count)?)
-            .bind(&manifest.parent_coinbase_txid).bind(i32::try_from(manifest.parent_coinbase_vout)?).bind(&pre.fanout_tx_template_hex).bind(&manifest.fanout_tx_hex)
-            .bind(pre.anchor_vout.map(i32::try_from).transpose()?).bind(i64::try_from(manifest.covenant_output_value_sats)?).bind(i64::try_from(pre.fanout_output_sum_sats)?).execute(&mut **tx).await?;
-        let matches: bool = sqlx::query_scalar("SELECT manifest=$2 AND block_hash=$3 AND manifest_set_sha256=$4 FROM qbit_ctv_fanout_artifacts WHERE fanout_txid=$1")
-            .bind(&manifest.fanout_txid).bind(serde_json::to_value(manifest)?).bind(block_hash).bind(&digest).fetch_one(&mut **tx).await?;
+        let artifact = FanoutArtifactRow::new(&row, form, manifest)?;
+        let fresh = artifact
+            .bind(sqlx::query(&insert))
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+            == 1;
+        if fresh {
+            continue;
+        }
+        let txid = &manifest.fanout_txid;
+        // No row: the insert did nothing because another artifact holds this
+        // one's chunk of the block.
+        let Some(held) = artifact
+            .bind(sqlx::query(&differing_artifact))
+            .fetch_optional(&mut **tx)
+            .await?
+        else {
+            bail!(
+                "{ARTIFACT_CONFLICT}: another artifact holds chunk {} of block {block_hash}, not fanout {txid}",
+                artifact.chunk_index
+            );
+        };
+        let columns: Vec<String> = held.try_get(0)?;
         ensure!(
-            matches,
-            "existing CTV artifact conflicts with verified audit"
+            columns.is_empty(),
+            "{ARTIFACT_CONFLICT}: fanout {txid} of block {block_hash} differs from the verified manifest in {}",
+            columns.join(",")
+        );
+    }
+    // A fresh set's only artifacts are the ones just written, which name it;
+    // a held set's must include none the audit lacks.
+    if !fresh_set {
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1",
+        )
+        .bind(block_hash)
+        .fetch_one(&mut **tx)
+        .await?;
+        ensure!(
+            usize::try_from(held)? == set.manifests.len(),
+            "{ARTIFACT_CONFLICT}: block {block_hash} holds {held} artifacts, the audit {}",
+            set.manifests.len()
         );
     }
     Ok(())

@@ -840,6 +840,7 @@ fn the_gate_passes_a_clean_run_and_fails_each_way_a_run_can_fall_short() {
         tip_last_notify_median_ms: None,
         d1_verdict_table: false,
         churn_tip_last_notify_p99_ms: None,
+        churn_tip_last_notify_median_ms: None,
         new_session_first_job_p99_ms: None,
     };
     let clean = gate::evaluate(&passing_report(), Some(0), &budgets);
@@ -922,21 +923,8 @@ fn a_few_tips_are_gated_on_their_median_and_a_stall_on_the_p99_with_headroom() {
         tip_last_notify_median_ms: Some(5000.0),
         ..gate_budgets()
     };
-    let with_tips = |times: &[f64]| {
-        let mut report = passing_report();
-        report["time_to_usable_work"]["tips"] = times
-            .iter()
-            .map(|ms| json!({"all_sessions_milliseconds": ms}))
-            .collect();
-        report
-    };
-    let row = |checks: &[gate::Check], statistic: &str| {
-        checks
-            .iter()
-            .find(|c| c.name == format!("tip to last session's notify, {statistic} over tips"))
-            .cloned()
-            .unwrap_or_else(|| panic!("no {statistic} row"))
-    };
+    let with_tips = |times: &[f64]| planned_tips(times, times.len(), 0);
+    let row = tip_row;
     // The two flaky failures' slowest tips beside passing runs' others.
     for slowest in [6665.0, 5315.0] {
         let checks = gate::evaluate(&with_tips(&[1500.0, slowest, 2600.0]), Some(0), &budgets);
@@ -981,6 +969,105 @@ fn a_few_tips_are_gated_on_their_median_and_a_stall_on_the_p99_with_headroom() {
     assert_eq!(row(&checks, "p99").pass, Some(false));
 }
 
+/// A passing report whose warm-up planned `planned` tips, `unminted` of
+/// them held behind a landing, and delivered `times`.
+fn planned_tips(times: &[f64], planned: usize, unminted: usize) -> Value {
+    let mut report = passing_report();
+    report["time_to_usable_work"]["tips"] = times
+        .iter()
+        .map(|ms| json!({"all_sessions_milliseconds": ms}))
+        .collect();
+    report["phases"][0]["external_tips_planned"] = json!(planned);
+    report["phases"][0]["external_tips_unminted"] = json!(unminted);
+    report
+}
+
+fn tip_row(checks: &[gate::Check], statistic: &str) -> gate::Check {
+    checks
+        .iter()
+        .find(|c| c.name == format!("tip to last session's notify, {statistic} over tips"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no {statistic} row: {}", gate::markdown("x", checks)))
+}
+
+/// #854: the median's premise is every tip the run planned. 2 tips of 8 have
+/// the faster as their nearest-rank median, so one at nearly twice the old
+/// 2,500 ms budget passed tip-delivery's split; a tip held unminted behind a
+/// landing, or a report that does not say what it planned, is an unmeasured
+/// median, not a pass. The slowest-tip row is unchanged.
+#[test]
+fn a_tip_median_is_measured_only_over_every_tip_the_run_planned() {
+    let budgets = gate::Budgets {
+        tip_last_notify_p99_ms: Some(5000.0),
+        tip_last_notify_median_ms: Some(2500.0),
+        ..gate_budgets()
+    };
+    // Every planned tip came: the median gates as before.
+    let all = planned_tips(&[1000.0, 4900.0], 2, 0);
+    assert!(gate::passed(&gate::evaluate(&all, Some(0), &budgets)));
+    // 2 of 8 planned, one slow: the median fails, unmeasured.
+    let two = gate::evaluate(&planned_tips(&[1000.0, 4900.0], 8, 0), Some(0), &budgets);
+    assert!(!gate::passed(&two), "{}", gate::markdown("x", &two));
+    let median = tip_row(&two, "median");
+    assert_eq!(median.pass, Some(false));
+    assert_eq!(median.observed, "unmeasured: 2 of 8 planned tips delivered");
+    assert_eq!(tip_row(&two, "p99").pass, Some(true));
+    // One tip held unminted behind a landing: 7 fast tips are not 8.
+    let fast = [900.0, 1000.0, 1100.0, 1000.0, 900.0, 1200.0, 1000.0];
+    let held = gate::evaluate(&planned_tips(&fast, 8, 1), Some(0), &budgets);
+    assert!(!gate::passed(&held), "{}", gate::markdown("x", &held));
+    assert_eq!(
+        tip_row(&held, "median").observed,
+        "unmeasured: 7 of 8 planned tips delivered, 1 held unminted behind a landing"
+    );
+    // A report that does not record its plan cannot show the premise.
+    let mut unplanned = planned_tips(&fast, 7, 0);
+    unplanned["phases"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("external_tips_planned");
+    let checks = gate::evaluate(&unplanned, Some(0), &budgets);
+    assert_eq!(tip_row(&checks, "median").pass, Some(false));
+    assert!(tip_row(&checks, "median")
+        .observed
+        .starts_with("unmeasured: phase warm_up does not record its planned tips"));
+    // A short run with an unserved tip says both.
+    let mut unserved = planned_tips(&[1000.0, 1000.0], 8, 0);
+    unserved["time_to_usable_work"]["tips"][1] = json!({"all_sessions_milliseconds": null,
+        "all_sessions_unavailable_reason": "3 of 50 sessions got no usable work"});
+    let checks = gate::evaluate(&unserved, Some(0), &budgets);
+    assert_eq!(
+        tip_row(&checks, "median").observed,
+        "unmeasured: 2 of 8 planned tips delivered; tip 1: 3 of 50 sessions got no usable work"
+    );
+    // Without a median budget nothing new is gated: the p99 alone, as before.
+    let p99_only = gate::Budgets {
+        tip_last_notify_median_ms: None,
+        ..budgets
+    };
+    let checks = gate::evaluate(&planned_tips(&[1000.0, 4900.0], 8, 0), Some(0), &p99_only);
+    assert!(gate::passed(&checks), "{}", gate::markdown("x", &checks));
+}
+
+/// #854's F2: a nearest-rank median of n tips is the ceil(n/2)-th fastest,
+/// so a slowdown on exactly half the tips passes it and one on more than
+/// half fails it, as the README's gate table says.
+#[test]
+fn a_tip_median_passes_a_slowdown_on_half_the_tips_and_fails_one_on_more() {
+    let budgets = gate::Budgets {
+        tip_last_notify_p99_ms: Some(5000.0),
+        tip_last_notify_median_ms: Some(2500.0),
+        ..gate_budgets()
+    };
+    let half = [600.0, 600.0, 600.0, 600.0, 4900.0, 4900.0, 4900.0, 4900.0];
+    let checks = gate::evaluate(&planned_tips(&half, 8, 0), Some(0), &budgets);
+    assert_eq!(tip_row(&checks, "median").pass, Some(true));
+    let more = [600.0, 600.0, 600.0, 4900.0, 4900.0, 4900.0, 4900.0, 4900.0];
+    let checks = gate::evaluate(&planned_tips(&more, 8, 0), Some(0), &budgets);
+    assert_eq!(tip_row(&checks, "median").pass, Some(false));
+    assert_eq!(tip_row(&checks, "p99").pass, Some(true));
+}
+
 fn gate_budgets() -> gate::Budgets {
     gate::Budgets {
         phases: None,
@@ -991,41 +1078,133 @@ fn gate_budgets() -> gate::Budgets {
         tip_last_notify_median_ms: None,
         d1_verdict_table: false,
         churn_tip_last_notify_p99_ms: None,
+        churn_tip_last_notify_median_ms: None,
         new_session_first_job_p99_ms: None,
     }
 }
 
-/// Only the real-node smoke sets the optional median key (#790); every
-/// other preset leaves it absent, which loads as not gated, and a budget
-/// that is not finite and positive is refused like the others.
+/// The optional median keys (#790, #842). The real-node smoke, and the
+/// nightly presets #842 split, hold their median tip to the old budget and
+/// their slowest tip to twice it, which one stalled tip on a contended runner
+/// no longer fails. The churn preset splits only its 8 churn tips: its
+/// warm-up has 2 tips, whose nearest-rank median is the faster one, so that
+/// row keeps its slowest tip at the old budget. Every other preset leaves
+/// both keys absent, which loads as not gated, and a median budget that is
+/// not finite and positive is refused like the others.
 #[test]
-fn only_the_real_node_smoke_gates_the_tip_median() -> Result<()> {
+fn presets_gate_the_tip_median_only_where_they_split_it_from_a_stall_budget() -> Result<()> {
+    // (preset, run tips' (median, slowest) or slowest alone, churn tips').
+    type Split = (&'static str, (Option<f64>, f64), Option<(f64, f64)>);
+    let split: &[Split] = &[
+        ("real-node-smoke", (Some(5000.0), 10_000.0), None),
+        (
+            "tip-delivery-2000-miners-400k-2fe-retarget",
+            (Some(2500.0), 5000.0),
+            None,
+        ),
+        (
+            "tip-delivery-2000-miners-400k-2fe-retarget-500-addresses",
+            (Some(2500.0), 5000.0),
+            None,
+        ),
+        ("mainnet-shape-130-addresses", (Some(3000.0), 6000.0), None),
+        ("mainnet-shape-650-addresses", (Some(3000.0), 6000.0), None),
+        (
+            "rental-churn-bursts-and-storms",
+            (None, 3000.0),
+            Some((3000.0, 6000.0)),
+        ),
+    ];
+    let mut seen = 0;
     for loaded in preset::load_all(&preset::presets_dir())? {
         let budgets = gate::Budgets::from(&loaded.gates);
-        if loaded.name == "real-node-smoke" {
-            assert_eq!(budgets.tip_last_notify_median_ms, Some(5000.0));
-            assert_eq!(budgets.tip_last_notify_p99_ms, Some(10_000.0));
-        } else {
-            assert_eq!(budgets.tip_last_notify_median_ms, None, "{}", loaded.name);
+        let name = loaded.name.as_str();
+        match split.iter().find(|(preset, ..)| *preset == name) {
+            Some((_, (median, slowest), churn)) => {
+                seen += 1;
+                assert_eq!(budgets.tip_last_notify_median_ms, *median, "{name}");
+                assert_eq!(budgets.tip_last_notify_p99_ms, Some(*slowest), "{name}");
+                assert_eq!(
+                    budgets.churn_tip_last_notify_median_ms,
+                    churn.map(|(median, _)| median),
+                    "{name}"
+                );
+                if let Some((_, slowest)) = churn {
+                    assert_eq!(
+                        budgets.churn_tip_last_notify_p99_ms,
+                        Some(*slowest),
+                        "{name}"
+                    );
+                }
+            }
+            None => {
+                assert_eq!(budgets.tip_last_notify_median_ms, None, "{name}");
+                assert_eq!(budgets.churn_tip_last_notify_median_ms, None, "{name}");
+            }
         }
     }
-    let source = preset::presets_dir().join("real-node-smoke.json");
-    let mut file: Value = serde_json::from_slice(&std::fs::read(&source)?)?;
+    assert_eq!(seen, split.len(), "every split preset is checked in");
+    let name = "rental-churn-bursts-and-storms";
+    let source = preset::presets_dir().join(format!("{name}.json"));
+    let original: Value = serde_json::from_slice(&std::fs::read(&source)?)?;
     let dir = std::env::temp_dir().join(format!("prism-load-median-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir)?;
-    let copy = dir.join("real-node-smoke.json");
-    let mut refused = Vec::new();
-    for budget in [json!(0), json!(-1.0)] {
-        file["gates"]["tip_last_notify_median_budget_ms"] = budget;
+    let copy = dir.join(format!("{name}.json"));
+    let mut results = Vec::new();
+    for key in [
+        "tip_last_notify_median_budget_ms",
+        "churn_tip_last_notify_median_budget_ms",
+    ] {
+        for budget in [json!(0), json!(-1.0), Value::Null] {
+            let mut file = original.clone();
+            file["gates"][key] = budget.clone();
+            std::fs::write(&copy, serde_json::to_vec(&file)?)?;
+            results.push((key, budget, preset::Preset::load(&copy).map(|p| p.gates)));
+        }
+    }
+    // A median above its slowest-tip budget gates nothing the p99 does not.
+    let mut swapped = Vec::new();
+    for (median, p99) in [
+        (
+            "tip_last_notify_median_budget_ms",
+            "tip_last_notify_p99_budget_ms",
+        ),
+        (
+            "churn_tip_last_notify_median_budget_ms",
+            "churn_tip_last_notify_p99_budget_ms",
+        ),
+    ] {
+        let mut file = original.clone();
+        file["gates"][median] = json!(6000);
+        file["gates"][p99] = json!(3000);
         std::fs::write(&copy, serde_json::to_vec(&file)?)?;
-        refused.push(preset::Preset::load(&copy).map(|_| ()));
+        swapped.push((median, p99, preset::Preset::load(&copy).map(|_| ())));
     }
     let _ = std::fs::remove_dir_all(&dir);
-    for result in refused {
+    for (median, p99, result) in swapped {
         let error = format!("{:#}", result.unwrap_err());
         assert!(
-            error.contains("tip_last_notify_median_budget_ms must be finite and positive"),
+            error.contains(&format!(": {median} (6000) is above {p99} (3000)")),
             "{error}"
+        );
+    }
+    for (key, budget, result) in results {
+        if budget.is_null() {
+            // null, like absent, is not gated.
+            let gates = result.map_err(|error| anyhow::anyhow!("{key}: {error:#}"))?;
+            let budgets = gate::Budgets::from(&gates);
+            let median = if key.starts_with("churn") {
+                budgets.churn_tip_last_notify_median_ms
+            } else {
+                budgets.tip_last_notify_median_ms
+            };
+            assert_eq!(median, None, "{key}");
+            continue;
+        }
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains(&format!(": {key} must be finite and positive")),
+            "{key} = {budget}: {error}"
         );
     }
     Ok(())
@@ -1101,6 +1280,7 @@ fn the_473_rule_gates_only_the_named_phases_and_each_of_its_three_figures() {
         tip_last_notify_median_ms: None,
         d1_verdict_table: true,
         churn_tip_last_notify_p99_ms: None,
+        churn_tip_last_notify_median_ms: None,
         new_session_first_job_p99_ms: None,
     };
     let checks = gate::evaluate(&report, Some(0), &rule);

@@ -13,7 +13,10 @@ with the same escaping since #731's fix.
 `crates/qbit-prism/src/audit_body_ref.rs`'s `share_parts_digest_tests` read
 it: 3.x must reproduce the stored parts digest, canonicalize the body to bytes
 whose sha256 is its `audit_bundle_sha256`, and refuse the body once an inline
-share's worker name changes.
+share's worker name changes. `tests/test_prism_legacy_parts_digest_check.py`
+reads it too: `scripts/prism_legacy_parts_digest_check.py` must call it
+`2x-order-only`, and `ok-in-3x` with `--with-731-fix`, and with that flag must
+agree with the real canonicalizer on variants of its inline shares.
 
 ## How it was made
 

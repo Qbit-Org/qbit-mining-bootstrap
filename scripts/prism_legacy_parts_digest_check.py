@@ -4,42 +4,57 @@ share_parts_digest_hex mismatch", without reading any share slot.
 
 2.x writes an audit-bundle.v2 body's window-proof `share_parts_digest_hex` as
 sha256 of `json.dumps({"share_parts": parts}, separators=(",", ":"))`: each
-part's keys in insertion order (`kind` first), non-ASCII escaped. 3.x
-recomputes it from the parsed parts through `serde_json::json!`, and
-serde_json without `preserve_order` sorts every object's keys, so 3.x refuses
-every 2.x v2 body (crates/qbit-prism/src/audit_body_ref.rs). `import-audits`
-reads a row's canonical sidecar before its body, so only a v2 body without one
-in the import root reaches that check; prism_legacy_range_sidecars.py writes
-the missing sidecars. The statuses below are those of a 3.x without #731's
-fix, the cutover's release. With the fix, 3.x recomputes 2.x's form and
-imports a `2x-order-only` body as it is, so the listing then holds rows
-import no longer refuses: the sidecar tool reports such a row `ok-in-3x` and
-writes nothing for it.
+part's keys in insertion order (`kind` first), non-ASCII escaped. A 3.x
+without #731's fix (#809), 3.1.0 and earlier, recomputes it from the parsed
+parts through `serde_json::json!`, and serde_json without `preserve_order`
+sorts every object's keys, so it refuses every 2.x v2 body whose parts digest
+covers a part (crates/qbit-prism/src/audit_body_ref.rs). With the fix, 3.1.1
+and later, 3.x recomputes 2.x's form, over the fields it parses, and refuses
+any other, the sorted-key one included. `import-audits` reads a row's
+canonical sidecar before its body, so only a v2 body without one in the
+import root reaches that check; prism_legacy_range_sidecars.py writes the
+missing sidecars.
+
+By default the statuses below are those of a 3.x without the fix, the
+cutover's release. On a release with the fix, that listing holds rows import
+no longer refuses (the sidecar tool reports such a row `ok-in-3x` and writes
+nothing for it), so the run exits 3 for bodies import accepts. Pass
+`--with-731-fix` to model the fixed import instead: a body whose digest is
+2.x's form over the parts as 3.x parses them (each part's known fields, and
+an inline part's shares as 3.x's AcceptedShare, in declaration order) is
+`ok-in-3x`, and one of any other form `matches-neither`; `2x-order-only` does
+not occur. Either mode checks the parts digest only, not that 3.x can parse
+each field: a missing or mistyped field can pass here and be refused by import.
 
 For each row (`block_hash,body_uri,audit_bundle_sha256`) the status is:
   has-sidecar      the import root holds the row's canonical sidecar, which
                    import reads instead of the body (its bytes are verified by
                    prism_legacy_range_sidecars.py and by import, not here)
-  2x-order-only    the v2 digest is 2.x's: import refuses the body
-  matches-neither  the v2 digest is neither form: import refuses the body
+  2x-order-only    the v2 digest is 2.x's: import refuses the body (without
+                   --with-731-fix only)
+  matches-neither  the v2 digest is neither form (with --with-731-fix: not
+                   the form 3.x recomputes): import refuses the body
   ok-in-3x         the v2 digest is the form 3.x recomputes
   no-parts-digest  a v2 body without the digest, which 3.x does not check
   no-window-proof  not a v2 body (a body-ref or a plain bundle): not checked
   body-missing, body-unreadable, body-digest-differs: the body itself
-The model of 3.x keeps an inline part's shares as stored; `has_inline` flags
-those bodies.
+Without --with-731-fix the model keeps an inline part's shares as stored,
+where 3.x reserializes them; `has_inline` flags those bodies. With it, inline
+shares are reserialized as prism_legacy_range_sidecars.py models 3.x's
+AcceptedShare, which this script loads from beside itself.
 
 `--affected-csv` writes the refused rows (2x-order-only, matches-neither) in
 the input's format, for prism_legacy_range_sidecars.py --rows. The exit status
 is 0 only when every row is has-sidecar, ok-in-3x, no-parts-digest or
-no-window-proof; the summary on stderr counts each status.
+no-window-proof, in either mode; the summary on stderr counts each status, and
+with --with-731-fix also says `"with_731_fix": true`.
 
 Usage:
   prism_legacy_parts_digest_check.py --rows rows.csv \\
       --audit-root /var/lib/qbit-mining-pool/prism/audit \\
       --sidecar-dir <the directory passed to import-audits --root> \\
-      [--affected-csv affected.csv] [--jobs 8] > report.jsonl
-  prism_legacy_parts_digest_check.py BODY.json [BODY.json ...]
+      [--affected-csv affected.csv] [--jobs 8] [--with-731-fix] > report.jsonl
+  prism_legacy_parts_digest_check.py [--with-731-fix] BODY.json [BODY.json ...]
 """
 
 from __future__ import annotations
@@ -47,6 +62,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import multiprocessing
 import os
@@ -77,14 +93,44 @@ def digest_2x(parts: list) -> str:
     ).hexdigest()
 
 
-def part_as_3x(part: dict) -> dict:
+_ACCEPTED_SHARE = None
+SIDECAR_TOOL = Path(__file__).resolve().with_name("prism_legacy_range_sidecars.py")
+
+
+def load_accepted_share():
+    """prism_legacy_range_sidecars.py's model of 3.x's AcceptedShare, the one
+    the sidecar tool proves ranges with: its fields in declaration order,
+    unknown keys dropped, a null `credit_policy` left out. Loaded by path, and
+    only for --with-731-fix, so the default mode needs no other file."""
+    global _ACCEPTED_SHARE
+    if _ACCEPTED_SHARE is None:
+        spec = importlib.util.spec_from_file_location("prism_legacy_range_sidecars", SIDECAR_TOOL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _ACCEPTED_SHARE = module.accepted_share
+    return _ACCEPTED_SHARE
+
+
+def accepted_share(share: dict) -> dict:
+    return load_accepted_share()(share)
+
+
+def part_as_3x(part: dict, shares_as_3x: bool = False) -> dict:
+    """A part as 3.x parses it: its kind's known fields, in declaration order,
+    absent segment bounds skipped. With `shares_as_3x`, an inline part's
+    shares are parsed too, as 3.x with #731's fix re-serializes them;
+    otherwise they are kept as stored."""
     kind = part.get("kind")
     out = {"kind": kind}
     for field in FIELDS.get(kind, ()):
         if field in OPTIONAL and part.get(field) is None:
             continue
         if field in part:
-            out[field] = part[field]
+            value = part[field]
+            if shares_as_3x and field == "shares" and isinstance(value, list):
+                value = [accepted_share(share) if isinstance(share, dict) else share
+                         for share in value]
+            out[field] = value
     return out
 
 
@@ -95,6 +141,14 @@ def digest_3x(parts: list) -> str:
     return hashlib.sha256(
         json.dumps(view, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+
+def digest_3x_fixed(parts: list) -> str:
+    """What 3.x with #731's fix (#809) recomputes: 2.x's form (`digest_2x`)
+    over the parts as 3.x parses them, inline shares included. A body whose
+    stored parts or shares differ from that, in key order, unknown keys or a
+    null `credit_policy`, is refused even if 2.x's digest covers it."""
+    return digest_2x([part_as_3x(part, shares_as_3x=True) for part in parts])
 
 
 def map_uri(uri: str, prefix: str, root: Path | None, base: Path | None) -> Path:
@@ -109,7 +163,7 @@ def map_uri(uri: str, prefix: str, root: Path | None, base: Path | None) -> Path
     return candidate if candidate.is_absolute() or base is None else base / candidate
 
 
-def classify_body(path: Path, digest: str | None) -> dict:
+def classify_body(path: Path, digest: str | None, with_731_fix: bool = False) -> dict:
     result: dict = {"body": str(path)}
     try:
         body = json.loads(path.read_bytes())
@@ -143,7 +197,9 @@ def classify_body(path: Path, digest: str | None) -> dict:
     expected = str(proof["share_parts_digest_hex"]).lower()
     result["parts"] = len(parts)
     result["has_inline"] = any(part.get("kind") == "inline" for part in parts)
-    if digest_3x(parts) == expected:
+    if with_731_fix:
+        result["status"] = "ok-in-3x" if digest_3x_fixed(parts) == expected else "matches-neither"
+    elif digest_3x(parts) == expected:
         result["status"] = "ok-in-3x"
     elif digest_2x(parts) == expected:
         result["status"] = "2x-order-only"
@@ -169,7 +225,7 @@ def classify_row(job: tuple[dict, dict]) -> dict:
         path = map_uri(body_uri, options["uri_prefix"], options["audit_root"],
                        sidecar_dir or options["audit_root"])
         try:
-            result = classify_body(path, digest or None)
+            result = classify_body(path, digest or None, options.get("with_731_fix", False))
         except Exception as exc:  # one malformed body must not end the run
             result = {"body": str(path), "status": "body-unreadable",
                       "error": f"{type(exc).__name__}: {exc}"[:200]}
@@ -194,15 +250,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--affected-csv", type=Path,
                         help="write the rows import refuses, in the --rows format")
     parser.add_argument("--jobs", type=int, default=1, help="parallel processes (default 1)")
+    parser.add_argument("--with-731-fix", action="store_true",
+                        help="model a 3.x with #731's fix (#809), 3.1.1 or later, which "
+                             "recomputes 2.x's parts digest over the parts as it parses "
+                             "them; needs prism_legacy_range_sidecars.py beside this script")
     args = parser.parse_args(argv)
     if args.rows is None and not args.bodies:
         parser.error("give --rows or body files")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.with_731_fix:
+        # Refuse up front rather than report each inline body unreadable.
+        try:
+            load_accepted_share()
+        except Exception as exc:
+            parser.error(f"--with-731-fix needs {SIDECAR_TOOL}: {type(exc).__name__}: {exc}")
     options = {
         "audit_root": args.audit_root.absolute() if args.audit_root else None,
         "uri_prefix": args.uri_prefix,
         "sidecar_dir": args.sidecar_dir.absolute() if args.sidecar_dir else None,
+        "with_731_fix": args.with_731_fix,
     }
     rows: list[dict] = [{"body_uri": str(body.absolute())} for body in args.bodies]
     if args.rows is not None:
@@ -235,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
             writer.writerows(refused)
     summary = {"import_refuses": sum(totals.get(status, 0) for status in REFUSED),
                "totals": dict(sorted(totals.items()))}
+    if args.with_731_fix:
+        summary["with_731_fix"] = True
     print(json.dumps(summary, sort_keys=True), file=sys.stderr)
     return 0 if set(totals) <= OK_STATUSES else 3
 

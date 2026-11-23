@@ -3,13 +3,6 @@
 WITH bounds AS (
     SELECT clock_timestamp() AS now_at
 ),
-pool AS (
-    SELECT COALESCE(sum(share_difficulty), 0)::text AS h3_difficulty
-    FROM qbit_share_ledger, bounds
-    WHERE accepted
-      AND accepted_at >= bounds.now_at - interval '3 hours'
-      AND accepted_at <= bounds.now_at
-),
 miner_rollups AS (
     SELECT
         count(*) FILTER (WHERE accepted_at >= bounds.now_at - interval '3 hours') AS accepted_3h,
@@ -39,6 +32,5 @@ SELECT json_build_object(
     'm10_difficulty', (SELECT m10_difficulty FROM miner_rollups),
     'h3_difficulty', (SELECT h3_difficulty FROM miner_rollups),
     'h24_difficulty', (SELECT h24_difficulty FROM miner_rollups),
-    'pool_h3_difficulty', (SELECT h3_difficulty FROM pool),
     'last_share_at', (SELECT last_share_at FROM miner_last)
 );

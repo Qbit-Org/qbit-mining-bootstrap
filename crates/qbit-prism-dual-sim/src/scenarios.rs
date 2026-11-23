@@ -14,12 +14,14 @@
 
 use crate::{
     balancer::Routing,
+    candidate_wait,
     faults::Fault,
     frontend::Node,
     invariants::{self, CheckOptions, InvariantReport, Status},
     load::ShareRecord,
     relay::LinkState,
     report::{self, Expectation, FoundBlock, GapReport, ScenarioReport},
+    rpc_gate::GateMode,
     sim::{FrontendRelease, Inputs, Sim, SimConfig, Topology},
 };
 use anyhow::{Context, Result};
@@ -198,6 +200,10 @@ pub enum Scenario {
     S11CarryOwnerTransfer,
     /// S10: dual mode off, the 3.0 pair, A's frontend killed under load.
     S10SingleWriter,
+    /// S10, the kill lands mid-offer (#841): the frontend holding a block's
+    /// candidate claim is killed once its node has accepted the block; its
+    /// peer takes the claim over after the lease and lands the block once.
+    S10ClaimAtKill,
     /// R1: the 3.0 pair serving on 3.0.0-rc.6 while 3.1's `migrate` takes its
     /// database to 27, 28 and 31 before the cutover.
     R01Rc6Premigrate,
@@ -237,6 +243,7 @@ impl Scenario {
             Scenario::S09Migration => "s09-migration".into(),
             Scenario::S11CarryOwnerTransfer => "s11-carry-owner-transfer".into(),
             Scenario::S10SingleWriter => "s10-single-writer".into(),
+            Scenario::S10ClaimAtKill => "s10-single-writer-claim-at-kill".into(),
             Scenario::R01Rc6Premigrate => "r01-rc6-premigrate".into(),
         }
     }
@@ -292,6 +299,9 @@ impl Scenario {
             Scenario::S10SingleWriter => {
                 "Single-writer regression: the 3.0 pair keeps every share and pays exactly through a frontend kill".into()
             }
+            Scenario::S10ClaimAtKill => {
+                "Single-writer: a frontend killed holding a block's claim; its peer takes the claim over after the lease and lands the block once".into()
+            }
             Scenario::R01Rc6Premigrate => {
                 "Pre-migrate: rc.6 keeps serving, landing and restarting while 3.1's migrate applies 027, 028 and 031 online".into()
             }
@@ -301,9 +311,10 @@ impl Scenario {
     fn topology(self) -> Topology {
         match self {
             Scenario::CheckerControl => Topology::Unsynced,
-            Scenario::S10SingleWriter | Scenario::S09Migration | Scenario::R01Rc6Premigrate => {
-                Topology::SingleWriter
-            }
+            Scenario::S10SingleWriter
+            | Scenario::S10ClaimAtKill
+            | Scenario::S09Migration
+            | Scenario::R01Rc6Premigrate => Topology::SingleWriter,
             _ => Topology::DualWriter,
         }
     }
@@ -312,6 +323,15 @@ impl Scenario {
         let mut config = SimConfig::new(&self.id(), self.topology())?;
         if self == Scenario::R01Rc6Premigrate {
             config.frontend_release = FrontendRelease::Rc6;
+        }
+        if self == Scenario::S10ClaimAtKill {
+            config.rpc_gates = true;
+            for node in Node::BOTH {
+                config.overrides.entry(node).or_default().push((
+                    "PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS".into(),
+                    WITHHELD_SUBMIT_TIMEOUT_SECONDS.into(),
+                ));
+            }
         }
         if let Scenario::S08BlockAtDeath(case) = self {
             config.rpc_gates = true;
@@ -429,6 +449,7 @@ pub async fn run(scenario: Scenario, inputs: Inputs) -> Result<ScenarioReport> {
             Scenario::S09Migration => s09_migration(&mut sim, body).await?,
             Scenario::S11CarryOwnerTransfer => s11_carry_owner_transfer(&mut sim, body).await?,
             Scenario::S10SingleWriter => s10_single_writer(&mut sim, body).await?,
+            Scenario::S10ClaimAtKill => s10_claim_at_kill(&mut sim, body).await?,
             Scenario::R01Rc6Premigrate => {
                 rc6_premigrate::r01_rc6_premigrate(&mut sim, body).await?
             }
@@ -599,7 +620,10 @@ async fn steady(sim: &Sim, seconds: u64) {
 /// work, so three attempts are plenty. Every retry is on the timeline.
 pub const FIND_ATTEMPTS: usize = 3;
 /// How long a node may take to settle on its tip and payout revision before
-/// a block is solved on its work.
+/// a block is solved on its work: the bound for live work. A candidate whose
+/// claim no one renews (its holder killed, say) can only be finished once a
+/// frontend has watched that claim go unrenewed for its whole lease (120 s),
+/// so the wait gives such a claim its lease first (`candidate_wait`, #841).
 pub const NODE_SETTLE_BOUND: Duration = Duration::from_secs(60);
 /// How soon an accepted block-solving share becomes a candidate.
 pub const CANDIDATE_BOUND: Duration = Duration::from_secs(15);
@@ -625,24 +649,8 @@ async fn solve_and_land(
 ) -> Result<std::result::Result<FoundBlock, String>> {
     let record = sim.load()?.find_block(node, LANDING_BOUND).await?;
     let hash = record.header_hash().to_owned();
-    if !record.accepted() {
-        let reason = record.reason.clone().unwrap_or_default();
-        if matches!(reason.as_str(), "stale-job" | "unknown-job") {
-            sim.mark(&format!(
-                "block on node {node:?} refused as {reason}; solving again"
-            ));
-            return Ok(Err(format!("refused ({reason})")));
-        }
-        anyhow::bail!(
-            "node {node:?} refused its own block ({}: {reason})",
-            record.outcome
-        );
-    }
-    if !sim.wait_candidate(node, &hash, CANDIDATE_BOUND).await? {
-        sim.mark(&format!(
-            "block {hash} on node {node:?} was solved on superseded work; solving again"
-        ));
-        return Ok(Err(format!("{hash} accepted but never a candidate")));
+    if let Some(why) = superseded(sim, node, &record).await? {
+        return Ok(Err(why));
     }
     let found_at_ms = record.answered_ms.unwrap_or_else(|| sim.clock.now_ms());
     sim.mark(&format!("block {hash} found on node {node:?}: {note}"));
@@ -661,6 +669,35 @@ async fn solve_and_land(
         found_at_ms,
         note: note.to_owned(),
     }))
+}
+
+/// Whether a scheduled block turned out solved on superseded work: its
+/// share refused as `stale-job` or `unknown-job`, or accepted under the stale
+/// grace without becoming a candidate. Says why, on the timeline too, for a
+/// retry from settled work (see [`FIND_ATTEMPTS`]); any other refusal fails
+/// the scenario.
+async fn superseded(sim: &Sim, node: Node, record: &ShareRecord) -> Result<Option<String>> {
+    let hash = record.header_hash();
+    if !record.accepted() {
+        let reason = record.reason.clone().unwrap_or_default();
+        if matches!(reason.as_str(), "stale-job" | "unknown-job") {
+            sim.mark(&format!(
+                "block on node {node:?} refused as {reason}; solving again"
+            ));
+            return Ok(Some(format!("refused ({reason})")));
+        }
+        anyhow::bail!(
+            "node {node:?} refused its own block ({}: {reason})",
+            record.outcome
+        );
+    }
+    if !sim.wait_candidate(node, hash, CANDIDATE_BOUND).await? {
+        sim.mark(&format!(
+            "block {hash} on node {node:?} was solved on superseded work; solving again"
+        ));
+        return Ok(Some(format!("{hash} accepted but never a candidate")));
+    }
+    Ok(None)
 }
 
 /// Find an own block on `node` and wait until it is confirmed in the
@@ -3799,6 +3836,262 @@ async fn s10_single_writer(sim: &mut Sim, body: &mut Body) -> Result<()> {
         back_on_a > 0,
         format!("{back_on_a} shares accepted on A's jobs in the last 4 s of load"),
     );
+    expect_single_writer_end(sim, body).await
+}
+
+// --- S10, a claim held at the kill (#841) -------------------------------------
+
+/// The `submitblock` timeout S10's mid-offer variant gives its frontends
+/// (`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS`, 1 s by default): the holder
+/// must still be in its withheld call when it is killed, and a loaded runner
+/// may take more than a second to get there. Well above
+/// [`WITHHELD_ANSWER_BOUND`], so the harness gives up first.
+pub const WITHHELD_SUBMIT_TIMEOUT_SECONDS: &str = "60";
+/// How long the harness waits for the node's answer to the withheld
+/// `submitblock` (a regtest node answers in milliseconds).
+pub const WITHHELD_ANSWER_BOUND: Duration = Duration::from_secs(10);
+
+/// S10 with the kill mid-offer (#841). The 3.0 pair as in S10: both
+/// frontends claim from A's one outbox. A block is found on A's work, and
+/// whichever frontend claims its candidate has its `submitblock` answer
+/// withheld at its gate: the node accepts the block, the holder never hears
+/// it, and is killed. Its claim stays in the table. The peer takes it over
+/// only once it has watched it unrenewed for the whole 120 s lease,
+/// recovers the reservation as unknown and lands the block from the chain,
+/// never offering it again. Meanwhile the survivor's own find waits that
+/// lease out: the wait that S10's nightly failure (#841) gave only its 60 s.
+async fn s10_claim_at_kill(sim: &mut Sim, body: &mut Body) -> Result<()> {
+    sim.load()?.resume();
+    steady(sim, 8).await;
+    find_block(sim, body, Node::A, "A before the fault", None).await?;
+    routing_settled(sim).await?;
+    let (holder, record) = find_withheld(sim).await?;
+    let hash = record.header_hash().to_owned();
+    let survivor = holder.peer();
+    // Killed at once: the holder is still in its `submitblock` call, whose
+    // answer the gate withholds (the scenario's submit timeout leaves it
+    // there, see `Scenario::config`).
+    let fault = Fault::FrontendKill9(holder);
+    let fault_at = sim.inject(fault).await?;
+    sim.gates[&holder].discard_held();
+    sim.mark(&format!(
+        "node {holder:?}'s frontend killed in its submitblock of {hash}, which its node took \
+         onto its active chain; the answer was withheld"
+    ));
+    // A dead holder writes nothing more: this is the row as the kill left it.
+    let pool = sim.pool(Node::A).await?;
+    let held = candidate_wait::read(&pool)
+        .await?
+        .into_iter()
+        .find(|row| row.block_hash == hash);
+    pool.close().await;
+    let claim = held.as_ref().and_then(|row| row.claim.clone());
+    // `offer_reserved`: the reservation is recorded and the call's outcome
+    // is not. A holder that heard an answer, or timed out, would have moved
+    // the row on.
+    body.expect(
+        "the killed frontend held the block's candidate claim mid-offer",
+        held.as_ref().is_some_and(|row| {
+            row.state == "offer_reserved"
+                && claim
+                    .as_ref()
+                    .and_then(|claim| claim.instance_id.as_deref())
+                    == Some(holder.instance_id().as_str())
+        }),
+        format!("{held:?}"),
+    );
+    body.blocks.push(FoundBlock {
+        node: Node::A,
+        hash: hash.clone(),
+        found_at_ms: record.answered_ms.unwrap_or(fault_at),
+        note: format!("its holder, node {holder:?}'s frontend, killed mid-offer"),
+    });
+    sim.balancer
+        .wait_state(holder.label(), false, MARK_DOWN_BOUND)
+        .await
+        .with_context(|| format!("the balancer kept {holder:?} up after its frontend died"))?;
+    sim.mark(&format!("balancer marked {holder:?} down"));
+    steady(sim, 8).await;
+    // The step S10's nightly failed (#841): the survivor's find first waits
+    // until no candidate of the shared outbox is unfinished, which includes
+    // the dead holder's until the survivor has taken it over.
+    find_block(
+        sim,
+        body,
+        survivor,
+        "on the survivor, after it took over the dead holder's claim",
+        None,
+    )
+    .await?;
+    sim.wait_confirmed(&hash, &[Node::A], RECOVERED_LANDING_BOUND)
+        .await
+        .with_context(|| format!("the dead holder's block {hash} was never landed"))?;
+    sim.mark(&format!(
+        "{hash} landed and confirmed {:.1} s after the kill",
+        sim.clock.now_ms().saturating_sub(fault_at) as f64 / 1000.0
+    ));
+    // The takeover is the claim's end: never before the survivor could have
+    // watched the claim unrenewed for its whole lease (the row's own
+    // `claim_lease_seconds`, 120 s). Every version of the claim was written
+    // after the finder sent the block's share, which is what made the
+    // candidate, so no frontend can have started timing one earlier. The
+    // wait's reads bracket the end: still there at `last_seen`, gone at
+    // `ended`. A claim proven gone before one lease after the share (both
+    // on the run clock, which stamps a share before it is written) was
+    // taken over early.
+    let end = sim
+        .claim_ends()
+        .into_iter()
+        .find(|end| end.block_hash == hash);
+    let lease = claim.as_ref().map_or(
+        candidate_wait::UNRECORDED_LEASE,
+        candidate_wait::Claim::lease,
+    );
+    let earliest = record.sent_ms + lease.as_millis() as u64;
+    body.expect(
+        "the survivor took the dead holder's claim over no earlier than its lease allows",
+        end.as_ref()
+            .is_some_and(|end| sim.clock.ms(end.ended) >= earliest),
+        match &end {
+            Some(end) => format!(
+                "the claim was still there at {} ms and gone at {} ms; the share was sent at {} \
+                 ms and the lease is {} s, so no takeover before {earliest} ms",
+                sim.clock.ms(end.last_seen),
+                sim.clock.ms(end.ended),
+                record.sent_ms,
+                lease.as_secs()
+            ),
+            None => "no candidate wait saw the dead holder's claim end".to_owned(),
+        },
+    );
+    let records = sim.load()?.records();
+    body.gaps.push(report::gap(&records, fault_at));
+    sim.heal(fault).await?;
+    sim.balancer
+        .wait_state(holder.label(), true, Duration::from_secs(30))
+        .await?;
+    sim.mark(&format!("balancer marked {holder:?} up"));
+    steady(sim, 6).await;
+    find_block(sim, body, holder, "on the restarted holder", None).await?;
+    routing_settled(sim).await?;
+    sim.settle(SETTLE_BOUND).await?;
+    // Each gate stays in front of its frontend's qbitd through the kill and
+    // the restart, so it sees every offer either frontend ever made.
+    let by_holder = sim.gates[&holder].submissions_of(&hash);
+    let by_survivor = sim.gates[&survivor].submissions_of(&hash);
+    body.expect(
+        "the dead holder's block is offered exactly once",
+        by_holder == 1 && by_survivor == 0,
+        format!(
+            "submitblock calls of {hash}: {by_holder} through node {holder:?}'s gate (1: the \
+             one withheld as it died), {by_survivor} through node {survivor:?}'s"
+        ),
+    );
+    let pool = sim.pool(Node::A).await?;
+    let (state, outcome, blocks): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT o.state, o.offer_outcome, \
+                (SELECT count(*) FROM qbit_pool_blocks b WHERE b.block_hash = o.block_hash) \
+         FROM qbit_block_candidate_outbox o WHERE o.block_hash = $1",
+    )
+    .bind(&hash)
+    .fetch_one(&pool)
+    .await?;
+    pool.close().await;
+    body.expect(
+        "the recovered candidate is submitted with an unknown offer outcome, landed once",
+        state == "submitted" && outcome.as_deref() == Some("unknown") && blocks == 1,
+        format!("state {state}, offer outcome {outcome:?}, {blocks} pool block rows"),
+    );
+    expect_single_writer_end(sim, body).await
+}
+
+/// Find a block on A's work with every `submitblock` answer withheld at the
+/// gates, and return the frontend that claimed its candidate and offered it,
+/// once its node holds the block on its active chain, with the block's
+/// share. Both frontends claim from the one outbox, so either may. Solved
+/// again (see [`FIND_ATTEMPTS`]) when the work turned out superseded.
+async fn find_withheld(sim: &Sim) -> Result<(Node, ShareRecord)> {
+    let found = find_withheld_once(sim).await;
+    if found.is_err() {
+        // Nothing may stay held behind a failed setup: the frontends would
+        // sit in their withheld calls through the teardown.
+        for gate in sim.gates.values() {
+            gate.release();
+        }
+    }
+    found
+}
+
+async fn find_withheld_once(sim: &Sim) -> Result<(Node, ShareRecord)> {
+    let mut attempts = Vec::new();
+    for attempt in 1..=FIND_ATTEMPTS {
+        prepare_finder(sim, Node::A).await?;
+        for node in Node::BOTH {
+            sim.gates
+                .get(&node)
+                .context("S10's mid-offer variant runs with RPC gates")?
+                .set_mode(GateMode::Withhold);
+        }
+        let record = sim.load()?.find_block(Node::A, LANDING_BOUND).await?;
+        if let Some(why) = superseded(sim, Node::A, &record).await? {
+            // Nothing of a superseded attempt may stay held.
+            for node in Node::BOTH {
+                sim.gates[&node].release();
+            }
+            attempts.push(format!("attempt {attempt}: {why}"));
+            continue;
+        }
+        let hash = record.header_hash().to_owned();
+        let started = Instant::now();
+        let holder = loop {
+            if let Some(node) = Node::BOTH
+                .into_iter()
+                .find(|node| sim.gates[node].submissions_of(&hash) > 0)
+            {
+                break node;
+            }
+            anyhow::ensure!(
+                started.elapsed() < LANDING_BOUND,
+                "no frontend offered candidate {hash} within {LANDING_BOUND:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        sim.gates[&holder.peer()].release();
+        sim.gates[&holder]
+            .node_answered(&hash, WITHHELD_ANSWER_BOUND)
+            .await?;
+        // The gate records an answer even when it could not reach the node:
+        // only the node's active chain shows that it accepted the block.
+        let header = sim
+            .chain
+            .node(crate::sim::qbitd_of(holder))
+            .rpc("getblockheader", json!([hash]))
+            .await;
+        let active = header
+            .as_ref()
+            .ok()
+            .and_then(|header| header["confirmations"].as_i64())
+            .is_some_and(|confirmations| confirmations >= 1);
+        anyhow::ensure!(
+            active,
+            "node {holder:?}'s qbitd did not take {hash}, offered by its frontend, onto its \
+             active chain, so there is no claim to kill mid-offer: {header:?}"
+        );
+        sim.mark(&format!(
+            "block {hash} found on node A's work, offered by node {holder:?}'s frontend; \
+             its node took it onto its active chain and the answer is withheld"
+        ));
+        return Ok((holder, record));
+    }
+    anyhow::bail!(
+        "node A found no block to withhold in {FIND_ATTEMPTS} attempts: {}",
+        attempts.join("; ")
+    )
+}
+
+/// The 3.0 pair's end state: no node reports a dual-writer mode, and the
+/// standby holds every landing the writer holds.
+async fn expect_single_writer_end(sim: &Sim, body: &mut Body) -> Result<()> {
     for node in Node::BOTH {
         let dual = dual_writer_health(sim, node).await?;
         body.expect(
@@ -3808,8 +4101,7 @@ async fn s10_single_writer(sim: &mut Sim, body: &mut Body) -> Result<()> {
             format!("/healthz dual_writer: {dual:?}"),
         );
     }
-    standby_holds_every_landing(sim, body).await?;
-    Ok(())
+    standby_holds_every_landing(sim, body).await
 }
 
 /// The 3.0 standby must hold every landing the writer holds.

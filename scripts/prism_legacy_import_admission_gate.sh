@@ -22,9 +22,11 @@
 #
 # Every query runs under statement_timeout 15 s and lock_timeout 5 s, except check 5's
 # carry-forward integrity report, which takes about a minute at production size: 120 s on the
-# writer, 600 s on a standby. The report holds a snapshot for that long, and on a primary with
-# live miners every share updates the cluster row, so a long snapshot there slows the share
-# append's lock (#738). Above about 200 shares/s, run the report elsewhere:
+# writer, 600 s on a standby. The report holds a snapshot for that long. While a frontend
+# before 3.1.1 serves the database, every share it appends updates the cluster row, so on a
+# primary with live miners a long snapshot slows the share append's lock (#738); from 3.1.1 an
+# append no longer updates the row (#801). Above about 200 shares/s while such a frontend serves, run
+# the report elsewhere:
 #   PRISM_INTEGRITY_REPORT_DATABASE_URL  run check 5 on this hot standby instead, which must
 #       have hot_standby_feedback off (or the report holds back the writer anyway). Pause its
 #       replay first (SELECT pg_wal_replay_pause(); until pg_get_wal_replay_pause_state() is

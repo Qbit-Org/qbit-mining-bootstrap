@@ -3,7 +3,8 @@
   "name": "mainnet-shape-650-addresses",
   "description": "mainnet-shape-130-addresses scaled five times: 650 payout addresses, 2,000 sessions, a 250/s mean peaking at 2,000/s, the 200 bps pool fee.",
   "issues": [
-    "#521"
+    "#521",
+    "#842"
   ],
   "schedule": "nightly",
   "runner": "blacksmith-8vcpu-ubuntu-2404",
@@ -17,7 +18,8 @@
     "max_shortfall": 0,
     "max_rejected_valid_shares": null,
     "max_unanswered_submits": null,
-    "tip_last_notify_p99_budget_ms": 3000,
+    "tip_last_notify_p99_budget_ms": 6000,
+    "tip_last_notify_median_budget_ms": 3000,
     "d1_verdict_table": false,
     "churn_tip_last_notify_p99_budget_ms": null,
     "new_session_first_job_p99_budget_ms": null

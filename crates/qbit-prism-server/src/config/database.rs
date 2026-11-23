@@ -1,6 +1,16 @@
 //! Configuration for commands that access stored data without signing work.
 use super::*;
-use sqlx::{postgres::PgConnectOptions, ConnectOptions};
+use sqlx::{
+    postgres::{PgConnectOptions, PgSslMode},
+    ConnectOptions,
+};
+
+/// The connect's refusal of `sslmode=verify-ca` without a root certificate
+/// (vendor/sqlx-core's `src/net/tls/tls_rustls.rs`, #818).
+const VERIFY_CA_WITHOUT_SSLROOTCERT: &str =
+    "sslmode=verify-ca requires sslrootcert: verify-ca does not check the server's host name, \
+     so it trusts only the root certificates in sslrootcert, never the public roots; set \
+     sslrootcert, or use sslmode=verify-full";
 
 fn non_default_credentials(value: &str) -> Result<()> {
     ensure!(
@@ -8,6 +18,49 @@ fn non_default_credentials(value: &str) -> Result<()> {
         "production requires non-default database credentials"
     );
     Ok(())
+}
+
+/// `url` as the PostgreSQL client parses it, with the `PG*` environment
+/// defaults it applies (`PGSSLMODE`, `PGSSLROOTCERT`, ...). SQLx logs unknown
+/// query parameters with their values, so it parses under a silent
+/// subscriber, and its error, which can quote a value, is dropped.
+pub(super) fn client_options(url: &url::Url) -> Option<PgConnectOptions> {
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        PgConnectOptions::from_url(url)
+    })
+    .ok()
+}
+
+/// `options` through SQLx's own URL conversion, the only view of its
+/// resolved password and `sslrootcert`. SQLx's URL builder interpolates
+/// decoded usernames and hosts without escaping them, so a clone's are
+/// replaced first.
+fn resolved_url(options: &PgConnectOptions) -> url::Url {
+    options
+        .clone()
+        .username("reader")
+        .socket("/prism-config-validation")
+        .to_url_lossy()
+}
+
+/// Refuses `sslmode=verify-ca` without a root certificate, by `name` and
+/// with the connect's message, since every connect would fail (#825). The
+/// mode and certificate are the connect's: the URL's `sslmode` and
+/// `sslrootcert` over `PGSSLMODE` and `PGSSLROOTCERT`. An empty
+/// `sslrootcert` names no file, so it counts as none.
+pub(super) fn verify_ca_has_root_cert(name: &str, options: &PgConnectOptions) -> Result<()> {
+    if !matches!(options.get_ssl_mode(), PgSslMode::VerifyCa) {
+        return Ok(());
+    }
+    // SQLx shows a certificate file as `file: <path>`, inline PEM as itself
+    // (`CertificateInput`'s Display, in vendor/sqlx-core's src/net/tls/mod.rs).
+    let root_cert = resolved_url(options)
+        .query_pairs()
+        .find_map(|(key, value)| (key == "sslrootcert").then(|| value.into_owned()));
+    match root_cert.as_deref() {
+        None | Some("file: ") => bail!("{name}: {VERIFY_CA_WITHOUT_SSLROOTCERT}"),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Parse the public process's effective reader DSN using SQLx's own credential
@@ -23,28 +76,16 @@ pub fn public_database_options_from_env() -> Result<PgConnectOptions> {
         matches!(url.scheme(), "postgres" | "postgresql"),
         "public PRISM_DATABASE_URL must use postgres or postgresql"
     );
-    // SQLx logs unknown query parameters with their values. Parse synchronously
-    // under a silent subscriber, and never retain a value-bearing parser error.
     let options =
-        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            PgConnectOptions::from_url(&url)
-        })
-        .map_err(|_| anyhow::anyhow!("invalid public PRISM_DATABASE_URL connection options"))?;
+        client_options(&url).context("invalid public PRISM_DATABASE_URL connection options")?;
+    verify_ca_has_root_cert("public PRISM_DATABASE_URL", &options)?;
     if production_mode()? {
         // Preserve DatabaseConfig's existing marker policy. Extend it to the
         // effective password so percent encoding and a separate reader carrier
         // cannot accidentally retain the shipped default in production.
         non_default_credentials(&database)?;
-        // SQLx exposes the resolved password only through ConnectOptions' URL
-        // conversion. Normalize non-password fields on a clone: SQLx's URL
-        // builder interpolates decoded usernames/hosts without escaping them.
         // The original options, including socket/TLS/auth settings, are returned.
-        let credential_url = options
-            .clone()
-            .username("reader")
-            .socket("/prism-config-validation")
-            .to_url_lossy();
-        if let Some(password) = credential_url.password() {
+        if let Some(password) = resolved_url(&options).password() {
             non_default_credentials(
                 &percent_encoding::percent_decode_str(password).decode_utf8_lossy(),
             )?;
@@ -90,6 +131,11 @@ impl DatabaseConfig {
             matches!(parsed.scheme(), "postgres" | "postgresql"),
             "PRISM_DATABASE_URL must use postgres or postgresql"
         );
+        // The ledger connects with these options, so a URL it cannot use
+        // fails here, by name, never at the first connect.
+        let options = client_options(&parsed)
+            .context("PRISM_DATABASE_URL is not a connection URL the PostgreSQL client accepts")?;
+        verify_ca_has_root_cert("PRISM_DATABASE_URL", &options)?;
         if production_mode()? {
             non_default_credentials(&database_url)?;
         }

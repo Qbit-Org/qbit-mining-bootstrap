@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the revision-work rule expressions, migration tables and a review-only qbit-tools patch from the frozen snapshot."""
+"""Render the revision-work and payout-revision listener rule expressions, migration tables and a review-only qbit-tools patch from the frozen snapshot."""
 
 import argparse
 import difflib
@@ -61,8 +61,63 @@ def miner_gated(term):
     return f"(({term} and {TARGETS} {miners_recently()}) or {TARGETS} (0 * {term}))"
 
 
+# #843: a frontend whose payout-revision listener (#752, #816) stays down. The
+# dwell and the scrape interval it is counted in are stated in the rule text.
+LISTENER_TITLE = "PrismPayoutRevisionListenerDown"
+LISTENER_DOWN_MINUTES = 10
+SCRAPE_SECONDS = 15
+# Rides over a failed scrape, which would otherwise restart the dwell (#666).
+LISTENER_SMOOTHING_MINUTES = 2
+
+
+def listener_down():
+    """1 where the listener is down, or a scraped frontend does not report it, on a frontend with a recent miner."""
+    listener = prism("qbit_prism_payout_revision_listener_up")
+    up = prism("up")
+    down = f"(last_over_time({listener}[{LISTENER_SMOOTHING_MINUTES}m]) == bool 0)"
+    # Present from startup on every frontend since #834, so a scraped target
+    # without it runs an older image: unknown, which is not healthy.
+    unreported = f"(max_over_time({up}[{LISTENER_SMOOTHING_MINUTES}m]) == bool 1)"
+    return miner_gated(f"({down} or {TARGETS} {unreported})")
+
+
+def listener_basis():
+    dwell, window = LISTENER_DOWN_MINUTES, MINER_WINDOW_MINUTES
+    return (
+        f"This frontend's payout-revision listener (#752) has not held its LISTEN for {dwell} minutes while it "
+        "served miners (#843). While qbit_prism_payout_revision_listener_up reads 0, the frontend republishes after "
+        "most announced same-tip payout revision bumps, such as another frontend's block confirmation, only at its "
+        "next poll (a PRISM_BLOCKPOLL_SECONDS tick or a blockwait return), so until then its miners' shares on work at "
+        "the superseded revision are refused stale-job "
+        "(qbit_prism_stale_job_rejections_total{cause=\"payout_revision\"}), and a block found on that work is kept "
+        "only as far as block capture (#478) allows. That is every frontend's exposure before #752, so this warns "
+        "and never pages. "
+        f"Counts only on a frontend that has had an authorized miner within the last {window} minutes, the "
+        "revision-work warnings' gate (#758): an idle standby's listener costs no miner anything, and when miners "
+        f"fail over to a frontend whose listener is down, the {dwell}-minute dwell starts as they arrive; a miner "
+        "count absent for the whole window closes the gate, and after a restart it still counts the previous "
+        "process's miners for the window. A scraped frontend that does not export the gauge, an "
+        "image from before #834, counts as down under the same gate and dwell: its listener's state is unknown, not "
+        f"healthy. Why {dwell} minutes: the listener waits at most 5 seconds between attempts, so it is back within "
+        "seconds of the database answering and an ordinary reconnect reads 0 for a scrape or two, while a "
+        "database that keeps refusing the listener's connection, for example with max_connections not raised by the "
+        f"one more connection each frontend needs, holds it at 0 for good. {dwell * 60 // SCRAPE_SECONDS} consecutive "
+        f"{SCRAPE_SECONDS}-second scrapes leave no reconnect behind, and an outage of the database itself pages "
+        "PrismDatabaseUnavailable after two minutes, so a short one does not warn here as well. The "
+        f"{LISTENER_SMOOTHING_MINUTES}-minute windows ride over a failed scrape, which would otherwise restart the "
+        f"dwell, and carry the last reading for {LISTENER_SMOOTHING_MINUTES} minutes after scrapes stop; a scrape that "
+        "keeps failing is PrismMetricsEndpointDown's. Each evaluation reads the latest scrape, and one that finds the "
+        "LISTEN holding restarts the dwell, so a listener that keeps reconnecting and dropping can warn late or not "
+        "at all; its WARN lines show it. "
+        "Not this rule's: a LISTEN that holds but hears nothing, as through a transaction-pooling proxy, reads 1; "
+        "compare qbit_prism_payout_revision_announcements_heard_total across the node's frontends. No-data and "
+        "evaluation errors are OK because PrismMetricsNoData and PrismMetricsEndpointDown own a missing target. "
+        "Provisional, measure in #291."
+    )
+
+
 def native_rules():
-    """Generate the revision-work expressions; everything else is authored in the file."""
+    """Generate the revision-work and listener expressions; everything else is authored in the file."""
     spec = load("docs/prism-native-alert-rules.json")
     assert spec["network_placeholder"] == "__NETWORK__"
     pending = prism("qbit_prism_accepted_block_revision_work_pending_seconds")
@@ -104,7 +159,9 @@ def native_rules():
             "sample (#758): any local settlement that found the block already confirmed proves its own revision, and a "
             "first confirmation that committed without a bump (the fatal early return) proves only the revisions after "
             "it. A serving frontend so clears the wait at its next such write; a long-idle backup keeps it, quietly, "
-            "until a miner receives work. The missing-gauge warning is not gated. Two-minute dwell: a failed template "
+            "until a miner receives work, or, when no authorized miner was connected at any instant since the block's "
+            "acceptance, until the block matures, when the wait is closed without a sample "
+            "(#820). The missing-gauge warning is not gated. Two-minute dwell: a failed template "
             "refresh marks tracking unknown only until the next successful refresh, one poll interval later (two seconds "
             "by default), so a single transient refresh error cannot span the eight consecutive 15-second scrapes this "
             "dwell requires, while a lost or cancelled settlement COMMIT reply persists until a later settlement of the "
@@ -140,7 +197,69 @@ def native_rules():
         rule["expr"] = expressions[rule["title"]]
         rule["basis"] = bases[rule["title"]]
         rule["description"] = REVISION_WORK_PREFIX + bases[rule["title"]]
+    # #843: the listener rule's dwell is stated in its text, so both come from
+    # one constant; it carries no revision-work prefix.
+    [listener] = [rule for rule in spec["rules"] if rule["title"] == LISTENER_TITLE]
+    listener["expr"], listener["for"] = listener_down(), f"{LISTENER_DOWN_MINUTES}m"
+    listener["basis"] = listener["description"] = listener_basis()
+    admission_wait_rule(spec)
     return spec
+
+
+# #844: the append-slot queue, from the admission stage of #829's stage
+# histogram. The dwell is twice the window, so one landing's queue, which
+# leaves the window five minutes after it formed, never warns on its own.
+ADMISSION_TITLE = "PrismShareAppendAdmissionWaitHigh"
+ADMISSION_P99_SECONDS = 1
+ADMISSION_WINDOW = "5m"
+ADMISSION_MINIMUM = 100
+ADMISSION_FOR = "10m"
+
+
+def admission_wait_rule(spec):
+    """Generate the append-slot queue warning's expression, dwell and texts."""
+    (rule,) = [rule for rule in spec["rules"] if rule["title"] == ADMISSION_TITLE]
+    stage = "qbit_prism_share_append_stage_seconds"
+    selector = "{" + TARGET + ',stage="admission"}'
+    by = "(job, instance, network)"
+    p99 = (f"histogram_quantile(0.99, sum by (job, instance, network, le) "
+           f"(rate({stage}_bucket{selector}[{ADMISSION_WINDOW}])))")
+    flowing = f"sum by {by} (increase({stage}_count{selector}[{ADMISSION_WINDOW}]))"
+    snapshot = (f"({prism('qbit_prism_metrics_snapshot_available')} == 1) and on{by} "
+                f"({prism('qbit_prism_metrics_snapshot_stale')} == 0)")
+    rule["expr"] = (f"(({p99} > bool {ADMISSION_P99_SECONDS}) and on{by} ({flowing} >= {ADMISSION_MINIMUM})) "
+                    f"and on{by} ({snapshot})")
+    rule["for"] = ADMISSION_FOR
+    rule["basis"] = (
+        f"Admission-wait p99 over {ADMISSION_P99_SECONDS} second, on the ORDER_LOCK hold ladder's one-second "
+        f"boundary, from at least {ADMISSION_MINIMUM} admissions in five minutes, for ten minutes. At production's "
+        "~50 shares/s (about 25/s on each frontend of the pair) an append holds its slot for a few milliseconds (its call, COMMIT and the connection's release round "
+        "trip), so a "
+        "wait needs fifteen appends in flight on one frontend, an ORDER_LOCK hold of at least 0.6 s. The load lanes' "
+        "clean steady states acknowledge at a p99 of 3-8 ms, while #829's occurrences queued here for seconds "
+        "(acknowledgement p99 5.5 s on 10-30 and 6.6 s in #835's run; a 0.96 s repeat stays under). One second is "
+        "also PrismShareAckP99High's bound and the load gate's, so the two rules read together say where slow "
+        "acknowledgements waited. Ten minutes is twice the window: one landing's queue leaves the window five "
+        "minutes after it formed, so a landing never warns on its own (at 25/s it needs a settlement hold over "
+        "about 4.6 s even to lift the five-minute p99 over a second, as 2.x.x's 4-5 s block minutes would), while "
+        "a queue that persists does. Repeated landings warn when, in every five minutes for ten minutes, their "
+        "holds' time beyond about 1.6 s adds up to more than about 3 s, for example a hold over 2.2 s every "
+        "minute; #602's R2 budget for those holds is 250 ms, and with arrivals spread evenly a hold under 0.6 s "
+        "never fills the fifteen slots. Provisional, measure in #291.")
+    rule["description"] = (
+        "Share appends on this frontend are queueing for an append slot. A frontend admits at most "
+        "PRISM_DATABASE_MAX_CONNECTIONS - 1 share appends at once (15 by default), each from before its pool "
+        "checkout until its connection is back in the pool, just after its COMMIT; the rest wait here, in front of "
+        "PostgreSQL, where ORDER_LOCK's own wait cannot show them (#829). A queue that persists means appends "
+        "finish more slowly than they arrive: read the accepted-share rate, the cluster-wide ORDER_LOCK holds by "
+        "holder on every frontend, the append's locked_call and commit stages, the runtime's wake and poll lag, "
+        "WAL syncs and checkpoints and pool saturation, as docs/prism-ledger-ops.md's \"Shares queued for an "
+        "append slot\" describes. "
+        "Every outcome counts, so an append dropped at the share-commit deadline while it queued is counted with "
+        "the time it waited. Gated on the snapshot, since the family is served from the cached body: a stale or "
+        "unpublished body suppresses it. A frontend without the stage histogram (older than #829's stages) has "
+        "no admission series and stays quiet; no-data and evaluation errors are OK because the snapshot and "
+        "no-data rules own missing measurements. " + rule["basis"])
 
 
 # How the operator docs state the window; checked against MINER_WINDOW_MINUTES.
@@ -149,15 +268,39 @@ WINDOW_PROSE = [r"authorized\s+miner\s+in\s+the\s+last\s+(\d+)\s+minutes",
                 r"qbit_prism_authorized_clients\[(\d+)m\]"]
 
 
+# How the operator docs state the listener rule's dwell (#843).
+LISTENER_PROSE = [r"has\s+read\s+0\s+for\s+(\d+)\s+minutes",
+                  r"served\s+miners\s+for\s+(\d+)\s+minutes"]
+# The docs that state them; in the ops guide only its listener runbook (#843).
+PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.md": None,
+              "docs/prism-ledger-ops.md": "### A payout-revision listener that stays down (#843)\n"}
+
+
+def check_prose(patterns, expected, what, constant):
+    for path, heading in PROSE_DOCS.items():
+        text = (ROOT / path).read_text()
+        if heading is not None:
+            if heading not in text:
+                raise SystemExit(f"{path} no longer has the section {heading.strip()!r}")
+            # The section ends at the next heading of its level or above,
+            # never at a comment line inside a code block.
+            section = re.sub(r"```.*?```", "", text.split(heading, 1)[1], flags=re.S)
+            text = re.split(r"\n#{1,3} ", section, maxsplit=1)[0]
+        found = [int(match.group(1)) for pattern in patterns for match in re.finditer(pattern, text)]
+        if not found:
+            raise SystemExit(f"{path} no longer states {what}")
+        if any(minutes != expected for minutes in found):
+            raise SystemExit(f"{path} states {what} other than {constant}={expected}")
+
+
 def check_window_prose():
     """#758: the operator docs state the recent-miner window the rules use."""
-    for path in ["docs/prism-alert-migration.md", "docs/prism-native-metrics.md"]:
-        text = (ROOT / path).read_text()
-        found = [int(match.group(1)) for pattern in WINDOW_PROSE for match in re.finditer(pattern, text)]
-        if not found:
-            raise SystemExit(f"{path} no longer states the recent-miner window")
-        if any(minutes != MINER_WINDOW_MINUTES for minutes in found):
-            raise SystemExit(f"{path} states a recent-miner window other than MINER_WINDOW_MINUTES={MINER_WINDOW_MINUTES}")
+    check_prose(WINDOW_PROSE, MINER_WINDOW_MINUTES, "the recent-miner window", "MINER_WINDOW_MINUTES")
+
+
+def check_listener_prose():
+    """#843: the operator docs state the listener rule's dwell the generator writes."""
+    check_prose(LISTENER_PROSE, LISTENER_DOWN_MINUTES, f"{LISTENER_TITLE}'s dwell", "LISTENER_DOWN_MINUTES")
 
 
 def postgres_rules():
@@ -340,6 +483,7 @@ def main():
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     check_window_prose()
+    check_listener_prose()
     update(ROOT / "docs/prism-native-alert-rules.json", json.dumps(native_rules(), indent=2) + "\n", args.check)
     update(ROOT / "docs/prism-postgres-alert-rules.json", json.dumps(postgres_rules(), indent=2) + "\n", args.check)
     doc = ROOT / "docs/prism-alert-migration.md"

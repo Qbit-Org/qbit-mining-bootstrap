@@ -12,7 +12,8 @@ sidecar is missing. With the fix, 3.x recomputes 2.x's form.
 `crates/qbit-prism/src/audit_body_ref.rs`'s `share_parts_digest_tests`:
 
 - `scripts/prism_legacy_parts_digest_check.py` must call the body
-  `2x-order-only`, and its `digest_2x` must reproduce the stored digest;
+  `2x-order-only`, and `ok-in-3x` with `--with-731-fix`, and its `digest_2x`
+  must reproduce the stored digest;
 - the real `qbit-prism-audit-canonicalize` must accept the body's parts
   digest. Once the parts name the slots beside the body and the checker's
   `digest_2x` recomputes that digest, the canonical bytes must hash to the

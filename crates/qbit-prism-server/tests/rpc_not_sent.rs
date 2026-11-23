@@ -1,18 +1,25 @@
 //! #522: which `submitblock` transport failures prove that the request never
 //! reached the node. Only a call whose connection was never established is
 //! [`RpcNotSentError`], one whose connect outlasted its share of the call's
-//! deadline included (#762); every failure after the connection existed,
-//! whether or not the peer read the request, stays an ordinary error that the
-//! offer path records as an unknown outcome. Each case runs the real client against a real
-//! socket on the loopback interface, so a change in reqwest's or hyper's
-//! error kinds fails here rather than in production.
+//! deadline included (#762), and one whose request hyper handed back
+//! unwritten because its connection closed first (#816); every failure after
+//! the request may have been written, whether or not the peer read it, stays
+//! an ordinary error that the offer path records as an unknown outcome. Each
+//! case runs the real client against a real socket on the loopback interface,
+//! so a change in reqwest's or hyper's error kinds fails here rather than in
+//! production.
 use qbit_prism_server::rpc::{
     relay_connect_budget, Rpc, RpcNotSentError, RpcRelayRefused, RpcReplyError, RELAY_METHODS,
 };
-use serde_json::{json, Value};
 #[cfg(target_os = "linux")]
-use std::net::SocketAddr;
+use qbit_prism_server::rpc::{NotSentStage, SpareObserver};
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 #[cfg(target_os = "linux")]
 use tokio::net::TcpSocket;
 use tokio::{
@@ -357,18 +364,64 @@ async fn answer(stream: &mut BufReader<TcpStream>, result: Value) -> Value {
     call["method"].clone()
 }
 
+/// Run with the client's kernel check of its spare, `idle_and_open`.
+#[cfg(target_os = "linux")]
+type SpareAction = Box<dyn FnOnce(&dyn Fn() -> bool) + Send>;
+
+/// What a client did with its spare (#816).
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct Spares {
+    parked: tokio::sync::Notify,
+    handed_out: AtomicUsize,
+    /// Run the next time the spare is handed out, before hyper has the
+    /// request for it.
+    on_handed_out: std::sync::Mutex<Option<SpareAction>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Spares {
+    fn handed_out(&self) -> usize {
+        self.handed_out.load(Ordering::SeqCst)
+    }
+
+    fn on_next_handed_out(&self, action: impl FnOnce(&dyn Fn() -> bool) + Send + 'static) {
+        *self.on_handed_out.lock().unwrap() = Some(Box::new(action));
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SpareObserver for Spares {
+    fn parked(&self) {
+        self.parked.notify_one();
+    }
+
+    fn taken(&self, idle_and_open: &dyn Fn() -> bool) {
+        self.handed_out.fetch_add(1, Ordering::SeqCst);
+        let action = self.on_handed_out.lock().unwrap().take();
+        if let Some(action) = action {
+            action(idle_and_open);
+        }
+    }
+}
+
 /// A connect its call stopped waiting for, landed: the node's accept queue is
 /// full when a `submitblock` connects, so its SYN is dropped and the call is
 /// cut at its connect budget, unsent. The node then makes room, before the
-/// SYN's first retransmission, and the connect gets through. Returns the
-/// client, which keeps that connection as its spare, the node's listener, with
-/// an empty queue, and the node's end of the connection.
+/// SYN's first retransmission, and the connect gets through. Returns, once
+/// the client keeps that connection as its spare: the client, the node's
+/// listener, with an empty queue, the node's end of the connection, and what
+/// the client does with its spare.
 #[cfg(target_os = "linux")]
-async fn land_a_cut_connect(deadline: Duration) -> Option<(Rpc, TcpListener, TcpStream)> {
+async fn land_a_cut_connect(
+    deadline: Duration,
+) -> Option<(Rpc, TcpListener, TcpStream, std::sync::Arc<Spares>)> {
     let listener = listen0("127.0.0.1:0".parse().unwrap());
     let address = listener.local_addr().unwrap();
     let queued = fill_accept_queue(address).await?;
     let rpc = rpc(address.port());
+    let spares = std::sync::Arc::new(Spares::default());
+    rpc.observe_spare(spares.clone());
     let error = rpc
         .call_timeout("submitblock", json!(["00"]), Some(deadline))
         .await
@@ -380,7 +433,10 @@ async fn land_a_cut_connect(deadline: Duration) -> Option<(Rpc, TcpListener, Tcp
         .await
         .expect("the cut connect was abandoned")
         .unwrap();
-    Some((rpc, listener, stream))
+    tokio::time::timeout(Duration::from_secs(4), spares.parked.notified())
+        .await
+        .expect("the cut connect's connection was not kept as the spare");
+    Some((rpc, listener, stream, spares))
 }
 
 /// #762: a connect its call stopped waiting for keeps running, and once
@@ -391,7 +447,7 @@ async fn land_a_cut_connect(deadline: Duration) -> Option<(Rpc, TcpListener, Tcp
 #[tokio::test]
 async fn a_connect_cut_at_its_budget_serves_the_next_call() {
     let deadline = Duration::from_secs(1);
-    let Some((rpc, listener, stream)) = land_a_cut_connect(deadline).await else {
+    let Some((rpc, listener, stream, _)) = land_a_cut_connect(deadline).await else {
         return;
     };
     let Some(_queued) = fill_accept_queue(listener.local_addr().unwrap()).await else {
@@ -418,11 +474,9 @@ async fn a_connect_cut_at_its_budget_serves_the_next_call() {
 #[tokio::test]
 async fn a_spare_the_node_closed_is_never_handed_out() {
     let deadline = Duration::from_secs(1);
-    let Some((rpc, listener, stream)) = land_a_cut_connect(deadline).await else {
+    let Some((rpc, listener, stream, spares)) = land_a_cut_connect(deadline).await else {
         return;
     };
-    // The client parks the connection as its spare.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     drop(stream);
     std::thread::sleep(Duration::from_millis(50));
     let node = tokio::spawn(async move {
@@ -435,6 +489,153 @@ async fn a_spare_the_node_closed_is_never_handed_out() {
         .unwrap_or_else(|error| panic!("the closed spare was handed out: {error:#}"));
     assert_eq!(accepted, Value::Null);
     assert_eq!(node.await.unwrap(), "submitblock");
+    assert_eq!(spares.handed_out(), 0, "the closed spare was handed out");
+}
+
+/// #816: the node closes the spare after the client's check of it, before
+/// hyper has written the request into it. hyper hands the request back
+/// unwritten, and hyper-util, to which the spare is a new connection, does
+/// not retry it: the call fails as not sent, so the block is offered again.
+/// The node's end shows that nothing was written: it only half-closes the
+/// connection and reads on, and finds the client's own close with no byte
+/// before it. The re-offer goes out on a new connection, and the node takes
+/// the block once.
+///
+/// The interleaving is the current-thread runtime's, so it does not depend on
+/// timing. The observer closes the node's end while the call, polled by the
+/// test itself, is handing the spare to hyper, and waits for the kernel to
+/// report the FIN on the client's socket. hyper's connection task then polls
+/// the socket from the readiness the runtime last saw, idle, and asks for the
+/// request. The runtime's I/O driver takes in the FIN before the call, woken
+/// by that ask, queues the request, so the connection task reads the close
+/// before it would take the request out of the queue; a tokio update that
+/// changes that order fails this test without any change to the proof. To
+/// hyper a new
+/// connection is busy, not idle, so the close is its "connection closed
+/// before message completed" error, and it hands back the request still
+/// queued.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_spare_the_node_closes_after_its_check_returns_the_submitblock_unsent() {
+    let deadline = Duration::from_secs(1);
+    let Some((rpc, listener, node_end, spares)) = land_a_cut_connect(deadline).await else {
+        return;
+    };
+    let node_end = node_end.into_std().unwrap();
+    let closer = node_end.try_clone().unwrap();
+    spares.on_next_handed_out(move |idle_and_open| {
+        closer.shutdown(std::net::Shutdown::Write).unwrap();
+        let closed = Instant::now();
+        while idle_and_open() {
+            assert!(
+                closed.elapsed() < Duration::from_secs(5),
+                "the node's FIN never reached the client's socket"
+            );
+            std::thread::yield_now();
+        }
+    });
+    let error = rpc
+        .call_timeout("submitblock", json!(["00"]), Some(deadline))
+        .await
+        .expect_err("the node closed the spare");
+    assert_eq!(spares.handed_out(), 1, "the call did not take the spare");
+    let not_sent = not_sent(&error).unwrap_or_else(|| {
+        panic!("a request hyper handed back unwritten was not proven unsent: {error:#}")
+    });
+    assert_eq!(not_sent.stage, NotSentStage::Returned);
+    assert_eq!(
+        error.to_string(),
+        "qbit RPC submitblock transport failed before the request was sent: the connection closed before the request was written (connection closed before message completed)"
+    );
+    let mut node_end = TcpStream::from_std(node_end).unwrap();
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), node_end.read_to_end(&mut received))
+        .await
+        .expect("the client never closed its end")
+        .unwrap();
+    assert!(
+        received.is_empty(),
+        "the node received {} bytes of the request",
+        received.len()
+    );
+
+    let node = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        answer(&mut BufReader::new(stream), Value::Null).await
+    });
+    let accepted = rpc
+        .call_timeout("submitblock", json!(["00"]), Some(deadline))
+        .await
+        .unwrap_or_else(|error| panic!("the block was not offered again: {error:#}"));
+    assert_eq!(accepted, Value::Null);
+    assert_eq!(node.await.unwrap(), "submitblock");
+    assert_eq!(spares.handed_out(), 1);
+}
+
+/// #816's other side: the node reads the `submitblock` off the spare and
+/// closes it without a reply. The request was written and the node may have
+/// acted on it, so the outcome stays unknown, never unsent.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_spare_the_node_closes_after_reading_the_submitblock_may_have_been_sent() {
+    let deadline = Duration::from_secs(1);
+    let Some((rpc, _listener, node_end, spares)) = land_a_cut_connect(deadline).await else {
+        return;
+    };
+    let node = tokio::spawn(async move {
+        let (_, call) = read_call(&mut BufReader::new(node_end)).await;
+        call["method"].clone()
+    });
+    let error = rpc
+        .call_timeout("submitblock", json!(["00"]), Some(deadline))
+        .await
+        .expect_err("the node closed without a reply");
+    assert_eq!(node.await.unwrap(), "submitblock");
+    assert_eq!(spares.handed_out(), 1, "the call did not take the spare");
+    assert!(
+        not_sent(&error).is_none(),
+        "a request the node read was taken for unsent: {error:#}"
+    );
+    assert_eq!(error.to_string(), "qbit RPC submitblock transport failed");
+}
+
+/// #816: [`RpcNotSentError`]'s proof that a canceled hyper error leaves the
+/// request unwritten was read in these sources, over HTTP/1 alone. A change
+/// to any of them, or `h2` in the build, must read them again before it
+/// changes this list. The workspace lockfile is the one every server build
+/// uses; the fuzz workspace's own lockfile builds fuzz targets, which send no
+/// node call.
+#[test]
+fn the_not_sent_proof_covers_the_http_stack_in_the_lockfile() {
+    let lock =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")).unwrap();
+    let versions = |name: &str| -> Vec<&str> {
+        let entry = format!("name = \"{name}\"");
+        lock.split("[[package]]")
+            .filter(|package| package.lines().any(|line| line == entry))
+            .filter_map(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+            })
+            .collect()
+    };
+    for (name, read) in [
+        ("hyper", "1.11.1"),
+        ("hyper-util", "0.1.20"),
+        ("reqwest", "0.12.28"),
+    ] {
+        assert_eq!(
+            versions(name),
+            [read],
+            "{name} changed: read rpc::RpcNotSentError's proof again in its sources"
+        );
+    }
+    assert_eq!(
+        versions("h2"),
+        Vec::<&str>::new(),
+        "h2 is in the build: if it enables hyper's or reqwest's HTTP/2 client, that client is not in rpc::RpcNotSentError's proof; read it, then change this check"
+    );
 }
 
 /// #762: a long deadline's budget still ends before the client's 5 s connect

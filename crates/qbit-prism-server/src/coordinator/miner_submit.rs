@@ -15,7 +15,7 @@
 use super::submit_ledger::{Appended, CommitGate, GateClosure, GateState};
 use super::*;
 use crate::ledger::CommitGateClosed;
-use crate::metrics::{BlockAckPath, StaleJobCause};
+use crate::metrics::{AppendStage, AppendStageOutcome, BlockAckPath, StaleJobCause};
 use sqlx::postgres::{PgDatabaseError, PgSeverity};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -383,6 +383,8 @@ impl Coordinator {
         submission: codec::Submission,
         stale_grace: StaleGrace,
     ) -> Result<(), StratumError> {
+        // #829: the submit checks below run from here to `start`.
+        let entered = tokio::time::Instant::now();
         // The proof-observation boundary of the first-offer latency: this
         // frontend's wall clock as the locally validated block proof enters
         // the coordinator, before any await. Recorded on the candidate row
@@ -568,6 +570,13 @@ impl Coordinator {
         }
         // Both acknowledgement bounds are measured from here.
         let start = tokio::time::Instant::now();
+        // #829: only checks that admit the share to its append are recorded;
+        // a refused or abandoned submission's are not.
+        self.metrics.observe_append_stage(
+            AppendStage::SubmitChecks,
+            AppendStageOutcome::Passed,
+            start.duration_since(entered),
+        );
         let share_id = share.share_id.clone();
         let block_hash = submission.block_hash_hex.clone();
         // Credit the share now, defer it to its block's confirmation (a

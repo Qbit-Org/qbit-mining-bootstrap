@@ -159,6 +159,31 @@ class Suites(unittest.TestCase):
             # A capacity-envelope point, not a D1 verdict.
             self.assertFalse(point["gates"]["d1_verdict_table"], name)
 
+    def test_only_the_20x_growth_shape_is_report_only_in_the_reduced_l3(self) -> None:
+        # #695: the 20x shape is a capacity-envelope point (#555 decision 5)
+        # past the share append's ceiling; every other preset still gates.
+        entries = matrix.select(self.presets, "suite:l3-reduced", suites=self.suites)
+        ungated = [entry["preset"] for entry in entries if entry["gated"] is not True]
+        self.assertEqual(ungated, ["mainnet-shape-2600-addresses"])
+        self.assertTrue(all(isinstance(entry["gated"], bool) for entry in entries))
+        # #847: report-only exempts capacity, never correctness. The 20x
+        # shape gates refused valid shares and unanswered submits at 0 (the
+        # collation sets aside only the commit deadline's overload refusals).
+        gates = self.presets["mainnet-shape-2600-addresses"]["gates"]
+        self.assertEqual(
+            (gates["max_rejected_valid_shares"], gates["max_unanswered_submits"]), (0, 0)
+        )
+        # The full L3 gates on every run.
+        full = matrix.select(self.presets, "suite:l3-full", suites=self.suites)
+        self.assertTrue(all(entry["gated"] is True for entry in full))
+
+    def test_a_preset_run_on_its_own_carries_no_report_only_mark(self) -> None:
+        # The nightly and a dispatch naming the preset run it under its own
+        # gates: nothing outside a suite can mark a run ungated.
+        for selection in ("mainnet-shape-2600-addresses", "all", "nightly"):
+            for entry in matrix.select(self.presets, selection):
+                self.assertNotIn("gated", entry, selection)
+
     def test_a_suite_preset_can_keep_its_own_schedule(self) -> None:
         # throughput-400k-window-1fe-async is nightly and in both L3 suites.
         self.assertEqual(self.presets["throughput-400k-window-1fe-async"]["schedule"], "nightly")
@@ -193,14 +218,69 @@ class Suites(unittest.TestCase):
             "boolean repeats": good.replace("repeats = 2", "repeats = true"),
             "runner": good + 'runner = "ubuntu-latest"\n',
             "issue": good.replace('["#550"]', '["550"]'),
+            "report_only not a list": good + 'report_only = "pr-smoke"\n',
+            "report_only outside the suite": good.replace('["pr-smoke"]', '["pr-smoke", "soak-smoke"]')
+            + 'report_only = ["faults-pr-smoke"]\n',
+            "report_only repeated": good.replace('["pr-smoke"]', '["pr-smoke", "soak-smoke"]')
+            + 'report_only = ["soak-smoke", "soak-smoke"]\n',
+            "report_only leaves nothing gated": good + 'report_only = ["pr-smoke"]\n',
+            "report_only names a soak": good.replace('["pr-smoke"]', '["pr-smoke", "soak-smoke"]')
+            + 'report_only = ["soak-smoke"]\n',
+            "report_only names a D1 cell": good.replace(
+                '["pr-smoke"]', '["pr-smoke", "throughput-400k-window-2fe-async"]'
+            )
+            + 'report_only = ["throughput-400k-window-2fe-async"]\n',
+            "report_only in the tag's suite": good.replace("[suites.s]", "[suites.l3-full]").replace(
+                '["pr-smoke"]', '["pr-smoke", "mainnet-shape-650-addresses"]'
+            )
+            + 'report_only = ["mainnet-shape-650-addresses"]\n',
+            # #847: a report-only preset must budget refused valid shares and
+            # unanswered submits; mainnet-shape-130-addresses sets neither.
+            "report_only names a preset with no correctness budgets": good.replace(
+                '["pr-smoke"]', '["pr-smoke", "mainnet-shape-130-addresses"]'
+            )
+            + 'report_only = ["mainnet-shape-130-addresses"]\n',
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for preset in matrix.PRESETS.glob("*.json"):
                 (root / preset.name).write_bytes(preset.read_bytes())
+            # The 650 shape, budgeted as a report-only point must be (#847).
+            budgeted = json.loads((root / "mainnet-shape-650-addresses.json").read_text())
+            budgeted["gates"].update(max_rejected_valid_shares=0, max_unanswered_submits=0)
+            (root / "mainnet-shape-650-addresses.json").write_text(json.dumps(budgeted))
             (root / "suites.toml").write_text(good, encoding="utf-8")
             presets = matrix.load(root)
-            self.assertEqual(len(matrix.select(presets, "suite:s", suites=matrix.load_suites(root, presets))), 2)
+            entries = matrix.select(presets, "suite:s", suites=matrix.load_suites(root, presets))
+            self.assertEqual([entry["gated"] for entry in entries], [True, True])
+            mixed = (
+                good.replace('["pr-smoke"]', '["pr-smoke", "mainnet-shape-650-addresses"]')
+                + 'report_only = ["mainnet-shape-650-addresses"]\n'
+            )
+            (root / "suites.toml").write_text(mixed, encoding="utf-8")
+            entries = matrix.select(presets, "suite:s", suites=matrix.load_suites(root, presets))
+            self.assertEqual(
+                [(entry["id"], entry["gated"]) for entry in entries],
+                [
+                    ("pr-smoke-r1", True),
+                    ("pr-smoke-r2", True),
+                    ("mainnet-shape-650-addresses-r1", False),
+                    ("mainnet-shape-650-addresses-r2", False),
+                ],
+            )
+            # Either correctness budget missing, null, out of u64 range or not
+            # an integer is refused on its own (#847); suites.toml is `mixed`.
+            for key in matrix.CORRECTNESS_BUDGETS:
+                for value in (None, -1, 2**64, True, 0.0, "0", "absent"):
+                    with self.subTest(budget=key, value=value):
+                        broken = json.loads(json.dumps(presets))
+                        gates = broken["mainnet-shape-650-addresses"]["gates"]
+                        if value == "absent":
+                            del gates[key]
+                        else:
+                            gates[key] = value
+                        with self.assertRaisesRegex(matrix.SelectionError, key):
+                            matrix.load_suites(root, broken)
             for name, text in cases.items():
                 with self.subTest(case=name):
                     (root / "suites.toml").write_text(text, encoding="utf-8")

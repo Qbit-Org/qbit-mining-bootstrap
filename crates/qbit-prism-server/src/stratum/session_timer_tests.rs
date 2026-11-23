@@ -1,6 +1,39 @@
 //! The live session timer must account for both active and retained miner work.
 use super::*;
 
+/// Serve `server` as a listener serves an accepted socket, beside a
+/// difficulty-hint writer of its own (#856), so every hint the session offers
+/// is written or counted rather than left queued with nothing to drain it.
+fn spawn_session_with_hint_writer<B: MiningBackend>(
+    server: TcpStream,
+    backend: Arc<B>,
+    config: StratumConfig,
+    refresh: watch::Receiver<u64>,
+    shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let hints = DifficultyHints::new();
+    tokio::spawn(async move {
+        hints
+            .beside(
+                backend.clone(),
+                config.clone(),
+                metrics.clone(),
+                WriterEnd::Abandon,
+                session(
+                    server,
+                    backend,
+                    config,
+                    refresh,
+                    shutdown,
+                    metrics,
+                    hints.clone(),
+                ),
+            )
+            .await
+    })
+}
+
 struct LiveSession {
     backend: Arc<Backend>,
     config: StratumConfig,
@@ -54,14 +87,13 @@ impl LiveSession {
         let (server, _) = listener.accept().await.unwrap();
         let (reader, writer) = client.into_split();
         let (shutdown, receiver) = watch::channel(false);
-        let task = tokio::spawn(session(
+        let task = spawn_session_with_hint_writer(
             server,
             backend.clone(),
             config.clone(),
             backend.fixture.coordinator.refresh.subscribe(),
             receiver,
-            Arc::new(crate::metrics::Metrics::default()),
-        ));
+        );
         Self {
             backend,
             config,
@@ -354,7 +386,7 @@ async fn an_allocation_stalled_on_the_database_times_out_as_the_databases() {
     let (server, _) = listener.accept().await.unwrap();
     let (reader, mut writer) = client.into_split();
     let (_shutdown, receiver) = watch::channel(false);
-    let task = tokio::spawn(session(
+    let task = spawn_session_with_hint_writer(
         server,
         fixture.coordinator.clone(),
         StratumConfig {
@@ -363,8 +395,7 @@ async fn an_allocation_stalled_on_the_database_times_out_as_the_databases() {
         },
         fixture.coordinator.refresh.subscribe(),
         receiver,
-        Arc::new(crate::metrics::Metrics::default()),
-    ));
+    );
     writer
         .write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n")
         .await

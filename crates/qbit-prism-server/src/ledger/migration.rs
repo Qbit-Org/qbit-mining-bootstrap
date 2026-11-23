@@ -2173,13 +2173,105 @@ fn named_objects(objects: &[String]) -> String {
     }
 }
 
-/// Whether a statement was cancelled by the statement timeout. An
-/// operator's cancel request carries the same SQLSTATE and another message,
-/// and still stops the run. The share-hash backfill's batches and record
-/// (`share_hashes.rs`) and the up-front table locks (`table_locks.rs`) read
-/// it.
-fn statement_timed_out(error: &dyn sqlx::error::DatabaseError) -> bool {
-    error.code().as_deref() == Some("57014") && error.message().contains("statement timeout")
+/// SQLSTATE 57014, `query_canceled`: a statement cancelled by its
+/// `statement_timeout`, or by a cancel request, an operator's
+/// `pg_cancel_backend` say. Only PostgreSQL's message tells the two apart,
+/// and PostgreSQL translates it under `lc_messages` (#824).
+const QUERY_CANCELED: &str = "57014";
+
+/// How much of a statement timeout a cancel may come early, on this side's
+/// clock, and still be that timeout's (`statement_timed_out`): a tenth.
+const TIMEOUT_SLACK_DIVISOR: u32 = 10;
+
+/// Whether `error`, from one statement that ran for `ran` on this side's
+/// clock under a `statement_timeout` of `timeout` that this code set for
+/// it, is that timeout's cancel: SQLSTATE 57014, with nearly `timeout`
+/// gone. No message is read, so a server whose `lc_messages` is not English
+/// is told apart the same way (#824). PostgreSQL starts the timeout once the
+/// statement reaches it, after this side started `ran`, and its error
+/// reaches this side after the timeout fired, so a statement the timeout
+/// cancelled has run `timeout` here, as far as the server's wall clock, by
+/// which PostgreSQL times it, keeps pace with this side's monotonic one. It
+/// may not, slewed fast or stepped forward, so a 57014 a tenth of the
+/// timeout early counts too: taking a timeout for a cancel would stop the
+/// run, the failure #824 is about, where taking a cancel for a timeout only
+/// tries the statement again. Any other 57014 is a cancel request, which
+/// sqlx never sends: an operator's, which stops the run as before. A cancel
+/// is taken for the timeout only where it lands within that tenth, or
+/// within what this side adds to the statement's run, a round trip or two
+/// and the wait to be scheduled, before the timeout would have fired. A
+/// `timeout` of zero is none, and never matches.
+fn statement_timed_out(
+    error: &dyn sqlx::error::DatabaseError,
+    timeout: Duration,
+    ran: Duration,
+) -> bool {
+    !timeout.is_zero()
+        && ran >= timeout - timeout / TIMEOUT_SLACK_DIVISOR
+        && error.code().as_deref() == Some(QUERY_CANCELED)
+}
+
+/// A statement's cancel by a statement timeout this code set for it, as
+/// `timed` marks it in the statement's error, with the timeout. PostgreSQL's
+/// own error, its message included, follows it in the chain.
+#[derive(Debug)]
+pub(super) struct StatementTimedOut(Duration);
+
+impl std::fmt::Display for StatementTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancelled by its {} ms statement timeout",
+            self.0.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for StatementTimedOut {}
+
+/// `statement`, one statement that runs under a `statement_timeout` of
+/// `timeout` that the caller set for it, timed from here: its error is
+/// marked `StatementTimedOut` where that timeout cancelled it
+/// (`statement_timed_out`), and returned unmarked otherwise. One statement
+/// per call, so that an operator's cancel of one statement is never timed
+/// with the statements before it. The share-hash backfill's batches,
+/// double-credit check and record of 2 (`share_hashes.rs`), the up-front
+/// table locks (`table_locks.rs`) and the carry-forward integrity report
+/// (`fatal_state.rs`) run theirs so, and `timed_out` reads the mark.
+pub(super) async fn timed<T, E>(
+    timeout: Duration,
+    statement: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    let started = std::time::Instant::now();
+    statement.await.map_err(|error| {
+        let ran = started.elapsed();
+        let error: anyhow::Error = error.into();
+        let cancelled =
+            database_error(&error).is_some_and(|cause| statement_timed_out(cause, timeout, ran));
+        if cancelled {
+            error.context(StatementTimedOut(timeout))
+        } else {
+            error
+        }
+    })
+}
+
+/// Whether `error` is a statement's cancel by a statement timeout this code
+/// set for it, as `timed` marked it, whatever context it gained since.
+pub(super) fn timed_out(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<StatementTimedOut>().is_some()
+}
+
+/// The server's error in `error`'s chain, if any: what its SQLSTATE is read
+/// from.
+pub(super) fn database_error(error: &anyhow::Error) -> Option<&dyn sqlx::error::DatabaseError> {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .find_map(sqlx::Error::as_database_error)
 }
 
 /// The native migrations in the order `migrate_schema` applies them, each
@@ -6712,5 +6804,191 @@ mod tests {
             .columns
             .remove("claim_token");
         require_no_native_collision(SourceState::Applied258, &reserved, &found).unwrap();
+    }
+
+    /// A database error with `code` and `message`, as a server sends one.
+    #[derive(Debug)]
+    pub(super) struct Reported(pub(super) &'static str, pub(super) &'static str);
+
+    impl std::fmt::Display for Reported {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.1)
+        }
+    }
+
+    impl std::error::Error for Reported {}
+
+    impl sqlx::error::DatabaseError for Reported {
+        fn message(&self) -> &str {
+            self.1
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// PostgreSQL 16's German for "canceling statement due to statement
+    /// timeout" and "... user request", as `lc_messages` gives them (#824).
+    pub(super) const GERMAN_TIMEOUT: &str =
+        "storniere Anfrage wegen Zeitüberschreitung der Anfrage";
+    pub(super) const GERMAN_CANCEL: &str = "storniere Anfrage wegen Benutzeraufforderung";
+    /// ... and for "canceling statement due to lock timeout".
+    pub(super) const GERMAN_LOCK_TIMEOUT: &str =
+        "storniere Anfrage wegen Zeitüberschreitung einer Sperre";
+
+    /// A statement's error, `code` and `message`, as `timed` returns it
+    /// under `timeout` after `ran`. A statement that ran its whole timeout
+    /// sleeps it, which never ends early; one that failed sooner fails at
+    /// once (`ran` zero), and should be given a timeout no scheduling delay
+    /// reaches (`LONG`).
+    pub(super) async fn failed_after(
+        code: &'static str,
+        message: &'static str,
+        timeout: Duration,
+        ran: Duration,
+    ) -> anyhow::Error {
+        timed(timeout, async move {
+            tokio::time::sleep(ran).await;
+            Err::<(), _>(sqlx::Error::Database(Box::new(Reported(code, message))))
+        })
+        .await
+        .expect_err("the statement failed")
+    }
+
+    /// A timeout no test's scheduling delay reaches, for a statement that
+    /// fails at once.
+    pub(super) const LONG: Duration = Duration::from_secs(60);
+
+    /// A statement timeout is SQLSTATE 57014 once the statement has run its
+    /// timeout, or all but a tenth of it for a server clock that runs fast,
+    /// whatever language the message is in, and nothing else is: not a
+    /// 57014 sooner, an operator's cancel, even where its message says
+    /// "statement timeout"; not another SQLSTATE; and nothing under a
+    /// timeout of zero, which is none.
+    #[test]
+    fn a_statement_timeout_is_told_by_its_sqlstate_and_its_time_not_its_message() {
+        let timeout = Duration::from_millis(100);
+        let error = |code, message| Reported(code, message);
+        assert!(statement_timed_out(
+            &error("57014", GERMAN_TIMEOUT),
+            timeout,
+            timeout
+        ));
+        assert!(statement_timed_out(
+            &error("57014", GERMAN_TIMEOUT),
+            timeout,
+            Duration::from_secs(3)
+        ));
+        assert!(statement_timed_out(
+            &error("57014", GERMAN_CANCEL),
+            timeout,
+            timeout
+        ));
+        assert!(statement_timed_out(
+            &error("57014", GERMAN_TIMEOUT),
+            timeout,
+            Duration::from_millis(90)
+        ));
+        assert!(!statement_timed_out(
+            &error("57014", GERMAN_TIMEOUT),
+            timeout,
+            Duration::from_millis(89)
+        ));
+        assert!(!statement_timed_out(
+            &error("57014", "canceling statement due to statement timeout"),
+            timeout,
+            Duration::ZERO
+        ));
+        assert!(!statement_timed_out(
+            &error("55P03", GERMAN_LOCK_TIMEOUT),
+            timeout,
+            timeout
+        ));
+        assert!(!statement_timed_out(
+            &error("57014", GERMAN_TIMEOUT),
+            Duration::ZERO,
+            timeout
+        ));
+    }
+
+    /// `timed` marks a statement's error `StatementTimedOut` where its
+    /// timeout cancelled it, keeping PostgreSQL's error and message after
+    /// the mark, and the mark is still read once more context is added; an
+    /// error sooner, or of another kind, is returned as it was.
+    #[tokio::test]
+    async fn timed_marks_a_statement_its_timeout_cancelled_and_nothing_else() {
+        // A statement runs its timeout by sleeping it; one that fails sooner
+        // fails at once under a timeout no scheduling delay reaches.
+        let timeout = Duration::from_millis(20);
+        let long = Duration::from_secs(60);
+        let statement = |message: &'static str, timeout: Duration, ran: Duration| {
+            timed(timeout, async move {
+                tokio::time::sleep(ran).await;
+                Err::<(), _>(sqlx::Error::Database(Box::new(Reported("57014", message))))
+            })
+        };
+        let cancelled = statement(GERMAN_TIMEOUT, timeout, timeout)
+            .await
+            .unwrap_err()
+            .context("mapping a batch");
+        let text = format!("{cancelled:#}");
+        assert!(timed_out(&cancelled), "{text}");
+        assert!(
+            text.starts_with("mapping a batch: cancelled by its 20 ms statement timeout: ")
+                && text.ends_with(GERMAN_TIMEOUT),
+            "{text}"
+        );
+        let cancel = statement(GERMAN_CANCEL, long, Duration::ZERO)
+            .await
+            .unwrap_err();
+        let text = format!("{cancel:#}");
+        assert!(!timed_out(&cancel), "{text}");
+        assert!(
+            !text.contains("statement timeout") && text.ends_with(GERMAN_CANCEL),
+            "{text}"
+        );
+        let wrapped = timed(timeout, async {
+            tokio::time::sleep(timeout).await;
+            Err::<(), _>(
+                anyhow::Error::from(sqlx::Error::Database(Box::new(Reported(
+                    "57014",
+                    GERMAN_TIMEOUT,
+                ))))
+                .context("refusing to record migration 2"),
+            )
+        })
+        .await
+        .unwrap_err();
+        assert!(timed_out(&wrapped), "{wrapped:#}");
+        let refused = timed(timeout, async {
+            tokio::time::sleep(timeout).await;
+            Err::<(), _>(anyhow::anyhow!("refusing to record migration 2"))
+        })
+        .await
+        .unwrap_err();
+        assert!(!timed_out(&refused));
+        assert_eq!(
+            timed(timeout, async { Ok::<_, sqlx::Error>(7) })
+                .await
+                .unwrap(),
+            7
+        );
     }
 }

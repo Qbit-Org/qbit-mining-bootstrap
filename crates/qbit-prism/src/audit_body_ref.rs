@@ -677,8 +677,9 @@ fn python_json_sha256<T: Serialize + ?Sized>(value: &T) -> Result<String, AuditB
 /// `\uXXXX`, and one above the BMP as a UTF-16 surrogate pair. serde_json
 /// passes `"`, `\` and control characters to `write_char_escape`, whose
 /// escapes are CPython's too, and everything else in a string to
-/// `write_string_fragment`.
-struct PythonJsonFormatter;
+/// `write_string_fragment`. The CTV manifest set's 2.x digest uses it too
+/// (`ctv::legacy_ctv_fanout_manifest_set_sha256_hex`, #739).
+pub(crate) struct PythonJsonFormatter;
 
 impl serde_json::ser::Formatter for PythonJsonFormatter {
     fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>

@@ -1071,6 +1071,7 @@ mod tests {
                 tip_last_notify_median_ms: None,
                 d1_verdict_table: false,
                 churn_tip_last_notify_p99_ms: None,
+                churn_tip_last_notify_median_ms: None,
                 new_session_first_job_p99_ms: None,
             },
         );
@@ -1111,6 +1112,7 @@ mod tests {
             tip_last_notify_median_ms: None,
             d1_verdict_table: false,
             churn_tip_last_notify_p99_ms: None,
+            churn_tip_last_notify_median_ms: None,
             new_session_first_job_p99_ms: None,
         };
         let row = |missing, in_gap| {

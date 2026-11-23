@@ -186,6 +186,47 @@ async fn sqlx_supported_password_sources_and_precedence_remain_valid() {
     );
 }
 
+/// #825: verify-ca without a root certificate fails every connect (#818),
+/// so the reader's own startup refuses it first, from the URL's
+/// sslrootcert or PGSSLROOTCERT as the connect resolves them.
+#[tokio::test]
+async fn verify_ca_without_a_root_certificate_fails_at_validation_and_real_startup() {
+    let verify_ca = "postgres://reader:fixture-secret@localhost/db?sslmode=verify-ca";
+    let refusal = "public PRISM_DATABASE_URL: sslmode=verify-ca requires sslrootcert";
+    for action in ["check-public-database-config", "public-api"] {
+        for (dsn, root_cert) in [
+            (verify_ca.to_owned(), None),
+            (format!("{verify_ca}&sslrootcert="), None),
+            (verify_ca.to_owned(), Some("")),
+        ] {
+            let mut cmd = command(action, false, Some(&dsn), None);
+            if let Some(root_cert) = root_cert {
+                cmd.env("PGSSLROOTCERT", root_cert);
+            }
+            assert_result(output(cmd).await, false, refusal);
+        }
+    }
+    for (dsn, root_cert) in [
+        (
+            format!("{verify_ca}&sslrootcert=/run/secrets/prism-db-ca.pem"),
+            None,
+        ),
+        (verify_ca.to_owned(), Some("/run/secrets/prism-db-ca.pem")),
+        (verify_ca.replace("verify-ca", "verify-full"), None),
+        (verify_ca.replace("verify-ca", "require"), None),
+    ] {
+        let mut cmd = command("check-public-database-config", false, Some(&dsn), None);
+        if let Some(root_cert) = root_cert {
+            cmd.env("PGSSLROOTCERT", root_cert);
+        }
+        assert_result(
+            output(cmd).await,
+            true,
+            "public database configuration valid",
+        );
+    }
+}
+
 #[tokio::test]
 async fn native_password_file_and_all_production_selectors_use_the_same_policy() {
     let dir = tempfile::tempdir().unwrap();

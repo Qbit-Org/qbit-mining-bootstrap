@@ -15,21 +15,39 @@
 //! also gave up on its 500 ms lock timeout behind a table the migrate held.
 //!
 //! So `migrate_schema` first takes the lock of every table the pending
-//! migrations of `ALTERED` alter, in one `LOCK TABLE` whose lock timeout and
-//! statement timeout are both `ATTEMPT`: the lock timeout bounds each
-//! table's wait, the statement timeout their sum. The statement takes the
-//! tables in order and keeps those it has while it waits for the next, but
-//! for `ATTEMPT` at most in all. The migration history's
+//! migrations of `ALTERED` alter, in one `LOCK TABLE` whose statement
+//! timeout is `ATTEMPT` and whose lock timeout is `LOCK_WAIT`, a margin
+//! under it: the lock timeout bounds each table's wait, the statement
+//! timeout their sum. The statement takes the tables in order and keeps
+//! those it has while it waits for the next, but for `ATTEMPT` at most in
+//! all. The migration history's
 //! ACCESS EXCLUSIVE lock, the first table lock of every migration
 //! transaction, which a starting frontend's read queues behind, is taken
-//! with the same bound. If either cannot be taken, or PostgreSQL picks the
+//! with the same bounds. If either cannot be taken, or PostgreSQL picks the
 //! request as a deadlock victim (possible where `deadlock_timeout` is below
-//! `ATTEMPT`, as the migrate's own is where it may lower it, below), the
+//! `LOCK_WAIT`, as the migrate's own is where it may lower it, below), the
 //! attempt is given up (`LockContention`), and
 //! `migrate_schema_committed` rolls the whole migration transaction back,
 //! which releases every lock it took (each is transaction-scoped,
 //! MIGRATION_LOCK included), and runs it again from the start after a
-//! backoff, until `BUDGET` has passed. Nothing is recorded before the
+//! backoff, until `BUDGET` has passed.
+//!
+//! What gave a request up is told by its SQLSTATE alone, never by
+//! PostgreSQL's message, which the server translates under `lc_messages`
+//! (#824). A request blocked on one table, the usual contention, ends at
+//! `LOCK_WAIT` with the lock timeout's 55P03, `lock_not_available`, before
+//! the statement timeout can fire: what the statement does before it waits,
+//! parsing and looking its tables up, takes far less than the margin. A
+//! request that waited for several tables in turn can reach `ATTEMPT`
+//! first, and end with the statement timeout's 57014, `query_canceled`,
+//! which an operator's cancel carries too: `timed` tells the timeout by the
+//! request having run `ATTEMPT`, but for a tenth's slack for the server's
+//! clock, and an operator's cancel, sooner, stops the run. A deadlock abort is 40P01. Until #824 a 57014 was told by its
+//! English message, and both bounds were `ATTEMPT`, so the statement
+//! timeout, whose clock starts first, ended nearly every blocked request:
+//! on a server whose messages were not English the first contention
+//! stopped `migrate`, and a start with `PRISM_POSTGRES_INIT_SCHEMA=1`, at
+//! once, instead of trying again within `BUDGET`. Nothing is recorded before the
 //! commit, and 027 and 028 are `IF NOT EXISTS` throughout, so each attempt
 //! plans afresh from what it reads and converges on the same schema, also
 //! when another migrator committed them meanwhile. Once it holds the
@@ -38,7 +56,8 @@
 //! 028's check over the audit snapshots, then the commit.
 //!
 //! `ATTEMPT` is 100 ms, well under PostgreSQL's 1 s `deadlock_timeout` and
-//! the 500 ms lock timeout of rc.6's metrics collector. A frontend waits for
+//! the 500 ms lock timeout of rc.6's metrics collector, and `LOCK_WAIT` is
+//! 80 ms, which leaves the statement 20 ms before its first wait. A frontend waits for
 //! the migrate's request at most that long, and the migrate leaves any cycle
 //! it closes within it. PostgreSQL checks a waiter for a deadlock only once
 //! it has waited a second, so no frontend is checked, let alone aborted, for
@@ -58,13 +77,15 @@
 //! before #791, 027's `ALTER TABLE` waited that second and PostgreSQL
 //! cancelled the pass, but no attempt waits that long. So, from a run's
 //! second attempt on, `lock_within_attempt` lowers the migrate's own
-//! `deadlock_timeout` to `DEADLOCK_CHECK`, half of `ATTEMPT`, for its two
+//! `deadlock_timeout` to `DEADLOCK_CHECK`, half of `ATTEMPT` and within any
+//! one table's `LOCK_WAIT`, for its two
 //! requests only, the history's `LOCK TABLE` and the tables', together with
 //! their lock and statement timeouts, and restores all three after each:
 //! everything else in the transaction, the files' DDL, index builds and
 //! checks included, waits under the session's own. The check then runs
 //! within the request and cancels the worker blocking it, whose lock is then
-//! usually granted within the attempt, or else in the next. PostgreSQL
+//! usually granted within the attempt, the `LOCK_WAIT` less `DEADLOCK_CHECK`
+//! that is left of its wait, 30 ms, or else in the next. PostgreSQL
 //! itself picks that worker, the one directly blocking the request, and
 //! tells an anti-wraparound one by its flags, with no permission check and
 //! whatever this role can see. The setting is the migrate's own: every
@@ -117,11 +138,21 @@ use super::*;
 use crate::ledger::connect::begin;
 use crate::metrics::Metrics;
 
-/// How long one attempt waits for all of its tables together (see the
-/// module docs).
+/// How long one attempt waits for all of its tables together, its
+/// requests' `statement_timeout` (see the module docs).
 pub(super) const ATTEMPT: Duration = Duration::from_millis(100);
+/// How long one attempt waits for any one table, its requests'
+/// `lock_timeout`: `ATTEMPT` less a margin for what the statement does
+/// before it waits, so that a request blocked on one table ends with the
+/// lock timeout's 55P03 before the statement timeout's 57014 (#824).
+const LOCK_WAIT: Duration = Duration::from_millis(80);
 /// How long `migrate` keeps trying, as 017's swap and 031's catalog steps
-/// keep trying for their own locks (`partition.rs`).
+/// keep trying for their own locks (`partition.rs`): with each attempt
+/// waiting `ATTEMPT` at most and the backoff doubling to `BACKOFF_MAX`,
+/// about 290 attempts. Every attempt that gives up within it is tried
+/// again, whatever language the server's messages are in, since `gave_up`
+/// reads no message (#824); an operator's cancel, or any other failure,
+/// ends the run at once.
 const BUDGET: Duration = Duration::from_secs(600);
 /// The first backoff, doubling after each attempt to at most `BACKOFF_MAX`.
 const BACKOFF: Duration = Duration::from_millis(100);
@@ -245,7 +276,11 @@ impl Locking {
 pub(super) struct LockContention {
     locking: Locking,
     tables: Vec<&'static str>,
-    /// PostgreSQL's message: a lock or statement timeout, or the deadlock.
+    /// What gave the request up (`gave_up`): 55P03, a lock timeout; 57014,
+    /// the statement timeout; or 40P01, the deadlock.
+    sqlstate: String,
+    /// PostgreSQL's message, in the server's `lc_messages`: for people, never
+    /// read.
     reason: String,
 }
 
@@ -253,10 +288,12 @@ impl std::fmt::Display for LockContention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} could not lock {} within {} ms ({})",
+            "{} could not lock {} within {} ms for any one, {} ms in all (SQLSTATE {}: {})",
             self.locking.subject(),
             self.tables.join(", "),
+            LOCK_WAIT.as_millis(),
             ATTEMPT.as_millis(),
+            self.sqlstate,
             self.reason
         )
     }
@@ -264,26 +301,27 @@ impl std::fmt::Display for LockContention {
 
 impl std::error::Error for LockContention {}
 
-/// PostgreSQL's message when `error` gave the request up: its lock timeout,
-/// its statement timeout (an operator's cancel carries the same SQLSTATE
-/// and another message, and stops the run), or a deadlock PostgreSQL broke
-/// by aborting it.
-fn gave_up(error: &sqlx::Error) -> Option<String> {
-    error
-        .as_database_error()
-        .filter(|error| {
-            matches!(error.code().as_deref(), Some("55P03") | Some("40P01"))
-                || statement_timed_out(*error)
-        })
-        .map(|error| error.message().to_owned())
+/// The SQLSTATE and PostgreSQL's message when `error`, the request's as
+/// `timed` returns it, gave the request up: its lock timeout (55P03), its
+/// statement timeout (57014, which `timed` marks once the request has run
+/// `ATTEMPT`, but for a tenth), or a deadlock PostgreSQL broke by aborting it
+/// (40P01). Told by the SQLSTATE and the time alone, never by the message,
+/// which the server translates under `lc_messages` (#824). An operator's
+/// cancel, a 57014 sooner, gave nothing up, and stops the run.
+fn gave_up(error: &anyhow::Error) -> Option<(String, String)> {
+    let database = database_error(error)?;
+    let sqlstate = database.code()?.into_owned();
+    (matches!(sqlstate.as_str(), "55P03" | "40P01") || timed_out(error))
+        .then(|| (sqlstate, database.message().to_owned()))
 }
 
-/// Take `statement`'s locks on `tables` within `ATTEMPT` in all, checked
+/// Take `statement`'s locks on `tables` within `ATTEMPT` in all, and
+/// `LOCK_WAIT` for each, checked
 /// for a deadlock after `DEADLOCK_CHECK` where this run lowers
 /// `deadlock_timeout` (`LOWER_DEADLOCK_TIMEOUT`), under the transaction's
 /// own timeouts again afterwards. Giving up is `LockContention`, and the
-/// lowered setting refused to this role `CannotLower`; any other failure is
-/// returned with `context`.
+/// lowered setting refused to this role `CannotLower`; any other failure,
+/// an operator's cancel included, is returned with `context`.
 async fn lock_within_attempt(
     tx: &mut Transaction<'_, Postgres>,
     statement: &str,
@@ -294,10 +332,9 @@ async fn lock_within_attempt(
     let lower = LOWER_DEADLOCK_TIMEOUT
         .try_with(|lower| *lower)
         .unwrap_or(false);
-    let attempt = ATTEMPT.as_millis().to_string();
     let mut bounds = vec![
-        ("lock_timeout", attempt.clone()),
-        ("statement_timeout", attempt),
+        ("lock_timeout", LOCK_WAIT.as_millis().to_string()),
+        ("statement_timeout", ATTEMPT.as_millis().to_string()),
     ];
     if lower {
         bounds.push(("deadlock_timeout", DEADLOCK_CHECK.as_millis().to_string()));
@@ -320,15 +357,16 @@ async fn lock_within_attempt(
             anyhow::Error::from(error).context(settings())
         });
     }
-    if let Err(error) = sqlx::query(statement).execute(&mut **tx).await {
+    if let Err(error) = timed(ATTEMPT, sqlx::query(statement).execute(&mut **tx)).await {
         return Err(match gave_up(&error) {
-            Some(reason) => LockContention {
+            Some((sqlstate, reason)) => LockContention {
                 locking,
                 tables,
+                sqlstate,
                 reason,
             }
             .into(),
-            None => anyhow::Error::from(error).context(context),
+            None => error.context(context),
         });
     }
     let restored: Vec<(&str, String)> = names.iter().copied().zip(before).collect();
@@ -491,6 +529,7 @@ async fn committed_within(
         let LockContention {
             locking,
             tables,
+            sqlstate,
             reason,
         } = contention;
         if lowers.is_none() {
@@ -536,11 +575,12 @@ async fn committed_within(
         if let Some(held) = held.filter(|_| refusing) {
             let held = refusal_tail(&held, lowers);
             bail!(
-                "refusing to wait any longer for the table locks of {}: {attempt} attempts over {} s each waited {} ms for {} and gave up, so that no serving frontend waits on the migrate longer than that. Nothing was changed{}.{held}",
+                "refusing to wait any longer for the table locks of {}: {attempt} attempts over {} s each waited up to {} ms for {}, {} ms for any one, and gave up, so that no serving frontend waits on the migrate longer than that. Nothing was changed{}.{held}",
                 locking.subject(),
                 started.elapsed().as_secs(),
                 ATTEMPT.as_millis(),
                 tables.join(", "),
+                LOCK_WAIT.as_millis(),
                 locking.unrecorded()
             );
         }
@@ -552,6 +592,7 @@ async fn committed_within(
                 attempt,
                 waited_s,
                 backoff_ms,
+                %sqlstate,
                 %reason,
                 "the migration could not lock the tables it alters within {} ms; rolled back, holding nothing, and trying again after a backoff",
                 ATTEMPT.as_millis()
@@ -562,6 +603,7 @@ async fn committed_within(
                 attempt,
                 waited_s,
                 backoff_ms,
+                %sqlstate,
                 %reason,
                 "the migration could not lock its tables; trying again"
             );
@@ -747,6 +789,9 @@ mod postgres_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{
+        failed_after, GERMAN_CANCEL, GERMAN_LOCK_TIMEOUT, GERMAN_TIMEOUT, LONG,
+    };
     use super::*;
 
     /// What each statement of `sql` that locks a table it names locks, and
@@ -870,8 +915,77 @@ mod tests {
         assert!(ATTEMPT * 5 <= Duration::from_millis(500));
         assert!(BACKOFF_MAX < BUDGET);
         // The migrate's own deadlock check, and its cancel of a blocking
-        // autovacuum worker, run well within an attempt.
+        // autovacuum worker, run well within an attempt, and within any one
+        // table's wait.
         assert!(DEADLOCK_CHECK * 2 <= ATTEMPT);
+        assert!(DEADLOCK_CHECK + Duration::from_millis(20) <= LOCK_WAIT);
+        // A request blocked on one table ends with the lock timeout, the
+        // statement left a fifth of the attempt before it waits (#824).
+        assert!(LOCK_WAIT + ATTEMPT / 5 <= ATTEMPT);
+    }
+
+    /// What gave a request up is told by its SQLSTATE, and a 57014 by the
+    /// time it took, never by the message: on a server whose messages are
+    /// German (#824), a lock timeout, a deadlock and a statement timeout
+    /// that ran `ATTEMPT` give the attempt up, with the message kept for
+    /// people, while a 57014 sooner, an operator's cancel, and anything
+    /// else do not, even where an English message says "statement
+    /// timeout".
+    #[tokio::test]
+    async fn an_attempt_gives_up_by_sqlstate_and_time_whatever_the_language() {
+        let (lock, statement, cancel) = (GERMAN_LOCK_TIMEOUT, GERMAN_TIMEOUT, GERMAN_CANCEL);
+        // The request's error as `lock_within_attempt` sees it.
+        let request_failed = |code, message, ran: Duration| {
+            let timeout = if ran.is_zero() { LONG } else { ATTEMPT };
+            failed_after(code, message, timeout, ran)
+        };
+        assert_eq!(
+            gave_up(&request_failed("55P03", lock, LOCK_WAIT).await),
+            Some(("55P03".to_owned(), lock.to_owned()))
+        );
+        assert_eq!(
+            gave_up(
+                &request_failed("40P01", "Verklemmung (Deadlock) entdeckt", Duration::ZERO).await
+            ),
+            Some((
+                "40P01".to_owned(),
+                "Verklemmung (Deadlock) entdeckt".to_owned()
+            ))
+        );
+        let timeout = request_failed("57014", statement, ATTEMPT).await;
+        assert!(timed_out(&timeout), "{timeout:#}");
+        assert_eq!(
+            gave_up(&timeout),
+            Some(("57014".to_owned(), statement.to_owned()))
+        );
+        for early in [
+            request_failed("57014", cancel, Duration::ZERO).await,
+            request_failed("57014", statement, Duration::ZERO).await,
+            request_failed(
+                "57014",
+                "canceling statement due to statement timeout",
+                Duration::ZERO,
+            )
+            .await,
+        ] {
+            assert!(!timed_out(&early), "{early:#}");
+            assert_eq!(gave_up(&early), None, "{early:#}");
+        }
+        assert_eq!(
+            gave_up(&request_failed("42501", "keine Berechtigung", ATTEMPT).await),
+            None
+        );
+        assert_eq!(gave_up(&anyhow::anyhow!("not the server's")), None);
+        let contention = LockContention {
+            locking: Locking::Migrations(vec![27, 28]),
+            tables: vec!["qbit_pool_blocks"],
+            sqlstate: "55P03".to_owned(),
+            reason: lock.to_owned(),
+        };
+        assert_eq!(
+            contention.to_string(),
+            format!("migration 27, 28 could not lock qbit_pool_blocks within 80 ms for any one, 100 ms in all (SQLSTATE 55P03: {lock})")
+        );
     }
 
     fn worker(query: Option<&str>) -> Holder {

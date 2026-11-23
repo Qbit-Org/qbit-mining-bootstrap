@@ -11,6 +11,7 @@ use crate::{
         SessionHandle, SessionShared, SubmitRecord, TipSighting,
     },
     cluster::{self, ManagedPostgres, ObservedReplication, Replication},
+    contention::{self, HostSampler},
     digest,
     frontend::{self, Frontend, FrontendSpec, SharedEnvironment},
     kill::KillDriver,
@@ -600,7 +601,19 @@ struct PhaseRun {
     shortfall: u64,
     locks: measure::PhaseLocks,
     processes: Vec<measure::ProcessSummary>,
+    /// The host's steal, iowait and pressure stall over the phase (#842),
+    /// set once the run has stopped reading the host: summarised at the
+    /// phase's own end, its last interval would have had no read after it.
+    host_contention: Option<contention::HostContention>,
     ack_deltas: Vec<measure::ServerAckDelta>,
+    /// Each frontend's [`measure::ACCOUNTED_SERIES`] deltas, in frontend
+    /// order, for the share-ack accounting (#829).
+    series_deltas: Vec<BTreeMap<String, measure::SeriesDelta>>,
+    /// The share append call's `pg_stat_statements` over the phase, or why
+    /// it is unknown.
+    append_call: std::result::Result<measure::AppendCallStats, String>,
+    /// `pg_stat_wal` and checkpoint counters over the phase.
+    database_counters: measure::DatabaseDelta,
     replication_start: cluster::ReplicationObservation,
     replication_end: cluster::ReplicationObservation,
     proxy_delay_configured_ms: u64,
@@ -621,6 +634,8 @@ struct PhaseRun {
     /// [`PhaseOutcome::tips_unminted`].
     ordered_landings: Vec<OrderedLanding>,
     tips_unminted: usize,
+    /// See [`PhaseOutcome::tips_planned`].
+    tips_planned: usize,
     frontend_restarts: usize,
     /// Every drained restart this phase completed, with its timings and the
     /// scrapes bracketing the counter reset.
@@ -1149,6 +1164,7 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
                 .clone()
         })
         .unwrap_or_else(|| "unknown (external database)".into());
+    let managed_cluster = managed.clone();
     let result = run_inner(
         &args,
         RunContext {
@@ -1178,6 +1194,7 @@ pub async fn execute_with_preset(args: Args, preset: Option<crate::preset::Prese
             declared_replication: replication,
             managed_standby,
             pg_stat_statements,
+            managed_cluster,
             soak,
             failover: failover.clone(),
         },
@@ -1279,6 +1296,9 @@ struct RunContext {
     declared_replication: Replication,
     managed_standby: Option<String>,
     pg_stat_statements: String,
+    /// The managed cluster, for its servers' checkpoint lines (#829); `None`
+    /// against `--database-url`.
+    managed_cluster: Option<crate::fault::failover::Cluster>,
     /// `--plan soak`'s phases and spec (#575).
     soak: Option<crate::soak_driver::SoakPlan>,
     /// The managed cluster and the writer endpoint, for the database faults
@@ -1500,6 +1520,12 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             )
         })
         .collect();
+    // #842: the host's steal, iowait and pressure stall over the same run, so
+    // a slow tip can be set against what the machine was doing.
+    let host_sampler = HostSampler::start(
+        std::path::PathBuf::from("/proc"),
+        Duration::from_millis(args.process_sample_interval_ms),
+    );
     // ORDER_LOCK is database-wide, so the sampler has to know which backends
     // are this run's. `application_name` only works if the driver carries it,
     // which is checked here rather than assumed.
@@ -1606,6 +1632,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                     )
                 });
             lock_sampler.stop();
+            host_sampler.stop();
             for sampler in &process_samplers {
                 sampler.stop();
             }
@@ -1637,6 +1664,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             let _ = session.control.send(client::Control::Stop);
         }
         lock_sampler.stop();
+        host_sampler.stop();
         for sampler in &process_samplers {
             sampler.stop();
         }
@@ -1779,7 +1807,8 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             }
         }
         let replication_start = cluster::observe_replication(&side, &plan.name).await?;
-        measure::reset_statement_stats(&side).await;
+        let statements_reset = measure::reset_statement_stats(&side).await;
+        let counters_before = measure::database_counters(&side).await;
         let mut before_scrapes = Vec::new();
         for child in &frontends {
             before_scrapes
@@ -1951,6 +1980,23 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             after_scrapes
                 .push(measure::scrape_metrics(&child.spec.instance_id, &child.metrics_url()).await);
         }
+        let counters_after = measure::database_counters(&side).await;
+        // Its totals are the phase's only if the phase's reset took, on the
+        // server that is still the primary.
+        let append_call = if !statements_reset {
+            Err(
+                "pg_stat_statements could not be reset at the phase's start (not loaded, or \
+                 not permitted), so its totals would not be the phase's"
+                    .to_owned(),
+            )
+        } else if let Some(reason) = measure::server_replaced(
+            &counters_before.server_started,
+            &counters_after.server_started,
+        ) {
+            Err(reason)
+        } else {
+            measure::append_call_statement(&side).await
+        };
         let replication_end = cluster::observe_replication(&side, &plan.name).await?;
         let mut locks = lock_sampler.summarize(started, ended);
         // All three PRISM locks share one normalized query text, so the same
@@ -1973,6 +2019,25 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
                 tier.finish().await;
             }
         }
+        // A frontend restarted during the phase reset its counters; its
+        // deltas are assembled from the scrapes on each side of every
+        // restart, and a restart no scrape bracketed (a mid-flight kill)
+        // leaves them unknown rather than negative or zero.
+        let frontend_segments: Vec<_> = frontends
+            .iter()
+            .enumerate()
+            .zip(before_scrapes.iter().zip(after_scrapes.iter()))
+            .map(|((index, child), (before, after))| {
+                let splits: Vec<&measure::AckSplit> = outcome
+                    .restart_records
+                    .iter()
+                    .filter(|record| record.index == index)
+                    .map(|record| &record.split)
+                    .collect();
+                let restarts = child.restarts.saturating_sub(restarts_before[index]);
+                (before, splits, after, restarts)
+            })
+            .collect();
         runs.push(PhaseRun {
             plan: plan.clone(),
             completed: outcome.aborted.is_none(),
@@ -1984,25 +2049,31 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             shortfall: outcome.shortfall,
             locks,
             processes,
-            // A frontend restarted during the phase reset its counters; the
-            // delta is assembled from the scrapes on each side of every
-            // restart, and a restart no scrape bracketed (a mid-flight kill)
-            // leaves it unknown rather than negative or zero.
-            ack_deltas: frontends
+            host_contention: None,
+            ack_deltas: frontend_segments
                 .iter()
-                .enumerate()
-                .zip(before_scrapes.iter().zip(after_scrapes.iter()))
-                .map(|((index, child), (before, after))| {
-                    let splits: Vec<&measure::AckSplit> = outcome
-                        .restart_records
-                        .iter()
-                        .filter(|record| record.index == index)
-                        .map(|record| &record.split)
-                        .collect();
-                    let restarts = child.restarts.saturating_sub(restarts_before[index]);
-                    measure::ack_delta_across_restarts(before, &splits, after, restarts)
+                .map(|(before, splits, after, restarts)| {
+                    measure::ack_delta_across_restarts(before, splits, after, *restarts)
                 })
                 .collect(),
+            series_deltas: frontend_segments
+                .iter()
+                .map(|(before, splits, after, restarts)| {
+                    measure::ACCOUNTED_SERIES
+                        .iter()
+                        .map(|series| {
+                            (
+                                series.key.to_owned(),
+                                measure::series_delta_across_restarts(
+                                    series.key, before, splits, after, *restarts,
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .collect(),
+            append_call,
+            database_counters: measure::database_delta(&counters_before, &counters_after),
             replication_start,
             replication_end,
             proxy_delay_configured_ms: plan.database_delay_ms,
@@ -2013,6 +2084,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             scheduled_blocks: outcome.scheduled_blocks,
             ordered_landings: outcome.ordered_landings,
             tips_unminted: outcome.tips_unminted,
+            tips_planned: outcome.tips_planned,
             frontend_restarts: outcome.frontend_restarts,
             restart_records: outcome.restart_records,
             mid_flight_indeterminate: outcome.indeterminate,
@@ -2074,8 +2146,19 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
         let _ = tokio::time::timeout(Duration::from_secs(15), session.task).await;
     }
     lock_sampler.stop();
+    host_sampler.finish();
     for sampler in &process_samplers {
         sampler.stop();
+    }
+    // Every read the run will take is in now, the last taken just above: one
+    // snapshot for every phase, every tip and the run-level block.
+    let host_readings = host_sampler.readings();
+    for phase in &mut runs {
+        phase.host_contention = Some(contention::summarize(
+            &host_readings,
+            phase.started,
+            phase.ended,
+        ));
     }
     drop(shared_session);
     let _ = tokio::time::timeout(Duration::from_secs(10), collector).await;
@@ -2595,6 +2678,27 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             committed.len(),
         )?,
     };
+    // Every managed server's checkpoint lines (#829). The paths are copied
+    // out of the cluster's lock, and the logs read off the runtime.
+    let checkpoint_log = match &ctx.managed_cluster {
+        Some(managed) => {
+            let paths = managed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .log_paths();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    paths
+                        .iter()
+                        .map(|path| cluster::checkpoint_log_lines(path))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .context("reading the managed servers' checkpoint lines")?,
+            )
+        }
+        None => None,
+    };
     let mut side_report = json!({
         "schema": report::SCHEMA,
         "run_id": ctx.run_id.to_string(),
@@ -2667,6 +2771,15 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             "durability": durability,
             "replication": replication_rows,
             "pg_stat_statements": ctx.pg_stat_statements,
+            "track_wal_io_timing": if ctx.managed_cluster.is_some() {
+                "requested on: the harness starts its managed primary and standby with it, so \
+                 pg_stat_wal times WAL writes and syncs (#829); each phase's \
+                 database_counters.wal says when the server read had it off"
+            } else {
+                "as the external database has it; each phase's database_counters.wal says when \
+                 it was off"
+            },
+            "checkpoint_log": checkpoint_log,
             "delay_proxy": proxy_block,
             "database_profile_sha256": profile_digest,
             "database_profile_path": profile_path.display().to_string(),
@@ -2697,21 +2810,7 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             window::LEGACY_RECIPIENTS,
         ),
         "arrival": args.arrival()?.render(),
-        "preset": ctx.preset.as_ref().map(|preset| json!({
-            "name": preset.name,
-            "path": preset.path.display().to_string(),
-            "sha256": preset.sha256,
-            "description": preset.description,
-            "issues": preset.issues,
-            "gates": {
-                "phases": preset.gates.phases,
-                "max_shortfall": preset.gates.max_shortfall,
-                "max_rejected_valid_shares": preset.gates.max_rejected_valid_shares,
-                "max_unanswered_submits": preset.gates.max_unanswered_submits,
-                "tip_last_notify_p99_budget_ms": preset.gates.tip_last_notify_p99_budget_ms,
-                "d1_verdict_table": preset.gates.d1_verdict_table,
-            },
-        })),
+        "preset": ctx.preset.as_ref().map(preset_report),
         "time_to_usable_work": time_to_usable_work(
             &external_tips, &tip_changes, &collected, args.sessions,
         ),
@@ -2851,6 +2950,46 @@ async fn run_inner(args: &Args, ctx: RunContext) -> Result<i32> {
             side_report["node"]["chain_reconciliation"]["reconciled"].clone();
         side_report["premise"]["node_failure"] = json!(real.failure());
     }
+    // #842: what the host was doing over the run and over each tip's
+    // delivery, so a slow tip can be told from a contended machine.
+    side_report["host_contention"] = contention::run_block(&host_readings, host_sampler.interval());
+    let phase_windows: Vec<(String, Instant, Instant)> = runs
+        .iter()
+        .map(|phase| (phase.plan.name.clone(), phase.started, phase.ended))
+        .collect();
+    // Looked up with pointer_mut, not indexing: indexing a missing key
+    // inserts it, and a report without churn or a soak keeps its shape.
+    annotate_tip_contention(
+        side_report
+            .pointer_mut("/time_to_usable_work/tips")
+            .and_then(Value::as_array_mut),
+        &tip_changes,
+        &host_readings,
+        &phase_windows,
+    );
+    annotate_tip_contention(
+        side_report
+            .pointer_mut("/churn/tip_delivery/tips")
+            .and_then(Value::as_array_mut),
+        &tip_changes,
+        &host_readings,
+        &phase_windows,
+    );
+    if let Some(phases) = side_report
+        .pointer_mut("/soak/churn_phases")
+        .and_then(Value::as_array_mut)
+    {
+        for phase in phases {
+            annotate_tip_contention(
+                phase
+                    .pointer_mut("/report/tip_delivery/tips")
+                    .and_then(Value::as_array_mut),
+                &tip_changes,
+                &host_readings,
+                &phase_windows,
+            );
+        }
+    }
     let report_path = args.out.join("load-harness-report.json");
     report::write_json(&report_path, &side_report)?;
 
@@ -2923,6 +3062,11 @@ pub struct PhaseOutcome {
     /// Warm-up tips the phase ended without minting, because a landing
     /// they were held behind never settled. Zero when every tip went out.
     pub tips_unminted: usize,
+    /// External tips the phase scheduled: the warm-up's share of
+    /// `--external-tips`, zero in every other phase. The gate holds a tip
+    /// median to it (#854): the median of the tips that came is not the
+    /// run's when some never did.
+    pub tips_planned: usize,
     /// When the phase stopped scheduling: its deadline, or the abort. This
     /// is the end of the measured window -- `duration_millis`, the lock and
     /// process windows and the rates' denominator -- and it is stamped
@@ -3251,6 +3395,7 @@ pub async fn drive_phase_with_population(
         slots_over_budget: 0,
         ordered_landings: Vec::new(),
         tips_unminted: 0,
+        tips_planned: 0,
         ended: started,
         ended_wall: chrono::Utc::now(),
         per_second: PerSecond::default(),
@@ -3297,6 +3442,7 @@ pub async fn drive_phase_with_population(
     } else {
         Vec::new()
     };
+    outcome.tips_planned = tip_times.len();
     let mut tip_cursor = 0usize;
     // A phase with both orders its landings against its tips (#638).
     let order_landings = !block_times.is_empty() && !tip_times.is_empty();
@@ -4468,6 +4614,68 @@ pub fn time_to_usable_work(
     })
 }
 
+/// #842: each tip's host contention over its delivery, from the node's tip
+/// stamp to the slowest session's first usable job. When no figure covers
+/// every session (some were never served), to the tip's replacement, which
+/// covers the time they were starved; a churn tip's replacement is its
+/// phase's end when no tip came. To the slowest served session's job only
+/// when nothing replaced it, and the interval holding the stamp when there
+/// is no figure at all. The phase
+/// the stamp fell in is named, so the gate can set the tip against the
+/// phase's own figures. A tip the node did not record keeps no block rather
+/// than one over a guessed window.
+pub fn annotate_tip_contention(
+    tips: Option<&mut Vec<Value>>,
+    changes: &[crate::node::TipChange],
+    readings: &[contention::HostReading],
+    phases: &[(String, Instant, Instant)],
+) {
+    for tip in tips.into_iter().flatten() {
+        let Some(change) = changes
+            .iter()
+            .find(|change| tip["tip"].as_str() == Some(change.hash.as_str()))
+        else {
+            continue;
+        };
+        let finite = |value: &Value| value.as_f64().filter(|ms| ms.is_finite() && *ms >= 0.0);
+        let span = finite(&tip["all_sessions_milliseconds"])
+            .or_else(|| finite(&tip["last_served_milliseconds"]))
+            .map(|ms| (ms, "the slowest session's first usable job"))
+            .or_else(|| {
+                finite(&tip["replaced_after_milliseconds"]).map(|ms| {
+                    (
+                        ms,
+                        "its replacement, or its phase's end when no tip replaced it: no \
+                         figure covers its slowest session",
+                    )
+                })
+            })
+            .or_else(|| {
+                finite(&tip["latency_milliseconds"]["max"]).map(|ms| {
+                    (
+                        ms,
+                        "the slowest served session's first usable job: some sessions were \
+                         never served and no tip replaced it",
+                    )
+                })
+            });
+        let until = span.map_or(change.monotonic, |(ms, _)| {
+            change.monotonic + Duration::from_secs_f64(ms / 1000.0)
+        });
+        let mut block = json!(contention::summarize(readings, change.monotonic, until));
+        block["window"] = json!(match span {
+            Some((_, to)) => format!("from the node's tip stamp to {to}"),
+            None => "the interval holding the node's tip stamp: the tip has no delivery figure"
+                .to_owned(),
+        });
+        block["phase"] = phases
+            .iter()
+            .find(|(_, started, ended)| *started <= change.monotonic && change.monotonic <= *ended)
+            .map_or(Value::Null, |(name, ..)| json!(name));
+        tip["host_contention"] = block;
+    }
+}
+
 /// The `dense_cadence` section of the side report.
 ///
 /// Additive: nothing else in the report or the artifact changes shape, and a
@@ -4968,9 +5176,16 @@ fn phase_report(
                                           client_rejection_latency",
         "client_rejection_latency": rejection_latency(&collected.submits, &phase.plan.name),
         "server_share_ack_seconds": phase.ack_deltas,
+        "share_ack_accounting": measure::share_ack_accounting(
+            &phase.ack_deltas,
+            &phase.series_deltas,
+            &phase.append_call,
+        ),
+        "database_counters": phase.database_counters,
         "order_lock": phase.locks.order,
         "settlement_lock": phase.locks.settlement,
         "processes": phase.processes,
+        "host_contention": phase.host_contention,
         "database_delay_milliseconds_configured": phase.proxy_delay_configured_ms,
         "previous_phase_settled_before_delay_change_seconds": phase.delay_settled_seconds,
         "database_delay_observed_select1_median_milliseconds": phase.proxy_delay_observed_ms.as_ref().ok(),
@@ -4981,6 +5196,7 @@ fn phase_report(
         "scheduled_blocks": phase.scheduled_blocks,
         "scheduled_blocks_ordered_against_tips": phase.ordered_landings,
         "external_tips_unminted": phase.tips_unminted,
+        EXTERNAL_TIPS_PLANNED: phase.tips_planned,
         "frontend_restarts": phase.frontend_restarts,
         "drained_restarts": phase.restart_records.iter().map(|record| json!({
             "frontend": record.index,
@@ -5077,6 +5293,10 @@ pub struct GapReport {
 /// The key of a fault phase's reconciliation that counts its missing shares
 /// a failover's verdict proves lie in the replication gap (#554).
 pub const MISSING_IN_A_FAILOVER_GAP: &str = "missing_in_a_failover_gap";
+
+/// A phase's planned external tips (#854), the key the gate's tip-median
+/// premise reads: one name on both sides.
+pub const EXTERNAL_TIPS_PLANNED: &str = "external_tips_planned";
 
 /// The kind a committed row that no phase offered is reported under.
 pub const OUTSIDE_PHASES_KIND: &str = "committed share that no phase offered";
@@ -5617,4 +5837,113 @@ pub fn summary_text(
         ));
     }
     text
+}
+
+/// The side report's `preset` block. Its `gates` is the preset's whole
+/// [`crate::preset::Gates`], serialized rather than copied key by key
+/// (#817): a hand-written subset had dropped the median tip gate and both
+/// churn gates, so a report showed only the 10 s p99 budget and read as a
+/// 10 s gate. These are the preset file's gates: a dispatch that overrides
+/// a budget on the gate's command line (prism-load-run.sh's
+/// `PRISM_LOAD_MAX_SHORTFALL`, `PRISM_LOAD_TIP_LAST_NOTIFY_P99_BUDGET_MS`)
+/// changes only what the gate applies, which gate.md's Budget column shows.
+fn preset_report(preset: &crate::preset::Preset) -> Value {
+    json!({
+        "name": preset.name,
+        "path": preset.path.display().to_string(),
+        "sha256": preset.sha256,
+        "description": preset.description,
+        "issues": preset.issues,
+        "gates": preset.gates,
+    })
+}
+
+#[cfg(test)]
+mod preset_report_tests {
+    use super::preset_report;
+    use crate::preset::{Gates, Preset, Schedule};
+    use std::collections::BTreeMap;
+
+    fn preset(gates: Gates) -> Preset {
+        Preset {
+            path: "presets/example.json".into(),
+            sha256: "00".repeat(32),
+            name: "example".to_owned(),
+            description: "example".to_owned(),
+            issues: vec!["#817".to_owned()],
+            schedule: Schedule::Manual,
+            runner: "runner".to_owned(),
+            timeout_minutes: 1,
+            gates,
+            args: BTreeMap::new(),
+            soak: None,
+        }
+    }
+
+    /// Every gate key reaches the report with the value the preset holds the
+    /// run to. The struct literal names every field, so a new gate must be
+    /// added here; the report's block then parses back (unknown keys refused)
+    /// to the same gates, so a key left out or renamed fails. Each value
+    /// differs from its default, so an optional key that went missing and
+    /// parsed back as `None` fails too.
+    /// Every gate set, each to a value other than its default.
+    fn every_gate_set() -> Gates {
+        Gates {
+            phases: Some(vec!["steady".to_owned()]),
+            max_shortfall: 1,
+            max_rejected_valid_shares: Some(2),
+            max_unanswered_submits: Some(3),
+            tip_last_notify_p99_budget_ms: Some(10_000.0),
+            tip_last_notify_median_budget_ms: Some(2_000.0),
+            d1_verdict_table: true,
+            churn_tip_last_notify_p99_budget_ms: Some(4_000.0),
+            churn_tip_last_notify_median_budget_ms: Some(1_500.0),
+            new_session_first_job_p99_budget_ms: Some(5_000.0),
+        }
+    }
+
+    #[test]
+    fn the_side_report_carries_every_gate_key() {
+        let gates = every_gate_set();
+        let report = preset_report(&preset(gates.clone()));
+        let round_trip: Gates =
+            serde_json::from_value(report["gates"].clone()).expect("the report's gates parse");
+        assert_eq!(round_trip, gates);
+    }
+
+    /// A gate the preset leaves ungated is reported as `null`, so the report
+    /// says it is not gated rather than leaving the key out: the report of a
+    /// preset that gates nothing optional has the same keys as one that sets
+    /// every gate, and each optional one is `null`.
+    #[test]
+    fn an_ungated_key_is_reported_as_null() {
+        let gates = Gates {
+            phases: None,
+            max_shortfall: 0,
+            max_rejected_valid_shares: None,
+            max_unanswered_submits: None,
+            tip_last_notify_p99_budget_ms: Some(10_000.0),
+            tip_last_notify_median_budget_ms: None,
+            d1_verdict_table: false,
+            churn_tip_last_notify_p99_budget_ms: None,
+            churn_tip_last_notify_median_budget_ms: None,
+            new_session_first_job_p99_budget_ms: None,
+        };
+        let report = preset_report(&preset(gates));
+        let block = report["gates"].as_object().expect("gates is an object");
+        let every = preset_report(&preset(every_gate_set()));
+        let every = every["gates"].as_object().expect("gates is an object");
+        assert_eq!(
+            block.keys().collect::<Vec<_>>(),
+            every.keys().collect::<Vec<_>>()
+        );
+        let required = [
+            "max_shortfall",
+            "tip_last_notify_p99_budget_ms",
+            "d1_verdict_table",
+        ];
+        for (key, value) in block {
+            assert_eq!(value.is_null(), !required.contains(&key.as_str()), "{key}");
+        }
+    }
 }

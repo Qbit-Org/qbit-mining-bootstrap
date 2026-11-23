@@ -1176,10 +1176,11 @@ impl Ledger {
     }
 
     /// Return the reservation this live claim holds to `pending` after its
-    /// one `submitblock` call provably never ran on the node: the connection
-    /// the request would have been written to was never established
-    /// (`rpc::RpcNotSentError`, #522), or the node answered it from its
-    /// warmup (`RPC_IN_WARMUP`, #526). The reservation and every
+    /// one `submitblock` call provably never ran on the node: no byte of it
+    /// left the frontend (`rpc::RpcNotSentError`), because the connection the
+    /// request would have been written to was never established (#522) or
+    /// the HTTP client handed the request back unwritten (#816), or the node
+    /// answered it from its warmup (`RPC_IN_WARMUP`, #526). The reservation and every
     /// offer column are cleared, because no offer was made, and `pending` is
     /// again what it always means: never offered. The attempt is recorded in
     /// `last_error` under [`OFFER_NOT_SENT_REASON_PREFIX`], the claim is

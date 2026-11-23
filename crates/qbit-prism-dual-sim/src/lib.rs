@@ -13,6 +13,7 @@
 //! binaries, launched with the settings a scenario names.
 
 pub mod balancer;
+pub mod candidate_wait;
 pub mod chain;
 pub mod faults;
 pub mod frontend;

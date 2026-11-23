@@ -83,24 +83,49 @@ commit in place of `<release-main-sha>`, and the version in place of
 `<version>` (as `v2.0.0` was; `v3.0.0` and `v3.1.0` are signed annotated
 tags on their branches' commits, with their own messages):
 
-```sh
-git fetch origin main --tags
-git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
-git verify-tag v<version>
-git push origin refs/tags/v<version>
-git show v<version>:doc/release-notes-<version>.md | sed -E \
-  -e 's#\]\(\.\./#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/#g' \
-  -e 's#\]\(([^)#/:][^):]*)\)#](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/doc/\1)#g' \
-  > /tmp/qbit-release-notes.md
-gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
-  --notes-file /tmp/qbit-release-notes.md
+```bash
+(
+  set -e -o pipefail
+  notes=$(mktemp)
+  trap 'rm -f "$notes"' EXIT
+  git fetch origin main --tags
+  git tag -s v<version> <release-main-sha> -m 'qbit-mining-bootstrap <version>'
+  git verify-tag v<version>
+  git show v<version>:doc/release-notes-<version>.md | sed -E \
+    -e 's|\]\(\.\./|](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/|g' \
+    -e 's|\]\(([^)#/:][^):]*)\)|](https://github.com/Qbit-Org/qbit-mining-bootstrap/blob/v<version>/doc/\1)|g' \
+    > "$notes"
+  grep -q '[^[:space:]]' "$notes" || { echo 'the release notes are empty; not publishing' >&2; exit 1; }
+  git push origin refs/tags/v<version>
+  gh release create v<version> --verify-tag --title 'qbit-mining-bootstrap <version>' \
+    --notes-file "$notes"
+)
 ```
 
 The `sed` points each inline relative link in the notes, `](path)`, at the
 tagged file, since a GitHub release body can't resolve one relative to the
 notes; `](#...)` anchors, absolute `](/...)` paths and URLs stay as they are.
 It doesn't handle reference-style links or link titles, so keep release
-notes to inline links without titles.
+notes to inline links without titles. Its expressions are delimited by `|`,
+which neither the patterns nor the replacements contain, so no `sed` has to
+tell a delimiter from a `#` in a bracket expression; keep `|` out of them.
+
+The block runs in a subshell, in bash or zsh, that stops at the first
+failing command, `git show` or `sed` alike (`pipefail`), and refuses notes
+that are empty or blank. Creating the tag is part of it, so a tag that
+already exists stops it too. The notes are rewritten from the local tag
+before it is pushed, so missing or empty notes stop it before anything is
+public.
+
+When it stops, first check whether the tag is public:
+`git ls-remote --tags origin refs/tags/v<version>`.
+- **Not public:** delete the local tag (`git tag -d v<version>`), fix the
+  cause, and run the block again. Notes are fixed on `main` through a
+  reviewed PR, and the resulting commit is identified and verified as above
+  before it is tagged.
+- **Public:** the tag is never recreated. Check `gh release view v<version>`;
+  if there is no release, run the block again without its `git tag -s` and
+  `git push` lines, so the notes are still rewritten and checked.
 
 Pushing a `v*` tag also runs the L3 production-window matrix
 (`prism-load-l3.yml`), which promotes the promotion PR's run on the same tree
@@ -134,6 +159,42 @@ will take patch releases. Preserve subsequent development and resolve metadata
 and notes deliberately; do not reset or force-push the shared branch. Run its
 checks before merging.
 
+Land the synchronization PR with the merge button, which has made a merge
+commit since squash and rebase merges were turned off on 2026-11-10. Never
+squash it into one commit: that drops `main` from the branch's history. The
+next merge between them then falls back to the old merge base and conflicts on
+changes only one side has made since this synchronization, and GitHub keeps
+counting each `main` commit as one the branch is behind. Two rulesets guard
+the version lines, and neither has a bypass list
+([`.github/rulesets/`](../.github/rulesets/)). Every commit added to a line
+needs a verified signature, so the PR's commits land as they are and must be
+signed, the merge of `main` included. That rule also refuses an old unsigned
+commit that the branch doesn't have yet, so a synchronization can't bring one
+in. And a line other than the dormant `1.x.x` and `0.1.x` takes changes only
+through a pull request whose `signed-landing` check passes. Pushing the PR's
+head to the line as a fast-forward, which was how earlier synchronizations
+could land, is refused. Once its checks and review pass:
+
+```sh
+gh pr checks <pr>
+gh pr merge <pr> --merge
+```
+
+If GitHub reports a conflict because the branch has moved, merge the branch
+into the synchronization branch, sign that merge too, and run the checks
+again. Other PRs into the branch
+are squashed into one signed commit by a maintainer and merged with the
+button, and a promotion still lands on `main` as one squashed commit, signed
+by a maintainer, under GitHub's merge commit. A promotion from `3.x.x` or
+`3.0.x` can't be merged as it is: they hold three unsigned commits from
+September 2026 (`1bcd61e1`, `72e099bc`, `6ed2250b`), which `main` would
+refuse. So the branch reads behind `main` from each promotion until its
+synchronization lands, and its ahead count keeps growing.
+`git diff origin/main origin/<branch>` shows what really differs. A kept merge
+base doesn't make every synchronization clean: a line the branch changed
+again after the promotion's cutoff still conflicts with the promotion's copy.
+Keep the branch's side unless the promotion edited that line.
+
 For 3.1.0 and 3.0.0 this step merges the released `main` (`b9187551`, #783)
 into `3.x.x`, and `main` at `b9579c67` into `3.0.x`. That commit is 3.0.0's
 promotion (#778) plus #781, before 3.1.0's, because a 3.0 patch branch must
@@ -146,6 +207,18 @@ For 3.1.1 this step merges the released `main` back into `3.x.x`. It brings
 only the promotion's edits: the release date and the fix PRs' numbers in the
 3.1.1 notes, and this guide's 3.1.1 record. `3.0.x` takes nothing from it, since 3.1.1 is a 3.1
 release.
+
+#826, the 3.1.1 synchronization, was squashed like the earlier ones, so
+`3.x.x`'s merge base with `main` stayed at `v1.1.0`. Merge commit
+`b51ac732`, landed by fast-forward as a synchronization then could, corrects that: it
+has `main` at `60467262` as a parent and changes no file. It takes its tree
+from `3.x.x`, as `git merge -s ours` does, because #826's `d0c649b4` already
+had `60467262`'s exact tree. Use `-s ours` only when a commit on the branch
+has the `main` commit's exact tree, so that
+`git diff <main-commit> <that-commit>` prints nothing. Otherwise it marks
+`main`'s changes as merged without taking them, as it would on `3.0.x`, which
+doesn't hold 3.1. `3.0.x` and `2.x.x` keep `v1.1.0` as their merge base with
+`main` for now.
 
 For 2.0.0 this step is required: PR #246 contains promotion fixes and the
 consolidated metadata that were not yet on `2.x.x`. Until this synchronization

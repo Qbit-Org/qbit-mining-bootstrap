@@ -1,6 +1,6 @@
 //! Small Prometheus text registry. Only the typed owner may insert samples.
 use super::{
-    CarryOwnerState, Labels, LockKind, OrderLockHolder, Outcome, PeerCheckResult,
+    AppendStage, CarryOwnerState, Labels, LockKind, OrderLockHolder, Outcome, PeerCheckResult,
     RefreshAcquisition, RefreshTrigger,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -121,6 +121,7 @@ families! {
     TipPollAge: Gauge, "tip_poll_age_seconds", "Monotonic age of this frontend's readiness proof, the node's tip as its last refresh or refresh-grade poll on the published tip found it, which job, share and block admission require within the health timeout; -1 while readiness is unavailable or before the coordinator publishes it.";
     JobPreparationDeferrals: Counter, "job_preparation_deferrals_total", "Job preparations this frontend deferred (each logged as job preparation deferred), by the first check that refused them.";
     OrderLockHold: Histogram, "database_order_lock_hold_seconds", "ORDER_LOCK hold from the grant of the lock to the end of the transaction holding it, by holder, in seconds (#602).";
+    ShareAppendStage: Histogram, "share_append_stage_seconds", "Stages of a share's path to its ledger append, each timed from its start to its end, by stage and how it ended, in seconds (#829).";
     ShareAckLandingWindow: Histogram, "share_ack_landing_window_seconds", "The share_ack_seconds observations whose submission arrived within 30 seconds after a pool block acceptance this frontend observed, by outcome (#602); steady state is share_ack_seconds minus this family.";
     SlowLandingWindows: Gauge, "share_ack_slow_landing_windows", "Consecutive most recent closed landing windows on this frontend whose share acknowledgement p99 exceeded the bound in seconds (#602); -1 before a landing window holding an acknowledgement has closed.";
     LandingTrimSeconds: Histogram, "landing_malloc_trim_seconds", "Duration of each malloc_trim(0) this frontend ran after a block landing released its rebuilt window (#600), in seconds; glibc builds only, none while PRISM_LANDING_MALLOC_TRIM_ENABLED=0.";
@@ -128,6 +129,7 @@ families! {
     LandingTrimResident: Gauge, "landing_malloc_trim_resident_bytes", "Process resident bytes right after this frontend's latest post-landing trim, its resident floor after the landing, or -1 before the first trim or when procfs could not be read.";
     RequestDeliveryWait: Histogram, "stratum_request_delivery_wait_seconds", "Complete Stratum request frame to the end of its session's own job delivery, for a request that waited for that delivery (#621): every JSON object frame but mining.submit and mining.get_health, that is mining.subscribe, mining.authorize, mining.configure, mining.suggest_difficulty, mining.extranonce.subscribe, any other method, or a missing or non-string method; the session reads nothing after it meanwhile, so a submit sent behind it waits as long. Submits and health probes are answered during a delivery and never wait.";
     DeliveryCancelled: Counter, "job_delivery_cancellations_total", "Local job deliveries abandoned before their announcement because their session ended: the miner disconnected or broke the protocol, or the listener shut down (#621); counted neither as successes nor as failures.";
+    DifficultyHints: Counter, "stratum_difficulty_hints_total", "Vardiff resume hints Stratum sessions offered to their listener's difficulty-hint writer (#856), each counted once by what became of it: written (the write and its read-back returned without error), failed (the write or its read-back returned an error), timed_out (its bound passed; the write may still have committed), aged_out (a decrease that had waited in the queue longer than 500 ms, so it was never written), dropped (the queue was full, so it was never written), superseded (combined into another hint for the same worker while queued, so never written itself), abandoned (still queued when its listener or connection stopped, the rest of the entry whose write was in flight then, or offered after that; a stopping listener lets that write finish within its bound, timed_out if it passes it, and only a listener aborted mid-write or a cancelled connection served on its own cancels it, in which case it may have committed) or writer_panicked (held by the writer task when it panicked, or offered after that, so never written, except that the write in flight may have committed).";
     PeerSyncReachable: Gauge, "peer_sync_peer_reachable", "3.1 dual writer: whether the peer sync's latest pass reached the peer's database on one of its paths (1) or on neither (0); reported, never a readiness input. No sample on a single writer.";
     PeerSyncOwnLogCaughtUp: Gauge, "peer_sync_own_log_caught_up", "3.1 dual writer: the own-log latch, the peer sync's one readiness input: 1 once every row this node originated that the peer holds is in its own database, 0 before and after a detected local rollback. Losing the peer later never clears it. No sample on a single writer.";
     PeerSyncRollbackEvidence: Gauge, "peer_sync_rollback_evidence", "3.1 dual writer: 1 while the own log is not caught up and this database's system identifier or WAL timeline differs from its last own-log verification, or it has none, so the node waits for the peer; 0 otherwise. No sample on a single writer.";
@@ -148,6 +150,8 @@ families! {
     DualWriterNodeIndex: Gauge, "dual_writer_node_index", "Dual-writer mode (3.1): this node's configured PRISM_NODE_INDEX, 0 for A and 1 for B.";
     DualWriterCarryOwner: Gauge, "dual_writer_carry_owner", "Dual-writer mode (3.1): this node's PRISM_CARRY_OWNER as configured, 1 on the node configured to pay down carried balances.";
     ReadinessRequests: Counter, "readiness_requests_total", "Requests to the readiness endpoint (PRISM_READINESS_PORT, 3.1) by answer: ready (200), not_ready (503), unauthorized (401, a missing, repeated or wrong token) or not_found (404, another path or method); no samples while the endpoint is off.";
+    PayoutRevisionListenerUp: Gauge, "payout_revision_listener_up", "Whether this frontend's payout-revision listener (#752, #816) holds its LISTEN on the qbit_prism_payout_revision channel: 1 from a successful LISTEN until its connection is lost or its probe, run after 30 s without an announcement, fails; 0 before the first LISTEN, while it reconnects and once the refresh loop stops. While 0 this frontend republishes after another frontend's block only on its blockpoll tick. A LISTEN through a transaction-pooling proxy reads 1 and hears nothing: read qbit_prism_payout_revision_announcements_heard_total beside it.";
+    PayoutRevisionAnnouncements: Counter, "payout_revision_announcements_heard_total", "Notifications this frontend's payout-revision listener received on the qbit_prism_payout_revision channel since process start (#816): one per announced payout revision bump (a block's confirmation or settlement, a carry gate change, a fatal-state clear) that any frontend, this one included, committed while it listened; one committed while it was down is never counted.";
 }
 
 // Keep bucket metadata below the descriptor block to preserve producer links.
@@ -162,6 +166,7 @@ const REVISION_WORK_BUCKETS: &[f64] = &[
 ];
 // #602: an append holds ORDER_LOCK for milliseconds and #602's R2 budget for
 // every other holder is 250 ms, so the ladder starts at one millisecond.
+// #829's share append stages are parts of the append's path, on the same one.
 const ORDER_LOCK_HOLD_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10.,
 ];
@@ -182,7 +187,7 @@ impl Family {
             Self::CtvChunkRows => &[1.],
             // The same ladder as ShareAck, so steady state is a subtraction.
             Self::ShareAck | Self::ShareAckLandingWindow => SHARE_ACK_BUCKETS,
-            Self::OrderLockHold => ORDER_LOCK_HOLD_BUCKETS,
+            Self::OrderLockHold | Self::ShareAppendStage => ORDER_LOCK_HOLD_BUCKETS,
             Self::RevisionWork => REVISION_WORK_BUCKETS,
             _ => BUCKETS,
         }
@@ -211,6 +216,10 @@ impl Family {
                     // runs moves it, and PrismBlockSubmissionHeld reads it on
                     // a successful scrape rather than a fresh snapshot.
                     | Self::BlockSubmission
+                    // #816: the listener goes down with the database, which
+                    // can stall the health publisher behind it.
+                    | Self::PayoutRevisionListenerUp
+                    | Self::PayoutRevisionAnnouncements
             )
     }
 
@@ -316,6 +325,22 @@ impl Registry {
                         (family, Labels::One(("holder", holder.as_str()))),
                         Sample::Pending,
                     );
+                }
+            }
+            Family::ShareAppendStage => {
+                for stage in AppendStage::ALL {
+                    for outcome in stage.outcomes() {
+                        self.samples.insert(
+                            (
+                                family,
+                                Labels::Two(
+                                    ("stage", stage.as_str()),
+                                    ("outcome", outcome.as_str()),
+                                ),
+                            ),
+                            Sample::Pending,
+                        );
+                    }
                 }
             }
             Family::RefreshSeconds => {

@@ -12,7 +12,7 @@ matrix for a selection:
   takes most of a runner's six hours);
 - `suite:<name>`: a suite from `presets/suites.toml` (#550), which names its
   presets whatever their schedules, how many times each runs and, optionally,
-  one runner for all of them;
+  one runner for all of them and the presets it runs report-only (#695);
 - otherwise a comma-separated list of preset names, any schedule. A name
   listed in `presets/aliases.txt` (a preset's deprecated name) selects the
   preset it was renamed to, with a warning.
@@ -20,7 +20,16 @@ matrix for a selection:
 Each entry carries the preset's name, runner and timeout, so which machine a
 preset runs on and for how long is checked in beside the flags it pins. A
 suite's entries also carry `repeat` (1-based) and `id`, `<preset>-r<repeat>`,
-one job per repeat, and the suite's runner where it sets one.
+one job per repeat, the suite's runner where it sets one, and `gated`: false
+for a preset the suite lists in `report_only`, true otherwise. A report-only
+run still runs and is gated by its preset, but its capacity budgets
+(shortfall, latency) never decide the suite (the L3 workflow's run step is
+`continue-on-error`); the collation still fails the suite unless it reached
+its gate and held every other check, the harness's exit 0 among them. A
+report-only preset must budget refused valid shares and unanswered submits
+(#847), which the collation still gates.
+Outside a suite no entry carries `gated`, so a preset run on its own is
+always held to its gates.
 
 Usage: python3 scripts/prism_load_matrix.py <selection> [--presets DIR]
 """
@@ -39,9 +48,14 @@ ROOT = Path(__file__).resolve().parents[1]
 PRESETS = ROOT / "crates" / "qbit-prism-load" / "presets"
 SCHEMA = "qbit.prism.load-preset.v1"
 SUITES_SCHEMA = "qbit.prism.load-suites.v1"
-SUITE_KEYS = {"description", "lane", "issues", "repeats", "runner", "presets"}
-SUITE_REQUIRED = SUITE_KEYS - {"runner"}
+SUITE_KEYS = {"description", "lane", "issues", "repeats", "runner", "presets", "report_only"}
+SUITE_REQUIRED = SUITE_KEYS - {"runner", "report_only"}
+# A report-only preset must budget both (#847): its capacity is exempt, these
+# are not.
+CORRECTNESS_BUDGETS = ("max_rejected_valid_shares", "max_unanswered_submits")
 MAX_REPEATS = 5
+# The suite a `v*` tag runs or promotes: release evidence gates every run.
+RELEASE_SUITE = "l3-full"
 ISSUE = re.compile(r"^#[1-9][0-9]*$")
 
 
@@ -78,6 +92,11 @@ def load_aliases(directory: Path) -> dict[str, str]:
             raise SelectionError(f"{path}:{number}: {raw!r} is not `old new`")
         aliases[fields[0]] = fields[1]
     return aliases
+
+
+def _is_count(value: object) -> bool:
+    """A budget the gate reads as a u64: an integer in 0..2**64-1, not a bool."""
+    return type(value) is int and 0 <= value < 2**64
 
 
 def load_suites(directory: Path, presets: dict[str, dict]) -> dict[str, dict]:
@@ -138,6 +157,44 @@ def load_suites(directory: Path, presets: dict[str, dict]) -> dict[str, dict]:
         unknown = [n for n in names if n not in presets]
         if unknown:
             raise SelectionError(f"{where}: unknown preset(s) {', '.join(unknown)}")
+        # #695: presets the suite measures without gating on them. Each is
+        # one of the suite's own presets, named once, and at least one preset
+        # stays gated, so a suite always has a verdict to give.
+        report_only = suite.get("report_only", [])
+        if not (isinstance(report_only, list) and all(isinstance(n, str) for n in report_only)):
+            raise SelectionError(f"{where}: report_only must be a list of preset names")
+        if len(set(report_only)) != len(report_only):
+            raise SelectionError(f"{where}: report_only repeats a name")
+        outside = [n for n in report_only if n not in names]
+        if outside:
+            raise SelectionError(
+                f"{where}: report_only names {', '.join(outside)}, which the suite does not run"
+            )
+        if set(report_only) == set(names):
+            raise SelectionError(f"{where}: report_only leaves no gated preset")
+        if report_only and name == RELEASE_SUITE:
+            raise SelectionError(f"{where}: a tag's suite gates every run; no report_only")
+        # The collation exempts a report-only run's capacity budgets and
+        # re-evaluates the rest; it cannot re-run a soak's own gates, and a
+        # D1 cell's verdict is what it exists for.
+        for preset in report_only:
+            if "soak" in presets[preset]:
+                raise SelectionError(f"{where}: report_only names soak preset {preset}")
+            if presets[preset]["gates"].get("d1_verdict_table"):
+                raise SelectionError(f"{where}: report_only names D1 cell {preset}")
+            # #847, EP-VALIDATION: report-only exempts capacity, never
+            # correctness. A preset that budgets no refused valid shares or no
+            # unanswered submits would leave those ungated, so it is refused.
+            unbudgeted = [
+                key
+                for key in CORRECTNESS_BUDGETS
+                if not _is_count(presets[preset]["gates"].get(key))
+            ]
+            if unbudgeted:
+                raise SelectionError(
+                    f"{where}: report_only names {preset}, which sets no "
+                    f"{' or '.join(unbudgeted)}; report-only exempts capacity, never correctness"
+                )
     return suites
 
 
@@ -147,6 +204,7 @@ def select_suite(presets: dict[str, dict], suites: dict[str, dict], name: str) -
         raise SelectionError(
             f"unknown suite {name!r}; choose from {', '.join(suites) or 'none (no suites.toml)'}"
         )
+    report_only = set(suite.get("report_only", []))
     return [
         {
             "preset": preset,
@@ -154,6 +212,7 @@ def select_suite(presets: dict[str, dict], suites: dict[str, dict], name: str) -
             "timeout_minutes": presets[preset]["timeout_minutes"],
             "repeat": repeat,
             "id": f"{preset}-r{repeat}",
+            "gated": preset not in report_only,
         }
         for preset in suite["presets"]
         for repeat in range(1, suite["repeats"] + 1)

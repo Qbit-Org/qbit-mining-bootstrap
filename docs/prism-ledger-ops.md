@@ -30,6 +30,125 @@ instances may append; transaction locks protect a shared ordering boundary.
 Database connection and statement/lock limits bound resource use. Session
 extranonce allocation also uses the shared database sequence and never cycles.
 
+### Shares queued for an append slot (#844)
+
+Each frontend admits at most `PRISM_DATABASE_MAX_CONNECTIONS - 1` share
+appends at once (15 by default). An append takes its slot before its pool
+checkout and keeps it until its connection is back in the pool. That happens in
+a cleanup task after its COMMIT, which first sends any queued ROLLBACK and
+checks the connection with one more round trip. So at most that many appends
+per frontend can wait on `ORDER_LOCK`. Every other append waits for a slot
+inside the frontend, in front of PostgreSQL. Neither `pg_locks`, the
+`ORDER_LOCK` wait histogram nor the log can see that queue. In #829's load-lane
+stalls, 98.5% of the stalled acknowledgement time was spent there, while
+`ORDER_LOCK` waits stayed under 0.13 s.
+
+`PrismShareAppendAdmissionWaitHigh` warns when the `admission` stage of
+`qbit_prism_share_append_stage_seconds` has a p99 above one second over five
+minutes on a frontend with at least 100 admissions in that window, and that
+lasts ten minutes. Every outcome counts, so an append dropped at the
+share-commit deadline while it queued counts with the time it waited. A queue
+that lasts means this frontend's appends are finishing more slowly than they
+arrive.
+
+- **Landings.** A landing's settlement holds `ORDER_LOCK` while appends queue
+  behind it, but its queue leaves the five-minute window within five minutes,
+  so one landing never warns.
+  - At about 25 shares/s per frontend, with arrivals spread evenly, a hold
+    under 0.6 s never fills the fifteen slots, and #602 budgets settlement
+    holds at 250 ms.
+  - Repeated landings warn when, in every five minutes for ten minutes, their
+    holds' time beyond about 1.6 s adds up to more than about 3 s, for example
+    a hold over 2.2 s every minute.
+- **More connections don't help.** Raising `PRISM_DATABASE_MAX_CONNECTIONS`
+  lengthens the `ORDER_LOCK` queue instead of this one. It adds no throughput,
+  because `ORDER_LOCK` serialises the appends.
+
+Read where the time went:
+
+1. **Arrivals.** A rise in `rate(qbit_prism_accepted_shares_total[5m])`, for
+   example after a difficulty change, lengthens every queue at an unchanged
+   hold.
+2. **Who holds `ORDER_LOCK`.** The lock is shared by the whole cluster, so read
+   `qbit_prism_database_order_lock_hold_seconds` by `holder` on every frontend,
+   not only this one:
+   - `append` is normally about a millisecond;
+   - `settlement` and `first_confirmation` are the landing work;
+   - `reconcile` runs on every template build;
+   - `prepared`, `candidate_insert`, `cleanup`, `peer_sync` and the rest are
+     the frontend's other work under the lock.
+
+   `qbit_prism_database_advisory_lock_wait_seconds{lock="order"}` is every
+   wait for the lock on that frontend, whoever takes it.
+3. **The append's stages.** The same stage histogram splits a one-call
+   append's hold:
+   - `locked_call` is the call's own hold, on PostgreSQL's clock. When it
+     rises, the work is inside the call: full-page images after a checkpoint
+     starts, autovacuum or analyze on the ledger partition, or a cold cache.
+   - `commit` is the COMMIT round trip on the frontend's clock. It includes
+     the WAL flush (step 5), the network round trip to the primary, and the
+     runtime waking late to the reply.
+
+   For a committed one-call append the hold minus both is only microseconds.
+   Anything more is appends without both stages: block-bearing ones, and
+   refused, rolled back or failed ones. Compare the counts as well as the
+   means:
+   ```promql
+   sum by (instance, stage) (rate(qbit_prism_share_append_stage_seconds_sum{job="qbit-prism"}[5m]))
+     / sum by (instance, stage) (rate(qbit_prism_share_append_stage_seconds_count{job="qbit-prism"}[5m]))
+   ```
+4. **Time no stage covers.** If the queue grows while arrivals, holds and
+   stages stay flat, the slots are going to time that no stage measures:
+   - Inside the lock: the call's reply on its way back and the runtime's wake
+     to it, and for an append abandoned by an error, the ROLLBACK that its
+     cleanup sends later. PostgreSQL holds `ORDER_LOCK` then, but the hold the
+     frontend records ends before it.
+   - Outside the lock but inside the slot: the connection's return to the
+     pool, with its release round trip.
+
+   Both point to the frontend's runtime or the network to the primary. For
+   the runtime, read `qbit_prism_runtime_lag_seconds` (the sampler's wake
+   lateness) and `qbit_prism_runtime_poll_lag_seconds` (the longest poll, by
+   task). `PrismRuntimeLagHigh` fires only above 2 s, and 0.6 s of lag
+   already fills the slots at 25 shares/s.
+5. **WAL syncs and checkpoints on the primary.** Each append's COMMIT
+   flushes WAL inside `ORDER_LOCK`, so commits don't group.
+   - Read `pg_stat_wal`: `wal_sync`, `wal_sync_time` (with
+     `track_wal_io_timing` on) and `wal_fpi`.
+   - Read the checkpointer's counters.
+   - Look in the primary's log for a checkpoint starting or ending in the
+     window.
+
+   A `commit` mean well above `wal_sync_time / wal_sync` is the round trip,
+   the runtime, or a COMMIT-path wait other than the flush.
+6. **Pool saturation.** `qbit_prism_database_pool_acquire_seconds` and
+   `PrismDatabasePoolWaitHigh` show checkouts made after admission, which hold
+   a slot while they wait. They also show other callers starving the share
+   appends' pool.
+
+The load harness reports the same split offline, per phase, in
+`load-harness-report.json`:
+
+- `share_ack_accounting` splits the accepted acknowledgements' seconds into
+  four parts:
+  - `before_lock_and_response`, made up of `submit_checks`, `admission` and
+    `before_lock_unattributed`. Despite its name it includes the call's reply
+    on its way back and the runtime's wake to it.
+  - `order_lock_wait`;
+  - `in_call_after_grant`;
+  - `after_call`.
+- It also splits the append's whole hold (`order_lock_hold_append`, which is
+  `in_call_after_grant` plus `after_call`) into `locked_call`, `commit` and
+  `hold_unattributed`.
+- `database_counters` holds the WAL syncs, their mean time and full-page images,
+  and the timed and requested checkpoints.
+- `database.checkpoint_log` holds the primary's checkpoint log lines.
+- A failed gated phase prints the same figures in an informational gate row.
+
+This warning is not a page. The miner-visible signal is `PrismShareAckP99High`,
+which has the same one-second bound; when both fire, the slow acknowledgements
+waited in this queue.
+
 ## Snapshot and payout boundary
 
 `qbit_prism_window(anchor_job_issued_at, window_weight)` selects eligible shares
@@ -81,8 +200,10 @@ The cluster row's lock matrix (#479):
 |---|---|
 | Authority writers (`payout_revision`, `config_fingerprint`, `fatal_error`) | `FOR UPDATE`, then the `UPDATE` |
 | Job persistence cohorts, repair and prepared storage | `FOR KEY SHARE` |
+| Peer-sync prepared apply, each chunk of at most 1,000 jobs and 2 MiB, or one larger job (#785) | `FOR KEY SHARE` |
 | Blob GC | `FOR UPDATE` |
 | Snapshot anchor (`ledger_clock_ms`; share appends only read it, #738) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
+| Peer-sync own-log floor (raises `ledger_clock_ms`, never lowers it) | `FOR NO KEY UPDATE` (the `UPDATE`'s own lock) |
 | Candidate, offer and append revision readers | `FOR SHARE` |
 
 `FOR KEY SHARE` conflicts with `FOR UPDATE`, so a cohort still serialises
@@ -112,11 +233,19 @@ fence. The schema is unchanged.
 proceeds instead of waiting. It leaves a locker-plus-updater MultiXact on the
 singleton row, and the lock is carried to the new row version. On PostgreSQL
 16, 1,000 clock `UPDATE`s used no MultiXact IDs with no locker and 2,000 with
-one `FOR KEY SHARE` holder open. At 500 shares/s with a fraction *f* of
-appends overlapping a cohort, that is about 86 M·*f* a day, which brings the
-anti-wraparound MultiXact vacuum forward to about every 4.6/*f* days at the
-default `autovacuum_multixact_freeze_max_age`. This is far cheaper than the
-wait it replaces, and it is not a correctness issue. To do: in the next D1
+one `FOR KEY SHARE` holder open. While a frontend before 3.1.1 serves the
+database, each share it appends is such a clock `UPDATE`: at 500 shares/s with
+a fraction *f* of appends overlapping a cohort, that is about 86 M·*f* a day,
+which brings the anti-wraparound MultiXact vacuum forward to about every
+4.6/*f* days at the default `autovacuum_multixact_freeze_max_age`. From 3.1.1
+no append writes the row (#801): the clock `UPDATE`s are the snapshot
+anchor's, one per window snapshot, and the peer sync's own-log floor's. A
+fenced append still locks the row `FOR SHARE` (032's
+`qbit_prism_append_share` with an expected revision), though, and a second
+locker on a row a cohort holds `FOR KEY SHARE` needs a MultiXact as well, so
+MultiXact use still grows with the share rate times *f*; it has not been
+measured since #801. Either way it is far cheaper than the wait it replaces,
+and it is not a correctness issue. To do: in the next D1
 run, record `pg_stat_slru` (`MultiXactOffset`, `MultiXactMember`) and
 `mxid_age(datminmxid)` before and after, and note the measured rate here. Coordinator
 readiness, publication generation, epoch and lease checks still run before and
@@ -133,6 +262,8 @@ Job expiry remains a separate statement with its outer renewal recheck.
 | Path | Lock order relevant to compact persistence |
 | --- | --- |
 | Compact prepared / issued / batch | Cluster SHARE → dependency/blob writes or locks → commit; no later advisory acquisition |
+| Peer-sync prepared apply (each chunk its own transaction, #785) | Cluster KEY SHARE → blob inserts → job inserts → the peer cursor, when the jobs are the peer's → commit; no advisory acquisition |
+| Peer-sync own-log floor | SETTLEMENT → ORDER → sequence floors → cluster NO KEY UPDATE (`ledger_clock_ms`) |
 | Blob collector | SETTLEMENT → ORDER → cluster UPDATE → fresh scans/deletes |
 | Candidate enqueue | ORDER → cluster SHARE → balance blob → candidate |
 | Share append without a block | ORDER → cluster SHARE (fenced), both inside `qbit_prism_append_share` (#711) |
@@ -206,6 +337,121 @@ three-miner gate. A network-valid candidate below its assigned share target is
 stored without ordinary share credit. Active-chain confirmation inserts its
 deferred share at network difficulty; a losing candidate receives no credit.
 
+### A payout-revision listener that stays down (#843)
+
+Each frontend's refresh loop holds one `LISTEN` on the
+`qbit_prism_payout_revision` channel (#752), on a connection of its own outside
+the ledger pool, so that another frontend's same-tip payout revision bump, such
+as a block's confirmation, republishes this frontend's work at once.
+`qbit_prism_payout_revision_listener_up` reads 1 while that `LISTEN` holds and
+0 before the first one, while the listener reconnects and once the refresh loop
+stops (#816; [reading the gauge and its counter](prism-native-metrics.md#reading-the-payout-revision-listener-816)).
+`PrismPayoutRevisionListenerDown` warns when the gauge has read 0 for 10
+minutes on a frontend that has had an authorized miner in the last 15
+minutes, the revision-work warnings' gate (#758). It never pages. Each
+evaluation reads the latest scrape, and one that finds the `LISTEN` holding
+restarts the dwell, so a listener that keeps reconnecting and dropping can warn
+late or not at all; its log lines show it.
+
+- **What miners see.** While the listener is down, the frontend republishes
+  after most announced same-tip payout revision bumps, such as another
+  frontend's block confirmation, only at its next poll, a
+  `PRISM_BLOCKPOLL_SECONDS` tick (2 s by default) or a blockwait return, as
+  every frontend did before #752. Two do not wait: a confirmation this
+  frontend lands itself wakes its refresh, and a bump its own refresh makes
+  while reconciling the chain is republished by that refresh.
+  Until it republishes, shares on work at the superseded revision are refused
+  `stale-job`, counted as
+  `qbit_prism_stale_job_rejections_total{cause="payout_revision"}`: up to one
+  poll interval of refusals after each such bump, on this frontend only. A
+  block found on that work is kept only as far as
+  [block capture](#block-capture-and-payout-divergence-478) allows.
+- **No gauge at all.** Check first that the frontend exports
+  `qbit_prism_payout_revision_listener_up`. One running an image from before
+  #834 does not, and the rule counts that as down under the same gate and
+  dwell, since its listener's state is unknown: none of the checks below
+  apply, upgrade the frontend.
+- **The database is down.** `PrismDatabaseUnavailable` pages after two
+  minutes; handle that. The listener waits at most 5 s between attempts and
+  holds again within seconds of the database answering, so this warning
+  resolves on its own; it fires only for an outage longer than its dwell.
+- **No connection to spare.** Each frontend needs one connection beyond its
+  `PRISM_DATABASE_MAX_CONNECTIONS` for the listener (see the budget under
+  [HA database and shutdown](#ha-database-and-shutdown)). An ordinary role
+  can use `max_connections` less `superuser_reserved_connections` and, from
+  PostgreSQL 16, `reserved_connections`. Once those slots are taken, the
+  listener's connect is refused, with `too many clients already` or
+  `remaining connection slots are reserved for …`, and the gauge stays 0 until
+  a slot frees up, while the frontend keeps working on the connections its
+  pool already holds. A `CONNECTION LIMIT` on the frontends' role or database
+  refuses it the same way, with `too many connections for role …` or
+  `… for database …`, while the server still has slots: compare
+  `pg_roles.rolconnlimit` with the `pg_stat_activity` rows for that `usename`,
+  and `pg_database.datconnlimit` with those for that `datname` (-1 is no
+  limit). Count the server's sessions as a superuser connected to the PRISM
+  database: a superuser can still connect through the reserved slots, and a
+  role without `pg_read_all_stats` (part of `pg_monitor`) reads other roles'
+  sessions without their `backend_type`, so it undercounts. The listener is
+  refused once `client_sessions` reaches `ordinary_slots`:
+
+  ```sql
+  SELECT count(*) AS client_sessions,
+         count(*) FILTER (WHERE application_name = 'qbit-prism-revision-wake'
+                            AND datname = current_database()) AS listeners,
+         current_setting('max_connections')::int
+           - current_setting('superuser_reserved_connections')::int
+           - coalesce(current_setting('reserved_connections', true), '0')::int AS ordinary_slots
+  FROM pg_stat_activity
+  WHERE backend_type = 'client backend';
+  ```
+
+  Every running frontend on this database should hold one
+  `qbit-prism-revision-wake` session. Raise `max_connections` (a PostgreSQL
+  restart) or lower a pool size until the frontends' budgets together, with
+  the reserve the budget names, fit in `ordinary_slots`; raise a role or
+  database limit with `ALTER ROLE … CONNECTION LIMIT` or
+  `ALTER DATABASE … CONNECTION LIMIT`, which needs no restart.
+- **A pooler in front of `PRISM_DATABASE_URL`.** `LISTEN` needs a session of
+  its own; a transaction-mode pooler does not keep one. A pooler that refuses
+  the listener's `LISTEN` keeps the gauge at 0 and fires this warning. One
+  that accepts it and then hears nothing, or drops the session later, reads 1
+  for all or most of the time, which this warning cannot see: there,
+  `qbit_prism_payout_revision_announcements_heard_total` stays flat while the
+  other frontends' counters on the same database grow. Point the URL at
+  PostgreSQL itself or at a session-mode pool.
+- **The listener's log lines.** When the listener cannot connect or loses its
+  connection, the frontend logs at WARN, at most once a minute while attempts
+  keep failing; a connection that held for 30 s or more resets that minute, so
+  the next failure warns at once and a session dropped every 40 s warns at
+  every drop:
+
+  ```
+  payout-revision listener unavailable: this frontend republishes after another frontend's block on its blockpoll tick until it reconnects (#752)
+  ```
+
+  Its `error` field is the reason, such as one of PostgreSQL's refusals
+  above, a timeout or a closed connection, and `retry_in` the wait before the
+  next attempt; the failures between two such lines log
+  `payout-revision listener unavailable` at DEBUG with the same fields. After
+  such a WARN, an INFO line,
+  `payout-revision listener reconnected; refresh woken once (#752)`, says when
+  it holds again. The WARN text names only another frontend's block and the
+  tick; the other bumps above wait the same way, for the tick or a blockwait
+  return.
+- **The refresh loop is not running.** The listener lives and ends with the
+  refresh loop, so a frontend whose loop has stopped, or a dual-writer
+  frontend still waiting for its own log at start, reads 0 with no WARN line.
+  After a restart the gate still counts the previous process's miners for
+  the window, so such a frontend can warn then. Look at its readiness and the
+  work-refresh alerts instead.
+
+The warning resolves at the first evaluation that finds the `LISTEN` holding
+at the latest scrape, or once the frontend has had no authorized miner for the
+whole window.
+Its two-minute windows ride over a failed scrape and carry the last reading for
+two minutes after scrapes stop; a scrape that keeps failing is
+`PrismMetricsEndpointDown`'s.
+
 ## Durable block candidates
 
 `qbit_block_candidate_outbox` stores complete candidate evidence before a node
@@ -222,9 +468,9 @@ accounting after it, and the row records where the block is between them:
 | State | Meaning |
 | --- | --- |
 | `pending` | Durable and never offered. The only state a claim may offer from, and the only one that may still be abandoned: a block proven superseded before it was ever offered. |
-| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522, or a connect still running at half the `submitblock` deadline, #762), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
+| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522, or a connect still running at half the `submitblock` deadline, #762), the HTTP client handed the request back unwritten because its connection closed first (#816), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
 | `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
-| `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout after the connection was established, a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
+| `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout after the connection was established, other than a request handed back unwritten (#816), a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
 | `orphaned` | Terminal (migration 015, #415). Reachable from the three offer states only. One coherent read-only observation proved a *different* block active at the candidate's height with at least `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted as `tip_height − height + 1`), after the row's audit landed: the lost tip race of the 2026-09-16 mainnet orphan stall (#413). `last_error` names the competitor, the height, the confirmations and the tip. Like the other terminal states, the row releases its document, block bytes and window reference, so terminal history does not pin candidate payloads or balance snapshots. It preserves its offer metadata and reason; the landed audit and pool-block row retain the accounting evidence. Never claimed again, never offered again, and no longer counted by `qbit_prism_block_candidates_pending` / `qbit_prism_block_candidate_oldest_pending_seconds`; `qbit_prism_block_candidates_orphaned_total` counts completions observed by this process after commit and may undercount if cancellation or restart intervenes. The block's `qbit_pool_blocks` row is marked `inactive` and keeps its landed audit, so a later reorg that reactivates the block is confirmed and credited (deferred share included) by the ordinary reorg reconciler, from that preserved evidence, without this row ever reopening. `orphaned` describes the completed outbox processing decision, not the block's permanent chain status. |
 | `submitted` | The block was proven on the active chain and its audit landed. The document, the block bytes and the window reference are released; the offer record stays. A recovered reservation, whose call's answer was never recorded, lands with `offer_outcome = unknown` (#529). |
 | `abandoned` | Reachable from `pending` only. |
@@ -784,15 +1030,22 @@ connection meanwhile was sent on it instead, and keeps that request's outcome
 (see below). The connect itself runs on, up to the 5-second connect timeout,
 and once established it serves the client's next call, so the re-offer finds
 the connection ready; the client hands it out only while the kernel reports
-it open and unread, and only within the 20-second idle bound. The attempt
+it open and unread, and only within the 20-second idle bound. Since #816 it
+also covers a request the HTTP client hands back unwritten because the
+connection it was given closed or failed before the client wrote it: for
+example a spare or pooled connection the node or a proxy closed after the
+client checked it, as in `... the connection closed before the request was
+written (connection closed before message completed)`. The attempt
 that holds the
 reservation returns the row to `pending`, and the next claim runs the
 pre-offer phase again: an ordinary candidate whose parent was superseded
 meanwhile is abandoned there, and a leased candidate is offered without that
-screen, as every leased candidate is (#350). Nothing else is treated this way. A reset, closed connection, lost
+screen, as every leased candidate is (#350). Nothing else is treated this way. A reset, any other closed connection, lost
 reply or timeout after the connection was established, and any HTTP or
 JSON-RPC error, stay unknown and are never offered again, because the request
-may have been written. So does a deadline that passes on a request that went
+may have been written. That includes a connection the node closed before the
+client handed it the request at all, which the client reports as it would a
+close after the write. So does a deadline that passes on a request that went
 out on a pooled connection while this call's own connect was still running. A crash or a lost claim between the failed connect and
 the row update leaves `offer_reserved`. Recovery treats that row as delivery
 unknown, since nothing durable proves the call was not made. Such an attempt
@@ -1318,18 +1571,113 @@ At production size the report takes about a minute, longer than the 15 s
 `self-check` runs it in a read-only transaction under a statement timeout of its
 own, 300 s, and `fatal-state clear` under the time its bound leaves it
 ([fatal-state recovery](#recovery-commands)), so neither needs that setting
-raised (#737). The `/audit/carry-forward-integrity` and `/audit/ledger-integrity`
-routes still run it under the setting.
+raised (#737).
+
+The `/audit/carry-forward-integrity` and `/audit/ledger-integrity` routes on a
+frontend's operator listener run it the same way: in a read-only transaction
+under a statement timeout of its own, the time left to the run's 300 s
+deadline, and at most one run at a time per frontend (#737). A run reads the
+`payout_divergence` line in that transaction first, under the session's
+statement timeout as before, then the report, and closes its connection when
+it ends. A
+request that arrives during a run waits for that run, up to its 300 s, and
+gets its outcome; a client that gives up sooner leaves the run going, and its
+outcome answers the next request. Each report served carries three fields
+more than before:
+
+- `computed_at`: when its run started (RFC 3339). Its figures were read from
+  then until the run ended.
+- `age_seconds`: how long before this response its run started.
+- `run_seconds`: how long its run took. That bounds the report's own time
+  from above: the run also waits for its connection and reads the divergence
+  line.
+
+A report is served for 5 minutes after its run ends; only the first request
+after that starts another run. A run that fails or times out answers 503 with
+the reason (the step that failed and how), when that run started and when the
+next may start, never a report. The routes answer the same for as long as
+that run took, at most 5 minutes, so a brief failure, a moment without a free
+connection say, is retried soon. So polling the routes, however often, starts
+a run on each frontend at most once per run time plus 5 minutes after a
+report, and after a failure at most once per twice the failed run's time: a
+run that keeps failing holds its connection at most about half the time. A
+frontend nobody asks runs none. For a report on demand, run `self-check`.
+
+A stopping frontend abandons its run in flight and starts no other: the
+waiting requests answer 503 at once, the run's connection closes, and
+PostgreSQL ends the report within about a second
+(`client_connection_check_interval`, set for the run's connection where the
+server supports it, PostgreSQL 14 and later), so a stop never waits on a
+report.
 
 The report holds one snapshot for its whole run, about a minute at production
-size today. On a primary serving miners every share updates the cluster row, so
-at high share rates that snapshot piles up dead versions of the row and slows
-the share append (#738); below about 200 shares/s it's harmless. At higher
-rates, run the report on a hot standby with `hot_standby_feedback` off and its
+size today. While a frontend before 3.1.1 serves the database, every share it
+appends updates the cluster row, so on a primary serving miners at high share
+rates that snapshot piles up dead versions of the row and slows the share
+append (#738); below about 200 shares/s it's harmless. From 3.1.1 an append
+no longer updates the row (#801), so once every frontend runs 3.1.1 or later this
+reason is gone. While an earlier frontend serves at higher rates, run the
+report on a hot standby with `hot_standby_feedback` off and its
 replay paused instead, as the admission gate's
 `PRISM_INTEGRITY_REPORT_DATABASE_URL` does (#740; see
 [drain and migrate](prism-rust-migration.md#drain-and-migrate)), or run
 `self-check` while the share rate is low.
+
+`/audit/latest` on the operator listener (the newest confirmed block's
+evidence, with the lifetime `accepted_share_count` and `distinct_miner_count`)
+follows the same one-run-at-a-time pattern since #859, on the ledger pool the
+share writer uses, though not in one read-only transaction: its statements run
+under the pool's statement timeout (`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`,
+15 s by default), and an abandoned one runs on, up to it, holding its writer-pool
+connection until it ends. One run computes it at a time per frontend, bounded
+by 60 s; a request that arrives during a run waits for that run and gets its
+answer, and a client that gives up sooner leaves the run going for the next
+request. An answer is served for 10 s after its run ends, with the same three
+fields as the integrity reports (`computed_at`, `age_seconds`, `run_seconds`),
+added to the keys it always had; only the first request after that starts
+another run. So after an answer, polling the route, however often, starts a
+run on each frontend at most once per run time plus 10 s, and an answer is at
+most that old: its counts can trail the ledger by up to 10 s plus the run's
+own time, and a newly confirmed block shows up after at most as long. A failed
+run is not served again, so while runs fail each request after one starts the
+next.
+
+A run reads the newest confirmed block with an audit bundle, the counts and
+the block's payout entries every time, in that order. Last, it decodes the
+bundle, which counts its shares, but only when the newest block, its bundle
+digest or its payout manifest differs from the previous answer's, so a
+frontend decodes each new piece of evidence once; a run that fails before the
+decode decodes nothing. A failure is never served again: the request that
+waited for it gets its error (404 while no evidence exists, 503 when the run
+timed out or the frontend stopped), and the next request starts a run. A
+stopping frontend abandons its run in flight and starts none.
+
+The 60 s is a fixed bound, as the integrity reports' is, not the run's worst
+case. A run makes up to seven statements (the evidence key, the rollup check,
+the counts, the payout count, then, for new evidence, the bundle row and its
+canonical bytes, or its share snapshot and window), and each may wait up to
+15 s for a connection from the share writer's pool and then run up to the
+statement timeout (`PRISM_DATABASE_STATEMENT_TIMEOUT_MS`, 15 s by default).
+So while share appends keep every connection of that pool busy and checkouts
+queue for seconds, each under the 15 s at which one fails, or after the
+statement timeout has been raised, a valid run can pass 60 s every time. Then
+every request waits up to 60 s and gets `503` with error code `read_timeout`
+("the latest evidence run did not finish within its 60 s"), nothing is
+served, and each abandoned run's statement in flight runs on and holds its
+writer-pool connection until it ends, while the next request starts the next
+run. Before #859 the route answered slowly instead. A checkout that waits the
+full 15 s fails the request at once with `503 read_timeout` and "the read
+timed out; try again shortly", the message a statement past its statement
+timeout also gives, as before #859.
+
+The decode can be another cause. It runs last, after a wait for one of the
+`PRISM_POSTGRES_READ_CONCURRENCY` decode permits that the operator listener's
+audit bundle and settlement-artifact reads share (a legacy `body_uri` row
+takes none), with no statement timeout. A run whose reads and decode together pass 60 s fails, and
+its decode runs on, holding its permit and the body, while the next request
+starts another decode of the same bundle; until a run fits, those decodes
+overlap and the bundle reads queue behind them. The route answers again once
+a whole run fits in 60 s, whatever made it slow.
 
 A landing writes the block's payout and carry rows from the immutable payout
 manifest of the audit its coinbase commits to, whatever the canonical balances
@@ -1529,7 +1877,9 @@ shows:
   captured. See [Sizing the ceiling](#sizing-the-ceiling).
 
 The line is read in one statement, so the float and the debt fields come from
-the same snapshot. Sats amounts are decimal strings. `positive_float_sats` is
+the same snapshot. The routes read it in the report's run and read-only
+transaction, just before the report, and serve it with that report, as old
+as its `computed_at`. Sats amounts are decimal strings. `positive_float_sats` is
 added by the frontend, not by migration 020, so a line served by a frontend
 without #506 does not have it. A missing field means that frontend cannot
 report the float; it does not mean the float is zero.
@@ -2622,14 +2972,19 @@ only documented.
   reply but before the end of the batch retires the connection as well. The
   test proves it by also holding only the batch's closing `ReadyForQuery`.
 
-On the successful path nothing changes: an append is the same ten round
-trips on one connection, followed by SQLx's own release ping. Since #479 they
-carry eleven server statements: the opening simple query is `BEGIN` plus
+On the successful path the guard changed nothing: before #802 an append was
+the same ten round trips on one connection, followed by SQLx's own release
+ping. Since #479 they carried eleven server statements: the opening simple query is `BEGIN` plus
 `SET LOCAL plan_cache_mode = force_generic_plan`, which applies to every
 statement of the append transaction and makes the share_id probe planned once
 per connection, and `pg_stat_statements` shows the `SET`. The test prints the
 trace after the retirement so the count can be compared with the trace
-recorded before the guard.
+recorded before the guard. Since #802 a share without a block takes three
+round trips instead, four server statements: the same opening
+`BEGIN; SET LOCAL` query, one call of 032's `qbit_prism_append_share`, and
+`COMMIT`, then the release ping. A share that carries a block keeps the ten
+round trips; one whose own fields fail the checks takes the statements too,
+and is refused after the first read.
 
 **Rejected alternative.** A pool-level `after_release` hook in the ledger's
 pool builder that rolls back any open transaction would cover every
@@ -2639,8 +2994,9 @@ transaction status: `PgConnection::in_transaction` is crate-private, and
 the number that is wrong here. Detection therefore needs a statement round
 trip on every release, in addition to the release ping, and an unconditional
 `ROLLBACK` would warn in the server log on every release. That is roughly one
-extra round trip per checkout on a path that costs ten statements and a ping
-today, paid as connection occupancy in the pool-bound `slow_database` phase,
+extra round trip per checkout on a path that, for a share without a block,
+costs `BEGIN`, `SET LOCAL`, one call and `COMMIT` and a ping since #802
+(eleven statements in ten round trips and a ping before), paid as connection occupancy in the pool-bound `slow_database` phase,
 with the `ORDER_LOCK` hold time unchanged. `idle_in_transaction_session_timeout`
 was rejected too: it reaps an idle leftover only after its timeout, does
 nothing under load, where the leftover is reused within milliseconds, and
@@ -2687,7 +3043,10 @@ PostgreSQL primaries. Budget database connections for all frontends together:
 each frontend uses up to `PRISM_DATABASE_MAX_CONNECTIONS` + 1 database
 connections (its payout-revision listener, #752), + 2 more in dual-writer mode
 (its health pool). Reserve capacity for migrations, monitoring, backup, and
-failover administration.
+failover administration. A role or database `CONNECTION LIMIT` on the
+frontends' login must allow the same sum. A frontend whose listener cannot
+connect keeps serving, and warns `PrismPayoutRevisionListenerDown` once it has stayed down
+with miners for the rule's dwell ([runbook](#a-payout-revision-listener-that-stays-down-843)).
 
 The cluster records its highest observed cumulative chain work. A node that is
 still synchronizing, follows a lower-work tip, or disagrees at equal work cannot
@@ -3028,12 +3387,21 @@ unaffected). Finish it once frontends serve, at a time of ordinary load.
 2. **Choose the throttle.** The defaults suit a primary taking up to a few
    hundred shares a second: batches of at most 5,000 `share_seq`, each
    statement cancelled after 2 s and retried at half its size, and a rest as
-   long as each batch took. Every native share updates the cluster row inside
+   long as each batch took. While a frontend before 3.1.1 serves the
+   database, every native share it appends updates the cluster row inside
    `ORDER_LOCK`, and a snapshot held on the primary keeps that row's dead
    versions, so `ORDER_LOCK` saturates after 18 to 20 seconds of held horizon
-   at about 400 shares a second (#738). Each of the backfill's statements,
-   its double-credit check's and its record's included, runs in a transaction
-   of its own and is cancelled at the statement timeout, which is at most 5 s.
+   at about 400 shares a second (#738). From 3.1.1 an append no longer updates
+   the row (#801), but the backfill can't tell which releases serve, so it keeps
+   the bound as a conservative choice: each of its statements, its
+   double-credit check's and its record's included, runs in a transaction of
+   its own and is cancelled at the statement timeout, which is at most 5 s.
+   A statement the timeout cancelled is told from one an administrator
+   cancelled with `pg_cancel_backend`, which stops the run, by its SQLSTATE,
+   57014, and by having run the timeout, all but a tenth of slack for the
+   server's clock, never by PostgreSQL's message,
+   so a server whose `lc_messages` is not English halves and retries the
+   same way (#824).
    If even the smallest batch times out, rerun with a smaller `--max-batch`
    first, and only then a larger `--statement-timeout-ms`. Lower `--duty-cycle` (down to 0.01) to
    spare the primary more; the run takes longer in proportion.
@@ -3430,7 +3798,7 @@ Two documented reader changes follow from a detach, and both are intended:
 Everything else that was lifetime-scoped keeps working across a detach. Block
 solver attribution moved onto `qbit_pool_blocks.solver_*` in migration 016,
 written at landing and backfilled for every existing block.
-`accepted_share_count` and `distinct_miner_count` in `/audit/latest-evidence`
+`accepted_share_count` and `distinct_miner_count` in `/audit/latest`
 and `GET /public/v1/hashrate-series?range=all` are served from the permanent
 rollup tables plus the raw tail above the watermark, which condition 3 keeps
 online until the sweep has folded it.
@@ -3776,8 +4144,10 @@ remains deferred.
    PRISM_POOL_FEE_ADDRESS=<reviewed P2MR fee address>
    ```
 
-   then set the same values in the frontends' environment. A 0-bps fee pays
-   nothing and adds no coinbase output until dust must be swept.
+   then set the same values in the frontends' environment. A 0-bps fee takes
+   no share of the coinbase. It adds a coinbase output only when dust must be
+   swept or when window work pays out to the fee address itself (#822): that
+   work's gross is paid in the fee output.
 
 2. Disable automatic restarts and stop every frontend and standalone candidate
    or CTV worker. Graceful SIGTERM closes miner admission and drains workers;
@@ -3996,6 +4366,10 @@ the settlement, ordering, and instance locks it refuses unless:
 - normal block reconciliation leaves no unresolved disconnection and the
   carry-forward integrity report passes.
 
+It asks the node for the active chain's block at each height it checks only
+once (#690), however many pool blocks and deep confirmed fanouts share that
+height, one call at a time while it holds those locks.
+
 Every check is made against the tip the command captures from the node when it
 starts. The chain may grow during the run, which takes about a minute at
 production size: blocks on top of the captured tip leave every block at or
@@ -4003,7 +4377,8 @@ below its height as it was, so every observation stands, and the command goes
 on and records the new tip (#737). It accepts a moved tip only when the node's
 new best block leads back, header by header, to the captured tip at the
 captured height. When the tip has already moved by the time the block and
-fanout checks end, the command first repeats each of their node queries, since
+fanout checks end, the command first repeats their node queries, once per
+height again, since
 a chain that went over to a fork during them and came back onto a longer chain
 would leave answers read on the fork. It refuses, clearing nothing:
 
@@ -4026,7 +4401,10 @@ statements, so that setting needs no override. With less than 6 s plus one RPC
 timeout of the bound left when the report would start (21 s by default), the
 command refuses with `raise --timeout-seconds`. A report that runs out of time
 is cancelled by PostgreSQL before the bound ends, so no statement and no lock
-outlives the failed command. The closing tip check must itself end 5 s before
+outlives the failed command. It is told from an administrator's cancel of the
+report by its SQLSTATE and by having run its timeout, all but a tenth, not by
+PostgreSQL's message, so the advice to raise `--timeout-seconds` comes
+whatever the server's `lc_messages` (#824). The closing tip check must itself end 5 s before
 the bound, however many headers a moved tip makes it walk on a slow node;
 otherwise the command refuses with nothing committed (`the closing tip check
 did not finish 5 s before the fatal-state recovery bound`), so the `UPDATE` and
@@ -4354,7 +4732,11 @@ and sets `qbit_prism_peer_sync_refused{reason}`. Then it pulls, in this order:
    its own landing or an adoption, is skipped whole, and its facts are
    compared. A block waits until the share mark covers its window.
 4. **Prepared jobs**, each with its template and balance blob, the blobs
-   first, in one transaction.
+   first, in chunks of at most 1,000 jobs and 2 MiB of JSON (#785). Each chunk
+   is its own transaction under the cluster row's `FOR KEY SHARE`, the
+   blob-GC fence, and advances the cursor through its last job. A chunk that
+   fails stops the pass: the chunks before it stay applied, and applying them
+   again changes nothing. A job whose blobs alone exceed 2 MiB goes alone.
 
 Landed blocks and prepared jobs have no lock that orders their commits, so
 their pulls stop at the peer's sync barrier: every `sync_seq` is drawn under an

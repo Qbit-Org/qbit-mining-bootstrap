@@ -43,6 +43,7 @@ pub use candidates::{
     ORPHANED_STATE, SIDE_CHAIN_REPLIES,
 };
 use candidates::{prepare_candidate_observed, prepare_fenced_candidate};
+pub use claim_observer::UNRECORDED_LEASE;
 mod connect;
 pub(crate) use connect::shielded_begin;
 use connect::{check_writable, require_revision, writable, writable_unless_held, WRITABLE_COLUMNS};

@@ -108,6 +108,22 @@ landings, so its landing holds are mixed with routine ones. A hold runs from the
 so it includes the transaction's own statements and its COMMIT round trip;
 the wait for the lock is `qbit_prism_database_advisory_lock_wait_seconds`.
 
+`qbit_prism_share_append_stage_seconds{stage,outcome}` (#829) uses the same
+ladder. Its stages are parts of one share's acknowledgement:
+`submit_checks`, the `admission` queue for the append's connection, the
+call's own hold on the database server's clock (`locked_call`), and the
+`commit` round trip. Read their `_sum` increases against
+`qbit_prism_share_ack_seconds{result="accepted"}`'s over the same range: the
+admission queue is the wait that `ORDER_LOCK`'s own wait cannot show, since a
+frontend admits at most `max_connections - 1` appends at once. The append's
+hold minus `locked_call` minus `commit` is only microseconds for a committed
+one-call append; anything more is appends without both stages (block-bearing
+ones, and refused, rolled back or failed ones), so compare the `_count`
+increases. The call's reply's trip back and the
+runtime's wake to it are in no stage: PostgreSQL holds the lock then, but the
+hold the frontend records starts after them. `admission{outcome="cancelled"}` is the time appends
+queued before they were dropped, not a share outcome.
+
 ## Reading the CTV chunk-row histogram
 
 `qbit_prism_ctv_fanout_broadcaster_chunk_rows` keeps its 2.x.x name and type

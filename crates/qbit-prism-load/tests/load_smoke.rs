@@ -298,6 +298,126 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
             assert!(summary["samples"].as_u64() > Some(0), "{}", plan.name);
             assert!(summary["unavailable_reason"].is_null(), "{}", plan.name);
         }
+        // #842: the host was read over the phase. Linux's /proc/stat has
+        // steal and iowait; PSI may be off on the runner's kernel, so each of
+        // its figures is either measured or unknown with a reason, never a
+        // bare null.
+        let host = &phase["host_contention"];
+        assert!(
+            host["intervals"].as_u64() > Some(0),
+            "{}: {host}",
+            plan.name
+        );
+        if cfg!(target_os = "linux") {
+            for figure in ["steal", "iowait"] {
+                assert!(
+                    host[figure]["percent"].as_f64().is_some(),
+                    "{}: {figure}: {host}",
+                    plan.name
+                );
+            }
+        }
+        for figure in [
+            "cpu_some",
+            "io_some",
+            "io_full",
+            "memory_some",
+            "memory_full",
+        ] {
+            assert!(
+                host[figure]["percent"].as_f64().is_some()
+                    || host[figure]["unavailable_reason"].is_string(),
+                "{}: {figure}: {host}",
+                plan.name
+            );
+        }
+        assert!(
+            phase["order_lock"]["longest_sample_gap_milliseconds"].as_f64() > Some(0.0),
+            "{}",
+            plan.name
+        );
+        // #829: where the acknowledgements' time went is measured against a
+        // real server and PostgreSQL, from histograms the server exports
+        // today and the managed cluster's statistics.
+        let accounting = &phase["share_ack_accounting"];
+        eprintln!(
+            "{}: {}",
+            plan.name,
+            gate::ack_accounting(phase).unwrap_or_default()
+        );
+        let acks_known = phase["server_share_ack_seconds"]
+            .as_array()
+            .context("server acks")?
+            .iter()
+            .all(|delta| delta["unavailable_reason"].is_null());
+        // A derived part whose inputs disagree (their populations differ),
+        // or that is derived from such a part, is unknown on purpose, but
+        // every measured input was there.
+        let known = |part: &str| {
+            accounting[part]["seconds"].as_f64().is_some()
+                || accounting[part]["unavailable_reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("the inputs disagree"))
+        };
+        if acks_known {
+            for part in [
+                "accepted_acks",
+                "order_lock_wait",
+                "order_lock_hold_append",
+                "before_lock_and_response",
+            ] {
+                assert!(known(part), "{}: {part}: {accounting}", plan.name);
+            }
+            // The server under test has its own append stages.
+            for part in [
+                "submit_checks",
+                "admission",
+                "locked_call",
+                "commit",
+                "hold_unattributed",
+                "before_lock_unattributed",
+            ] {
+                assert!(known(part), "{}: {part}: {accounting}", plan.name);
+            }
+            if accounting["accepted_acks"]["count"].as_f64() > Some(0.0) {
+                for part in ["submit_checks", "admission", "locked_call", "commit"] {
+                    assert!(
+                        accounting[part]["count"].as_f64() > Some(0.0),
+                        "{}: accepted shares passed through {part}: {accounting}",
+                        plan.name
+                    );
+                }
+            }
+            if report["database"]["pg_stat_statements"] == "loaded" {
+                for part in ["append_call", "in_call_after_grant", "after_call"] {
+                    assert!(known(part), "{}: {part}: {accounting}", plan.name);
+                }
+                if accounting["accepted_acks"]["count"].as_f64() > Some(0.0) {
+                    assert!(
+                        accounting["append_call"]["count"].as_f64() > Some(0.0),
+                        "{}: accepted shares were appended by the call: {accounting}",
+                        plan.name
+                    );
+                }
+            }
+        }
+        let wal = &phase["database_counters"]["wal"];
+        // A phase across a primary's restart or promotion is unknown on
+        // purpose; the smoke preset has neither.
+        assert!(wal["syncs"].as_i64().is_some(), "{}: {wal}", plan.name);
+        assert!(
+            wal["sync_seconds"].as_f64().is_some(),
+            "{}: the managed primary times WAL syncs: {wal}",
+            plan.name
+        );
+        assert!(
+            phase["database_counters"]["checkpoints"]["timed"]
+                .as_i64()
+                .is_some(),
+            "{}: {}",
+            plan.name,
+            phase["database_counters"]
+        );
         // A delayed phase's delay was seen to be paid.
         if plan.database_delay_ms > 0 {
             let observed = phase["database_delay_observed_select1_median_milliseconds"]
@@ -479,8 +599,18 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         {
             let hash = tip["tip"].as_str().context("tip hash")?;
             assert!(changed.contains(&hash), "{pointer}: {hash}");
+            // #842: each driven tip carries the host over its delivery,
+            // named to the phase it fell in.
+            let host = &tip["host_contention"];
+            assert!(host["intervals"].as_u64() > Some(0), "{pointer}: {host}");
+            assert!(host["phase"].is_string(), "{pointer}: {host}");
         }
     }
+    assert!(
+        report["host_contention"]["reads"].as_u64() > Some(1),
+        "{}",
+        report["host_contention"]
+    );
     for change in report["node"]["tip_changes"]
         .as_array()
         .context("tip changes")?
@@ -567,6 +697,27 @@ async fn the_smoke_preset_serves_every_session_every_tip_and_reconciles() -> Res
         "the 60% whale's share of accepted work: {whale}"
     );
     assert_eq!(report["validator"]["artifact_written"], false);
+    // #829: the managed primary's checkpoint lines were read, and its WAL
+    // timing is reported as the harness's own setting.
+    let database = &report["database"];
+    let logs = database["checkpoint_log"]
+        .as_array()
+        .context("checkpoint logs")?;
+    assert!(
+        logs.iter().any(|log| log["source"]
+            .as_str()
+            .is_some_and(|source| source.ends_with("primary.log"))),
+        "{database}"
+    );
+    for log in logs {
+        assert!(log["unavailable_reason"].is_null(), "{log}");
+    }
+    assert!(
+        database["track_wal_io_timing"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("requested on:")),
+        "{database}"
+    );
 
     // The churn phase drove what the preset planned, and every abandoned
     // submit is accounted for as the churn's, never as a divergence.

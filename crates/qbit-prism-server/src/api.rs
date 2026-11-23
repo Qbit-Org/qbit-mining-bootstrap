@@ -1,5 +1,6 @@
 //! Compatibility HTTP API. Every accounting read uses the shared PostgreSQL ledger.
 mod charts;
+mod integrity;
 mod metrics_snapshot;
 mod operator_auth;
 mod public;
@@ -309,10 +310,13 @@ pub struct ApiState {
     pub health: Arc<RwLock<Value>>,
     metrics: Arc<RwLock<MetricsSnapshot>>,
     registry: Arc<crate::metrics::Metrics>,
-    pub latest_evidence: Arc<RwLock<Option<Value>>>,
+    /// `/audit/latest`'s run and newest answer (#859).
+    latest_evidence: Arc<read_models::LatestEvidence>,
     health_published_at: Arc<RwLock<Instant>>,
     client: reqwest::Client,
     cache: ResponseCache,
+    /// `network()`'s node answers, shared by the routes that read them (#858).
+    network: Arc<public::NetworkMemo>,
     public_pool: PgPool,
     /// Imported audit decodes run after their read connection is released,
     /// so they share the read pool's concurrency through this limit instead.
@@ -323,6 +327,8 @@ pub struct ApiState {
     audit_rebuilds: Arc<Semaphore>,
     /// Audit artifact requests admitted to wait for, or run, a rebuild.
     audit_artifacts: Arc<Semaphore>,
+    /// The `/audit` integrity routes' report run and newest outcome (#737).
+    integrity: Arc<integrity::IntegrityReports>,
     public_service: Option<Arc<public_service::ServiceState>>,
 }
 #[derive(Clone, Debug)]
@@ -370,6 +376,11 @@ impl ApiState {
             audit_decodes,
             audit_rebuilds,
             audit_artifacts: Arc::new(Semaphore::new(config.audit_artifact_max_in_flight as usize)),
+            integrity: Arc::new(integrity::IntegrityReports::new(
+                integrity::RUN_TIMEOUT,
+                integrity::REUSE,
+            )),
+            network: Arc::default(),
             public_service: None,
             config: Arc::new(config),
             health: Arc::new(RwLock::new(
@@ -377,7 +388,10 @@ impl ApiState {
             )),
             metrics: Arc::new(RwLock::new(MetricsSnapshot::default())),
             registry,
-            latest_evidence: Arc::new(RwLock::new(None)),
+            latest_evidence: Arc::new(read_models::LatestEvidence::new(
+                read_models::LATEST_EVIDENCE_RUN_TIMEOUT,
+                read_models::LATEST_EVIDENCE_REUSE,
+            )),
             health_published_at: Arc::new(RwLock::new(Instant::now())),
             // Idle node connections are dropped before the node's idle close (#759).
             client: crate::rpc::node_client_builder()
@@ -410,6 +424,34 @@ impl ApiState {
     #[doc(hidden)]
     pub fn audit_artifact_admission(&self) -> Arc<Semaphore> {
         self.audit_artifacts.clone()
+    }
+    /// The integrity routes with another run bound and reuse window than
+    /// their 300 s each, for the tests.
+    #[doc(hidden)]
+    pub fn with_integrity_report_timing(mut self, timeout: Duration, reuse: Duration) -> Self {
+        self.integrity = Arc::new(self.integrity.with_timing(timeout, reuse));
+        self
+    }
+    /// `/audit/latest` with another reuse window than its 10 s, for the
+    /// tests; zero starts a run for every request that finds none in flight.
+    #[doc(hidden)]
+    pub fn with_latest_evidence_reuse(mut self, reuse: Duration) -> Self {
+        self.latest_evidence = Arc::new(
+            self.latest_evidence
+                .with_timing(read_models::LATEST_EVIDENCE_RUN_TIMEOUT, reuse),
+        );
+        self
+    }
+    /// The frontend's stop signal, `true` once it is stopping: the integrity
+    /// routes and `/audit/latest` then abandon their run in flight and start
+    /// none, so a stop never waits on a report (#737, #859). An abandoned
+    /// `/audit/latest` statement still holds its ledger connection until it
+    /// ends, up to the statement timeout, which closing the ledger pool
+    /// waits for.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.latest_evidence = Arc::new(self.latest_evidence.stopping_on(shutdown.clone()));
+        self.integrity = Arc::new(self.integrity.stopping_on(shutdown));
+        self
     }
     #[cfg(test)]
     pub(crate) fn health_published_at_for_test(&self) -> &RwLock<Instant> {
@@ -526,6 +568,15 @@ impl ApiError {
             message:
                 "too many audit artifacts are being rebuilt; retry after the Retry-After delay"
                     .into(),
+        }
+    }
+    /// The integrity routes have no current report: its run failed, or
+    /// ended without an outcome (#737).
+    fn integrity_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "integrity_report_unavailable",
+            message: message.into(),
         }
     }
     /// The `Retry-After` delay an error carries, in seconds.
@@ -978,26 +1029,14 @@ async fn audit(state: &ApiState, path: &str, q: &Query) -> ApiResult<Value> {
             )
         }
         "/audit/carry-forward-integrity" | "/audit/ledger-integrity" => {
-            let mut value: Value =
-                sqlx::query_scalar("SELECT qbit_carry_forward_integrity_report()")
-                    .fetch_one(&state.pool)
-                    .await?;
-            // #478: debt from divergent landings is exact accounting, so the
-            // report's mismatch count never shows it; this line does.
-            value["payout_divergence"] = crate::ledger::payout_divergence_line(&state.pool).await?;
-            value["ledger_backend"] = json!("postgres-native");
-            return Ok(value);
+            // #737: one run at a time under its own timeout, its outcome
+            // served with when it was computed.
+            return state.integrity.answer_request(&state.pool).await;
         }
         "/audit/latest" => {
-            let row = state
-                .latest_evidence
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if let Some(row) = row {
-                return Ok(row);
-            }
-            return read_models::latest_evidence(state).await;
+            // #859: one run at a time under its own timeout, its answer
+            // served with when it was computed, for a few seconds.
+            return state.latest_evidence.answer_latest(state).await;
         }
         "/audit/share-window" => {
             let anchor = q

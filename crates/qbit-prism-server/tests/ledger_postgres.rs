@@ -46,6 +46,8 @@ mod candidates_recover;
 mod clock_steps;
 #[path = "support/fanout_lane_plan.rs"]
 mod fanout_lane_plan;
+#[path = "support/pending_fanouts_plan.rs"]
+mod pending_fanouts_plan;
 
 #[path = "support/index_trim.rs"]
 mod index_trim;

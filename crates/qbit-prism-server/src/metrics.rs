@@ -77,6 +77,9 @@ pub struct Metrics {
     /// The Stratum listeners' accepted-share counter, read at every scrape
     /// once the server attaches it (#581).
     accepted_shares: std::sync::OnceLock<AcceptedShares>,
+    /// Payout-revision listeners whose LISTEN holds (#816), updated under
+    /// `inner`'s lock.
+    revision_listeners: std::sync::atomic::AtomicUsize,
 }
 
 type AcceptedShares = Box<dyn Fn() -> u64 + Send + Sync>;
@@ -120,6 +123,9 @@ impl Metrics {
             Family::RevisionWorkTimeouts,
             Family::LandingTrimReleased,
             Family::RequestDeliveryWait,
+            // #816: down, never up, until the listener's first LISTEN holds.
+            Family::PayoutRevisionListenerUp,
+            Family::PayoutRevisionAnnouncements,
         ] {
             registry.register(family, vec![], 0.);
         }
@@ -179,6 +185,13 @@ impl Metrics {
             registry.register(
                 Family::ConnectionRefusals,
                 label("reason", reason.as_str()),
+                0.,
+            );
+        }
+        for outcome in DifficultyHintOutcome::ALL {
+            registry.register(
+                Family::DifficultyHints,
+                label("outcome", outcome.as_str()),
                 0.,
             );
         }
@@ -242,6 +255,7 @@ impl Metrics {
             Family::CarryOwnerPeerChecks,
             Family::LockWait,
             Family::OrderLockHold,
+            Family::ShareAppendStage,
             Family::RefreshSeconds,
             Family::RollupLag,
             Family::LandingTrimSeconds,
@@ -297,6 +311,7 @@ impl Metrics {
             rollup_caught_up: Mutex::new(None),
             landing_acks: landing_acks::LandingAcks::default(),
             accepted_shares: std::sync::OnceLock::new(),
+            revision_listeners: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     /// Render `qbit_prism_accepted_shares_total` from `read` at every scrape

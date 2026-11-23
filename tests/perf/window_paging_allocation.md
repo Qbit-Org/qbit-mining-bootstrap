@@ -433,6 +433,10 @@ exercising the daemon protocol; it is **not** a coordinator run (§8).
 ## Re-running
 
 ```
+# Today's tree holds neither the harness nor the Python lab/ modules it imports (#244 removed
+# them). Run from #241's commit, which added the harness beside this report; its crates/ are
+# 527b3ac's with window.rs reformatted and one more test. The results land in that worktree.
+git worktree add /tmp/prism-241 8b02c72b0cf68003c6d2c7aaf9b38cc4867a0224 && cd /tmp/prism-241
 cargo build --release --locked -p qbit-prism --bin qbit-prism-build-audit-bundle
 # an old binary for the baseline rows, built from the base commit into its own target dir:
 git worktree add /tmp/base 0bc7fa6c023082df81d23137ebabf4ff96f24683 && \
@@ -446,8 +450,14 @@ python3 tests/perf/window_paging_allocation.py \
 
 python3 tests/perf/window_paging_allocation.py --sizes 210000 --skip-oracle   # fixed binary only, quick
 
-# inside a locally built coordinator image (context: Cargo.toml, Cargo.lock, crates/, lab/auxpow/, lab/prism/):
-docker build -f lab/prism/Dockerfile -t prism-240-local:test <context-dir>
+# inside a locally built coordinator image. The run line needs section 7's image: Python, binaries
+# under /app/target/release. Today's lab/prism/Dockerfile builds a debian:bookworm-slim runtime
+# with the binaries in /usr/local/bin and no Python, so build from 527b3ac's tree, as section 7
+# did. Its Dockerfile copies only Cargo.toml, Cargo.lock, crates/, lab/auxpow/ and lab/prism/,
+# so the whole tree as build context gives the image that section 7's disposable context gave.
+# The build names the tree by path: the run line mounts the harness from the worktree above.
+git worktree add /tmp/prism-527b3ac 527b3acb5e25148ec6e6a71141818ddbaa06866a
+docker build -f /tmp/prism-527b3ac/lab/prism/Dockerfile -t prism-240-local:test /tmp/prism-527b3ac
 docker run --rm --memory 8g -v "$PWD/tests:/app/tests:ro" -v "$PWD/out:/out" prism-240-local:test \
     python3 tests/perf/window_paging_allocation.py --daemon-binary /app/target/release --daemon-label image \
     --sizes 210000,400000 --stderr-dir /tmp/stderr --json /out/container.json

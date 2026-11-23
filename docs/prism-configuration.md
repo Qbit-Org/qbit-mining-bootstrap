@@ -61,6 +61,28 @@ this also prevents dumps piped to a host collector, for which
 [Linux ignores `RLIMIT_CORE`](https://man7.org/linux/man-pages/man5/core.5.html).
 The key rotation rehearsal required before cutover is tracked by #291.
 
+## Database TLS and verify-ca
+
+`sslmode=verify-ca` checks the database certificate's chain but not its host
+name. So it trusts only the root certificates in `sslrootcert`, or
+`PGSSLROOTCERT`, never the public roots, and since 3.1.1 (#818) every
+connect without one is refused. Startup refuses such a URL first, naming the
+setting, with the connect's message,
+`sslmode=verify-ca requires sslrootcert`. That covers `PRISM_DATABASE_URL`,
+`PRISM_PEER_DATABASE_URL` and `PRISM_PEER_DATABASE_URL_FALLBACK`, in
+`check-config`, `check-public-database-config`, the frontend, the public
+reader, and the database commands that check `PRISM_DATABASE_URL` as the
+server does.
+
+Startup resolves the mode and the certificate as the connect does: the URL's
+`sslmode` and `sslrootcert` win over `PGSSLMODE` and `PGSSLROOTCERT`. An
+empty `sslrootcert` names no file, so startup refuses it with the same
+message (the connect would fail to read it). Startup doesn't read the file,
+so a certificate file that is missing or holds no certificate is still
+refused only at connect. `verify-full`, `require` and the other modes are unchanged. A
+`PRISM_DATABASE_URL` the PostgreSQL client can't parse, such as one with
+`sslmode=sometimes`, is refused at startup too, as a peer URL already was.
+
 ## Database-only commands and audit import
 
 `migrate`, `import-audits`, and `backfill-ctv` load database configuration
@@ -144,9 +166,8 @@ in `/metrics` reports the remaining headroom; see
 
 ## Stratum per-source cap and per-session budgets
 
-Five settings bound what one source address or one connection can cost. Every
-one defaults to the value that keeps today's behavior, and `check-config`
-rejects an out-of-range value rather than falling back.
+Five settings bound what one source address or one connection can cost.
+`check-config` rejects an out-of-range value rather than falling back.
 
 | Setting | Default | Accepted range | Failure when rejected |
 | --- | --- | --- | --- |
@@ -154,7 +175,7 @@ rejects an out-of-range value rather than falling back.
 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS` | 60 | finite, above 0, at most 3600 | `PRISM_STRATUM_SESSION_BUDGET_INTERVAL_SECONDS must be finite, positive and at most 3600` |
 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_MALFORMED_FRAMES_PER_INTERVAL must be at most 1000000` |
 | `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_UNKNOWN_JOBS_PER_INTERVAL must be at most 1000000` |
-| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 0 (disabled) | 0 through 1000000 | `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL must be at most 1000000` |
+| `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL` | 32 | 0 (disabled) through 1000000 | `PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL must be at most 1000000` |
 
 A value that is not a number fails as `invalid <name>`; an empty value selects
 the default. The three budgets are rates measured over the shared interval, not
@@ -162,8 +183,28 @@ session lifetime totals: a full window's allowance is admitted as a burst and
 refills whole at the next window. Valid `mining.submit` traffic is never
 charged against any of them.
 
+The authorization budget is on by default (#823): a username is not
+authenticated, and an address the frontend has not seen costs a node
+`validateaddress` call. Only the address before the first `.` decides the
+payout, so a resolved address is cached for an hour and a new worker suffix on
+it costs no call. Sessions naming the same new address share one validation,
+and a frontend runs at most four validations at once, so authorization cannot
+fill the node's RPC work queue ahead of templates and block submission; a
+session that has waited five seconds, behind another session's validation of
+its address and then for one of the four, is refused with
+`backend-rpc-unavailable` and may retry. `getblocktemplate`, `submitblock` and
+other sessions' share submission never wait on that bound. A session handles
+its requests in order, so shares it sends while its own `mining.authorize`
+waits are answered after it. When the cache is full, entries older than the
+hour are dropped first, then the entries of addresses the node refused, which
+resolved to the configured fallback (`PRISM_USERNAME_FALLBACK_ADDRESS`), and
+only then the others.
+
 The per-source cap keys on the address this listener observed, which is the
 last hop. Leave it at 0 unless the deployment preserves miner source addresses.
+This repository has no PROXY-protocol support, so behind a load balancer that
+sends no PROXY header every miner arrives from the balancer's few addresses and
+any cap throttles the whole pool; that is why it stays 0 by default.
 See [prism-b4-stratum-admission.md](prism-b4-stratum-admission.md) for the
 runbook, the recommended starting values and the topologies that make a cap
 unsafe.
@@ -237,14 +278,16 @@ on. While it is off, no setting below is read and a frontend behaves exactly as
 | `PRISM_PEER_DATABASE_URL` | required | the peer's PostgreSQL, as its read-only sync role |
 | `PRISM_PEER_DATABASE_URL_FALLBACK` | unset | a second network path to the same database, tried when the first fails |
 | `PRISM_PEER_SYNC_INTERVAL_MS` | `250` | wait between pulls that found nothing new, 10 to 60000 |
-| `PRISM_PEER_SYNC_BATCH_ROWS` | `5000` | most rows of one stream a pull reads and inserts at once, 1 to 20000: each batch is one statement on the peer, under its 8 s timeout |
+| `PRISM_PEER_SYNC_BATCH_ROWS` | `5000` | most rows of one stream (shares, prepared jobs) a pull reads at once, 1 to 20000: each batch is one statement on the peer, under its 8 s timeout. A share batch is inserted in one local transaction; a prepared batch in chunks of at most 1,000 jobs and 2 MiB (a job whose blobs alone are larger goes alone), each its own transaction under the cluster row's `FOR KEY SHARE` (#785) |
 | `PRISM_PEER_INGEST_WAIT_MS` | `250` | before a found block's `submitblock`, the most it waits for the peer to hold what adopting the block needs, 0 (off) to 10000 |
 
 Each error names its setting and never prints a value: the peer DSNs carry the
 sync role's credentials. A peer DSN must use `postgres` or `postgresql`, name
 a host, and not name this node's own database (`PRISM_DATABASE_URL`'s host,
 port and database). The fallback must differ from the first DSN. In production
-neither may carry the shipped `change-this` credential. These settings are per
+neither may carry the shipped `change-this` credential. Neither may use
+`sslmode=verify-ca` without a root certificate
+([database TLS](#database-tls-and-verify-ca)). These settings are per
 node and not part of the cluster fingerprint: each node's database is its own
 cluster, and the two nodes' identities differ by design. Migration 027 adds
 the columns and tables the dual writer needs, and

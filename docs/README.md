@@ -62,6 +62,10 @@ This is useful for reviewers and operators who need implementation detail:
 - [prism-e2e-load-ci.md](prism-e2e-load-ci.md): the end-to-end and load CI
   lanes (#487 L0-L6): what each proves and does not, how to dispatch and read
   a run, where its evidence lives and how to reproduce it locally.
+- [ci-same-tree-skip.md](ci-same-tree-skip.md): how `ci.yml` and the L3
+  workflow skip a pull request's repeated run on a tree that already passed
+  (the pass marker, bound to the run that saved it), the `run-full-ci` label,
+  the `TREE_PASS_SALT` variable, and what remains possible.
 - [prism-stratum-fuzzing.md](prism-stratum-fuzzing.md): the Stratum
   cargo-fuzz targets, their invariants and nightly job, and the per-PR
   property tests for the line codec and target conversions (#575).

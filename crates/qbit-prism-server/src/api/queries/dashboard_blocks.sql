@@ -1,29 +1,52 @@
 -- Parameterized shared-database read model.
 
-WITH public_blocks AS (
-    SELECT block.*, CASE WHEN block.chain_state='inactive' AND block.audit_publication_sequence IS NOT NULL THEN 'reversed' ELSE block.chain_state END AS public_chain_state
-    FROM qbit_pool_blocks block
-), total AS (
+-- The page's filter as plain column tests, one branch per filter behind a
+-- one-time test of $3 (#857). An `active` page is then an ordered read of
+-- qbit_pool_blocks_public_recent_idx, whose predicate its own implies, in
+-- custom and generic plans alike; a CASE over the public chain state, or one
+-- filter ORed over all three, keeps every plan off the index.
+WITH total AS (
     SELECT count(*) AS total_count
-    FROM public_blocks
-    WHERE ($3 = 'all' OR ($3 = 'active' AND public_chain_state = 'confirmed') OR ($3 = 'reversed' AND public_chain_state = 'reversed'))
+    FROM qbit_pool_blocks block
+    WHERE $3 = 'all'
+       OR ($3 = 'active' AND block.chain_state = 'confirmed')
+       OR ($3 = 'reversed' AND (block.chain_state = 'reversed' OR (block.chain_state = 'inactive' AND block.audit_publication_sequence IS NOT NULL)))
+),
+page_keys AS (
+    (SELECT block.block_hash
+     FROM qbit_pool_blocks block
+     WHERE $3 = 'active' AND block.chain_state = 'confirmed'
+     ORDER BY block.block_height DESC, block.found_at DESC
+     LIMIT $1 OFFSET $2)
+    UNION ALL
+    (SELECT block.block_hash
+     FROM qbit_pool_blocks block
+     WHERE $3 = 'all'
+     ORDER BY block.block_height DESC, block.found_at DESC
+     LIMIT $1 OFFSET $2)
+    UNION ALL
+    (SELECT block.block_hash
+     FROM qbit_pool_blocks block
+     WHERE $3 = 'reversed'
+       AND (block.chain_state = 'reversed' OR (block.chain_state = 'inactive' AND block.audit_publication_sequence IS NOT NULL))
+     ORDER BY block.block_height DESC, block.found_at DESC
+     LIMIT $1 OFFSET $2)
 ),
 page_blocks AS (
     SELECT
         block.block_hash,
         block.block_height,
         block.found_at,
-        block.public_chain_state AS chain_state,
+        CASE WHEN block.chain_state = 'inactive' AND block.audit_publication_sequence IS NOT NULL THEN 'reversed' ELSE block.chain_state END AS chain_state,
         COALESCE(block.disconnected_at,block.inactive_since) AS disconnected_at,
         block.payout_manifest_sha256,
         block.solver_miner_id,
         block.solver_share_id,
         block.solver_share_difficulty,
         block.solver_network_difficulty
-    FROM public_blocks block
-    WHERE ($3 = 'all' OR ($3 = 'active' AND block.public_chain_state = 'confirmed') OR ($3 = 'reversed' AND block.public_chain_state = 'reversed'))
-    ORDER BY block.block_height DESC, block.found_at DESC
-    LIMIT $1 OFFSET $2
+    FROM page_keys
+    JOIN qbit_pool_blocks block
+      ON block.block_hash = page_keys.block_hash
 ),
 rows AS (
     SELECT

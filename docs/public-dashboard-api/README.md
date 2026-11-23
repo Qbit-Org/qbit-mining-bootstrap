@@ -134,6 +134,34 @@ worse than an honest one.
   sha256 is correct at any age and this route never refuses for staleness.
 - `Age` — the observed age of the response actually served, as before.
 
+One input can be older than `Age` says. The pool summary, the reward
+leaderboard (`/public/v1/leaderboard?window=reward`) and the miner pages
+(`/public/v1/miners/{recipient_id}`) share one in-process answer from the node
+(#858). It is remembered for the shortest cache TTL and staleness budget among
+those three routes: 5 s by default, never more than 15 s, and not at all when
+the public cache is off or any of their TTLs is 0. That lifetime counts from
+when its node calls started, so a response built on a remembered answer
+carries chain state read up to that lifetime before the response asked for
+it, and a response that waited for a set of node calls already running
+carries chain state read when that set started. That comes on top of the
+response's `Age` and, as before, of the time the response took to build. It
+covers:
+
+- the pool summary's `network` object apart from `network.hashrate_ths`, which
+  every response reads afresh: `name`, `height`, `tip_hash`, `bits`,
+  `network_difficulty`, `initial_block_download` and `peers`;
+- what that `network_difficulty` sizes or prices: the pool summary's
+  `pool.reward_window` and `pool.expected_time_to_block_seconds`, the reward
+  leaderboard's window and rows, and a miner page's `estimated_next_block`
+  and `reward_window_percent`.
+
+So by default a pool-summary response served at `Age` 60 (its 30 s TTL plus
+30 s of stale-while-revalidate) and built on a remembered answer can carry a
+`network.height` read up to 65 s before it is served, plus that build time.
+One that waited for a running set instead carries, in place of those 5 s,
+however long that set had been running when it joined: under 20 s, since the
+node client allows each call 10 s and the set makes two in a row.
+
 When a cached response exceeds the budget, a healthy service discards it and
 recomputes before answering. During a database outage it returns **503** with
 `Cache-Control: no-store` and an ordinary `prism.dashboard.error.v1` body with

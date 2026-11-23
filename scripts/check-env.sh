@@ -1047,6 +1047,7 @@ check_public_reader_credentials() (
       'PRISM_DATABASE_URL is required by the public service' \
       'public PRISM_DATABASE_URL must use postgres or postgresql' \
       'invalid public PRISM_DATABASE_URL connection options' \
+      'public PRISM_DATABASE_URL: sslmode=verify-ca requires sslrootcert' \
       'invalid public PRISM_DATABASE_URL' \
       'production requires non-default database credentials'; do
       [[ "${output}" != *"${name}"* ]] || fail "public reader: ${name}"

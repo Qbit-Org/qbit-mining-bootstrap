@@ -245,6 +245,19 @@ impl Metrics {
                 Labels::One(("reason", reason.as_str())),
             );
     }
+    /// Exactly once per difficulty hint a session offered its listener's
+    /// writer, when the hint's fate is known (#856); `count` hints at once
+    /// when a stopping writer abandons its queue.
+    pub fn record_difficulty_hints(&self, outcome: DifficultyHintOutcome, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).add(
+            Family::DifficultyHints,
+            Labels::One(("outcome", outcome.as_str())),
+            count as f64,
+        );
+    }
     /// The configured global ceiling, never the permits left after admissions.
     pub fn set_stratum_connection_limit(&self, limit: usize) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).set(
@@ -387,6 +400,35 @@ impl Metrics {
             elapsed,
         );
     }
+    /// #816: a payout-revision listener's LISTEN began to hold (`true`) or
+    /// stopped holding (`false`), each `false` after one `true`. The gauge
+    /// reads 1 while any holds, so a listener that ends after a newer one
+    /// began cannot clear it.
+    pub fn record_payout_revision_listener(&self, holds: bool) {
+        let mut registry = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let held = self
+            .revision_listeners
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let holding = if holds {
+            held + 1
+        } else {
+            held.saturating_sub(1)
+        };
+        self.revision_listeners
+            .store(holding, std::sync::atomic::Ordering::Relaxed);
+        registry.set(
+            Family::PayoutRevisionListenerUp,
+            Labels::Empty,
+            f64::from(u8::from(holding > 0)),
+        );
+    }
+    /// #816: one announcement this frontend's payout-revision listener heard.
+    pub fn record_payout_revision_announcement(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .increment(Family::PayoutRevisionAnnouncements, Labels::Empty);
+    }
     /// 3.1 dual writer (D2): whether this frontend's latest window snapshot
     /// found the `(origin_node, share_seq)` index its cut reads need.
     pub fn record_origin_index(&self, indexed: bool) {
@@ -521,6 +563,25 @@ impl Metrics {
         self.observe(
             Family::OrderLockHold,
             Labels::One(("holder", holder.as_str())),
+            elapsed,
+        );
+    }
+    /// #829: one stage of a share's path to its append, recorded once the
+    /// stage has ended and never while the append holds ORDER_LOCK. `outcome`
+    /// is one of [`AppendStage::outcomes`], whose keys are reserved at start.
+    pub fn observe_append_stage(
+        &self,
+        stage: AppendStage,
+        outcome: AppendStageOutcome,
+        elapsed: Duration,
+    ) {
+        debug_assert!(
+            stage.outcomes().contains(&outcome),
+            "{stage:?} records no {outcome:?}"
+        );
+        self.observe(
+            Family::ShareAppendStage,
+            Labels::Two(("stage", stage.as_str()), ("outcome", outcome.as_str())),
             elapsed,
         );
     }

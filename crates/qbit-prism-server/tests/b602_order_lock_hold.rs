@@ -37,6 +37,7 @@ use support::{
 const HOLD: &str = "qbit_prism_database_order_lock_hold_seconds";
 const LANDING: &str = "qbit_prism_share_ack_landing_window_seconds";
 const ACK: &str = "qbit_prism_share_ack_seconds";
+const STAGE: &str = "qbit_prism_share_append_stage_seconds";
 
 /// #602 R1: no acknowledgement over 2 s in the landing window, and a p99 at
 /// or under 500 ms.
@@ -149,6 +150,24 @@ fn hold(metrics: &Metrics, holder: &str, part: &str) -> f64 {
     sample(metrics, &format!("{HOLD}_{part}{{holder=\"{holder}\"}}"))
 }
 
+/// #829: the `_count` of one share append stage's `outcome`.
+fn stage(metrics: &Metrics, stage: &str, outcome: &str) -> f64 {
+    sample(
+        metrics,
+        &format!("{STAGE}_count{{stage=\"{stage}\",outcome=\"{outcome}\"}}"),
+    )
+}
+
+/// The submit checks, admission, call and COMMIT stages, in that order.
+fn stages(metrics: &Metrics) -> [f64; 4] {
+    [
+        stage(metrics, "submit_checks", "passed"),
+        stage(metrics, "admission", "admitted"),
+        stage(metrics, "locked_call", "replied"),
+        stage(metrics, "commit", "committed"),
+    ]
+}
+
 /// Acknowledgements of both results in `family`.
 fn acks(metrics: &Metrics, family: &str) -> f64 {
     ["accepted", "rejected"]
@@ -159,7 +178,9 @@ fn acks(metrics: &Metrics, family: &str) -> f64 {
 
 /// R3: a landing's transactions record their `ORDER_LOCK` holds under their
 /// own holder, and a hold runs from the grant to the end of its transaction,
-/// not just across the lock statement.
+/// not just across the lock statement. #829: the block-solving share passes
+/// its submit checks, is admitted and commits on the statement path, which
+/// has no call to report its own hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_landing_records_each_order_lock_hold_under_its_holder() -> Result<()> {
     run(gate::site!(), |f| {
@@ -174,10 +195,17 @@ async fn a_landing_records_each_order_lock_hold_under_its_holder() -> Result<()>
             hold_first_confirmation(f, injected).await?;
             f.node.accept_blocks();
             let appends = hold(metrics, "append", "count");
+            let [checked, admitted, called, committed] = stages(metrics);
             let claim = queue_block(&f.a).await?;
             ensure!(
                 hold(metrics, "append", "count") == appends + 1.,
                 "the block-solving share's append recorded no hold"
+            );
+            ensure!(
+                stages(metrics) == [checked + 1., admitted + 1., called, committed + 1.],
+                "the block-solving share recorded stages {:?} after {:?}",
+                stages(metrics),
+                [checked, admitted, called, committed]
             );
             let started = Instant::now();
             f.a.process_candidate(&claim).await?;

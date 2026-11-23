@@ -5383,6 +5383,663 @@ async fn imported_ctv_audit_backfills_and_links_without_the_legacy_file() -> Res
     db.close(vec![ledger]).await
 }
 
+/// One block's CTV rows as backfill-ctv must leave them, set first, then
+/// each artifact by chunk: its id, the set digest it names, and the sha256
+/// of its stored JSON text.
+async fn ctv_rows(pool: &PgPool, hash: &str) -> Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as("SELECT id,manifest_set_sha256,text_sha256 FROM (SELECT -1 AS chunk_index,block_hash AS id,manifest_set_sha256,encode(sha256(convert_to(manifest_set_json,'UTF8')),'hex') AS text_sha256 FROM qbit_ctv_fanout_sets WHERE block_hash=$1 UNION ALL SELECT chunk_index,fanout_txid,manifest_set_sha256,encode(sha256(convert_to(manifest_json,'UTF8')),'hex') FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1) rows ORDER BY chunk_index")
+        .bind(hash).fetch_all(pool).await?)
+}
+
+/// #739: 2.x stored each CTV set's digest as the sha256 of its compact
+/// sorted-key JSON, and every artifact names that digest; 3.x hashes struct
+/// order. backfill-ctv reads such a set as written: a no-op when it is
+/// complete, and an artifact it restores names the set's own digest. It
+/// still refuses a set whose jsonb differs or whose digest is neither
+/// canonical form, and an artifact naming another digest, and keeps none of
+/// what it wrote before refusing.
+#[tokio::test]
+async fn a_2x_ctv_set_under_its_sorted_key_digest_backfills_as_written() -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger("legacy-ctv-digest").await?;
+    ledger.append(share(5251), None).await?;
+    let mut second = share(5252);
+    second.miner_id = "other".into();
+    second.order_key = "other".into();
+    second.p2mr_program_hex = "22".repeat(32);
+    ledger.append(second, None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    let key = keys().1.public_key_hex();
+    let bundle = settled_bundle(
+        &snapshot,
+        u64::MAX,
+        qbit_prism::SettlementModeConfig {
+            max_fanout_recipients_per_transaction: 1,
+            ..Default::default()
+        },
+    )?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        Some(test_ctv()),
+        5251,
+    )?;
+    let hash = block.block_hash.clone();
+    land_confirmed(&ledger, &block).await?;
+    let set = block
+        .bundle
+        .ctv_fanout_manifest_set
+        .clone()
+        .context("a CTV block")?;
+    let struct_digest = qbit_prism::ctv_fanout_manifest_set_sha256_hex(&set)?;
+
+    // Rewrite the rows as 2.x wrote them. Every string in this set is ASCII,
+    // so serde_json's compact form of the stored jsonb, whose keys come out
+    // sorted, is `json.dumps(set, sort_keys=True, separators=(",", ":"))`.
+    let stored: Value =
+        sqlx::query_scalar("SELECT manifest_set FROM qbit_ctv_fanout_sets WHERE block_hash=$1")
+            .bind(&hash)
+            .fetch_one(&ledger.pool)
+            .await?;
+    let legacy_json = serde_json::to_string(&stored)?;
+    let legacy_digest = sha256_hex(&legacy_json);
+    let struct_json =
+        String::from_utf8(qbit_prism::canonical_ctv_fanout_manifest_set_bytes(&set)?)?;
+    assert!(
+        legacy_json.starts_with(r#"{"block_height":"#),
+        "{legacy_json}"
+    );
+    assert!(struct_json.starts_with(r#"{"schema":"#), "{struct_json}");
+    assert_eq!(legacy_json.len(), struct_json.len());
+    assert_ne!(legacy_digest, struct_digest);
+    assert_eq!(
+        legacy_digest,
+        qbit_prism::legacy_ctv_fanout_manifest_set_sha256_hex(&set)?
+    );
+    sqlx::query("UPDATE qbit_ctv_fanout_sets SET manifest_set_json=$2,manifest_set_sha256=$3 WHERE block_hash=$1")
+        .bind(&hash).bind(&legacy_json).bind(&legacy_digest).execute(&ledger.pool).await?;
+    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET manifest_set_sha256=$2 WHERE block_hash=$1")
+        .bind(&hash)
+        .bind(&legacy_digest)
+        .execute(&ledger.pool)
+        .await?;
+    let legacy = ctv_rows(&ledger.pool, &hash).await?;
+    assert_eq!(legacy.len(), 3);
+    assert_eq!(
+        legacy[0],
+        (hash.clone(), legacy_digest.clone(), legacy_digest.clone())
+    );
+    assert!(
+        legacy[1..].iter().all(|row| row.1 == legacy_digest),
+        "{legacy:?}"
+    );
+
+    // A complete legacy set is a no-op, read as written.
+    assert_eq!(ledger.backfill_ctv(&key).await?, 0);
+    assert_eq!(ctv_rows(&ledger.pool, &hash).await?, legacy);
+    // A restored artifact names the set's stored digest, not 3.x's.
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=1")
+        .bind(&hash)
+        .execute(&ledger.pool)
+        .await?;
+    assert_eq!(ledger.backfill_ctv(&key).await?, 1);
+    assert_eq!(ctv_rows(&ledger.pool, &hash).await?, legacy);
+    assert_eq!(ledger.backfill_ctv(&key).await?, 0);
+
+    // Each refusal below leaves chunk 0 missing, which the backfill would
+    // otherwise restore: whatever it wrote is rolled back with the refusal.
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=0")
+        .bind(&hash)
+        .execute(&ledger.pool)
+        .await?;
+    let set_conflict = "existing CTV manifest set conflicts with verified audit";
+    let pg_text_digest: String = sqlx::query_scalar("SELECT encode(sha256(convert_to(manifest_set::text,'UTF8')),'hex') FROM qbit_ctv_fanout_sets WHERE block_hash=$1")
+        .bind(&hash).fetch_one(&ledger.pool).await?;
+    for (case, update, expected) in [
+        (
+            "differing jsonb under the legacy digest",
+            "UPDATE qbit_ctv_fanout_sets SET manifest_set=jsonb_set(manifest_set,'{coinbase_value_sats}',to_jsonb((manifest_set->>'coinbase_value_sats')::bigint+1)) WHERE block_hash=$1".to_owned(),
+            set_conflict,
+        ),
+        (
+            "PostgreSQL's jsonb text digest",
+            format!("UPDATE qbit_ctv_fanout_sets SET manifest_set_sha256='{pg_text_digest}' WHERE block_hash=$1"),
+            set_conflict,
+        ),
+        (
+            "the legacy digest in uppercase",
+            format!("UPDATE qbit_ctv_fanout_sets SET manifest_set_sha256='{}' WHERE block_hash=$1", legacy_digest.to_ascii_uppercase()),
+            set_conflict,
+        ),
+        (
+            "an artifact naming the 3.x digest beside a legacy set",
+            format!("UPDATE qbit_ctv_fanout_artifacts SET manifest_set_sha256='{struct_digest}' WHERE block_hash=$1 AND chunk_index=1"),
+            "existing CTV artifact conflicts with verified audit",
+        ),
+    ] {
+        sqlx::query(&update).bind(&hash).execute(&ledger.pool).await?;
+        let corrupted = ctv_rows(&ledger.pool, &hash).await?;
+        assert_eq!(corrupted.len(), 2, "{case}: {corrupted:?}");
+        let err = ledger.backfill_ctv(&key).await.unwrap_err();
+        assert!(format!("{err:#}").contains(expected), "{case}: {err:#}");
+        assert_eq!(ctv_rows(&ledger.pool, &hash).await?, corrupted, "{case}");
+        sqlx::query("UPDATE qbit_ctv_fanout_sets SET manifest_set=$2,manifest_set_sha256=$3 WHERE block_hash=$1")
+            .bind(&hash).bind(&stored).bind(&legacy_digest).execute(&ledger.pool).await?;
+        sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET manifest_set_sha256=$2 WHERE block_hash=$1")
+            .bind(&hash)
+            .bind(&legacy_digest)
+            .execute(&ledger.pool)
+            .await?;
+    }
+    assert_eq!(ledger.backfill_ctv(&key).await?, 1);
+    assert_eq!(ctv_rows(&ledger.pool, &hash).await?, legacy);
+    assert_eq!(ledger.backfill_ctv(&key).await?, 0);
+    db.close(vec![ledger]).await
+}
+
+/// Every column of a block's CTV rows that its verified set determines, set
+/// first, then each artifact by chunk: what backfill-ctv compares.
+async fn ctv_determined_columns(pool: &PgPool, hash: &str) -> Result<Vec<Value>> {
+    Ok(sqlx::query_scalar("SELECT row FROM (SELECT -1 AS chunk_index,to_jsonb(s)-'created_at'-'origin_node' AS row FROM qbit_ctv_fanout_sets s WHERE block_hash=$1 UNION ALL SELECT chunk_index,to_jsonb(a) FROM (SELECT fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1) a) rows ORDER BY chunk_index")
+        .bind(hash).fetch_all(pool).await?)
+}
+
+/// A block's whole CTV rows, every column: its set, and its artifacts by chunk.
+async fn ctv_whole_rows(pool: &PgPool, hash: &str) -> Result<(Option<Value>, Value)> {
+    Ok(sqlx::query_as("SELECT (SELECT to_jsonb(s) FROM qbit_ctv_fanout_sets s WHERE block_hash=$1),(SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.chunk_index,a.fanout_txid),'[]') FROM qbit_ctv_fanout_artifacts a WHERE block_hash=$1)")
+        .bind(hash).fetch_one(pool).await?)
+}
+
+/// Put a block's CTV rows back as [`ctv_whole_rows`] read them.
+async fn restore_ctv_rows(pool: &PgPool, hash: &str, rows: &(Option<Value>, Value)) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE qbit_ctv_fanout_sets s SET manifest_set_json=r.manifest_set_json,manifest_set=r.manifest_set,manifest_set_sha256=r.manifest_set_sha256,settlement_mode=r.settlement_mode,parent_coinbase_txid=r.parent_coinbase_txid,parent_coinbase_tx_hex=r.parent_coinbase_tx_hex,fanout_count=r.fanout_count,fanout_output_sum_sats=r.fanout_output_sum_sats,covenant_output_value_sats=r.covenant_output_value_sats,created_at=r.created_at,origin_node=r.origin_node FROM jsonb_populate_record(NULL::qbit_ctv_fanout_sets,$2) r WHERE s.block_hash=$1")
+        .bind(hash).bind(&rows.0).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1")
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO qbit_ctv_fanout_artifacts SELECT * FROM jsonb_populate_recordset(NULL::qbit_ctv_fanout_artifacts,$1)")
+        .bind(&rows.1).execute(&mut *tx).await?;
+    tx.commit().await?;
+    assert_eq!(&ctv_whole_rows(pool, hash).await?, rows);
+    Ok(())
+}
+
+/// A compact serde_json text as CPython's `json.dumps` writes it by default:
+/// every character outside printable ASCII escaped (serde_json has already
+/// escaped the control characters), one above the BMP as a UTF-16 surrogate
+/// pair. Built apart from `qbit_prism::legacy_ctv_json_text`, so the 2.x rows
+/// below do not come from the code that checks them.
+fn python_ensure_ascii(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if (' '..='~').contains(&character) {
+            escaped.push(character);
+        } else {
+            for unit in character.encode_utf16(&mut [0; 2]) {
+                escaped.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    escaped
+}
+
+/// Rewrite a block's CTV rows as 1.x and 2.x wrote them (#739): the set's and
+/// each artifact's text `json.dumps(value, sort_keys=True, separators=(",",
+/// ":"))` of its stored jsonb, each digest that text's sha256, and every
+/// artifact naming its set's digest. serde_json writes a jsonb value's keys
+/// sorted, so escaping its compact text gives `json.dumps`'s.
+async fn rewrite_ctv_as_2x(
+    pool: &PgPool,
+    hash: &str,
+    set: &qbit_prism::CtvFanoutManifestSet,
+) -> Result<()> {
+    let stored: Value =
+        sqlx::query_scalar("SELECT manifest_set FROM qbit_ctv_fanout_sets WHERE block_hash=$1")
+            .bind(hash)
+            .fetch_one(pool)
+            .await?;
+    let set_json = python_ensure_ascii(&serde_json::to_string(&stored)?);
+    assert_eq!(
+        set_json,
+        qbit_prism::legacy_ctv_fanout_manifest_set_json(set)?
+    );
+    let set_digest = sha256_hex(&set_json);
+    let rewritten = sqlx::query("UPDATE qbit_ctv_fanout_sets SET manifest_set_json=$2,manifest_set_sha256=$3 WHERE block_hash=$1")
+        .bind(hash).bind(&set_json).bind(&set_digest).execute(pool).await?;
+    assert_eq!(rewritten.rows_affected(), 1);
+    let artifacts: Vec<(String, Value)> = sqlx::query_as("SELECT fanout_txid,manifest FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 ORDER BY chunk_index")
+        .bind(hash).fetch_all(pool).await?;
+    assert_eq!(artifacts.len(), set.manifests.len());
+    for ((txid, manifest), verified) in artifacts.iter().zip(&set.manifests) {
+        let json = python_ensure_ascii(&serde_json::to_string(manifest)?);
+        assert_eq!(json, qbit_prism::legacy_ctv_json_text(verified)?);
+        let rewritten = sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET manifest_set_sha256=$2,manifest_json=$3,manifest_sha256=$4 WHERE fanout_txid=$1")
+            .bind(txid).bind(&set_digest).bind(&json).bind(sha256_hex(&json)).execute(pool).await?;
+        assert_eq!(rewritten.rows_affected(), 1);
+    }
+    Ok(())
+}
+
+/// A text as a PostgreSQL dollar-quoted literal.
+fn dollar_quoted(text: &str) -> String {
+    assert!(!text.contains("$q$"), "{text}");
+    format!("$q${text}$q$")
+}
+
+/// #846 follow-up: backfill-ctv accepts a held CTV set and its artifacts only
+/// when every column the verified set determines holds what that set
+/// implies, as 2.x's persist required: the stored text, digests, transaction
+/// hex and amounts, not only the jsonb. 3.x rows (`legacy` false) and 2.x
+/// rows (`legacy` true) are held to that alike. Columns that move as a
+/// fanout settles are not compared, and a chunk the backfill restores is in
+/// its set's text form. Each refusal keeps nothing the backfill wrote.
+///
+/// The block pays two recipients, one fanout each. The second recipient's id
+/// is not ASCII, so its manifest's two text forms differ, as do the set's.
+async fn backfill_ctv_compares_every_determined_ctv_column(
+    name: &str,
+    seed: u64,
+    legacy: bool,
+) -> Result<()> {
+    let Some(db) = Database::open().await? else {
+        return Ok(());
+    };
+    let ledger = db.ledger(name).await?;
+    ledger.append(share(seed), None).await?;
+    let mut second = share(seed + 1);
+    second.miner_id = "mineur-\u{e9}\u{1f600}".into();
+    second.order_key = "other".into();
+    second.p2mr_program_hex = "22".repeat(32);
+    ledger.append(second, None).await?;
+    let snapshot = ledger.snapshot(100).await?;
+    let key = keys().1.public_key_hex();
+    let bundle = settled_bundle(
+        &snapshot,
+        u64::MAX,
+        qbit_prism::SettlementModeConfig {
+            max_fanout_recipients_per_transaction: 1,
+            ..Default::default()
+        },
+    )?;
+    let block = candidate_with_bundle(
+        bundle,
+        WindowRef::from_snapshot(&snapshot)?,
+        snapshot.payout_revision,
+        Some(test_ctv()),
+        u32::try_from(seed)?,
+    )?;
+    let hash = block.block_hash.clone();
+    land_confirmed(&ledger, &block).await?;
+    let pool = &ledger.pool;
+    let set = block
+        .bundle
+        .ctv_fanout_manifest_set
+        .clone()
+        .context("a CTV block")?;
+    assert_eq!(set.manifests.len(), 2);
+    let current_text = |manifest: &qbit_prism::CtvFanoutManifest| -> Result<String> {
+        Ok(serde_json::to_string(&serde_json::to_value(manifest)?)?)
+    };
+    // The last fanout pays the non-ASCII id; the first one's text is
+    // printable ASCII, the same bytes in both forms.
+    let (first, wide) = (&set.manifests[0], &set.manifests[1]);
+    assert_eq!(
+        qbit_prism::legacy_ctv_json_text(first)?,
+        current_text(first)?
+    );
+    let current_set_json =
+        String::from_utf8(qbit_prism::canonical_ctv_fanout_manifest_set_bytes(&set)?)?;
+    let legacy_set_json = qbit_prism::legacy_ctv_fanout_manifest_set_json(&set)?;
+    let (current_wide_json, legacy_wide_json) =
+        (current_text(wide)?, qbit_prism::legacy_ctv_json_text(wide)?);
+    assert!(!current_wide_json.is_ascii(), "{current_wide_json}");
+    assert!(
+        legacy_wide_json.contains(r"mineur-\u00e9\ud83d\ude00"),
+        "{legacy_wide_json}"
+    );
+    assert!(
+        legacy_set_json.contains(&legacy_wide_json),
+        "{legacy_set_json}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&legacy_wide_json)?,
+        serde_json::from_str::<Value>(&current_wide_json)?
+    );
+    if legacy {
+        rewrite_ctv_as_2x(pool, &hash, &set).await?;
+    }
+    let (set_json, other_set_json, wide_json, other_wide_json) = if legacy {
+        (
+            legacy_set_json,
+            current_set_json,
+            legacy_wide_json,
+            current_wide_json,
+        )
+    } else {
+        (
+            current_set_json,
+            legacy_set_json,
+            current_wide_json,
+            legacy_wide_json,
+        )
+    };
+    // Every determined column as the verified set implies it, built here
+    // field by field, so a value bound to the wrong column is caught too.
+    let set_digest = sha256_hex(&set_json);
+    let artifact_row = |manifest: &qbit_prism::CtvFanoutManifest, json: &str| -> Result<Value> {
+        let pre = &manifest.precommitment;
+        Ok(json!({
+            "fanout_txid": manifest.fanout_txid,
+            "block_hash": hash,
+            "manifest_set_sha256": set_digest,
+            "manifest_json": json,
+            "manifest": serde_json::to_value(manifest)?,
+            "manifest_sha256": sha256_hex(json),
+            "precommitment_sha256": manifest.precommitment_sha256_hex,
+            "ctv_hash": pre.ctv_hash_hex,
+            "commitment_witness_leaf_hex": manifest.commitment_witness_leaf_hex,
+            "chunk_index": pre.chunk_index,
+            "chunk_count": pre.chunk_count,
+            "parent_coinbase_txid": manifest.parent_coinbase_txid,
+            "parent_coinbase_vout": manifest.parent_coinbase_vout,
+            "fanout_tx_template_hex": pre.fanout_tx_template_hex,
+            "fanout_tx_hex": manifest.fanout_tx_hex,
+            "anchor_vout": pre.anchor_vout,
+            "covenant_output_value_sats": manifest.covenant_output_value_sats,
+            "fanout_output_sum_sats": pre.fanout_output_sum_sats,
+        }))
+    };
+    let written = vec![
+        json!({
+            "block_hash": hash,
+            "manifest_set_json": set_json,
+            "manifest_set": serde_json::to_value(&set)?,
+            "manifest_set_sha256": set_digest,
+            "settlement_mode": set.settlement_mode,
+            "parent_coinbase_txid": set.parent_coinbase_txid,
+            "parent_coinbase_tx_hex": first.parent_coinbase_tx_hex,
+            "fanout_count": set.fanout_count,
+            "fanout_output_sum_sats": set.fanout_output_sum_sats,
+            "covenant_output_value_sats": set.covenant_output_value_sats,
+        }),
+        artifact_row(first, &current_text(first)?)?,
+        artifact_row(wide, &wide_json)?,
+    ];
+    assert_eq!(ctv_determined_columns(pool, &hash).await?, written);
+
+    // Untouched rows are a no-op, and a restored chunk is in its set's form.
+    assert_eq!(ledger.backfill_ctv(&key).await?, 0);
+    assert_eq!(ctv_determined_columns(pool, &hash).await?, written);
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=1")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    assert_eq!(ledger.backfill_ctv(&key).await?, 1);
+    assert_eq!(ctv_determined_columns(pool, &hash).await?, written);
+    assert_eq!(ledger.backfill_ctv(&key).await?, 0);
+
+    // A row moved to another chunk of its block is refused on its chunk
+    // index: chunk 1 missing, and chunk 0's row moved into its place.
+    let whole = ctv_whole_rows(pool, &hash).await?;
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=1")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE qbit_ctv_fanout_artifacts SET chunk_index=1 WHERE block_hash=$1 AND chunk_index=0",
+    )
+    .bind(&hash)
+    .execute(pool)
+    .await?;
+    let moved = ctv_whole_rows(pool, &hash).await?;
+    let err = format!("{:#}", ledger.backfill_ctv(&key).await.unwrap_err());
+    let expected = format!(
+        "existing CTV artifact conflicts with verified audit: fanout {} of block {hash} differs from the verified manifest in chunk_index",
+        first.fanout_txid
+    );
+    assert!(err.contains(&expected), "{name}: {err}");
+    assert_eq!(ctv_whole_rows(pool, &hash).await?, moved, "{name}");
+    restore_ctv_rows(pool, &hash, &whole).await?;
+
+    // Chunk 0 stays missing through every refusal below. The backfill
+    // writes it before it checks chunk 1, so a refusal that kept any write
+    // would leave it there.
+    sqlx::query("DELETE FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=0")
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    let missing = ctv_whole_rows(pool, &hash).await?;
+    let form = if legacy { "2.x" } else { "3.x" };
+    let set_differs = |columns: &str| {
+        format!("existing CTV manifest set conflicts with verified audit: block {hash} differs from the verified set's {form} form in {columns}")
+    };
+    let artifact_conflict = "existing CTV artifact conflicts with verified audit";
+    let chunk_differs = |columns: &str| {
+        format!(
+            "{artifact_conflict}: fanout {} of block {hash} differs from the verified manifest in {columns}",
+            wide.fanout_txid
+        )
+    };
+    let set_update =
+        |assign: &str| format!("UPDATE qbit_ctv_fanout_sets SET {assign} WHERE block_hash=$1");
+    let chunk_update = |assign: &str| {
+        format!(
+            "UPDATE qbit_ctv_fanout_artifacts SET {assign} WHERE block_hash=$1 AND chunk_index=1"
+        )
+    };
+    let cases = [
+        (
+            "set text",
+            set_update("manifest_set_json=manifest_set_json||' '"),
+            set_differs("manifest_set_json"),
+        ),
+        (
+            "set text in the other form",
+            set_update(&format!("manifest_set_json={}", dollar_quoted(&other_set_json))),
+            set_differs("manifest_set_json"),
+        ),
+        (
+            "set jsonb",
+            set_update("manifest_set=jsonb_set(manifest_set,'{coinbase_value_sats}',to_jsonb((manifest_set->>'coinbase_value_sats')::bigint+1))"),
+            set_differs("manifest_set"),
+        ),
+        (
+            "set digest",
+            set_update("manifest_set_sha256=repeat('0',64)"),
+            set_differs("manifest_set_sha256"),
+        ),
+        (
+            "settlement mode",
+            set_update("settlement_mode=CASE settlement_mode WHEN 'ctv_fanout' THEN 'hybrid_coinbase_ctv_fanout' ELSE 'ctv_fanout' END"),
+            set_differs("settlement_mode"),
+        ),
+        (
+            "set parent coinbase txid",
+            set_update("parent_coinbase_txid=repeat('ab',32)"),
+            set_differs("parent_coinbase_txid"),
+        ),
+        (
+            "set parent coinbase transaction",
+            set_update("parent_coinbase_tx_hex=parent_coinbase_tx_hex||'00'"),
+            set_differs("parent_coinbase_tx_hex"),
+        ),
+        (
+            "fanout count",
+            set_update("fanout_count=fanout_count+1"),
+            set_differs("fanout_count"),
+        ),
+        (
+            "set output sum",
+            set_update("fanout_output_sum_sats=fanout_output_sum_sats+1"),
+            set_differs("fanout_output_sum_sats"),
+        ),
+        (
+            "set covenant value",
+            set_update("covenant_output_value_sats=covenant_output_value_sats+1"),
+            set_differs("covenant_output_value_sats"),
+        ),
+        (
+            "fanout txid",
+            chunk_update("fanout_txid=repeat('cd',32)"),
+            format!(
+                "{artifact_conflict}: another artifact holds chunk 1 of block {hash}, not fanout {}",
+                wide.fanout_txid
+            ),
+        ),
+        (
+            "artifact set digest",
+            chunk_update("manifest_set_sha256=repeat('0',64)"),
+            chunk_differs("manifest_set_sha256"),
+        ),
+        (
+            "artifact text",
+            chunk_update("manifest_json=manifest_json||' '"),
+            chunk_differs("manifest_json"),
+        ),
+        (
+            "artifact text in the other form",
+            chunk_update(&format!("manifest_json={}", dollar_quoted(&other_wide_json))),
+            chunk_differs("manifest_json"),
+        ),
+        (
+            "artifact text and digest in the other form",
+            chunk_update(&format!(
+                "manifest_json={},manifest_sha256='{}'",
+                dollar_quoted(&other_wide_json),
+                sha256_hex(&other_wide_json)
+            )),
+            chunk_differs("manifest_json,manifest_sha256"),
+        ),
+        (
+            "artifact jsonb",
+            chunk_update("manifest=jsonb_set(manifest,'{covenant_output_value_sats}',to_jsonb((manifest->>'covenant_output_value_sats')::bigint+1))"),
+            chunk_differs("manifest"),
+        ),
+        (
+            "artifact digest",
+            chunk_update("manifest_sha256=repeat('0',64)"),
+            chunk_differs("manifest_sha256"),
+        ),
+        (
+            "precommitment digest",
+            chunk_update("precommitment_sha256=repeat('0',64)"),
+            chunk_differs("precommitment_sha256"),
+        ),
+        (
+            "CTV hash",
+            chunk_update("ctv_hash=repeat('0',64)"),
+            chunk_differs("ctv_hash"),
+        ),
+        (
+            "commitment witness leaf",
+            chunk_update("commitment_witness_leaf_hex=repeat('0',64)"),
+            chunk_differs("commitment_witness_leaf_hex"),
+        ),
+        (
+            "chunk count",
+            chunk_update("chunk_count=chunk_count+1"),
+            chunk_differs("chunk_count"),
+        ),
+        (
+            "artifact parent coinbase txid",
+            chunk_update("parent_coinbase_txid=repeat('ab',32)"),
+            chunk_differs("parent_coinbase_txid"),
+        ),
+        (
+            "parent coinbase vout",
+            chunk_update("parent_coinbase_vout=parent_coinbase_vout+1"),
+            chunk_differs("parent_coinbase_vout"),
+        ),
+        (
+            "fanout template",
+            chunk_update("fanout_tx_template_hex=fanout_tx_template_hex||'00'"),
+            chunk_differs("fanout_tx_template_hex"),
+        ),
+        (
+            "fanout transaction",
+            chunk_update("fanout_tx_hex=fanout_tx_hex||'00'"),
+            chunk_differs("fanout_tx_hex"),
+        ),
+        (
+            "anchor vout",
+            chunk_update("anchor_vout=CASE WHEN anchor_vout IS NULL THEN 0 ELSE NULL END"),
+            chunk_differs("anchor_vout"),
+        ),
+        (
+            "artifact covenant value",
+            chunk_update("covenant_output_value_sats=covenant_output_value_sats+1"),
+            chunk_differs("covenant_output_value_sats"),
+        ),
+        (
+            "artifact output sum",
+            chunk_update("fanout_output_sum_sats=fanout_output_sum_sats+1"),
+            chunk_differs("fanout_output_sum_sats"),
+        ),
+        (
+            "an artifact the audit does not have",
+            "INSERT INTO qbit_ctv_fanout_artifacts(fanout_txid,block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,ctv_hash,commitment_witness_leaf_hex,chunk_index,chunk_count,parent_coinbase_txid,parent_coinbase_vout,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats) SELECT repeat('ef',32),block_hash,manifest_set_sha256,manifest_json,manifest,manifest_sha256,precommitment_sha256,repeat('ef',32),repeat('ef',32),2,3,parent_coinbase_txid,parent_coinbase_vout+10,fanout_tx_template_hex,fanout_tx_hex,anchor_vout,covenant_output_value_sats,fanout_output_sum_sats FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=1".to_owned(),
+            format!("{artifact_conflict}: block {hash} holds 3 artifacts, the audit 2"),
+        ),
+    ];
+    for (case, update, expected) in &cases {
+        sqlx::query(update)
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .with_context(|| format!("{name}: {case}"))?;
+        let tampered = ctv_whole_rows(pool, &hash).await?;
+        assert_ne!(tampered, missing, "{name}: {case} changed nothing");
+        let err = match ledger.backfill_ctv(&key).await {
+            Ok(repaired) => panic!("{name}: {case} was accepted, {repaired} repaired"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains(expected.as_str()), "{name}: {case}: {err}");
+        assert_eq!(
+            ctv_whole_rows(pool, &hash).await?,
+            tampered,
+            "{name}: {case}: the refusal kept a write"
+        );
+        restore_ctv_rows(pool, &hash, &missing).await?;
+    }
+
+    // Columns that move as a fanout settles, or say when and where the row
+    // was written, are not compared.
+    sqlx::query("UPDATE qbit_ctv_fanout_artifacts SET settlement_status='failed',updated_at='2001-02-03T04:05:06Z',origin_node=1 WHERE block_hash=$1 AND chunk_index=1")
+        .bind(&hash).execute(pool).await?;
+    sqlx::query(
+        "UPDATE qbit_ctv_fanout_sets SET created_at='2001-02-03T04:05:06Z',origin_node=1 WHERE block_hash=$1",
+    )
+    .bind(&hash)
+    .execute(pool)
+    .await?;
+    assert_eq!(ledger.backfill_ctv(&key).await?, 1);
+    assert_eq!(ctv_determined_columns(pool, &hash).await?, written);
+    let status: String = sqlx::query_scalar(
+        "SELECT settlement_status FROM qbit_ctv_fanout_artifacts WHERE block_hash=$1 AND chunk_index=1",
+    )
+    .bind(&hash)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(status, "failed");
+    assert_eq!(ledger.backfill_ctv(&key).await?, 0);
+    db.close(vec![ledger]).await
+}
+
+#[tokio::test]
+async fn backfill_ctv_refuses_any_tampered_column_of_3x_ctv_rows() -> Result<()> {
+    backfill_ctv_compares_every_determined_ctv_column("ctv-columns-3x", 5261, false).await
+}
+
+#[tokio::test]
+async fn backfill_ctv_refuses_any_tampered_column_of_2x_ctv_rows() -> Result<()> {
+    backfill_ctv_compares_every_determined_ctv_column("ctv-columns-2x", 5271, true).await
+}
+
 #[tokio::test]
 async fn inline_only_legacy_audit_import_keeps_its_body_and_serves_canonical_bytes() -> Result<()> {
     let Some(db) = Database::open().await? else {

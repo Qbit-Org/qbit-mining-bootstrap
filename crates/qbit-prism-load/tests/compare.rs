@@ -429,6 +429,65 @@ fn a_candidate_failing_the_presets_own_tip_budget_fails_though_the_d1_rule_holds
         .contains("the preset's own gates: **regression**"));
 }
 
+/// #854: a base build's harness predates `external_tips_planned`, so its
+/// reports record no plan. Re-gated on a preset with a tip median, the base
+/// is held to the pinned `--external-tips`, which the comparison already
+/// pins every run's tip list to, rather than failing as unmeasured and
+/// hiding the candidate's regression behind "as does a base run".
+#[test]
+fn a_base_report_predating_the_tip_plan_is_held_to_the_pinned_tips() {
+    let manifest = manifest(288.0);
+    let mut runs = loaded(&manifest, |_, _| met_steady());
+    for run in &mut runs {
+        if run.run.build != "candidate" {
+            continue;
+        }
+        let report = run.report.as_mut().unwrap();
+        for (index, tip) in report["time_to_usable_work"]["tips"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            tip["all_sessions_milliseconds"] = json!(if index == 0 { 600.0 } else { 3000.0 });
+        }
+        for phase in report["phases"].as_array_mut().unwrap() {
+            let planned = if phase["name"] == "warm_up" { 3 } else { 0 };
+            phase["external_tips_planned"] = json!(planned);
+        }
+    }
+    let budgets = Budgets {
+        tip_last_notify_p99_ms: Some(5000.0),
+        tip_last_notify_median_ms: Some(2500.0),
+        ..d1_budgets()
+    };
+    let result = compare::compare(&manifest, &runs, &budgets, &d1_args()).unwrap();
+    assert!(!result.passed, "{}", result.markdown);
+    assert!(
+        result.markdown.contains("| base | 3 / 3 | – |"),
+        "{}",
+        result.markdown
+    );
+    assert!(result.markdown.contains("| candidate | 0 / 3 |"));
+    assert!(result
+        .markdown
+        .contains("the preset's own gates: **regression**"));
+    // The plan is filled only where no phase records one, and only from
+    // the pinned count.
+    let older = json!({"phases": [{"name": "warm_up"}, {"name": "steady_state"}]});
+    let filled = compare::with_pinned_tip_plan(older.clone(), Some(3));
+    assert_eq!(filled["phases"][0]["external_tips_planned"], 3);
+    assert_eq!(filled["phases"][1]["external_tips_planned"], 0);
+    assert_eq!(compare::with_pinned_tip_plan(older.clone(), None), older);
+    // A report with no phase list, or that is not an object, is left alone.
+    for odd in [json!(null), json!([]), json!({"aborted": "x"})] {
+        assert_eq!(compare::with_pinned_tip_plan(odd.clone(), Some(3)), odd);
+    }
+    let newer = json!({"phases": [{"name": "warm_up", "external_tips_planned": 8},
+                                  {"name": "steady_state"}]});
+    assert_eq!(compare::with_pinned_tip_plan(newer.clone(), Some(3)), newer);
+}
+
 #[test]
 fn builds_reporting_different_target_rates_fail_the_comparison() {
     let manifest = manifest(288.0);

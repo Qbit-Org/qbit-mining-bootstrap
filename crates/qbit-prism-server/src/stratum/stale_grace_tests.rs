@@ -139,7 +139,13 @@ impl Connection {
             max_jobs_per_connection: max_jobs,
             ..Default::default()
         };
-        let mut session = Session::new(&config, SessionObservation::new(config.stats.clone()));
+        // No listener, so no writer: a hint the session offers is counted at
+        // once instead of waiting forever in a queue nothing drains.
+        let mut session = Session::new(
+            &config,
+            SessionObservation::new(config.stats.clone()),
+            DifficultyHints::closed(),
+        );
         session.extranonce1 = Some(first.wire.extranonce1.clone());
         session.worker = Some(first.context.worker.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

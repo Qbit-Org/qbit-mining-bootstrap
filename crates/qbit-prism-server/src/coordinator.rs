@@ -44,6 +44,7 @@ mod compact_runtime;
 mod issued_batcher;
 mod miner_submit;
 mod offer_shutdown;
+mod payout_identity;
 mod prepared_storage;
 mod publication_authority;
 mod refresh_window;
@@ -316,7 +317,7 @@ pub struct Coordinator {
     resume_flights: compact_resume::ResumeFlights,
     /// One shared clock+revision read per fan-out burst; see `clocked_flight`.
     clocked_flights: clocked_flight::ClockedFlights,
-    identities: Mutex<HashMap<String, (Worker, Instant)>>,
+    identities: payout_identity::PayoutIdentities,
     chain_cache: Mutex<Option<ChainCache>>,
     /// The ledger sessions' effective `statement_timeout`, `None` when
     /// disabled. A COMMIT that ran this long may be a cancelled synchronous
@@ -382,16 +383,18 @@ pub(crate) fn unix_ms_now() -> Result<i64> {
 }
 
 /// Why the one `submitblock` call provably did not run on the node, if it
-/// did not: its connection was never established, so no byte of it left this
-/// process (`rpc::RpcNotSentError`, #522, a connect that outlasted half the
-/// submit deadline included, #762), the client refused to send it
-/// under `PRISM_BLOCK_SUBMIT_ENABLED` (`rpc::RpcRelayRefused`, #291), or the
-/// node answered it with `RPC_IN_WARMUP`, which qbitd returns before it
-/// dispatches any call (`rpc::RpcReplyError::in_warmup`, #526). Only a
-/// `submitblock` reply counts: a warmup answer to another call says nothing
-/// about this one. Every other result, any other error code, a transport
-/// failure after the connection existed or the submit deadline included, may
-/// have run and is `None`.
+/// did not: no byte of it left this process (`rpc::RpcNotSentError`), because
+/// its connection was never established (#522, a connect that outlasted half
+/// the submit deadline included, #762) or because the HTTP client handed the
+/// request back unwritten when its connection closed first (#816); the client
+/// refused to send it under `PRISM_BLOCK_SUBMIT_ENABLED`
+/// (`rpc::RpcRelayRefused`, #291); or the node answered it with
+/// `RPC_IN_WARMUP`, which qbitd returns before it dispatches any call
+/// (`rpc::RpcReplyError::in_warmup`, #526). Only a `submitblock` reply counts:
+/// a warmup answer to another call says nothing about this one. Every other
+/// result, any other error code, any other transport failure after the
+/// connection existed or the submit deadline included, may have run and is
+/// `None`.
 fn offer_not_executed(result: &Result<Value>) -> Option<String> {
     let error = result.as_ref().err()?;
     if let Some(not_sent) = error.downcast_ref::<crate::rpc::RpcNotSentError>() {
@@ -540,6 +543,21 @@ const CANDIDATE_LEASE: CandidateLease = CandidateLease {
     timeout: Duration::from_secs(5),
     rebuild_deadline: Duration::from_secs(60),
 };
+
+/// `CANDIDATE_LEASE`'s lease, renewal interval and per-renewal bound, for
+/// a harness that models a live holder's renewals from outside the process
+/// (the dual-sim's candidate waits, #841). The server reads
+/// `CANDIDATE_LEASE` itself, never these. From them, and from how
+/// `Coordinator::with_tracked_heartbeat` retries a renewal lost to
+/// contention, the dual-sim models the longest a live holder leaves a
+/// claim's version unchanged (its `RENEWAL_BOUND`): a change to that retry
+/// needs the model revisited.
+#[doc(hidden)]
+pub const CANDIDATE_LEASE_SECONDS: i64 = CANDIDATE_LEASE.seconds;
+#[doc(hidden)]
+pub const CANDIDATE_RENEWAL_INTERVAL: Duration = CANDIDATE_LEASE.interval;
+#[doc(hidden)]
+pub const CANDIDATE_RENEWAL_TIMEOUT: Duration = CANDIDATE_LEASE.timeout;
 
 /// How many times one post-offer write phase writes again after a
 /// payout-revision race, and how long after its first lost race it may still
@@ -1404,7 +1422,7 @@ impl Coordinator {
             refreshed_at: std::sync::Mutex::new(Instant::now()),
             refresh_lock: Mutex::new(RefreshState::default()),
             refresh_in_flight: std::sync::Mutex::new(None),
-            identities: Mutex::new(HashMap::new()),
+            identities: payout_identity::PayoutIdentities::new(),
             chain_cache: Mutex::new(None),
             statement_timeout,
             #[cfg(test)]
@@ -4163,16 +4181,37 @@ impl MiningBackend for Coordinator {
         if username.is_empty() || username.len() > 512 || username.chars().any(char::is_control) {
             return Err(protocol_error("unauthorized-worker", "invalid username"));
         }
-        if let Some((worker, at)) = self.identities.lock().await.get(username) {
-            if at.elapsed() < Duration::from_secs(3600) {
-                return Ok(worker.clone());
-            }
-        }
         let (address, worker_name) = username
             .split_once('.')
             .map_or((username, None), |(address, worker)| {
                 (address, Some(worker.to_string()))
             });
+        let worker = |identity: payout_identity::PayoutIdentity| Worker {
+            username: username.into(),
+            payout_address: identity.payout_address,
+            worker_name: worker_name.clone(),
+            p2mr_program_hex: identity.p2mr_program_hex,
+        };
+        // Only the address decides the payout, so a new worker suffix on a
+        // known address costs no node RPC (#823).
+        if let Some(identity) = self.identities.cached(address) {
+            return Ok(worker(identity));
+        }
+        // A session behind another's validation of the same address reads
+        // its result instead of repeating it. That wait and the wait for a
+        // validation slot share one bound.
+        let deadline = tokio::time::Instant::now() + payout_identity::VALIDATION_WAIT;
+        let flight = self.identities.flight(address);
+        let _flight = tokio::time::timeout_at(deadline, flight.lock())
+            .await
+            .map_err(|_| payout_identity::busy())?;
+        if let Some(identity) = self.identities.cached(address) {
+            return Ok(worker(identity));
+        }
+        // One slot covers the address and, when the node refuses it, the
+        // fallback, so a definitive refusal is never lost to a second wait
+        // under the spent bound.
+        let slot = self.identities.validation_slot(deadline).await?;
         let resolve = |address: String| async move {
             let validation = self
                 .rpc
@@ -4230,21 +4269,13 @@ impl MiningBackend for Coordinator {
                 }
             },
         };
-        let worker = Worker {
-            username: username.into(),
+        drop(slot);
+        let identity = payout_identity::PayoutIdentity {
             payout_address,
-            worker_name,
             p2mr_program_hex,
         };
-        let mut cache = self.identities.lock().await;
-        if cache.len() >= 4096 {
-            cache.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(300));
-            if cache.len() >= 4096 {
-                cache.clear();
-            }
-        }
-        cache.insert(username.into(), (worker.clone(), Instant::now()));
-        Ok(worker)
+        self.identities.remember(address, identity.clone());
+        Ok(worker(identity))
     }
 
     async fn build_job(

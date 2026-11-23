@@ -22,6 +22,7 @@ pub mod client;
 pub mod cluster;
 pub mod collate;
 pub mod compare;
+pub mod contention;
 pub mod digest;
 pub mod external;
 pub mod fault;

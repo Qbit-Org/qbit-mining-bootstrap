@@ -21,8 +21,13 @@ async fn configured_command(
     let secrets = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_qbit-prism-server"));
     command.arg(subcommand).kill_on_drop(true);
+    // The PostgreSQL client's PGSSL* defaults decide whether a database URL
+    // is valid, so a test sees only those it sets.
     for (name, _) in std::env::vars().filter(|(name, _)| {
-        name.starts_with("PRISM_") || name.starts_with("QBIT_") || name == "RUST_LOG"
+        name.starts_with("PRISM_")
+            || name.starts_with("QBIT_")
+            || name.starts_with("PGSSL")
+            || name == "RUST_LOG"
     }) {
         command.env_remove(name);
     }
@@ -515,6 +520,165 @@ async fn retired_writer_sessions_and_invalid_backend_urls_fail_before_startup() 
         "qbit RPC URL must use http or https",
     )
     .await;
+    rejects(
+        false,
+        &[(
+            "PRISM_DATABASE_URL",
+            "postgresql://operator:test-only-password@127.0.0.1:1/offline?sslmode=sometimes",
+        )],
+        "PRISM_DATABASE_URL is not a connection URL the PostgreSQL client accepts",
+    )
+    .await;
+}
+
+/// The connect's refusal of verify-ca without a root certificate (#818).
+const VERIFY_CA_WITHOUT_SSLROOTCERT: &str =
+    "sslmode=verify-ca requires sslrootcert: verify-ca does not check the server's host name";
+
+/// #825: verify-ca trusts only sslrootcert's certificates, so since #818
+/// every connect without one fails. Startup refuses such a URL first, by
+/// name, for this node's database and both peer paths, resolving the mode
+/// and the certificate as the connect does: the URL's sslmode and
+/// sslrootcert over PGSSLMODE and PGSSLROOTCERT. The other modes are
+/// unchanged, and check-config never reads the certificate file.
+#[tokio::test]
+async fn verify_ca_without_a_root_certificate_fails_before_startup() {
+    const OWN: &str = "postgresql://operator:test-only-password@127.0.0.1:1/offline";
+    const PEER: &str = "postgresql://sync:test-only-password@127.0.0.2:1/offline";
+    const CA: &str = "/run/secrets/prism-db-ca.pem";
+    let dual = [
+        ("PRISM_DUAL_WRITER", "1"),
+        ("PRISM_NODE_INDEX", "0"),
+        ("PRISM_CARRY_OWNER", "1"),
+    ];
+    let with_ca = format!("?sslmode=verify-ca&sslrootcert={CA}");
+    // A URL's query, the PGSSL* settings beside it, and whether startup refuses it.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], bool);
+    let cases: [Case; 10] = [
+        ("?sslmode=verify-ca", &[], true),
+        ("?sslmode=verify-ca&sslrootcert=", &[], true),
+        ("?sslmode=verify-ca", &[("PGSSLROOTCERT", "")], true),
+        ("", &[("PGSSLMODE", "verify-ca")], true),
+        (&with_ca, &[], false),
+        ("?sslmode=verify-ca", &[("PGSSLROOTCERT", CA)], false),
+        (
+            "",
+            &[("PGSSLMODE", "verify-ca"), ("PGSSLROOTCERT", CA)],
+            false,
+        ),
+        ("?sslmode=verify-full", &[], false),
+        ("?sslmode=require", &[], false),
+        ("?sslmode=require", &[("PGSSLMODE", "verify-ca")], false),
+    ];
+    for name in [
+        "PRISM_DATABASE_URL",
+        "PRISM_PEER_DATABASE_URL",
+        "PRISM_PEER_DATABASE_URL_FALLBACK",
+    ] {
+        let base = if name == "PRISM_DATABASE_URL" {
+            OWN
+        } else {
+            PEER
+        };
+        for (query, environment, refused) in &cases {
+            let url = format!("{base}{query}");
+            // The other URLs name their TLS mode, so only `name`'s takes the
+            // PGSSL* defaults.
+            let own = format!("{OWN}?sslmode=disable");
+            let first = format!("{PEER}?sslmode=disable");
+            let mut settings = environment.to_vec();
+            if name != "PRISM_DATABASE_URL" {
+                settings.extend(dual);
+                settings.push(("PRISM_DATABASE_URL", &own));
+            }
+            if name == "PRISM_PEER_DATABASE_URL_FALLBACK" {
+                settings.push(("PRISM_PEER_DATABASE_URL", &first));
+            }
+            settings.push((name, &url));
+            let output = check(false, &settings).await;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let case = format!("{name}{query} with {environment:?}");
+            assert!(
+                !stderr.contains("test-only-password"),
+                "{case}: a credential leaked"
+            );
+            if *refused {
+                assert!(!output.status.success(), "{case} was accepted");
+                let expected = format!("{name}: {VERIFY_CA_WITHOUT_SSLROOTCERT}");
+                assert!(stderr.contains(&expected), "{case}: {stderr}");
+            } else {
+                assert!(output.status.success(), "{case} was refused: {stderr}");
+            }
+        }
+    }
+}
+
+/// #825: the refusal is the connect's own. In one environment, startup's
+/// check refuses verify-ca without a root certificate, and a connect with
+/// the same URL fails with the same message once the server agrees to TLS,
+/// before the client sends any TLS byte.
+#[tokio::test]
+async fn startup_refuses_verify_ca_with_the_message_the_connect_gives() {
+    if std::env::var_os("VERIFY_CA_CONNECT_CHILD").is_some() {
+        use sqlx::Connection;
+        let refusal = qbit_prism_server::config::DatabaseConfig::url_from_env()
+            .unwrap_err()
+            .to_string();
+        let url = std::env::var("PRISM_DATABASE_URL").unwrap();
+        let error = sqlx::PgConnection::connect(&url).await.unwrap_err();
+        let sqlx::Error::Configuration(message) = &error else {
+            panic!("the connect failed with something other than a configuration error: {error}");
+        };
+        assert_eq!(refusal, format!("PRISM_DATABASE_URL: {message}"));
+        return;
+    }
+    // A server that agrees to TLS, then records what the client sends.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 8];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, [0, 0, 0, 8, 4, 210, 22, 47], "not an SSLRequest");
+        socket.write_all(b"S").await.unwrap();
+        let mut rest = Vec::new();
+        socket.read_to_end(&mut rest).await.unwrap();
+        rest.len()
+    });
+    let output = timeout(
+        Duration::from_secs(10),
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "startup_refuses_verify_ca_with_the_message_the_connect_gives",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("VERIFY_CA_CONNECT_CHILD", "1")
+            .env("HOME", "/nonexistent-prism-config-test")
+            .env("PGPASSFILE", "/nonexistent-prism-config-test")
+            .env(
+                "PRISM_DATABASE_URL",
+                format!("postgresql://operator@127.0.0.1:{port}/offline?sslmode=verify-ca"),
+            )
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("the connect stalled")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sent = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the client kept the connection open")
+        .unwrap();
+    assert_eq!(sent, 0, "the client started the TLS handshake");
 }
 
 #[tokio::test]

@@ -899,8 +899,10 @@ the command line, where clap refuses any of them given again, and the side
 report's `preset` block records its name, path, SHA-256 and gates.
 
 A preset also names the runner it needs, its timeout, when it runs, and its
-`gates`, every key stated (`null` where it does not gate) except the optional
-`tip_last_notify_median_budget_ms`, which is absent where it does not gate:
+`gates`, every key stated (`null` where it does not gate) except the two
+optional median keys, `tip_last_notify_median_budget_ms` and
+`churn_tip_last_notify_median_budget_ms`, which are absent where they do not
+gate:
 
 | Gate | Meaning |
 |---|---|
@@ -909,9 +911,10 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `max_shortfall` | offers no session could take, per gated phase |
 | `max_rejected_valid_shares`, `max_unanswered_submits` | #473's D1 rule, per gated phase |
 | `tip_last_notify_p99_budget_ms` | per external tip, the slowest session's time to usable work (`time_to_usable_work.tips[].all_sessions_milliseconds`); the p99 over the tips, nearest rank. A tip some session never got work on fails |
-| `tip_last_notify_median_budget_ms` | optional (#790): the same per-tip figure, its median over the tips, nearest rank. The p99 of a few tips is their slowest, so one slow tip on a busy runner fails it; the median holds most tips to the budget while the p99 key, given headroom, still fails a stalled tip. Only `real-node-smoke` sets it: median <= 5000 ms, p99 <= 10000 ms over its 3 tips |
+| `tip_last_notify_median_budget_ms` | optional (#790): the same per-tip figure, its median over the tips, nearest rank. The p99 of a few tips is their slowest, so one slow tip on a busy runner fails it; the median holds most tips to the budget while the p99 key, given headroom, still fails a stalled tip. A regression confined to one tip that lands between the median budget and the p99 budget passes; one that slows more than half the tips fails the median. The median is measured only over every tip the run planned (#854): when fewer tips are in the report than its phases' `external_tips_planned` (one held unminted behind a landing, counted in `external_tips_unminted`, or a real node's mint that failed or never reached the watcher), or the report does not record the plan, the row is unmeasured and fails, since 2 tips of 8 have the faster as their median. `real-node-smoke` gates median <= 5000 ms and p99 <= 10000 ms over its 3 tips. A nearest-rank median of n tips is the ceil(n/2)-th fastest, so up to half the tips (the slower of 2, 3 of 6, 4 of 8) can sit between the two budgets and pass. After three single-tip stalls on contended runners failed PR runs (#842), the tip-delivery and mainnet-shape presets keep their old budget as the median and give the slowest tip twice it: `tip-delivery-2000-miners-400k-2fe-retarget` (nightly) and its manual 500-address variant 2500 / 5000 ms over 8 tips, `mainnet-shape-130-addresses` and `mainnet-shape-650-addresses` 3000 / 6000 ms over 6 |
 | `d1_verdict_table` | print #473's D1 verdict table, in its columns, for `steady_state` and `burst` |
 | `churn_tip_last_notify_p99_budget_ms` | per churn tip, the slowest served session of those connected at the tip; the p99 over the tips. A tip with a connected session never served fails |
+| `churn_tip_last_notify_median_budget_ms` | optional (#842): the same churn figure, its median over the churn tips, nearest rank, with the same trade-off as `tip_last_notify_median_budget_ms`, and the same premise over the churn section's planned tips (`plan.tips_at_seconds`). `rental-churn-bursts-and-storms` gates median <= 3000 ms and p99 <= 6000 ms over its 8 churn tips; its 2 warm-up tips keep `tip_last_notify_p99_budget_ms` 3000 ms and no median, since the median of 2 is the faster |
 | `new_session_first_job_p99_budget_ms` | the churn phase's new connections' time to first job, p99 |
 
 | Preset | Runs | Runner | What it is |
@@ -926,7 +929,7 @@ A preset also names the runner it needs, its timeout, when it runs, and its
 | `mainnet-shape-130-addresses` | nightly | 8 vCPU | the mainnet 2.x.x shape as a floor: 130 addresses, an 85% whale over a Zipf(1.1) tail, difficulty over three orders of magnitude, bursty arrivals peaking at 400 shares/s around a 50/s mean, a 400k window, 6 retargeting tips, and mainnet's 200 bps pool fee |
 | `mainnet-shape-650-addresses` | nightly | 8 vCPU | mainnet-shape-130-addresses with 650 addresses, 2,000 sessions and a 250/s mean peaking at 2,000/s |
 | `mainnet-shape-2600-addresses` | manual | 16 vCPU | 2,600 addresses, 8,000 sessions on four frontends, a 1,000/s mean peaking at 8,000/s |
-| `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, connected-at-tip delivery p99 3 s and new-session first-job p99 10 s |
+| `rental-churn-bursts-and-storms` | nightly | 8 vCPU | mainnet-shape-130-addresses's population in a tips plan, then 300 s of churn: rental bursts of 100, 500 and 2,000 sessions within 10 s leaving after a Pareto(1.2) lifetime from 30 s, and storms of 10%, 25% and 50% of the connected sessions, with 8 tips; gated on reconciliation, warm-up tip delivery p99 3 s, connected-at-tip churn delivery (median 3 s, slowest tip 6 s) and new-session first-job p99 10 s |
 | `short-plan-20k-window-1fe` | manual | 8 vCPU | the short plan over `throughput-20k-window-1fe`'s fixture (2,000 sessions, one frontend, async standby, 20k window) at 50 shares/s with no burst; with `throughput-20k-window-1fe`, what the runner probe below runs on each class |
 | `pr-smoke` | every PR | 2 vCPU | the per-PR smoke run below |
 | `real-node-smoke` | every PR | 2 vCPU | the per-PR real-node smoke run: [Real-node mode](#real-node-mode-547) |
@@ -1006,7 +1009,7 @@ it.
 | Suite | Presets | Repeats | Runner |
 |---|---|---|---|
 | `l3-full` | #447's matrix as #473 ran it: 200k fe1, 400k fe1/2/4 async, 400k fe2 sync, the 3-block run, dense cadence at fe1 and fe2, 500k fe1/2/4 | 3 | 32 vCPU |
-| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; the 5,000 and 10,000 session points (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521) | 1 | 32 vCPU |
+| `l3-reduced` | 400k at 1, 2 and 4 frontends, async; the 5,000 and 10,000 session points (#555); `mainnet-shape-{130,650,2600}-addresses` and `rental-churn-bursts-and-storms` (#521); `mainnet-shape-2600-addresses` report-only (#695) | 1 | 32 vCPU |
 
 The runner is the 32 vCPU class until #542 picks one per lane.
 `.github/workflows/prism-load-l3.yml` runs `l3-full` on a pull request into
@@ -1020,8 +1023,32 @@ D1 phase a row per preset with its sessions, window, frontends, replication
 and plan, and #511's cells. A planned run whose job left no artifact, or
 whose report names another commit or another preset file, is listed and
 fails the suite; it is never dropped. The collate job writes a verdict,
-`complete` when every run reached its gate and `passed` when every one passed
-it, as the artifact `prism-l3-verdict-<tree>`.
+`complete` when every planned run reached its gate and `passed` when every
+gated run passed it and every report-only run held every check but its
+capacity budgets, as the artifact `prism-l3-verdict-<tree>`.
+
+A suite may name some of its presets in `report_only` (#695): their matrix
+entries carry `gated: false`, their run step is gated by their preset but is
+`continue-on-error` (the job's other steps are not, and a harness failure or
+a gate with no verdict still fails the job), and the collation shows their
+numbers and failed checks labelled `report-only, not gated`. Only their
+capacity budgets (shortfall and the latency budgets) are exempt, and refused
+valid shares answered as a commit deadline in a phase short of its rate are
+set aside: the collation re-evaluates such a run that way and fails the
+suite on any other check, so it must reach its gate with harness exit 0
+(completed, reconciled exactly), no durability finding, every gated phase
+run, every tip measured, unanswered submits within budget, and refused valid
+shares within budget once those answered `share was not confirmed by the
+database` in a phase short of its rate (a commit deadline passing under
+overload) are set aside (#847), and it shows and records how many were. A
+report-only preset must budget both refused valid shares and unanswered
+submits; the matrix and the collation refuse one that does not. A tag never
+promotes a verdict with a report-only run.
+`l3-reduced` runs the 20x growth shape, `mainnet-shape-2600-addresses`, this
+way: it runs past the share append's `ORDER_LOCK` ceiling (#695), a
+capacity-envelope point, not a verdict (#555 decision 5). Outside a suite no
+entry carries `gated`, so a preset run on its own is always held to its
+gates. A plan entry without `gated` is gated.
 
 A tag promotes instead of rerunning when the newest finished pull request
 run of `l3-full` from this repository recorded a complete verdict for the
@@ -1418,6 +1445,119 @@ of the restart was scraped. A reset no scrape bracketed (a mid-flight kill)
 leaves `counts` empty with `unavailable_reason` set: unknown, which is not
 zero. A counter that went backwards between two scrapes with no recorded
 restart is reported the same way rather than as a negative number.
+
+Each phase's `share_ack_accounting` (#829) says where the accepted
+acknowledgements' summed seconds went, split at ORDER_LOCK, from the server's
+histograms and `pg_stat_statements`:
+
+- **Measured:**
+  - `accepted_acks`: the sum above, frontend clock.
+  - `order_lock_wait`: granted ORDER_LOCK waits, on PostgreSQL's clock for share
+    appends; the rebuild paths' few are included.
+  - `order_lock_hold_append`: the append's hold from the grant the call reports
+    to its COMMIT or ROLLBACK, frontend clock. An append abandoned by an error
+    ends its hold as it unwinds, before its queued ROLLBACK runs.
+  - `append_call`: the one-call append's `pg_stat_statements` time, including its
+    lock wait.
+  - `pool_acquire`: every ledger checkout; context only.
+- **Derived**, each with its `formula`:
+  - `in_call_after_grant` = call − wait;
+  - `after_call` = hold − in-call: COMMIT with its WAL flush and the runtime's
+    wake to its reply, plus the holds the call's `pg_stat_statements` row does
+    not time (block-bearing appends on the statement path, refused calls,
+    rolled-back gates);
+  - `before_lock_and_response` = acks − wait − hold: the append-admission queue,
+    the submit checks, the pool checkouts, BEGIN, the call's trip to its lock,
+    its reply's trip back and the runtime's wake to it, and the response write.
+    The hold starts at the grant the call reports, counted back from when the
+    frontend processes the reply. PostgreSQL still holds the lock while the
+    reply travels and the runtime wakes to it, but that time is here, not in
+    the hold.
+- **The server's own stages** (`qbit_prism_share_append_stage_seconds`, #829),
+  unknown against a server from before them:
+  - measured: `submit_checks` (the coordinator's checks, for every submission
+    that passed them, block-only work included),
+    `admission` (the wait for one of the frontend's `max_connections - 1`
+    append permits), `locked_call` (the call's own hold, on PostgreSQL's clock)
+    and `commit` (the COMMIT round trip), all but `locked_call` on the frontend
+    clock;
+  - derived: `hold_unattributed` = hold − `locked_call` − `commit`. For a
+    committed one-call append it is only microseconds: nothing awaits between
+    the reply and COMMIT, and the runtime's wake to COMMIT's reply is inside
+    `commit`. Anything more is appends without both a `locked_call` and a
+    committed `commit`: block-bearing ones (less any COMMIT), and refused,
+    rolled back or failed ones.
+  - derived: `before_lock_unattributed` =
+    `before_lock_and_response` − `submit_checks` − `admission`: the Stratum
+    handling, the append task's start, the block-only and candidate work after
+    the checks, the append's pool checkout and BEGIN, the call's trip to its
+    lock, its reply's trip back and the runtime's wake to it, and the response
+    write.
+
+A derived part is unknown when an input is, and also when its inputs disagree
+(a negative difference: the holds and waits include refused appends and the
+rebuild paths' waits, and the submit checks and admissions include refused and
+block-only submissions, which `accepted_acks` does not). The windows differ
+slightly as well. The frontend serves its histograms (pool acquire excepted)
+from a metrics snapshot published every couple of seconds, while
+`pg_stat_statements` is read live, so the call's figures can cover up to a
+snapshot's age more of the phase's tail. COMMIT is not read from
+`pg_stat_statements` at all: PostgreSQL commits and flushes after the extension
+stops timing the statement.
+
+Each phase's `database_counters` has the primary's `pg_stat_wal` deltas (syncs,
+sync time and mean, full-page images, bytes) and its checkpoint counters.
+- The times are reported only when `track_wal_io_timing` was on at both reads;
+  the harness turns it on for its managed primary and standby, which
+  `database.track_wal_io_timing` records.
+- A primary that restarted or was replaced during the phase leaves the block
+  unknown.
+- `database.checkpoint_log` carries each managed server log's checkpoint and
+  restartpoint lines, with their own timestamps, to place a stall against them.
+- A gated phase that fails gets one informational gate row built from both
+  blocks.
+
+`host_contention` (#842) says what the machine was doing, so a slow tip can be
+told from a contended host. The harness reads `/proc/stat` and
+`/proc/pressure/{cpu,io,memory}` every `--process-sample-interval-ms`.
+- **The run-level block** names its sources as the first read found them,
+  the interval, and the steal counter at start. A counter still at 0 since boot cannot tell a host the
+  hypervisor never took CPU from one whose hypervisor does not report steal.
+- **Each phase's and each tip's block:**
+  - `steal` and `iowait` are shares of the CPU time the kernel accounted over
+    every CPU.
+  - `cpu_some`, `io_some`, `io_full`, `memory_some` and `memory_full` are PSI
+    stall time as a share of the harness's monotonic time from before one read
+    of the file to after the next. That is the most the two totals can cover,
+    so time the sampler lost around a read lowers a share and never raises it.
+  - Each figure gives its share over the window and its largest single
+    interval.
+  - Reads that overlap the window count, and `covered_from_milliseconds` and
+    `covered_to_milliseconds` say how far they reach past it. Each figure
+    places its intervals by its own source's reads, so a pressure file read
+    late after a preempted `/proc/stat` read keeps its own interval.
+  - A tip's window runs from the node's tip stamp to its slowest session's
+    first usable job. When some session never got the tip, it runs to the
+    tip's replacement instead (a churn tip's phase end when no tip came), so
+    the window covers the time those sessions were starved. A tip never
+    replaced runs to its slowest served session, and one with no figure at
+    all gets the interval holding its stamp. Each block's `window` says
+    which. It is set in `time_to_usable_work.tips[]` and in each churn
+    section's `tip_delivery.tips[]`, beside the name of the phase it fell
+    in.
+- **Unknown, never 0:** a host without PSI, or a kernel whose `/proc/stat` has
+  no steal field, leaves that figure null with `unavailable_reason`. CPU
+  `full` is not read, because the kernel reports it as zero at the system
+  level.
+- **The lock sampler** adds `longest_sample_gap_milliseconds` to each phase's
+  lock blocks. It is the harness's time between two consecutive polls whose
+  interval overlaps the phase, with the server's `clock_timestamp()` of the
+  poll that ended it. A stall that began before the phase counts; a poll
+  still blocked when the phase is summarised does not.
+- **The gate:** a failed tip row gets one informational row with the host
+  over the slowest tip's delivery, over its phase, and that phase's longest
+  sampler gap. `gate::tip_timeline` prints each tip's line. Both add a
+  caveat when the steal counter was 0 since boot.
 
 The frontend environment is printed redacted, here and in
 `database-profile.json`: the RPC password and the signing seeds are replaced

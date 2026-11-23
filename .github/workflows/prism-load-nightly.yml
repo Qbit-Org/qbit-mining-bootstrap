@@ -155,8 +155,11 @@ on:
         description: >-
           Override every selected preset's tip-to-last-notify p99 budget, in
           ms. Empty keeps each preset's own (gates.tip_last_notify_p99_budget_ms:
-          2,500 for tip-delivery-2000-miners-400k-2fe-retarget*, 3,000 for mainnet-shape-130-addresses and mainnet-shape-650-addresses, 5,000 for
-          mainnet-shape-2600-addresses; ungated for the D1 presets, whose rule is #473's).
+          5,000 for tip-delivery-2000-miners-400k-2fe-retarget* and 6,000 for mainnet-shape-130-addresses
+          and mainnet-shape-650-addresses, each also gating its median tip at half that (#842); 3,000 for
+          rental-churn-bursts-and-storms's warm-up tips; 5,000 for mainnet-shape-2600-addresses; ungated
+          for the D1 presets, whose rule is #473's). Neither the medians nor the churn-tip budgets are
+          overridden.
         required: false
         default: ""
       max_shortfall:

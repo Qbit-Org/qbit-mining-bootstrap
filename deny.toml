@@ -1,6 +1,6 @@
-# cargo-deny configuration. CI runs `cargo deny check` with the version that
-# .github/scripts/install-pinned-tool.sh pins; run the same locally with
-# `cargo deny check` once cargo-deny is on PATH.
+# cargo-deny configuration. CI runs `cargo deny --locked check` with the
+# version that .github/scripts/install-pinned-tool.sh pins; run the same
+# locally with `cargo deny --locked check` once cargo-deny is on PATH.
 #
 # Every ignore below names its reason. Add to a list only with one.
 
@@ -11,12 +11,23 @@ all-features = true
 feature-depth = 1
 
 [advisories]
-# RustSec advisories: any vulnerability, unmaintained crate, or yanked
-# version in the lock file fails the check.
+# RustSec advisories: any vulnerability, unsound or unmaintained crate, or
+# yanked version in the workspace's dependency graph (all features) fails
+# the check, except the advisories ignored below, each with its reason.
+# (The fuzz workspace's own lock file,
+# crates/qbit-prism-server/fuzz/Cargo.lock, is not checked.)
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # The advisory reports no vulnerability. When it was accepted,
+    # qbit-prism-server, qbit-prism-load and qbit-prism-dual-sim used chrono
+    # directly, and the vendored sqlx-core and crates.io sqlx-postgres through
+    # sqlx's `chrono` feature. Replacing it is too large for a patch release.
+    # The PR that resolves #878 deletes this entry (cargo-deny only warns,
+    # advisory-not-detected, once nothing matches it).
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no patched version; replacement tracked in Qbit-Org/qbit-mining-bootstrap#878" },
+]
 
 [licenses]
 # Every crate in the graph must carry one of these licenses. The list is what

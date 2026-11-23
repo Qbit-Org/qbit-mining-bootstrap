@@ -28,6 +28,7 @@
     "harness_bug_rejections",
     "honest_value_notes",
     "host",
+    "host_contention",
     "mid_flight_kill",
     "no_response_commits",
     "node",
