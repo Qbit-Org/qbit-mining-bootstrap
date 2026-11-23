@@ -266,8 +266,17 @@ def admission_wait_rule(spec):
     p99 = (f"histogram_quantile(0.99, sum by (job, instance, network, le) "
            f"(rate({stage}_bucket{selector}[{ADMISSION_WINDOW}])))")
     flowing = f"sum by {by} (increase({stage}_count{selector}[{ADMISSION_WINDOW}]))"
-    snapshot = (f"({prism('qbit_prism_metrics_snapshot_available')} == 1) and on{by} "
-                f"({prism('qbit_prism_metrics_snapshot_stale')} == 0)")
+    # A failed scrape writes staleness markers, so instant gauges would drop
+    # the series for an evaluation; in Grafana 11.5, when no other frontend
+    # has a series, that evaluation is NoData, which alertingNoDataErrorExecution
+    # applies to every state with noDataState OK, restarting the dwell. The
+    # gate carries each gauge's last value for one evaluation interval: enough
+    # to ride over one failed scrape, or two in a row at 15-second scrapes,
+    # while a reading of unknown freshness never counts as fresh for longer.
+    # Unlike the listener rule it does not bridge to PrismMetricsEndpointDown.
+    carry = STANDARD_EVALUATION_MINUTES
+    snapshot = (f"(last_over_time({prism('qbit_prism_metrics_snapshot_available')}[{carry}m]) == 1) and on{by} "
+                f"(last_over_time({prism('qbit_prism_metrics_snapshot_stale')}[{carry}m]) == 0)")
     rule["expr"] = (f"(({p99} > bool {ADMISSION_P99_SECONDS}) and on{by} ({flowing} >= {ADMISSION_MINIMUM})) "
                     f"and on{by} ({snapshot})")
     rule["for"] = ADMISSION_FOR
@@ -298,7 +307,16 @@ def admission_wait_rule(spec):
         "append slot\" describes. "
         "Every outcome counts, so an append dropped at the share-commit deadline while it queued is counted with "
         "the time it waited. Gated on the snapshot, since the family is served from the cached body: a stale or "
-        "unpublished body suppresses it. A frontend without the stage histogram (older than #829's stages) has "
+        "unpublished body suppresses it. The gate reads each snapshot gauge's last value in the last "
+        f"{carry} minute{'s' if carry != 1 else ''}, one evaluation interval, so a failed scrape, which would "
+        "otherwise end the dwell when no other frontend reports this series, does not, while a stale or "
+        "unpublished body the frontend publishes ends this frontend's count at the next evaluation (Grafana "
+        "resolves an instance missing beside others within two). It does not bridge to "
+        f"{ENDPOINT_TITLE} as {LISTENER_TITLE} does: from {carry} minute{'s' if carry != 1 else ''} after a "
+        f"frontend's last successful scrape until {ENDPOINT_TITLE} fires, neither covers it, and a scrape outage "
+        "that long restarts the dwell, because a snapshot whose freshness cannot be read must not count as "
+        "fresh for longer than one evaluation, and a queue on a frontend that cannot be scraped is that "
+        "alert's. A frontend without the stage histogram (older than #829's stages) has "
         "no admission series and stays quiet; no-data and evaluation errors are OK because the snapshot and "
         "no-data rules own missing measurements. " + rule["basis"])
 
@@ -319,6 +337,12 @@ LISTENER_RUNBOOK = "### A payout-revision listener that stays down (#843)\n"
 PROSE_DOCS = {"docs/prism-alert-migration.md": None, "docs/prism-native-metrics.md": None,
               "docs/prism-ledger-ops.md": LISTENER_RUNBOOK}
 RUNBOOK_DOCS = {path: heading for path, heading in PROSE_DOCS.items() if heading == LISTENER_RUNBOOK}
+# How the append-slot runbook states the snapshot gate's carry and when
+# PrismMetricsEndpointDown takes over (#844).
+APPEND_RUNBOOK = {"docs/prism-ledger-ops.md": "### Shares queued for an append slot (#844)\n"}
+APPEND_CARRY_PROSE = [r"last\s+snapshot\s+readings\s+for\s+(\d+)\s+minutes?",
+                      r"not\s+scraped\s+for\s+(\d+)\s+minutes?"]
+APPEND_ENDPOINT_PROSE = [r"reports\s+it\s+(\d+)\s+minutes\s+after"]
 # How the runbook states how long the listener rule carries a reading, and
 # what that window is made of (#869).
 LISTENER_WINDOW_PROSE = [r"carry\s+the\s+last\s+reading\s+for\s+(\d+)\s+minutes",
@@ -365,6 +389,10 @@ def check_listener_prose():
     check_prose(EVALUATION_PROSE, STANDARD_EVALUATION_MINUTES, "the standard evaluation interval",
                 "STANDARD_EVALUATION_MINUTES", docs=RUNBOOK_DOCS)
     check_prose(SCRAPE_PROSE, SCRAPE_SECONDS, "the scrape interval", "SCRAPE_SECONDS", docs=RUNBOOK_DOCS)
+    check_prose(APPEND_CARRY_PROSE, STANDARD_EVALUATION_MINUTES, "the append-slot snapshot gate's carry",
+                "STANDARD_EVALUATION_MINUTES", docs=APPEND_RUNBOOK)
+    check_prose(APPEND_ENDPOINT_PROSE, endpoint_dwell_minutes(), f"{ENDPOINT_TITLE}'s dwell",
+                f"{ENDPOINT_TITLE}'s for", docs=APPEND_RUNBOOK)
 
 
 def postgres_rules():
