@@ -1,4 +1,4 @@
-# sqlx-core 0.8.6 with launchbadge/sqlx#4251 (#771) and #3861 (#713), and verify-ca trusting only sslrootcert
+# sqlx-core 0.8.6 with launchbadge/sqlx#4251 (#771), #3861 (#713) and #4289, and verify-ca trusting only sslrootcert
 
 This is sqlx-core 0.8.6 as published on crates.io: the `.crate` whose
 SHA-256 is `ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6`,
@@ -6,9 +6,9 @@ built from upstream commit `bab1b022bd56a64f9a08b46b36b97c5cff19d77e`
 (`.cargo_vcs_info.json`). It is licensed MIT OR Apache-2.0; see
 `LICENSE-MIT` and `LICENSE-APACHE`.
 
-Two upstream fixes are applied, and one local change that is not
-upstream's; nothing else changes. Both fixes were first released in sqlx
-0.9.0; no 0.8.x release has either.
+Three upstream fixes are applied, and one local change that is not
+upstream's; nothing else changes. #4251 and #3861 were first released in
+sqlx 0.9.0 and #4289 in 0.9.1; no 0.8.x release has any of them.
 
 - [launchbadge/sqlx#4251](https://github.com/launchbadge/sqlx/pull/4251),
   "fix(tls): potential deadlock in `StdSocket::poll_ready()`" (merge commit
@@ -33,6 +33,21 @@ upstream's; nothing else changes. Both fixes were first released in sqlx
   0.23.15 to 0.23.24, the first release with that variant: in
   `Cargo.toml.orig`, and on the same requirement in `Cargo.toml`. Both lock
   files already build rustls 0.23.46, so neither changes.
+- [launchbadge/sqlx#4289](https://github.com/launchbadge/sqlx/pull/4289),
+  "fix(pool): prevent num_idle underflow that wedges maintenance in a CPU
+  spin" (merge commit `5d3787ef9d69947065085f46b58767a50b3d8e25`), for a
+  production PRISM v3.1.1 coordinator that froze with one runtime worker
+  spinning. It changes `src/pool/inner.rs` only. 0.8.6's `release()` pushed
+  a connection onto the
+  idle queue and released its permit before it added one to `num_idle`, so
+  a concurrent acquire could pop that connection and subtract one first.
+  With the count at 0 it wrapped to `usize::MAX` until the add landed. The
+  pool's maintenance task reads `num_idle()` once as the bound of its sweep,
+  and with the queue empty the sweep's body never awaits: a task that read
+  the wrapped count kept one runtime worker at 100% CPU and never ran
+  again. `release()` now adds to `num_idle` before it pushes, `pop_idle()`
+  subtracts saturating at 0, and the sweep makes at most `max_connections`
+  checks whatever the count says.
 - **Local: verify-ca trusts only `sslrootcert`**, in
   `src/net/tls/tls_rustls.rs`. Upstream seeds the trust store with Mozilla's
   public roots (`webpki-roots`, or the system's with the native-roots
@@ -53,10 +68,17 @@ upstream's; nothing else changes. Both fixes were first released in sqlx
 Each upstream diff applies as upstream wrote it, except that #3861's
 `Cargo.lock` hunk, which belongs to upstream's workspace, is left out.
 #4251's first hunk's context differs only because 0.8.6 imports `future`
-from `futures_util` rather than `std`, and that import stays. The
+from `futures_util` rather than `std`, and that import stays. #4289's
+changes to the pool code apply as upstream wrote them. Its test, the
+`underflow_tests` module it adds to the same file, is adapted to 0.8.6 in
+two ways. Its stub backend takes 0.8.6's `AnyConnectionBackend` signatures:
+`&str` and `Cow<'static, str>` where 0.9 has `SqlStr`, and `describe`
+without the `offline` gate. Its pool sets neither `max_lifetime` nor
+`idle_timeout`, so that it spawns no maintenance task and the test needs no
+runtime. The
 registry's `.cargo-ok` marker is not copied, and this README and
 `reviewed-advisories.toml` are added. Diffing this directory against the
-extracted crate shows those three changes and nothing else.
+extracted crate shows those four changes and nothing else.
 
 The root `Cargo.toml` and `crates/qbit-prism-server/fuzz/Cargo.toml` patch
 sqlx-core to this directory, and `lab/prism/Dockerfile` copies it into the
@@ -68,6 +90,13 @@ refuse a CA-signed certificate for another name. Without the local change,
 the same file sees verify-ca without a usable `sslrootcert` report an
 unknown issuer rather than the configuration error, and take a public root,
 ISRG Root X1, as a certificate's issuer, as verify-full does.
+
+#4289's test is upstream's own, a unit test inside sqlx-core, and CI does
+not run it: Cargo tests only workspace members, and this directory is not
+one. To run it, copy this directory out of the repository, delete the
+`[dev-dependencies.sqlx]` table from the copy's `Cargo.toml`, and run
+`cargo test --lib --features any,_rt-tokio underflow` there. Against
+0.8.6's pool code it fails, having read `num_idle` as `usize::MAX`.
 
 `scripts/check_vendored_sqlx_core.py` guards both in CI:
 
@@ -87,7 +116,7 @@ Cargo builds a path dependency as local code, so the crate's own rustc
 warnings (three `mismatched_lifetime_syntaxes` on Rust 1.98) show in builds.
 They are left as upstream shipped them.
 
-When sqlx moves to a release that carries both fixes (0.9.0 or later),
+When sqlx moves to a release that carries all three fixes (0.9.1 or later),
 first check that release's verify-ca trust store in
 `src/net/tls/tls_rustls.rs`. The local change is not upstream's: if the
 release still adds the public roots under verify-ca, carry the change
