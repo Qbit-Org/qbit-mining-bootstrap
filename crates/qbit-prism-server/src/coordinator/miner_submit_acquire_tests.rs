@@ -55,10 +55,14 @@ impl Harness {
     fn metrics(&self) -> &Metrics {
         &self.coordinator().metrics
     }
+    /// One attempt of the probe and enqueue, without the found block's retry:
+    /// these tests count one attempt's checkouts. The retry is covered by
+    /// `commit_reconcile_tests::found_block_retry`.
     fn persist(&self, start: TokioInstant) -> impl std::future::Future<Output = SaveOutcome> + '_ {
         self.coordinator().persist_block_only(
             &self.share,
             Some(self.candidate.clone()),
+            None,
             Some(1234),
             &self.candidate.block_hash,
             start,
@@ -140,7 +144,7 @@ where
             credit_policy: None,
         };
         let deferred = (!proof.share_pass).then(|| share.clone());
-        let candidate = submission_candidate(&job, proof, deferred).await?;
+        let candidate = submission_candidate(&CandidateSource::new(&job, proof, deferred)).await?;
         Arc::get_mut(&mut fixture.coordinator)
             .expect("fixture coordinator has no other owners before the test starts")
             .ledger = Arc::new(ledger);
@@ -367,6 +371,7 @@ async fn block_only_initial_probe_sql_error_cancel_and_original_deadline() -> Re
                 .coordinator()
                 .persist_block_only(
                     &h.share,
+                    None,
                     None,
                     None,
                     &h.candidate.block_hash,

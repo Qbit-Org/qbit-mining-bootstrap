@@ -204,6 +204,9 @@ pub async fn run(config: Config) -> Result<()> {
     // rather than accept shares until the lead runs out.
     let config = &coordinator.config;
     let (shutdown, shutdown_rx) = watch::channel(false);
+    // A found block's append run again after a failure before COMMIT starts
+    // no new attempt once the shutdown is signalled (`FoundBlockRetry`).
+    let _ = coordinator.shutdown_signal.set(shutdown_rx.clone());
     api_config.rpc_url = config.rpc_url.clone();
     api_config.rpc_user = config.rpc_user.clone();
     api_config.rpc_password = config.rpc_password.clone();
