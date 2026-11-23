@@ -95,11 +95,16 @@ Against unpatched 0.8.6,
 refuse a CA-signed certificate for another name. Without the local change,
 the same file sees verify-ca without a usable `sslrootcert` report an
 unknown issuer rather than the configuration error, and take a public root,
-ISRG Root X1, as a certificate's issuer, as verify-full does.
+ISRG Root X1, as a certificate's issuer, as verify-full does. Against
+0.8.6's pool code, `crates/qbit-prism-server/tests/sqlx_pool_num_idle.rs`
+sees the pool count `usize::MAX` idle connections while a waiter takes one
+inside `release()`, and sees the maintenance task stop for good after a
+sweep that ran at that moment.
 
-#4289's test is upstream's own, a unit test inside sqlx-core, and CI does
-not run it: Cargo tests only workspace members, and this directory is not
-one. To run it, copy this directory out of the repository, delete the
+#4289 also brings upstream's own test, a unit test inside sqlx-core. CI
+does not run that one: Cargo tests only workspace members, and this
+directory is not one. To run it, copy this directory out of the
+repository, delete the
 `[dev-dependencies.sqlx]` table from the copy's `Cargo.toml`, and run
 `cargo test --lib --features any,_rt-tokio underflow` there. Against
 0.8.6's pool code it fails, having read `num_idle` as `usize::MAX`.
@@ -130,8 +135,7 @@ one. To run it, copy this directory out of the repository, delete the
   the code and its patch. The control is review of every change under
   `vendor/sqlx-core.patches/`, which shows each change to the vendored code
   as a diff against upstream, and the regression tests above, which check
-  what #4251, #3861 and the local change do; CI runs no test of #4289's
-  change. Edits to `reviewed-advisories.toml` are not
+  what the four changes do. Edits to `reviewed-advisories.toml` are not
   checked, nor are this README's, except that it must record the `.crate`'s
   SHA-256 exactly once and name every patch, so that the change list keeps
   up with them. Locally, the script uses Cargo's cached copy of the
@@ -156,8 +160,9 @@ it. Only when it is no longer needed, remove these together:
 - the script, its tests, and its CI steps: the check, the `.crate`
   download for the Python tests, and the advisory review.
 
-Keep both regression test files, with their sqlx-core dev-dependency moved to
-the new version: `sqlx_tls_verify_ca.rs` fails if the local change is lost.
+Keep both TLS regression test files, with their sqlx-core dev-dependency moved
+to the new version: `sqlx_tls_verify_ca.rs` fails if the local change is lost.
+`sqlx_pool_num_idle.rs` uses only sqlx's public pool API and can stay as it is.
 
 ## Changing this copy
 
