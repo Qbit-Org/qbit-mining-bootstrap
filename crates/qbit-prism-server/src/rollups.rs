@@ -1,7 +1,7 @@
 //! Incremental dashboard history, independently maintained by any frontend.
 use crate::metrics::{time_pool_acquire, Metrics};
 use anyhow::{ensure, Result};
-use sqlx::{PgPool, Transaction};
+use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -139,8 +139,12 @@ async fn advance_with_metrics(
         batch > 0 && batch <= 100_000,
         "rollup batch must be 1..100000"
     );
+    // `BEGIN` is `shielded_begin`'s: shutdown cuts the sweep, and a future
+    // dropped between `BEGIN`'s write and its reply would otherwise leave the
+    // pooled connection in a transaction SQLx never counted (#482). The
+    // timeout stays a statement of its own after it, as before.
     let mut transaction =
-        Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await?;
+        crate::ledger::shielded_begin(time_pool_acquire(metrics, pool.acquire()).await?).await?;
     sqlx::query("SET LOCAL statement_timeout = '10s'")
         .execute(&mut *transaction)
         .await?;

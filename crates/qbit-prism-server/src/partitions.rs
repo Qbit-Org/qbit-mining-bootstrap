@@ -7,12 +7,18 @@
 //! happening through `qbit_prism_share_partition_ensure()`, which attaches
 //! empty partitions until `lead_partitions` of them cover the sequence, and
 //! which every frontend calls once at startup and then on this task's tick.
-//! The call is serialized per schema by the online migration runner's advisory
-//! lock class, so several frontends ticking together create each partition
-//! once, and it creates nothing while the lead is intact.
+//! The call is serialized per schema by a transaction-scoped advisory lock of
+//! its own, class 1347571027 (0x50524D53, `PRMS`) with the schema's hash as
+//! the second key, which the table's conversion to partitions takes too
+//! (migration 016). That is not the online migration runner's lock class,
+//! `ONLINE_DDL_LOCK_CLASS` (0x50524953, `PRIS`, the same second key), whatever
+//! migration 016's own comment says, so ensure and the runner do not wait for
+//! each other. Several frontends ticking together create each partition once,
+//! none is created while a conversion swaps the table, and it creates nothing
+//! while the lead is intact.
 use crate::metrics::{time_pool_acquire, Metrics};
 use anyhow::{ensure, Result};
-use sqlx::{PgPool, Transaction};
+use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -48,9 +54,16 @@ pub async fn ensure(pool: &PgPool) -> Result<i32> {
 }
 
 /// Time only checkout, before BEGIN and the unchanged partition transaction.
+///
+/// `BEGIN` is [`crate::ledger::shielded_begin`]'s: the append's partition
+/// repair is cut by the share-commit deadline and the tick by shutdown, and a
+/// future dropped between `BEGIN`'s write and its reply would otherwise hand
+/// the pool a connection whose server side is in a transaction SQLx never
+/// counted, where the next checkout's autocommit writes would run uncommitted
+/// (#482). The timeout stays a statement of its own after it, as before.
 pub(crate) async fn ensure_with_metrics(pool: &PgPool, metrics: Option<&Metrics>) -> Result<i32> {
     let mut transaction =
-        Transaction::begin(time_pool_acquire(metrics, pool.acquire()).await?, None).await?;
+        crate::ledger::shielded_begin(time_pool_acquire(metrics, pool.acquire()).await?).await?;
     sqlx::query(ENSURE_STATEMENT_TIMEOUT)
         .execute(&mut *transaction)
         .await?;
