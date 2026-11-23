@@ -12,8 +12,14 @@
 //! connection is served on its own, that connection's): it stops when they
 //! do, letting a listener's write in flight finish within its bound rather
 //! than cancelling it mid-statement, and whatever it still holds then is
-//! dropped and counted.
+//! dropped and counted. Each write has one deadline, its bound from when it
+//! starts, which the writer holds it to and which the coordinator's ledger
+//! has PostgreSQL end every statement of the write before its `COMMIT` by
+//! (#872), so a write that runs out of time before its commit leaves
+//! nothing running on the server; the commit waits for the local WAL flush
+//! only, bounded by the writer alone.
 use super::{retain_difficulty, MiningBackend, StratumConfig, Worker};
+use crate::ledger::{hint_timed_out, HintDeadline};
 use crate::metrics::{DifficultyHintOutcome as Outcome, Metrics, TaskKind};
 use std::{
     collections::{HashMap, VecDeque},
@@ -21,7 +27,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::{sync::Notify, task::JoinHandle, time::timeout};
+use tokio::{sync::Notify, task::JoinHandle, time::timeout_at};
 
 /// Workers one listener's writer holds hints for unless the configuration
 /// says otherwise. About 2,000 sessions offer one each per 30 s at a steady
@@ -479,7 +485,9 @@ impl DifficultyHints {
     /// its own; later offers are refused once `work` ends. If this future is
     /// dropped first, a write still in flight is cancelled and whatever is
     /// still queued is dropped, both counted as abandoned (besides a write's
-    /// own bound, the only way a write is cancelled mid-statement). Should
+    /// own bound on a stalled connection, the only way a write is cancelled
+    /// mid-statement; a statement before its `COMMIT` then runs on the server
+    /// no longer than the write's deadline, #872). Should
     /// the writer panic, see
     /// [`Self::writer_ended`]. When `work` ends,
     /// `end` says what becomes of what is left, and the writer task has
@@ -616,29 +624,42 @@ impl DifficultyHints {
                     ..
                 } = step;
                 let downward_only = share_id.is_none();
-                let persisted = timeout(bound, async {
-                    backend
-                        .remember_worker_difficulty(
-                            &config.listener_name,
-                            &worker,
-                            difficulty,
-                            share_id.as_deref(),
-                            downward_only,
-                        )
-                        .await?;
-                    // A different frontend may already have newer accepted
-                    // evidence. Cache the canonical retained value and its
-                    // database age, rather than treating this optional write
-                    // as new evidence on this host.
-                    backend
-                        .worker_difficulty(
-                            &config.listener_name,
-                            &worker,
-                            config.resume_ttl_seconds,
-                        )
-                        .await
-                })
+                // One deadline for the whole write, its read-back included,
+                // and for every statement the backend sends for it (#872).
+                // EP-ERRORS: where a dropped statement goes. PostgreSQL ends
+                // each statement before the `COMMIT` before this deadline (see
+                // `HINT_MARGIN_DIVISOR`), so this bound fires mid-statement only
+                // when the server's answer is held up on the way (a stalled
+                // connection), or during the `COMMIT`, which no server-side
+                // timer bounds (it waits for the local WAL flush only, never a
+                // standby). A statement has then ended, or ends at its own
+                // timeout. As the connection returns, SQLx reads what is
+                // still unread: a completed statement's reply and then the
+                // transaction's queued `ROLLBACK`, and the pool keeps the
+                // connection; or the server's cancel, which SQLx takes for a
+                // broken connection and closes it (with a warning). A closed
+                // pool closes it at once. Either way the transaction ends on
+                // the server. Dropped during the `COMMIT`, the write may have
+                // committed: `timed_out`, an unknown outcome, and the next
+                // hint applies on top of either (the ledger keeps the newer
+                // evidence and lowers only a higher row).
+                let deadline = HintDeadline::after(bound);
+                let persisted = timeout_at(
+                    deadline.at(),
+                    backend.write_difficulty_hint(
+                        &config.listener_name,
+                        &worker,
+                        difficulty,
+                        share_id.as_deref(),
+                        config.resume_ttl_seconds,
+                        deadline,
+                    ),
+                )
                 .await;
+                // A different frontend may already have newer accepted
+                // evidence. Cache the canonical retained value and its
+                // database age, read back after the write, rather than
+                // treating this optional write as new evidence on this host.
                 in_flight.settle(match persisted {
                     Ok(Ok(Some((difficulty, age)))) => {
                         retain_difficulty(config, &worker, difficulty, age, !downward_only);
@@ -652,6 +673,11 @@ impl DifficultyHints {
                             .remove(&(config.listener_name.clone(), worker.username.clone()));
                         Outcome::Written
                     }
+                    // The server ended a statement at the write's deadline,
+                    // or too little was left to send one: the bound passing,
+                    // as below, and the write rolled back. An operator's
+                    // cancel or any other error is a failure.
+                    Ok(Err(error)) if hint_timed_out(&error) => Outcome::TimedOut,
                     Ok(Err(error)) => {
                         tracing::debug!(listener = %config.listener_name, error = %format_args!("{error:#}"), "Stratum difficulty hint not written");
                         Outcome::Failed

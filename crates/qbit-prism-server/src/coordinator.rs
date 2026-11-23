@@ -4137,30 +4137,49 @@ impl MiningBackend for Coordinator {
         Ok(hint.map(|hint| (hint.difficulty, Duration::from_millis(hint.age_ms))))
     }
 
+    /// Refused: the coordinator writes hints only through
+    /// [`MiningBackend::write_difficulty_hint`], whose statements PostgreSQL
+    /// ends by the writer's deadline (#872). The trait's default here would
+    /// silently write nothing, and the ledger's own calls write unbounded, so
+    /// a caller that reaches this fails, and its hint counts as `failed`.
     async fn remember_worker_difficulty(
+        &self,
+        _listener: &str,
+        _worker: &Worker,
+        _difficulty: f64,
+        _share_id: Option<&str>,
+        _downward_only: bool,
+    ) -> Result<()> {
+        anyhow::bail!("the coordinator writes difficulty hints only under the writer's deadline, through write_difficulty_hint")
+    }
+
+    async fn write_difficulty_hint(
         &self,
         listener: &str,
         worker: &Worker,
         difficulty: f64,
         share_id: Option<&str>,
-        downward_only: bool,
-    ) -> Result<()> {
-        if downward_only {
-            self.ledger
-                .lower_worker_difficulty(listener, &worker.username, difficulty)
-                .await?;
-        } else if let Some(share_id) = share_id {
+        ttl_seconds: u64,
+        deadline: crate::ledger::HintDeadline,
+    ) -> Result<Option<(f64, Duration)>> {
+        if let Some(share_id) = share_id {
             ensure!(
                 share_id.starts_with(&format!("{}:", worker.username)),
                 "difficulty evidence belongs to another worker"
             );
-            if let Some(evidence) = self.ledger.share_accepted_at_ms(share_id).await? {
-                self.ledger
-                    .record_worker_difficulty(listener, &worker.username, difficulty, evidence)
-                    .await?;
-            }
         }
-        Ok(())
+        let hint = self
+            .ledger
+            .write_worker_difficulty_hint(
+                listener,
+                &worker.username,
+                difficulty,
+                share_id,
+                ttl_seconds,
+                deadline,
+            )
+            .await?;
+        Ok(hint.map(|hint| (hint.difficulty, Duration::from_millis(hint.age_ms))))
     }
 
     async fn new_session_id(&self) -> Result<crate::ledger::SessionId, StratumError> {

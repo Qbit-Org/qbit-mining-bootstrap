@@ -93,7 +93,7 @@ pub use migration::{
 pub use migration::{ImportAuditRow, ImportAuditsOptions, ImportStopped};
 pub use migration::{ShareHashBackfillFinished, ShareHashBackfillPending, ShareHashThrottle};
 mod window;
-pub use difficulty::WorkerDifficulty;
+pub use difficulty::{hint_timed_out, HintDeadline, WorkerDifficulty};
 pub(crate) use window::blocking_drop::{BlockingDrop, ReadAdmission};
 pub use window::{
     probe_share_rows, probe_window_holding, put_balance_snapshot, read_range_paged, AppendResult,

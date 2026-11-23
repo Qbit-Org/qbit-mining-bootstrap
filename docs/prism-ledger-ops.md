@@ -2865,6 +2865,53 @@ it:
   `import-audits: block_hash=...` line on
   stderr with every parameter's encoded size and the prepare, write, lock
   wait, lock hold and total times.
+- Difficulty-hint writes (#856, #872). Each listener's hint writer gives a
+  vardiff resume hint's write and its read-back one bound (500 ms), and runs
+  them as one transaction on one pool checkout whose every statement before
+  `COMMIT` PostgreSQL ends by that bound. Each statement runs under a
+  transaction-local `statement_timeout` of what is left of the bound less a
+  tenth of it: the first is set in the `BEGIN`'s own round trip, and another
+  only when a statement sent under the one in force could end later than the
+  deadline less half the tenth, to what will be left, less the tenth, once
+  that setting's own round trip (the last one measured) is over (at most
+  twice per statement). A statement with less than a millisecond left is not sent,
+  nor a `COMMIT` with less than the tenth and a millisecond left. PostgreSQL turns the
+  statement timer off before it commits, so the transaction also sets
+  `synchronous_commit = local` for itself: a hint's `COMMIT` waits for the
+  local WAL flush only, never a standby (see the
+  [HA reference](prism-ha-reference-architecture.md), D3). That flush is the
+  one part no server-side timer bounds; the writer's own bound is its outer
+  limit, and a bound that passes during `COMMIT` leaves the outcome unknown,
+  counted `timed_out`.
+  A hint that runs out of time before its `COMMIT` therefore rolls back and
+  leaves no statement running and no connection busy, and the connection
+  goes back to the pool
+  at `PRISM_DATABASE_STATEMENT_TIMEOUT_MS` (or, when the frontend's own
+  bound passed first with the server's cancel still on its way, SQLx closes
+  it with a warning, `error occurred while testing the connection
+  on-release`). These statements run under the hint's bound in place of that
+  setting, even where it is set lower: they are hints, never share credit.
+  `PRISM_DATABASE_LOCK_TIMEOUT_MS` still applies to their lock waits, as
+  before, and a lock wait it ends counts as `failed`. The row lock a hint's
+  write takes is held through its read-back and `COMMIT`, a few round trips
+  and the local flush. While database round trips stay within that
+  tenth (50 ms at 500 ms), no statement before `COMMIT`
+  holds it past the bound; a local flush that stalls holds it, and its
+  connection, until the flush ends, and a connection that stalls mid-transaction holds it until
+  the session ends, as before. Another
+  frontend's hint for the same worker waits for it under its own bound, and
+  the pruner skips locked rows. A hint ended so counts as
+  `timed_out` in `qbit_prism_stratum_difficulty_hints_total`, told from an
+  operator's `pg_cancel_backend` by SQLSTATE 57014 and by having run its
+  timeout, all but a tenth, never by the server's message, and PostgreSQL
+  logs one `canceling statement due to statement timeout` (in the language
+  of its `lc_messages`) per such hint. Before #872 the writer gave up on a
+  slow hint after its bound while the statement ran on, up to the 15 s
+  statement timeout, holding its connection as the writer moved on to
+  another. A `BEGIN` with the timeout that the server refuses, or whose
+  caller is cancelled before its reply is read, closes its connection
+  instead of returning it to the pool, so neither a transaction nor a hint's
+  timeout outlives it.
 
 ### A ledger future cancelled inside `BEGIN` (#482)
 
