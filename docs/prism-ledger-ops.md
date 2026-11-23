@@ -468,7 +468,7 @@ accounting after it, and the row records where the block is between them:
 | State | Meaning |
 | --- | --- |
 | `pending` | Durable and never offered. The only state a claim may offer from, and the only one that may still be abandoned: a block proven superseded before it was ever offered. |
-| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522, or a connect still running at half the `submitblock` deadline, #762), the HTTP client handed the request back unwritten because its connection closed first (#816), or the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526). A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Both rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. That attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff. |
+| `offer_reserved` | The claim took the durable reservation immediately before its one `submitblock` call. The row is the unique reservation per block hash: once it commits, no claim on any frontend offers the block again, this frontend included after a crash. The one exception is a call that provably never ran on the node: the connection the request would have been written to was never established (connection refused, a name or route failure, the connect timeout, #522, or a connect still running at half the `submitblock` deadline, #762), the HTTP client handed the request back unwritten because its connection closed first (#816), the node answered it with `RPC_IN_WARMUP` (`-28`), which qbitd returns before it dispatches any call while it is still starting (#526), or the node refused it with HTTP 503 and exactly one of the two bodies its HTTP server writes before it dispatches a request: `Work queue depth exceeded` (its `-rpcworkqueue` was full) or libevent's own 503 page (its HTTP server was shutting down). Any other 503 body, such as a reverse proxy's own page, stays unknown. A 3.1 dual-writer frontend also returns a reservation whose call it never made, because the carry gate moved after the reservation (see the carry gate below); that row is due again at once. Since 3.1.2, an attempt that fails after its reservation committed but before the `submitblock` request could leave also returns it: the renewal right before the send failed, the heartbeat dropped the attempt during the standby or peer-ingest wait, a shutdown stopped waiting for it, or the write returning a refused call's reservation failed. Its failed-attempt release, retried like any other (see the deferred release below), returns the reservation to `pending` instead of keeping it. These rules assume the RPC URL reaches one node: an endpoint that retries a failed POST on another backend is not supported, because it can submit a block twice by itself. The attempt returns its own reservation to `pending` in one claim-fenced transaction. The offer columns are cleared, `last_error` starts with `offer not sent`, and the row is offered again after the ordinary pending backoff, or at once when the carry gate withdrew it or its owner's release ran while the frontend was shutting down. |
 | `offered` | The node's answer is recorded in `offer_outcome` (`accepted`, `rejected` with the node's reply in `offer_reply`, or `unknown`) with the call time; the audit is still to be landed. |
 | `reconciliation` | Offered, and automation could not finish it: an unknown outcome (a transport failure or timeout after the connection was established, other than a request handed back unwritten (#816), a reservation whose call was lost with its frontend, or a pre-011 attempt 011 quarantined), a node rejection, a landing that failed after acceptance, a node or database error after the offer, or a block not on the active chain yet. `last_error` holds the reason. Retried `min(3600, 10 × attempt_count)` s apart with read-only chain observations only, never another `submitblock`, and never abandoned; settled terminal as `orphaned` once the chain proves a competitor at its height. |
 | `orphaned` | Terminal (migration 015, #415). Reachable from the three offer states only. One coherent read-only observation proved a *different* block active at the candidate's height with at least `PRISM_CANDIDATE_ORPHAN_CONFIRMATIONS` confirmations (default 6, counted as `tip_height − height + 1`), after the row's audit landed: the lost tip race of the 2026-09-16 mainnet orphan stall (#413). `last_error` names the competitor, the height, the confirmations and the tip. Like the other terminal states, the row releases its document, block bytes and window reference, so terminal history does not pin candidate payloads or balance snapshots. It preserves its offer metadata and reason; the landed audit and pool-block row retain the accounting evidence. Never claimed again, never offered again, and no longer counted by `qbit_prism_block_candidates_pending` / `qbit_prism_block_candidate_oldest_pending_seconds`; `qbit_prism_block_candidates_orphaned_total` counts completions observed by this process after commit and may undercount if cancellation or restart intervenes. The block's `qbit_pool_blocks` row is marked `inactive` and keeps its landed audit, so a later reorg that reactivates the block is confirmed and credited (deferred share included) by the ordinary reorg reconciler, from that preserved evidence, without this row ever reopening. `orphaned` describes the completed outbox processing decision, not the block's permanent chain status. |
@@ -985,7 +985,11 @@ authenticates an already-landed audit against the block rather than rebuilding
 over it, and is finished once the block is active. A duplicate offer is
 therefore impossible across crashes and takeovers. The price is that a crash
 between the reservation commit and the call loses that delivery; the row
-reports it as unknown and reconciles rather than retrying.
+reports it as unknown and reconciles rather than retrying. An attempt that
+fails in that window instead of crashing knows it sent nothing, and returns
+the reservation to `pending` itself (below). A claim another frontend has
+taken over meanwhile is left alone: the new holder cannot know whether the
+call was made, and settles the block as unknown.
 
 A frontend whose attempt fails releases its claim at once, so the row does
 not wait for the lease. When that release fails too, because the database
@@ -994,7 +998,22 @@ the old primary), the frontend retries the same token-fenced release about
 once a second, alongside its other work, until the database answers or the
 lease ends, and once more at shutdown (#529). The release runs only after the
 failed attempt has stopped, and changes nothing once another frontend has
-taken the row. The frontend logs `candidate claim release deferred` when it
+taken the row. Since 3.1.2, an attempt that held an offer reservation and
+provably sent nothing (it failed, or its heartbeat or a shutdown dropped it,
+after the reservation committed and before the `submitblock` request could
+leave, or after the node's answer proved the call did not run) releases with
+`release_unsent_offer` instead, or `release_unmade_offer` when the row is due
+at once: the same retries, fenced on the token, on `offer_reserved` and on an
+empty offer record, return the row to `pending` with `last_error` starting
+`offer not sent`, and it is offered again. A row the carry gate withdrew, and
+any row returned once the frontend is shutting down, is due again at once;
+any other after the pending backoff. If the row turns out to be held
+by this claim but no longer reserved (a failover lost the reservation's
+commit), the ordinary release frees the claim at once. The frontend logs `the
+attempt failed holding an offer reservation the node never ran` when that
+release starts. If the database does not answer before the lease ends, the
+row keeps its reservation and the next claim settles it as unknown, as
+before. The frontend logs `candidate claim release deferred` when it
 starts retrying, and `deferred candidate claim release succeeded` or
 `... expired with its lease` when it stops. A claim whose frontend was lost
 with the old primary still waits for its 120 s lease.
@@ -1007,12 +1026,24 @@ and the lease's bound for each of the reservation, the renewal before the
 send and the recording, and logs `shutdown waits for a found block's offer
 in flight`. Everything the submit loop does after the shutdown signal
 (this wait, handing back its claim and the deferred releases) finishes
-within 20 s, inside the server's 30 s shutdown, and no new row is claimed
+within 20 s, inside the server's 30 s shutdown; since 3.1.2 an attempt that
+still holds a reservation it never sent when only the lease's 5 s bound of
+that budget is left is cut then, logging `shutdown stops waiting for a found
+block's offer that was never sent`, so that the hand-back has that bound to
+return it (an attempt that is sending or recording keeps the whole wait), and
+no new row is claimed
 once the signal arrived. Only then does it stop;
 the landing that follows is left to the next claim, which lands the `offered`
 row without another offer. Without this, a restart between the reservation
 and the call left an `offer_reserved` row that was never sent and is never
-offered again. A crash in the same window still recovers as delivery unknown.
+offered again. If the wait ends before the request was sent, the claim's
+hand-back returns the reservation to `pending`, due at once (since 3.1.2):
+the frontend logs `the shutdown stopped an attempt holding an offer
+reservation the node never ran`, after the cut's line above or, when the
+section's own bound ran out first, after the shutdown's `ALERT` line saying
+recovery reconciles it as unknown, which then does not apply, and the block
+is offered again. A crash in the same window
+still recovers as delivery unknown.
 
 **A call that never connected (#522).** When `submitblock` fails before its
 connection is established, the request provably never reached the node. That
@@ -1053,6 +1084,26 @@ records no outcome and no first-offer sample. While the node refuses, the
 row stays `pending` and counts toward
 `qbit_prism_block_candidate_oldest_unacknowledged_seconds`, like any block the
 node has not accepted. It never counts as an unknown outcome.
+
+**A call the node refused before dispatch (3.1.2).** qbitd answers HTTP 503
+before it dispatches a request in exactly two places (Qbit Core v1.0.1,
+`src/httpserver.cpp`): when its HTTP work queue is full (`-rpcworkqueue`, 64
+in the shipped configuration), with the body `Work queue depth exceeded`, and
+once its HTTP server is shutting down, when every request, on kept-alive
+connections too, gets libevent's 503 page. Neither request reaches a handler,
+so a `submitblock` refused either way returns its reservation to `pending`
+like a refused connection, with `last_error` naming the refusal (`... refused
+before dispatch (HTTP 503 Service Unavailable): the node's HTTP work queue was
+full ...` or `... was shutting down ...`). Only those exact bodies count. A
+reverse proxy in front of the node answers 503 with its own page when it has
+no healthy backend or its upstream timed out, possibly after it forwarded the
+request, so any other 503 body stays unknown and is never offered again. A
+proxy that passes the node's own reply through keeps the proof for the one
+node it sent the request to; one that rewrites error pages or compresses
+bodies only turns the refusal back into an unknown outcome. A node built
+against another libevent than the release's 2.1.12 writes another shutdown
+page, which also stays unknown. qbitd's `Unhandled request` (HTTP 500) is not
+counted: it can also follow a handler that ran.
 
 **Parked candidates.** A claim parks a row it must not use instead of
 retrying it. Two cases park: an unsupported `storage_version`, or a version-1
@@ -2769,7 +2820,7 @@ Every later attempt is a separate public operation with its own claim.
 | --- | --- | --- | --- | --- |
 | Candidate terminal disposition: `finish_candidate`, `finish_candidate_at_revision` | never-retried mutation | none | The same live claim may invoke again after a reported error; otherwise the worker calls `retry_candidate`. A consumed claim is rejected and writes nothing. | dynamic: `candidate_terminal_timeout_executes_once` |
 | Candidate backoff: `retry_candidate` | explicit later operation | none | Releases the claim, records the error and advances `next_attempt_at` by `min(60, attempt_count)` seconds, or `min(3600, 10 × attempt_count)` for a `reconciliation` row. It does not re-run the failed write and never changes the row's lifecycle state. A fresh `claim_candidate` after that time is the next attempt, with a new token; the old token stays rejected. | dynamic: `candidate_backoff_requires_new_claim`; `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once` |
-| Offer lifecycle: `reserve_offer`, `record_offer`, `release_unsent_offer`, `adopt_active_candidate`, `reconcile_candidate` | never-retried mutations, claim-fenced | none | Each is one state transition of the live claim's row (`pending` to `offer_reserved`, `offer_reserved` to `offered`, `offer_reserved` back to `pending` after a `submitblock` that never established its connection (#522) or that the node answered from its warmup (#526), `pending` to `reconciliation`, an offered state to `reconciliation`) and is rejected once the claim is lost or the row has moved on. A reported error after `reserve_offer` leaves the reservation in place: the next claim, on any frontend, treats the row as delivery unknown and never calls `submitblock` for it. | `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once`, `candidate_lease_tests::token_loss_between_heartbeats_is_fenced_immediately_before_submitblock`, `candidate_lease_tests::crash_after_offer_before_landing_recovers_on_another_frontend_without_a_second_offer`, `candidate_lease_tests::offer_not_sent_tests::*` (#522, #526), `offer_not_executed_tests` (#526), `rpc_not_sent`, `live_regtest::node_outage_tests::node_killed_before_submitblock_lands_the_block_once_after_restart`, `live_regtest::node_outage_tests::node_restarted_into_warmup_before_submitblock_lands_the_block_once` (#526), `live_regtest::lost_reply_tests::lost_submitblock_reply_owner_killed_survivor_lands_the_block_once` (#474: the owning frontend killed with the node's acceptance unheard) |
+| Offer lifecycle: `reserve_offer`, `record_offer`, `release_unsent_offer`, `adopt_active_candidate`, `reconcile_candidate` | never-retried mutations, claim-fenced | none | Each is one state transition of the live claim's row (`pending` to `offer_reserved`, `offer_reserved` to `offered`, `offer_reserved` back to `pending` after a `submitblock` that never established its connection (#522), that the node answered from its warmup (#526) or that it refused with one of its two exact pre-dispatch HTTP 503 replies, or after an attempt that failed before its `submitblock` request could leave, `pending` to `reconciliation`, an offered state to `reconciliation`) and is rejected once the claim is lost or the row has moved on. A reported error from `reserve_offer`, or one that may follow the send, leaves the reservation in place: the next claim, on any frontend, treats the row as delivery unknown and never calls `submitblock` for it. An attempt that ends after `reserve_offer` returned but before the request could leave (the renewal before the send failed, the heartbeat or a shutdown dropped it, or the write returning a refused call failed) knows nothing was sent: its failed-attempt release returns the row to `pending` with `release_unsent_offer`, or `release_unmade_offer` when it is due at once (the carry gate, or the frontend shutting down), under the same fences (the token, `offer_reserved`, no `offered_at_ms`, no `offer_outcome`), retried by the deferred-release loop until the database answers or the lease ends. When that write's fence misses while this claim still holds the row in another state (a failover lost the reservation's commit), the ordinary release frees the claim instead. A row another claim has taken is left alone. A reservation whose COMMIT reply was lost (it reports an error before the attempt knows it holds one), a crash, or a release that never got through before the lease ended still leaves the reservation, recovered as unknown. | `offer_lifecycle::every_unfinished_state_is_claimable_retained_and_reserved_only_once`, `candidate_lease_tests::token_loss_between_heartbeats_is_fenced_immediately_before_submitblock`, `candidate_lease_tests::crash_after_offer_before_landing_recovers_on_another_frontend_without_a_second_offer`, `candidate_lease_tests::offer_not_sent_tests::*` (#522, #526, the pre-dispatch 503 in `offer_not_dispatched_tests`, the failed attempt's return in `offer_unsent_release_tests`), `candidate_lease_tests::claim_release_tests::*`, `offer_not_executed_tests` (#526), `rpc_not_sent`, `live_regtest::node_outage_tests::node_killed_before_submitblock_lands_the_block_once_after_restart`, `live_regtest::node_outage_tests::node_restarted_into_warmup_before_submitblock_lands_the_block_once` (#526), `live_regtest::lost_reply_tests::lost_submitblock_reply_owner_killed_survivor_lands_the_block_once` (#474: the owning frontend killed with the node's acceptance unheard) |
 | CTV attempt journal: `finish_fanout` | never-retried mutation; one journal row per authorized claim | none | Every recorded attempt, `failed` included, releases the claim and schedules `next_broadcast_attempt_at` (10 s per attempt, at most 3600 s). A fresh `claim_fanout` after that time is the next attempt and its own journal row; the old token stays rejected. | dynamic: `fanout_journal_timeout_executes_once`, `broadcast_retry_requires_new_claim` |
 | Claims: `claim_candidate`, `claim_fanout`, `renew_candidate_claim`, `renew_fanout_claim` | public reinvocation | none | One token per block hash or fanout. Distinct hashes have independent leases. Candidate terminal dispositions acquire the shared `SETTLEMENT_LOCK`, then `ORDER_LOCK`. The cited test verifies that a disposition does not touch a sibling candidate's locked outbox row; it does not establish concurrent execution of dispositions. | dynamic: `distinct_hashes_hold_independent_claims` |
 | Landing: `land_candidate`, `land_candidate_at_revision` | dependency reread, idempotent for an identical audit | none | Re-invocation re-reads the stored audit digest and header bits and accepts only an identical audit. A superseded payout revision is a reported error with no block, audit, payout, carry or fanout row written; recovery at a proven newer revision is an explicit call. | dynamic: `superseded_landing_reports_failure`; existing `ledger_postgres::active_candidate_can_land_at_proven_new_chain_revision` |

@@ -23,6 +23,16 @@
 //! token: once another frontend has taken the row it changes nothing. A
 //! holder that died with the old primary still leaves its claim to the
 //! lease.
+//!
+//! An attempt that took an offer reservation and provably sent nothing
+//! ([`UnsentOffer`]) releases differently ([`Release::Unsent`]): its release
+//! returns the reservation to `pending` for another offer
+//! ([`Ledger::release_unsent_offer`], or [`Ledger::release_unmade_offer`] when
+//! the row is due at once), fenced on the token, `offer_reserved` and an
+//! empty offer record, and is retried, deferred and attempted at shutdown
+//! exactly like the ordinary release. A release that keeps the reservation
+//! would make every later claim settle the block as delivery unknown and
+//! never offer it, although the holder knows the call never ran.
 use super::*;
 
 /// How often a deferred release is retried, at most: once a second, or at
@@ -50,10 +60,73 @@ impl LeaseHorizon {
     }
 }
 
+/// Whether an attempt holds an offer reservation that it has provably not
+/// sent, and what its release then records. The offer sets it once the
+/// reservation has committed, clears it synchronously immediately before the
+/// `submitblock` request can leave this process
+/// (`Coordinator::submit_block`), and sets it again once the node's answer
+/// proves the call did not run (`offer_not_executed`), before it writes the
+/// row back to `pending`. It lives in the [`Attempt`], outside the work's
+/// future, so it survives that future being dropped by the heartbeat or by a
+/// shutdown, and the work can no longer change it once it is gone.
+#[derive(Default)]
+pub(super) struct UnsentOffer(std::sync::Mutex<Option<Unsent>>);
+
+/// What [`UnsentOffer`] holds.
+struct Unsent {
+    /// Why nothing ran, for the reason the release records.
+    why: String,
+    /// The returned row is due again at once rather than after the pending
+    /// backoff, as for a reservation the carry gate withdrew.
+    due_now: bool,
+}
+
+impl UnsentOffer {
+    /// The reservation is held and nothing of its call ran on the node;
+    /// `why` says so in the reason the release records, and `due_now` makes
+    /// the returned row due at once.
+    pub(super) fn hold(&self, why: String, due_now: bool) {
+        *self.0.lock().unwrap() = Some(Unsent { why, due_now });
+    }
+
+    /// From here the request may leave: the reservation is no longer
+    /// provably unsent.
+    pub(super) fn sending(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    /// The attempt returned the reservation to `pending` itself: nothing is
+    /// held any more.
+    pub(super) fn returned(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    fn is_held(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+
+    fn take(&self) -> Option<Unsent> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+/// How a failed attempt's claim is released.
+#[derive(Clone, Copy)]
+enum Release {
+    /// The ordinary release: the row keeps its state.
+    Claim,
+    /// The attempt held an offer reservation that provably never ran on the
+    /// node: the release returns it to `pending`, due at once with
+    /// `due_now`, else after the pending backoff; the reason starts with
+    /// `OFFER_NOT_SENT_REASON_PREFIX`.
+    Unsent { due_now: bool },
+}
+
 /// A claimed row's processing, owning the claim while it runs.
 pub(super) struct Attempt {
     claim: CandidateClaim,
     horizon: LeaseHorizon,
+    unsent: UnsentOffer,
 }
 
 /// A failed attempt whose work has finished: the only thing a release takes.
@@ -61,6 +134,7 @@ pub(super) struct FailedAttempt {
     claim: CandidateClaim,
     reason: String,
     lease_end: tokio::time::Instant,
+    release: Release,
 }
 
 impl Attempt {
@@ -75,6 +149,7 @@ impl Attempt {
         Self {
             claim,
             horizon: LeaseHorizon(std::sync::Mutex::new(horizon)),
+            unsent: UnsentOffer::default(),
         }
     }
 
@@ -88,17 +163,36 @@ impl Attempt {
                 &self.claim,
                 lease,
                 Some(&self.horizon),
-                coordinator.process_candidate_inner(&self.claim, lease),
+                coordinator.process_candidate_inner(&self.claim, lease, &self.unsent),
             )
             .await
     }
 
-    /// The attempt's run failed with `error`.
+    /// Whether the attempt holds an offer reservation that it has not sent
+    /// (the submit loop's shutdown cuts such an attempt in time for the
+    /// hand-back to return it).
+    pub(super) fn holds_unsent_offer(&self) -> bool {
+        self.unsent.is_held()
+    }
+
+    /// The attempt's run failed with `error`. When it held an offer
+    /// reservation it never sent, the release returns it to `pending`.
     pub(super) fn failed(self, error: anyhow::Error) -> Box<FailedAttempt> {
-        tracing::warn!(%error,block=%self.claim.candidate.block_hash,"candidate remains recoverable");
+        let block = &self.claim.candidate.block_hash;
+        let (reason, release) = match self.unsent.take() {
+            Some(Unsent { why, due_now }) => {
+                tracing::warn!(%error,%block,"the attempt failed holding an offer reservation the node never ran; returning the reservation to pending");
+                (unsent_reason(&why, &error), Release::Unsent { due_now })
+            }
+            None => {
+                tracing::warn!(%error,%block,"candidate remains recoverable");
+                (error.to_string(), Release::Claim)
+            }
+        };
         Box::new(FailedAttempt {
-            reason: error.to_string(),
+            reason,
             lease_end: self.horizon.get(),
+            release,
             claim: self.claim,
         })
     }
@@ -110,14 +204,28 @@ impl Attempt {
     /// does: exactly what it would do after the expiry. Fenced on the token
     /// and on an unfinished state, so a terminal commit that won the race is
     /// left alone. A failed release falls back to the expiry.
+    ///
+    /// Dropped while it held an offer reservation the node never ran (a
+    /// shutdown that stopped waiting for the offer section before the send),
+    /// the attempt returns the reservation to `pending` instead, due at once,
+    /// in the same one bounded try ([`return_unsent_reservation`]).
     pub(super) async fn hand_back_at_shutdown(self, ledger: &Ledger, budget: Duration) {
         let block = &self.claim.candidate.block_hash;
-        match tokio::time::timeout(
-            budget,
-            ledger.release_recovery_claim(&self.claim, "claim released at shutdown"),
-        )
-        .await
-        {
+        let release = async {
+            match self.unsent.take() {
+                Some(Unsent { why, .. }) => {
+                    tracing::warn!(%block,"the shutdown stopped an attempt holding an offer reservation the node never ran; returning the reservation to pending");
+                    let reason = unsent_reason(&why, &anyhow::anyhow!("stopped at shutdown"));
+                    return_unsent_reservation(ledger, &self.claim, &reason, true).await
+                }
+                None => {
+                    ledger
+                        .release_recovery_claim(&self.claim, "claim released at shutdown")
+                        .await
+                }
+            }
+        };
+        match tokio::time::timeout(budget, release).await {
             Ok(Ok(_)) => {}
             Ok(Err(release)) => {
                 tracing::warn!(%release,%block,"candidate claim release at shutdown failed; the claim waits for its expiry")
@@ -152,6 +260,8 @@ impl FailedAttempt {
 
     /// One bounded release: `Ok(true)` released, `Ok(false)` no longer held
     /// by this claim, an error when the database did not answer in time.
+    /// Once the loop is stopping (`stop_by`), an unsent reservation is
+    /// returned due at once, as at shutdown.
     async fn try_release(
         &self,
         ledger: &Ledger,
@@ -160,7 +270,7 @@ impl FailedAttempt {
     ) -> Result<bool> {
         tokio::time::timeout(
             self.budget(lease, stop_by),
-            ledger.release_candidate_claim(&self.claim, &self.reason),
+            self.release_with(ledger, false, stop_by.is_some()),
         )
         .await
         .context("candidate claim release deadline exceeded")?
@@ -177,10 +287,115 @@ impl FailedAttempt {
     ) -> Result<bool> {
         tokio::time::timeout(
             self.budget(lease, stop_by),
-            ledger.release_recovery_claim(&self.claim, &self.reason),
+            self.release_with(ledger, true, true),
         )
         .await
         .context("candidate claim release deadline exceeded")?
+    }
+
+    /// The release itself: an unsent reservation goes back to `pending`
+    /// ([`return_unsent_reservation`]), due at once when `stopping`, as the
+    /// ordinary shutdown release keeps the row claimable at once; any other
+    /// claim is released keeping the row's state, with the backoff, or at
+    /// shutdown keeping its schedule.
+    async fn release_with(
+        &self,
+        ledger: &Ledger,
+        at_shutdown: bool,
+        stopping: bool,
+    ) -> Result<bool> {
+        match self.release {
+            Release::Unsent { due_now } => {
+                return_unsent_reservation(ledger, &self.claim, &self.reason, due_now || stopping)
+                    .await
+            }
+            Release::Claim if at_shutdown => {
+                ledger
+                    .release_recovery_claim(&self.claim, &self.reason)
+                    .await
+            }
+            Release::Claim => {
+                ledger
+                    .release_candidate_claim(&self.claim, &self.reason)
+                    .await
+            }
+        }
+    }
+}
+
+/// The `last_error` of an unsent reservation returned by its owner after the
+/// attempt failed with `error`; `why` is what [`UnsentOffer::hold`] recorded.
+/// It starts with `OFFER_NOT_SENT_REASON_PREFIX`, as
+/// [`Ledger::release_unsent_offer`] requires.
+fn unsent_reason(why: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{}: {why} ({error:#}); the reservation was returned to pending for another offer",
+        crate::ledger::OFFER_NOT_SENT_REASON_PREFIX
+    )
+}
+
+/// Return `claim`'s offer reservation, which the node provably never ran, to
+/// `pending`: [`Ledger::release_unmade_offer`], due at once, when `due_now`,
+/// else [`Ledger::release_unsent_offer`], after the pending backoff; one
+/// transaction fenced on the token,
+/// `offer_reserved`, no call time and no outcome, so a row another claim has
+/// taken, or one that has moved on, is never touched. `Ok(true)` released,
+/// `Ok(false)` no longer held by this claim, an error when the database did
+/// not answer.
+///
+/// That write reports a row its fence did not match as an error, like a
+/// database that did not answer, so a failed write is followed by a read on
+/// a primary (an answer from a server in recovery may be stale, and is
+/// retried):
+/// - the row is still this claim's unsent reservation (the same fence as the
+///   write's `WHERE`; keep the two equal): the write's error, retried;
+/// - this claim's token holds the row in another state, as when a failover
+///   lost the reservation's commit and the row is `pending` again: the
+///   ordinary release frees it now rather than leaving it to the lease,
+///   keeping its schedule when `due_now` ([`Ledger::release_recovery_claim`])
+///   and otherwise with the backoff ([`Ledger::release_candidate_claim`]).
+///   The hold is taken only once the reservation's COMMIT has answered, and
+///   the attempt's own returns clear the token, so no write of this attempt
+///   can still turn the row back into an `offer_reserved` row under this
+///   token after the read;
+/// - another token, or none, holds the row: `Ok(false)`. A write whose
+///   COMMIT committed although its reply was lost reads this way, which is
+///   the case.
+///
+/// If the read fails too, the write's error is kept and retried. The
+/// caller's deadline bounds all of it: a statement it cuts off is either
+/// committed on the server already or rolled back when its connection is
+/// next used or closed, and its row lock is held until then, so the next try
+/// waits for it within its own bound.
+async fn return_unsent_reservation(
+    ledger: &Ledger,
+    claim: &CandidateClaim,
+    reason: &str,
+    due_now: bool,
+) -> Result<bool> {
+    let returned = if due_now {
+        ledger.release_unmade_offer(claim, reason).await
+    } else {
+        ledger.release_unsent_offer(claim, reason).await
+    };
+    let Err(error) = returned else {
+        return Ok(true);
+    };
+    let held = async {
+        sqlx::query_as::<_, (bool, bool, bool)>(
+            "SELECT pg_is_in_recovery(),COALESCE((SELECT claim_token IS NOT DISTINCT FROM $2 FROM qbit_block_candidate_outbox WHERE block_hash=$1),false),COALESCE((SELECT state='offer_reserved' AND offered_at_ms IS NULL AND offer_outcome IS NULL FROM qbit_block_candidate_outbox WHERE block_hash=$1),false)",
+        )
+        .bind(&claim.candidate.block_hash)
+        .bind(&claim.claim_token)
+        .fetch_one(&mut *ledger.acquire().await?)
+        .await
+    };
+    match held.await {
+        // A standby's answer may be stale: never conclude from it.
+        Ok((true, ..)) | Ok((false, true, true)) | Err(_) => Err(error),
+        Ok((false, true, false)) if due_now => ledger.release_recovery_claim(claim, reason).await,
+        Ok((false, true, false)) => ledger.release_candidate_claim(claim, reason).await,
+        Ok((false, false, _)) => Ok(false),
     }
 }
 
