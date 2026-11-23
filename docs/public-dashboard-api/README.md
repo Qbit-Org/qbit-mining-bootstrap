@@ -88,18 +88,39 @@ series with `view=both` should size `PRISM_PUBLIC_CACHE_MAX_RESPONSE_BYTES`
 accordingly or the origin cache will deliberately skip oversized responses.
 
 The public read service also keeps a small in-process origin cache keyed by
-normalized path and query string, and coalesces concurrent misses for the same
-key. The `stale-while-revalidate` window applies in-process too, not only at
-CDNs: an entry that has expired inside the window is served immediately with
-its honest `Age` while a single background refresh recomputes it. Concurrent
-stale hits share that one refresh, and a failed refresh keeps the stale entry
-servable until the window ends. The in-process window is clamped so a
-stale-served `Age` never exceeds the route's staleness budget (below); past
-the window the next request blocks and recomputes as before. Error responses
-use `Cache-Control: no-store` and are not cached by that origin cache.
+normalized path and the query parameters that route reads, and coalesces
+concurrent misses for the same key. The `stale-while-revalidate` window
+applies in-process too, not only at CDNs: an entry that has expired inside the
+window is served immediately with its honest `Age` while a single background
+refresh recomputes it. Concurrent stale hits share that one refresh, and a
+failed refresh keeps the stale entry servable until the window ends. The
+in-process window is clamped so a stale-served `Age` never exceeds the
+route's staleness budget (below); past the window the next request blocks
+and recomputes as before. Error responses use `Cache-Control: no-store` and
+are not cached by that origin cache.
 Miner pages calculate reward-window aggregates directly in PostgreSQL and
 share the same response cache as the other public routes. The former Python
 `PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS` <!-- retired-setting: PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS --> inner-cache setting is obsolete.
+
+Each route reads only the parameters listed here, and only the first
+non-empty value of each:
+
+| Route | Parameters |
+| --- | --- |
+| `/public/v1/blocks` | `page`, `limit`, `chain_state` |
+| `/public/v1/leaderboard` | `page`, `limit`, `window`, `search`, `recipient_id` |
+| `/public/v1/hashrate-series` | `range`, `bucket`, `subject`, `view` |
+| `/public/v1/block-markers` | `range`, `bucket` |
+| `/public/v1/fanouts/pending` | `page`, `limit` |
+| `/public/v1/miners/{recipient_id}/earnings` and `/payouts` | `page`, `limit` |
+| `/public/v1/miners/{recipient_id}/workers` | `page`, `limit`, `search`, `hide_inactive` |
+| every other route | none |
+
+Any other parameter is ignored, as it always was: it changes neither the
+answer nor the status, and it no longer gets an origin cache entry of its
+own, so `?_=<timestamp>` cache-busting and tracking parameters share the
+route's entry. A CDN keys on the whole query string unless it is configured
+not to, so there such requests still miss and reach the origin.
 
 Every origin computation that takes a ledger read slot — the immutable
 artifact route included, on a cold request — runs under one per-request
@@ -147,9 +168,10 @@ carries chain state read when that set started. That comes on top of the
 response's `Age` and, as before, of the time the response took to build. It
 covers:
 
-- the pool summary's `network` object apart from `network.hashrate_ths`, which
-  every response reads afresh: `name`, `height`, `tip_hash`, `bits`,
-  `network_difficulty`, `initial_block_download` and `peers`;
+- the pool summary's `network` object: `name`, `height`, `tip_hash`, `bits`,
+  `network_difficulty`, `initial_block_download` and `peers`, and
+  `network.hashrate_ths`, which the node answers by a call of its own,
+  remembered the same way but only when it answered with a usable value;
 - what that `network_difficulty` sizes or prices: the pool summary's
   `pool.reward_window` and `pool.expected_time_to_block_seconds`, the reward
   leaderboard's window and rows, and a miner page's `estimated_next_block`
@@ -343,7 +365,8 @@ Like the reorg counters, this is an additive field on
 non-fatal: if the node cannot answer, the response carries
 `"hashrate_ths": null` and never turns the failure into a 503. Pool-summary
 still returns 503 only when no valid compact bits are available, exactly as
-before.
+before. A usable answer is remembered with the node answer described under
+Staleness; a failed one is not, so the next pool-summary miss asks again.
 
 ## Block Markers
 

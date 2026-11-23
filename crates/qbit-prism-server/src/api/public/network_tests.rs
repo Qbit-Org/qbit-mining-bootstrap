@@ -9,14 +9,20 @@ use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
 /// A node that counts each method it is asked, holds `getblockchaininfo`
-/// while closed, and fails the next `fail_chain` of them, or every
-/// `getnetworkinfo` while `fail_info` is set.
+/// while closed and `getnetworkhashps` while its own gate is closed, and
+/// fails the next `fail_chain` of the first, `fail_info` `getnetworkinfo`,
+/// or `fail_hashrate` `getnetworkhashps`, which otherwise answers `hashrate`
+/// and keeps the parameters it was asked with in `hashrate_params`.
 struct FakeNode {
     calls: StdMutex<BTreeMap<String, usize>>,
     open: watch::Sender<bool>,
+    hashrate_open: watch::Sender<bool>,
     fail_chain: AtomicUsize,
     fail_info: AtomicUsize,
+    fail_hashrate: AtomicUsize,
     tip: StdMutex<String>,
+    hashrate: StdMutex<Value>,
+    hashrate_params: StdMutex<Vec<Value>>,
 }
 impl FakeNode {
     fn calls(&self, method: &str) -> usize {
@@ -73,6 +79,17 @@ async fn fake_node_reply(
             }
             json!({"connections":2})
         }
+        "getnetworkhashps" => {
+            node.hashrate_params
+                .lock()
+                .unwrap()
+                .push(input["params"].clone());
+            let _ = node.hashrate_open.subscribe().wait_for(|open| *open).await;
+            if failed(&node.fail_hashrate) {
+                return Json(json!({"id":input["id"],"result":null,"error":{"code":-1}}));
+            }
+            node.hashrate.lock().unwrap().clone()
+        }
         _ => Value::Null,
     };
     Json(json!({"id":input["id"],"result":result,"error":null}))
@@ -114,9 +131,13 @@ async fn fake(
     let node = Arc::new(FakeNode {
         calls: StdMutex::default(),
         open: watch::channel(true).0,
+        hashrate_open: watch::channel(true).0,
         fail_chain: AtomicUsize::new(0),
         fail_info: AtomicUsize::new(0),
+        fail_hashrate: AtomicUsize::new(0),
         tip: StdMutex::new("ab".repeat(32)),
+        hashrate: StdMutex::new(json!("1234567890123.125")),
+        hashrate_params: StdMutex::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rpc_url = format!("http://{}/", listener.local_addr().unwrap());
@@ -161,6 +182,9 @@ impl StallingNode {
         self.sets.load(Ordering::SeqCst)
     }
 }
+
+/// The fake node's `getnetworkhashps` answer as the pool summary serves it.
+const HASHRATE: &str = "1.234567890123125";
 
 fn expected(tip: &str, peers: u64) -> Value {
     json!({"name":"regtest","height":100,"tip_hash":tip.repeat(32),"bits":"207fffff","network_difficulty":"1000000","initial_block_download":false,"peers":peers})
@@ -346,8 +370,106 @@ async fn a_zero_lifetime_asks_the_node_every_time() {
     let (state, node, _server) = fake(0, Duration::from_secs(30)).await;
     for _ in 0..3 {
         assert_eq!(network(&state).await.unwrap(), expected("ab", 2));
+        assert_eq!(remembered_hashrate(&state).await.as_deref(), Some(HASHRATE));
     }
     assert_eq!(node.calls("getblocktemplate"), 3);
+    assert_eq!(node.calls("getnetworkhashps"), 3);
+}
+
+/// The finding: pool-summary requests that differ only in junk parameters,
+/// inside one memo lifetime, share one cache entry and ask the node for its
+/// network hashrate once. Their ledger reads fail here, so none is cached
+/// and every one computes the summary again: only the memo keeps each from
+/// asking the node.
+#[tokio::test]
+async fn pool_summary_requests_with_junk_parameters_share_one_entry_and_one_hashrate_call() {
+    let (state, node, _server) = fake(60, Duration::from_secs(30)).await;
+    let state = without_database(state);
+    let path = "/public/v1/pool-summary";
+    let policy = CachePolicy::for_path(path, &state.config);
+    for n in 0..16 {
+        let query = Query::parse(&format!("x={n}&page={n}"));
+        let (result, cache, _) =
+            super::super::response_cache::public_response(&state, path, &query, &policy, None)
+                .await;
+        assert_eq!(result.unwrap_err().code, "read_timeout");
+        assert_eq!(cache, "MISS");
+    }
+    assert_eq!(state.cache.lock().await.len(), 1);
+    for method in [
+        "getblockchaininfo",
+        "getblocktemplate",
+        "getnetworkinfo",
+        "getnetworkhashps",
+    ] {
+        assert_eq!(node.calls(method), 1, "{method}");
+    }
+    assert_eq!(
+        *node.hashrate_params.lock().unwrap(),
+        [json!([120, -1, "permissionless"])],
+        "the call pool-summary always made"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_pool_summary_misses_wait_for_one_hashrate_call() {
+    let (state, node, _server) = fake(60, Duration::from_secs(30)).await;
+    node.hashrate_open.send_replace(false);
+    let waiters: Vec<_> = (0..24)
+        .map(|_| {
+            let state = state.clone();
+            tokio::spawn(async move { remembered_hashrate(&state).await })
+        })
+        .collect();
+    node.until("getnetworkhashps", 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        waiters.iter().all(|waiter| !waiter.is_finished()),
+        "every miss waits for the call in flight"
+    );
+    assert_eq!(node.calls("getnetworkhashps"), 1);
+    node.hashrate_open.send_replace(true);
+    for waiter in waiters {
+        assert_eq!(waiter.await.unwrap().as_deref(), Some(HASHRATE));
+    }
+    assert_eq!(remembered_hashrate(&state).await.as_deref(), Some(HASHRATE));
+    assert_eq!(node.calls("getnetworkhashps"), 1);
+}
+
+#[tokio::test]
+async fn a_failed_or_unusable_hashrate_is_not_remembered_and_the_network_answer_still_is() {
+    let (state, node, _server) = fake(60, Duration::from_secs(30)).await;
+    assert_eq!(network(&state).await.unwrap(), expected("ab", 2));
+    node.fail_hashrate.store(1, Ordering::SeqCst);
+    assert_eq!(remembered_hashrate(&state).await, None);
+    *node.hashrate.lock().unwrap() = json!("invalid");
+    assert_eq!(remembered_hashrate(&state).await, None);
+    assert_eq!(node.calls("getnetworkhashps"), 2, "neither was remembered");
+    *node.hashrate.lock().unwrap() = json!("1234567890123.125");
+    assert_eq!(remembered_hashrate(&state).await.as_deref(), Some(HASHRATE));
+    assert_eq!(remembered_hashrate(&state).await.as_deref(), Some(HASHRATE));
+    assert_eq!(node.calls("getnetworkhashps"), 3, "the usable answer was");
+    // The hashrate's failures never cost the network answer its memo.
+    assert_eq!(network(&state).await.unwrap(), expected("ab", 2));
+    assert_eq!(node.calls("getblockchaininfo"), 1);
+    assert_eq!(node.calls("getblocktemplate"), 1);
+}
+
+#[tokio::test]
+async fn a_held_hashrate_call_times_out_and_is_not_remembered() {
+    let (state, node, _server) = fake(60, Duration::from_millis(200)).await;
+    node.hashrate_open.send_replace(false);
+    let started = Instant::now();
+    assert_eq!(remembered_hashrate(&state).await, None);
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(200) && waited < Duration::from_secs(5),
+        "{waited:?}"
+    );
+    node.hashrate_open.send_replace(true);
+    assert_eq!(remembered_hashrate(&state).await.as_deref(), Some(HASHRATE));
+    assert_eq!(remembered_hashrate(&state).await.as_deref(), Some(HASHRATE));
+    assert_eq!(node.calls("getnetworkhashps"), 2);
 }
 
 #[tokio::test]
