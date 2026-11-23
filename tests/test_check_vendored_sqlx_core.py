@@ -690,8 +690,8 @@ class CheckVendoredSqlxCoreTests(unittest.TestCase):
             result = run_check(ROOT, "--advisory-db", tmp, "--upstream-crate", str(REAL_CRATE))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            f"vendor/sqlx-core is upstream sqlx-core {VERSION} plus the 3 patch(es) in "
-            f"{PATCHES.as_posix()}, byte for byte: 4 of its 100 files patched, and README.md and "
+            f"vendor/sqlx-core is upstream sqlx-core {VERSION} plus the 4 patch(es) in "
+            f"{PATCHES.as_posix()}, byte for byte: 5 of its 100 files patched, and README.md and "
             "reviewed-advisories.toml added",
             result.stdout,
         )
