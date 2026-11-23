@@ -2220,7 +2220,11 @@ presence alone does not provide this lossless accounting failover guarantee.
 
 Exercise the actual database failover endpoint under controlled mining load.
 Reconcile ACKed proof IDs with the promoted database and inspect retry/dedupe,
-payout, and candidate outcomes. Use independent backups and WAL archives even
+payout, and candidate outcomes. Follow
+[the HA failover procedure](prism-ha-reference-architecture.md#promotion-fencing-and-the-stable-writer-endpoint):
+after an unclean loss whose fence leaves the frontends' established
+connections silent, its step 5 restarts both frontends once the writer
+endpoint has moved. Use independent backups and WAL archives even
 when replication is synchronous; replicas can reproduce operator mistakes.
 
 The repository also includes a disposable physical PostgreSQL failover test:

@@ -183,12 +183,22 @@ session lifetime totals: a full window's allowance is admitted as a burst and
 refills whole at the next window. Valid `mining.submit` traffic is never
 charged against any of them.
 
-The authorization budget is on by default (#823): a username is not
+The authorization budget is on by default since 3.1.2 (#823): a username is not
 authenticated, and an address the frontend has not seen costs a node
-`validateaddress` call. Only the address before the first `.` decides the
-payout, so a resolved address is cached for an hour and a new worker suffix on
-it costs no call. Sessions naming the same new address share one validation,
-and a frontend runs at most four validations at once, so authorization cannot
+`validateaddress` call. An explicit value wins over the default, and
+`.env.example` up to 3.1.1 set
+`PRISM_STRATUM_MAX_AUTHORIZE_ATTEMPTS_PER_INTERVAL=0`, so an `.env` copied
+from it keeps the budget off: delete the line, or set 32. A session's 33rd
+attempt in an interval is answered with error 20 `too many authorization
+attempts`, and the session is closed and counted as
+`qbit_prism_stratum_connection_refusals_total{reason="authorize_budget"}`. A
+Stratum proxy that authorizes more than 32 downstream workers over one
+upstream connection within an interval needs a higher value, or 0.
+
+Only the address before the first `.` decides the payout, so a resolved
+address is cached for an hour and a new worker suffix on it costs no call.
+Sessions naming the same new address share one validation, and a frontend
+runs at most four validations at once, so authorization cannot
 fill the node's RPC work queue ahead of templates and block submission; a
 session that has waited five seconds, behind another session's validation of
 its address and then for one of the four, is refused with
@@ -196,9 +206,10 @@ its address and then for one of the four, is refused with
 other sessions' share submission never wait on that bound. A session handles
 its requests in order, so shares it sends while its own `mining.authorize`
 waits are answered after it. When the cache is full, entries older than the
-hour are dropped first, then the entries of addresses the node refused, which
-resolved to the configured fallback (`PRISM_USERNAME_FALLBACK_ADDRESS`), and
-only then the others.
+hour are dropped first, then the entries whose payout address is not the text
+as typed (addresses the node refused, which resolved to the configured
+fallback, `PRISM_USERNAME_FALLBACK_ADDRESS`), then entries older than five
+minutes, and if it is still full, every entry.
 
 The per-source cap keys on the address this listener observed, which is the
 last hop. Leave it at 0 unless the deployment preserves miner source addresses.

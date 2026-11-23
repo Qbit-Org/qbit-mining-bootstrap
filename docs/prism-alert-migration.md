@@ -111,8 +111,21 @@ It reaches a deployment at its next re-vendor of these rules. A scraped
 frontend that does not export the gauge counts as down, so a deployment that
 re-vendors while a frontend still runs an image from before #834 sees this
 warning on it once it has served miners for 10 minutes; upgrade the frontends
-first. The [ledger operations runbook](prism-ledger-ops.md#a-payout-revision-listener-that-stays-down-843)
+first. The same holds the other way: before frontends go back to an image
+from before #834, such as 3.1.1, roll this rule back or remove it. The
+[ledger operations runbook](prism-ledger-ops.md#a-payout-revision-listener-that-stays-down-843)
 says what to check.
+
+#844 adds `PrismShareAppendAdmissionWaitHigh`
+(`qbit-prism-share-append-admission-wait`), a warning without a page label: a
+frontend's share appends have queued for an append slot, with an admission-wait
+p99 above 1 s over five minutes from at least 100 admissions, for 10 minutes.
+It reads `qbit_prism_share_append_stage_seconds{stage="admission"}` (#829). A
+frontend without that histogram, an image from before 3.1.2, has no series and
+stays quiet, so this rule can be deployed before the frontends are upgraded and
+needs no change if they roll back. The
+[ledger operations runbook](prism-ledger-ops.md#shares-queued-for-an-append-slot-844)
+says what to read.
 
 Before cutover, render with the deployment's actual Ansible variables and
 confirm the scrape selectors: `qbit-prism`, `qbit-prism-public-read`, and the new
