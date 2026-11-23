@@ -8,11 +8,16 @@
 //! marks the frontend down: on the pair, 400 simultaneous connects through
 //! HAProxy overflowed a 128 queue 175 times. Whatever is asked for, the
 //! kernel caps the backlog at `net.core.somaxconn`.
+use anyhow::Context;
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    time::Duration,
 };
-use tokio::net::{lookup_host, TcpListener, TcpSocket, ToSocketAddrs};
+use tokio::{
+    net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs},
+    time::Instant,
+};
 
 /// The HTTP listeners' backlog (the audit and operator API, and the public
 /// read service). Their clients are health checks, scrapes and API readers,
@@ -155,6 +160,244 @@ impl ReservedAddress {
     }
 }
 
+/// How long a Stratum listener waits after an `accept()` failure it rides
+/// out before it tries again, as the readiness endpoint does. A failure for
+/// want of a descriptor or of kernel memory leaves the connection queued, and
+/// the socket stays readable, so an accept tried at once fails at once: this
+/// pause is what keeps the loop from spinning.
+pub const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(100);
+
+/// At most one line per this interval about a listener's failed accepts.
+const ACCEPT_FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// What a Stratum listener does about one `accept()` error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptFailure {
+    /// The listening socket itself cannot accept, now or on any retry: the
+    /// listener ends, as on every error before 3.1.2.
+    Fatal,
+    /// Nothing about the socket or the queue stands in the way: the next
+    /// accept is tried at once. It cannot spin: each such failure used up a
+    /// queued connection, or a signal.
+    Retry,
+    /// The next accept waits [`ACCEPT_RETRY_PAUSE`].
+    Pause,
+}
+
+/// One `accept()` error: its errno's name, for the log, and what to do.
+///
+/// - Fatal: `EBADF` and `ENOTSOCK` (not an open socket), `EINVAL` (not
+///   listening), `EFAULT` (a bad address buffer, a bug), and `EPERM` and
+///   `EACCES`: Linux fails an accept so only when a security module refuses
+///   the listening socket's accept permission, which it refuses again on every
+///   retry (netfilter never fails an accept).
+/// - Retried at once: `ECONNABORTED`, which Linux returns only after taking
+///   the connection off the queue (its peer address could not be read), and
+///   `EINTR` (a signal; near impossible on a non-blocking socket).
+/// - Paused: `EMFILE` and `ENFILE` (no descriptor), `ENOBUFS` and `ENOMEM` (no
+///   kernel memory), the network errors accept(2) says Linux may pass
+///   on for the connection being accepted (`EPROTO`, `ENOPROTOOPT`, `ENETDOWN`,
+///   `ENETUNREACH`, `EHOSTDOWN`, `EHOSTUNREACH`, `ENONET`, `EOPNOTSUPP`,
+///   `ETIMEDOUT`; Linux's TCP accept returns none of them today, so the pause
+///   costs nothing and keeps the loop from spinning if one ever repeats), and
+///   any error not named here, an error with no errno included.
+fn accept_error(error: &io::Error) -> (&'static str, AcceptFailure) {
+    use AcceptFailure::{Fatal, Pause, Retry};
+    let Some(errno) = error.raw_os_error() else {
+        return ("other", Pause);
+    };
+    #[cfg(target_os = "linux")]
+    {
+        match errno {
+            libc::EBADF => ("EBADF", Fatal),
+            libc::ENOTSOCK => ("ENOTSOCK", Fatal),
+            libc::EINVAL => ("EINVAL", Fatal),
+            libc::EFAULT => ("EFAULT", Fatal),
+            libc::EPERM => ("EPERM", Fatal),
+            libc::EACCES => ("EACCES", Fatal),
+            libc::ECONNABORTED => ("ECONNABORTED", Retry),
+            libc::EINTR => ("EINTR", Retry),
+            libc::EMFILE => ("EMFILE", Pause),
+            libc::ENFILE => ("ENFILE", Pause),
+            libc::ENOBUFS => ("ENOBUFS", Pause),
+            libc::ENOMEM => ("ENOMEM", Pause),
+            libc::EPROTO => ("EPROTO", Pause),
+            libc::ENOPROTOOPT => ("ENOPROTOOPT", Pause),
+            libc::ENETDOWN => ("ENETDOWN", Pause),
+            libc::ENETUNREACH => ("ENETUNREACH", Pause),
+            libc::EHOSTDOWN => ("EHOSTDOWN", Pause),
+            libc::EHOSTUNREACH => ("EHOSTUNREACH", Pause),
+            libc::ENONET => ("ENONET", Pause),
+            libc::EOPNOTSUPP => ("EOPNOTSUPP", Pause),
+            libc::ETIMEDOUT => ("ETIMEDOUT", Pause),
+            _ => ("other", Pause),
+        }
+    }
+    // Off Linux (development builds only) errno has no names here; the
+    // error kinds carry the same decisions where std names them.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = errno;
+        match error.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => ("other", Fatal),
+            io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted => ("other", Retry),
+            _ => ("other", Pause),
+        }
+    }
+}
+
+/// A Stratum listener's accepts. An error `accept_error` rides out is
+/// logged and the next accept waits [`ACCEPT_RETRY_PAUSE`], unless it may be
+/// tried at once. At most one line per `ACCEPT_FAILURE_REPORT_INTERVAL`
+/// reports failed accepts: a warning at a failure; at the first accept after
+/// a warned run, a line saying it is accepting again; otherwise at the first
+/// accept once the interval has passed. Each line's `failed_accepts` counts
+/// the failures since the previous line, its own included, so the lines add
+/// up to every failure. Only an error that ends the listener is returned.
+#[derive(Debug)]
+pub(crate) struct Acceptor {
+    listener: String,
+    /// The pause after the last failure ridden out: no accept before it.
+    resume_at: Option<Instant>,
+    /// When the last line about failed accepts was logged.
+    reported_at: Option<Instant>,
+    /// Failed accepts no line has reported yet.
+    unreported: u64,
+    /// The failures since the last accept that succeeded, on this listening
+    /// socket: since when, and whether a warning named them.
+    run: Option<FailedRun>,
+}
+
+#[derive(Debug)]
+struct FailedRun {
+    since: Instant,
+    warned: bool,
+}
+
+impl Acceptor {
+    /// The accepts of the Stratum listener named `listener`, for its log.
+    pub(crate) fn new(listener: impl Into<String>) -> Self {
+        Self {
+            listener: listener.into(),
+            resume_at: None,
+            reported_at: None,
+            unreported: 0,
+            run: None,
+        }
+    }
+
+    /// The next connection on `listener`. Cancel-safe, as `accept` is: a
+    /// pause cut short by another branch of a `select!` resumes, to the same
+    /// instant, at the next call.
+    pub(crate) async fn accept(
+        &mut self,
+        listener: &TcpListener,
+    ) -> anyhow::Result<(TcpStream, SocketAddr)> {
+        loop {
+            if let Some(resume_at) = self.resume_at {
+                tokio::time::sleep_until(resume_at).await;
+                self.resume_at = None;
+            }
+            match listener.accept().await {
+                Ok(accepted) => {
+                    self.accepted();
+                    return Ok(accepted);
+                }
+                Err(error) => self
+                    .failed(error)
+                    .with_context(|| format!("accept on the {} Stratum listener", self.listener))?,
+            }
+        }
+    }
+
+    /// The listening socket was closed (a dual-writer withdrawal). A run of
+    /// failures ends with it, so a later listener's first accept does not
+    /// report the time it was closed as failing; failures no line reported
+    /// wait for the next one.
+    pub(crate) fn closed(&mut self) {
+        self.run = None;
+        self.resume_at = None;
+    }
+
+    fn report_due(&self, now: Instant) -> bool {
+        self.reported_at
+            .is_none_or(|at| now.duration_since(at) >= ACCEPT_FAILURE_REPORT_INTERVAL)
+    }
+
+    fn reported(&mut self, now: Instant) {
+        self.reported_at = Some(now);
+        self.unreported = 0;
+    }
+
+    fn failed(&mut self, error: io::Error) -> io::Result<()> {
+        let (kind, failure) = accept_error(&error);
+        self.unreported += 1;
+        let pause = match failure {
+            AcceptFailure::Fatal => {
+                tracing::error!(
+                    listener = %self.listener,
+                    kind,
+                    %error,
+                    failed_accepts = self.unreported,
+                    "Stratum listener accept failed on the listening socket itself: the listener stops"
+                );
+                return Err(error);
+            }
+            AcceptFailure::Retry => Duration::ZERO,
+            AcceptFailure::Pause => ACCEPT_RETRY_PAUSE,
+        };
+        let now = Instant::now();
+        if !pause.is_zero() {
+            self.resume_at = Some(now + pause);
+        }
+        let warn = self.report_due(now);
+        let run = self.run.get_or_insert(FailedRun {
+            since: now,
+            warned: false,
+        });
+        if warn {
+            run.warned = true;
+            tracing::warn!(
+                listener = %self.listener,
+                kind,
+                %error,
+                failed_accepts = self.unreported,
+                pause_ms = pause.as_millis() as u64,
+                "Stratum listener accept failed: the listener keeps its sessions and accepts again"
+            );
+            self.reported(now);
+        }
+        Ok(())
+    }
+
+    fn accepted(&mut self) {
+        if self.run.is_none() && self.unreported == 0 {
+            return;
+        }
+        let now = Instant::now();
+        match self.run.take() {
+            Some(run) if run.warned => {
+                tracing::info!(
+                    listener = %self.listener,
+                    failed_accepts = self.unreported,
+                    failing_ms = now.duration_since(run.since).as_millis() as u64,
+                    "Stratum listener accepting again after failed accepts"
+                );
+                self.reported(now);
+            }
+            _ if self.unreported > 0 && self.report_due(now) => {
+                tracing::info!(
+                    listener = %self.listener,
+                    failed_accepts = self.unreported,
+                    "Stratum listener accepting; failed accepts since the last report"
+                );
+                self.reported(now);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -198,6 +441,92 @@ mod tests {
             streams.len()
         );
         drop(listener);
+    }
+
+    /// Only an error that says the listening socket itself cannot accept
+    /// ends a Stratum listener; a connection the kernel already dequeued, or
+    /// a signal, is retried at once; running out of descriptors or kernel memory, and
+    /// anything unnamed, is paused and ridden out.
+    #[test]
+    fn only_errors_of_the_listening_socket_itself_end_the_listener() {
+        use AcceptFailure::{Fatal, Pause, Retry};
+        let errno = io::Error::from_raw_os_error;
+        for (code, name, failure) in [
+            (libc::EBADF, "EBADF", Fatal),
+            (libc::ENOTSOCK, "ENOTSOCK", Fatal),
+            (libc::EINVAL, "EINVAL", Fatal),
+            (libc::EFAULT, "EFAULT", Fatal),
+            (libc::EPERM, "EPERM", Fatal),
+            (libc::EACCES, "EACCES", Fatal),
+            (libc::ECONNABORTED, "ECONNABORTED", Retry),
+            (libc::EINTR, "EINTR", Retry),
+            (libc::EMFILE, "EMFILE", Pause),
+            (libc::ENFILE, "ENFILE", Pause),
+            (libc::ENOBUFS, "ENOBUFS", Pause),
+            (libc::ENOMEM, "ENOMEM", Pause),
+            (libc::EPROTO, "EPROTO", Pause),
+            (libc::EOPNOTSUPP, "EOPNOTSUPP", Pause),
+            (libc::EXDEV, "other", Pause),
+        ] {
+            assert_eq!(accept_error(&errno(code)), (name, failure), "{name}");
+        }
+        assert_eq!(
+            accept_error(&io::Error::other("not an OS error")),
+            ("other", Pause)
+        );
+    }
+
+    /// A failure ridden out holds the next accept back for the whole pause,
+    /// although a connection is waiting, and a pause cut short by a
+    /// `select!` resumes to the same instant; a connection already dequeued
+    /// is followed at once; a fatal error is returned.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_ridden_out_pauses_the_next_accept() {
+        let listener = bind_listener(("127.0.0.1", 0), 16).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _first = TcpStream::connect(address).await.unwrap();
+        let mut acceptor = Acceptor::new("test");
+        let failed_at = Instant::now();
+        acceptor
+            .failed(io::Error::from_raw_os_error(libc::EMFILE))
+            .unwrap();
+        let early = ACCEPT_RETRY_PAUSE - Duration::from_millis(1);
+        assert!(
+            tokio::time::timeout(early, acceptor.accept(&listener))
+                .await
+                .is_err(),
+            "an accept was tried within the pause"
+        );
+        acceptor.accept(&listener).await.unwrap();
+        assert_eq!(Instant::now(), failed_at + ACCEPT_RETRY_PAUSE);
+        assert!(acceptor.run.is_none() && acceptor.resume_at.is_none());
+
+        let _second = TcpStream::connect(address).await.unwrap();
+        let failed_at = Instant::now();
+        acceptor
+            .failed(io::Error::from_raw_os_error(libc::ECONNABORTED))
+            .unwrap();
+        assert!(acceptor.resume_at.is_none());
+        acceptor.accept(&listener).await.unwrap();
+        assert_eq!(Instant::now(), failed_at, "a dequeued connection paused");
+
+        let error = acceptor
+            .failed(io::Error::from_raw_os_error(libc::EBADF))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// A run of failures ends with its listening socket: a gated listener
+    /// withdrawn mid-run starts its next socket with no pause and no run.
+    #[test]
+    fn a_closed_listener_ends_the_run_of_failures() {
+        let mut acceptor = Acceptor::new("test");
+        acceptor
+            .failed(io::Error::from_raw_os_error(libc::EMFILE))
+            .unwrap();
+        assert!(acceptor.run.as_ref().is_some_and(|run| run.warned));
+        acceptor.closed();
+        assert!(acceptor.run.is_none() && acceptor.resume_at.is_none());
     }
 
     #[tokio::test]

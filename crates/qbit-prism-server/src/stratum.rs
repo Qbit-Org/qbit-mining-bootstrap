@@ -2228,6 +2228,7 @@ pub async fn run_listener<B: MiningBackend>(
     metrics.set_stratum_connection_limit(config.connection_limit.capacity());
     metrics.revision_work_sessions_tracked();
     let mut connections = JoinSet::new();
+    let mut acceptor = crate::listen::Acceptor::new(config.listener_name.clone());
     let hints = DifficultyHints::new();
     let sessions = Sessions {
         config: config.clone(),
@@ -2248,7 +2249,9 @@ pub async fn run_listener<B: MiningBackend>(
                 tokio::select! {
                     changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
                     _ = connections.join_next(), if !connections.is_empty() => {}
-                    accepted = listener.accept() => sessions.start(accepted?, &mut connections),
+                    // An error the listener rides out is logged and paused
+                    // inside; only one that ends it arrives here.
+                    accepted = acceptor.accept(&listener) => sessions.start(accepted?, &mut connections),
                 }
             }
             drain_sessions(connections).await;
@@ -2321,6 +2324,8 @@ async fn gated_listener<B: MiningBackend>(
     metrics.revision_work_sessions_tracked();
     metrics.publish_stratum_listener_accepting(&config.listener_name, false);
     let mut connections = JoinSet::new();
+    // Kept across gate cycles, so its warnings stay rate-limited.
+    let mut acceptor = crate::listen::Acceptor::new(config.listener_name.clone());
     // The sessions' stop signal, raised on shutdown and on a withdrawal that
     // closes them. A session reads it between requests, so it finishes the
     // one in hand before it closes.
@@ -2411,7 +2416,9 @@ async fn gated_listener<B: MiningBackend>(
                         break;
                     }
                 }
-                accepted = listener.accept() => {
+                // An error the listener rides out is logged and paused
+                // inside; only one that ends it arrives here.
+                accepted = acceptor.accept(&listener) => {
                     let accepted = accepted?;
                     // The select is unbiased: a pending connection can win
                     // the poll in which the decision goes stale or a newer
@@ -2427,6 +2434,7 @@ async fn gated_listener<B: MiningBackend>(
             }
         }
         drop(listener);
+        acceptor.closed();
         address.reserve().with_context(|| {
             format!(
                 "hold the {} Stratum address {} after closing its listener",
