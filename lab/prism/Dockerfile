@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.29
 
 # The builder is the toolchain pinned in rust-toolchain.toml, by version and by
 # the multi-arch index digest of that tag on Docker Hub; the docker-builds CI
